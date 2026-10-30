@@ -10,6 +10,7 @@ version = "0.1.0"
 name = "sr2-hook"
 version = "0.1.0"
 dependencies = [
+ "sr2-formats",
  "windows-sys",
 ]
 

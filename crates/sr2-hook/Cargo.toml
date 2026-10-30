@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
+sr2-formats = { path = "../sr2-formats" }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",

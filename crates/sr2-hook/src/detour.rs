@@ -28,6 +28,33 @@ fn jmp_rel32(from: usize, to: usize) -> [u8; 5] {
     [0xE9, r[0], r[1], r[2], r[3]]
 }
 
+/// Replace `target` outright with a `jmp replacement` (no trampoline, so the
+/// original can no longer be called). `expected` should cover the whole original
+/// function body, to pin it to this exact build.
+///
+/// # Safety
+/// No thread may be executing the first 5 bytes of `target` while it is patched.
+pub unsafe fn replace(target: usize, expected: &[u8], replacement: usize) -> Result<(), DetourError> {
+    if expected.len() < 5 {
+        return Err(DetourError::PrologueTooShort);
+    }
+    let current = unsafe { std::slice::from_raw_parts(target as *const u8, expected.len()) };
+    if current != expected {
+        return Err(DetourError::PrologueMismatch { found: current.to_vec() });
+    }
+    let mut old = 0u32;
+    if unsafe { VirtualProtect(target as *const c_void, 5, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+        return Err(DetourError::Protect);
+    }
+    let jmp = jmp_rel32(target, replacement);
+    unsafe {
+        std::ptr::copy_nonoverlapping(jmp.as_ptr(), target as *mut u8, 5);
+        VirtualProtect(target as *const c_void, 5, old, &mut old);
+        FlushInstructionCache(GetCurrentProcess(), target as *const c_void, 5);
+    }
+    Ok(())
+}
+
 /// Redirect `target` to `replacement`. Returns a trampoline that runs the
 /// original function (stolen prologue + jump back).
 ///

@@ -40,4 +40,5 @@ original. The standalone build can move to 64-bit later.
 2. ✅ Ghidra baseline: startup chain, window, D3D and input entry points (docs/analysis/00_initial_overview.md). ⏳ Still to do: RTTI class list.
 3. ✅ Rust workspace and toolchain; hook DLL (proxy `dinput8.dll`) loads in-game (log: `exe base 0x400000`).
 4. ✅ `sr2-formats::vpp`: parses all 18 shipped archives (`cargo run --release -p sr2-formats --example vpp -- check <dir>/*.vpp_pc`). ⏳ Still to do: map the in-game loader.
-5. First detoured game functions (file system / archive layer), verified in-game.
+5. ✅ First Rust replacement: `hash_filename_ci` @0xBF2BD0 → `sr2_formats::hash` (self-tested against the original in-process; main menu loads). Next: `packfile_find_record` (0xC0A3B0, cdecl) and `packfile_mount` (0xC0B410, ECX=path).
+6. Get computer control working (desktop app) to test gameplay-dependent rewrites.
