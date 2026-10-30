@@ -403,10 +403,29 @@ extern "C" fn packfile_mount_rust(path: *const u8) -> u32 {
     }
 }
 
-/// ECX-convention entry for [`packfile_mount_rust`].
+/// Our override archive (game folder), mounted right after `patch.vpp_pc` so its
+/// files win the last-match lookup. Built by `sr2-mod`.
+const OVERRIDE_PACKFILE: &[u8] = b"decomp.vpp_pc\0";
+
+/// [`packfile_mount_rust`], plus the override archive after the patch archive.
+extern "C" fn packfile_mount_with_overrides(path: *const u8) -> u32 {
+    let r = packfile_mount_rust(path);
+    if r != 0 && unsafe { cstr(path) }.eq_ignore_ascii_case(b"patch.vpp_pc") {
+        let p = OVERRIDE_PACKFILE.as_ptr();
+        if std::path::Path::new("decomp.vpp_pc").exists() {
+            let ok = packfile_mount_rust(p);
+            packfile_mount_log(p, ok, 0);
+        } else {
+            log("no decomp.vpp_pc in the game folder; skipping override archive");
+        }
+    }
+    r
+}
+
+/// ECX-convention entry for [`packfile_mount_with_overrides`].
 #[unsafe(naked)]
 extern "C" fn packfile_mount_rust_ecx() {
-    naked_asm!("push ecx", "call {f}", "add esp, 4", "ret", f = sym packfile_mount_rust)
+    naked_asm!("push ecx", "call {f}", "add esp, 4", "ret", f = sym packfile_mount_with_overrides)
 }
 
 #[unsafe(naked)]

@@ -221,52 +221,54 @@ impl Archive {
     }
 }
 
+/// Build a v4 archive laid out like `patch.vpp_pc`: flag 2 ("condensed"), file
+/// data packed back to back on 16-byte boundaries, sections padded to 0x800.
+/// `files` are `(name, extension, bytes)`.
+pub fn write(files: &[(&str, &str, &[u8])]) -> Vec<u8> {
+    let mut names = Vec::new();
+    let mut exts = Vec::new();
+    let mut dir = Vec::new();
+    let mut data = Vec::new();
+    for (n, x, bytes) in files {
+        let name_off = names.len() as u32;
+        names.extend_from_slice(n.as_bytes());
+        names.push(0);
+        let ext_off = exts.len() as u32;
+        exts.extend_from_slice(x.as_bytes());
+        exts.push(0);
+        while data.len() % 16 != 0 {
+            data.push(0);
+        }
+        for v in [name_off, ext_off, 0, data.len() as u32, bytes.len() as u32, NOT_COMPRESSED, 0] {
+            dir.extend_from_slice(&v.to_le_bytes());
+        }
+        data.extend_from_slice(bytes);
+    }
+    let mut out = vec![0u8; ALIGN as usize];
+    let put = |out: &mut Vec<u8>, o: usize, v: u32| out[o..o + 4].copy_from_slice(&v.to_le_bytes());
+    put(&mut out, 0, MAGIC);
+    put(&mut out, 4, VERSION);
+    put(&mut out, 0x14C, 2);
+    put(&mut out, 0x154, files.len() as u32);
+    put(&mut out, 0x15C, dir.len() as u32);
+    put(&mut out, 0x160, names.len() as u32);
+    put(&mut out, 0x164, exts.len() as u32);
+    put(&mut out, 0x168, data.len() as u32);
+    put(&mut out, 0x16C, NOT_COMPRESSED);
+    for section in [&dir, &names, &exts] {
+        out.extend_from_slice(section);
+        out.resize(align(out.len() as u64) as usize, 0);
+    }
+    out.extend_from_slice(&data);
+    let size = out.len() as u32;
+    put(&mut out, 0x158, size);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
-
-    /// Build a minimal archive with the same layout as the shipped ones.
-    fn build(files: &[(&str, &str, &[u8])]) -> Vec<u8> {
-        let mut names = Vec::new();
-        let mut exts = Vec::new();
-        let mut dir = Vec::new();
-        let mut data = Vec::new();
-        for (n, x, bytes) in files {
-            let name_off = names.len() as u32;
-            names.extend_from_slice(n.as_bytes());
-            names.push(0);
-            let ext_off = exts.len() as u32;
-            exts.extend_from_slice(x.as_bytes());
-            exts.push(0);
-            while data.len() % 16 != 0 {
-                data.push(0);
-            }
-            for v in [name_off, ext_off, 0, data.len() as u32, bytes.len() as u32, NOT_COMPRESSED, 0] {
-                dir.extend_from_slice(&v.to_le_bytes());
-            }
-            data.extend_from_slice(bytes);
-        }
-        let mut out = vec![0u8; ALIGN as usize];
-        let put = |out: &mut Vec<u8>, o: usize, v: u32| out[o..o + 4].copy_from_slice(&v.to_le_bytes());
-        put(&mut out, 0, MAGIC);
-        put(&mut out, 4, VERSION);
-        put(&mut out, 0x14C, 2);
-        put(&mut out, 0x154, files.len() as u32);
-        put(&mut out, 0x15C, dir.len() as u32);
-        put(&mut out, 0x160, names.len() as u32);
-        put(&mut out, 0x164, exts.len() as u32);
-        put(&mut out, 0x168, data.len() as u32);
-        put(&mut out, 0x16C, NOT_COMPRESSED);
-        for section in [&dir, &names, &exts] {
-            out.extend_from_slice(section);
-            out.resize(align(out.len() as u64) as usize, 0);
-        }
-        out.extend_from_slice(&data);
-        let size = out.len() as u32;
-        put(&mut out, 0x158, size);
-        out
-    }
 
     #[test]
     fn accepts_v4_header() {
@@ -279,7 +281,7 @@ mod tests {
 
     #[test]
     fn parses_and_reads_entries() {
-        let bytes = build(&[("a", "xtbl", b"<root/>"), ("b_long_name", "lua", b"print(1)")]);
+        let bytes = write(&[("a", "xtbl", b"<root/>"), ("b_long_name", "lua", b"print(1)")]);
         let mut cur = Cursor::new(bytes);
         let vpp = Archive::read(&mut cur).unwrap();
         assert_eq!(vpp.entries.len(), 2);

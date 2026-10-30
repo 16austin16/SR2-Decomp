@@ -1,0 +1,11 @@
+[package]
+name = "sr2-mod"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+# Builds `decomp.vpp_pc`, the override archive the hook mounts after patch.vpp_pc.
+[dependencies]
+sr2-formats = { path = "../sr2-formats" }
+ab_glyph = "0.2"
+png = "0.17"
