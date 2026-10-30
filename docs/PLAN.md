@@ -37,7 +37,7 @@ original. The standalone build can move to 64-bit later.
 
 ## Milestones
 1. ✅ Unpack DRM and get a clean exe for static analysis.
-2. ⏳ Ghidra baseline: CRT/WinMain/main loop, subsystem map, RTTI class list.
+2. ✅ Ghidra baseline: startup chain, window, D3D and input entry points (docs/analysis/00_initial_overview.md). ⏳ Still to do: RTTI class list.
 3. ✅ Rust workspace and toolchain; hook DLL (proxy `dinput8.dll`) loads in-game (log: `exe base 0x400000`).
-4. `sr2-formats::vpp`: list and extract every `.vpp_pc`, round-trip tested.
+4. ✅ `sr2-formats::vpp`: parses all 18 shipped archives (`cargo run --release -p sr2-formats --example vpp -- check <dir>/*.vpp_pc`). ⏳ Still to do: map the in-game loader.
 5. First detoured game functions (file system / archive layer), verified in-game.
