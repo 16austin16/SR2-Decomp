@@ -35,6 +35,9 @@ extern "system" fn DllMain(_module: HINSTANCE, reason: u32, _reserved: *mut c_vo
         log(&format!("sr2-hook attached, exe base {base:#x}"));
         if base != SR2_IMAGE_BASE {
             log("warning: exe is not at its preferred base; hooks will be disabled");
+        } else {
+            // Starts once the loader lock is released, racing SteamStub's decryption.
+            std::thread::spawn(hooks::install_early);
         }
     }
     1

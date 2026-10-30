@@ -179,7 +179,11 @@ Hand-decoded from the bytes (Observed). The stack frame has an `/GS` cookie (`[0
 6. On failure (`bl == 0`): `count -= 1` and return 0. The handle is not closed here; `packfile_load` closes it on failure.
 7. On success, switch on `h+0x150`: 0 → `flags |= 8`, 1 → `flags |= 0x10`, 2 → `flags |= 4` (other values: no flag). Then `0xBFDF30(h)` (cdecl close) and return `bl`.
 
-Porting this needs asm shims for `0xC0B120`, `0xBFF700`, `file_open` and `packfile_load`. It runs only at boot (16 calls), so it cannot be compared against the original side by side. Plan: log each mount's inputs and outputs (slot contents, record count) from an observe-only trampoline first, then compare the Rust version's log on the next boot.
+**Ported (hooks.rs).** `0xC0B120`, `0xBFF700` and `0xC0AE90` are reimplemented in Rust. `file_open`, `packfile_load` and `file_close` are called through asm shims.
+
+- **Lesson:** the first port crashed inside `packfile_load` (0xBFE611, bad `os_file*` at handle+0x14C) until the shims saved and restored EBX/ESI/EDI/EBP around the call. LTCG callees are not guaranteed to preserve callee-saved registers, so **every shim into game code must save all four**.
+- **Verification:** an observe-only trampoline logged each mount's result, slot fields, an FNV fingerprint of the directory, and the record table (`golden/boot_mounts.txt`). The Rust build's log is byte-identical.
+- **Not yet exercised:** the already-mounted path, the failure paths, and later mounts (city load).
 
 ## 6. Open questions
 

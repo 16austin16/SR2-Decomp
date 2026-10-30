@@ -25,7 +25,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     let original: extern "C" fn() -> i32 =
         unsafe { std::mem::transmute(FRAME_TICK_ORIGINAL.load(Ordering::Relaxed)) };
     let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    if n == 1 || n % 3600 == 0 {
+    if n == 1 || n.is_multiple_of(3600) {
         log(&format!("game_frame_tick: frame {n}"));
     }
     if n == FIND_RECORD_VERIFY_FRAME {
@@ -185,10 +185,9 @@ unsafe fn find_record(query: *const u8) -> *const FileRecord {
             }
             if (*rec).hash == hash && !query.is_null() {
                 let e = &*(*rec).entry;
-                if *e.name != 0 || (!e.ext.is_null() && *e.ext != 0) {
-                    if query_matches_entry(query, e) {
-                        found = rec;
-                    }
+                let nonempty = *e.name != 0 || (!e.ext.is_null() && *e.ext != 0);
+                if nonempty && query_matches_entry(query, e) {
+                    found = rec;
                 }
             }
             i += 1;
@@ -255,6 +254,237 @@ fn find_record_verify() {
     }
 }
 
+// --- 0xC0B410 packfile_mount (replaced; every call logged) -----------------
+
+/// LTCG: ECX = `const char* path`, returns bool in AL, no stack args.
+/// Prologue `sub esp,50; mov eax,[__security_cookie]`: 8 bytes, absolute operands only.
+const PACKFILE_MOUNT: usize = 0x00C0_B410;
+const PACKFILE_MOUNT_PROLOGUE: [u8; 8] = [0x83, 0xEC, 0x50, 0xA1, 0x50, 0x0B, 0xE8, 0x00];
+
+const G_PACKFILES: usize = 0x0234_8978; // *mut [u8; 0x180]
+const G_PACKFILE_COUNT: usize = 0x0234_8970; // i32
+const PACKFILE_SIZE: usize = 0x180;
+
+const G_PACKFILE_MAX: usize = 0x0234_896C; // i32
+const FILE_OPEN: usize = 0x00BF_DC20; // ECX = path, stack (mode, flag), caller-clean -> file_handle*
+const FILE_CLOSE: usize = 0x00BF_DF30; // cdecl (file_handle*)
+const PACKFILE_LOAD: usize = 0x00C0_A7E0; // ESI = slot, stack (h, permanent, register), caller-clean -> AL
+const STR_RB: usize = 0x00DD_88E4; // the game's "rb" literal
+
+/// Trampoline to the original; the thunk below calls [`MOUNT_IMPL`], which is
+/// either this or the Rust port.
+static MOUNT_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static MOUNT_IMPL: AtomicUsize = AtomicUsize::new(0);
+/// Use the Rust port. The original stays on the trampoline either way.
+const MOUNT_USE_RUST: bool = true;
+
+/// `0xBFF700` `path_basename(EDI=path, dst, size)`: copy what follows the last
+/// `\` or `/` with `strncpy` semantics, then force `dst[size-1] = 0`.
+unsafe fn path_basename(path: *const u8, dst: &mut [u8]) {
+    let s = unsafe { cstr(path) };
+    let name = match s.iter().rposition(|&c| c == b'\\' || c == b'/') {
+        Some(i) => &s[i + 1..],
+        None => s,
+    };
+    let n = name.len().min(dst.len());
+    dst[..n].copy_from_slice(&name[..n]);
+    dst[n..].fill(0);
+    let last = dst.len() - 1;
+    dst[last] = 0;
+}
+
+/// `0xC0AE90`: the mounted packfile whose name (+0x8) `_stricmp`-matches `name`.
+unsafe fn packfile_find_mounted(name: &[u8]) -> Option<*mut u8> {
+    unsafe {
+        let base = *(G_PACKFILES as *const *mut u8);
+        (0..*(G_PACKFILE_COUNT as *const i32)).map(|i| base.add(i as usize * PACKFILE_SIZE)).find(|&pf| {
+            cstr(pf.add(8)).eq_ignore_ascii_case(name)
+        })
+    }
+}
+
+// LTCG-compiled callees need not preserve EBX/ESI/EDI/EBP, so these shims save
+// all four. ESI and EBP can't be asm operands on x86-32 anyway.
+
+unsafe fn file_open(path: *const u8, mode: *const u8, flag: u32) -> *mut u8 {
+    let h: *mut u8;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "push {flag}",
+            "push {mode}",
+            "call {f}",
+            "add esp, 8",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) FILE_OPEN,
+            flag = in(reg) flag,
+            mode = in(reg) mode,
+            in("ecx") path,
+            lateout("eax") h,
+            clobber_abi("C"),
+        );
+    }
+    h
+}
+
+unsafe fn packfile_load(slot: *mut u8, h: *mut u8, permanent: bool, register: bool) -> bool {
+    let r: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "push {reg}",
+            "push {perm}",
+            "push {h}",
+            "mov esi, {slot}",
+            "call {f}",
+            "add esp, 12",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) PACKFILE_LOAD,
+            slot = in(reg) slot,
+            h = in(reg) h,
+            perm = in(reg) permanent as u32,
+            reg = in(reg) register as u32,
+            lateout("eax") r,
+            clobber_abi("C"),
+        );
+    }
+    r as u8 != 0
+}
+
+/// Rust port of `packfile_mount` (0xC0B410), docs/analysis/01_packfile.md §5a.
+extern "C" fn packfile_mount_rust(path: *const u8) -> u32 {
+    unsafe {
+        // 0xC0B120: rejects only NULL (its basename length check cannot fail).
+        if path.is_null() {
+            return 0;
+        }
+        let count = G_PACKFILE_COUNT as *mut i32;
+        if *count >= *(G_PACKFILE_MAX as *const i32) {
+            return 0;
+        }
+        let mut name = [0u8; 0x41];
+        path_basename(path, &mut name);
+        if packfile_find_mounted(cstr(name.as_ptr())).is_some() {
+            return 1;
+        }
+        let h = file_open(path, STR_RB as *const u8, 0);
+        if h.is_null() {
+            return 0;
+        }
+        let slot = (*(G_PACKFILES as *const *mut u8)).add(*count as usize * PACKFILE_SIZE);
+        *count += 1;
+        // On failure packfile_load closes the handle itself.
+        if !packfile_load(slot, h, true, true) {
+            *count -= 1;
+            return 0;
+        }
+        let flags = slot.add(0x14C) as *mut u32;
+        match *(h.add(0x150) as *const u32) {
+            0 => *flags |= 0x8,
+            1 => *flags |= 0x10,
+            2 => *flags |= 0x4,
+            _ => {}
+        }
+        let close: extern "C" fn(*mut u8) = std::mem::transmute(FILE_CLOSE);
+        close(h);
+        1
+    }
+}
+
+/// ECX-convention entry for [`packfile_mount_rust`].
+#[unsafe(naked)]
+extern "C" fn packfile_mount_rust_ecx() {
+    naked_asm!("push ecx", "call {f}", "add esp, 4", "ret", f = sym packfile_mount_rust)
+}
+
+#[unsafe(naked)]
+extern "C" fn packfile_mount_thunk() {
+    naked_asm!(
+        "push ecx",
+        "call dword ptr [{imp}]", // ECX still = path
+        "push eax",
+        "push dword ptr [esp + 8]", // caller's return address
+        "push eax",
+        "push dword ptr [esp + 12]", // path
+        "call {log}",
+        "add esp, 12",
+        "pop eax",
+        "add esp, 4",
+        "ret",
+        imp = sym MOUNT_IMPL,
+        log = sym packfile_mount_log,
+    )
+}
+
+/// FNV-1a, used to fingerprint mount results so two boots can be diffed.
+fn fnv(h: &mut u32, bytes: &[u8]) {
+    for &b in bytes {
+        *h = (*h ^ b as u32).wrapping_mul(0x0100_0193);
+    }
+}
+
+unsafe fn cstr<'a>(p: *const u8) -> &'a [u8] {
+    if p.is_null() { b"<null>" } else { unsafe { std::ffi::CStr::from_ptr(p.cast()) }.to_bytes() }
+}
+
+/// One line per call: inputs, result, and a fingerprint of everything the mount
+/// writes (packfile slot fields, directory, file-record table).
+extern "C" fn packfile_mount_log(path: *const u8, result: u32, caller: usize) {
+    unsafe {
+        let count = *(G_PACKFILE_COUNT as *const i32);
+        let mut line = format!(
+            "mount {:?} from {caller:#x} -> {} | packfiles {count}",
+            String::from_utf8_lossy(cstr(path)),
+            result as u8
+        );
+        if result as u8 != 0 && count > 0 {
+            let pf = (*(G_PACKFILES as *const *const u8)).add((count as usize - 1) * PACKFILE_SIZE);
+            let rd = |o: usize| *(pf.add(o) as *const u32);
+            let mut h = 0x811C_9DC5u32;
+            let entries = rd(0x170) as *const u32;
+            for i in 0..rd(0x154) as usize {
+                let e = entries.add(i * 7);
+                fnv(&mut h, cstr(*e as *const u8));
+                fnv(&mut h, b".");
+                fnv(&mut h, cstr(*e.add(1) as *const u8));
+                for k in 2..6 {
+                    fnv(&mut h, &(*e.add(k)).to_le_bytes());
+                }
+                fnv(&mut h, &[(*e.add(6) as *const u8 == pf) as u8]);
+            }
+            let (recs, nrec) =
+                (*(G_FILE_RECORDS as *const *const FileRecord), *(G_FILE_RECORD_COUNT as *const i32));
+            let mut rh = 0x811C_9DC5u32;
+            for i in 0..nrec.max(0) as usize {
+                fnv(&mut rh, &(*recs.add(i)).hash.to_le_bytes());
+            }
+            line += &format!(
+                " | last {:?} flags {:#x} data {:#x} n {} dir {:#x} names {:#x} ext {:#x} entries#{h:08x} | records {nrec} #{rh:08x}",
+                String::from_utf8_lossy(cstr(pf.add(8))),
+                rd(0x14C),
+                rd(0x150),
+                rd(0x154),
+                rd(0x15C),
+                rd(0x160),
+                rd(0x164)
+            );
+        }
+        log(&line);
+    }
+}
+
 /// Install all hooks. Safe to call repeatedly; runs once.
 pub fn install_all() {
     static ONCE: Once = Once::new();
@@ -304,5 +534,45 @@ pub fn install_all() {
                 Err(e) => log(&format!("hook packfile_find_record failed: {e:?}")),
             }
         }
+
     });
+}
+
+/// Hooks on code that runs before the game's first `DirectInput8Create` (the
+/// boot packfile mounts). Spawned from `DllMain`: spins until SteamStub has
+/// decrypted the target bytes, then patches before the game reaches them.
+pub fn install_early() {
+    let start = std::time::Instant::now();
+    let decrypted = || unsafe {
+        std::slice::from_raw_parts(PACKFILE_MOUNT as *const u8, PACKFILE_MOUNT_PROLOGUE.len()) == PACKFILE_MOUNT_PROLOGUE
+    };
+    while !decrypted() {
+        if start.elapsed().as_secs() >= 30 {
+            log("install_early: packfile_mount bytes never matched, not hooking");
+            return;
+        }
+        std::thread::yield_now();
+    }
+    let waited = start.elapsed();
+    // The thunk goes live as soon as the jmp is written, so set its target first.
+    // (In observe mode the trampoline address is only known afterwards; the game
+    // does not mount within that window, since boot mounts start hundreds of ms later.)
+    if MOUNT_USE_RUST {
+        MOUNT_IMPL.store(packfile_mount_rust_ecx as extern "C" fn() as usize, Ordering::Relaxed);
+    }
+    match unsafe {
+        detour::install(PACKFILE_MOUNT, &PACKFILE_MOUNT_PROLOGUE, packfile_mount_thunk as extern "C" fn() as usize)
+    } {
+        Ok(tramp) => {
+            MOUNT_ORIGINAL.store(tramp, Ordering::Relaxed);
+            let which = if MOUNT_USE_RUST {
+                "Rust"
+            } else {
+                MOUNT_IMPL.store(tramp, Ordering::Relaxed);
+                "original, observed"
+            };
+            log(&format!("hooked packfile_mount @ 0xc0b410 ({which}), {waited:?} after attach"));
+        }
+        Err(e) => log(&format!("hook packfile_mount failed: {e:?}")),
+    }
 }

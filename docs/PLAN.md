@@ -41,5 +41,6 @@ original. The standalone build can move to 64-bit later.
 3. ✅ Rust workspace and toolchain; hook DLL (proxy `dinput8.dll`) loads in-game (log: `exe base 0x400000`).
 4. ✅ `sr2-formats::vpp`: parses all 18 shipped archives (`cargo run --release -p sr2-formats --example vpp -- check <dir>/*.vpp_pc`). ⏳ Still to do: map the in-game loader.
 5. ✅ First Rust replacement: `hash_filename_ci` @0xBF2BD0 → `sr2_formats::hash` (self-tested against the original in-process; main menu loads).
-6. ✅ `packfile_find_record` @0xC0A3B0 → Rust (`hooks.rs`). Trampoline keeps the original; at frame 300 every registered file (53,018) is queried as-is, upper-cased and as a miss through both, and any mismatch flips the hook back to the original. 159,057/159,057 matched in-game. Next: `packfile_mount` (0xC0B410, ECX=path).
+6. ✅ `packfile_find_record` @0xC0A3B0 → Rust (`hooks.rs`). Trampoline keeps the original; at frame 300 every registered file (53,018) is queried as-is, upper-cased and as a miss through both, and any mismatch flips the hook back to the original. 159,057/159,057 matched in-game.
+7. ✅ `packfile_mount` @0xC0B410 → Rust. Boot mounts run before the first `DirectInput8Create`, so this hook is installed from a thread spawned in `DllMain` that waits for SteamStub to decrypt the bytes (~270 ms). Verified by diffing a per-mount fingerprint log (slot fields, directory, record table) against a reference captured from the original: `docs/analysis/golden/boot_mounts.txt`, all 16 identical.
 6. Get computer control working (desktop app) to test gameplay-dependent rewrites.

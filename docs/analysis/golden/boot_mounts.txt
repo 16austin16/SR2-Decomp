@@ -1,0 +1,16 @@
+mount "anims.vpp_pc" -> 1 | packfiles 1 | last "anims.vpp_pc" flags 0xa data 0xa4000 n 14755 dir 0x64dd4 names 0x3d8b3 ext 0x8 entries#492446c9 | records 14755 #85c7b5e2
+mount "audio.vpp_pc" -> 1 | packfiles 2 | last "audio.vpp_pc" flags 0x8 data 0x6000 n 467 dir 0x3314 names 0x111d ext 0xc entries#36e885e6 | records 15222 #e26bab09
+mount "chunks1.vpp_pc" -> 1 | packfiles 3 | last "chunks1.vpp_pc" flags 0xa data 0x5000 n 400 dir 0x2bc0 names 0x868 ext 0x1d entries#8ac78dd7 | records 15622 #28448adc
+mount "chunks2.vpp_pc" -> 1 | packfiles 4 | last "chunks2.vpp_pc" flags 0xa data 0x5800 n 482 dir 0x34b8 names 0xa28 ext 0x1d entries#6aa1657c | records 16104 #a1f604f5
+mount "chunks3.vpp_pc" -> 1 | packfiles 5 | last "chunks3.vpp_pc" flags 0xa data 0x10000 n 1546 dir 0xa918 names 0x3bbc ext 0x25 entries#0cdd85b7 | records 17650 #f70fa8f9
+mount "chunks4.vpp_pc" -> 1 | packfiles 6 | last "chunks4.vpp_pc" flags 0xa data 0xd800 n 1028 dir 0x7070 names 0x4aa7 ext 0x22 entries#258ea991 | records 18678 #6c14ab7e
+mount "common.vpp_pc" -> 1 | packfiles 7 | last "common.vpp_pc" flags 0x8 data 0x45800 n 6166 dir 0x2a268 names 0x19fba ext 0x75 entries#886b632a | records 24844 #cdb6f002
+mount "cutscenes.vpp_pc" -> 1 | packfiles 8 | last "cutscenes.vpp_pc" flags 0x8 data 0x3800 n 177 dir 0x135c names 0x93e ext 0x5 entries#99c60e3f | records 25021 #1f1b1ba9
+mount "meshes.vpp_pc" -> 1 | packfiles 9 | last "meshes.vpp_pc" flags 0xa data 0x92000 n 15306 dir 0x68a18 names 0x27ac2 ext 0x93 entries#d48cdf01 | records 40327 #9d24c9f0
+mount "music1.vpp_pc" -> 1 | packfiles 10 | last "music1.vpp_pc" flags 0x8 data 0x2000 n 4 dir 0x70 names 0x2a ext 0x4 entries#8afb4ef9 | records 40331 #8ca55b7a
+mount "music2.vpp_pc" -> 1 | packfiles 11 | last "music2.vpp_pc" flags 0x8 data 0x2000 n 9 dir 0xfc names 0x5f ext 0x4 entries#a9346ab6 | records 40340 #4f7f9c35
+mount "music3.vpp_pc" -> 1 | packfiles 12 | last "music3.vpp_pc" flags 0x8 data 0x2000 n 8 dir 0xe0 names 0x58 ext 0x4 entries#b0b55332 | records 40348 #3fab5add
+mount "music4.vpp_pc" -> 1 | packfiles 13 | last "music4.vpp_pc" flags 0x8 data 0x2000 n 3 dir 0x54 names 0x25 ext 0x4 entries#2194b2b5 | records 40351 #b1e94a20
+mount "pegs.vpp_pc" -> 1 | packfiles 14 | last "pegs.vpp_pc" flags 0xa data 0x4b000 n 6740 dir 0x2e130 names 0x1b672 ext 0x7 entries#d96c8f22 | records 47091 #715e8e11
+mount "textures.vpp_pc" -> 1 | packfiles 15 | last "textures.vpp_pc" flags 0xa data 0x3a800 n 5251 dir 0x23e54 names 0x15332 ext 0x9 entries#7470dee8 | records 52342 #6baf6fd3
+mount "patch.vpp_pc" -> 1 | packfiles 16 | last "patch.vpp_pc" flags 0xa data 0x9000 n 676 dir 0x49f0 names 0x2955 ext 0x49 entries#4e9925e8 | records 53018 #01349517
