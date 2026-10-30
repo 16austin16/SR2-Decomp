@@ -1,7 +1,8 @@
 //! Proxy `dinput8.dll` that loads into the original `SR2_pc.exe`.
 //!
-//! Stage 1: forward `DirectInput8Create` to the system DLL and log that we
-//! were loaded. Function detours are added here as Rust replacements land.
+//! Forwards `DirectInput8Create` to the system DLL. The game's first call to it
+//! happens after SteamStub has decrypted `.text`, so that is where detours go in
+//! (patching in `DllMain` would be overwritten by the decryption).
 
 #![cfg(all(windows, target_arch = "x86"))]
 
@@ -14,6 +15,9 @@ use windows_sys::Win32::Foundation::{HINSTANCE, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryA;
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
+
+mod detour;
+mod hooks;
 
 /// Image base the original exe was linked at (no ASLR expected; verified at attach).
 const SR2_IMAGE_BASE: usize = 0x0040_0000;
@@ -66,6 +70,9 @@ unsafe extern "system" fn DirectInput8Create(
     outer: *mut c_void,
 ) -> i32 {
     const E_FAIL: i32 = 0x8000_4005_u32 as i32;
+    if unsafe { GetModuleHandleA(std::ptr::null()) } as usize == SR2_IMAGE_BASE {
+        hooks::install_all();
+    }
     match real_dinput8() {
         Some(f) => unsafe { f(hinst, version, riid, out, outer) },
         None => {
