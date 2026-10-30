@@ -46,7 +46,7 @@ The "Conv." column gives the calling convention as observed in the assembly. "LT
 |---|---|---|---|---|
 | 0x00bf2bd0 | `hash_filename_ci` | LTCG: `EDX = const char*`, returns `u32` | `h = 0; for c: c = tolower_ascii(c); h = rotl(h, 6) ^ c`. A NULL string returns `0xFFFFFFFF`. | Observed, ev_6c664e2d |
 | 0x00c0a350 | `packfile_hash_insert` | cdecl `(file_record* rec)` | Bucket = `hash % (bucket_count - 0x67)`, then linear probe to the next empty slot. Tracks the maximum probe length in `DAT_0252a568`. | Observed, ev_2cf43132 |
-| 0x00c0a3b0 | `packfile_find_record` | cdecl `(const char* name_ext)`, returns `file_record*` or NULL | Hashes the name, probes until an empty slot, and on each hash match rebuilds `"name.ext"` (`FUN_00c0ad10`) and `_stricmp`s it. **Returns the last match.** | Observed, ev_0d7fb2a6 |
+| 0x00c0a3b0 | `packfile_find_record` | cdecl `(const char* name_ext)`, returns `file_record*` or NULL | Hashes the name, probes until an empty slot, and on each hash match rebuilds `"name.ext"` (`FUN_00c0ad10`, into a per-thread TLS buffer at `[fs:0x2C][0]+0x18`) and `_stricmp`s it. Entries whose full name is empty are skipped. **Returns the last match.** The probe runs linearly from the bucket to the end of the slot array with **no wrap-around**; if it runs off the end without meeting an empty slot it returns **NULL even if it matched** (Observed, hand-decoded asm). Replaced by Rust. | Observed, ev_0d7fb2a6 |
 | 0x00c0ad80 | `packfile_find_entry` | LTCG: `ECX = const char* path`, caller-clean, returns `vpp_entry*` | Normalises the path into a 64-char buffer (`FUN_00bff700`). First linear-scans the "priority" packfile `DAT_02348944`, then falls back to `packfile_find_record(...)->entry`. | Observed asm, ev_464ee056 |
 | 0x00c0ad10 | `vpp_entry_full_name` | LTCG: `ECX = entry*`, `ESI = out buf` | `sprintf("%s.%s")`, or just the name when ext is empty | Observed, ev_136e2d15 |
 
@@ -165,6 +165,21 @@ Because of the 0x800-byte sector read, everything past 0x180 in the header is re
   - `packfile_mount` is the cleanest: path in ECX, bool in AL, no stack args, so a `__fastcall` hook works.
   - `packfile_find_record` is plain cdecl.
   - `file_open`, `packfile_find_entry` and `file_read` use custom register conventions and need naked thunks.
+
+## 5a. `packfile_mount` (0xC0B410) hand decode, for the Rust port
+
+Hand-decoded from the bytes (Observed). The stack frame has an `/GS` cookie (`[0xE80B50]`).
+
+1. `edi = ecx = path`. Calls `0xC0B120(ECX=path)`. If it returns AL=0, return 0.
+   - `0xC0B120` returns 0 for a NULL path, then normalises the path into a 0x40 stack buffer through `0xBFF700`. The rest is not decoded yet.
+2. If `count (0x2348970) >= max (0x234896C)`, return 0.
+3. `0xBFF700(buf[0x41], 0x41)` (cdecl, path passed in EDI/implicitly; strips the directory at the last `\` or `/` and copies the name). Then `0xC0AE90(buf)` (cdecl, `_stricmp` against `pf+0x8` of each mounted packfile; returns `packfile*` or 0). If already mounted, return 1.
+4. `h = file_open(ECX=path, "rb", 0)`. If NULL, return 0.
+5. `slot = array + count*0x180`, `count += 1`, then `bl = packfile_load(ESI=slot, h, 1, 1)`.
+6. On failure (`bl == 0`): `count -= 1` and return 0. The handle is not closed here; `packfile_load` closes it on failure.
+7. On success, switch on `h+0x150`: 0 → `flags |= 8`, 1 → `flags |= 0x10`, 2 → `flags |= 4` (other values: no flag). Then `0xBFDF30(h)` (cdecl close) and return `bl`.
+
+Porting this needs asm shims for `0xC0B120`, `0xBFF700`, `file_open` and `packfile_load`. It runs only at boot (16 calls), so it cannot be compared against the original side by side. Plan: log each mount's inputs and outputs (slot contents, record count) from an observe-only trampoline first, then compare the Rust version's log on the next boot.
 
 ## 6. Open questions
 

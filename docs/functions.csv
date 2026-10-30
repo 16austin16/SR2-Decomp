@@ -27,7 +27,7 @@ address,name,subsystem,status,notes
 0x00c0a290,packfile_compute_entry_sectors,packfile,documented,"EAX=pf; only if !(flags&2); entry+8 = start sector (01)"
 0x00bf2bd0,hash_filename_ci,packfile,rust,"EDX=str; h=rotl(h,6)^tolower(c) (01). Replaced by sr2_formats::hash::filename_hash; in-process self-test vs original + main menu verified"
 0x00c0a350,packfile_hash_insert,packfile,documented,"cdecl(file_record*); linear probe (01)"
-0x00c0a3b0,packfile_find_record,packfile,documented,"cdecl(name_ext) -> file_record*; last match wins (01)"
+0x00c0a3b0,packfile_find_record,packfile,rust,"cdecl(name_ext) -> file_record*; last match wins; no wrap, NULL if probe runs off the end (01). Replaced by Rust (hooks.rs), original kept on trampoline; in-game verify over all 53018 records matched"
 0x00c0ad80,packfile_find_entry,packfile,documented,"ECX=path -> vpp_entry*; priority packfile scan then hash (01)"
 0x00c0ad10,vpp_entry_full_name,packfile,documented,"ECX=entry, ESI=buf; name.ext (01)"
 0x00bfdc20,file_open,file,documented,"ECX=path; stack(mode,flag) caller-clean -> file_handle* (01)"
