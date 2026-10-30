@@ -1,0 +1,12 @@
+# Game binaries/data are copyrighted: never commit them
+/bin/
+*.exe
+*.dll
+*.vpp_pc
+# Rust
+/target/
+# Ghidra / REA local state
+*.gpr
+*.rep/
+*.lock~
+__pycache__/
