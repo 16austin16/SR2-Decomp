@@ -38,6 +38,6 @@ original. The standalone build can move to 64-bit later.
 ## Milestones
 1. ✅ Unpack DRM and get a clean exe for static analysis.
 2. ⏳ Ghidra baseline: CRT/WinMain/main loop, subsystem map, RTTI class list.
-3. Rust workspace and toolchain, and a hook DLL that loads and logs.
+3. ✅ Rust workspace and toolchain, and a hook DLL (proxy `dinput8.dll`) that builds. ⏳ Still to do: an in-game load test.
 4. `sr2-formats::vpp`: list and extract every `.vpp_pc`, round-trip tested.
 5. First detoured game functions (file system / archive layer), verified in-game.

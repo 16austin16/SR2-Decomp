@@ -1,0 +1,3 @@
+# The hook DLL must match the original 32-bit exe.
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

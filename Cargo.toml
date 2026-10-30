@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/sr2-formats", "crates/sr2-hook"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+
+[profile.release]
+debug = true
