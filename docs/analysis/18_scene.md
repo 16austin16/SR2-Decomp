@@ -450,7 +450,8 @@ threads check at the same time).
 types 19, 1C and 1F (vertex space: the record's space address goes back into the caller's
 {dst, bytes}; replay skips counts over 64). Checked with 1,285,885 queued calls and every replay,
 0 differences; live, the HUD text and minimap draw through it. The clip plane
-(`gfx_set_clip_plane`, `gfx_set_user_clip_plane`, type 0C) is written but never ran in play, so it
+(`gfx_set_clip_plane`, `gfx_set_user_clip_plane`, type 0C) is written but is dead code on PC (no caller,
+nothing queues type 0C; Function Analysis), so it
 stays original. In the check, the {dst, bytes} pointer an add passes to the queue is each caller's
 own stack and is not compared (its contents are).
 
