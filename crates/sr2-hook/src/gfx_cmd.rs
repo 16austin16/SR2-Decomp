@@ -10,11 +10,9 @@
 //! not touch (they must not have changed).
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
 use crate::{detour, log};
 
@@ -154,6 +152,8 @@ impl Mem {
             let mut e = vec![1, kind];
             e.extend_from_slice(args);
             self.tape.push(e);
+            let buf: Vec<u32> = args.iter().copied().chain(std::iter::repeat(0).take(32)).collect();
+            deferred_queue(self, kind, buf.as_ptr() as usize);
         } else {
             let mut a = vec![kind];
             a.extend_from_slice(args);
@@ -812,6 +812,506 @@ fn batch_end(m: &mut Mem, list: bool) {
     }
 }
 
+// --- The deferred command lists (18_scene.md "The deferred command lists") -----------------
+//
+// Two lists of 3000 records {type, offset} with a 0x16800-byte data area. API calls
+// on the game thread are recorded into the game-side list by `render_deferred_queue`,
+// whose per-type handler copies the arguments (mode 0); `render_deferred_execute`
+// replays the render-side list on the render thread (handler mode 1 calls the API).
+
+const LIST_GAME: usize = 0x0230_597C; // the list being recorded
+const LIST_RENDER: usize = 0x0230_5978; // the list being executed
+const HANDLERS: usize = 0x00E8_47E0; // [43] bool cdecl (mode, ctx *{data, used, space}, args)
+const L_COUNT: usize = 0x5DC0;
+const L_DATA: usize = 0x5DC4;
+const L_USED: usize = 0x1_C5C4;
+const L_SPACE: u32 = 0x1_6800;
+const L_MAX: u32 = 3000;
+
+/// How a handler records its arguments.
+#[derive(Clone, Copy, PartialEq)]
+enum Rec {
+    /// Nothing.
+    None,
+    /// n dwords from the arguments, each written only if it still fits.
+    Dwords(usize),
+    /// A double argument stored as a float.
+    Float,
+    /// n dwords copied from the pointer argument, written only if all fit.
+    Block(usize),
+}
+
+/// The ported handler types: how they record, and the API function they replay.
+fn spec(kind: u32) -> Option<(Rec, usize)> {
+    Some(match kind {
+        0x00 => (Rec::Dwords(5), 0x00D1_49B0),
+        0x01 => (Rec::Dwords(4), 0x00D1_4D20),
+        0x02 => (Rec::None, 0x00D1_4950),
+        0x03 => (Rec::Block(2), 0x00D1_48D0),
+        0x04 => (Rec::Dwords(4), 0x00D1_4840),
+        0x05 => (Rec::Dwords(1), 0x00D1_47E0),
+        0x06 => (Rec::Dwords(1), 0x0056_C2B0),
+        0x07 => (Rec::Block(3), 0x00D1_4700),
+        0x08 => (Rec::Float, 0x00D2_32C0),
+        0x09 => (Rec::None, 0x00D2_3200),
+        0x0A => (Rec::Float, 0x00D2_3120),
+        0x0B => (Rec::None, 0x00D2_3060),
+        0x0D => (Rec::Float, 0x00D2_3000),
+        0x0E => (Rec::Float, 0x00D2_2F90),
+        0x0F => (Rec::Block(3), 0x00D0_9E20),
+        0x10 => (Rec::Dwords(4), 0x00D1_4B20),
+        0x11 => (Rec::Dwords(1), 0x00D1_4AD0),
+        0x18 => (Rec::Block(2), 0x00D0_A580),
+        0x1A => (Rec::None, 0x00D0_A4B0),
+        0x1B => (Rec::Block(2), 0x00D0_A440),
+        0x1D => (Rec::None, 0x00D0_A330),
+        0x1E => (Rec::Block(2), 0x00D0_A2C0),
+        0x20 => (Rec::None, 0x00D0_A190),
+        0x27 => (Rec::None, 0x00D1_EF40),
+        0x2A => (Rec::Dwords(2), 0),
+        _ => return None,
+    })
+}
+
+/// Replay a recorded call: each type's registers and stack, as its original handler.
+fn replay(kind: u32, target: usize, v: &[u32]) {
+    let mut local = [0u32; 3];
+    local[..v.len().min(3)].copy_from_slice(&v[..v.len().min(3)]);
+    let p = local.as_ptr() as u32;
+    unsafe {
+        match kind {
+            0x00 => call_regs(target, 0, 0, 0, 0, v[1], &[v[0], v[2], v[3], v[4]]),
+            0x01 => call_regs(target, 0, 0, 0, v[2], v[0], &[v[1], v[3]]),
+            0x03 | 0x1B | 0x1E => call_regs(target, 0, p, 0, 0, 0, &[]),
+            0x07 | 0x18 => call_regs(target, 0, 0, 0, p, 0, &[]),
+            0x0F => call_regs(target, p, 0, 0, 0, 0, &[]),
+            0x04 => call_regs(target, 0, 0, 0, 0, 0, &[v[0], v[1], v[2], v[3]]),
+            0x05 | 0x08 | 0x0A | 0x0D | 0x0E => call_regs(target, 0, 0, 0, 0, 0, &[v[0]]),
+            0x06 => call_regs(target, 0, 0, 0, v[0], 0, &[]),
+            0x10 => call_regs(target, 0, v[3], v[2], 0, 0, &[v[0], v[1]]),
+            0x11 => call_regs(target, 0, v[0], 0, 0, 0, &[]),
+            0x2A => call_regs(v[0] as usize, 0, 0, 0, 0, 0, &[v[1]]),
+            _ => call_regs(target, 0, 0, 0, 0, 0, &[]),
+        };
+    }
+}
+
+fn rec_size(r: Rec) -> u32 {
+    match r {
+        Rec::None => 0,
+        Rec::Dwords(n) | Rec::Block(n) => n as u32 * 4,
+        Rec::Float => 4,
+    }
+}
+
+/// A ported handler: mode 0 records (false when it does not fit), any other mode
+/// reads the record back (mode 1 also replays it). `ctx` is {data, used, space}.
+fn handler(m: &mut Mem, kind: u32, mode: u32, ctx: usize, args: usize) -> bool {
+    let (rec, target) = spec(kind).unwrap();
+    let data = m.rd(ctx) as usize;
+    if mode == 0 {
+        let put = |m: &mut Mem, v: u32| -> bool {
+            let used = m.rd(ctx + 4);
+            if used.wrapping_add(4) > m.rd(ctx + 8) {
+                return false;
+            }
+            m.wr(data + used as usize, v);
+            m.wr(ctx + 4, used + 4);
+            true
+        };
+        return match rec {
+            Rec::None => true,
+            Rec::Dwords(n) => {
+                for i in 0..n {
+                    let v = m.rd(args + i * 4);
+                    if !put(m, v) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Rec::Float => {
+                let d = f64::from_bits(m.rd(args) as u64 | (m.rd(args + 4) as u64) << 32);
+                let v = (d as f32).to_bits();
+                put(m, v)
+            }
+            Rec::Block(n) => {
+                let p = m.rd(args) as usize;
+                let v: Vec<u32> = (0..n).map(|i| m.rd(p + i * 4)).collect();
+                let used = m.rd(ctx + 4);
+                if used.wrapping_add(n as u32 * 4) > m.rd(ctx + 8) {
+                    return false;
+                }
+                for (i, &x) in v.iter().enumerate() {
+                    m.wr(data + used as usize + i * 4, x);
+                }
+                m.wr(ctx + 4, used + n as u32 * 4);
+                true
+            }
+        };
+    }
+    let used = m.rd(ctx + 4) as usize;
+    let n = rec_size(rec) as usize / 4;
+    let v: Vec<u32> = (0..n).map(|i| m.rd(data + used + i * 4)).collect();
+    m.wr(ctx + 4, (used + n * 4) as u32);
+    if mode == 1 {
+        if m.dry {
+            m.tape.push(expected_call(kind, &v));
+        } else {
+            replay(kind, target, &v);
+        }
+    }
+    true
+}
+
+/// `render_deferred_queue` (0xCF8EA0; cdecl varargs (type, ...)): record an API call
+/// in the game-side list; false (and the list marked overflowed) when it is full.
+fn deferred_queue(m: &mut Mem, kind: u32, args: usize) -> bool {
+    let list = m.rd(LIST_GAME) as usize;
+    if m.rd(list + L_USED) as i32 > L_SPACE as i32 {
+        return false;
+    }
+    if m.rd(list + L_COUNT) == L_MAX {
+        m.wr(list + L_USED, L_SPACE + 1);
+        return false;
+    }
+    let used = m.rd(list + L_USED);
+    let mut ctx = [0u32; 3];
+    let c = ctx.as_mut_ptr() as usize;
+    m.wr(c, list as u32 + L_DATA as u32 + used);
+    m.wr(c + 4, 0);
+    m.wr(c + 8, L_SPACE.wrapping_sub(used));
+    let ok = if spec(kind).is_some() {
+        handler(m, kind, 0, c, args)
+    } else if m.dry {
+        // Not ported: the original handler cannot run in a prediction.
+        for k in 0..3 {
+            m.overlay.remove(&(c + k * 4));
+        }
+        return true;
+    } else {
+        unsafe {
+            call_regs(rd(HANDLERS + kind as usize * 4) as usize, 0, 0, 0, 0, 0, &[0, c as u32, args as u32]) as u8 != 0
+        }
+    };
+    if !ok {
+        for k in 0..3 {
+            m.overlay.remove(&(c + k * 4));
+        }
+        m.wr(list + L_USED, L_SPACE + 1);
+        return false;
+    }
+    let added = m.rd(c + 4);
+    // The context is scratch on our stack (the original's is on its own): not compared.
+    for k in 0..3 {
+        m.overlay.remove(&(c + k * 4));
+    }
+    let count = m.rd(list + L_COUNT) as usize;
+    m.wr(list + count * 8, kind);
+    m.wr(list + count * 8 + 4, m.rd(list + L_USED));
+    let used = m.rd(list + L_USED);
+    m.wr(list + L_USED, used.wrapping_add(added));
+    m.wr(list + L_COUNT, count as u32 + 1);
+    true
+}
+
+/// `render_deferred_execute` (0xCF8FA0): replay the render-side list, then forget
+/// the bitmaps bound per stage.
+fn deferred_execute(m: &mut Mem) {
+    let mut i = 0usize;
+    loop {
+        let list = m.rd(LIST_RENDER) as usize;
+        if i as i32 >= m.rd(list + L_COUNT) as i32 {
+            break;
+        }
+        let (kind, off) = (m.rd(list + i * 8), m.rd(list + i * 8 + 4));
+        let mut ctx = [0u32; 3];
+        let c = ctx.as_mut_ptr() as usize;
+        // Through the memory interface, so a prediction sees fresh values at a reused address.
+        m.wr(c, list as u32 + L_DATA as u32 + off);
+        m.wr(c + 4, 0);
+        m.wr(c + 8, 0);
+        if spec(kind).is_some() {
+            handler(m, kind, 1, c, 0);
+        } else if m.dry {
+            m.tape.push(vec![3, kind]);
+        } else {
+            unsafe { call_regs(rd(HANDLERS + kind as usize * 4) as usize, 0, 0, 0, 0, 0, &[1, c as u32, 0]) };
+        }
+        i += 1;
+    }
+    for s in 0..16 {
+        m.wr(BITMAP_CACHE + s * 4, u32::MAX);
+    }
+}
+
+// Replay check. While the original executes, the API functions a handler calls
+// directly are taped from their hooks (registers and stack, ECX's block for the
+// block types); types whose API is not hooked tape only their type.
+const T_ECX: usize = 3;
+const T_EDX: usize = 4;
+const T_ESI: usize = 5;
+const T_EDI: usize = 6;
+const T_ARG: usize = 7; // 6 stack arguments
+const T_BLOCK: usize = 13; // 2 dwords at ECX
+
+/// What the hook tape should show for a replayed call: [2, port, then (field, value)
+/// pairs], or [3, type] when the API function is not hooked.
+fn expected_call(kind: u32, v: &[u32]) -> Vec<u32> {
+    let (port, fields): (usize, Vec<(usize, u32)>) = match kind {
+        0x00 => {
+            (VIEWPORT_RECT, vec![(T_EDI, v[1]), (T_ARG, v[0]), (T_ARG + 1, v[2]), (T_ARG + 2, v[3]), (T_ARG + 3, v[4])])
+        }
+        0x01 => (SCISSOR_RECT, vec![(T_EDI, v[0]), (T_ESI, v[2]), (T_ARG, v[1]), (T_ARG + 1, v[3])]),
+        0x02 => (INVALIDATE_BLOCK, vec![]),
+        0x03 => (SET_BLOCK, vec![(T_BLOCK, v[0]), (T_BLOCK + 1, v[1])]),
+        0x04 => (SET_COLOR, (0..4).map(|i| (T_ARG + i, v[i])).collect()),
+        0x05 => (SET_ALPHA, vec![(T_ARG, v[0])]),
+        0x06 => (SET_BITMAP, vec![(T_ESI, v[0])]),
+        0x08 => (PUSH_DEPTH_BIAS, vec![(T_ARG, v[0])]),
+        0x09 => (POP_DEPTH_BIAS, vec![]),
+        0x0A => (PUSH_SLOPE_BIAS, vec![(T_ARG, v[0])]),
+        0x0B => (POP_SLOPE_BIAS, vec![]),
+        0x10 => (CLEAR_REGION, vec![(T_ECX, v[3]), (T_EDX, v[2]), (T_ARG, v[0]), (T_ARG + 1, v[1])]),
+        0x11 => (API_CLEAR, vec![(T_ECX, v[0])]),
+        0x1B => (STRIP_BEGIN, vec![(T_BLOCK, v[0]), (T_BLOCK + 1, v[1])]),
+        0x1D => (STRIP_END, vec![]),
+        0x1E => (LIST_BEGIN, vec![(T_BLOCK, v[0]), (T_BLOCK + 1, v[1])]),
+        0x20 => (LIST_END, vec![]),
+        0x27 => (RESTORE_TARGETS, vec![]),
+        _ => return vec![3, kind],
+    };
+    let mut e = vec![2, port as u32];
+    for (f, x) in fields {
+        e.push(f as u32);
+        e.push(x);
+    }
+    e
+}
+
+/// Does a taped hook call match an expected one?
+fn call_matches(tape: &[u32], expected: &[u32]) -> bool {
+    if tape[0] != expected[0] || tape[1] != expected[1] {
+        return false;
+    }
+    expected[2..].chunks(2).all(|p| tape[p[0] as usize] == p[1])
+}
+
+thread_local! {
+    static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn exec_taping() -> bool {
+    EXEC_TAPING.with(|t| t.get())
+}
+
+/// Called from `run` for every hooked API call: tape it if a handler made it.
+fn tape_exec_call(i: usize, r: &Regs) -> bool {
+    if !exec_taping() || EXEC_DEPTH.with(|d| d.get()) != 0 {
+        return false;
+    }
+    let mut e = vec![2, i as u32, r.0, r.1, r.2, r.3, r.4];
+    e.extend((0..6).map(|k| arg(r.5, k)));
+    let block = matches!(i, SET_BLOCK | STRIP_BEGIN | LIST_BEGIN);
+    e.extend((0..2).map(|k| if block { unsafe { rd(r.1 as usize + k * 4) } } else { 0 }));
+    tape_push(e);
+    EXEC_DEPTH.with(|d| d.set(1));
+    true
+}
+
+fn end_exec_call(taped: bool) {
+    if taped {
+        EXEC_DEPTH.with(|d| d.set(0));
+    }
+}
+
+/// Shadow-mode handler shims (all 43 types): while the original executes, a type
+/// whose API is not hooked tapes its type and hides its inner calls.
+fn shim(kind: u32, mode: u32, ctx: u32, args: u32) -> u32 {
+    let orig = HANDLER_ORIG[kind as usize].load(Ordering::Acquire);
+    let hooked = !matches!(expected_call(kind, &[0; 5])[0], 3);
+    if mode == 1 && exec_taping() && EXEC_DEPTH.with(|d| d.get()) == 0 && !hooked {
+        tape_push(vec![3, kind]);
+        EXEC_DEPTH.with(|d| d.set(1));
+        let r = unsafe { call_regs(orig, 0, 0, 0, 0, 0, &[mode, ctx, args]) };
+        EXEC_DEPTH.with(|d| d.set(0));
+        return r;
+    }
+    unsafe { call_regs(orig, 0, 0, 0, 0, 0, &[mode, ctx, args]) }
+}
+
+/// Rust-mode handler entries for the ported types.
+fn live_handler(kind: u32, mode: u32, ctx: u32, args: u32) -> u32 {
+    handler(&mut Mem::live(), kind, mode, ctx as usize, args as usize) as u32
+}
+
+static HANDLER_ORIG: [AtomicUsize; 43] = [const { AtomicUsize::new(0) }; 43];
+
+macro_rules! handler_entries {
+    ($($name:ident = $k:expr),* $(,)?) => {
+        $(
+            extern "C" fn $name(mode: u32, ctx: u32, args: u32) -> u32 {
+                if MODE == Mode::Shadow { shim($k, mode, ctx, args) } else { live_handler($k, mode, ctx, args) }
+            }
+        )*
+        const HANDLER_ENTRIES: [extern "C" fn(u32, u32, u32) -> u32; 43] = [$($name),*];
+    };
+}
+handler_entries!(
+    hd00 = 0x00,
+    hd01 = 0x01,
+    hd02 = 0x02,
+    hd03 = 0x03,
+    hd04 = 0x04,
+    hd05 = 0x05,
+    hd06 = 0x06,
+    hd07 = 0x07,
+    hd08 = 0x08,
+    hd09 = 0x09,
+    hd0a = 0x0A,
+    hd0b = 0x0B,
+    hd0c = 0x0C,
+    hd0d = 0x0D,
+    hd0e = 0x0E,
+    hd0f = 0x0F,
+    hd10 = 0x10,
+    hd11 = 0x11,
+    hd12 = 0x12,
+    hd13 = 0x13,
+    hd14 = 0x14,
+    hd15 = 0x15,
+    hd16 = 0x16,
+    hd17 = 0x17,
+    hd18 = 0x18,
+    hd19 = 0x19,
+    hd1a = 0x1A,
+    hd1b = 0x1B,
+    hd1c = 0x1C,
+    hd1d = 0x1D,
+    hd1e = 0x1E,
+    hd1f = 0x1F,
+    hd20 = 0x20,
+    hd21 = 0x21,
+    hd22 = 0x22,
+    hd23 = 0x23,
+    hd24 = 0x24,
+    hd25 = 0x25,
+    hd26 = 0x26,
+    hd27 = 0x27,
+    hd28 = 0x28,
+    hd29 = 0x29,
+    hd2a = 0x2A,
+);
+
+/// Point the handler table at our entries: all of them for the shadow check, the
+/// ported ones in the Rust build.
+fn install_handlers() {
+    unsafe {
+        let mut old = 0u32;
+        if VirtualProtect(HANDLERS as *const _, 43 * 4, PAGE_READWRITE, &mut old) == 0 {
+            log("gfx: could not write the deferred handler table");
+            return;
+        }
+        for k in 0..43u32 {
+            let p = HANDLERS + k as usize * 4;
+            HANDLER_ORIG[k as usize].store(rd(p) as usize, Ordering::Release);
+            if MODE == Mode::Shadow || spec(k).is_some() {
+                wr(p, HANDLER_ENTRIES[k as usize] as usize as u32);
+            }
+        }
+        VirtualProtect(HANDLERS as *const _, 43 * 4, old, &mut old);
+    }
+}
+
+#[unsafe(naked)]
+extern "C" fn queue_entry() {
+    std::arch::naked_asm!(
+        "lea eax, [esp + 8]",
+        "push eax",
+        "push dword ptr [esp + 8]",
+        "call {h}",
+        "add esp, 8",
+        "ret",
+        h = sym queue_hook,
+    )
+}
+
+/// `render_deferred_queue`: tape it while an original runs (type and ten argument
+/// dwords), then original / shadow / Rust.
+extern "C" fn queue_hook(kind: u32, args: u32) -> u32 {
+    if taping() {
+        let mut e = vec![1, kind];
+        e.extend((0..10).map(|k| unsafe { rd(args as usize + k * 4) }));
+        tape_push(e);
+    }
+    CALLS[QUEUE].fetch_add(1, Ordering::Relaxed);
+    // Varargs: pass on the caller's argument block (32 dwords covers every type).
+    let original = move || unsafe {
+        let mut a = vec![kind];
+        a.extend((0..32).map(|k| rd(args as usize + k * 4)));
+        call_regs(ORIG[QUEUE].load(Ordering::Acquire), 0, 0, 0, 0, 0, &a) & 0xFF
+    };
+    match MODE {
+        Mode::Original => original(),
+        Mode::Shadow => {
+            if IN_SHADOW.with(|f| f.replace(true)) {
+                return original();
+            }
+            let r = shadow(
+                QUEUE,
+                |m| {
+                    deferred_queue(m, kind, args as usize);
+                },
+                original,
+            );
+            IN_SHADOW.with(|f| f.set(false));
+            r
+        }
+        Mode::Rust => deferred_queue(&mut Mem::live(), kind, args as usize) as u32,
+    }
+}
+
+/// `render_deferred_execute`: in the shadow check, the Rust decodes the list into the
+/// calls the handlers should make, then the original executes with those calls taped.
+extern "C" fn execute_hook() {
+    CALLS[EXECUTE_LIST].fetch_add(1, Ordering::Relaxed);
+    let original =
+        || unsafe { std::mem::transmute::<usize, extern "C" fn()>(ORIG[EXECUTE_LIST].load(Ordering::Acquire))() };
+    match MODE {
+        Mode::Original => original(),
+        Mode::Shadow => {
+            let mut m = Mem { dry: true, ..Mem::live() };
+            deferred_execute(&mut m);
+            tape_take();
+            EXEC_TAPING.with(|t| t.set(true));
+            original();
+            EXEC_TAPING.with(|t| t.set(false));
+            let theirs = tape_take();
+            let theirs: Vec<Vec<u32>> = theirs.into_iter().filter(|e| e[0] >= 2).collect();
+            let ok = theirs.len() == m.tape.len()
+                && theirs.iter().zip(&m.tape).all(|(t, x)| if x[0] == 3 { t == x } else { call_matches(t, x) });
+            REPLAYS.fetch_add(theirs.len() as u32, Ordering::Relaxed);
+            if !ok {
+                MISMATCHES[EXECUTE_LIST].fetch_add(1, Ordering::Relaxed);
+                let at =
+                    theirs.iter().zip(&m.tape).position(|(t, x)| if x[0] == 3 { t != x } else { !call_matches(t, x) });
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 40 {
+                    log(&format!(
+                        "gfx: render_deferred_execute mismatch: {} calls taped, {} expected; first difference at {at:?}: {:x?} vs {:x?}",
+                        theirs.len(),
+                        m.tape.len(),
+                        at.and_then(|i| theirs.get(i)),
+                        at.and_then(|i| m.tape.get(i))
+                    ));
+                }
+            }
+        }
+        Mode::Rust => deferred_execute(&mut Mem::live()),
+    }
+}
+
+static REPLAYS: AtomicU32 = AtomicU32::new(0);
+
 // --- Calling the originals ------------------------------------------------------------------
 
 /// Call a game function with ECX/EDX/ESI/EDI set and cdecl stack arguments.
@@ -846,47 +1346,34 @@ pub(crate) unsafe fn call_regs(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32,
 
 // --- Shadow check -----------------------------------------------------------------------
 
-static TAPE_ON: AtomicBool = AtomicBool::new(false);
-static TAPE_THREAD: AtomicU32 = AtomicU32::new(0);
-static TAPE: Mutex<Vec<Vec<u32>>> = Mutex::new(Vec::new());
+// Tapes are per thread: the game and render threads both run checks.
+thread_local! {
+    static TAPE: std::cell::RefCell<Vec<Vec<u32>>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TAPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXEC_TAPING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn tape_push(e: Vec<u32>) {
+    TAPE.with(|t| t.borrow_mut().push(e));
+}
+
+fn tape_take() -> Vec<Vec<u32>> {
+    TAPE.with(|t| std::mem::take(&mut *t.borrow_mut()))
+}
 static REAL_INTERLOCKED_ADD: AtomicUsize = AtomicUsize::new(0);
 
 fn taping() -> bool {
-    TAPE_ON.load(Ordering::Acquire) && unsafe { GetCurrentThreadId() } == TAPE_THREAD.load(Ordering::Acquire)
+    TAPING.with(|t| t.get())
 }
 
 extern "system" fn interlocked_add_w(p: *mut i32, v: i32) -> i32 {
     if p as usize == RING_PUBLISHED && taping() {
-        TAPE.lock().unwrap_or_else(|p| p.into_inner()).push(vec![0, v as u32]);
+        tape_push(vec![0, v as u32]);
     }
     let f: extern "system" fn(*mut i32, i32) -> i32 =
         unsafe { std::mem::transmute(REAL_INTERLOCKED_ADD.load(Ordering::Acquire)) };
     f(p, v)
 }
-
-/// `render_deferred_queue`, taped while the original runs (type and the first ten
-/// argument dwords; a call's own arguments are a prefix of them).
-extern "C" fn queue_hook(
-    kind: u32,
-    a0: u32,
-    a1: u32,
-    a2: u32,
-    a3: u32,
-    a4: u32,
-    a5: u32,
-    a6: u32,
-    a7: u32,
-    a8: u32,
-    a9: u32,
-) -> u32 {
-    if taping() {
-        TAPE.lock().unwrap_or_else(|p| p.into_inner()).push(vec![1, kind, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9]);
-    }
-    let f: extern "C" fn(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) -> u32 =
-        unsafe { std::mem::transmute(QUEUE_ORIG.load(Ordering::Acquire)) };
-    f(kind, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)
-}
-static QUEUE_ORIG: AtomicUsize = AtomicUsize::new(0);
 
 /// Caches the code may touch, watched for writes the prediction did not make.
 fn watched() -> Vec<usize> {
@@ -925,12 +1412,11 @@ fn shadow(i: usize, rust: impl FnOnce(&mut Mem), original: impl FnOnce() -> u32)
     let before: Vec<u32> = watch.iter().map(|&p| unsafe { rd(p) }).collect();
     let mut m = Mem { dry: true, ..Mem::live() };
     rust(&mut m);
-    TAPE.lock().unwrap_or_else(|p| p.into_inner()).clear();
-    TAPE_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
-    TAPE_ON.store(true, Ordering::Release);
+    tape_take();
+    TAPING.with(|t| t.set(true));
     let r = original();
-    TAPE_ON.store(false, Ordering::Release);
-    let theirs = std::mem::take(&mut *TAPE.lock().unwrap_or_else(|p| p.into_inner()));
+    TAPING.with(|t| t.set(false));
+    let theirs = tape_take();
     let mut diffs = Vec::new();
     for (&p, &v) in &m.overlay {
         let o = unsafe { rd(p) };
@@ -966,6 +1452,9 @@ fn shadow(i: usize, rust: impl FnOnce(&mut Mem), original: impl FnOnce() -> u32)
 /// outer check predicted it already.
 fn run(i: usize, rust: impl FnOnce(&mut Mem), original: impl FnOnce() -> u32) -> u32 {
     CALLS[i].fetch_add(1, Ordering::Relaxed);
+    if exec_taping() {
+        return original(); // a handler's call during the replay check: taped by the hook
+    }
     match MODE {
         Mode::Original => original(),
         Mode::Shadow => {
@@ -1025,7 +1514,10 @@ macro_rules! hook {
     ($entry:ident, $hook:ident, $idx:expr, $nargs:expr, |$m:ident, $eax:ident, $ecx:ident, $edx:ident, $esi:ident, $edi:ident, $a:ident| $body:expr) => {
         extern "C" fn $hook($eax: u32, $ecx: u32, $edx: u32, $esi: u32, $edi: u32, $a: *const u32) -> u32 {
             let r = ($eax, $ecx, $edx, $esi, $edi, $a);
-            run($idx, |$m: &mut Mem| $body, original($idx, r, $nargs))
+            let t = tape_exec_call($idx, &r);
+            let res = run($idx, |$m: &mut Mem| $body, original($idx, r, $nargs));
+            end_exec_call(t);
+            res
         }
         entry!($entry, $hook);
     };
@@ -1225,7 +1717,9 @@ const STRIP_BEGIN: usize = 39;
 const STRIP_END: usize = 40;
 const LIST_BEGIN: usize = 41;
 const LIST_END: usize = 42;
-const COUNT: usize = 43;
+const QUEUE: usize = 43;
+const EXECUTE_LIST: usize = 44;
+const COUNT: usize = 45;
 
 /// (name, address, the bytes the detour steals (whole instructions, no relative branches)).
 const PORTS: [(&str, usize, &[u8]); COUNT] = [
@@ -1272,6 +1766,8 @@ const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("im2d_strip_end", 0x00D0A330, &[0x80, 0x3D, 0xDB, 0x49, 0xE8, 0x00, 0x00]),
     ("im2d_list_begin", 0x00D0A2C0, &[0x80, 0x3D, 0xDB, 0x49, 0xE8, 0x00, 0x00]),
     ("im2d_list_end", 0x00D0A190, &[0x80, 0x3D, 0xDB, 0x49, 0xE8, 0x00, 0x00]),
+    ("render_deferred_queue", 0x00CF_8EA0, &[0xA1, 0x7C, 0x59, 0x30, 0x02]),
+    ("render_deferred_execute", 0x00CF_8FA0, &[0xA1, 0x78, 0x59, 0x30, 0x02]),
 ];
 
 /// Whole bodies of the writers whose first five bytes hold a short branch: these are
@@ -1353,6 +1849,8 @@ fn entry_address(i: usize) -> usize {
         STRIP_END => e_strip_end,
         LIST_BEGIN => e_list_begin,
         LIST_END => e_list_end,
+        QUEUE => queue_entry,
+        EXECUTE_LIST => execute_hook,
         _ => unreachable!(),
     };
     f as usize
@@ -1372,21 +1870,6 @@ pub fn install() {
             REAL_INTERLOCKED_ADD.store(rd(SLOT_INTERLOCKED_ADD) as usize, Ordering::Release);
             wr(SLOT_INTERLOCKED_ADD, interlocked_add_w as extern "system" fn(*mut i32, i32) -> i32 as usize as u32);
             VirtualProtect(SLOT_INTERLOCKED_ADD as *const _, 4, old, &mut old);
-        }
-    }
-    if MODE == Mode::Shadow {
-        match unsafe {
-            detour::install(
-                DEFERRED_QUEUE,
-                &[0xA1, 0x7C, 0x59, 0x30, 0x02],
-                queue_hook as extern "C" fn(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32) -> u32 as usize,
-            )
-        } {
-            Ok(t) => QUEUE_ORIG.store(t, Ordering::Release),
-            Err(e) => {
-                log(&format!("gfx: hooking render_deferred_queue failed: {e:?}; not hooking"));
-                return;
-            }
         }
     }
     let mut ok = 0;
@@ -1412,7 +1895,10 @@ pub fn install() {
             Err(e) => log(&format!("gfx_cmd: hooking {name} @ {addr:#x} failed: {e:?}")),
         }
     }
-    log(&format!("replaced {ok}/{COUNT} graphics functions (ring writers and API)"));
+    install_handlers();
+    log(&format!(
+        "replaced {ok}/{COUNT} graphics functions (ring writers, API, deferred lists) and the ported deferred handlers"
+    ));
     let _ = RING_BASE;
 }
 
@@ -1428,5 +1914,5 @@ pub fn summary() -> String {
             (c > 0).then(|| format!("{name} {c} ({} mismatched)", MISMATCHES[i].load(Ordering::Relaxed)))
         })
         .collect();
-    format!("gfx live: {}", parts.join(", "))
+    format!("gfx live: {} | deferred replays compared {}", parts.join(", "), REPLAYS.load(Ordering::Relaxed))
 }

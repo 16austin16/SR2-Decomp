@@ -265,7 +265,24 @@ game normally.
 Not ported yet: `gfx_cmd_set_vertex_declaration`, the three shader-constant writers and
 `gfx_cmd_draw`. They never ran in the play run (those commands are written inline elsewhere),
 so they stay original. Also not yet: the 2D `_add` functions (they allocate through 0xD1E070 /
-0xD19070), `gfx_set_ps_params3`, the clip plane, text and the queue / handlers / execute.
+0xD19070), `gfx_set_tint_color` (0xD14700), the clip plane and text.
+
+
+**Deferred lists (second batch).** `render_deferred_queue`, `render_deferred_execute` and the
+handlers of 25 types are Rust: 00-0B, 0D-11, 18, 1A, 1B, 1D, 1E, 20, 27 and 2A. Their records are
+four shapes: dwords (each written only if it still fits), a double stored as a float, a block
+copied from a pointer (all or nothing), or nothing. The other 18 types (2D add, text, shapes,
+the bitmap draw, 0x0C, 0x26, 0x28, 0x29) keep their original handlers, called from the Rust
+queue and replay loop.
+
+Check: the API checks' predictions now include the list bytes a deferred call writes, and the
+queue itself is predicted when called from unported code; replay is checked by decoding each
+executed list in Rust into the API calls its handlers should make, then executing the original
+with every handler-table entry routed through a shim and the handlers' direct API calls taped
+from their hooks (registers, stack, and the pair for the block types; types whose API is not
+hooked tape only their type). Over a play run: 1,264,367 queued calls and 3,599 executed lists,
+0 differences; then the Rust lists drew the game. Tapes are per thread (the game and render
+threads check at the same time).
 
 Details:
 - `gfx_apply_render_state_block`: blend modes 0-12 (0 off; 1 one/one add; 2 srcalpha/one add;
