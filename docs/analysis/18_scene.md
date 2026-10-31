@@ -96,8 +96,8 @@ Handlers are named `render_deferred_h<type>_<api>`. "Record" is what the handler
 | 10 | 0xCF91E0 | `gfx_clear_region` 0xD14B20 | registers + cdecl 2, pops 8 | `gfx_cmd_clear`, re-applies the state block |
 | 11 | 0xCF9190 | `gfx_clear` 0xD14AD0 | ECX = stencil value | `gfx_cmd_clear` of the **stencil** only (flags 4) |
 | 12 | 0xCFB740 | `gfx_draw_bitmap` 0xD11240 | EAX + cdecl 10, pops 0x2C | bitmap, state block, 0xD1F0D0 (2D quad) |
-| 13 / 15 | 0xCFAD50 / 0xCFA8C0 | `gfx_draw_text_13` 0xD15C60 / `gfx_draw_text_15` 0xCF5D90 | ESI, EDI + cdecl (3 floats, 1), pops 16; the record also holds the string | font layer 0xBD68E0 / 0xBDB5C0 |
-| 14 / 16 | 0xCFAB00 / 0xCFA670 | `gfx_draw_text_14` 0xD15BD0 | ESI, EAX + cdecl 4, pops 16 | font layer 0xBD6E60 |
+| 13 / 15 | 0xCFAD50 / 0xCFA8C0 | `gfx_draw_text` 0xD15C60 / `gfx_draw_text_wide` 0xCF5D90 | ESI, EDI + cdecl (3 floats, 1), pops 16; the record also holds the string | font layer 0xBD68E0 / 0xBDB5C0 |
+| 14 / 16 | 0xCFAB00 / 0xCFA670 | `gfx_draw_text_3d` 0xD15BD0 | ESI, EAX + cdecl 4, pops 16 | font layer 0xBD6E60 |
 | 17 | 0xCFA4E0 | `im2d_draw_17` 0xD0B020 | ECX + cdecl 4 floats, pops 16 | 2D shape (role open) |
 | 18 / 19 / 1A | 0xCFA450 / 0xCFA340 / 0xCFA330 | `im2d_c_begin` 0xD0A580 / `_add` 0xD0A4F0 / `_end` 0xD0A4B0 | ESI = &{state pair} / ESI = count + cdecl (data) / - | batch at 0x22F6430 with its own vertex declaration |
 | 1B / 1C / 1D | 0xCFA2A0 / 0xCFA190 / 0xCFA180 | `im2d_strip_begin` 0xD0A440 / `_add` 0xD0A380 / `_end` 0xD0A330 | ECX = &{state pair} / ESI = count ≤ 64 + cdecl (vertices) / - | strip; end = `gfx_2d_flush(TRIANGLESTRIP, n - 2)` |
@@ -199,6 +199,76 @@ The 0x38-byte entries are filled at shader load. The default pair is entry 3 (0x
 
 `0x252A314` is the enabled-plane mask, and it is kept even when the cache already matches.
 
+### The text path, step by step
+
+Four deferred types carry text. The API functions are thin wrappers; the drawing happens in the font layer (0xBD6xxx-0xBDCxxx), which builds 2D quads through the strip batch (2D text) or the declared-vertex batch (3D text).
+
+| Type | API (renamed) | Font layer | Text |
+|---|---|---|---|
+| 13 | `gfx_draw_text` 0xD15C60 | `font_draw_string_2d` 0xBD68E0 | `char *`, 2D |
+| 15 | `gfx_draw_text_wide` 0xCF5D90 | `font_draw_string_2d_wide` 0xBDB5C0 | `u16 *` (UTF-16), 2D |
+| 14 | `gfx_draw_text_3d` 0xD15BD0 | `font_draw_string_3d` 0xBD6E60 | `char *`, 3D (position + orientation) |
+| 16 | none: no queue site in the binary | its handler also replays `gfx_draw_text_3d` | unused |
+
+**`gfx_draw_text` / `gfx_draw_text_wide`** (`ESI` = string, `EDI` = &state pair; cdecl `(f32 x, f32 y, f32 scale, i32 font)`, caller pops 16):
+1. Return if the string is NULL or empty.
+2. If `gfx_should_defer()` (0x56C310: `0xE849DB` clear and a game-thread context), queue type 13 / 15. The record is x, y, the string (with its length including the terminator; ×2 bytes for wide), scale, font and the state pair. Return.
+3. Otherwise call the font layer: `font_draw_string_2d(x, y, str, scale, font, &pair)` (cdecl 0x18 bytes).
+
+**`gfx_draw_text_3d`** (`ESI` = string, `EAX` = font, cdecl `(vec3 *pos, mat3 *orient, f32 scale, &pair)`):
+- It defers as type 14 (the record copies the vec3, the 3×3 matrix, the scale, the string and the pair).
+- Otherwise it calls `font_draw_string_3d(EAX = pos, EDI = orient; scale, str, font, &pair)`.
+
+**`font_lookup`** (0xC15CF0; `EAX` = font id; returns the font record or 0):
+
+| Font id | Result |
+|---|---|
+| ≥ 0 | `0x234F268[id]`, while id < `0x252A5C0` |
+| −1 | the default font `0x252A5C8` |
+| below −1 | an alias: entry `(id + 0x7FFFFFFF)` of the 8-byte table `0x234F238` = `{f32 scale, i32 font id}` (count `0x252A5CC`), looked up again |
+
+**Font record** (fields used here):
+
+| Off | Field |
+|---|---|
+| +0x14 | s16 line height |
+| +0x16 | s16 used for the inverse scale |
+| +0x24 / +0x26 | s16 baseline y / x offsets |
+| +0xA8 / +0xAC | kerning / glyph tables used by the glyph lookup |
+| +0xB0 | the font's bitmap handle |
+| +0xB4 / +0xB8 | per-glyph u / v pixel tables (i32) |
+
+**`font_draw_string_2d`** (0xBD68E0; cdecl `(f32 x, f32 y, char *str, f32 scale, i32 font, pair *state)`; plain `ret`):
+1. Return if the string is NULL or empty.
+2. `f = font_lookup(font)`. `k` = the alias scale (1.0 unless the id is an alias). `sx = k × scale`.
+3. If `x == 9999.123` (`0xE5CCE8`), the line is centred: `x = text_center_x(str, scale, font)` (0xD15520; `EAX` = str).
+4. `pen_x = x + f.base_x(+0x26) × sx`, `pen_y = y + f.base_y(+0x24) × sx`.
+5. `gfx_set_bitmap(f+0xB0)`.
+6. Vertex colour from the context: R, G, B = `ctx+0x28 / +0x2C / +0x30 × 128` (bytes, so 1.0 maps to 128 for 2× modulate). A = `ctx+0x34 × 255`.
+7. The bitmap's size (0xC094E0 lookup → +4 / +6) gives the half-texel offsets `0.5 / w` and `0.5 / h`.
+8. `im2d_strip_begin(ECX = state)`.
+9. For each character:
+   - **`\n`**: `pen_y += round(f.line_height(+0x14) × sx)`, then reset `pen_x` (centring again on the rest of the string when the sentinel was given).
+   - **Other characters below 0x20**: skipped.
+   - **Printable characters**:
+     1. `font_glyph_metrics` (0xBD7D70; `ESI` = &out; `(state, prev char, char, &kern)`) gives the glyph index, width and advance (with kerning against the previous character).
+     2. `u0 = f.u[g] / w + 0.5 / w`, `v0 = f.v[g] / h + 0.5 / h`, and u1 / v1 from the glyph size.
+     3. Get space for 4 vertices of 0x1C bytes:
+        - **deferring**: `render_deferred_queue(0x1C, 4, &{dst = 0, bytes = 0x70})`, then write the vertices to the `dst` it returns (the VTX write-back);
+        - **immediate**: when a strip is open (`0xE863C4 >= 0`), flush it (`gfx_2d_flush(5, count − 2)`), then `0xE863C4 = 4` and `0xD1E070(4)` returns the vertex pointer.
+     4. Fill the quad: four vertices `{f32 x, f32 y, (+8 / +0xC left as is), u8 r, g, b, a at +0x10, f32 u, v at +0x14 / +0x18}` for the glyph's corners.
+     5. `pen_x += advance × scale`.
+10. Tail-jump `im2d_strip_end`.
+
+So **each glyph is its own 4-vertex strip and its own draw** in immediate mode.
+
+**`font_draw_string_2d_wide`** (0xBDB5C0) is the same with `u16` characters, `text_center_x_wide` (0xCF5C20) and `font_glyph_metrics_wide` (0xBDC760).
+
+**`font_draw_string_3d`** (0xBD6E60; `EAX` = &pos, `EDI` = &orient; cdecl `(f32 scale, char *str, i32 font, pair *state)`):
+- It follows the same per-glyph steps (font lookup, bitmap, glyph metrics).
+- It builds the quads in 3D: each corner is `pos + orient × (pen offset × scale)`.
+- It uses the declared-vertex batch: `im2d_c_begin`, then type 0x19 / `0xD1E600` for the space (VTX write-back again when deferring).
+
 ### Deferred record layouts
 
 What each handler stores in mode 0. Fields are 4 bytes in order; `f32` arguments arrive in the varargs as doubles and are stored as floats. Mode 1 reads the same fields back and calls the API with the convention in the handler table.
@@ -229,8 +299,8 @@ What each handler stores in mode 0. Fields are 4 bytes in order; `f32` arguments
 | 10 | `gfx_clear_region` | 4 × u32 |
 | 11 | `gfx_clear` | u32 stencil |
 | 12 | `gfx_draw_bitmap` | 11 × u32 (EAX + 10 stack), pair8 |
-| 13, 15 | `gfx_draw_text_13` / `_15` | f32 x, f32 y, STR text, u32, f32 scale, u32, pair8 |
-| 14, 16 | `gfx_draw_text_14` | 12 bytes (vec3 position), 36 bytes (3 × 3 orientation), f32, STR text, u32, u32, pair8 (3D text) |
+| 13, 15 | `gfx_draw_text` / `_wide` | f32 x, f32 y, STR text, u32, f32 scale, u32, pair8 |
+| 14, 16 | `gfx_draw_text_3d` (16 unused) | 12 bytes (vec3 position), 36 bytes (3 × 3 orientation), f32, STR text, u32, u32, pair8 (3D text) |
 | 17 | `im2d_draw_17` | f32 × 4, pair8 |
 | 18, 1B, 1E | `im2d_*_begin` | pair8 |
 | 19, 1C, 1F | `im2d_*_add` | VTX |
