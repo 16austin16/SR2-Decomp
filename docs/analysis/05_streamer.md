@@ -253,7 +253,7 @@ Debug: flag `0x2529DDB` makes reads of `player.cvtf` copy from memory (`0x2223CC
 | 0x01 | `0x4ADCD0` | 0x94-byte named entries (rec+0x104/+0x108) with per-entry scale floats and u16 lists |
 | 0x02 | `0x4A35E0` | 0x28-byte entries (rec+0x134/+0x138), then `0x7F63B0` |
 | 0x03 | inline | count/pointer at rec+0x10C/+0x110 |
-| 0x04 | `0x4ADF20` | rec+0x5C/+0x60/+0x64; dropped for flag-bit-0 chunks |
+| 0x04 | `0x4ADF20` render_items | 0xC8-byte render items (rec+0x5C/+0x60) and a node tree (rec+0x64); `game_render` collects the visible ones through the tree (`0x5239A0`); dropped for flag-bit-0 chunks |
 | 0x05 | `0x4ADF70` collision_models | Collision models via `0x7051C0` (indices rec+0x1F0/+0x1F4); remaps object collision indices (+0x3C/+0x3E). The only section with a string ("city_objects_load: Failed to load the collision models…") |
 | 0x06 | `0x4AE0C0` placed_spawns | 0x34-byte placements (rec+0x19C/+0x1A0); type-name hash → table `0x263AF98`; created by `0x4C61C0` at position/orientation, not within 15 m of the player |
 | 0x07, 0x08 | `0x4AE240`, `0x4AE280` | Two count/array pairs each (rec+0x68..+0x74, +0x78..+0x84); cleared when chunk flags & 0x13 |
@@ -274,8 +274,9 @@ Debug: flag `0x2529DDB` makes reads of `player.cvtf` copy from memory (`0x2223CC
 | 0x17 | `0x4AE8C0` | 0x34-byte entries (rec+0x1A4/+0x1A8), chunk id stored in each |
 | 0x18 | `0x4AE990` | 0x34-byte entries (rec+0x1B8/+0x1BC); `0x6C7E90` in some modes |
 | 0x19 | — | not handled |
-| 0x1A | `0x4AEA20` | 0x84-byte entries with meshes (rec+0x1C0/+0x1C4) |
-| 0x1B, 0x1C | `0x4AEAB0`, `0x4AEAE0` | count/array rec+0x1D4/+0x1D8, rec+0x1DC/+0x1E0 |
+| 0x1A | `0x4AEA20` volumes | 0x84-byte volumes (rec+0x1C0/+0x1C4): AABB, flags (8, 0x200), mesh; point-in-volume tests for audio, teleport, vehicle entry, npc respawn (interiors or water, unverified) |
+| 0x1B | `0x4AEAB0` | count/array rec+0x1D4/+0x1D8 |
+| 0x1C | `0x4AEAE0` object_attachments | 0x48-byte entries (rec+0x1DC/+0x1E0): object, offset, orientation, handle into `0x2AE50E8`; moved with their object each frame (`0x4AB140`) |
 | 0x1D | — | not handled |
 | 0x1E | `0x4AEB10` | 0x10-byte entries with 0x14-byte sub-arrays (rec+0x204/+0x208) |
 | 0x1F | `0x4AEB80` | count/array rec+0x20C/+0x210 |
@@ -284,7 +285,17 @@ Debug: flag `0x2529DDB` makes reads of `player.cvtf` copy from memory (`0x2223CC
 | 0x22 | `0x4AEDB0` | rec+0x224 |
 | 0x23 | `0x4AEF00` | per-object 8-byte array (rec+0x54/+0x58) |
 | 0x24 | `0x4AEF60` | per-object array (rec+0x230/+0x234) |
-| 0x25 | `0x4AEFA0` object_groups | Named object groups (rec+0x238/+0x23C): name, object (flagged +0x34 \|= 0x40000), indices into rec+0xA0 |
+| 0x25 | `0x4AEFA0` object_anims | Per-object frame animations (rec+0x238/+0x23C): name, object (flagged +0x34 \|= 0x40000), frame table into rec+0xA0; `0x91C6C0` plays them (flags 1 playing, 2 ping-pong, 4 loop, 8 reversing) |
 | 0x26 | `0x4AEDD0` speedtree_instances | Trees (rec+0x228/+0x22C): hash → SpeedTree table `0x26B5DE8` (count `0x2527288`), the table the SpeedTree loader `0xA8DAFB` fills |
 
 Versions below 0x78 copy some arrays into the cpu pool instead of pointing into the file (sections 0, 0x0E, 0x15, 0x16). The loader only accepts 0x79, so those paths are dead for shipped data.
+
+Identified from their consumers (2026-10-30). The loader adds a chunk to a per-feature list when a section is present, and each list's walker is a direct consumer:
+- **0x04 render items:** `chunk_render_items_collect_visible` (`0x5239A0`) is called from `game_render.cpp`. It walks the node tree with a visibility test and collects the visible 0xC8-byte items.
+- **0x1A volumes:** `chunk_point_in_volume_flag8` (`0x4AB430`, 20 callers including `luafn_teleport` and vehicle entry), `audio_point_in_chunk_volume` (`0x46F770`, audio modes 5/6) and `chunk_point_in_volume_flag200` (`0x4AAB50`). All do an AABB check, then a mesh test (`0xBFD510`).
+- **0x1C object attachments:** `chunk_object_attachments_update` (`0x4AB140`, from `sim_frame`) moves table entries at `0x2AE50E8` with their objects.
+- **0x25 object animations:** `chunk_object_anims_update` (`0x91C6C0`, from `sim_frame`).
+
+The chunk record's bounding box is rec+0x28..+0x3C (min x/y/z, max x/y/z, from header words 0x35..0x3A).
+
+Still unidentified: sections 0x01, 0x02, 0x07, 0x08, 0x0A (probably roads), 0x0C, 0x0D, 0x0F, 0x11–0x14, 0x17, 0x18, 0x1B, 0x1E–0x24. They are not on a per-feature list, so finding their consumers means searching for reads of their record offsets.
