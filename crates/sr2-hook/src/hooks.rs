@@ -977,6 +977,276 @@ extern "C" fn file_resolve_thunk() {
     )
 }
 
+// --- 0xBFDC20 file_open (every call logged to sr2-fileopen.log) -----------
+
+/// LTCG: ECX = `const char* path`, stack `(const char* mode, bool flag)`,
+/// caller-clean, returns `file_handle*`. Prologue `push ebp; mov ebp,esp;
+/// and esp,-8; sub esp,224`: 12 bytes, no absolute or relative operands.
+const FILE_OPEN_PROLOGUE: [u8; 12] = [0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x81, 0xEC, 0x24, 0x02, 0x00, 0x00];
+
+const FILE_HANDLE_ALLOC: usize = 0x00BF_D710; // no args -> file_handle* (pool 0x33D9710, under a lock)
+const FILE_HANDLE_FREE: usize = 0x00BF_FEB0; // ECX = handle, stack pool, callee-clean
+const FILE_HANDLE_POOL: usize = 0x033D_9710;
+const FILE_SOURCE_OPEN: usize = 0x00BF_D930; // ECX = location*, EDX = mode, ESI = handle -> AL
+
+static FILE_OPEN_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// Called by the thunk with the original's convention.
+static FILE_OPEN_IMPL: AtomicUsize = AtomicUsize::new(0);
+const FILE_OPEN_USE_RUST: bool = true;
+/// Port write/append opens too (see [`file_open_rust`]).
+const FILE_OPEN_WRITE_IN_RUST: bool = false;
+
+/// Call the original's convention: ECX = path, stack (mode, flag), caller-clean.
+unsafe fn call_file_open(f: usize, path: *const u8, mode: *const u8, flag: u32) -> *mut u8 {
+    let h: *mut u8;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "push {flag}",
+            "push {mode}",
+            "call {f}",
+            "add esp, 8",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) f,
+            flag = in(reg) flag,
+            mode = in(reg) mode,
+            in("ecx") path,
+            lateout("eax") h,
+            clobber_abi("C"),
+        );
+    }
+    h
+}
+
+unsafe fn file_handle_alloc() -> *mut u8 {
+    let h: *mut u8;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "call {f}",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) FILE_HANDLE_ALLOC,
+            lateout("eax") h,
+            clobber_abi("C"),
+        );
+    }
+    h
+}
+
+unsafe fn file_handle_free(h: *mut u8) {
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "push {pool}",
+            "call {f}", // ret 4
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) FILE_HANDLE_FREE,
+            pool = in(reg) FILE_HANDLE_POOL,
+            in("ecx") h,
+            clobber_abi("C"),
+        );
+    }
+}
+
+unsafe fn file_source_open(loc: *mut u8, mode: *const u8, h: *mut u8) -> bool {
+    let r: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "mov esi, {h}",
+            "call {f}",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) FILE_SOURCE_OPEN,
+            h = in(reg) h,
+            in("ecx") loc,
+            in("edx") mode,
+            lateout("eax") r,
+            clobber_abi("C"),
+        );
+    }
+    r as u8 != 0
+}
+
+/// Rust port of `file_open` (0xBFDC20), docs/analysis/01_packfile.md §5d.
+///
+/// `file_handle` (0x16C bytes, pooled): name `char[0x41]` +0, path +0x41,
+/// location kind +0x144, type +0x148 (0 OS file, 1 packfile, -1 dead),
+/// stream +0x14C, arg +0x150, access +0x154 (1 read, 2 write/append),
+/// position +0x15C, size +0x160, flag +0x168.
+extern "C" fn file_open_rust(path: *const u8, mode: *const u8, flag: u32) -> *mut u8 {
+    unsafe {
+        if *(G_SEARCH_PATH_COUNT as *const u32) == 0 {
+            return std::ptr::null_mut();
+        }
+        let m = cstr(mode);
+        if m.len() != 2 || !b"rwa".contains(&m[0]) || !b"tb".contains(&m[1]) {
+            return std::ptr::null_mut();
+        }
+        // Writes (saves, settings) have not been exercised in-game yet, so they
+        // stay on the original until they are; a bad port there would corrupt saves.
+        if !FILE_OPEN_WRITE_IN_RUST && !m.contains(&b'r') {
+            return call_file_open(FILE_OPEN_ORIGINAL.load(Ordering::Relaxed), path, mode, flag);
+        }
+        let mut name = [0u8; 0x101];
+        strncpy(name.as_mut_ptr(), path, 0x100);
+        let h = file_handle_alloc();
+        if h.is_null() {
+            return std::ptr::null_mut();
+        }
+        let mut loc = [0u8; LOCATION_SIZE];
+        let l = loc.as_mut_ptr();
+        let fail = |h: *mut u8| {
+            *(h.add(0x148) as *mut i32) = -1;
+            file_handle_free(h);
+            std::ptr::null_mut()
+        };
+        if m.contains(&b'r') {
+            *(h.add(0x154) as *mut u32) = 1;
+            if file_resolve_hook(l, name.as_ptr()) == 0 {
+                return fail(h);
+            }
+        } else {
+            *(h.add(0x154) as *mut u32) = 2;
+            // Append keeps an existing file's size; otherwise (or if there is
+            // none) it is a fresh disk file.
+            if !(m.contains(&b'a') && resolve_on_disk(l, name.as_ptr(), 0)) {
+                strncpy(l.add(8), name.as_ptr(), 0xFF);
+                *l.add(0x107) = 0;
+                *(l as *mut u32) = 0;
+                *(l.add(0x108) as *mut u32) = 0;
+            }
+            *(l.add(4) as *mut u32) = 0;
+        }
+        *(h.add(0x168) as *mut u32) = (flag as u8 == 1) as u32;
+        if !file_source_open(l, mode, h) {
+            return fail(h);
+        }
+        let rd = |o: usize| *(l.add(o) as *const u32);
+        let kind = rd(0);
+        *(h.add(0x144) as *mut u32) = kind;
+        *(h.add(0x148) as *mut u32) = match kind {
+            0 | 2 => 0,
+            1 => 1,
+            // Unreachable (resolve only yields 0-2); the original leaks the handle here.
+            _ => return std::ptr::null_mut(),
+        };
+        *(h.add(0x150) as *mut u32) = rd(4);
+        *(h.add(0x160) as *mut u32) = rd(0x108);
+        *(h.add(0x15C) as *mut u32) = if *(h.add(0x154) as *const u32) == 2 { rd(0x108) } else { 0 };
+        path_basename(name.as_ptr(), std::slice::from_raw_parts_mut(h, 0x41));
+        let p = cstr(l.add(8));
+        std::ptr::copy_nonoverlapping(p.as_ptr(), h.add(0x41), p.len());
+        *h.add(0x41 + p.len()) = 0;
+        h
+    }
+}
+
+/// Original-convention entry for [`file_open_rust`].
+#[unsafe(naked)]
+extern "C" fn file_open_rust_conv() {
+    naked_asm!(
+        "push dword ptr [esp + 8]", // flag
+        "push dword ptr [esp + 8]", // mode
+        "push ecx",                 // path
+        "call {f}",
+        "add esp, 12",
+        "ret",
+        f = sym file_open_rust,
+    )
+}
+
+#[unsafe(naked)]
+extern "C" fn file_open_thunk() {
+    naked_asm!(
+        "push ecx",                 // path, kept for the log
+        "push dword ptr [esp + 12]", // flag
+        "push dword ptr [esp + 12]", // mode
+        "call dword ptr [{imp}]",    // ECX unchanged since entry
+        "add esp, 8",
+        // [esp] = path, [esp+4] = ret, [esp+8] = mode, [esp+12] = flag
+        "push eax",
+        "push dword ptr [esp + 8]",  // caller
+        "push eax",                  // handle
+        "push dword ptr [esp + 24]", // flag
+        "push dword ptr [esp + 24]", // mode
+        "push dword ptr [esp + 20]", // path
+        "call {log}",
+        "add esp, 20",
+        "pop eax",
+        "add esp, 4",
+        "ret",
+        imp = sym FILE_OPEN_IMPL,
+        log = sym file_open_log,
+    )
+}
+
+static FILE_OPEN_LOG: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// One line per call to `sr2-fileopen.log`: the inputs and every handle field
+/// except the stream pointer (only whether it is set).
+extern "C" fn file_open_log(path: *const u8, mode: *const u8, flag: u32, h: *const u8, caller: usize) {
+    use std::io::Write as _;
+    let mut line = unsafe {
+        format!(
+            "{caller:#x} {:?} {:?} {} ->",
+            String::from_utf8_lossy(cstr(path)),
+            String::from_utf8_lossy(cstr(mode)),
+            flag as u8
+        )
+    };
+    if h.is_null() {
+        line += " NULL";
+    } else {
+        unsafe {
+            let rd = |o: usize| *(h.add(o) as *const u32);
+            line += &format!(
+                " {:?} {:?} kind {} type {} stream {} arg {} access {} pos {:#x} size {:#x} flag {}",
+                String::from_utf8_lossy(cstr(h)),
+                String::from_utf8_lossy(cstr(h.add(0x41))),
+                rd(0x144) as i32,
+                rd(0x148) as i32,
+                (rd(0x14C) != 0) as u8,
+                rd(0x150),
+                rd(0x154),
+                rd(0x15C),
+                rd(0x160),
+                rd(0x168)
+            );
+        }
+    }
+    let mut guard = FILE_OPEN_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = std::fs::OpenOptions::new().create(true).append(true).open("sr2-fileopen.log").ok();
+    }
+    if let Some(f) = guard.as_mut() {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 fn search_path_table() -> String {
     unsafe {
         let n = *(G_SEARCH_PATH_COUNT as *const u32);
@@ -1200,5 +1470,22 @@ pub fn install_early() {
             ));
         }
         Err(e) => log(&format!("hook file_resolve failed: {e:?}")),
+    }
+
+    if FILE_OPEN_USE_RUST {
+        FILE_OPEN_IMPL.store(file_open_rust_conv as extern "C" fn() as usize, Ordering::Relaxed);
+    }
+    match unsafe { detour::install(FILE_OPEN, &FILE_OPEN_PROLOGUE, file_open_thunk as extern "C" fn() as usize) } {
+        Ok(tramp) => {
+            FILE_OPEN_ORIGINAL.store(tramp, Ordering::Relaxed);
+            let which = if FILE_OPEN_USE_RUST {
+                "Rust"
+            } else {
+                FILE_OPEN_IMPL.store(tramp, Ordering::Relaxed);
+                "original, observed"
+            };
+            log(&format!("hooked file_open @ 0xbfdc20 ({which}), calls in sr2-fileopen.log"));
+        }
+        Err(e) => log(&format!("hook file_open failed: {e:?}")),
     }
 }

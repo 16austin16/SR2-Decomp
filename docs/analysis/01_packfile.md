@@ -229,6 +229,28 @@ Hand-decoded with capstone (Observed). It takes EAX = `location*` and a stack na
 
 **Ported (hooks.rs).** The loop and kinds 0 and 1 are in Rust; kind 0 calls the game's own CRT. Kind 2 goes through a shim. Every call is shadow-checked: the original runs on a copy of the location, all 0x110 bytes and the result are compared, and the original's answer is kept on a mismatch. A boot plus city load gave 22,159 calls and 0 mismatches: 22,029 from packfiles, 46 from disk, 84 missing. Boot mounts were unchanged.
 
+## 5d. `file_open` (0xBFDC20)
+
+Hand-decoded with capstone (Observed). It takes ECX = path and stack `(mode, bool flag)`, caller-clean, and returns `file_handle*`.
+
+1. Return NULL if the search-path table is empty, or if `mode` is not exactly `[rwa][tb]`.
+2. `strncpy(name[0x101], path, 0x100)`. `h = 0xBFD710()`: a 0x16C-byte handle from pool `0x33D9710`, under critical section `0x33DA2D4`. Return NULL if that fails.
+3. Mode contains `r`: access (+0x154) = 1, then `file_resolve(&loc, name)`. On failure, the handle's type (+0x148) = -1, then `0xBFFEB0(ECX=h, pool)` (callee-clean) frees it, and the call returns NULL.
+4. Otherwise, access = 2. For `a`, `file_resolve_on_disk(&loc, name, 0)` keeps an existing file's size. Without `a`, or when there is no file, `loc` becomes a fresh disk location: path = name, kind = 0, size = 0. Then arg = 0.
+5. flag (+0x168) = `(flag == 1)`. `0xBFD930(ECX=&loc, EDX=mode, ESI=h)` opens the source:
+   - kind 1 goes through `0xC18300(mode, flag)`;
+   - kinds 0 and 2 go through `0xC181C0(path, mode, flag)` and fail if arg != 0.
+
+   The stream goes to +0x14C. On failure, free as in step 3.
+6. Fill in the handle:
+   - kind +0x144 = loc.kind; type +0x148 = 1 for kind 1, 0 for kinds 0 and 2 (any other kind returns NULL and leaks the handle);
+   - arg +0x150; size +0x160; position +0x15C = size when writing, 0 when reading;
+   - name +0 = `path_basename(name, 0x41)`; path +0x41 = loc.path.
+
+**Ported (hooks.rs), 2026-10-31.** Rust handles steps 1–6. The pool alloc/free and the source open go through shims; `file_resolve` and the disk probe call the Rust ports. Every call is logged to `sr2-fileopen.log`, with the inputs and all handle fields except the stream pointer.
+- A boot plus save load with the original made 19,421 calls; the Rust run made 19,433. All 9,843 distinct calls seen in both runs gave identical results, including 69 NULLs on each side. The rest are ambient pedestrians and cars that differ between runs; all of them opened fine.
+- Only `rb` (flag 0 and 1) occurs on that path. **Write/append opens (saves, settings) are still routed to the original** (`FILE_OPEN_WRITE_IN_RUST = false`) until a save has been tested.
+
 ## 6. Open questions
 
 - `packfile_mount_temp` callers: 0x69d250 mounts `city_load.vpp_pc` and 0xc0b6f0 mounts `hmaps.vpp_pc` on a save load. 0xc0b640 has not been seen yet. The temp unmount (it should rewind the record count to the mark) is not traced yet.
