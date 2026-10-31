@@ -89,7 +89,7 @@ Humans are character proxies, not bodies (15_humans.md). A vehicle is one body (
 1. Find both collidables' root bodies. Read each one's owner handle from entity property 1 (0x7031C0), and resolve the objects and their **types** (+0x4C).
 2. **Type-pair table** `0x1743D80`: 5 dwords per unordered pair, indexed `(hi + 1) × hi / 2 + lo`. When the pair has an entry, call its callback(objA, objB). Returning true **disables the contact** (+0x20 = 1).
 3. Vehicles (type 5) get special handling (0x703230).
-4. Each side gets 0x70A230 (impulse / damage from the separating velocity), then 0x70A650.
+4. Each side gets `physics_contact_pair_record` (0x70A230: per-object contact list, 20_weapons.md), then 0x70A650.
 5. When the bodies approach each other (relative normal velocity > 0), 0x709CA0 builds a collision event. Each object's **per-type handler** `0x1765140[type]` (function, context) then runs; returning false rejects the contact.
 
 | Slot | Method |
