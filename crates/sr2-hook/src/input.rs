@@ -1,18 +1,18 @@
 //! Input, docs/analysis/14_input.md: the per-frame update (`input_do_frame` and its
 //! tree: keyboard events, keyboard/mouse mapping, button and stick state, idle
 //! time), the key queue the window procedure feeds, and the key/button queries.
-//! Still original: the XInput / DirectInput pad polls, the rebind captures and
-//! `mouse_update`.
+//! Still original: the DirectInput pad poll and the rebind captures.
 //!
 //! Verified in-process: in `Mode::Shadow` every hooked call runs the original on a
 //! snapshot of the input state, then the Rust on the same snapshot, and compares
 //! the two results byte for byte (the Rust result is kept). Both runs see the same
-//! clock: `QueryPerformanceCounter` is wrapped, recorded during the original and
-//! replayed to the Rust.
+//! Windows calls: the import slots they use are wrapped, recorded during the
+//! original and replayed to the Rust (the "tape"). The XInput poll is also run on a
+//! fake pad (`pad_selftest`).
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
@@ -79,9 +79,8 @@ const SENS_Y: usize = 0x025F_5C9C;
 const CLOCK_ON: usize = 0x0252_A404;
 const CLOCK_BASE: usize = 0x0234_6508;
 const CLOCK_DIV: usize = 0x0234_64F8;
-const QPC_SLOT: usize = 0x00DB_8114;
 
-const POLL_XINPUT: usize = 0x00C1_3C80; // cdecl (pad)
+const POLL_XINPUT_FN: usize = 0x00C1_3C80; // cdecl (pad)
 const POLL_DINPUT: usize = 0x00C1_41D0; // cdecl (pad)
 const REBIND_CAPTURE_KEYS: usize = 0x00C1_2910;
 const REBIND_CAPTURE_PAD: usize = 0x00C1_2B00;
@@ -135,42 +134,282 @@ unsafe fn cdecl(f: usize, args: &[u32]) {
     }
 }
 
-// --- Clock ------------------------------------------------------------------------------
+// --- The call tape ------------------------------------------------------------------------
+//
+// The Windows calls the input code makes go through import slots, which are wrapped.
+// During a shadow check the original's calls are recorded (kind, inputs, results)
+// and replayed to the Rust in the same order, so both see the same clock, cursor,
+// window rectangles and pad states (and SetCursorPos happens once). A fake pad can
+// stand in for XInputGetState while recording, for the controller self-test.
 
-static QPC_REAL: AtomicUsize = AtomicUsize::new(0);
-static CLOCK_MODE: AtomicU8 = AtomicU8::new(0); // 0 pass through, 1 record, 2 replay
-static CLOCK_THREAD: AtomicU32 = AtomicU32::new(0);
-static CLOCK: Mutex<VecDeque<i64>> = Mutex::new(VecDeque::new());
-static CLOCK_UNDERFLOW: AtomicU32 = AtomicU32::new(0);
-static CLOCK_LEFTOVER: AtomicU32 = AtomicU32::new(0);
+const SLOT_QPC: usize = 0x00DB_8114; // QueryPerformanceCounter(i64*)
+const SLOT_CURSOR_POS: usize = 0x00DB_8304; // GetCursorPos(POINT*)
+const SLOT_RECT_A: usize = 0x00DB_8298; // (hwnd, RECT*): the window rectangle (screen)
+const SLOT_RECT_B: usize = 0x00DB_8308; // (hwnd, RECT*): the client rectangle
+const SLOT_CLIENT_TO_SCREEN: usize = 0x00DB_8294; // (hwnd, POINT*)
+const SLOT_SET_CURSOR_POS: usize = 0x00DB_8288; // (x, y)
+const SLOT_XINPUT_GET_STATE: usize = 0x00DB_83B8; // (user, XINPUT_STATE*) -> error
+const SLOT_ASYNC_KEY_STATE: usize = 0x00DB_82D0; // (vk) -> SHORT
+const SLOT_ENTER_CS: usize = 0x00DB_80CC;
+const SLOT_LEAVE_CS: usize = 0x00DB_80D0;
 
-extern "system" fn qpc_hook(out: *mut i64) -> i32 {
-    let real: extern "system" fn(*mut i64) -> i32 = unsafe { std::mem::transmute(QPC_REAL.load(Ordering::Acquire)) };
-    let mode = CLOCK_MODE.load(Ordering::Acquire);
-    if mode != 0 && unsafe { GetCurrentThreadId() } == CLOCK_THREAD.load(Ordering::Acquire) {
-        let mut q = CLOCK.lock().unwrap_or_else(|p| p.into_inner());
-        if mode == 1 {
-            let r = real(out);
-            q.push_back(unsafe { *out });
-            return r;
-        }
-        if let Some(v) = q.pop_front() {
-            unsafe { *out = v };
-            return 1;
-        }
-        CLOCK_UNDERFLOW.fetch_add(1, Ordering::Relaxed);
-    }
-    real(out)
+const TAPED: [(usize, &str); 8] = [
+    (SLOT_QPC, "QueryPerformanceCounter"),
+    (SLOT_CURSOR_POS, "GetCursorPos"),
+    (SLOT_RECT_A, "rect A"),
+    (SLOT_RECT_B, "rect B"),
+    (SLOT_CLIENT_TO_SCREEN, "ClientToScreen"),
+    (SLOT_SET_CURSOR_POS, "SetCursorPos"),
+    (SLOT_XINPUT_GET_STATE, "XInputGetState"),
+    (SLOT_ASYNC_KEY_STATE, "GetAsyncKeyState"),
+];
+
+static REAL: [AtomicUsize; 8] = [const { AtomicUsize::new(0) }; 8];
+static TAPE_MODE: AtomicU8 = AtomicU8::new(0); // 0 pass through, 1 record, 2 replay
+static TAPE_THREAD: AtomicU32 = AtomicU32::new(0);
+static TAPE: Mutex<VecDeque<Vec<u32>>> = Mutex::new(VecDeque::new());
+static TAPE_MISMATCH: AtomicU32 = AtomicU32::new(0);
+static TAPE_LEFTOVER: AtomicU32 = AtomicU32::new(0);
+static FAKE_PAD: AtomicBool = AtomicBool::new(false);
+static RNG: AtomicU32 = AtomicU32::new(0x1234_5678);
+
+fn real<T: Copy>(i: usize) -> T {
+    let p = REAL[i].load(Ordering::Acquire);
+    unsafe { std::mem::transmute_copy(&p) }
 }
 
-/// The game's millisecond clock, read the way the input code reads it (through the
-/// QPC slot, so the shadow replay sees it).
+/// The tape mode for this call: only the shadow-checking thread is taped.
+fn tape_mode() -> u8 {
+    let m = TAPE_MODE.load(Ordering::Acquire);
+    if m != 0 && unsafe { GetCurrentThreadId() } == TAPE_THREAD.load(Ordering::Acquire) { m } else { 0 }
+}
+
+fn tape_push(e: Vec<u32>) {
+    TAPE.lock().unwrap_or_else(|p| p.into_inner()).push_back(e);
+}
+
+/// The next recorded call's results, if it is this kind with these inputs.
+fn tape_next(kind: u32, inputs: &[u32]) -> Option<Vec<u32>> {
+    let e = TAPE.lock().unwrap_or_else(|p| p.into_inner()).pop_front();
+    match e {
+        Some(e) if e[0] == kind && e[1..=inputs.len()] == *inputs => Some(e[1 + inputs.len()..].to_vec()),
+        _ => {
+            TAPE_MISMATCH.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
+fn rng() -> u32 {
+    // xorshift; only the shadow thread uses it.
+    let mut x = RNG.load(Ordering::Relaxed);
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    RNG.store(x, Ordering::Relaxed);
+    x
+}
+
+extern "system" fn qpc_w(out: *mut i64) -> i32 {
+    let f: extern "system" fn(*mut i64) -> i32 = real(0);
+    match tape_mode() {
+        1 => {
+            let r = f(out);
+            let v = unsafe { *out };
+            tape_push(vec![0, r as u32, v as u32, (v >> 32) as u32]);
+            r
+        }
+        2 => match tape_next(0, &[]) {
+            Some(o) => {
+                unsafe { *out = (o[1] as u64 | (o[2] as u64) << 32) as i64 };
+                o[0] as i32
+            }
+            None => f(out),
+        },
+        _ => f(out),
+    }
+}
+
+extern "system" fn cursor_pos_w(p: *mut [i32; 2]) -> i32 {
+    let f: extern "system" fn(*mut [i32; 2]) -> i32 = real(1);
+    match tape_mode() {
+        1 => {
+            let r = f(p);
+            let v = unsafe { *p };
+            tape_push(vec![1, r as u32, v[0] as u32, v[1] as u32]);
+            r
+        }
+        2 => match tape_next(1, &[]) {
+            Some(o) => {
+                unsafe { *p = [o[1] as i32, o[2] as i32] };
+                o[0] as i32
+            }
+            None => f(p),
+        },
+        _ => f(p),
+    }
+}
+
+fn rect_w(i: usize, hwnd: u32, p: *mut [i32; 4]) -> i32 {
+    let f: extern "system" fn(u32, *mut [i32; 4]) -> i32 = real(i);
+    match tape_mode() {
+        1 => {
+            let r = f(hwnd, p);
+            let v = unsafe { *p };
+            tape_push(vec![i as u32, hwnd, r as u32, v[0] as u32, v[1] as u32, v[2] as u32, v[3] as u32]);
+            r
+        }
+        2 => match tape_next(i as u32, &[hwnd]) {
+            Some(o) => {
+                unsafe { *p = [o[1] as i32, o[2] as i32, o[3] as i32, o[4] as i32] };
+                o[0] as i32
+            }
+            None => f(hwnd, p),
+        },
+        _ => f(hwnd, p),
+    }
+}
+
+extern "system" fn rect_a_w(hwnd: u32, p: *mut [i32; 4]) -> i32 {
+    rect_w(2, hwnd, p)
+}
+
+extern "system" fn rect_b_w(hwnd: u32, p: *mut [i32; 4]) -> i32 {
+    rect_w(3, hwnd, p)
+}
+
+extern "system" fn client_to_screen_w(hwnd: u32, p: *mut [i32; 2]) -> i32 {
+    let f: extern "system" fn(u32, *mut [i32; 2]) -> i32 = real(4);
+    match tape_mode() {
+        1 => {
+            let v = unsafe { *p };
+            let r = f(hwnd, p);
+            let o = unsafe { *p };
+            tape_push(vec![4, hwnd, v[0] as u32, v[1] as u32, r as u32, o[0] as u32, o[1] as u32]);
+            r
+        }
+        2 => {
+            let v = unsafe { *p };
+            match tape_next(4, &[hwnd, v[0] as u32, v[1] as u32]) {
+                Some(o) => {
+                    unsafe { *p = [o[1] as i32, o[2] as i32] };
+                    o[0] as i32
+                }
+                None => f(hwnd, p),
+            }
+        }
+        _ => f(hwnd, p),
+    }
+}
+
+extern "system" fn set_cursor_pos_w(x: i32, y: i32) -> i32 {
+    let f: extern "system" fn(i32, i32) -> i32 = real(5);
+    match tape_mode() {
+        1 => {
+            let r = f(x, y);
+            tape_push(vec![5, x as u32, y as u32, r as u32]);
+            r
+        }
+        // Replayed, not repeated: the cursor moves once.
+        2 => match tape_next(5, &[x as u32, y as u32]) {
+            Some(o) => o[0] as i32,
+            None => f(x, y),
+        },
+        _ => f(x, y),
+    }
+}
+
+extern "system" fn xinput_get_state_w(user: u32, p: *mut [u32; 4]) -> u32 {
+    let f: extern "system" fn(u32, *mut [u32; 4]) -> u32 = real(6);
+    match tape_mode() {
+        1 => {
+            let r = if FAKE_PAD.load(Ordering::Relaxed) {
+                if rng() % 8 == 0 {
+                    0x48F // ERROR_DEVICE_NOT_CONNECTED
+                } else {
+                    // Sticks: often 0, small (inside the dead zone) or extreme.
+                    let axis = || -> u16 {
+                        match rng() % 6 {
+                            0 => 0,
+                            1 => (rng() % 4000) as u16 ^ if rng() & 1 != 0 { 0xFFFF } else { 0 },
+                            2 => 0x7FFF,
+                            3 => 0x8000,
+                            _ => rng() as u16,
+                        }
+                    };
+                    let triggers = (rng() & 0xFFFF) * if rng() % 3 == 0 { 0 } else { 1 };
+                    let state = [
+                        rng(),
+                        (rng() & 0xF3FF) | triggers << 16,
+                        axis() as u32 | (axis() as u32) << 16,
+                        axis() as u32 | (axis() as u32) << 16,
+                    ];
+                    unsafe { *p = state };
+                    0
+                }
+            } else {
+                f(user, p)
+            };
+            let v = unsafe { *p };
+            tape_push(vec![6, user, r, v[0], v[1], v[2], v[3]]);
+            r
+        }
+        2 => match tape_next(6, &[user]) {
+            Some(o) => {
+                unsafe { *p = [o[1], o[2], o[3], o[4]] };
+                o[0]
+            }
+            None => f(user, p),
+        },
+        _ => f(user, p),
+    }
+}
+
+extern "system" fn async_key_state_w(vk: i32) -> i16 {
+    let f: extern "system" fn(i32) -> i16 = real(7);
+    match tape_mode() {
+        1 => {
+            let r = f(vk);
+            tape_push(vec![7, vk as u32, r as u16 as u32]);
+            r
+        }
+        2 => match tape_next(7, &[vk as u32]) {
+            Some(o) => o[0] as u16 as i16,
+            None => f(vk),
+        },
+        _ => f(vk),
+    }
+}
+
+fn wrapper(i: usize) -> usize {
+    match i {
+        0 => qpc_w as extern "system" fn(*mut i64) -> i32 as usize,
+        1 => cursor_pos_w as extern "system" fn(*mut [i32; 2]) -> i32 as usize,
+        2 => rect_a_w as extern "system" fn(u32, *mut [i32; 4]) -> i32 as usize,
+        3 => rect_b_w as extern "system" fn(u32, *mut [i32; 4]) -> i32 as usize,
+        4 => client_to_screen_w as extern "system" fn(u32, *mut [i32; 2]) -> i32 as usize,
+        5 => set_cursor_pos_w as extern "system" fn(i32, i32) -> i32 as usize,
+        6 => xinput_get_state_w as extern "system" fn(u32, *mut [u32; 4]) -> u32 as usize,
+        7 => async_key_state_w as extern "system" fn(i32) -> i16 as usize,
+        _ => unreachable!(),
+    }
+}
+
+/// Call through an import slot (so the tape sees it).
+unsafe fn slot<T: Copy>(s: usize) -> T {
+    unsafe {
+        let p = rd(s) as usize;
+        std::mem::transmute_copy(&p)
+    }
+}
+
+/// The game's millisecond clock, read the way the input code reads it.
 unsafe fn now_ms() -> u32 {
     unsafe {
         if rb(CLOCK_ON) == 0 {
             return 0;
         }
-        let qpc: extern "system" fn(*mut i64) -> i32 = std::mem::transmute(rd(QPC_SLOT) as usize);
+        let qpc: extern "system" fn(*mut i64) -> i32 = slot(SLOT_QPC);
         let mut c = 0i64;
         qpc(&mut c);
         let base = *(CLOCK_BASE as *const i64);
@@ -492,7 +731,11 @@ unsafe fn poll_devices() {
                 wf(b, 0.0);
             }
         }
-        cdecl(if rd(PAD_MODE) == 3 { POLL_XINPUT } else { POLL_DINPUT }, &[PAD as u32]);
+        if rd(PAD_MODE) == 3 {
+            poll_xinput(PAD);
+        } else {
+            cdecl(POLL_DINPUT, &[PAD as u32]);
+        }
         if rb(CAPTURE_KEYS) == 1 {
             cdecl(REBIND_CAPTURE_KEYS, &[]);
         } else if rb(CAPTURE_CB) == 1 {
@@ -636,6 +879,304 @@ unsafe fn button_analog(b: usize) -> f32 {
     }
 }
 
+// --- Pad (XInput), dead zone, mouse -----------------------------------------------------------
+
+const XINPUT_CONNECTED: usize = 0x0252_A58E;
+const PAD_REBIND_RAW: usize = 0x0234_9808; // capture: raw buttons as bools, then the D-pad
+const AXIS_MAP: usize = 0x0234_E768; // 4 indices into {LY, LX, RY, RX}
+
+/// The game's float CRT helpers (the same code, so the same results).
+unsafe fn crt_sqrtf(x: f32) -> f32 {
+    unsafe {
+        let f: extern "C" fn(f32) -> f32 = std::mem::transmute(0x0040_EA20usize);
+        f(x)
+    }
+}
+unsafe fn crt_cosf(x: f32) -> f32 {
+    unsafe {
+        let f: extern "C" fn(f32) -> f32 = std::mem::transmute(0x0040_B820usize);
+        f(x)
+    }
+}
+unsafe fn crt_sinf(x: f32) -> f32 {
+    unsafe {
+        let f: extern "C" fn(f32) -> f32 = std::mem::transmute(0x0042_8CD0usize);
+        f(x)
+    }
+}
+/// `atan` (0xDA0DC0) takes and returns ST0; the caller stores the result as a float.
+unsafe fn crt_atanf(x: f32) -> f32 {
+    let mut v = x;
+    unsafe {
+        std::arch::asm!(
+            "push {p}", // the call may clobber {p}
+            "fld dword ptr [{p}]",
+            "call {f}",
+            "pop {p}",
+            "fstp dword ptr [{p}]",
+            p = in(reg) &mut v, f = in(reg) 0x00DA_0DC0usize,
+            clobber_abi("C"),
+        );
+    }
+    v
+}
+
+/// `input_stick_deadzone` (0xC13A90; EDI = &a, ESI = &b, cdecl (dead zone)): both
+/// axes inside the dead zone give zero; otherwise the magnitude (clamped to 0..1) is
+/// rescaled past a dead zone widened by 1/cos of the angle within its octant, and the
+/// axes rebuilt from the angle (a = sin, b = cos).
+unsafe fn stick_deadzone(ap: usize, bp: usize, dz: f32) {
+    unsafe {
+        let pc = x87_precision();
+        if dz > rf(ap).abs() && dz > rf(bp).abs() {
+            wf(ap, 0.0);
+            wf(bp, 0.0);
+            return;
+        }
+        if rf(bp) == 0.0 {
+            wf(bp, 9.999_999_747_378_752e-6);
+        }
+        let (a, b) = (rf(ap) as f64, rf(bp) as f64);
+        let m2 = rnd(rnd(b * b, pc) + rnd(a * a, pc), pc) as f32;
+        let mut m = crt_sqrtf(m2);
+        if m > 0.0 {
+            if !(1.0 > m) {
+                m = 1.0;
+            }
+        } else {
+            m = 0.0;
+        }
+        let mut angle = crt_atanf(rnd(a / b, pc) as f32);
+        if 0.0 > b {
+            angle = rnd(angle as f64 + 3.141_592_741_012_573_2, pc) as f32;
+        }
+        const QUARTER: f64 = 0.785_398_185_253_143_3;
+        const HALF: f64 = 1.570_796_370_506_286_6;
+        let mut t = angle;
+        while t as f64 > QUARTER {
+            t = rnd(t as f64 - HALF, pc) as f32;
+        }
+        if -QUARTER > t as f64 {
+            t = rnd(t as f64 + HALF, pc) as f32;
+        }
+        let lo = if t as f64 > -QUARTER { t } else { -QUARTER as f32 };
+        let t = if QUARTER > lo as f64 { lo } else { QUARTER as f32 };
+        let e = rnd(dz as f64 / crt_cosf(t) as f64, pc) as f32;
+        let r = rnd(rnd(m as f64 - e as f64, pc) / rnd(1.0 - e as f64, pc), pc) as f32;
+        wf(bp, rnd(crt_cosf(angle) as f64 * r as f64, pc) as f32);
+        wf(ap, rnd(crt_sinf(angle) as f64 * r as f64, pc) as f32);
+    }
+}
+
+/// `input_poll_xinput` (0xC13C80; cdecl (pad)): read the pad's XInput state into
+/// its raw button bytes (A, B, X, Y, shoulders, back, start, thumbs, triggers past
+/// 30 halved, D-pad), then either feed a pad rebind capture or set the sticks (axes
+/// remapped by input.bin, dead zones, copied into the sticks that are still zero)
+/// and the still-zero buttons from their bound raw bytes. Disconnected: look for a
+/// pad on users 0-3.
+unsafe fn poll_xinput(pad: usize) {
+    unsafe {
+        let pc = x87_precision();
+        let get: extern "system" fn(u32, *mut [u32; 4]) -> u32 = slot(SLOT_XINPUT_GET_STATE);
+        let mut st = [0u32; 4];
+        if get(rd(pad + 0x1044), &mut st) != 0 {
+            for user in 0..4 {
+                st = [0; 4];
+                if get(user, &mut st) == 0 {
+                    if rb(XINPUT_CONNECTED) == 0 {
+                        wb(0x00E8_DFBF, 0);
+                    }
+                    wr(pad + 0x1044, user);
+                    wb(XINPUT_CONNECTED, 1);
+                    return;
+                }
+            }
+            if rb(XINPUT_CONNECTED) != 0 {
+                pad_reset_buttons(pad);
+            }
+            wb(XINPUT_CONNECTED, 0);
+            return;
+        }
+        if rb(XINPUT_CONNECTED) == 0 {
+            wb(0x00E8_DFBF, 0);
+        }
+        let buttons = st[1] & 0xFFFF;
+        let (lt, rt) = ((st[1] >> 16) as u8, (st[1] >> 24) as u8);
+        let (lx, ly) = (st[2] as i16, (st[2] >> 16) as i16);
+        let (rx, ry) = (st[3] as i16, (st[3] >> 16) as i16);
+        let raw = rd(pad + 0xF68) as usize;
+        let bit = |b: u32| ((buttons >> b & 1) << 7) as u8;
+        for (i, b) in [12, 13, 14, 15, 8, 9, 5, 4, 6, 7].into_iter().enumerate() {
+            wb(raw + i, bit(b));
+        }
+        wb(XINPUT_CONNECTED, 1);
+        let trigger = |t: u8| if t != 0 && t > 30 { t >> 1 } else { 0 };
+        wb(raw + 0xA, trigger(lt));
+        wb(raw + 0xB, trigger(rt));
+        for (i, b) in [3, 0, 2, 1].into_iter().enumerate() {
+            wb(raw + 0x10 + i, bit(b));
+        }
+        if rb(CAPTURE_PAD) != 0 {
+            for i in 0..rd(pad + 0xF64) as usize {
+                wb(PAD_REBIND_RAW + i, (rb(raw + i) != 0) as u8);
+            }
+            for (i, b) in [3, 0, 2, 1].into_iter().enumerate() {
+                wb(PAD_REBIND_RAW + 0x10 + i, (buttons >> b & 1) as u8);
+            }
+            return;
+        }
+        let k = 32767.0;
+        let axes = [ly, lx, ry, rx].map(|v| rnd(v as f64 / k, pc) as f32);
+        let axis = |i: usize| axes.get(rd(AXIS_MAP + i * 4) as usize).copied().unwrap_or(0.0);
+        wf(pad + 0xD4C, axis(0));
+        wf(pad + 0xD50, axis(1));
+        wf(pad + 0xD0C, axis(2));
+        wf(pad + 0xD10, axis(3));
+        stick_deadzone(pad + 0xD50, pad + 0xD4C, rf(pad + 0xD54));
+        stick_deadzone(pad + 0xD10, pad + 0xD0C, rf(pad + 0xD14));
+        for (to, from) in [
+            (0xC4C, 0xD4C),
+            (0xC50, 0xD50),
+            (0xC8C, 0xD0C),
+            (0xC90, 0xD10),
+            (0xDCC, 0xD0C),
+            (0xDD0, 0xD10),
+            (0xE0C, 0xD4C),
+            (0xE10, 0xD50),
+            (0xCCC, 0xC4C),
+            (0xCD0, 0xC50),
+        ] {
+            if rf(pad + to) == 0.0 {
+                wr(pad + to, rd(pad + from));
+            }
+        }
+        for i in 0..BUTTON_COUNT {
+            let b = pad + 0x10 + i * 0x24;
+            let src = rd(BINDINGS + i * 8 + 4);
+            if src != u32::MAX && rf(b) == 0.0 {
+                wf(b, (rb(raw + src as usize) as f64 * 0.0078125) as f32);
+            }
+        }
+    }
+}
+
+/// `mouse_update` (0xC1F320), under the critical section 0x234F9E0: with the window
+/// active and the cursor in the client area (or mouse look captured, 0x252A5D6), the
+/// mouse delta is the cursor minus the window centre (zero on the first captured
+/// frame) and the wheel delta the change of the wheel accumulator; with 0x252A5D5 the
+/// cursor is warped back to the centre. Inactive: everything zero.
+unsafe fn mouse_update() {
+    unsafe {
+        let enter: extern "system" fn(u32) = slot(SLOT_ENTER_CS);
+        let leave: extern "system" fn(u32) = slot(SLOT_LEAVE_CS);
+        let cursor_pos: extern "system" fn(*mut [i32; 2]) -> i32 = slot(SLOT_CURSOR_POS);
+        let rect_a: extern "system" fn(u32, *mut [i32; 4]) -> i32 = slot(SLOT_RECT_A);
+        let rect_b: extern "system" fn(u32, *mut [i32; 4]) -> i32 = slot(SLOT_RECT_B);
+        let to_screen: extern "system" fn(u32, *mut [i32; 2]) -> i32 = slot(SLOT_CLIENT_TO_SCREEN);
+        let set_cursor: extern "system" fn(i32, i32) -> i32 = slot(SLOT_SET_CURSOR_POS);
+        const CS: u32 = 0x0234_F9E0;
+        const CAPTURED: usize = 0x0252_A5D6;
+        const STATE: usize = 0x0252_A620;
+        const WHEEL_ACC: usize = 0x0234_F460;
+        const WHEEL_LAST: usize = 0x0347_B2F4;
+        enter(CS);
+        if rb(WINDOW_ACTIVE) == 0 {
+            wr(STATE, 2);
+            wb(CAPTURED, 0);
+            wr(0x0234_F464, 0);
+            wr(0x0234_F468, 0);
+            wr(MOUSE_DY, 0);
+            wr(MOUSE_DX, 0);
+            wr(WHEEL, 0);
+            wr(WHEEL_ACC, 0);
+            leave(CS);
+            return;
+        }
+        let mut cur = [0i32; 2];
+        cursor_pos(&mut cur);
+        let hwnd = rd(0x0252_A410);
+        let mut a = [0i32; 4];
+        rect_a(hwnd, &mut a);
+        let mut b = [0i32; 4];
+        rect_b(hwnd, &mut b);
+        let mut tl = [0i32; 2];
+        to_screen(hwnd, &mut tl);
+        let mut br = [b[2], b[3]];
+        to_screen(hwnd, &mut br);
+        let inside = !(tl[0] > cur[0] || tl[1] > cur[1] || br[0] < cur[0] || br[1] < cur[1]);
+        if !inside && rb(CAPTURED) != 1 {
+            leave(CS);
+            return;
+        }
+        let cx = a[0].wrapping_add(a[2].wrapping_sub(a[0]) / 2);
+        let cy = a[1].wrapping_add(a[3].wrapping_sub(a[1]) / 2);
+        wr(STATE, 1);
+        if rb(CAPTURED) == 0 {
+            wb(CAPTURED, 1);
+            wr(MOUSE_DX, 0);
+            wr(MOUSE_DY, 0);
+        } else {
+            wr(MOUSE_DX, cur[0].wrapping_sub(cx) as u32);
+            wr(MOUSE_DY, cur[1].wrapping_sub(cy) as u32);
+        }
+        let acc = rd(WHEEL_ACC);
+        wr(WHEEL, acc.wrapping_sub(rd(WHEEL_LAST)));
+        wr(WHEEL_LAST, acc);
+        if rb(0x0252_A5D5) != 0 {
+            let mut r = [0i32; 4];
+            rect_b(hwnd, &mut r);
+            let mut p = [r[0], r[1]];
+            to_screen(hwnd, &mut p);
+            let mut q = [r[0].wrapping_add(r[2]), r[1].wrapping_add(r[3])];
+            to_screen(hwnd, &mut q);
+            set_cursor(cx, cy);
+        }
+        leave(CS);
+    }
+}
+
+fn mouse_regions() -> Vec<(usize, usize)> {
+    vec![(MOUSE_DY, 8), (0x0234_F464, 8), (WHEEL, 4), (0x0347_B2F4, 4), (0x0252_A620, 4), (0x0252_A5D6, 1)]
+}
+
+/// The controller self-test: `SELFTEST_POLLS` XInput polls with a fake pad (random
+/// buttons, triggers and sticks, some disconnects, some during a rebind capture),
+/// each shadow-checked, then the input state put back as it was.
+const SELFTEST_FRAME: u32 = 600;
+const SELFTEST_POLLS: u32 = 5000;
+
+fn pad_selftest() {
+    with_lock(|| unsafe {
+        let regs = regions();
+        let before = snapshot(&regs);
+        let capture = rb(CAPTURE_PAD);
+        FAKE_PAD.store(true, Ordering::Relaxed);
+        for i in 0..SELFTEST_POLLS {
+            wb(CAPTURE_PAD, (i % 16 == 0) as u8);
+            // Some sticks start zero (so the pad fills them), some not.
+            for s in [0, 1, 2, 6, 7] {
+                let p = STICKS + s * 0x40;
+                wf(p, if rng() % 2 == 0 { 0.0 } else { (rng() % 200) as f32 / 100.0 - 1.0 });
+                wf(p + 4, if rng() % 2 == 0 { 0.0 } else { (rng() % 200) as f32 / 100.0 - 1.0 });
+            }
+            // And some buttons, so the "still zero" test matters.
+            for b in 0..BUTTON_COUNT {
+                wf(BUTTONS + b * 0x24, if rng() % 4 == 0 { 1.0 } else { 0.0 });
+            }
+            CALLS[POLL_XINPUT].fetch_add(1, Ordering::Relaxed);
+            shadow_locked(POLL_XINPUT, &regs, || cdecl(POLL_XINPUT_FN, &[PAD as u32]), || poll_xinput(PAD));
+        }
+        FAKE_PAD.store(false, Ordering::Relaxed);
+        restore(&regs, &before);
+        wb(CAPTURE_PAD, capture);
+        log(&format!(
+            "input: pad self-test: {SELFTEST_POLLS} fake-pad polls, {} mismatched, tape mismatches {}",
+            MISMATCHES[POLL_XINPUT].load(Ordering::Relaxed),
+            TAPE_MISMATCH.load(Ordering::Relaxed)
+        ));
+    })
+}
+
 // --- Shadow checking ----------------------------------------------------------------------
 
 /// Everything the hooked functions write, and nothing else (a restore must not undo
@@ -697,28 +1238,35 @@ fn with_lock<R>(f: impl FnOnce() -> R) -> R {
 static MISMATCHES: [AtomicU32; COUNT] = [const { AtomicU32::new(0) }; COUNT];
 static LOGGED: AtomicU32 = AtomicU32::new(0);
 
-/// Run the original and the Rust on the same input state and clock; keep the Rust.
-fn shadow(i: usize, original: impl FnOnce(), rust: impl FnOnce()) {
-    with_lock(|| shadow_locked(i, original, rust))
+static IN_SHADOW: AtomicBool = AtomicBool::new(false);
+
+/// Run the original and the Rust on the same input state and call tape; keep the
+/// Rust. A hooked function reached inside a check runs as the original.
+fn shadow(i: usize, regs: &[(usize, usize)], original: impl FnOnce(), rust: impl FnOnce()) {
+    with_lock(|| shadow_locked(i, regs, original, rust))
 }
 
-fn shadow_locked(i: usize, original: impl FnOnce(), rust: impl FnOnce()) {
-    let regs = regions();
-    let before = snapshot(&regs);
-    CLOCK.lock().unwrap_or_else(|p| p.into_inner()).clear();
-    CLOCK_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
-    CLOCK_MODE.store(1, Ordering::Release);
-    original();
-    CLOCK_MODE.store(2, Ordering::Release);
-    let theirs = snapshot(&regs);
-    restore(&regs, &before);
-    rust();
-    CLOCK_MODE.store(0, Ordering::Release);
-    let left = CLOCK.lock().unwrap_or_else(|p| p.into_inner()).len();
-    if left > 0 {
-        CLOCK_LEFTOVER.fetch_add(left as u32, Ordering::Relaxed);
+fn shadow_locked(i: usize, regs: &[(usize, usize)], original: impl FnOnce(), rust: impl FnOnce()) {
+    if IN_SHADOW.swap(true, Ordering::AcqRel) {
+        original();
+        return;
     }
-    let ours = snapshot(&regs);
+    let before = snapshot(regs);
+    TAPE.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    TAPE_THREAD.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+    TAPE_MODE.store(1, Ordering::Release);
+    original();
+    TAPE_MODE.store(2, Ordering::Release);
+    let theirs = snapshot(regs);
+    restore(regs, &before);
+    rust();
+    TAPE_MODE.store(0, Ordering::Release);
+    IN_SHADOW.store(false, Ordering::Release);
+    let left = TAPE.lock().unwrap_or_else(|p| p.into_inner()).len();
+    if left > 0 {
+        TAPE_LEFTOVER.fetch_add(left as u32, Ordering::Relaxed);
+    }
+    let ours = snapshot(regs);
     let mut diffs = Vec::new();
     for (k, (a, b)) in theirs.iter().zip(&ours).enumerate() {
         for (o, (x, y)) in a.iter().zip(b).enumerate() {
@@ -743,7 +1291,9 @@ const KEYBOARD_RESET: usize = 2;
 const BUTTON_ANALOG: usize = 3;
 const KEY_DOWN: usize = 4;
 const WNDPROC_KEYS: usize = 5;
-const COUNT: usize = 6;
+const MOUSE_UPDATE: usize = 6;
+const POLL_XINPUT: usize = 7; // not hooked: only reached through input_poll_devices
+const COUNT: usize = 8;
 
 const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("input_do_frame", 0x00C0_63D0, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
@@ -752,6 +1302,8 @@ const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("input_button_analog", 0x00C0_6870, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
     ("input_key_down", 0x00C1_11D0, &KEY_DOWN_BODY),
     ("input_wndproc_keys", 0x00C1_0CD0, &[0x80, 0x3D, 0x4E, 0xA5, 0x52, 0x02, 0x00]),
+    ("mouse_update", 0x00C1_F320, &[0x83, 0xEC, 0x4C, 0x53, 0x55]),
+    ("input_poll_xinput", 0x00C1_3C80, &[]),
 ];
 
 /// `input_key_down`'s whole body: its prologue holds a short branch, so the original
@@ -773,13 +1325,26 @@ fn orig(i: usize) -> usize {
 }
 
 extern "C" fn do_frame_hook() {
-    CALLS[DO_FRAME].fetch_add(1, Ordering::Relaxed);
+    let n = CALLS[DO_FRAME].fetch_add(1, Ordering::Relaxed) + 1;
+    if MODE == Mode::Shadow && n == SELFTEST_FRAME {
+        pad_selftest();
+    }
     let original = || unsafe { cdecl(orig(DO_FRAME), &[]) };
     with_lock(|| match MODE {
         Mode::Original => original(),
-        Mode::Shadow => shadow(DO_FRAME, original, || unsafe { do_frame() }),
+        Mode::Shadow => shadow(DO_FRAME, &regions(), original, || unsafe { do_frame() }),
         Mode::Rust => unsafe { do_frame() },
     })
+}
+
+extern "C" fn mouse_update_hook() {
+    CALLS[MOUSE_UPDATE].fetch_add(1, Ordering::Relaxed);
+    let original = || unsafe { cdecl(orig(MOUSE_UPDATE), &[]) };
+    match MODE {
+        Mode::Original => original(),
+        Mode::Shadow => shadow(MOUSE_UPDATE, &mouse_regions(), original, || unsafe { mouse_update() }),
+        Mode::Rust => unsafe { mouse_update() },
+    }
 }
 
 extern "C" fn wndproc_keys_hook(msg: u32, wparam: u32, lparam: u32) {
@@ -790,7 +1355,7 @@ extern "C" fn wndproc_keys_hook(msg: u32, wparam: u32, lparam: u32) {
     };
     with_lock(|| match MODE {
         Mode::Original => original(),
-        Mode::Shadow => shadow(WNDPROC_KEYS, original, || unsafe { wndproc_keys(msg, lparam) }),
+        Mode::Shadow => shadow(WNDPROC_KEYS, &regions(), original, || unsafe { wndproc_keys(msg, lparam) }),
         Mode::Rust => unsafe { wndproc_keys(msg, lparam) },
     })
 }
@@ -826,7 +1391,7 @@ extern "C" fn key_queue_push_hook(scan: u32, edx: u32) {
     };
     with_lock(|| match MODE {
         Mode::Original => original(),
-        Mode::Shadow => shadow(KEY_QUEUE_PUSH, original, || unsafe { key_queue_push(scan, is_down) }),
+        Mode::Shadow => shadow(KEY_QUEUE_PUSH, &regions(), original, || unsafe { key_queue_push(scan, is_down) }),
         Mode::Rust => unsafe { key_queue_push(scan, is_down) },
     })
 }
@@ -836,7 +1401,7 @@ extern "C" fn keyboard_reset_hook() {
     let original = || unsafe { cdecl(orig(KEYBOARD_RESET), &[]) };
     with_lock(|| match MODE {
         Mode::Original => original(),
-        Mode::Shadow => shadow(KEYBOARD_RESET, original, || unsafe { keyboard_reset() }),
+        Mode::Shadow => shadow(KEYBOARD_RESET, &regions(), original, || unsafe { keyboard_reset() }),
         Mode::Rust => unsafe { keyboard_reset() },
     })
 }
@@ -867,7 +1432,9 @@ extern "C" fn button_analog_hook(b: u32) -> f32 {
             let f = orig(BUTTON_ANALOG);
             let mut out = 0f32;
             std::arch::asm!(
+                "push {out}", // the call may clobber {out}
                 "call {f}",
+                "pop {out}",
                 "fstp dword ptr [{out}]",
                 f = in(reg) f, out = in(reg) &mut out,
                 inout("eax") b => _, clobber_abi("C"),
@@ -943,25 +1510,30 @@ fn hook_address(i: usize) -> usize {
         BUTTON_ANALOG => button_analog_entry as extern "C" fn() as usize,
         KEY_DOWN => key_down_entry as extern "C" fn() as usize,
         WNDPROC_KEYS => wndproc_keys_hook as extern "C" fn(u32, u32, u32) as usize,
+        MOUSE_UPDATE => mouse_update_hook as extern "C" fn() as usize,
         _ => unreachable!(),
     }
 }
 
 pub fn install() {
-    // The clock wrapper first: the shadow replay depends on it.
-    unsafe {
-        let mut old = 0u32;
-        if VirtualProtect(QPC_SLOT as *const _, 4, PAGE_READWRITE, &mut old) != 0 {
-            QPC_REAL.store(rd(QPC_SLOT) as usize, Ordering::Release);
-            wr(QPC_SLOT, qpc_hook as extern "system" fn(*mut i64) -> i32 as usize as u32);
-            VirtualProtect(QPC_SLOT as *const _, 4, old, &mut old);
-        } else {
-            log("input: could not wrap QueryPerformanceCounter; not hooking input");
-            return;
+    // The call tape first: the shadow replay depends on it.
+    for (i, &(slot, name)) in TAPED.iter().enumerate() {
+        unsafe {
+            let mut old = 0u32;
+            if VirtualProtect(slot as *const _, 4, PAGE_READWRITE, &mut old) == 0 {
+                log(&format!("input: could not wrap {name}; not hooking input"));
+                return;
+            }
+            REAL[i].store(rd(slot) as usize, Ordering::Release);
+            wr(slot, wrapper(i) as u32);
+            VirtualProtect(slot as *const _, 4, old, &mut old);
         }
     }
     let mut ok = 0;
     for (i, &(name, addr, bytes)) in PORTS.iter().enumerate() {
+        if bytes.is_empty() {
+            continue;
+        }
         let r = unsafe {
             if i == KEY_DOWN {
                 detour::relocate(addr, bytes, &[]).and_then(|copy| {
@@ -985,7 +1557,7 @@ pub fn install() {
         Mode::Shadow => "Rust, shadow-checked against the original",
         Mode::Rust => "Rust",
     };
-    log(&format!("replaced {ok}/{COUNT} input functions ({mode})"));
+    log(&format!("replaced {ok} input functions ({mode})"));
 }
 
 pub fn summary() -> String {
@@ -998,10 +1570,10 @@ pub fn summary() -> String {
         })
         .collect();
     format!(
-        "input live: {} | clock underflow {}, leftover {} | x87 precision {}",
+        "input live: {} | tape mismatches {}, leftover {} | x87 precision {}",
         parts.join(", "),
-        CLOCK_UNDERFLOW.load(Ordering::Relaxed),
-        CLOCK_LEFTOVER.load(Ordering::Relaxed),
+        TAPE_MISMATCH.load(Ordering::Relaxed),
+        TAPE_LEFTOVER.load(Ordering::Relaxed),
         x87_precision()
     )
 }

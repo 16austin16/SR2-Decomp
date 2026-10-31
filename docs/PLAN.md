@@ -69,4 +69,5 @@ original. The standalone build can move to 64-bit later.
 31. ✅ rsched job layer in Rust: job_add/cancel/start_next/pump and rsched_update_all; job events match the original in the teleport test.
 32. ✅ The rest of rsched in Rust: add_ref/release/update, group quotas, request-slot pairing, slot binding, use, idle and eviction, the job finish handlers and the two queue compares (0 mismatches over ~180,000 shadow checks). Teleport test: every output tracks the game's own requests.
 33. ✅ Input in Rust: input_do_frame and its tree (keyboard events, keyboard/mouse mapping, button and stick state, idle time), the window procedure's key callback and the key queue. Shadow-checked against the original every call in a scripted play run (8,902 frames, 0 differences).
-34. Next: the pad polls (XInput, dead zone) and mouse_update; then the render executor (07_render.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).
+34. ✅ The XInput poll, its dead zone and mouse_update in Rust; the shadow check now replays the Windows calls (the call tape), and a 5,000-poll fake-pad self-test found 0 differences.
+35. Next: the render executor (07_render.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).

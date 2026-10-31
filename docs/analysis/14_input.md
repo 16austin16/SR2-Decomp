@@ -196,8 +196,9 @@ The pad record base is `0x23478A8` (stride 0x104C). Its 87 button records start 
 `input_do_frame` and its tree run in Rust: keyboard events, key events, the keyboard/mouse
 mapping, the repeat timers, button and stick state, idle time; also the window procedure's
 key callback, the key queue, `input_keyboard_reset`, `input_key_down`, `input_button_analog` and
-`input_pad_reset_buttons`. Still original: the XInput / DirectInput polls (called from the Rust
-`input_poll_devices`), the dead zone, the rebind captures and `mouse_update`.
+`input_pad_reset_buttons`, the XInput poll with its dead zone, and `mouse_update`. Still original:
+the DirectInput poll (called from the Rust `input_poll_devices` when the pad is not XInput) and the
+rebind captures.
 
 **How it was checked.** In shadow mode each hooked call runs the original on a snapshot of the
 input state, records every `QueryPerformanceCounter` read (the pointer at `0xDB8114` is wrapped),
@@ -205,6 +206,33 @@ restores the snapshot, runs the Rust with the same clock readings replayed, and 
 two results byte for byte. `tools/ingame/run_input.ps1` drives a scripted stretch of play (walk,
 sprint, jump, mouse look, wheel, clicks, the pause menu, Ctrl and H / J). Result: 8,902 frames,
 272 window messages, ~850,000 key queries, 0 differences, the clock replay exact.
+
+**The call tape.** The second round also replays the Windows calls: the import slots for
+QueryPerformanceCounter, GetCursorPos, the two rectangle queries (0xDB8298 window rect,
+0xDB8308 client rect), ClientToScreen, SetCursorPos, XInputGetState and GetAsyncKeyState are
+wrapped. During a check the original's calls are recorded (kind, inputs, results) and the Rust's
+are answered from the recording, which also checks they come in the same order with the same
+inputs (SetCursorPos runs once). For the controller, `pad_selftest` (frame 600, shadow builds
+only) runs 5,000 XInput polls against a fake pad: random buttons and triggers, sticks at 0, inside
+the dead zone or at the extremes, one poll in 8 disconnected, one in 16 during a rebind capture.
+Result: 0 differences, 0 tape mismatches; the play run's 7,199 `mouse_update` calls also 0.
+
+- `input_stick_deadzone` (EDI = &a, ESI = &b, cdecl (dz)): both |a| and |b| below dz -> zero.
+  Otherwise b == 0 becomes 1e-5; m = sqrt(a² + b²) clamped to 0..1; angle = atan(a/b), + pi
+  when b < 0; t = the angle folded into ±45° (minus 90° while above 45°, plus 90° once if below
+  -45°, then clamped); e = dz / cos t; r = (m - e) / (1 - e); b = cos(angle)·r, a = sin(angle)·r.
+  It uses the game's CRT sqrtf 0x40EA20, atan 0xDA0DC0 (ST0 in and out), cosf 0x40B820 and
+  sinf 0x428CD0, so Rust calls those.
+- `input_poll_xinput`: the raw bytes are A, B, X, Y, LB, RB, Back, Start, LS, RS (bit 7 each), the
+  triggers (> 30, halved) at +0xA / +0xB, and the D-pad right, up, left, down at +0x10..+0x13.
+  The axes {LY, LX, RY, RX} / 32767 are remapped into sticks 4 (x, y) and 3 (x, y), dead-zoned
+  with each stick's +8, then copied into sticks 0 / 7 (from 4), 1 / 6 (from 3) and 2 (from 0)
+  only where those are still exactly zero. Buttons take raw / 128 only where still zero (so the
+  keyboard wins). In a pad rebind capture the raw bytes become bools at 0x2349808 and the D-pad
+  bits at 0x2349818..1B, and nothing else changes.
+- `mouse_update`: rect A (0xDB8298) gives the centre the delta is measured from and the warp
+  target; rect B (0xDB8308) with ClientToScreen gives the client area the cursor must be in.
+  The warp path computes the client corners in screen space and never uses them.
 
 Corrections and details found on the way:
 - **Key events arrive on another thread** (the window procedure). `input_wndproc_keys` writes
