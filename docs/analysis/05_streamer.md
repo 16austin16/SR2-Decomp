@@ -1150,6 +1150,35 @@ Then for each group short of its quota, move spare slots into it: set the reques
 2. `rsched_job_pump`.
 3. `0xA78AC0` when streaming is on, `0x2528C14` is set, (`0x2528B56` == 0 or `0x2528B2B` != 0), `*0x2528C14 + 0x3F8` is set and `0x2528BB4` < 1.
 
+### Resource slot scheduler in Rust
+
+`rsched.rs` now runs the whole scheduler: add_ref, release, update, assign_group_quotas,
+update_group, bind_loaded_slot, slot_use / make_idle / evict / set_group, request_requeue,
+job_begin_slot, slot_loaded / load_failed, the job finish handlers and the two queue compares.
+Only init/reset (0xA78E60 / 0xA76A30), slot_free (0xA76F40, which still calls the original
+evict) and the network-side update (0xA78AC0) are original. Corrections found while porting:
+
+- Callback **+0 is called**: it is the kind's compare. `rsched_slot_compare` falls back to it
+  (0xA78E30: `cb(a.id, b.id)`, 1 when either id is -1 or there is no callback) when the slots
+  tie on failed bit, level, time and loaded data.
+- `rsched_slot_compare`: a slot's level is its request's best level, or 2 with no request.
+  Lower level, then smaller time, then smaller +0x10 sort first (0).
+- `rsched_request_compare`: evaluated (flag 1) first, failed last, higher level first, then
+  with a slot before without, then the slots' time / +0x10 the other way round.
+- The deferred release buffer (+0x4C..+0xCC) holds 8 records, with no bound check.
+- `assign_group_quotas`: spare slots that no group below quota takes are left in no queue
+  until something requeues them. `+0xCC` is a pointer to the quota array.
+- `update_group` leaves the temp links (+0x24/+0x28, +0x34/+0x38) set after pushing everything
+  back, and pass 3 keeps scanning slots after a request was taken out.
+- `slot_evict` on a slot in state 2 or 3 would unlink from list 0 (crash). make_idle runs first
+  for in-use slots, so only state 2 (the current job's slot) is unsafe, and callers avoid it.
+
+Test (teleport test, original vs Rust): the add_ref/release calls come from game code and
+differ with ambient spawns (+2 characters and +2 vehicles in the Rust run). Jobs added,
+started and finished, releases, unloads and available callbacks moved by the same amount; no
+failed loads in either run. The queue compares ran on both paths for every call
+(~180,000 over the two runs) with 0 mismatches.
+
 ### poll_chunk_extras and process_sequential in Rust
 
 `streamman_poll_chunk_extras` (`0xA7E900`) and `streamman_process_sequential` (`0xA7D0C0`) are in

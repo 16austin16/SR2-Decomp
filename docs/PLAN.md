@@ -67,4 +67,5 @@ original. The standalone build can move to 64-bit later.
 29. ✅ Streamer step/completion callbacks in Rust (23): the whole streamer runs in Rust; teleport test event logs identical to the original.
 30. ✅ The file-read (hdd) scheduler in Rust: hdd_service and the request functions; I/O events identical to the original for all 1,241 distinct world-chunk reads in the teleport test.
 31. ✅ rsched job layer in Rust: job_add/cancel/start_next/pump and rsched_update_all; job events match the original in the teleport test.
-32. Next: the rest of rsched (slot add_ref/release/update, group quotas, slot binding and eviction); then input (14_input.md), the render executor (07_render.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).
+32. ✅ The rest of rsched in Rust: add_ref/release/update, group quotas, request-slot pairing, slot binding, use, idle and eviction, the job finish handlers and the two queue compares (0 mismatches over ~180,000 shadow checks). Teleport test: every output tracks the game's own requests.
+33. Next: input (14_input.md), the render executor (07_render.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).
