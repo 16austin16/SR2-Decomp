@@ -17,7 +17,7 @@ The XACT engine methods the game uses, by vtable slot:
 |---|---|---|
 | 6 | Initialize | `xact_init` |
 | 7 | ShutDown | 0x481A00 |
-| 8 | DoWork | the audio thread, 0x481BF0, `loading_screen_pump` 0x481080, 0x481D20 |
+| 8 | DoWork | the audio thread (`0x2526B48`, vtable +0x20), 0x481BF0, `loading_screen_pump` 0x481080, 0x481D20 |
 | 9 | CreateSoundBank | 0x481220 |
 | 10 | CreateInMemoryWaveBank | 0x4810E0, 0x481BF0 |
 | 11 | CreateStreamingWaveBank | 0x481170 |
@@ -62,19 +62,86 @@ The sound bank (`.xsb`) is always read with `file_open` into the soundbank pool,
 
 ## Per frame
 
+Audio runs on two threads: its own audio thread, and the game thread, which hands voice updates to the job workers once a frame.
+
 **Audio thread.** `audio_thread_proc` (0x46C900) is started with `thread_create` (0xBFA930, a CreateThread wrapper; handle in `0xE99C48`) from startup (0x520054) and 0x465270. A console command "audio_thread_force_to_hw_thread" can pin it to a hardware thread.
 
-Each pass:
-1. Measure time with `QueryPerformanceCounter`.
-2. While the window is inactive (`0x252A406`), set the mastering voice's volume to 0 (`IXAudio2Voice::SetVolume`, slot 10). Set it back to 1 when the window is active again.
-3. `IXACT3Engine::DoWork`, and 0x480DB0.
-4. Update the listener and emitters: 0x46C360, 0x47E7C0, `audio_point_in_chunk_volume`, 0x46EDA0, 0x477250, 0x47E850, 0x484760.
-5. `DoWork` again.
-6. `0x46C7F0` keeps the frame timing (`0x2526A74`).
+Each pass, step by step:
+1. If `0x2526A4B` is set, clear it and return (the thread exits).
+2. **Focus mute.** While the window is inactive (`0x252A406` clear), set the mastering voice (`0xF52E30`) volume to 0 (`IXAudio2Voice::SetVolume`, vtable +0x28). Set it back to 1.0 when the window is active again. `0x2526B58` caches the current state.
+3. Enter the critical section `0x256D9C4` and take a start time in ms.
+4. `IXACT3Engine::DoWork` (`0x2526B48`, vtable +0x20).
+5. `audio_stream_issue_reads` (0x480DB0): issue the queued overlapped `ReadFile`s for streaming wave banks.
+6. `audio_listener_select` (0x46C360): copy the game's listener snapshot and pick the listener.
+7. `audio_set_listener` (0x47E7C0) with that position, orientation and velocity → the X3DAudio listener globals (position at `0xEEB254`).
+8. `0x2526ABE = audio_point_in_chunk_volume(listener)` (interior check).
+9. `audio_volume_zones_update` (0x46EDA0): voice-attached zones and the four category volume floors.
+10. If no cutscene is playing (`0x2526B44 < 1`, `0x2527C08 < 1`) and the audio mode `0x144E760[0xE96B7C]` is 5: `audio_ambient_emitters_update` (0x477250).
+11. `audio_voices_update` (0x47E850): the voice slot state machine.
+12. `audio_stream_requests_update` (0x484760): poll the streaming reads.
+13. `DoWork` and `audio_stream_issue_reads` again.
+14. Clear the per-pass bit 2 on every node of the list `0xF52220` (+0x14) and on `0xF5221C`.
+15. `audio_thread_record_overrun(start)` (0x46C7F0): `0x2526A74` = how many ms over 30 the pass took.
+16. Leave the critical section, `Sleep(10)`.
+17. `0xE99C44` = time since the last pass, in seconds. Every timer and fade in the audio code uses it.
 
-It stops when `0x2526A4B` is set.
+Times come from `QueryPerformanceCounter` (enabled by `0x252A404`), with base `0x2346508` and two divisors: `0x23464F8` for ms and `0x2346500` for µs.
 
-**Game side.** At the end of each game frame, `game_frame_tick` → 0x521A00 → `audio_queue_frame_job` (0x4655B0) queues the job `audio_frame_job` (0x464FE0, tagged gameaudio.cpp line 0x2D5) on the job system. Lua bindings (`audio_play`, `audio_play_for_character_do`, … in `luafn_*`) start cues.
+**Voice slots.** 128 records of 0x19C bytes from `0xEEB8F8`:
+
+| Off | Field |
+|---|---|
+| +0 | XACT cue handle (−1 free, 0 not yet prepared) |
+| +0x20 | volume |
+| +0x2C / +0x34 / +0x38 | fade values |
+| +0x5C / +0x60 / +0x64 | position |
+| +0xA4 | category (0-3) |
+| +0xB4 | generation: a voice handle is `slot \| generation << 8` |
+| +0xC4 / +0xC8 / +0xF4 | timers in ms, counted down by `dt × 1000`; +0xF4 is also the sort key for the 3D update |
+| +0x194 / +0x196 / +0x198 | u16 flag words: 0x80 active, 0x100 forced update, 0x400 (on +0x198) stopping, … |
+
+**Listener.** `audio_listener_select` copies 0xC0 bytes from `0x256DAE8` (written by the game thread) to `0x256DA28` under the critical section `0x256DBA8`. It then picks one of five sources (recorded in `0x256DA24`):
+- 4 when the object handle `0x2526A78` is valid: the snapshot block at +0x78 (`0x256DAA0`).
+- 0 / 1 when `0x21703D4` is set and no override is on: 0x46C2C0(`0x21703D4`) false → block +0 (`0x256DA28`), true → block +0x1C (`0x256DA44`).
+- 2 when `0x21703D4` is clear, 3 when the override flags `0x2527D14`/`0x2527CF7` or `0x2527D15` are set: block +0x38 (`0x256DA60`).
+
+Each block is a position and a previous position. The position goes to `0x256D9E0`, position − previous to `0x256D9EC`, and the orientation matrix to `0x256D9F8` (identity unless 0xBE37D0 / 0xBE3A60 provide one). *Which game state each source is (camera, vehicle, cutscene) is still open.*
+
+**Volume zones.** `audio_volume_zones_update` walks the nodes in `0xEE3508` {+8 voice handle, +0x14 zone index, +0x18 radius}:
+- A node whose voice is dead goes back to the free list `0xEE350C`.
+- A node whose radius is positive and whose listener distance² exceeds 0.7 × radius² stops its voice (0x47C740).
+- Otherwise its zone (`0xEE3510[zone]`) contributes four category volumes. The minimum of each, clamped by the base `0xEE34F8..0xEE3504`, goes to `0xEE34E8..0xEE34F4`.
+
+**Voice update.** `audio_voices_update`:
+1. Ramp the four category volumes `0xEEB2E8[i]` toward the floors `0xEE34E8[i]` by `dt` (down) or back up to 1.0. `0xEEB284[i]` = "below 1.0".
+2. Mixer updates: 0x46E4B0, `audio_ramp_toward` (0x46FE30; `ECX` = &target, `EDX` = &value, cdecl rate per second), 0x47C350, 0x47D4E0, 0x46F210, 0x46E790.
+3. `0x2526AC0 = 1 − (1 − 0x2526AB0)(1 − 0x2526A90)`, clamped to 0..1.
+4. For each of the 128 slots with a handle, run its state machine on the +0x198 flags: 0x1000 / 0x800 stop paths (0x4827B0, 0x482730), 0x400 stopping (0x47D170 / 0x47C4D0), 0x100 prepare (0x481F60, 0x47D040), 0x200 play (0x4820B0 / 0x482030, 0x47D0F0), 0x2000 / 0x4000 pause and resume (0x47D250), then the delay and lifetime timers and the fades. Changed voices are committed with 0x47D380 → 0x482600.
+
+**Game side.** At the end of each game frame, `frame_end_handoff` (0x521A00) calls `audio_update_voices_on_workers` (0x4655B0):
+1. `audio_voices_dispatch` (0x47E220; cdecl `(desc *, job **)` → bool):
+   - Scans the 128 slots. An active slot goes to `0xEEB6F8` if it has the forced flag 0x100. Otherwise it becomes a candidate `{index, key}` in `0xEEB2F8`.
+   - Sorts the candidates by key (qsort with 0x47D4B0) and appends them until there are 32 entries (at least 4 candidates).
+   - Gets a job object from the pool `0xEC5BB8` and runs `audio_voice_job` (0x47D420) over each group of 8, with the descriptor `{fn, job, start, end, 4}`.
+   - Returns whether anything was queued.
+2. If it was:
+   - `job_alloc("gameaudio.cpp", 0x2D5)` (0xBF3F50).
+   - Set both job workers' mode (+0x38 of `0x33D63F8` / `0x33D64C8`) to 4 and `job_worker_wake`.
+   - `audio_job_workers_mode_reset` (0x464FE0) puts the mode back to 3.
+   - Kick and sync the job (vtable +4 / +0xC), then release the dispatch job object (vtable +0x10).
+
+`audio_voice_job` (0x47D420) runs `audio_voice_update_one` (0x47D7F0) for each listed slot that is neither free nor stopping. That is probably the per-voice 3D calculation.
+
+**Porting order:**
+1. `audio_ramp_toward`, `audio_thread_record_overrun`, `audio_set_listener` (pure data).
+2. `audio_stream_issue_reads` and `audio_stream_requests_update` (they sit on the already ported async I/O in `hddio.rs`).
+3. `audio_listener_select` and `audio_volume_zones_update`.
+4. `audio_voices_dispatch` / `audio_voice_job`. These can run synchronously at first.
+5. `audio_voices_update`, the largest piece. It needs the voice-slot layout above and the XACT cue calls behind it.
+6. `audio_ambient_emitters_update` (its five shape tests and five sound types).
+7. The thread loop itself. Keep XACT (`DoWork`) original until the cue layer is ported.
+
+Lua bindings (`audio_play`, `audio_play_for_character_do`, … in `luafn_*`) start cues.
 
 ## Port notes
 
@@ -85,5 +152,5 @@ It stops when `0x2526A4B` is set.
 ## Open
 
 - The exact meaning of SectorRead banks (who supplies their memory).
-- The listener / emitter update functions in the thread loop.
+- The voice-slot flag bits in full, and `audio_voice_update_one` (0x47D7F0).
 - The radio system.

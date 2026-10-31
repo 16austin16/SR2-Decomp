@@ -145,7 +145,7 @@ The order of calls, grouped by the profiler sections. Unnamed calls are listed w
 2. 0xCFBC00, then 0xD14950 / 0xD14770 / 0xD14700 (begin 2D).
 3. In gameplay (state 5): `world_streaming_do_frame` (0x68E410).
 4. 0x5217E0 → `gfx_present` (end of the frame's D3D commands).
-5. In gameplay: `audio_queue_frame_job`.
+5. In gameplay: `audio_update_voices_on_workers` (10_audio.md).
 6. 0x521970, 0x5218D0, 0x5220B0, 0x521870.
 7. **Render snapshot.** When the world is visible (`0xE94D3E`):
    1. Copy the camera (`0x25F5B14..`, matrix `0x25F5B38`) and FOV into the render frame block `0xE9D620..`.
