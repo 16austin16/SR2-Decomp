@@ -425,3 +425,8 @@ multi_core_object_registration,18,on_ownership_taken,"(handle, data, ...): after
 multi_core_object_registration,19,write_migration_data,"(handle, buf, len*): payload of the give-ownership packet 0x27 (0x806910)"
 multi_core_object_registration,20,on_ownership_given,"(handle, new owner peer): after ownership was handed to another peer (0x8067D0); base no-op"
 multi_core_object_registration,21,on_owner_left,"(handle) -> 0 = migrate to another peer, 1 = take it locally, other = nothing (0x806F70, 0x807070, 0x8072E0)"
+diversion_type_info,5,can_start,"() -> bool: the type's start conditions are met; 0x603140 (diversion mode frame) picks the offered diversion 0xE97C0C from the types whose +0x14 enabled byte is set"
+diversion_type_info,16,get_start_mode,"0 = starts by itself when can_start, 1 = offered with a button prompt (text from get_start_message, 0x4F82C0) and started by 0x603250"
+diversion_type_info,22,on_object_killed,"(killer human, killer vehicle handle): game event 11, raised by object_mover::vf15 (take damage) when hit points run out; broadcast to enabled types by 0x604840"
+diversion_type_info,23,on_vehicle_destroyed,"(vehicle, ...): game event 12, raised when a vehicle is destroyed (0xA9D290, 0xAB3550, multiplayer 0x874310); broadcast by 0x6047F0"
+diversion_type_info,25,on_object_damaged,"(attacker, amount): game event 14, raised by object_mover::vf15 (take damage); broadcast by 0x604740"
