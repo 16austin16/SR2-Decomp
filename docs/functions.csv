@@ -34,7 +34,7 @@ address,name,subsystem,status,notes
 0x00c0a3b0,packfile_find_record,packfile,rust,"cdecl(name_ext) -> file_record*; last match wins; no wrap, NULL if probe runs off the end (01). Replaced by Rust (hooks.rs), original kept on trampoline; in-game verify over all 53018 records matched"
 0x00c0ad80,packfile_find_entry,packfile,rust,"ECX=path -> vpp_entry*; basename, priority packfile scan, then find_record (01 §5b). Replaced by Rust, shadow-checked against the original on every call"
 0x00c0ad10,vpp_entry_full_name,packfile,documented,"ECX=entry, ESI=buf; name.ext (01)"
-0x00bfdc20,file_open,file,rust,"ECX=path; stack (mode, flag) caller-clean -> file_handle* (0x16C, pooled) (01 §5d). Reads replaced by Rust (9843 distinct calls identical); writes/appends still go to the original"
+0x00bfdc20,file_open,file,rust,"ECX=path; stack (mode, flag) caller-clean -> file_handle* (0x16C, pooled) (01 §5d). Replaced by Rust: reads (9843 distinct calls identical) and writes (save game written and reloaded)"
 0x00bfd880,file_resolve,file,rust,"EAX=location*, stack name, caller-clean, AL; walks search paths [{1,0},{0,0},{1,1}] (01 §5c). Replaced by Rust, shadow-checked on every call (22k calls, 0 mismatches)"
 0x00bfd7a0,file_resolve_in_packfile,file,rust,"ESI=location*, stack (name, arg); kind 1 via packfile_find_entry, size = entry+0x10 (01 §5c). Ported inside file_resolve"
 0x00c18130,file_resolve_on_disk,file,rust,"EDI=location*, stack (path, arg); arg must be 0; fopen/fseek/_ftelli64; leaks FILE* on seek/size failure (01 §5c). Ported inside file_resolve"

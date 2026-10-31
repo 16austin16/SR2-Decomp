@@ -249,7 +249,12 @@ Hand-decoded with capstone (Observed). It takes ECX = path and stack `(mode, boo
 
 **Ported (hooks.rs), 2026-10-31.** Rust handles steps 1–6. The pool alloc/free and the source open go through shims; `file_resolve` and the disk probe call the Rust ports. Every call is logged to `sr2-fileopen.log`, with the inputs and all handle fields except the stream pointer.
 - A boot plus save load with the original made 19,421 calls; the Rust run made 19,433. All 9,843 distinct calls seen in both runs gave identical results, including 69 NULLs on each side. The rest are ambient pedestrians and cars that differ between runs; all of them opened fine.
-- Only `rb` (flag 0 and 1) occurs on that path. **Write/append opens (saves, settings) are still routed to the original** (`FILE_OPEN_WRITE_IN_RUST = false`) until a save has been tested.
+- Only `rb` (flag 0 and 1) occurs on that path.
+- **Writes, tested 2026-10-31 with a save game.** Pause menu → SAVE/LOAD → Save Game → NEW SAVE GAME opens `%LOCALAPPDATA%\THQ\Saints Row 2\_<id><timestamp>.bbsave` with `"wb"` from 0x695245. That is the only write-mode `file_open`; `profile.dat` is updated some other way.
+  - The original and the Rust port produced the same handle (kind 0, type 0, access 2, position 0, size 0); only the timestamped name differed.
+  - The two 240,472-byte saves differ in 44 bytes: header checksum, timestamps, play time and a few world-state fields from the two sessions.
+  - The Rust-written save loads back into the game. Writes now go through Rust too (`FILE_OPEN_WRITE_IN_RUST = true`). Append (`a`) has not been exercised.
+- Write-mode opens are always logged to `sr2-hook.log` (they are rare).
 
 ## 5e. `file_read` (0xBFE170)
 

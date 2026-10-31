@@ -997,7 +997,7 @@ static FILE_OPEN_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 static FILE_OPEN_IMPL: AtomicUsize = AtomicUsize::new(0);
 const FILE_OPEN_USE_RUST: bool = true;
 /// Port write/append opens too (see [`file_open_rust`]).
-const FILE_OPEN_WRITE_IN_RUST: bool = false;
+const FILE_OPEN_WRITE_IN_RUST: bool = true;
 
 /// Call the original's convention: ECX = path, stack (mode, flag), caller-clean.
 unsafe fn call_file_open(f: usize, path: *const u8, mode: *const u8, flag: u32) -> *mut u8 {
@@ -1218,7 +1218,9 @@ const LOG_FILE_CALLS: bool = false;
 /// except the stream pointer (only whether it is set).
 extern "C" fn file_open_log(path: *const u8, mode: *const u8, flag: u32, h: *const u8, caller: usize) {
     use std::io::Write as _;
-    if !LOG_FILE_CALLS {
+    // Writes (saves, settings) are rare, so they always go to the main log.
+    let write = !unsafe { cstr(mode) }.contains(&b'r');
+    if !LOG_FILE_CALLS && !write {
         return;
     }
     let mut line = unsafe {
@@ -1247,6 +1249,12 @@ extern "C" fn file_open_log(path: *const u8, mode: *const u8, flag: u32, h: *con
                 rd(0x160),
                 rd(0x168)
             );
+        }
+    }
+    if write {
+        log(&format!("file_open (write) {line}"));
+        if !LOG_FILE_CALLS {
+            return;
         }
     }
     let mut guard = FILE_OPEN_LOG.lock().unwrap_or_else(|e| e.into_inner());
