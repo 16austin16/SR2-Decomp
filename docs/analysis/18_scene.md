@@ -459,6 +459,84 @@ Details:
 - `gfx_get_thread_state` returns the TLS state; 0x31BF4B0 only when that state is 0x31C0C20
   and the thread is not the device owner (the 07 note had it the other way round).
 
+## World batch passes, for porting
+
+This covers what `game_render_thread_frame`'s "build_render_batch" block does before `render_frame`. Everything here runs on the render thread. The job workers only help through the job object `0x2526CC8`.
+
+**Batch accumulators.** Two global "callback + buffer + count" accumulators collect work items and hand them to a callback in groups:
+
+| Accumulator | Callback | Buffer | Count | Group | Start | Flush |
+|---|---|---|---|---|---|---|
+| A (chunks) | `0xF83AFC` | `0xF83B04` | `0xF83B00` | 5 × 16-byte chunk entries | `city_batch_begin(cb)` 0x4B6830 | `city_batch_flush` 0x4B65F0 |
+| B (instances) | `0xF83AF0` | `0xF83AF8` | `0xF83AF4` | 20 × 0x24-byte entries | `city_instance_batch_begin(cb)` 0x4B68D0 | `city_instance_batch_flush` 0x4B66A0 |
+
+- **Start** (cdecl `(cb)`):
+  1. Create the job object `0x2526CC8` once, from the pool `0xEC5BB8` (vtable +8), and clear its +0x28 / +0xAC.
+  2. Allocate a group buffer from the allocator `0x2774148` (vtable +0x1C, `(bytes, 0)`).
+  3. Count = 0, store the callback.
+- **Flush:**
+  1. Call `cb(&{…, buffer, count, 6}, buffer, count)` on this thread.
+  2. Run the job object's vtable +4 and +0xC (kick, then sync).
+  3. Allocate a fresh buffer and reset the count.
+
+  The per-entry functions append and flush when a group is full (0x4B6970 → `city_batch_flush` / `city_instance_batch_flush`).
+
+**`frustum_test_aabb`** (0x530270; `ECX` = &min (vec3), `EDX` = &max; cdecl `(planes *, …)`; returns bool):
+- Uses SSE. `planes` = {u32 count, then 16-byte planes from +0x10}, with a per-plane sign mask at +0xF0 that picks the AABB corner.
+- An AABB outside any plane fails. With `0xE8E88A` clear, the test is skipped (always visible).
+- Every per-instance step calls it.
+
+**`city_build_render_batches`** (0x4B7CC0, city_render.cpp), in order:
+1. `0xFA6C28 = 0x2784990` (a timestamp, for the "citycul" stat).
+2. Camera vectors from 0x4D9120 / 0x4D91E0 → `0x2615720..0x2615734`. This is done twice, the second for the current view. The camera position `0x319BEB4..BC` → `0x2612D04..0C`.
+3. Clear each streamed chunk's visibility bitmap: for each of the `0xF6FBC4` entries of `0xF6FBD8[]`, memset(+0x58, 0, +0x54).
+4. Profile "citycul:1".
+5. **Cull the chunks.** If there are views (`0x2526CCC`) and view 0 has flag 0x2000 at `0x2612D18`:
+   - begin A with 0x4B64F0 (per entry 0x4B5CE0 → 0x4B5FF0 → 0x4B6160 / 0x4B6310);
+   - then `0x4B6B60`;
+   - the main view index starts at 1.
+
+   Otherwise:
+   - begin A with 0x4B64C0 (per entry 0x4B5C40, the AABB test);
+   - then `0x4B6A20`;
+   - start at 0.
+6. Flush A if anything is pending (`0xF83B00`).
+7. Profile "citybrb:3".
+8. **Per-view batches.** Begin A with 0x4B6520 (per entry 0x4B5FF0: `frustum_test_aabb` against view N, then 0x4B6160 / 0x4B6310, which read the instance and its LOD and add it). For each remaining view N (0x280-byte records at `0x2612D18`, count `0x2526CCC`) with flag 0x100, call `0x4B6CC0(N)`. Flush A.
+9. Dynamic water: `0xB779C0` ("Dynamic water", picks the water instances).
+10. `0x4B7870`: time-of-day lights.
+11. `city_render_func` (0x4B6760): allocates the frame's batch lists through 0xBF3F50 / 0xBF3700.
+12. Profile "citybrb:5".
+13. `0x4B74D0` (0x4B8280, 0x4B5510): builds the draw lists from the visible instances.
+14. `city_render_func_2` (0x4B72E0): finalises the lists.
+15. `0xFA6C24 = now − 0xFA6C28` (time spent).
+
+After this, `game_render_thread_frame` runs:
+- 0x9FA9E0, 0x533910 and 0x533A70 (wake the job workers), then 0x533CD0;
+- the two instance passes: `city_instance_batch_begin(0x4B6550)` + 0x4B6E10, then `city_instance_batch_begin(0x4B6580)` + 0x4B7070, each followed by `city_instance_batch_flush` when `0xF83AF4` is non-zero;
+- then 0x4B6760.
+
+0x4B6550 / 0x4B6580 call 0x4B6160 / 0x4B6310 per entry: the same instance-add path as above, for the shadow and main instance lists.
+
+**What each stage writes:**
+
+| Stage | Writes |
+|---|---|
+| culling (5, 8) | the chunks' visibility bitmaps (+0x58), and the per-view instance lists through 0x4B6160 / 0x4B6310 (LOD pick, `rl_*` pre-render) |
+| water (9) | the water instance list |
+| lights (10) | `+0x2E6` on the light records, through `cmd_r_force_time_of_day_lights` / 0x52F910 |
+| lists (11-14) | the frame's batch lists that `render_frame` consumes (render2:a3 / render4) |
+
+**Porting order (leaves first):**
+1. `frustum_test_aabb` (pure maths).
+2. The two accumulators (begin / flush) and the job object (can start synchronous: call the callback inline).
+3. The per-entry functions 0x4B5C40, 0x4B5FF0, 0x4B6160, 0x4B6310.
+4. `city_build_render_batches` steps 1-8.
+5. Water (0xB779C0), lights (0x4B7870) and the list build (0x4B6760, 0x4B74D0, 0x4B72E0).
+6. `render_frame`'s stages (table above), which consume the lists through `rl_*::render` (`rl_mesh_inst::render` 0xCF8C90: `gfx_set_shader_state3`, `mesh_render_pass7`, `mesh_render_depth`, `mesh_render_generic`).
+
+**Open:** the list layouts written in steps 11-14, and how `rl_mesh_inst::render` turns a list entry into `gfx_cmd_*` calls (`mesh_render_*`). Those need their own step-by-step pass.
+
 ## render_frame (0x52A710), by profiler stage
 
 | Stage | Calls | What |
