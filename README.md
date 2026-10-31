@@ -7,7 +7,7 @@ no game files; you need your own copy of the game.
 
 ![Progress: functions and code running in Rust, by area](docs/img/progress.svg)
 
-The original functions are replaced one at a time while the game runs. Each replacement is checked against the original in-game before it counts. The file system (archives, open/read/write/close) and the main memory-pool allocators are done; see `docs/PLAN.md` for the milestones. The world streamer (`streamman`: request queue, per-frame pump, loading infos, chunk loader, and the "hdd thread" read scheduler underneath) is mapped in `docs/analysis/05_streamer.md` and is the next system to port.
+The original functions are replaced one at a time while the game runs. Each replacement is checked against the original in-game before it counts. The file system (archives, open/read/write/close) and the main memory-pool allocators are done; see `docs/PLAN.md` for the milestones. The world streamer (`streamman`: request queue, per-frame pump, loading infos, chunk loader and its 39 section types, and the "hdd thread" read scheduler underneath) is mapped in `docs/analysis/05_streamer.md` and is the next system to port.
 
 Functions are identified mostly by `tools/harvest_names.py`: Lua script bindings, Ghidra library matches, RTTI vtable slots and constructors/destructors. Virtual methods worked out by hand are recorded per base class in `docs/vtable_slots.csv`, and the name is applied to every subclass's override (for example `fuzz_crime::get_bar_title` names that method in all 44 crime types). The game's own Direct3D 9 wrappers (`IDirect3DDevice9Lost`, `gr_vertex_buffer`, `gr_index_buffer`) are named from the COM method order in `d3d9.h`.
 
