@@ -511,3 +511,22 @@ When the pending list is empty:
 5. Call `streamman_finish_current`.
 
 Unlike `check_batch` there is no progress, after or retry callback, and a failed part is only dropped.
+
+### finish_current and start_chunk_extras in Rust
+
+`streamman_finish_current` (`0xA7CFC0`) and `streamman_start_chunk_extras` (`0xA7E100`) are in Rust
+too, both detoured (`finish_current` has 4 callers). The teleport test logs one event per finish
+(result, state, the replayed byte counts at slot +8/+0xC) and per extras start (reads and bytes
+per kind: object parts, anims, file). Original vs Rust: identical non-ambient event logs (1,030
+distinct events each). The only difference was one extras start that landed on slot 4:1
+instead of 4:0, because the free extras slot depends on timing.
+
+Extras start details that the port keeps:
+- Every part repeats the template/record lookup.
+- A record that is already loaded only gets the chunk added and nothing is read.
+- A missing or too-big mesh (parts 0/1) drops the object's nodes (`streamman_read_nodes_free_list`).
+- Missing pegs are skipped.
+- An object's nodes are spliced onto the batch only after all four parts.
+- With nothing queued, the batch goes back on the free list and the slot stays requested, so it
+  is retried on the next pump.
+

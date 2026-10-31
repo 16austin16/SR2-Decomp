@@ -43,7 +43,7 @@ const READ_RELEASE: usize = 0x00A7_4270; // (id lo, id hi, mode)
 const BATCH_CANCEL_READS: usize = 0x00A7_D9C0; // (batch)
 const BATCH_RELEASE_A: usize = 0x00A7_DA30; // (batch, mode)
 const BATCH_RELEASE_B: usize = 0x00A7_DB30; // (batch, mode)
-const START_LOAD_EXTRAS: usize = 0x00A7_E100; // (slot), type 4
+
 const POLL_BATCH_EXTRAS: usize = 0x00A7_E900; // (batch), type 4
 const PROCESS_ANIMATION: usize = 0x00A7_D0C0; // (), type 6
 const STREAMMAN_NOP: usize = 0x00A7_D810;
@@ -55,7 +55,6 @@ const ASYNC_IO_SUBMIT: usize = 0x00A7_3290; // stdcall (io manager, desc[8], boo
 const IO_MANAGER: usize = 0x00EB_80E0; // -> io manager*
 const IO_STATUS: usize = 0x00A7_41A0; // cdecl (request, sequence) -> 1 queued, 2 reading, 3 done, 4 cancelled, 5 failed
 const IO_FREE: usize = 0x00A7_3650; // stdcall (mgr, request, sequence, mode)
-const FINISH_CURRENT: usize = 0x00A7_CFC0; // () -> bool: completion callback, state 4 or abort
 const READ_NODE_POOL: usize = 0x0252_A020;
 const READ_NODE_POOL_COUNT: usize = 0x0252_A024;
 /// Written by check_batch when a finished request's sequence no longer matches (a debug "last error" copy).
@@ -84,7 +83,9 @@ const PROCESS: usize = 12;
 const WAIT: usize = 13;
 const START_LOAD_I: usize = 14;
 const CHECK_BATCH: usize = 15;
-const COUNT: usize = 16;
+const FINISH: usize = 16;
+const START_EXTRAS: usize = 17;
+const COUNT: usize = 18;
 
 /// (name, address, stolen prologue): whole, position-independent instructions.
 const PORTS: [(&str, usize, &[u8]); COUNT] = [
@@ -104,6 +105,8 @@ const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("wait", 0x00A7_D600, &[0x56, 0x8B, 0x74, 0x24, 0x08]),
     ("start_load", 0x00A7_DDE0, &[0x83, 0xEC, 0x30, 0x53, 0x8B, 0x1D, 0x18, 0xA0, 0x52, 0x02]),
     ("check_batch", 0x00A7_ED40, &[0x83, 0xEC, 0x50, 0xA1, 0x50, 0x0B, 0xE8, 0x00]),
+    ("finish_current", 0x00A7_CFC0, &[0x83, 0xEC, 0x08, 0x53, 0x55, 0x56]),
+    ("start_chunk_extras", 0x00A7_E100, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
 ];
 
 /// Trampolines to the originals.
@@ -694,7 +697,7 @@ unsafe fn process_generic() {
         let cur = rd(CURRENT) as usize;
         if rd(cur + 4) == 1 {
             if rd(cur) == 4 {
-                call(START_LOAD_EXTRAS, &[cur as u32]);
+                start_extras_hook(cur as u32); // through the hook, for the event log
             } else {
                 start_load_hook(cur as u32); // through the hook, for the event log
             }
@@ -962,7 +965,7 @@ unsafe fn check_batch(batch: usize) {
             return;
         }
         wr(s + 0x20, 0);
-        call(FINISH_CURRENT, &[]);
+        finish_current_hook(); // through the hook, for the event log
         let mut node = rd(batch + 0x10) as usize;
         while node != 0 {
             let next = rd(node + 4) as usize;
@@ -1005,6 +1008,356 @@ extern "C" fn check_batch_hook(batch: u32) {
         if rd(s + 4) != state {
             event(format!("{e} -> s{} current {}", rd(s + 4), (rd(CURRENT) as usize == s) as u8));
         }
+    }
+}
+
+/// `streamman_finish_current` (0xA7CFC0): replay the info's step sizes and
+/// alignments into the current slot's byte counts (+0x0C for steps with flag
+/// bit 0 at +0x21C, else +8), then run the info's completion callback (+0x1C).
+/// True: state 4 (loaded), no current slot. False: abort (state 3).
+unsafe fn finish_current() -> bool {
+    unsafe {
+        let cur = rd(CURRENT) as usize;
+        let info = rd(cur + 0x10) as usize;
+        wr(cur + 8, 0);
+        wr(cur + 0x0C, 0);
+        for k in 0..((rd(info + 0x20) >> 10) & 0x3FF) as usize {
+            let step = rd(info + 0x14) as usize + k * 0x244;
+            let size = rd(step + 0x210);
+            let align = *((step + 0x214) as *const u16) as u32;
+            let field = if rd(step + 0x21C) & 1 != 0 { cur + 0x0C } else { cur + 8 };
+            if align > 0 {
+                let r = rd(field) % align;
+                wr(field, rd(field).wrapping_add(if r == 0 { 0 } else { align - r }));
+            }
+            wr(field, rd(field).wrapping_add(size));
+        }
+        if call(rd(info + 0x1C) as usize, &[info as u32]) as u8 == 0 {
+            abort_current_hook(0);
+            return false;
+        }
+        wr(rd(CURRENT) as usize + 4, 4);
+        wr(CURRENT, 0);
+        true
+    }
+}
+
+extern "C" fn finish_current_hook() -> u32 {
+    CALLS[FINISH].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let cur = rd(CURRENT) as usize;
+        let e = format!("finish {}", describe(cur));
+        let r = if PUMP_RUST {
+            finish_current() as u32
+        } else {
+            let f: extern "C" fn() -> u32 = std::mem::transmute(orig(FINISH));
+            f() & 0xFF
+        };
+        event(format!("{e} -> {r} s{} bytes {:#x}/{:#x}", rd(cur + 4), rd(cur + 8), rd(cur + 0x0C)));
+        r
+    }
+}
+
+// --- Chunk extras start ---------------------------------------------------------
+
+const OBJECT_TEMPLATES: usize = 0x02BC_5B00; // 0x90-byte entries: +4 name hash, +8 name
+const OBJECT_TEMPLATES_COUNT: usize = 0x0215_D788;
+/// Streamed mesh cache: the two pools' active record lists (circular, next at +0;
+/// record +0x110 = object template, +0x10C = mesh object, +0x122 = loaded).
+const SMESH_CACHE_ACTIVE: [usize; 2] = [0x0151_259C, 0x0147_A514];
+const STRING_HASH: usize = 0x00BD_CB30; // ECX = string, EAX = seed, (u32 *out), ret 4
+const PATH_CHANGE_EXTENSION: usize = 0x00BF_F930; // ECX = src, cdecl (out, size, ext) -> bool
+const FILE_RESOLVE: usize = 0x00BF_D880; // EAX = location (0x110 bytes, size at +0x108), cdecl (name) -> AL
+const SMESH_CACHE_ADD_REF: usize = 0x006E_63F0; // ESI = object template, cdecl (chunk id) -> record
+const SMESH_CACHE_RECORD_ADD_CHUNK: usize = 0x006E_6B30; // EDI = record, cdecl (chunk id) -> bool
+const READ_NODES_FREE_LIST: usize = 0x00A7_DD50; // EAX = node list: every node back to the pool
+const ANIM_EXT: usize = 0x00E0_CACC; // ".anim_pc"
+const PART_EXTS: usize = 0x00E8_7B90; // [".smesh_pc", ".g_smesh_pc", ".peg_pc", ".g_peg_pc"]
+const PART_ALIGNS: usize = 0x00E8_7BA0; // [0x40, 0x1000, 4, 0x40]
+const SCRATCH_POOL: usize = 0x02FA_4018; // virtual_mempool for step 2
+const VIRTUAL_MEMPOOL_ALLOC: usize = 0x00BF_CA60;
+
+/// Call a game function with EAX/ECX/ESI/EDI set and three stack arguments,
+/// saving EBX/ESI/EDI/EBP. ESP is restored from EBP afterwards, so it works for
+/// cdecl and callee-clean functions alike, and for ones taking fewer arguments
+/// (the extra pushes are ignored). Everything goes through one block in EDX so
+/// no operand can sit in a register the sequence overwrites.
+unsafe fn game_call(f: usize, eax: u32, ecx: u32, esi: u32, edi: u32, args: [u32; 3]) -> u32 {
+    let block: [u32; 6] = [f as u32, esi, edi, args[0], args[1], args[2]];
+    let r: u32;
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "mov ebp, esp",
+            "push dword ptr [edx + 20]", "push dword ptr [edx + 16]", "push dword ptr [edx + 12]",
+            "mov esi, [edx + 4]", "mov edi, [edx + 8]",
+            "call dword ptr [edx]",
+            "mov esp, ebp",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("edx") block.as_ptr() => _, inout("eax") eax => r, inout("ecx") ecx => _,
+            clobber_abi("C"),
+        );
+    }
+    r
+}
+
+unsafe fn thiscall(f: usize, this: usize, args: [u32; 3]) -> u32 {
+    unsafe { game_call(f, 0, this as u32, 0, 0, args) }
+}
+
+unsafe fn vslot(obj: usize, slot: usize) -> usize {
+    unsafe { rd(rd(obj) as usize + slot * 4) as usize }
+}
+
+/// Resolve `name` (a full file name); returns its size, or None.
+unsafe fn resolve_size(name: *const u8) -> Option<u32> {
+    unsafe {
+        let mut loc = [0u8; 0x110];
+        let ok = game_call(FILE_RESOLVE, loc.as_mut_ptr() as u32, 0, 0, 0, [name as u32, 0, 0]);
+        (ok as u8 != 0).then(|| u32::from_le_bytes(loc[0x108..0x10C].try_into().unwrap()))
+    }
+}
+
+/// `name` + extension into a 0x40-byte buffer.
+unsafe fn with_ext(name: u32, ext: u32) -> [u8; 0x40] {
+    unsafe {
+        let mut buf = [0u8; 0x40];
+        game_call(PATH_CHANGE_EXTENSION, 0, name, 0, 0, [buf.as_mut_ptr() as u32, 0x40, ext]);
+        buf
+    }
+}
+
+/// A read node from the pool with the fields every extras read sets.
+unsafe fn extras_node(file: u32, ext: u32, dest: u32, kind: u32, size: u32) -> usize {
+    unsafe {
+        let node = call(READ_NODE_ALLOC, &[]) as usize;
+        wr(node + 8, file);
+        wr(node + 0x0C, ext);
+        *((node + 0x28) as *mut u8) = 0x30;
+        wr(node + 0x20, dest);
+        wr(node + 0x2C, kind);
+        wr(node + 0x24, size);
+        node
+    }
+}
+
+/// Append circular list `b` (head node) to the tail of the list whose head pointer is at `head`.
+unsafe fn list_splice(head: usize, b: usize) {
+    unsafe {
+        let a = rd(head) as usize;
+        if a == 0 {
+            wr(head, b as u32);
+        } else if b != 0 {
+            let (a_tail, b_tail) = (rd(a) as usize, rd(b) as usize);
+            wr(a_tail + 4, b as u32);
+            wr(b_tail + 4, a as u32);
+            wr(b, a_tail as u32);
+            wr(a, b_tail as u32);
+        }
+    }
+}
+
+/// Step 0 of the chunk extras, for one object name: find its object template (by
+/// name hash) and its streamed mesh cache record (on either pool's active list),
+/// and queue up to 4 parts. A record that is already loaded only gets this chunk
+/// added (`smesh_cache_record_add_chunk`) and nothing is read; without a record
+/// one is taken (`smesh_cache_add_ref`). Each part is read into the record's mesh
+/// object (+0x10C; its peg object at +0x54 for the two GPU parts) if the file
+/// exists and fits. A missing or too-big mesh (parts 0/1) drops the whole object;
+/// missing pegs are skipped. Each part repeats the lookup, as the original does.
+/// Returns the object's node list (head), or 0.
+unsafe fn extras_object(info: usize, name: u32) -> usize {
+    unsafe {
+        let chunk = *((info + 0x772) as *const u16) as u32;
+        let mut nodes = 0usize;
+        for part in 0..4usize {
+            let mut hash = 0u32;
+            game_call(STRING_HASH, 0, name, 0, 0, [&mut hash as *mut u32 as u32, 0, 0]);
+            let mut entry = 0usize;
+            for k in 0..rd(OBJECT_TEMPLATES_COUNT) as usize {
+                let e = OBJECT_TEMPLATES + k * 0x90;
+                if rd(e + 4) == hash {
+                    entry = e;
+                    break;
+                }
+            }
+            let mut rec = 0usize;
+            'lists: for list in SMESH_CACHE_ACTIVE {
+                let head = rd(list) as usize;
+                let mut o = head;
+                while o != 0 {
+                    if rd(o + 0x110) as usize == entry {
+                        rec = o;
+                        break 'lists;
+                    }
+                    o = rd(o) as usize;
+                    if o == head {
+                        break;
+                    }
+                }
+            }
+            if rec != 0 && *((rec + 0x122) as *const u8) != 0 {
+                game_call(SMESH_CACHE_RECORD_ADD_CHUNK, 0, 0, 0, rec as u32, [chunk, 0, 0]);
+                rec = 0;
+            } else if rec == 0 {
+                rec = game_call(SMESH_CACHE_ADD_REF, 0, 0, entry as u32, 0, [chunk, 0, 0]) as usize;
+            }
+            if rec == 0 {
+                game_call(READ_NODES_FREE_LIST, nodes as u32, 0, 0, 0, [0, 0, 0]);
+                return 0;
+            }
+            let ext = rd(PART_EXTS + part * 4);
+            let file = rd(entry + 8);
+            let buf = with_ext(file, ext);
+            let size = resolve_size(buf.as_ptr()).filter(|&s| s != 0);
+            let mut pool = rd(rec + 0x10C) as usize;
+            if part == 1 || part == 3 {
+                pool = rd(pool + 0x54) as usize;
+            }
+            match size {
+                Some(size) if size <= thiscall(vslot(pool, 3), pool, [0; 3]) => {
+                    let dest = thiscall(vslot(pool, 7), pool, [size, rd(PART_ALIGNS + part * 4), 0]);
+                    let node = extras_node(file, ext, dest, 0, size);
+                    wr(node + 0x30, name);
+                    list_append(&mut nodes as *mut usize as usize, node);
+                }
+                _ if part < 2 => {
+                    game_call(READ_NODES_FREE_LIST, nodes as u32, 0, 0, 0, [0, 0, 0]);
+                    return 0;
+                }
+                _ => {}
+            }
+        }
+        nodes
+    }
+}
+
+/// `streamman_start_chunk_extras` (0xA7E100): like start_load, for type 4. Read
+/// steps: 0 = objects (see `extras_object`), 1 = `.anim_pc` files into the step's
+/// pool (+0x220), 2 = one file into the scratch pool (reset first), NUL-terminated.
+/// Steps are filtered like start_load's; read priority 0x30. If nothing was
+/// queued the batch goes back on the free list and the slot stays requested
+/// (it is retried on the next pump); there is no abort path.
+unsafe fn start_extras(s: usize) {
+    unsafe {
+        let info = rd(s + 0x10) as usize;
+        let batch = rd(BATCHES_FREE) as usize;
+        if rd(batch + 4) as usize == batch {
+            wr(BATCHES_FREE, 0);
+        } else {
+            let (prev, next) = (rd(batch), rd(batch + 4));
+            wr(BATCHES_FREE, next);
+            if prev != 0 {
+                wr(prev as usize + 4, next);
+            }
+            if next != 0 {
+                wr(next as usize, prev);
+            }
+        }
+        for o in [0, 4, 8, 0x0C, 0x10, 0x14] {
+            wr(batch + o, 0);
+        }
+        *((batch + 0x18) as *mut u16) = 0xFFFF;
+
+        let mut i = 0usize;
+        while (i as u32) < (rd(info + 0x20) >> 10) & 0x3FF {
+            let step = rd(info + 0x14) as usize + i * 0x244;
+            let file = rd(step);
+            let filter = rd(info + 0x10);
+            let wanted = if filter != 0 { call(filter as usize, &[file]) as u8 != 0 } else { file != 0 };
+            if wanted {
+                match i {
+                    1 => {
+                        for j in 0..(rd(step + 0x208) as i32).max(0) as usize {
+                            let name = rd(step + 8 + j * 4);
+                            let buf = with_ext(name, ANIM_EXT as u32);
+                            let Some(size) = resolve_size(buf.as_ptr()).filter(|&s| s != 0) else { continue };
+                            let pool = rd(step + 0x220) as usize;
+                            if size > thiscall(vslot(pool, 3), pool, [0; 3]) {
+                                continue;
+                            }
+                            let align = *((step + 0x214) as *const u16) as u32;
+                            let dest = thiscall(vslot(pool, 7), pool, [size, align, 0]);
+                            let node = extras_node(name, ANIM_EXT as u32, dest, 1, size);
+                            list_append(batch + 0x0C, node);
+                        }
+                    }
+                    2 => {
+                        let mut size = 0u32;
+                        if file_get_size(file, &mut size) && size != 0 {
+                            thiscall(vslot(SCRATCH_POOL, 13), SCRATCH_POOL, [0; 3]);
+                            if size <= rd(SCRATCH_POOL + 0x3C).wrapping_sub(rd(SCRATCH_POOL + 0x44)) {
+                                let align = *((step + 0x214) as *const u16) as u32;
+                                let dest = thiscall(VIRTUAL_MEMPOOL_ALLOC, SCRATCH_POOL, [size + 1, align, 0]);
+                                let node = extras_node(file, 0, dest, 2, size);
+                                *((dest as usize + size as usize) as *mut u8) = 0;
+                                list_append(batch + 0x0C, node);
+                            }
+                        }
+                    }
+                    0 => {
+                        for j in 0..(rd(step + 0x208) as i32).max(0) as usize {
+                            let nodes = extras_object(info, rd(step + 8 + j * 4));
+                            list_splice(batch + 0x0C, nodes);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        if rd(batch + 0x0C) != 0 {
+            wr(s + 0x20, batch as u32);
+            wr(s + 0x18, 0);
+            wr(s + 0x1C, 0);
+            wr(batch + 0x14, s as u32);
+            list_append(BATCHES_ACTIVE, batch);
+            let head = rd(batch + 0x0C) as usize;
+            let mut n = head;
+            while n != 0 {
+                let desc = [rd(n + 8), rd(n + 0x0C), 0, rd(n + 0x24), rd(n + 0x20), *((n + 0x28) as *const u8) as u32, 0, 0];
+                let (lo, hi) = io_submit(&desc);
+                wr(n + 0x10, lo);
+                wr(n + 0x14, hi);
+                n = rd(n + 4) as usize;
+                if n == rd(batch + 0x0C) as usize {
+                    break;
+                }
+            }
+            wr(s + 4, 2);
+        } else {
+            list_append(BATCHES_FREE, batch);
+        }
+    }
+}
+
+extern "C" fn start_extras_hook(s: u32) {
+    CALLS[START_EXTRAS].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let s = s as usize;
+        let e = format!("start_extras {}", describe(s));
+        if PUMP_RUST {
+            start_extras(s);
+        } else {
+            let f: extern "C" fn(u32) = std::mem::transmute(orig(START_EXTRAS));
+            f(s as u32);
+        }
+        // Reads per kind (+0x2C: 0 object part, 1 anim, 2 file) with their bytes.
+        let mut kinds = [(0u32, 0u32); 3];
+        if rd(s + 4) == 2 {
+            let head = rd(rd(s + 0x20) as usize + 0x0C) as usize;
+            let mut n = head;
+            while n != 0 {
+                let k = (rd(n + 0x2C) as usize).min(2);
+                kinds[k].0 += 1;
+                kinds[k].1 = kinds[k].1.wrapping_add(rd(n + 0x24));
+                n = rd(n + 4) as usize;
+                if n == head {
+                    break;
+                }
+            }
+        }
+        event(format!("{e} -> s{} parts {:?} anims {:?} file {:?}", rd(s + 4), kinds[0], kinds[1], kinds[2]));
     }
 }
 
@@ -1203,6 +1556,8 @@ fn hook_address(i: usize) -> usize {
         WAIT => wait_hook as extern "C" fn(u32) -> u32 as usize,
         START_LOAD_I => start_load_hook as extern "C" fn(u32) as usize,
         CHECK_BATCH => check_batch_hook as extern "C" fn(u32) as usize,
+        FINISH => finish_current_hook as extern "C" fn() -> u32 as usize,
+        START_EXTRAS => start_extras_hook as extern "C" fn(u32) as usize,
         _ => unreachable!(),
     }
 }
