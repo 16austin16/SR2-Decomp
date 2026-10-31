@@ -102,12 +102,12 @@ Handlers are named `render_deferred_h<type>_<api>`. "Record" is what the handler
 | 18 / 19 / 1A | 0xCFA450 / 0xCFA340 / 0xCFA330 | `im2d_c_begin` 0xD0A580 / `_add` 0xD0A4F0 / `_end` 0xD0A4B0 | ESI = &{state pair} / ESI = count + cdecl (data) / - | batch at 0x22F6430 with its own vertex declaration |
 | 1B / 1C / 1D | 0xCFA2A0 / 0xCFA190 / 0xCFA180 | `im2d_strip_begin` 0xD0A440 / `_add` 0xD0A380 / `_end` 0xD0A330 | ECX = &{state pair} / ESI = count ≤ 64 + cdecl (vertices) / - | strip; end = `gfx_2d_flush(TRIANGLESTRIP, n - 2)` |
 | 1E / 1F / 20 | 0xCFA0F0 / 0xCF9FE0 / 0xCF9FD0 | `im2d_list_begin` 0xD0A2C0 / `_add` 0xD0A1F0 / `_end` 0xD0A190 | same | list; end = `gfx_2d_flush(TRIANGLELIST, n / 3)` |
-| 21 | 0xCF9E60 | `im2d_draw_quad` 0xD0A130 | ESI, EDI + cdecl (ptr), pops 4 | state block, 0xD1E330 |
-| 22 / 23 / 24 | 0xCF9D00 / 0xCF9AD0 / 0xCF9910 | `im2d_draw_22` 0xD0B980 / `_23` 0xD0B7D0 / `_24` 0xD0A5E0 | cdecl 5 / EDI + 6 / 4 floats + 1 | 2D shapes over the strip / list batches (role open) |
-| 25 | 0xCFBA10 | `gfx_draw_25` 0xD13A60 | EAX + cdecl (float, ptr), pops 8 | role open |
+| 21 | 0xCF9E60 | `im2d_draw_line` 0xD0A130 | ESI, EDI + cdecl (ptr), pops 4 | state block, 0xD1E330 |
+| 22 / 23 / 24 | 0xCF9D00 / 0xCF9AD0 / 0xCF9910 | `im2d_fill_rect` 0xD0B980 / `im2d_draw_textured_rect` 0xD0B7D0 / `im2d_draw_rotated_bitmap` 0xD0A5E0 | cdecl 5 / EDI + 6 / 4 floats + 1 | 2D shapes over the strip / list batches (role open) |
+| 25 | 0xCFBA10 | `gfx_draw_world_sprite` 0xD13A60 | EAX + cdecl (float, ptr), pops 8 | role open |
 | 26 / 27 | 0xCF9810 / 0xCF9800 | `gfx_set_render_target_level` 0xD1EF80 / `gfx_restore_default_targets` 0xD1EF40 | ESI = target index, EDX = level + cdecl (3 bools) / - | 26: render target `0x22FDC28[index]` level `level` (GetSurfaceLevel), then optional clears; 27: the default render target, depth target and viewport (0x22F63F8 / 0x22F63FC) |
 | 28 | 0xCFB240 | queued by `gfx_queue_28` 0xD09D90 (16 dwords from 0x25282F4…) | - | calls 0x7715E0 with 8 floats (the pause map) |
-| 29 | 0xCFB450 | `gfx_draw_29` 0xD15E80 | EDI, EAX + cdecl 6, pops 0x18 | role open |
+| 29 | 0xCFB450 | `gfx_draw_text_world` 0xD15E80 | EDI, EAX + cdecl 6, pops 0x18 | role open |
 | 2A | 0xCF9060 | `render_deferred_h_call_fn` | record {fn, arg} | `fn(arg)` on the render thread. `gfx_queue_call_79edf0` (0xCF90E0) uses it |
 
 "Role open" rows are named from their shape. Port them by copying the record layout, and name them once traced in-game.
@@ -198,6 +198,75 @@ The 0x1C-byte entries are filled at shader load. The default pair is entry 6 (0x
    2. Then `dev->SetClipPlane(index, {a, b, c, d})` (slot 55) **directly on the device**, not through the ring.
 
 `0x252A314` is the enabled-plane mask, and it is kept even when the cache already matches.
+
+### 2D batches and shapes, step by step
+
+**Shader-pair entries** (0xE84AF0 + index × 0x1C):
+
+| Off | Field |
+|---|---|
+| +0 | vertex shader |
+| +4 | pixel shader |
+| +0xC | vertex declaration |
+| +0x10 | vertex stride |
+
+The 2D code picks between them:
+- entries 0-3 for the declared-vertex batch: 0 / 1 textured / untextured, 2 / 3 the same when `pair.b & 0xF00`;
+- entries 4 / 5 for the strip / list batch: textured / untextured.
+
+The vertex declaration goes through its own cache `0x252A30C` (ring 5, SetVertexDeclaration).
+
+**`gfx_2d_alloc`** (0xD1E070; cdecl `(count)`; returns the vertex buffer `0x22F6438` (0x1C stride), or 0 when a batch is already pending):
+1. If `0x252A2FC` (pending) is set, return 0. Callers flush first.
+2. `0x252A2FC = 1`, `0x252A2F8 = count`.
+3. Sampler 0 MIPFILTER (7) and MAGFILTER (5) = 2 (linear), through the sampler cache `0x22F530C` / `0x22F5304` (ring 19).
+4. `index = 4 + (0xE84AA8[0] < 0)`. The 0xE84AA8 bitmap cache tells whether a texture is bound.
+5. Set the declaration from that entry through the cache.
+6. `gfx_bind_shader_pair(EAX = index)`.
+7. Return `0x22F6438`.
+
+The vertices are flushed later by `gfx_2d_flush` (strip / list end, or the next shape).
+
+**Strip / list vertex** (0x1C bytes):
+
+| Off | Field |
+|---|---|
+| +0 / +4 | f32 x, y (screen) |
+| +8 / +0xC | not written by the 2D code |
+| +0x10 | u8 r, g, b, a |
+| +0x14 / +0x18 | f32 u, v |
+
+**Declared-vertex batch (`im2d_c_*`).** Its vertices are 0x24 bytes and its stride comes from the entry.
+- **`im2d_c_begin`** (0xD0A580; `ESI` = &state pair):
+  1. Defer as type 0x18. Otherwise:
+  2. `gfx_set_render_state_block(ECX = pair)`.
+  3. `0x252A300 = gfx_2d_bind_material(pair)` (0xD1DEB0). That binds stage 0 to the context bitmap (`gfx_set_texture_cached(0, ctx+0x38)`), picks entry `(pair.b & 0xF00 ? 2 : 0) + (bitmap < 0)`, sets its declaration and shaders, stores the stride in `0x22F6430` and returns it.
+  4. `0xE863C0 = −1`.
+- **`im2d_c_add`** (0xD0A4F0; `ESI` = count; cdecl `(src)`; returns the vertex pointer):
+  1. **Deferred**: type 0x19 with a VTX of `count × 0x24` bytes; return the record's space for the caller to fill.
+  2. **Immediate**: `gfx_2d_c_alloc(count)` (0xD1E600). If a batch is open (`0xE863C0 >= 0`), it first draws it: `gfx_cmd_draw_up(ECX = n − 2, EDI = 5 (strip), EDX = stride, push 0x22FD438)`, then clears the eight dwords `0x2304D6C..0x2304D98`. Then `0xE863C0 = count`, and it returns `0x22FD438`.
+  3. If `src` is given, memcpy `count × 0x24` bytes into the buffer.
+- **`im2d_c_end`** (0xD0A4B0): defer as type 0x1A, or `gfx_2d_c_flush` (0xD1E590): the same draw as above, then `0xE863C0 = −1`.
+
+**`gfx_cmd_draw_up`** (0xD217F0): `ECX` = primitive count, `EDI` = D3DPRIMITIVETYPE, `EDX` = stride, then a push of the data pointer; the caller pops 4.
+
+**`gfx_clip_rect_to_viewport`** (0xD0A050; cdecl `(int *x, int *y, int *w, int *h)` → bool):
+1. Offset x / y by the viewport origin (ctx+8 / +0x10).
+2. Clip against the viewport (origin + size at ctx+0x18 / +0x1C). It adjusts x / y / w / h in place.
+3. Return 0 when nothing is left.
+
+**Shapes:**
+
+| Type | API (renamed) | Convention | Steps |
+|---|---|---|---|
+| 21 | `im2d_draw_line` 0xD0A130 (was im2d_draw_quad) | `ESI` = &pair, `EDI` = &p0 (vec3), cdecl `(&p1)` | Defer, or `gfx_set_render_state_block`, then `gfx_draw_line_immediate` (0xD1E330; `EAX` = &p0, `ECX` = &p1, cdecl `(&pair)`). That builds 2 vertices with the colour × 255 (u, v = 0, 0 and 1, 1), binds no bitmap (`gfx_set_bitmap(−1)`) and `gfx_2d_bind_material(pair)`, then `gfx_cmd_draw_up(1, D3DPT_LINELIST, stride, verts)` and clears 0x2304D6C..D98 |
+| 22 | `im2d_fill_rect` 0xD0B980 | cdecl `(int x, y, w, h, &pair)` | `gfx_clip_rect_to_viewport` (return if empty), defer, or: no bitmap, colour × 255, `im2d_strip_begin(pair)`, `im2d_strip_add` of 4 corners, `im2d_strip_end` |
+| 23 | `im2d_draw_textured_rect` 0xD0B7D0 | `EDI` = bitmap; cdecl `(int x, y, w, h, 4 UV values, &pair)` | Clip, defer, or: bitmap, colour, one strip quad with the given UV rectangle |
+| 12 | `gfx_draw_bitmap` 0xD11240 | `EAX` + cdecl 10, pops 0x2C | Defer, or: bitmap and state block; 0xD09E70 computes the clipped screen and UV rectangle; 0xD1F0D0 binds the texture and emits one strip quad (`im2d_strip_begin`, `gfx_2d_flush` + `gfx_2d_alloc(4)`, or deferred type 0x1C with the write-back) |
+| 24 | `im2d_draw_rotated_bitmap` 0xD0A5E0 | `u32` + cdecl 4 floats + &pair | Uses sin / cos (0x428CD0 / 0x40B820) of an angle and the bitmap's size (0xC094E0) to rotate the quad's corners, then one strip quad. *Name from structure* |
+| 17 | `im2d_draw_17` 0xD0B020 | `ECX` + cdecl 4 floats | 400 FPU instructions, texture via `gfx_set_texture_cached`, `gfx_clip_rect_to_viewport`, 0xD1E690. Several quads (probably a stretched or framed bitmap). *Role still open* |
+| 25 | `gfx_draw_world_sprite` 0xD13A60 | `EAX` + cdecl `(f32, ptr)` | Projects a world position through the thread state's camera (0xD22CE0 reads `gfx_get_thread_state()+0x1554 / +0x1720`), sin / cos for rotation, then a screen quad. *Name from structure* |
+| 29 | `gfx_draw_text_world` 0xD15E80 | `EDI`, `EAX` + cdecl 6, pops 0x18 | UTF-16 text through 0xD156D0 (`font_lookup`, `font_glyph_metrics_wide`, `im2d_strip_begin`), positioned from two vec3s (0x729F30); sets sampler states first. *Name from structure: text placed by world position* |
 
 ### The text path, step by step
 
@@ -325,14 +394,14 @@ What each handler stores in mode 0. Fields are 4 bytes in order; `f32` arguments
 | 17 | `im2d_draw_17` | f32 × 4, pair8 |
 | 18, 1B, 1E | `im2d_*_begin` | pair8 |
 | 19, 1C, 1F | `im2d_*_add` | VTX |
-| 21 | `im2d_draw_quad` | 12 bytes (from ESI), 12 bytes (from EDI), pair8 |
-| 22 | `im2d_draw_22` | 4 × u32, pair8 |
-| 23 | `im2d_draw_23` | 8 × u32, pair8 |
-| 24 | `im2d_draw_24` | u32, f32 × 4, pair8 |
-| 25 | `gfx_draw_25` | 12 bytes, f32, pair8 |
+| 21 | `im2d_draw_line` | 12 bytes (from ESI), 12 bytes (from EDI), pair8 |
+| 22 | `im2d_fill_rect` | 4 × u32, pair8 |
+| 23 | `im2d_draw_textured_rect` | 8 × u32, pair8 |
+| 24 | `im2d_draw_rotated_bitmap` | u32, f32 × 4, pair8 |
+| 25 | `gfx_draw_world_sprite` | 12 bytes, f32, pair8 |
 | 26 | `gfx_set_render_target_level` | index, level, 3 × bool |
 | 28 | (pause map draw 0x7715E0) | f32 × 8 |
-| 29 | `gfx_draw_29` | f32, f32, STR, u32, 12 bytes, 12 bytes, u32, u32, pair8 |
+| 29 | `gfx_draw_text_world` | f32, f32, STR, u32, 12 bytes, 12 bytes, u32, u32, pair8 |
 | 2A | callback | fn, arg |
 
 Each handler checks `used + size <= space` before every field. When a field doesn't fit, it returns 0 and `render_deferred_queue` marks the list overflowed (0x16801). The VTX check happens before the space is handed out.
