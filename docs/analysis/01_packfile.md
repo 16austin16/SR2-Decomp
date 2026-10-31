@@ -207,10 +207,33 @@ Hand-decoded with capstone (Observed).
 - `mount_temp` was logged observe-only first (`golden/temp_mounts.txt`), then switched to Rust; the log of a city load is identical.
 - Loading a save temp-mounts `hmaps.vpp_pc` (from 0xC0B70A) and then `city_load.vpp_pc` (from 0x69D26C), both in temp slot 0 with mark 53031, so `hmaps` is unmounted in between.
 
+## 5c. `file_resolve` (0xBFD880) and the search-path table
+
+Hand-decoded with capstone (Observed). It takes EAX = `location*` and a stack name, caller-clean, and returns AL.
+
+`location` is 0x110 bytes: kind +0, arg +4, `char path[0x100]` +8, size +0x108, `vpp_entry*` +0x10C.
+
+1. Initialise: kind = arg = -1, `path[0] = 0`, size = entry = 0.
+2. For each `{kind, arg}` in `0x2347678[count 0x252A540]` (the count is re-read every pass), dispatch on kind. Any other kind stops the walk and returns 0. The first hit returns 1.
+   - **Kind 0, `0xC18130`** (EDI = loc): fails unless arg == 0.
+     - `fopen(name, "rb")`, then `strncpy(path, name, 0xFF)`, then kind = arg = 0.
+     - `fseek(END)`, then `_ftelli64`; size = the result.
+     - `fclose`. A failed seek or a size of 0xFFFFFFFF or more fails *after* writing kind/arg/path, and leaks the FILE*.
+   - **Kind 1, `0xBFD7A0`** (ESI = loc): `e = packfile_find_entry(name)`. If NULL, fail with nothing written. Otherwise:
+     - entry = e, arg = arg, kind = 1;
+     - `strncpy(path, name, 0x100)`, `path[0xFF] = 0`;
+     - size = `e+0x10`.
+   - **Kind 2, `0xBFD800`** (ESI = loc, ECX = name): calls `0xC1DA80(path, 0x100, &size)`, an indexed lookup through `0xC20CA0` (basename, a string table at `0x252A630`), then `_stat`. Not decoded further.
+
+**Search-path table at runtime (PC, 2026-10-31):** `[{1,0}, {0,0}, {1,1}]`, so a packfile is searched first, then a loose file on disk, then a packfile again with arg 1. **Archives win over loose files.** A loose file is only used when no archive has that name, so a mod has to go into an archive (as `decomp.vpp_pc` does) to replace a shipped file. Kind 2 is never used.
+
+**Ported (hooks.rs).** The loop and kinds 0 and 1 are in Rust; kind 0 calls the game's own CRT. Kind 2 goes through a shim. Every call is shadow-checked: the original runs on a copy of the location, all 0x110 bytes and the result are compared, and the original's answer is kept on a mismatch. A boot plus city load gave 22,159 calls and 0 mismatches: 22,029 from packfiles, 46 from disk, 84 missing. Boot mounts were unchanged.
+
 ## 6. Open questions
 
 - `packfile_mount_temp` callers: 0x69d250 mounts `city_load.vpp_pc` and 0xc0b6f0 mounts `hmaps.vpp_pc` on a save load. 0xc0b640 has not been seen yet. The temp unmount (it should rewind the record count to the mark) is not traced yet.
 - How the remaining archives get mounted (`shaders`, `startup`, `vint_docs`, `misc_tables_startup`, which are not in the 0xe98a28 table).
-- The search-path table `DAT_0234767c` contents and order (does disk override packfile?).
+- ~~The search-path table contents and order~~: answered in §5c (packfile, disk, packfile; archives win). Who builds it (0xBFDA70–0xBFDC14 and 0xBFF22A–0xBFF689 touch it) is still open.
+- Kind-2 indexed lookup (0xC1DA80, 0xC20CA0, `0x252A630`): what it indexes, and whether any build uses it.
 - `FUN_00bff700` (path normalisation: strip directory? lowercase?), `FUN_00c0ae90` (is-mounted check), and `FUN_00bfd930`/`FUN_00bfdf30` (open/close).
 - The async streaming path (OVERLAPPED reads, `entry+8` sector use) needs a separate pass.

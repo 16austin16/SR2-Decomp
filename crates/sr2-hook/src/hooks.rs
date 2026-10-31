@@ -32,6 +32,9 @@ extern "C" fn game_frame_tick_hook() -> i32 {
         find_record_verify();
         find_entry_verify();
     }
+    if n == 1 || n == FIND_RECORD_VERIFY_FRAME || n.is_multiple_of(3600) {
+        log(&file_resolve_summary());
+    }
     if n.is_multiple_of(3600) && FIND_ENTRY_SHADOW {
         log(&format!(
             "find_entry live: {} calls, {} mismatches",
@@ -748,7 +751,255 @@ fn find_entry_verify() {
     }
 }
 
-/// FNV-1a, used to fingerprint mount results so two boots can be diffed.
+// --- 0xBFD880 file_resolve (replaced, original shadow-checked) -------------
+
+/// LTCG: EAX = `location*`, stack `const char* name`, caller-clean, AL = found.
+/// Walks the search-path table and fills the location from the first source
+/// that has the file. Prologue `sub esp,8; push ebx; mov ebx,[esp+10]`: 8
+/// bytes, stack-relative only.
+const FILE_RESOLVE: usize = 0x00BF_D880;
+const FILE_RESOLVE_PROLOGUE: [u8; 8] = [0x83, 0xEC, 0x08, 0x53, 0x8B, 0x5C, 0x24, 0x10];
+
+/// `{kind: u32, arg: u32}[count]`. Kind 0 = loose file on disk, 1 = packfile,
+/// 2 = the indexed lookup at 0xBFD800; any other kind stops the walk.
+const G_SEARCH_PATHS: usize = 0x0234_7678;
+const G_SEARCH_PATH_COUNT: usize = 0x0252_A540; // u32
+
+/// `0xBFD800`: kind-2 lookup (ESI = location, ECX = name, stack arg). Goes
+/// through 0xC1DA80 / 0xC20CA0 and `_stat`; not ported yet.
+const FILE_RESOLVE_INDEXED: usize = 0x00BF_D800;
+
+// The game's CRT (cdecl). Kind 0 keeps using it so the FILE* never crosses CRTs.
+const CRT_FOPEN: usize = 0x00C9_9705;
+const CRT_FSEEK: usize = 0x00C9_8287;
+const CRT_FTELLI64: usize = 0x00C9_FC60;
+const CRT_FCLOSE: usize = 0x00C9_78DE;
+
+/// `location` (0x110 bytes): kind +0, arg +4, path `char[0x100]` +8, size
+/// +0x108, `vpp_entry*` +0x10C.
+const LOCATION_SIZE: usize = 0x110;
+
+static FILE_RESOLVE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// Run the original on a copy of the location for every call, compare all
+/// 0x110 bytes and the result, and keep the original's answer on a mismatch.
+/// Kind 0 opens and closes the file twice as a result; nothing else repeats.
+const FILE_RESOLVE_SHADOW: bool = true;
+static FILE_RESOLVE_CALLS: AtomicU32 = AtomicU32::new(0);
+static FILE_RESOLVE_MISMATCHES: AtomicU32 = AtomicU32::new(0);
+/// Hits per kind (0, 1, 2) and misses, for the periodic summary.
+static FILE_RESOLVE_HITS: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+
+/// `strncpy(dst, src, n)`: copy up to `n` bytes, zero-pad the rest of `n`.
+unsafe fn strncpy(dst: *mut u8, src: *const u8, n: usize) {
+    unsafe {
+        let s = cstr(src);
+        let k = s.len().min(n);
+        std::ptr::copy_nonoverlapping(s.as_ptr(), dst, k);
+        std::ptr::write_bytes(dst.add(k), 0, n - k);
+    }
+}
+
+/// `0xC18130` (EDI = location, stack name, arg): a loose file, if `arg` is 0
+/// and `fopen(name, "rb")` works. Kind/arg/path are written before the size
+/// probe, and a failed seek or a size of 4 GiB or more leaks the FILE*, as in
+/// the original.
+unsafe fn resolve_on_disk(loc: *mut u8, name: *const u8, arg: u32) -> bool {
+    unsafe {
+        if arg != 0 {
+            return false;
+        }
+        let fopen: extern "C" fn(*const u8, *const u8) -> *mut u8 = std::mem::transmute(CRT_FOPEN);
+        let fseek: extern "C" fn(*mut u8, i32, i32) -> i32 = std::mem::transmute(CRT_FSEEK);
+        let ftelli64: extern "C" fn(*mut u8) -> i64 = std::mem::transmute(CRT_FTELLI64);
+        let fclose: extern "C" fn(*mut u8) -> i32 = std::mem::transmute(CRT_FCLOSE);
+        let f = fopen(name, STR_RB as *const u8);
+        if f.is_null() {
+            return false;
+        }
+        strncpy(loc.add(8), name, 0xFF);
+        *loc.add(0x107) = 0;
+        *(loc as *mut u32) = 0;
+        *(loc.add(4) as *mut u32) = 0;
+        if fseek(f, 0, 2) != 0 {
+            return false;
+        }
+        let size = ftelli64(f);
+        if size as u64 > 0xFFFF_FFFE {
+            return false;
+        }
+        *(loc.add(0x108) as *mut u32) = size as u32;
+        fclose(f);
+        true
+    }
+}
+
+/// `0xBFD7A0` (ESI = location, stack name, arg): the file in a packfile.
+unsafe fn resolve_in_packfile(loc: *mut u8, name: *const u8, arg: u32) -> bool {
+    unsafe {
+        let e = packfile_find_entry_hook(name);
+        if e.is_null() {
+            return false;
+        }
+        *(loc.add(0x10C) as *mut *const VppEntry) = e;
+        *(loc.add(4) as *mut u32) = arg;
+        *(loc as *mut u32) = 1;
+        strncpy(loc.add(8), name, 0x100);
+        *loc.add(0x107) = 0;
+        *(loc.add(0x108) as *mut u32) = *(e.cast::<u8>().add(0x10) as *const u32);
+        true
+    }
+}
+
+unsafe fn resolve_indexed(loc: *mut u8, name: *const u8, arg: u32) -> bool {
+    let r: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "mov esi, {loc}",
+            "push {arg}",
+            "call {f}",
+            "add esp, 4",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) FILE_RESOLVE_INDEXED,
+            loc = in(reg) loc,
+            arg = in(reg) arg,
+            in("ecx") name,
+            lateout("eax") r,
+            clobber_abi("C"),
+        );
+    }
+    r as u8 != 0
+}
+
+/// Rust port of `file_resolve` (0xBFD880). Returns the kind that matched.
+unsafe fn file_resolve(loc: *mut u8, name: *const u8) -> Option<u32> {
+    unsafe {
+        *(loc as *mut i32) = -1;
+        *(loc.add(4) as *mut i32) = -1;
+        *loc.add(8) = 0;
+        *(loc.add(0x108) as *mut u32) = 0;
+        *(loc.add(0x10C) as *mut u32) = 0;
+        let table = G_SEARCH_PATHS as *const [u32; 2];
+        // The count is re-read every iteration, as in the original.
+        let mut i = 0;
+        while i < *(G_SEARCH_PATH_COUNT as *const u32) {
+            let [kind, arg] = *table.add(i as usize);
+            let found = match kind {
+                0 => resolve_on_disk(loc, name, arg),
+                1 => resolve_in_packfile(loc, name, arg),
+                2 => resolve_indexed(loc, name, arg),
+                _ => return None,
+            };
+            if found {
+                return Some(kind);
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+/// Call the original's convention: EAX = location, stack name.
+unsafe fn call_file_resolve(f: usize, loc: *mut u8, name: *const u8) -> bool {
+    let r: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "push {name}",
+            "call {f}",
+            "add esp, 4",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) f,
+            name = in(reg) name,
+            inout("eax") loc => r,
+            clobber_abi("C"),
+        );
+    }
+    r as u8 != 0
+}
+
+extern "C" fn file_resolve_hook(loc: *mut u8, name: *const u8) -> u32 {
+    let original = FILE_RESOLVE_ORIGINAL.load(Ordering::Relaxed);
+    let mut shadow = [0u8; LOCATION_SIZE];
+    let check = FILE_RESOLVE_SHADOW && original != 0;
+    if check {
+        // Same starting bytes, so identical writes give identical structs.
+        unsafe { std::ptr::copy_nonoverlapping(loc, shadow.as_mut_ptr(), LOCATION_SIZE) };
+    }
+    let kind = unsafe { file_resolve(loc, name) };
+    FILE_RESOLVE_HITS[kind.map_or(3, |k| k as usize)].fetch_add(1, Ordering::Relaxed);
+    if check {
+        FILE_RESOLVE_CALLS.fetch_add(1, Ordering::Relaxed);
+        let o = unsafe { call_file_resolve(original, shadow.as_mut_ptr(), name) };
+        let same = o == kind.is_some() && unsafe { std::slice::from_raw_parts(loc, LOCATION_SIZE) } == shadow;
+        if !same {
+            if FILE_RESOLVE_MISMATCHES.fetch_add(1, Ordering::Relaxed) < 10 {
+                let rd = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+                let ours = unsafe { std::slice::from_raw_parts(loc, LOCATION_SIZE) };
+                log(&format!(
+                    "file_resolve mismatch for {:?}: original {o} kind {} size {:#x}, rust {:?} kind {} size {:#x}",
+                    String::from_utf8_lossy(unsafe { cstr(name) }),
+                    rd(&shadow, 0) as i32,
+                    rd(&shadow, 0x108),
+                    kind,
+                    rd(ours, 0) as i32,
+                    rd(ours, 0x108)
+                ));
+            }
+            unsafe { std::ptr::copy_nonoverlapping(shadow.as_ptr(), loc, LOCATION_SIZE) };
+            return o as u32;
+        }
+    }
+    kind.is_some() as u32
+}
+
+#[unsafe(naked)]
+extern "C" fn file_resolve_thunk() {
+    naked_asm!(
+        "push dword ptr [esp + 4]", // name
+        "push eax",                 // location
+        "call {f}",
+        "add esp, 8",
+        "ret",
+        f = sym file_resolve_hook,
+    )
+}
+
+fn search_path_table() -> String {
+    unsafe {
+        let n = *(G_SEARCH_PATH_COUNT as *const u32);
+        let table = G_SEARCH_PATHS as *const [u32; 2];
+        let items: Vec<String> = (0..n.min(16)).map(|i| format!("{:?}", *table.add(i as usize))).collect();
+        format!("{n} [{}]", items.join(", "))
+    }
+}
+
+fn file_resolve_summary() -> String {
+    let h = |i: usize| FILE_RESOLVE_HITS[i].load(Ordering::Relaxed);
+    format!(
+        "file_resolve live: {} checked, {} mismatches | disk {} packfile {} indexed {} missing {} | search paths {}",
+        FILE_RESOLVE_CALLS.load(Ordering::Relaxed),
+        FILE_RESOLVE_MISMATCHES.load(Ordering::Relaxed),
+        h(0),
+        h(1),
+        h(2),
+        h(3),
+        search_path_table()
+    )
+}
+
 fn fnv(h: &mut u32, bytes: &[u8]) {
     for &b in bytes {
         *h = (*h ^ b as u32).wrapping_mul(0x0100_0193);
@@ -937,5 +1188,17 @@ pub fn install_early() {
             log(&format!("hooked packfile_mount_temp @ 0xc0a970 ({which})"));
         }
         Err(e) => log(&format!("hook packfile_mount_temp failed: {e:?}")),
+    }
+
+    // Every file_open at boot goes through here, so hook it before the mounts.
+    match unsafe { detour::install(FILE_RESOLVE, &FILE_RESOLVE_PROLOGUE, file_resolve_thunk as extern "C" fn() as usize) } {
+        Ok(tramp) => {
+            FILE_RESOLVE_ORIGINAL.store(tramp, Ordering::Relaxed);
+            log(&format!(
+                "replaced file_resolve @ 0xbfd880 with Rust (shadow-checked), search paths {}",
+                search_path_table()
+            ));
+        }
+        Err(e) => log(&format!("hook file_resolve failed: {e:?}")),
     }
 }

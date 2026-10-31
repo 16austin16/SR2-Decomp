@@ -46,4 +46,5 @@ original. The standalone build can move to 64-bit later.
 8. ✅ First visible change: an override archive (`decomp.vpp_pc`, mounted after patch) plus a peg reader/writer, used to add "Decomp" to the main-menu logo. See `docs/analysis/02_ui_textures_and_overrides.md`.
 9. ✅ City load tested: Continue → crib with every Rust hook live, no fallbacks. Game input works through `SendInput` scancodes.
 10. ✅ `packfile_find_entry` @0xC0AD80 → Rust, shadow-checked against the original on every call (212k-query sweep plus 37k live calls, 0 mismatches). `packfile_mount_temp` @0xC0A970 → Rust; its city-load log is identical to `docs/analysis/golden/temp_mounts.txt`.
-11. Next: the file layer above (`file_open`, `file_resolve` and the search-path table, `file_read`), and the temp unmount.
+11. ✅ `file_resolve` @0xBFD880 → Rust (kinds 0 and 1; kind 2 shimmed), shadow-checked on every call: 22,159 calls in a boot plus city load, 0 mismatches. The search order is packfile, disk, packfile, so archives win over loose files.
+12. Next: `file_open` (0xBFDC20, with `0xBFD710` alloc and `0xBFD930` open), `file_read`, and the temp unmount.
