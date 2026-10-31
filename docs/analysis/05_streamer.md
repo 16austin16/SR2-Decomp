@@ -250,7 +250,7 @@ Debug: flag `0x2529DDB` makes reads of `player.cvtf` copy from memory (`0x2223CC
 | Type | Handler | What it fills |
 |---|---|---|
 | 0x00 | `0x4ACDF0` objects | The main section. Object names (rec+0xEC/+0xF0); objects, 0x50 bytes each (rec+0x48 count, +0x4C), each pointing to a 0x60-byte render-info entry (rec+0x40/+0x44) and given a squared fade distance from the table `0x144EA40`; 3-level LOD sets; several typed arrays; 0x54-byte entries flagged 0x80000/0x100000 spawn entities through `0xA69E00` (kinds 0xF / 0x14) |
-| 0x01 | `0x4ADCD0` | 0x94-byte named entries (rec+0x104/+0x108) with per-entry scale floats and u16 lists |
+| 0x01 | `0x4ADCD0` lights | **Lights**: 0x94-byte entries (rec+0x104/+0x108): RGB colour, position, direction, orientation, ranges and fade distance, name, optional intensity values |
 | 0x02 | `0x4A35E0` | 0x28-byte entries (rec+0x134/+0x138), then `0x7F63B0` |
 | 0x03 | inline | **player starts** (`PlayerStart01`, …): count/pointer at rec+0x10C/+0x110 |
 | 0x04 | `0x4ADF20` render_items | 0xC8-byte render items (rec+0x5C/+0x60) and a node tree (rec+0x64); `game_render` collects the visible ones through the tree (`0x5239A0`); dropped for flag-bit-0 chunks |
@@ -259,13 +259,13 @@ Debug: flag `0x2529DDB` makes reads of `player.cvtf` copy from memory (`0x2223CC
 | 0x07, 0x08 | `0x4AE240`, `0x4AE280` collision_mopp | **Havok MOPP collision** (`BBPF`/`MOPP` in the data): two count/array pairs each (rec+0x68..+0x74, +0x78..+0x84); cleared when chunk flags & 0x13 |
 | 0x09 | inline | count/pointer at rec+0x88/+0x8C |
 | 0x0A | `0xA8AC00` | 0x3C- and 0x28-byte entries (rec+0x13C..+0x148), then `0xA8D970` with the traffic globals `0x2225B64`. Probably the road/lane network (unverified) |
-| 0x0B | inline | count/pointer at rec+0x14C/+0x150 |
-| 0x0C | `0x4AE320` | Node tree at rec+0x154, fixed up recursively by `0xBF6A40` |
+| 0x0B | inline | **Path segments**: 0x20-byte {start vec3, end vec3, flags, link}, chained end-to-start at ground height (count/pointer at rec+0x14C/+0x150) |
+| 0x0C | `0x4AE320` path_tree | Node tree over the 0x0B segments at rec+0x154, fixed up recursively by `0xBF6A40` |
 | 0x0D | `0x4AE380` collision_shapes | Havok collision (`MOPP` in the data): 0x28-byte entries with vec3 lists (rec+0x158/+0x15C), registered with `0x6F9590` → rec+0x160 |
 | 0x0E | `0x4AE460` water_volume_geometry | **Water volumes**: N meshes (rec+0x164/+0x168), 16-byte vertices, u16×3 triangles |
 | 0x0F | `0x4AE510` render_materials | Render materials (texture references such as `missing-alpha.tga`, `flat-normalmap.tgn`; avg 292 KB): rec+0x174/+0x178; advances a gpu-side offset |
 | 0x10 | inline | count/pointer at rec+0x180/+0x184 |
-| 0x11 | `0x4AE590` | 0x54-byte entries (rec+0x188/+0x18C), tail at rec+0x190 |
+| 0x11 | `0x4AE590` tree_instances | **Tree placements** (`TP09A_161_Tree34`, …): 0x54-byte entries (rec+0x188/+0x18C): name, model hash, position, orientation, scale, distances; names in the tail (rec+0x190) |
 | 0x12 | `0x4AE620` | Tagged `DTNC` data: rec+0x1AC if `0x70D740` accepts it |
 | 0x13 | `0x4AE640` | Tagged `LTNC`/`ITNC` data: rec+0x1B0/+0x1B4 |
 | 0x14 | `0x4AE690` | 0x3C-byte entries (rec+0x194/+0x198) |
@@ -278,15 +278,15 @@ Debug: flag `0x2529DDB` makes reads of `player.cvtf` copy from memory (`0x2223CC
 | 0x1B | `0x4AEAB0` | count/array rec+0x1D4/+0x1D8 |
 | 0x1C | `0x4AEAE0` object_attachments | 0x48-byte entries (rec+0x1DC/+0x1E0): object, offset, orientation, handle into `0x2AE50E8`; moved with their object each frame (`0x4AB140`) |
 | 0x1D | — | not handled |
-| 0x1E | `0x4AEB10` | 0x10-byte entries with 0x14-byte sub-arrays (rec+0x204/+0x208) |
+| 0x1E | `0x4AEB10` cell_quadtrees | 12×12 grid of 30-unit cells (rec+0x204/+0x208), each a quadtree of 20-byte nodes {min/max height, 4 children, leaf index}: a height/surface lookup |
 | 0x1F | `0x4AEB80` | count/array rec+0x20C/+0x210 |
 | 0x20 | `0x4AEBB0` | 12-byte {object, hash → `0x21F2AA0` entry, hash → `0x27923E0` index} (rec+0x214/+0x218) |
 | 0x21 | `0x4AECB0` | 0x38-byte entries with arrays and a mesh (rec+0x21C/+0x220) |
 | 0x22 | `0x4AEDB0` | rec+0x224 |
-| 0x23 | `0x4AEF00` | per-object 8-byte array (rec+0x54/+0x58) |
-| 0x24 | `0x4AEF60` | per-object array (rec+0x230/+0x234) |
+| 0x23 | `0x4AEF00` object_runtime_data | per-object 8-byte array (rec+0x54/+0x58); all zeros in the files (runtime storage) |
+| 0x24 | `0x4AEF60` object_runtime_data | per-object array (rec+0x230/+0x234); all zeros in the files (runtime storage) |
 | 0x25 | `0x4AEFA0` object_anims | Per-object frame animations (rec+0x238/+0x23C): name, object (flagged +0x34 \|= 0x40000), frame table into rec+0xA0; `0x91C6C0` plays them (flags 1 playing, 2 ping-pong, 4 loop, 8 reversing) |
-| 0x26 | `0x4AEDD0` speedtree_instances | Trees (rec+0x228/+0x22C): hash → SpeedTree table `0x26B5DE8` (count `0x2527288`), the table the SpeedTree loader `0xA8DAFB` fills |
+| 0x26 | `0x4AEDD0` speedtree_models | SpeedTree models, a few per chunk (the placements are 0x11) (rec+0x228/+0x22C): hash → SpeedTree table `0x26B5DE8` (count `0x2527288`), the table the SpeedTree loader `0xA8DAFB` fills |
 
 Versions below 0x78 copy some arrays into the cpu pool instead of pointing into the file (sections 0, 0x0E, 0x15, 0x16). The loader only accepts 0x79, so those paths are dead for shipped data.
 
@@ -364,4 +364,12 @@ already been taken off the free list and is never put back, and the slot stays i
 The teleport test logs one event per start (type, read count, total bytes, priorities). Original
 vs Rust: identical for every chunk geom (627), peg (23), type 5 (16) and type 7 (2) start. Only
 the ambient vehicle/character loads (types 2 and 3) differ, and those vary from run to run.
+
+Decoded from the data (2026-10-30; numbers from sr2_chunk161 and sr2_chunk060, read with the chunk example):
+- 0x01 lights: warm-white colour (1.0, 0.957, 0.498), positions inside the chunk, ranges 2/5 and fade 150.
+- 0x0B: 1,046 chained ~3-unit segments at constant ground height in a waterfront chunk, so a path network. Pedestrian, vehicle or navigation paths: not settled.
+- 0x11 vs 0x26: 75 tree placements (`TP…_TreeNN`) against 2 SpeedTree entries, so 0x26 lists the models and 0x11 places them (0x26 was labelled "instances" before).
+- 0x1E: per-cell quadtrees with min/max heights (−6.03 = sea level here) and leaf indices.
+- 0x23/0x24: zero-filled per-object storage.
+- Undecided: 0x09 (224 entries with position, orientation, two 30° angles and distances 5.05/3.0: cones of some kind), 0x0A (78 local transforms with ids 43xx, grouped by offset lists: attachment points?), 0x10 (19 hashed placements with orientation), 0x14, 0x1B, 0x1F, 0x20, 0x21, 0x22.
 
