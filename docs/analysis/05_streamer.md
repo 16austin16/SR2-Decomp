@@ -1314,3 +1314,31 @@ Corrections to "Request side, step by step" (checked against the disassembly):
 - request_vehicle: the register inputs are EDX = size A and ECX = dest B; EAX is read from the
   stack.
 
+### Step and completion callbacks in Rust
+
+All 23 callbacks are detoured and run in Rust behind `PUMP_RUST`:
+- chunk geom: begin, GPU begin, issue, after, GPU after and `chunk_geom_on_loaded`;
+- chunk peg: begin, GPU begin, progress, issue, after, retry and `chunk_peg_on_loaded`;
+- character: begin, after and `character_on_loaded`;
+- vehicle: step filter, begin, after and `vehicle_on_loaded`;
+- `animation_on_loaded`, `streamman_retry_never` and `chunk_extras_on_loaded`.
+
+The whole streamer (requests, the pump, loading, polling, completion) now runs in Rust. Still
+original: the io scheduler (`async_io_*`, the hdd thread) and the resource slot scheduler
+(rsched).
+
+Teleport test, original vs Rust: identical non-ambient event logs (1,989 distinct events each).
+That includes all 647 geom, 23 peg and 17 extras completions (all succeeded) and the replayed
+byte counts of every geom finish. The world renders normally after each jump. The peg retry,
+animation completion and extras retry never ran in any test.
+
+Details checked against the disassembly:
+- `chunk_load_from_memory` is called with EAX = file, ECX = pool, EDX = step 1's GPU dest,
+  ESI = info and EDI = step 0's size, plus 6 stack arguments.
+- `0x4C6C30` and `0x562100` take the chunk in EDI. `0x4AB660` takes ECX = chunk/entry and
+  EAX = state. `0x4AA840` and `0x4AA8D0` take EAX.
+- Peg helpers: `0xC08D90` takes EDI = file; `0xC08EB0` and `0xC08DE0` take EAX = file; `0xC08D40`
+  takes ECX = file; `0xC084C0` takes EDX = *entry plus the *value* at entry+8.
+- The character and vehicle begin callbacks write the step's dest as info + k*0x244 + 0x23C,
+  which works because their steps are inline at info+0x24.
+

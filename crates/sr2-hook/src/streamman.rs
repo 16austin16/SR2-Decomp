@@ -3166,6 +3166,708 @@ extern "C" fn request_chunk_hook(out: u32, req: u32) -> u32 {
     }
 }
 
+// --- Step and completion callbacks ---------------------------------------------------
+//
+// The loading infos' read-step callbacks (begin +0x22C, issue +0x234, progress
+// +0x230, after +0x238, retry +0x240), the vehicle step filter (+0x10) and the
+// completions (+0x1C), each detoured; all cdecl (info) -> AL, except progress
+// (info, node) and the filter (file). In `PUMP_RUST` mode they run in Rust.
+
+const CHUNK_LOAD_FROM_MEMORY: usize = 0x004A_F280; // ECX = pool, EDX = GPU dest, EDI = size; cdecl (file, dest, size, b540, b542, b541)
+const CHUNK_REGISTER: usize = 0x004A_8BC0; // cdecl (chunk)
+const CHUNK_LINK: usize = 0x004C_6C30; // EDI = chunk
+const CHUNK_SET_STATE: usize = 0x004A_B660; // ECX = chunk/entry, EAX = state
+const CHUNK_ACTIVATE: usize = 0x004A_A840; // EAX = chunk (EDI = chunk too)
+const CHUNK_NOTIFY: usize = 0x0056_2100; // EDI = chunk
+const CHUNK_EXTRA_LIST: usize = 0x00F7_0BA8; // [] chunk*, count 0xF71B58
+const CHUNK_EXTRA_LIST_COUNT: usize = 0x00F7_1B58;
+const WORLD_ENTRY_PEG_LOADED: usize = 0x004A_A8D0; // EAX = entry
+const RESERVATIONS_KEEP: usize = 0x00F6_FBC0; // u8
+const PEG_ENTRY_FIND: usize = 0x00C0_86E0; // cdecl (file) -> entry
+const PEG_ENTRY_ADD: usize = 0x00C0_8D90; // EDI = file, cdecl (dest) -> bool
+const PEG_ENTRY_SET_SIZE: usize = 0x00C0_8EB0; // EAX = file, cdecl (size) -> bool
+const PEG_ENTRY_LOADED: usize = 0x00C0_8DE0; // EAX = file
+const PEG_ENTRY_REMOVE: usize = 0x00C0_8D40; // ECX = file
+const PEG_FREE: usize = 0x00C0_84C0; // EDX = *entry, cdecl (entry + 8)
+const IO_BYTES_READ: usize = 0x00A7_35E0; // (mgr, request, sequence) -> bytes read so far
+const ERROR_PRINTF: usize = 0x00BF_2C10; // ESI = size, EDI = buffer; cdecl (fmt, arg)
+const ERROR_BUFFER: usize = 0x0234_60E0;
+const MSG_NO_GPU_PEG_ROOM: usize = 0x00E4_4698;
+const CHARACTER_POOL: usize = 0x0277_1178; // virtual_mempool for morph data in mode 1
+const CHARACTER_LOADER_FIND: usize = 0x006E_8A50; // EAX = loader* out
+const VEHICLE_ON_LOADED_IMPL: usize = 0x00AD_B530; // EAX = object, cdecl (files[11] {file, size, dest})
+const CHUNK_EXTRAS_NOTIFY: usize = 0x0091_4460; // cdecl (u16 chunk id)
+
+/// The world chunk entry of an info's chunk id at `field`, if there is one.
+unsafe fn world_entry(info: usize, field: usize) -> usize {
+    unsafe {
+        let id = *((info + field) as *const u16) as usize;
+        if id == 0xFFFF || id >= 0x866 { 0 } else { rd(WORLD_CHUNKS + id * 4) as usize }
+    }
+}
+
+/// Round `at` up to a multiple of `align`: the padding added.
+fn pad(at: u32, align: u32) -> u32 {
+    let r = at % align;
+    if r == 0 { 0 } else { align - r }
+}
+
+/// Take all of `pool`'s free space but `align` for step `k` of a chunk info:
+/// dest at step+0x218, info+8, size at info+0xC and +0x538 (or +0x534 for pegs).
+unsafe fn chunk_take_pool(info: usize, pool: usize, k: usize, taken: usize) -> bool {
+    unsafe {
+        let step = rd(info + 0x14) as usize + k * 0x244;
+        let align = *((step + 0x214) as *const u16) as u32;
+        let free = thiscall(vslot(pool, 3), pool, [0; 3]).wrapping_sub(align);
+        if free as i32 <= 0 {
+            return false;
+        }
+        let dest = thiscall(vslot(pool, 7), pool, [free, align, 0]);
+        wr(step + 0x218, dest);
+        if dest == 0 {
+            return false;
+        }
+        wr(info + taken, free);
+        wr(info + 8, dest);
+        wr(info + 0x0C, free);
+        true
+    }
+}
+
+/// `chunk_geom_before_read_began_cb` (0xA84E60): release the pool reservation
+/// (+0x53C), then take the CPU pool's free space for step 0.
+unsafe fn geom_begin(info: usize) -> bool {
+    unsafe {
+        let r = rd(info + 0x53C) as i32;
+        if r >= 0 {
+            if r < rd(RESERVATION_COUNT) as i32 {
+                call(WORLD_CHUNK_RELEASE, &[rd(RESERVATIONS + r as usize * 4), r as u32]);
+            }
+            wr(info + 0x53C, u32::MAX);
+        }
+        wr(info + 0x538, 0);
+        chunk_take_pool(info, rd(info + 0x534) as usize, 0, 0x538)
+    }
+}
+
+/// `chunk_geom_before_read_began_gpu_cb` (0xA84F00): the GPU pool for step 1.
+unsafe fn geom_begin_gpu(info: usize) -> bool {
+    unsafe {
+        wr(info + 0x538, 0);
+        chunk_take_pool(info, rd(rd(info + 0x534) as usize + 0x54) as usize, 1, 0x538)
+    }
+}
+
+/// `chunk_geom_after_read_cb` (0xA84F90) / `_gpu` (0xA84FC0): give the unused
+/// tail back (pool vtable slot 14, `taken - size`).
+unsafe fn geom_after(info: usize, gpu: bool) -> bool {
+    unsafe {
+        let mut pool = rd(info + 0x534) as usize;
+        if gpu {
+            pool = rd(pool + 0x54) as usize;
+        }
+        let size = rd(rd(info + 0x14) as usize + if gpu { 0x454 } else { 0x210 });
+        thiscall(vslot(pool, 14), pool, [rd(info + 0x538).wrapping_sub(size), 0, 0]);
+        true
+    }
+}
+
+/// `chunk_geom_on_loaded` (0xA84FF0): build the chunk from the read data
+/// (`chunk_load_from_memory`). On failure clear its world chunk entry, unload its
+/// pegs/extras and fail. Without a peg load: register it, list it if it has
+/// extras (+0x180), link it, state 7; else with wait: state 7; else +0x20 = 4 then
+/// 0 (two stores, as the original). Waited or flagged (+0x1C bit 0) chunks get
+/// +0x18 = 3, activated and notified.
+unsafe fn geom_on_loaded(info: usize) -> bool {
+    unsafe {
+        let steps = rd(info + 0x14) as usize;
+        let (file, dest, size) = (rd(steps), rd(steps + 0x218), rd(steps + 0x210));
+        let chunk = if file != 0 {
+            let args = [file, dest, size, rb(info + 0x540) as u32, rb(info + 0x542) as u32, rb(info + 0x541) as u32];
+            game_call_full(CHUNK_LOAD_FROM_MEMORY, file, rd(info + 0x534), rd(steps + 0x45C), info as u32, size, &args)
+                .0
+        } else {
+            0
+        };
+        wr(info + 0x530, chunk);
+        if chunk == 0 {
+            let id = game_call(WORLD_CHUNK_FIND_ID, 0, (info + 0x4AC) as u32, 0, 0, [0; 3]) & 0xFFFF;
+            if id != 0xFFFF {
+                wr(WORLD_CHUNKS + id as usize * 4, 0);
+            }
+            unload_chunk_pegs_extras_hook(*((info + 0x52E) as *const u16) as u32);
+            return false;
+        }
+        let chunk = chunk as usize;
+        if rb(info + 0x543) != 0 {
+            call(CHUNK_REGISTER, &[chunk as u32]);
+            if rd(chunk + 0x180) != 0 {
+                let n = rd(CHUNK_EXTRA_LIST_COUNT) as usize;
+                wr(CHUNK_EXTRA_LIST + n * 4, chunk as u32);
+                wr(CHUNK_EXTRA_LIST_COUNT, n as u32 + 1);
+            }
+            game_call_full(CHUNK_LINK, 0, 0, 0, info as u32, chunk as u32, &[]);
+            game_call_full(CHUNK_SET_STATE, 7, rd(info + 0x530), 0, info as u32, chunk as u32, &[]);
+        } else if rb(info + 0x541) != 0 {
+            game_call_full(CHUNK_SET_STATE, 7, chunk as u32, 0, info as u32, chunk as u32, &[]);
+        } else {
+            wr(chunk + 0x20, 4);
+            wr(rd(info + 0x530) as usize + 0x20, 0);
+        }
+        let chunk = rd(info + 0x530) as usize;
+        if rd(chunk + 0x1C) & 1 != 0 || rb(info + 0x541) != 0 {
+            wr(chunk + 0x18, 3);
+            game_call_full(CHUNK_ACTIVATE, chunk as u32, 0, 0, info as u32, chunk as u32, &[]);
+            game_call_full(CHUNK_NOTIFY, 0, 0, 0, info as u32, chunk as u32, &[]);
+        }
+        true
+    }
+}
+
+/// Give the unused part of a peg CPU allocation back: `pool.release_to(used_end -
+/// (taken - size))` with the pool's mark (+0x48) preserved.
+unsafe fn peg_give_back(pool: usize, amount: u32) {
+    unsafe {
+        let mark = rd(pool + 0x48);
+        thiscall(vslot(pool, 13), pool, [rd(pool + 0x44).wrapping_sub(amount), 0, 0]);
+        wr(pool + 0x48, mark);
+    }
+}
+
+/// `chunk_peg_before_read_began_cb` (0xA85450): take the pool's (+0x53C) free
+/// space for step 0; unless the request value (+4) is set, register the peg
+/// (`0xC08D90`); mark the world chunk entry state 4.
+unsafe fn peg_begin(info: usize) -> bool {
+    unsafe {
+        let steps = rd(info + 0x14) as usize;
+        let file = rd(steps);
+        wr(info + 0x534, 0);
+        let pool = rd(info + 0x53C) as usize;
+        let align = *((steps + 0x214) as *const u16) as u32;
+        let free = thiscall(vslot(pool, 3), pool, [0; 3]).wrapping_sub(align);
+        if free as i32 <= 0 {
+            return false;
+        }
+        let dest = thiscall(vslot(pool, 7), pool, [free, align, 0]);
+        wr(steps + 0x218, dest);
+        if dest == 0 {
+            return false;
+        }
+        wr(info + 0x534, free);
+        wr(info + 8, dest);
+        wr(info + 0x0C, free);
+        if rd(info + 4) == 0 && game_call_full(PEG_ENTRY_ADD, 0, 0, 0, 0, file, &[dest]).0 == 0 {
+            return false;
+        }
+        let e = world_entry(info, 0x52E);
+        if e != 0 {
+            wr(e + 0x20, 4);
+        }
+        true
+    }
+}
+
+/// `streamman_chunk_peg_before_read_began_peg_gpu_cb` (0xA85510): give back the
+/// CPU tail, then take the GPU pool's free space for step 1 (an error message
+/// when there is none) and point the peg entry at it.
+unsafe fn peg_begin_gpu(info: usize) -> bool {
+    unsafe {
+        let steps = rd(info + 0x14) as usize;
+        if rd(info + 0x534) != 0 {
+            peg_give_back(rd(info + 0x53C) as usize, rd(info + 0x534).wrapping_sub(rd(steps + 0x210)));
+            wr(info + 0x534, 0);
+        }
+        wr(info + 0x538, 0);
+        let gpu = rd(rd(info + 0x53C) as usize + 0x54) as usize;
+        let align = *((steps + 0x458) as *const u16) as u32;
+        let free = thiscall(vslot(gpu, 3), gpu, [0; 3]).wrapping_sub(align);
+        if free as i32 <= 0 {
+            game_call_full(
+                ERROR_PRINTF,
+                0,
+                0,
+                0,
+                0x400,
+                ERROR_BUFFER as u32,
+                &[MSG_NO_GPU_PEG_ROOM as u32, rd(steps + 0x244)],
+            );
+            return false;
+        }
+        let dest = thiscall(vslot(gpu, 7), gpu, [free, align, 0]);
+        wr(steps + 0x45C, dest);
+        if dest == 0 {
+            return false;
+        }
+        wr(info + 0x538, free);
+        wr(info + 8, dest);
+        wr(info + 0x0C, free);
+        let e = call(PEG_ENTRY_FIND, &[rd(steps + 0x244)]) as usize;
+        if e != 0 {
+            wr(e + 4, dest);
+            wr(rd(e) as usize + 4, 0);
+        }
+        true
+    }
+}
+
+/// `chunk_peg_progress_cb` (0xA85600, (info, node)): while the GPU peg reads,
+/// record how much has arrived (+0x530, plus the request value) and tell the peg
+/// entry; false only if that fails.
+unsafe fn peg_progress(info: usize, node: usize) -> bool {
+    unsafe {
+        let (req, seq) = (rd(node + 0x10), rd(node + 0x14));
+        if req == 0 {
+            return true;
+        }
+        let mut n = game_call_n(IO_BYTES_READ, 0, 0, 0, 0, &[rd(req as usize + 0x3C), req, seq]).0;
+        if n == 0 {
+            return true;
+        }
+        if rd(info + 4) as i32 > 0 {
+            n = n.wrapping_add(rd(info + 4));
+        }
+        wr(info + 0x530, n);
+        if n as i32 <= 0 {
+            return true;
+        }
+        game_call_n(PEG_ENTRY_SET_SIZE, rd(rd(info + 0x14) as usize), 0, 0, 0, &[n]).0 != 0
+    }
+}
+
+/// `chunk_peg_read_issued_cb` (0xA85660): give back the CPU tail. Returns
+/// nothing (AL is whatever is left; the caller ignores it).
+unsafe fn peg_issue(info: usize) {
+    unsafe {
+        if rd(info + 0x534) != 0 {
+            let amount = rd(info + 0x534).wrapping_sub(rd(rd(info + 0x14) as usize + 0x210));
+            peg_give_back(rd(info + 0x53C) as usize, amount);
+            wr(info + 0x534, 0);
+        }
+    }
+}
+
+/// `chunk_peg_after_read_cb` (0xA856B0): if the current step read anything, mark
+/// the peg loaded (by step 0's file, whichever step is current).
+unsafe fn peg_after(info: usize) -> bool {
+    unsafe {
+        let steps = rd(info + 0x14) as usize;
+        let step = steps + (rd(info + 0x20) & 0x3FF) as usize * 0x244;
+        if rd(step + 0x210) != 0 {
+            game_call_n(PEG_ENTRY_LOADED, rd(steps), 0, 0, 0, &[]);
+        }
+        true
+    }
+}
+
+/// `chunk_peg_retry_cb` (0xA856E0): give up on the peg. Clear both steps' after
+/// callbacks, drop the peg entry (or remove the name), return the CPU and GPU
+/// allocations, flag the world chunk entry (+0x1C |= 0x20) and fail.
+unsafe fn peg_retry(info: usize) -> bool {
+    unsafe {
+        let steps = rd(info + 0x14) as usize;
+        wr(steps + 0x238, 0);
+        wr(steps + 0x47C, 0);
+        let file = rd(steps);
+        let e = call(PEG_ENTRY_FIND, &[file]) as usize;
+        if e == 0 {
+            game_call_n(PEG_ENTRY_REMOVE, 0, file, 0, 0, &[]);
+        } else {
+            game_call_n(PEG_FREE, 0, 0, rd(e), 0, &[rd(e + 8)]);
+            wr(e, 0);
+        }
+        if rd(info + 0x534) != 0 {
+            peg_give_back(rd(info + 0x53C) as usize, rd(info + 0x534));
+        }
+        if rd(info + 0x538) != 0 {
+            let gpu = rd(rd(info + 0x53C) as usize + 0x54) as usize;
+            thiscall(vslot(gpu, 14), gpu, [rd(info + 0x538), 0, 0]);
+        }
+        let e = world_entry(info, 0x52E);
+        if e != 0 {
+            wb(e + 0x1C, rb(e + 0x1C) | 0x20);
+        }
+        false
+    }
+}
+
+/// `chunk_peg_on_loaded` (0xA857A0): finish the GPU peg entry (size, clear its
+/// pending pointer), give back the GPU tail and mark the world chunk entry's pegs
+/// loaded: state 6 (reservation kept) or 7.
+unsafe fn peg_on_loaded(info: usize) -> bool {
+    unsafe {
+        let steps = rd(info + 0x14) as usize;
+        let (file1, size1) = (rd(steps + 0x244), rd(steps + 0x454));
+        let e = call(PEG_ENTRY_FIND, &[file1]) as usize;
+        if e == 0 {
+            return false;
+        }
+        game_call_n(PEG_ENTRY_SET_SIZE, file1, 0, 0, 0, &[size1]);
+        wr(e, 0);
+        if rd(steps) == 0 || rd(steps + 0x210) == 0 {
+            return false;
+        }
+        if rd(info + 0x538) != 0 {
+            let gpu = rd(rd(info + 0x53C) as usize + 0x54) as usize;
+            thiscall(vslot(gpu, 14), gpu, [rd(info + 0x538).wrapping_sub(size1), 0, 0]);
+            wr(info + 0x538, 0);
+        }
+        let w = world_entry(info, 0x52E);
+        if w != 0 {
+            game_call_n(WORLD_ENTRY_PEG_LOADED, w as u32, 0, 0, 0, &[]);
+            if rb(info + 0x540) == 0 && rb(RESERVATIONS_KEEP) != 0 {
+                wr(w + 0x20, 6);
+                wr(w + 0x24, u32::MAX);
+            } else {
+                game_call_n(CHUNK_SET_STATE, 7, w as u32, 0, 0, &[]);
+            }
+        }
+        true
+    }
+}
+
+/// Buffer A or B of a character/vehicle info: (base, cursor, size) offsets.
+const CHAR_A: (usize, usize, usize) = (0x1750, 0x1760, 0x1758);
+const CHAR_B: (usize, usize, usize) = (0x1754, 0x1764, 0x175C);
+const VEH_A: (usize, usize, usize) = (0x1910, 0x1920, 0x1918);
+const VEH_B: (usize, usize, usize) = (0x1914, 0x1924, 0x191C);
+
+/// Point step `k`'s read at buffer `buf`'s cursor, aligned; the rest of the
+/// buffer is the space left. False if the buffer is full.
+unsafe fn buffer_begin(info: usize, k: usize, at: u32, left: u32) -> bool {
+    unsafe {
+        if left == 0 {
+            return false;
+        }
+        let align = *((rd(info + 0x14) as usize + k * 0x244 + 0x214) as *const u16) as u32;
+        let p = pad(at, align);
+        wr(info + 8, at.wrapping_add(p));
+        wr(info + k * 0x244 + 0x23C, at.wrapping_add(p));
+        wr(info + 0x0C, left.wrapping_sub(p));
+        true
+    }
+}
+
+unsafe fn buffer_cursor(info: usize, buf: (usize, usize, usize)) -> (u32, u32) {
+    unsafe {
+        let used = rd(info + buf.1).wrapping_sub(rd(info + buf.0));
+        (rd(info + buf.0).wrapping_add(used), rd(info + buf.2).wrapping_sub(used))
+    }
+}
+
+/// `character_before_read_began_cb` (0xA7F840): steps 0/2/4/6/7/8 read into
+/// buffer A, 1/5 into B; 3 (.g_morph_pc) and 9 fail. In mode 1 step 2 gets its own
+/// allocation from the character pool instead.
+unsafe fn character_begin(info: usize) -> bool {
+    unsafe {
+        let k = (rd(info + 0x20) & 0x3FF) as usize;
+        let (at, left) = match k {
+            2 if rb(info + 0x1768) == 1 => {
+                let size = rd(rd(info + 0x14) as usize + k * 0x244 + 0x210);
+                (thiscall(VIRTUAL_MEMPOOL_ALLOC, CHARACTER_POOL, [size, 0, 0]), size)
+            }
+            0 | 2 | 4 | 6 | 7 | 8 => buffer_cursor(info, CHAR_A),
+            1 | 5 => buffer_cursor(info, CHAR_B),
+            _ => return false,
+        };
+        buffer_begin(info, k, at, left)
+    }
+}
+
+/// `character_after_read_cb` (0xA7F9C0): advance the buffer's cursor past the
+/// read (not for step 2 in mode 1); step 3 fails, step 9 succeeds unchanged.
+unsafe fn character_after(info: usize) -> bool {
+    unsafe {
+        let k = (rd(info + 0x20) & 0x3FF) as usize;
+        let size = rd(rd(info + 0x14) as usize + k * 0x244 + 0x210);
+        let end = rd(info + 8).wrapping_add(size);
+        match k {
+            2 if rb(info + 0x1768) == 1 => {}
+            0 | 2 | 4 | 6 | 7 | 8 => wr(info + CHAR_A.1, end),
+            1 | 5 => wr(info + CHAR_B.1, end),
+            9 => {}
+            _ => return false,
+        }
+        true
+    }
+}
+
+/// `character_on_loaded` (0xA7FA40): hand the read files to a free character
+/// loader (`loader->vtable[2](&descriptor)`); fails without one.
+unsafe fn character_on_loaded(info: usize) -> bool {
+    unsafe {
+        let s = rd(info + 0x14) as usize;
+        let mut loader = 0u32;
+        game_call_n(CHARACTER_LOADER_FIND, &mut loader as *mut u32 as u32, 0, 0, 0, &[]);
+        if loader == 0 {
+            return false;
+        }
+        let f = |o: usize| rd(s + o);
+        let desc: [u32; 18] = [
+            rd(info + 0x18),
+            f(0),
+            f(0x218),
+            f(0x45C),
+            f(0x910),
+            f(0xB28),
+            f(0xB20),
+            f(0xD6C),
+            f(0xD64),
+            f(0x488),
+            f(0x6A0),
+            f(0x8E4),
+            f(0xD98),
+            f(0xFB0),
+            f(0xFDC),
+            f(0x11F4),
+            f(0x1220),
+            f(0x1438),
+        ];
+        thiscall(vslot(loader as usize, 2), loader as usize, [desc.as_ptr() as u32, 0, 0]) as u8 != 0
+    }
+}
+
+/// `vehicle_step_filter` (0xA87AF0): a file is read if it is set and does not start with '!'.
+unsafe fn vehicle_filter(file: u32) -> bool {
+    unsafe { file != 0 && rb(file as usize) != b'!' }
+}
+
+/// `vehicle_before_read_began_cb` (0xA87B10): buffer B if the step's flag bit 0 is set, else A.
+unsafe fn vehicle_begin(info: usize) -> bool {
+    unsafe {
+        let k = (rd(info + 0x20) & 0x3FF) as usize;
+        let step = rd(info + 0x14) as usize + k * 0x244;
+        let buf = if rd(step + 0x21C) & 1 != 0 { VEH_B } else { VEH_A };
+        let (at, left) = buffer_cursor(info, buf);
+        buffer_begin(info, k, at, left)
+    }
+}
+
+/// `vehicle_after_read_cb` (0xA87BB0): advance that buffer's cursor.
+unsafe fn vehicle_after(info: usize) -> bool {
+    unsafe {
+        let step = rd(info + 0x14) as usize + (rd(info + 0x20) & 0x3FF) as usize * 0x244;
+        let buf = if rd(step + 0x21C) & 1 != 0 { VEH_B } else { VEH_A };
+        wr(info + buf.1, rd(info + 8).wrapping_add(rd(step + 0x210)));
+        true
+    }
+}
+
+/// `vehicle_on_loaded` (0xA87BF0): 11 x {file, size, dest} to the vehicle loader.
+unsafe fn vehicle_on_loaded(info: usize) -> bool {
+    unsafe {
+        let s = rd(info + 0x14) as usize;
+        let mut files = [0u32; 33];
+        for k in 0..11 {
+            let st = s + k * 0x244;
+            files[k * 3] = rd(st);
+            files[k * 3 + 1] = rd(st + 0x210);
+            files[k * 3 + 2] = rd(st + 0x218);
+        }
+        game_call_n(VEHICLE_ON_LOADED_IMPL, rd(info + 0x18), 0, 0, 0, &[files.as_ptr() as u32]).0 as u8 != 0
+    }
+}
+
+/// `chunk_extras_on_loaded` (0xA81620): flag the world chunk entry (+0x1C |=
+/// 0x80), advance state 7 to 8, and notify (`0x914460`).
+unsafe fn extras_on_loaded(info: usize) -> bool {
+    unsafe {
+        let e = world_entry(info, 0x772);
+        if e != 0 {
+            wb(e + 0x1C, rb(e + 0x1C) | 0x80);
+            if rd(e + 0x20) == 7 {
+                game_call_n(CHUNK_SET_STATE, 8, e as u32, 0, 0, &[]);
+            }
+            call(CHUNK_EXTRAS_NOTIFY, &[*((e + 8) as *const u16) as u32]);
+        }
+        true
+    }
+}
+
+/// The callbacks, in the order of `CALLBACKS` (index, address, prologue).
+const CB_GEOM_BEGIN: usize = 0;
+const CB_GEOM_BEGIN_GPU: usize = 1;
+const CB_GEOM_ISSUE: usize = 2;
+const CB_GEOM_AFTER: usize = 3;
+const CB_GEOM_AFTER_GPU: usize = 4;
+const CB_GEOM_LOADED: usize = 5;
+const CB_PEG_BEGIN: usize = 6;
+const CB_PEG_BEGIN_GPU: usize = 7;
+const CB_PEG_PROGRESS: usize = 8;
+const CB_PEG_ISSUE: usize = 9;
+const CB_PEG_AFTER: usize = 10;
+const CB_PEG_RETRY: usize = 11;
+const CB_PEG_LOADED: usize = 12;
+const CB_CHAR_BEGIN: usize = 13;
+const CB_CHAR_AFTER: usize = 14;
+const CB_CHAR_LOADED: usize = 15;
+const CB_VEH_FILTER: usize = 16;
+const CB_VEH_BEGIN: usize = 17;
+const CB_VEH_AFTER: usize = 18;
+const CB_VEH_LOADED: usize = 19;
+const CB_ANIM_LOADED: usize = 20;
+const CB_EXTRAS_RETRY: usize = 21;
+const CB_EXTRAS_LOADED: usize = 22;
+const CB_COUNT: usize = 23;
+
+const CALLBACKS: [(&str, usize, &[u8]); CB_COUNT] = [
+    ("chunk_geom_before_read_began_cb", 0x00A8_4E60, &[0x53, 0x55, 0x56, 0x57, 0x8B, 0x7C, 0x24, 0x14]),
+    ("chunk_geom_before_read_began_gpu_cb", 0x00A8_4F00, &[0x53, 0x56, 0x57, 0x8B, 0x7C, 0x24, 0x10]),
+    ("chunk_geom_read_issued_cb", 0x00A8_4F80, &[0xC3, 0xCC, 0xCC, 0xCC, 0xCC]),
+    ("chunk_geom_after_read_cb", 0x00A8_4F90, &[0x8B, 0x44, 0x24, 0x04, 0x8B, 0x88, 0x34, 0x05, 0x00, 0x00]),
+    ("chunk_geom_after_read_gpu_cb", 0x00A8_4FC0, &[0x8B, 0x44, 0x24, 0x04, 0x8B, 0x88, 0x34, 0x05, 0x00, 0x00]),
+    ("chunk_geom_on_loaded", 0x00A8_4FF0, &[0x83, 0xEC, 0x0C, 0x53, 0x55]),
+    ("chunk_peg_before_read_began_cb", 0x00A8_5450, &[0x53, 0x55, 0x56, 0x8B, 0x74, 0x24, 0x10]),
+    ("chunk_peg_before_read_began_gpu_cb", 0x00A8_5510, &[0x53, 0x55, 0x56, 0x8B, 0x74, 0x24, 0x10]),
+    ("chunk_peg_progress_cb", 0x00A8_5600, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
+    ("chunk_peg_read_issued_cb", 0x00A8_5660, &[0x57, 0x8B, 0x7C, 0x24, 0x08]),
+    ("chunk_peg_after_read_cb", 0x00A8_56B0, &[0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x41, 0x14]),
+    ("chunk_peg_retry_cb", 0x00A8_56E0, &[0x53, 0x56, 0x57, 0x8B, 0x7C, 0x24, 0x10]),
+    ("chunk_peg_on_loaded", 0x00A8_57A0, &[0x53, 0x55, 0x56, 0x57, 0x8B, 0x7C, 0x24, 0x14]),
+    ("character_before_read_began_cb", 0x00A7_F840, &[0x53, 0x55, 0x56, 0x8B, 0x74, 0x24, 0x10]),
+    ("character_after_read_cb", 0x00A7_F9C0, &[0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x41, 0x20]),
+    ("character_on_loaded", 0x00A7_FA40, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
+    ("vehicle_step_filter", 0x00A8_7AF0, &[0x8B, 0x44, 0x24, 0x04, 0x85, 0xC0]),
+    ("vehicle_before_read_began_cb", 0x00A8_7B10, &[0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x51, 0x14]),
+    ("vehicle_after_read_cb", 0x00A8_7BB0, &[0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x41, 0x20]),
+    ("vehicle_on_loaded", 0x00A8_7BF0, &[0x81, 0xEC, 0x84, 0x00, 0x00, 0x00]),
+    ("animation_on_loaded", 0x00A8_7C50, &[0x32, 0xC0, 0xC3, 0xCC, 0xCC]),
+    ("streamman_retry_never", 0x00A8_1610, &[0x32, 0xC0, 0xC3, 0xCC, 0xCC]),
+    ("chunk_extras_on_loaded", 0x00A8_1620, &[0x8B, 0x44, 0x24, 0x04, 0x0F, 0xB7, 0x80, 0x72, 0x07, 0x00, 0x00]),
+];
+
+static CB_ORIG: [AtomicUsize; CB_COUNT] = [const { AtomicUsize::new(0) }; CB_COUNT];
+static CB_CALLS: [AtomicU32; CB_COUNT] = [const { AtomicU32::new(0) }; CB_COUNT];
+
+/// Run callback `i`: the Rust port, or the original through its trampoline.
+fn run_cb(i: usize, a: u32, b: u32, rust: impl FnOnce() -> bool) -> u32 {
+    CB_CALLS[i].fetch_add(1, Ordering::Relaxed);
+    if PUMP_RUST {
+        return rust() as u32;
+    }
+    let f: extern "C" fn(u32, u32) -> u32 = unsafe { std::mem::transmute(CB_ORIG[i].load(Ordering::Acquire)) };
+    f(a, b) & 0xFF
+}
+
+macro_rules! cb_hook {
+    ($name:ident, $i:expr, |$info:ident| $body:expr) => {
+        #[allow(unused_unsafe)]
+        extern "C" fn $name($info: u32) -> u32 {
+            run_cb($i, $info, 0, || unsafe {
+                let $info = $info as usize;
+                $body
+            })
+        }
+    };
+}
+
+cb_hook!(cb_geom_begin, CB_GEOM_BEGIN, |info| geom_begin(info));
+cb_hook!(cb_geom_begin_gpu, CB_GEOM_BEGIN_GPU, |info| geom_begin_gpu(info));
+cb_hook!(cb_geom_issue, CB_GEOM_ISSUE, |info| {
+    let _ = info;
+    false
+});
+cb_hook!(cb_geom_after, CB_GEOM_AFTER, |info| geom_after(info, false));
+cb_hook!(cb_geom_after_gpu, CB_GEOM_AFTER_GPU, |info| geom_after(info, true));
+cb_hook!(cb_peg_begin, CB_PEG_BEGIN, |info| peg_begin(info));
+cb_hook!(cb_peg_begin_gpu, CB_PEG_BEGIN_GPU, |info| peg_begin_gpu(info));
+cb_hook!(cb_peg_issue, CB_PEG_ISSUE, |info| {
+    peg_issue(info);
+    false
+});
+cb_hook!(cb_peg_after, CB_PEG_AFTER, |info| peg_after(info));
+cb_hook!(cb_peg_retry, CB_PEG_RETRY, |info| peg_retry(info));
+cb_hook!(cb_char_begin, CB_CHAR_BEGIN, |info| character_begin(info));
+cb_hook!(cb_char_after, CB_CHAR_AFTER, |info| character_after(info));
+cb_hook!(cb_veh_filter, CB_VEH_FILTER, |info| vehicle_filter(info as u32));
+cb_hook!(cb_veh_begin, CB_VEH_BEGIN, |info| vehicle_begin(info));
+cb_hook!(cb_veh_after, CB_VEH_AFTER, |info| vehicle_after(info));
+cb_hook!(cb_anim_loaded, CB_ANIM_LOADED, |info| {
+    let _ = info;
+    false
+});
+cb_hook!(cb_extras_retry, CB_EXTRAS_RETRY, |info| {
+    let _ = info;
+    false
+});
+
+/// Completions also log their result (the finish event shows it too, but this
+/// names the callback).
+macro_rules! cb_completion {
+    ($name:ident, $i:expr, $f:ident) => {
+        extern "C" fn $name(info: u32) -> u32 {
+            let r = run_cb($i, info, 0, || unsafe { $f(info as usize) });
+            event(format!("{} -> {}", CALLBACKS[$i].0, r));
+            r
+        }
+    };
+}
+
+cb_completion!(cb_geom_loaded, CB_GEOM_LOADED, geom_on_loaded);
+cb_completion!(cb_peg_loaded, CB_PEG_LOADED, peg_on_loaded);
+cb_completion!(cb_char_loaded, CB_CHAR_LOADED, character_on_loaded);
+cb_completion!(cb_veh_loaded, CB_VEH_LOADED, vehicle_on_loaded);
+cb_completion!(cb_extras_loaded, CB_EXTRAS_LOADED, extras_on_loaded);
+
+extern "C" fn cb_peg_progress(info: u32, node: u32) -> u32 {
+    run_cb(CB_PEG_PROGRESS, info, node, || unsafe { peg_progress(info as usize, node as usize) })
+}
+
+fn cb_address(i: usize) -> usize {
+    type Cb = extern "C" fn(u32) -> u32;
+    match i {
+        CB_GEOM_BEGIN => cb_geom_begin as Cb as usize,
+        CB_GEOM_BEGIN_GPU => cb_geom_begin_gpu as Cb as usize,
+        CB_GEOM_ISSUE => cb_geom_issue as Cb as usize,
+        CB_GEOM_AFTER => cb_geom_after as Cb as usize,
+        CB_GEOM_AFTER_GPU => cb_geom_after_gpu as Cb as usize,
+        CB_GEOM_LOADED => cb_geom_loaded as Cb as usize,
+        CB_PEG_BEGIN => cb_peg_begin as Cb as usize,
+        CB_PEG_BEGIN_GPU => cb_peg_begin_gpu as Cb as usize,
+        CB_PEG_PROGRESS => cb_peg_progress as extern "C" fn(u32, u32) -> u32 as usize,
+        CB_PEG_ISSUE => cb_peg_issue as Cb as usize,
+        CB_PEG_AFTER => cb_peg_after as Cb as usize,
+        CB_PEG_RETRY => cb_peg_retry as Cb as usize,
+        CB_PEG_LOADED => cb_peg_loaded as Cb as usize,
+        CB_CHAR_BEGIN => cb_char_begin as Cb as usize,
+        CB_CHAR_AFTER => cb_char_after as Cb as usize,
+        CB_CHAR_LOADED => cb_char_loaded as Cb as usize,
+        CB_VEH_FILTER => cb_veh_filter as Cb as usize,
+        CB_VEH_BEGIN => cb_veh_begin as Cb as usize,
+        CB_VEH_AFTER => cb_veh_after as Cb as usize,
+        CB_VEH_LOADED => cb_veh_loaded as Cb as usize,
+        CB_ANIM_LOADED => cb_anim_loaded as Cb as usize,
+        CB_EXTRAS_RETRY => cb_extras_retry as Cb as usize,
+        CB_EXTRAS_LOADED => cb_extras_loaded as Cb as usize,
+        _ => unreachable!(),
+    }
+}
+
+fn install_callbacks() {
+    let mut ok = 0;
+    for (i, &(name, addr, prologue)) in CALLBACKS.iter().enumerate() {
+        match unsafe { detour::install(addr, prologue, cb_address(i)) } {
+            Ok(tramp) => {
+                CB_ORIG[i].store(tramp, Ordering::Release);
+                ok += 1;
+            }
+            Err(e) => log(&format!("streamman: hooking {name} @ {addr:#x} failed: {e:?}")),
+        }
+    }
+    log(&format!("streamman: {ok}/{CB_COUNT} step/completion callbacks detoured"));
+}
+
+fn callbacks_summary() -> String {
+    let parts: Vec<String> = CALLBACKS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(name, ..))| {
+            let c = CB_CALLS[i].load(Ordering::Relaxed);
+            (c > 0).then(|| format!("{name} {c}"))
+        })
+        .collect();
+    format!("streamman callbacks: {}", parts.join(", "))
+}
+
 // --- Install and report ---------------------------------------------------------------
 
 fn hook_address(i: usize) -> usize {
@@ -3224,6 +3926,7 @@ pub fn install() {
     log(&format!(
         "replaced {ok}/{COUNT} streamman functions (inline detours; queue and queries Rust, shadow-checked; pump/unload/abort/wait: {pump})"
     ));
+    install_callbacks();
 }
 
 pub fn summary() -> String {
@@ -3238,5 +3941,11 @@ pub fn summary() -> String {
             parts.push(format!("{name} {c}{}", if m > 0 { format!(" ({m} MISMATCH)") } else { String::new() }));
         }
     }
-    format!("streamman live: {} calls, {} mismatches | {}", total.0, total.1, parts.join(", "))
+    format!(
+        "streamman live: {} calls, {} mismatches | {} | {}",
+        total.0,
+        total.1,
+        parts.join(", "),
+        callbacks_summary()
+    )
 }
