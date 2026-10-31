@@ -209,3 +209,5 @@ vint_object_factory,1,alloc,"takes the head of the free list (+4) and links it i
 vint_object_factory,2,free,"(obj) unlinks obj from the used list (+8)"
 vint_object_factory,3,index_of,"(obj) -> (obj - array (+0x14)) / element size (0xC4 for bitmaps)"
 vint_object_factory,4,get,"(i) -> array (+0x14) + i x element size, or NULL when i >= count (+0x10)"
+activity_level_instance,1,load_xtbl,"base is ret; overrides build '%s%s' + '_activities.xtbl', resolve the file and parse its Activity entries"
+activity_level_instance,3,update,"returns a status; the base shows the level message (+0x14) via 0x767830 once its game-time timer (+0x18) expires, retrying every 3 s; overrides add fail checks (ACT_*_FAIL_*)"
