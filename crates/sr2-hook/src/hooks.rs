@@ -176,7 +176,7 @@ struct VppEntry {
 const SURVEY: bool = false;
 /// Teleport the player around a loop after a save loads (teleport.rs), to exercise
 /// streaming. Test runs only (tools/ingame/run_teleport.ps1): it moves the player.
-const TELEPORT_TEST: bool = true;
+const TELEPORT_TEST: bool = false;
 
 /// Run the verify pass once the main menu is up (packfiles mounted at boot).
 const FIND_RECORD_VERIFY_FRAME: u32 = 300;
