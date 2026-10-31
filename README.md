@@ -7,7 +7,7 @@ no game files; you need your own copy of the game.
 
 ![Progress: functions and code running in Rust, by area](docs/img/progress.svg)
 
-The original functions are replaced one at a time while the game runs. Each replacement is checked against the original in-game before it counts. The file system (archives, open/read/write/close) and the main memory-pool allocators are done; see `docs/PLAN.md` for the milestones.
+The original functions are replaced one at a time while the game runs. Each replacement is checked against the original in-game before it counts. The file system (archives, open/read/write/close) and the main memory-pool allocators are done; see `docs/PLAN.md` for the milestones. The world streamer (`streamman`: request queue, per-frame pump, loading infos, chunk loader) is mapped in `docs/analysis/05_streamer.md` and is the next system to port.
 
 Functions are identified mostly by `tools/harvest_names.py`: Lua script bindings, Ghidra library matches, RTTI vtable slots and constructors/destructors. Virtual methods worked out by hand are recorded per base class in `docs/vtable_slots.csv`, and the name is applied to every subclass's override (for example `fuzz_crime::get_bar_title` names that method in all 44 crime types).
 

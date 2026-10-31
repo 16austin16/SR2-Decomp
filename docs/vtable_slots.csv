@@ -51,3 +51,5 @@ script_positionable_object,5,set_transform,"(pos, orient, x) clears the referenc
 heli_objective,2,load_from_table,"reads Start_Line, End_Line, Help_Text; overrides add Level_info, Locations, ..."
 heli_objective,21,get_start_message,"overrides return ACT_HELI_*_START_MESSAGE string ids"
 menu_widget,0,get_width,"measures the widest value text (e.g. '$9876543.00') in the widget font (0xBD7730) and returns it scaled"
+streamman_resource_loading_info_base,0,unload,"thiscall, no args; base is ret. streamman_unload (0xA7D4F0) and abort_current(false) call it; peg releases its peg by name (05)"
+streamman_resource_loading_info_base,1,abort,"thiscall, no args; base is ret. abort_current(true) calls it; peg rewinds its mempool, chunk_extras unloads then re-requests (05)"
