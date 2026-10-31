@@ -431,3 +431,4 @@ diversion_type_info,22,on_object_killed,"(killer human, killer vehicle handle): 
 diversion_type_info,23,on_vehicle_destroyed,"(vehicle, ...): game event 12, raised when a vehicle is destroyed (0xA9D290, 0xAB3550, multiplayer 0x874310); broadcast by 0x6047F0"
 diversion_type_info,25,on_object_damaged,"(attacker, amount): game event 14, raised by object_mover::vf15 (take damage); broadcast by 0x604740"
 object,6,set_physics_keyframed,"(bool keyframed, bool): body index +0x7C into 0x28F25C0 (0x18-byte entries); switches the entity motion (0x8002E) via 0x6FD440 (12)"
+GeneralCollisionListener,0,contact_point_added,"game contact callback: owner objects from entity property 1, type-pair table 0x1743D80 (true = disable contact), impulse/damage 0x70A230, per-type handlers 0x1765140 (17)"
