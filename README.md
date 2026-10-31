@@ -17,7 +17,7 @@ Update the graphic after porting or naming something: `python -I tools/progress.
 - `docs/PLAN.md`: strategy and milestones
 - `docs/analysis/`: findings from Ghidra/REA
 - `tools/`: analysis helpers (`unsteamstub21.py` strips the SteamStub 2.1 DRM from your own `SR2_pc.exe` so it can be analyzed statically; `rtti_dump.py` lists the C++ classes; `progress.py` draws the progress graphic; `harvest_names.py` adds auto-recovered names to `docs/functions.csv`: script bindings, Ghidra library matches, vtable slots)
-- `crates/sr2-formats`: game file formats (`.vpp_pc`, …)
+- `crates/sr2-formats`: game file formats (`.vpp_pc`, `.peg_pc`, `.chunk_pc`, …); `cargo run -p sr2-formats --example chunk -- stats <chunks*.vpp_pc>` summarises the world chunk sections
 - `crates/sr2-hook`: proxy `dinput8.dll` loaded into the original exe, used to swap original functions for Rust ones one at a time
 
 ## Building

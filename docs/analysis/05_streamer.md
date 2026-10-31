@@ -252,27 +252,27 @@ Debug: flag `0x2529DDB` makes reads of `player.cvtf` copy from memory (`0x2223CC
 | 0x00 | `0x4ACDF0` objects | The main section. Object names (rec+0xEC/+0xF0); objects, 0x50 bytes each (rec+0x48 count, +0x4C), each pointing to a 0x60-byte render-info entry (rec+0x40/+0x44) and given a squared fade distance from the table `0x144EA40`; 3-level LOD sets; several typed arrays; 0x54-byte entries flagged 0x80000/0x100000 spawn entities through `0xA69E00` (kinds 0xF / 0x14) |
 | 0x01 | `0x4ADCD0` | 0x94-byte named entries (rec+0x104/+0x108) with per-entry scale floats and u16 lists |
 | 0x02 | `0x4A35E0` | 0x28-byte entries (rec+0x134/+0x138), then `0x7F63B0` |
-| 0x03 | inline | count/pointer at rec+0x10C/+0x110 |
+| 0x03 | inline | **player starts** (`PlayerStart01`, …): count/pointer at rec+0x10C/+0x110 |
 | 0x04 | `0x4ADF20` render_items | 0xC8-byte render items (rec+0x5C/+0x60) and a node tree (rec+0x64); `game_render` collects the visible ones through the tree (`0x5239A0`); dropped for flag-bit-0 chunks |
 | 0x05 | `0x4ADF70` collision_models | Collision models via `0x7051C0` (indices rec+0x1F0/+0x1F4); remaps object collision indices (+0x3C/+0x3E). The only section with a string ("city_objects_load: Failed to load the collision models…") |
 | 0x06 | `0x4AE0C0` placed_spawns | 0x34-byte placements (rec+0x19C/+0x1A0); type-name hash → table `0x263AF98`; created by `0x4C61C0` at position/orientation, not within 15 m of the player |
-| 0x07, 0x08 | `0x4AE240`, `0x4AE280` | Two count/array pairs each (rec+0x68..+0x74, +0x78..+0x84); cleared when chunk flags & 0x13 |
+| 0x07, 0x08 | `0x4AE240`, `0x4AE280` collision_mopp | **Havok MOPP collision** (`BBPF`/`MOPP` in the data): two count/array pairs each (rec+0x68..+0x74, +0x78..+0x84); cleared when chunk flags & 0x13 |
 | 0x09 | inline | count/pointer at rec+0x88/+0x8C |
 | 0x0A | `0xA8AC00` | 0x3C- and 0x28-byte entries (rec+0x13C..+0x148), then `0xA8D970` with the traffic globals `0x2225B64`. Probably the road/lane network (unverified) |
 | 0x0B | inline | count/pointer at rec+0x14C/+0x150 |
 | 0x0C | `0x4AE320` | Node tree at rec+0x154, fixed up recursively by `0xBF6A40` |
-| 0x0D | `0x4AE380` | 0x28-byte entries with vec3 lists (rec+0x158/+0x15C), registered with `0x6F9590` → rec+0x160 |
-| 0x0E | `0x4AE460` physics_mesh_geometry | N meshes (rec+0x164/+0x168): 16-byte vertices, u16×3 triangles |
-| 0x0F | `0x4AE510` | rec+0x174/+0x178; advances a gpu-side offset |
+| 0x0D | `0x4AE380` collision_shapes | Havok collision (`MOPP` in the data): 0x28-byte entries with vec3 lists (rec+0x158/+0x15C), registered with `0x6F9590` → rec+0x160 |
+| 0x0E | `0x4AE460` water_volume_geometry | **Water volumes**: N meshes (rec+0x164/+0x168), 16-byte vertices, u16×3 triangles |
+| 0x0F | `0x4AE510` render_materials | Render materials (texture references such as `missing-alpha.tga`, `flat-normalmap.tgn`; avg 292 KB): rec+0x174/+0x178; advances a gpu-side offset |
 | 0x10 | inline | count/pointer at rec+0x180/+0x184 |
 | 0x11 | `0x4AE590` | 0x54-byte entries (rec+0x188/+0x18C), tail at rec+0x190 |
-| 0x12 | `0x4AE620` | rec+0x1AC if `0x70D740` accepts it |
-| 0x13 | `0x4AE640` | rec+0x1B0/+0x1B4 |
+| 0x12 | `0x4AE620` | Tagged `DTNC` data: rec+0x1AC if `0x70D740` accepts it |
+| 0x13 | `0x4AE640` | Tagged `LTNC`/`ITNC` data: rec+0x1B0/+0x1B4 |
 | 0x14 | `0x4AE690` | 0x3C-byte entries (rec+0x194/+0x198) |
-| 0x15 | `0x4AE6F0` physics_mesh_info | Per physics mesh: descriptor with counts/arrays and a name (rec+0x16C) |
-| 0x16 | `0x4AE7E0` physics_mesh_havok | Per physics mesh: Havok object from `0x7281D0` (rec+0x170) |
-| 0x17 | `0x4AE8C0` | 0x34-byte entries (rec+0x1A4/+0x1A8), chunk id stored in each |
-| 0x18 | `0x4AE990` | 0x34-byte entries (rec+0x1B8/+0x1BC); `0x6C7E90` in some modes |
+| 0x15 | `0x4AE6F0` water_volume_info | Per water volume: descriptor with counts/arrays and a name such as `watervol_001` (rec+0x16C) |
+| 0x16 | `0x4AE7E0` water_volume_havok | Per water volume: Havok MOPP object from `0x7281D0` (rec+0x170) |
+| 0x17 | `0x4AE8C0` floors | Floor surfaces named by texture (`…_hangar_floor1.tga`); probably reflective floors: 0x34-byte entries (rec+0x1A4/+0x1A8), chunk id stored in each |
+| 0x18 | `0x4AE990` slates | Named slates (`slate_srhq_landing`, `slate_adult_store`, …): 0x34-byte entries (rec+0x1B8/+0x1BC); `0x6C7E90` in some modes |
 | 0x19 | — | not handled |
 | 0x1A | `0x4AEA20` volumes | 0x84-byte volumes (rec+0x1C0/+0x1C4): AABB, flags (8, 0x200), mesh; point-in-volume tests for audio, teleport, vehicle entry, npc respawn (interiors or water, unverified) |
 | 0x1B | `0x4AEAB0` | count/array rec+0x1D4/+0x1D8 |
@@ -300,4 +300,24 @@ The chunk record's bounding box is rec+0x28..+0x3C (min x/y/z, max x/y/z, from h
 
 Still unidentified: sections 0x01, 0x02, 0x07, 0x08, 0x0A (probably roads), 0x0C, 0x0D, 0x0F, 0x11–0x14, 0x17, 0x18, 0x1B, 0x1E–0x24. They are not on a per-feature list, so finding their consumers means searching for reads of their record offsets.
 Searching for reads of the remaining record offsets in functions that touch chunk records gives false positives. The same small offsets are fields of other objects (for example `general_mover_init`, `0x9F9EA0`, reads mover fields, not the chunk record). The better next step for those sections is to dump them from the shipped `.chunk_pc` files (several carry name strings) and identify them by content.
+
+### Section data from the shipped chunks
+
+`cargo run --release -p sr2-formats --example chunk -- stats <game>/chunks1.vpp_pc ... chunks4.vpp_pc` parses all 751 chunks in those archives (about 16 s). It reports, per section type, how many chunks have it, the sizes, the first u32 and the most common strings. `chunk dump <archive> <chunk>` lists one chunk's sections, and `chunk hex <archive> <chunk> <kind>` hex-dumps one section. The parser is `sr2_formats::chunk`; the section table is at the end of the file (`count` × 12 bytes, count in header word 4).
+
+Identified from the data:
+- 0x03 player starts.
+- 0x05 collision models (magic `MCKH` in all 751).
+- 0x07/0x08/0x0D/0x16 Havok MOPP collision.
+- 0x0E/0x15/0x16 water volumes (`watervol_001`).
+- 0x0F render materials (texture references).
+- 0x17 floors named by texture (probably reflective).
+- 0x18 slates.
+- 0x25 flipbook animations (`flipfloatc01`, `ai_bannerfb08`, `flagflip`, `windsock_fb`), which confirms the consumer analysis.
+
+Sections 0x12/0x13 carry the magics `DTNC` and `LTNC`/`ITNC`. The objects section also contains material/texture names.
+
+Sections present in every chunk: 0x00, 0x05, 0x22, 0x25. Never seen in these archives: 0x02, 0x19, 0x1C, 0x1D. The header words 0x35..0x3A give boxes that look too large for single chunks (e.g. sr2_chunk161: x −4..1340, z −1751..2.7), so treat the bounding-box reading as unverified.
+
+Still unidentified by data (no strings): 0x01, 0x04, 0x06, 0x09, 0x0A, 0x0B/0x0C (they share data; 0x0C is a tree over 0x0B), 0x10, 0x11, 0x14, 0x1A, 0x1B, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24.
 
