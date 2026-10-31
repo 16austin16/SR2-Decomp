@@ -43,13 +43,17 @@ const READ_RELEASE: usize = 0x00A7_4270; // (id lo, id hi, mode)
 const BATCH_CANCEL_READS: usize = 0x00A7_D9C0; // (batch)
 const BATCH_RELEASE_A: usize = 0x00A7_DA30; // (batch, mode)
 const BATCH_RELEASE_B: usize = 0x00A7_DB30; // (batch, mode)
-const START_LOAD: usize = 0x00A7_DDE0; // (slot)
 const START_LOAD_EXTRAS: usize = 0x00A7_E100; // (slot), type 4
 const POLL_BATCH: usize = 0x00A7_ED40; // (batch)
 const POLL_BATCH_EXTRAS: usize = 0x00A7_E900; // (batch), type 4
 const PROCESS_ANIMATION: usize = 0x00A7_D0C0; // (), type 6
 const STREAMMAN_NOP: usize = 0x00A7_D810;
 const IAT_SLEEP: usize = 0x00DB_80B8;
+const FILE_GET_SIZE: usize = 0x00BF_E0E0; // ESI = u32 *out, cdecl (name) -> AL
+const READ_NODE_ALLOC: usize = 0x00A7_D930; // () -> node, from the pool 0x252A020
+const BATCH_FREE_NODES: usize = 0x00A7_DC30; // (batch)
+const ASYNC_IO_SUBMIT: usize = 0x00A7_3290; // stdcall (io manager, desc[8], bool) -> u64 request id
+const IO_MANAGER: usize = 0x00EB_80E0; // -> io manager*
 
 /// Run the control flow in Rust (false: the originals, with the same event log).
 const PUMP_RUST: bool = true;
@@ -71,7 +75,8 @@ const ABORT_CURRENT: usize = 10;
 const UNLOAD: usize = 11;
 const PROCESS: usize = 12;
 const WAIT: usize = 13;
-const COUNT: usize = 14;
+const START_LOAD_I: usize = 14;
+const COUNT: usize = 15;
 
 /// (name, address, stolen prologue): whole, position-independent instructions.
 const PORTS: [(&str, usize, &[u8]); COUNT] = [
@@ -89,6 +94,7 @@ const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("unload", 0x00A7_D4F0, &[0x8B, 0x44, 0x24, 0x04, 0x8B, 0xC8]),
     ("process", 0x00A7_D6D0, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
     ("wait", 0x00A7_D600, &[0x56, 0x8B, 0x74, 0x24, 0x08]),
+    ("start_load", 0x00A7_DDE0, &[0x83, 0xEC, 0x30, 0x53, 0x8B, 0x1D, 0x18, 0xA0, 0x52, 0x02]),
 ];
 
 /// Trampolines to the originals.
@@ -675,9 +681,231 @@ unsafe fn process_generic() {
     unsafe {
         let cur = rd(CURRENT) as usize;
         if rd(cur + 4) == 1 {
-            call(if rd(cur) == 4 { START_LOAD_EXTRAS } else { START_LOAD }, &[cur as u32]);
+            if rd(cur) == 4 {
+                call(START_LOAD_EXTRAS, &[cur as u32]);
+            } else {
+                start_load_hook(cur as u32); // through the hook, for the event log
+            }
         }
         poll_active();
+    }
+}
+
+unsafe fn file_get_size(name: u32, out: &mut u32) -> bool {
+    let r: u32;
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "mov esi, {o}",
+            "push {n}", "call {f}", "add esp, 4",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            o = in(reg) out as *mut u32, n = in(reg) name, f = in(reg) FILE_GET_SIZE,
+            lateout("eax") r, clobber_abi("C"),
+        );
+    }
+    r as u8 != 0
+}
+
+/// `async_io_submit` (stdcall): queue a read on the io thread; returns its 64-bit id.
+unsafe fn io_submit(desc: &[u32; 8]) -> (u32, u32) {
+    let (lo, hi): (u32, u32);
+    unsafe {
+        let mgr = rd(rd(IO_MANAGER) as usize);
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "push 0", "push {d}", "push {m}", "call {f}",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            d = in(reg) desc.as_ptr(), m = in(reg) mgr, f = in(reg) ASYNC_IO_SUBMIT,
+            lateout("eax") lo, lateout("edx") hi, clobber_abi("C"),
+        );
+    }
+    (lo, hi)
+}
+
+/// Append `n` to the circular `{prev, next}` list whose head pointer is at `head`.
+unsafe fn list_append(head: usize, n: usize) {
+    unsafe {
+        let h = rd(head) as usize;
+        if h == 0 {
+            wr(n, n as u32);
+            wr(n + 4, n as u32);
+            wr(head, n as u32);
+        } else {
+            let tail = rd(h) as usize;
+            wr(n, tail as u32);
+            wr(n + 4, h as u32);
+            wr(tail + 4, n as u32);
+            wr(h, n as u32);
+        }
+    }
+}
+
+/// `streamman_start_load` (0xA7DDE0): issue the reads for a requested slot.
+///
+/// Takes the free list's head batch (+0x08..+0x14 cleared, +0x18 = the chunk id for
+/// type 0, else 0xFFFF). For each read step that passes the info's filter (+0x10;
+/// default: the step names a file): set it as the current step, run its begin
+/// callback, align the destination cursor (unless the info manages its own memory,
+/// flag 0x100000), get the file's size and, if non-zero, check it fits, take a
+/// read node `{prev, next, file, 0, .., +0x20 dest, +0x24 size, +0x28 priority
+/// (0x70 for chunk geom/peg, else 0x40), +0x2C step}` onto the batch, then the issue
+/// and after callbacks (after is skipped for chunk pegs) and advance the cursor. A
+/// failing callback or a file too big (flag 0x200000) frees the nodes and aborts
+/// the slot. If any reads were taken, the batch goes on the active list, every
+/// node is submitted to the io thread (id at +0x10/+0x14) and the slot reads
+/// (state 2). Otherwise the batch goes back on the free list after a failure;
+/// after a run with nothing to read it is left off both lists, as in the original.
+unsafe fn start_load(s: usize) {
+    unsafe {
+        let batch = rd(BATCHES_FREE) as usize;
+        let info = rd(s + 0x10) as usize;
+        if rd(batch + 4) as usize == batch {
+            wr(batch + 4, 0);
+            wr(batch, 0);
+            wr(BATCHES_FREE, 0);
+        } else {
+            let (prev, next) = (rd(batch), rd(batch + 4));
+            wr(BATCHES_FREE, next);
+            if prev != 0 {
+                wr(prev as usize + 4, next);
+            }
+            if next != 0 {
+                wr(next as usize, prev);
+            }
+            wr(batch + 4, 0);
+            wr(batch, 0);
+        }
+        for o in [8, 0x0C, 0x10, 0x14] {
+            wr(batch + o, 0);
+        }
+        let id = if rd(s) == 0 { *((info + 0x52E) as *const u16) } else { 0xFFFF };
+        *((batch + 0x18) as *mut u16) = id;
+
+        let flags = |info: usize| rd(info + 0x20);
+        let call_bool = |f: u32, arg: u32| call(f as usize, &[arg]) as u8 != 0;
+        let (mut ok, mut failed) = (true, false);
+        let mut i = 0u32;
+        while i < (flags(info) >> 10) & 0x3FF {
+            let step = rd(info + 0x14) as usize + i as usize * 0x244;
+            let file = rd(step);
+            let filter = rd(info + 0x10);
+            let wanted = if filter != 0 { call_bool(filter, file) } else { file != 0 };
+            if wanted {
+                wr(info + 0x20, (flags(info) & !0x3FF) | (i & 0x3FF));
+                let begin = rd(step + 0x22C);
+                if begin != 0 && !call_bool(begin, info as u32) {
+                    failed = true;
+                    break;
+                }
+                if flags(info) & 0x10_0000 == 0 {
+                    let align = *((step + 0x214) as *const u16) as u32;
+                    let r = rd(info + 8) % align;
+                    let pad = if r == 0 { 0 } else { align - r };
+                    wr(info + 8, rd(info + 8).wrapping_add(pad));
+                    wr(info + 0x0C, rd(info + 0x0C).wrapping_sub(pad));
+                    wr(step + 0x218, rd(info + 8));
+                }
+                if file_get_size(file, &mut *((step + 0x210) as *mut u32)) {
+                    let size = rd(step + 0x210);
+                    if size != 0 {
+                        if size > rd(info + 0x0C) {
+                            wr(info + 0x20, flags(info) | 0x20_0000);
+                            failed = true;
+                            break;
+                        }
+                        let node = call(READ_NODE_ALLOC, &[]) as usize;
+                        wr(node + 8, file);
+                        wr(node + 0x0C, 0);
+                        *((node + 0x28) as *mut u8) = if rd(s) <= 1 { 0x70 } else { 0x40 };
+                        wr(node + 0x20, rd(info + 8));
+                        wr(node + 0x2C, i);
+                        wr(node + 0x24, size);
+                        list_append(batch + 0x0C, node);
+                        let issue = rd(step + 0x234);
+                        if issue != 0 {
+                            call(issue as usize, &[info as u32]);
+                        }
+                        let after = rd(step + 0x238);
+                        if after != 0 && rd(s) != 1 && !call_bool(after, info as u32) {
+                            failed = true;
+                            break;
+                        }
+                        if flags(info) & 0x10_0000 == 0 {
+                            wr(info + 8, rd(info + 8).wrapping_add(size));
+                            wr(info + 0x0C, rd(info + 0x0C).wrapping_sub(size));
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+        if failed {
+            ok = false;
+            if rd(batch + 0x0C) != 0 {
+                call(BATCH_FREE_NODES, &[batch as u32]);
+            }
+            abort_current_hook(0); // through the hook, for the event log
+        }
+        if rd(batch + 0x0C) != 0 {
+            wr(s + 0x20, batch as u32);
+            wr(s + 0x18, 0);
+            wr(s + 0x1C, 0);
+            wr(batch + 0x14, s as u32);
+            list_append(BATCHES_ACTIVE, batch);
+            let head = rd(batch + 0x0C) as usize;
+            let mut n = head;
+            while n != 0 {
+                let desc = [rd(n + 8), rd(n + 0x0C), 0, rd(n + 0x24), rd(n + 0x20), *((n + 0x28) as *const u8) as u32, 0, 0];
+                let (lo, hi) = io_submit(&desc);
+                wr(n + 0x10, lo);
+                wr(n + 0x14, hi);
+                n = rd(n + 4) as usize;
+                if n == rd(batch + 0x0C) as usize {
+                    break;
+                }
+            }
+            wr(s + 4, 2);
+        } else if !ok {
+            list_append(BATCHES_FREE, batch);
+        }
+    }
+}
+
+extern "C" fn start_load_hook(s: u32) {
+    CALLS[START_LOAD_I].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let s = s as usize;
+        let e = format!("start {}", describe(s));
+        if PUMP_RUST {
+            start_load(s);
+        } else {
+            let f: extern "C" fn(u32) = std::mem::transmute(orig(START_LOAD_I));
+            f(s as u32);
+        }
+        // What was issued: the batch's reads (count, bytes, destination offsets
+        // relative to the first), read back the same way in both modes.
+        let (mut reads, mut bytes, mut dests) = (0u32, 0u32, String::new());
+        if rd(s + 4) == 2 {
+            let batch = rd(s + 0x20) as usize;
+            let head = rd(batch + 0x0C) as usize;
+            let mut n = head;
+            while n != 0 {
+                reads += 1;
+                bytes = bytes.wrapping_add(rd(n + 0x24));
+                dests += &format!(" {:x}/{:x}", rd(n + 0x20).wrapping_sub(rd(head + 0x20)), *((n + 0x28) as *const u8));
+                n = rd(n + 4) as usize;
+                if n == head {
+                    break;
+                }
+            }
+        }
+        let flags = rd(rd(s + 0x10) as usize + 0x20);
+        event(format!(
+            "{e} -> s{} reads {reads} bytes {bytes:#x}{dests} too_big {} current {}",
+            rd(s + 4),
+            (flags >> 21) & 1,
+            (rd(CURRENT) as usize == s) as u8
+        ));
     }
 }
 
@@ -836,6 +1064,7 @@ fn hook_address(i: usize) -> usize {
         UNLOAD => unload_hook as extern "C" fn(u32) -> u32 as usize,
         PROCESS => process_hook as extern "C" fn() as usize,
         WAIT => wait_hook as extern "C" fn(u32) -> u32 as usize,
+        START_LOAD_I => start_load_hook as extern "C" fn(u32) as usize,
         _ => unreachable!(),
     }
 }

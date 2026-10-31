@@ -347,3 +347,21 @@ switches between the port and the originals, and both modes write the same disti
 above 2 GB, else mode 2. It cancels the 64-bit read id at +0x18/+0x1C if set (`0xA74150`, then
 `0xA74270` with the mode), otherwise the batch at +0x20.
 
+### start_load
+
+`streamman_start_load` (`0xA7DDE0`) is in Rust as well, detoured because the chunk-extras
+start (`0xA7E100`, at `0xA7E791`) also calls it. Per read step it runs the filter and begin
+callback, aligns the destination cursor, gets the file size (`file_get_size`, `0xBFE0E0`,
+ESI = out), takes a read node and runs the issue/after callbacks. Read nodes hold
+`{prev, next, +8 file, +0xC 0, +0x10/+0x14 io id, +0x20 dest, +0x24 size, +0x28 priority,
++0x2C step}`; priority is 0x70 for chunk geom/peg and 0x40 otherwise. Each node goes to
+`async_io_submit` (`0xA73290`, stdcall `ret 0xC`) as an 8-dword descriptor
+`{file, 0, 0, size, dest, priority, 0, 0}`.
+
+Quirk kept from the original: if the step count is 0, or every step is skipped, the batch has
+already been taken off the free list and is never put back, and the slot stays in state 1.
+
+The teleport test logs one event per start (type, read count, total bytes, priorities). Original
+vs Rust: identical for every chunk geom (627), peg (23), type 5 (16) and type 7 (2) start. Only
+the ambient vehicle/character loads (types 2 and 3) differ, and those vary from run to run.
+
