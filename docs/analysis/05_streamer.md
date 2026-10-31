@@ -1258,15 +1258,18 @@ Each request logs its handle, slot state and, for every step, the file name, ali
 Still original: `request_chunk` (`0xA80360`), `request_chunk_extras` (`0xA84510` / `_impl`
 `0xA82EA0`), `step_init_multipart` and all the completion and step callbacks.
 
-**Open item.** In 2 of 3 Rust runs since `poll_chunk_extras` was ported, the same two chunk-extras
-starts differ from the original, with identical numbers both times:
-- one chunk: 0 mesh parts and anims of 227,720 bytes, vs 8 parts and 189,368 bytes;
-- the other: 16 parts, vs 8.
+**Resolved: not a port bug.** In 2 of 3 Rust runs, two chunk-extras starts differed from the
+earlier original runs: chunk `0x103` got 0 mesh parts with 227,720 bytes of anims (instead of 8
+parts and 189,368 bytes), and chunk `0x16F` got 16 parts (instead of 8). A run of the original
+with the start order logged (`sr2-streamman-seq.log`, one line per chunk-extras start, written
+next to the event log) shows exactly that pattern too. So the original flips between the two
+outcomes from run to run.
 
-Three original runs never showed this. The part totals agree (16), which fits two neighbouring
-chunks sharing objects being started in the opposite order, so their shared mesh cache records
-are loaded by the other chunk. That may be a timing effect of the hook, but it reproduces too
-exactly to dismiss. Next step: log the order of extras starts and polls, and the record states.
+The cause is ordering. The request queue compare (`0xA7CF30`) orders by slot type and pop_best
+keeps the lower slot address, so extras requests start in slot order (4:0 before 4:1), not
+request order. Which slot a request gets depends on which one was free at request time.
+Neighbouring chunks share objects, so whichever starts first loads the shared mesh parts. The
+sequence log is kept for checking orderings in future comparisons.
 
 
 ## Request order: the queue compare (0xA7CF30)

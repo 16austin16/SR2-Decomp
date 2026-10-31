@@ -7,7 +7,7 @@ $bin = "F:\Saints Row 2 Decomp\bin"
 $input = "F:\Saints Row 2 Decomp\tools\ingame\sr2input.ps1"
 if (Get-Process SR2_pc -ErrorAction SilentlyContinue) { "game already running"; exit 1 }
 Copy-Item "F:\Saints Row 2 Decomp\target\i686-pc-windows-msvc\release\dinput8.dll" "$g\dinput8.dll" -Force
-Remove-Item "$g\sr2-hook.log", "$g\sr2-streamman.log" -ErrorAction SilentlyContinue
+Remove-Item "$g\sr2-hook.log", "$g\sr2-streamman.log", "$g\sr2-streamman-seq.log" -ErrorAction SilentlyContinue
 Start-Process "steam://rungameid/9480"
 $log = "$g\sr2-hook.log"
 $deadline = (Get-Date).AddSeconds(150)
@@ -37,4 +37,5 @@ if (Get-Process SR2_pc -ErrorAction SilentlyContinue) {
 }
 Copy-Item $log "$bin\$Label.hook.log" -ErrorAction SilentlyContinue
 Copy-Item "$g\sr2-streamman.log" "$bin\$Label.events.log" -ErrorAction SilentlyContinue
+Copy-Item "$g\sr2-streamman-seq.log" "$bin\$Label.seq.log" -ErrorAction SilentlyContinue
 Get-Content $log | Select-String -Pattern "teleport test|streamman live|EXITED|panic" | ForEach-Object { $_.Line.Substring(0, [Math]::Min(330, $_.Line.Length)) }

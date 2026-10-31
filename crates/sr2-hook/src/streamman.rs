@@ -1406,6 +1406,15 @@ extern "C" fn start_extras_hook(s: u32) {
             }
         }
         event(format!("{e} -> s{} parts {:?} anims {:?} file {:?}", rd(s + 4), kinds[0], kinds[1], kinds[2]));
+        let chunk = *((rd(s + 0x10) as usize + 0x772) as *const u16);
+        sequence(format!(
+            "start_extras {} chunk {chunk:#x} -> s{} parts {:?} anims {:?} file {:?}",
+            describe(s),
+            rd(s + 4),
+            kinds[0],
+            kinds[1],
+            kinds[2]
+        ));
     }
 }
 
@@ -1900,10 +1909,21 @@ extern "C" fn wait_hook(handle: u32) -> u32 {
     }
 }
 
+/// Chunk-extras starts in the order they happened (`sr2-streamman-seq.log`): the
+/// event set cannot show ordering differences between runs.
+static SEQUENCE: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn sequence(e: String) {
+    SEQUENCE.lock().unwrap_or_else(|p| p.into_inner()).push(e);
+}
+
 fn write_events() {
     let events = EVENTS.lock().unwrap_or_else(|p| p.into_inner());
     let text: String = events.iter().map(|(e, n)| format!("{e}\t{n}\n")).collect();
     let _ = std::fs::write("sr2-streamman.log", text);
+    let seq = SEQUENCE.lock().unwrap_or_else(|p| p.into_inner());
+    let text: String = seq.iter().enumerate().map(|(i, e)| format!("{i}\t{e}\n")).collect();
+    let _ = std::fs::write("sr2-streamman-seq.log", text);
 }
 
 // --- Request side -----------------------------------------------------------------
