@@ -87,20 +87,88 @@ Every slot of the 11 pool vtables was routed through a `lock inc; jmp [orig]` st
 
 **Pool objects in `.data`:** "gpu idx/vtx buffers", "cpu idx/vtx buffers", "gr_mesh pool" (async), "string_hash_table", "Bmpman extra filename hash table", "BitmapsMemPool", "packfile_pool", "temp packfile", "cmdline", 10 × "audio - engine slot", per-character and weather `string_pool`s, "light set", "Vint" and "profile_vpool" (`virtual_mempool`), and about 70 unused "Untitled" `virtual_mempool` slots. Pools on the heap were not scanned.
 
-## Ported
+## Other methods (all used over a boot plus save load)
 
-- **`static_mempool_base::alloc` → Rust** (`crates/sr2-hook/src/mempool.rs`, 2026-10-31). Slot 7 is swapped in every vtable that uses `0xC00DB0`: `mempool`, `string_pool`, `string_hash_table`, `split_mempool_template<mempool>`. No code bytes are patched. The `is_valid` and `bytes_free` calls stay virtual, so subclass overrides still apply.
-- **Verification:** on every call the original runs first. Its result and the first 0x50 bytes of the pool are kept, the header is rewound, the port runs, and both outcomes are compared; on a mismatch the original's outcome is restored. Boot plus save load: 428,079 calls, 0 mismatches. The failure path (printf) has not been exercised.
+| Slot | Function | Meaning |
+|---|---|---|
+| 4 | `0x4A4AE0` | `used_bytes()`: `size − bytes_free()` |
+| 5 / 11 | `0x4A4B10` / `0x4A4B20` | `size()` (+0x3C) / `base()` (+0x38) |
+| 8 | `0xC00EC0` | `resize_last(ptr, size)`: if `ptr` is the last allocation and the growth fits, `used = last − base + size`; returns `last` or NULL |
+| 10 | `0xC00FA0` / `0xBF4AF0` (mempool) | `reset()`: `release_to(0)`; mempool also `set_limit(size)` |
+| 12 | `0xC00CF0` | `mark()`: mark (+0x48) = used |
+| 13 | `0xC00D00` | `release_to(pos)`: used = mark = pos (−1 means the mark) |
+| 13 | `0xBFC870` (virtual) | `release_to(pos)`: under the lock, used = pos (the mark is not updated), then unless flag +0x6C bit 1 is set, `VirtualFree(MEM_DECOMMIT)` the whole pages above `used` and return them to the tracker (`0xC153A0`). If bit 0 is set, zero the released bytes after unlocking. |
+| 14 | `0xC00F80` | `release(n)`: `release_to(used − n)`, keeping the mark |
+| 15 | `0xC00F40` | `align_to(a)`: if `base + used` is unaligned, `alloc(pad, 1)` |
+| 17 | `0xBF4A10` | `init(base, size, name, align, flags)` (`ret 0x14`): name copied to +0x0C, flags byte to +0x2C, `limit = saved limit = size`, everything else zero |
+| 22 | `0xBF4AB0` | `set_limit(x)`: limit (+0x4C) = saved (+0x50) = x (−1 means the saved value) |
+| 7 | `0xC0BC00` (async) | `alloc(size, align)` lock-free: if `align` exceeds the default, over-allocate by `align`. Round up, `InterlockedExchangeAdd(&used, n)`; on overflow set `used = size` and return NULL; otherwise return the aligned `base + old`. |
+| 7 / 28 | `0xC01040` / `0xC01060` (tracked) | `alloc` forwards to slot 28 with tracking arguments (`this+0x60`, `[this+0xA0]`); slot 28 ignores them and calls the base alloc directly |
 
-- **`virtual_mempool::alloc` → Rust** (2026-10-31), by swapping slot 7 of `virtual_mempool`. The tracker reserve/release and `VirtualAlloc` are called as before; `printf` and `memset` are the game's own CRT functions.
-- **Verification:** same snapshot/rewind/compare approach, with three additions:
-  - It holds the pool's lock, and the tracker's when there is one, across both runs. Both are recursive, and they are taken in the same order as the original.
-  - The lock bytes are never compared or restored.
-  - On a commit, the tracker's counters (+0x1C..+0x2C) are rewound and compared too. Re-running the commit is safe: `MEM_COMMIT` and `MEM_DECOMMIT` can be repeated, and nothing has written to the new pages yet.
+`mempool`'s +0x4C is a **limit** (bytes from base, which `bytes_free` uses), not an address; +0x50 is its saved copy.
 
-  Only a reservation larger than the tracker's free pages (compaction) would be left to the original; none happened. Boot plus save load: 1,257,654 calls, including 18,574 page commits through the tracker, 0 mismatches.
-- **Not exercised:** every failure path (out of reserve, no tracker pages, `VirtualAlloc` failure) and the tracker compaction.
+## Ported (2026-10-31): every pool method the game calls
 
-## Next
+**25 methods → Rust** (`crates/sr2-hook/src/mempool.rs`):
+- `is_valid`, the five `bytes_free` variants, `used_bytes`, `size`, `base`, `mark`, `release_to`, `can_alloc`, `alloc`, `resize_last`, `release`, `align_to`;
+- both `reset`s, `set_limit` and `init`;
+- `virtual_mempool::alloc` and `::release_to`, `async_mempool::alloc`, and the two `tracked_mempool` allocs.
 
-`can_alloc` (slot 6) and `bytes_free` (slot 3) are trivial. Then `tracked_mempool` (alloc slot 7 `0xC01040`, slot 28), `page_mempool`, `split_page_mempool` and `async_mempool`, the reset paths (slots +0x30/+0x34/+0x58), and the page tracker itself (`0xC152C0`, `0xC153A0`, `0xC15810`).
+This is every pool method called over a boot plus save load (re-surveyed with the first two ports in place); each one ran at least once.
+
+**Inline detours, not vtable swaps.**
+- The first two ports swapped vtable slots. The exe also calls these methods directly: 290 call sites for `alloc`, 57 for `virtual_mempool::alloc`, 33 for `virtual_mempool::release_to` and 7 for `async_mempool::alloc`. Those direct calls were still running the original.
+- Every method is now detoured at its body, so both virtual and direct calls reach Rust. The original stays callable through its trampoline.
+- All 25 prologues were checked against the exe with capstone: bytes match, they end on an instruction boundary, and there are no relative branches. The one-line getters steal their own `ret` plus one byte of int3 padding.
+
+**Register-exact leaf thunks.**
+- The first build crashed at boot, in a text parser at `0xBF82F3`. With LTCG, a direct caller of a leaf function may keep values in the registers the leaf happens not to touch.
+- The leaves now enter through naked thunks that reproduce the original's exact outputs:
+  - `is_valid` changes only AL;
+  - `size`/`base` change only EAX;
+  - `mark` leaves EAX = `used`;
+  - the `mempool` `bytes_free` leaves ECX = `used`, the `size − used` variants leave EDX = `used`;
+  - `used_bytes` leaves ECX = EAX.
+- Methods that call a virtual function clobber EAX/ECX/EDX anyway.
+
+**Verification on every call.**
+- Pure methods run both versions and compare the results. The original is read a second time before reporting a difference, since another thread may have allocated in between.
+- State-changing methods use snapshot → original → rewind → port → compare over the first 0x54 bytes, keeping the original's outcome on a mismatch.
+- The `virtual_mempool` methods hold the pool and tracker locks, skip the lock bytes, and rewind the tracker counters. `MEM_COMMIT`/`MEM_DECOMMIT`, the tracker's recommit and the zero-fill are all safe to repeat.
+- The lock-free async pool is serialized by a mutex in the hook while it is checked. That is possible because every call now reaches the hook.
+
+**Boot plus save load:** 20,473,919 calls, 0 mismatches, 31,923 page commits and decommits done by Rust, and no tracker compaction left to the original.
+
+| Method | Calls |
+|---|---|
+| `is_valid` | 8.8M |
+| `async_mempool::alloc` | 2.1M |
+| `virtual_mempool::bytes_free` | 2.4M |
+| `can_alloc` | 1.4M |
+| `mempool::bytes_free` | 1.4M |
+| `virtual_mempool::alloc` | 1.26M |
+| `mark` | 1.19M |
+| `virtual_mempool::release_to` | 1.08M |
+| `alloc` | 516k |
+| `release_to` | 121k |
+| `size` | 57k |
+| `tracked_mempool::alloc_impl` | 31k |
+| `tracked_mempool::alloc` | 13k |
+| `set_limit` | 6.8k |
+| `mempool::reset` | 3.3k |
+| `release` | 1.2k |
+| `init` | 901 |
+| `align_to` | 14 |
+| `resize_last` | 3 |
+| `used_bytes` | 1 |
+
+**Not exercised:** the failure paths (out of space or reserve, no tracker pages, `VirtualAlloc` failure) and tracker compaction.
+
+## Not ported (never called in the survey)
+
+- The overrides in `page_mempool` (`0xC1C9D0`…), `split_page_mempool` (`0xC166B0`…) and `compacting_mempool` (beyond `bytes_free`).
+- `async_mempool`'s other slots, and `virtual_mempool` init/destroy/attach-tracker (`0xBFC630`, `0xBFC790`, `0xBFC830`, `0xBFC850`).
+- The string-pool `release_to` variants (`0xC07040`, `0xC078C0`, the hash table).
+- The page tracker itself (`0xC152C0`, `0xC153A0`, `0xC15810`).
+
+These need a scenario that actually reaches them (multiplayer, other game modes) before they can be verified.

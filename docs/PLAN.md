@@ -55,4 +55,5 @@ original. The standalone build can move to 64-bit later.
 17. ✅ RTTI class map (`docs/analysis/03_rtti_classes.md`): 517 game classes across objects, memory pools, streaming, renderer, D3D wrappers, vint UI, scripting, activities, multiplayer; about 305 Havok.
 18. ✅ Memory pools started (`docs/analysis/04_mempool.md`): vtables, layout, and a runtime survey of method calls and pool objects. `static_mempool_base::alloc` → Rust by vtable-slot swap in 4 pool classes, shadow-checked on every call (428k allocations, 0 mismatches).
 19. ✅ `virtual_mempool::alloc` → Rust (page commits through the page tracker included), shadow-checked under the pool and tracker locks: 1.26M allocations and 18,574 commits, 0 mismatches.
-20. Next: the rest of the pools (`can_alloc`, tracked/page/split/async pools, the reset paths, the page tracker), then the streamer (`streamman_*`), the vint UI, and the D3D wrappers.
+20. ✅ Memory pools done for everything the game calls: 25 methods → Rust as inline detours, covering direct calls as well as virtual ones, with register-exact thunks for leaf methods. Shadow-checked on every call: 20.5M calls over boot plus save load, 0 mismatches. Untouched: the pool types never used in single player, and the page tracker internals.
+21. Next: the streamer (`streamman_*`, mapped in `docs/analysis/05_streamer.md`), the vint UI, and the D3D wrappers.

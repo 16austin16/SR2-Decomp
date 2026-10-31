@@ -35,6 +35,9 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if n == 1 || n == FIND_RECORD_VERIFY_FRAME || n.is_multiple_of(3600) {
         log(&file_resolve_summary());
         log(&crate::mempool::summary());
+        if SURVEY {
+            crate::survey::report(&format!("frame {n}"));
+        }
     }
     if n.is_multiple_of(60) {
         file_read_log_flush();
@@ -158,6 +161,10 @@ struct VppEntry {
     name: *const u8,
     ext: *const u8,
 }
+
+/// Count calls per memory-pool vtable slot (crate::survey) and log them with
+/// the frame summaries. For finding which methods matter; off normally.
+const SURVEY: bool = false;
 
 /// Run the verify pass once the main menu is up (packfiles mounted at boot).
 const FIND_RECORD_VERIFY_FRAME: u32 = 300;
@@ -2083,8 +2090,10 @@ pub fn install_all() {
             Err(e) => log(&format!("hook packfile_find_entry failed: {e:?}")),
         }
 
-        // crate::survey::install(); // method-count survey (conflicts with vtable ports while on)
         crate::mempool::install();
+        if SURVEY {
+            crate::survey::install(); // wraps whatever the slots hold, so after the ports
+        }
     });
 }
 
