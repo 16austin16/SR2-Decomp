@@ -95,7 +95,10 @@ const REQUEST_CHARACTER: usize = 26;
 const REQUEST_VEHICLE: usize = 27;
 const REQUEST_GEOM: usize = 28;
 const REQUEST_PEG: usize = 29;
-const COUNT: usize = 30;
+const REQUEST_EXTRAS: usize = 30;
+const REQUEST_EXTRAS_IMPL: usize = 31;
+const REQUEST_CHUNK: usize = 32;
+const COUNT: usize = 33;
 
 /// (name, address, stolen prologue): whole, position-independent instructions.
 const PORTS: [(&str, usize, &[u8]); COUNT] = [
@@ -129,6 +132,9 @@ const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("request_vehicle", 0x00A8_7F80, &[0x8B, 0x44, 0x24, 0x0C, 0x53]),
     ("request_chunk_geom", 0x00A8_5140, &[0x83, 0xEC, 0x08, 0x53, 0x56]),
     ("request_chunk_peg", 0x00A8_5890, &[0x83, 0xEC, 0x08, 0x53, 0x56]),
+    ("request_chunk_extras", 0x00A8_4510, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
+    ("request_chunk_extras_impl", 0x00A8_2EA0, &[0xA0, 0x48, 0x8B, 0x52, 0x02]),
+    ("request_chunk", 0x00A8_0360, &[0x81, 0xEC, 0xCC, 0x01, 0x00, 0x00]),
 ];
 
 /// Trampolines to the originals.
@@ -1949,7 +1955,12 @@ const UNLOAD_FLAGGED_GEOM_FLAG: usize = 0x00E8_7B4F; // u8
 /// Call a game function with EAX/ECX/EDX/ESI set and any number of stack
 /// arguments (cdecl or callee-clean alike: ESP is restored from EBP).
 unsafe fn game_call_n(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, args: &[u32]) -> (u32, u32) {
-    let block: [u32; 7] = [f as u32, eax, ecx, edx, esi, args.as_ptr() as u32, args.len() as u32];
+    unsafe { game_call_full(f, eax, ecx, edx, esi, 0, args) }
+}
+
+/// [`game_call_n`] with EDI set too.
+unsafe fn game_call_full(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> (u32, u32) {
+    let block: [u32; 8] = [f as u32, eax, ecx, edx, esi, args.as_ptr() as u32, args.len() as u32, edi];
     let (lo, hi): (u32, u32);
     unsafe {
         std::arch::asm!(
@@ -1966,6 +1977,7 @@ unsafe fn game_call_n(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, args: &[
             "jmp 2b",
             "3:",
             "mov eax, [ebx + 4]", "mov ecx, [ebx + 8]", "mov edx, [ebx + 12]", "mov esi, [ebx + 16]",
+            "mov edi, [ebx + 28]",
             "call dword ptr [ebx]",
             "mov esp, ebp",
             "pop ebp", "pop edi", "pop esi", "pop ebx",
@@ -2632,6 +2644,528 @@ extern "C" fn unload_flagged_geom_hook(flag: u32) {
     }
 }
 
+// --- Chunk extras request ---------------------------------------------------------
+
+const STREAMING_OFF_A: usize = 0x0252_8B48; // u8: streaming is off when this is 1 and B is 0
+const STREAMING_OFF_B: usize = 0x0252_8B49;
+const CHUNK_POOLS: usize = 0x0277_1894; // 3 chunk pools, 0x58 bytes each
+const ANIM_POOLS: usize = 0x0277_1AA0; // 3 per-pool anim allocators, 0x54 bytes each
+const NETWORK: usize = 0x0252_8C14; // network object, NULL in single player
+const NET_PENDING: usize = 0x00EB_8148; // {u16 chunk id + junk, u32 sequence}[], count +8, capacity +4
+const NET_SEQUENCE: usize = 0x0252_A02C;
+const NET_PENDING_REMOVE: usize = 0x00A8_4DD0; // ECX = index
+const NET_SEND: usize = 0x0081_4740; // cdecl (message, length)
+const NET_HEADER_LONG: usize = 0x00E8_BDDC; // u8: 4-byte message header instead of 3
+const EXTRAS_LIST_RELEASE: usize = 0x00A8_2600; // DI = chunk id, DL = flag
+const EXTRAS_LIST_GET: usize = 0x00A8_2AD0; // EAX = u32 *count, EDX = chunk id, cdecl (list)
+const EXTRAS_LIST_STORE: usize = 0x00A8_2690; // EAX = count, cdecl (list, chunk id, 1)
+const EXTRAS_COLLECT_PARTS: usize = 0x00A8_2B40; // ECX = meshes, EDX = list, cdecl (anims, &anim count, &mesh count, count, chunk id)
+const SMESH_CACHE_FILTER_REQUESTS: usize = 0x006E_6B80; // cdecl (out, meshes, count, chunk id) -> count
+const MESH_ALIGN: usize = 0x00E8_355C; // u16
+
+fn streaming_off() -> bool {
+    unsafe { rb(STREAMING_OFF_A) == 1 && rb(STREAMING_OFF_B) == 0 }
+}
+
+/// The first type-4 slot that is NULL or idle (state 0, 3 or 4).
+unsafe fn free_extras_slot() -> Option<u32> {
+    unsafe {
+        (0..rd(SLOT_COUNTS + 16)).find(|&i| {
+            let s = slot(0x4_0000 | (i & 0xFFFF));
+            s == 0 || matches!(rd(s + 4), 0 | 3 | 4)
+        })
+    }
+}
+
+/// `streamman_step_init_multipart` (0xA80EE0; EAX = step, ECX = count; stdcall
+/// (list, file, u16 align, extra, begin, after)): a step reading `count` files
+/// one at a time; the list is copied into the step buffer. +0x218 is kept.
+#[allow(clippy::too_many_arguments)]
+unsafe fn step_init_multipart(
+    step: usize,
+    count: u32,
+    list: *const u32,
+    file: u32,
+    align: u16,
+    extra: u32,
+    begin: u32,
+    after: u32,
+) {
+    unsafe {
+        wr(step + 0x21C, rd(step + 0x21C) & !1);
+        *((step + 0x214) as *mut u16) = align;
+        wr(step + 0x220, extra);
+        wr(step, file);
+        wr(step + 0x22C, begin);
+        wr(step + 0x210, 0);
+        wr(step + 0x230, 0);
+        wr(step + 0x234, 0);
+        wr(step + 0x238, after);
+        wr(step + 0x228, 0);
+        wb(step + 4, 1);
+        wr(step + 0x208, count);
+        wr(step + 0x20C, 0);
+        if count as i32 > 0 {
+            std::ptr::copy_nonoverlapping(list, (step + 8) as *mut u32, count as usize);
+        }
+        wr(step + 0x21C, rd(step + 0x21C) & !2);
+        wr(step + 0x240, 0);
+        wr(step + 0x23C, 0);
+    }
+}
+
+/// `streamman_request_chunk_extras_impl` (0xA82EA0; cdecl (out, chunk id, name,
+/// pool index, list, count) -> out): the first free type-4 slot. Step 0 reads
+/// the mesh objects not already resident (multi-part), step 1 the animations
+/// (multi-part), step 2 the chunk's .cts file if it exists. With none of them
+/// the result is "none" and the slot is left as set up, unclaimed. Completion
+/// `chunk_extras_on_loaded`; every step retries never (0xA81610). The step
+/// callbacks are never run on PC (start/poll_chunk_extras don't call them).
+unsafe fn request_extras_impl(out: usize, id: u32, name: u32, pool: u32, list: u32, count: u32) {
+    unsafe {
+        if streaming_off() {
+            out_none(out);
+            return;
+        }
+        let Some(i) = free_extras_slot() else {
+            out_none(out);
+            return;
+        };
+        let s = rd(SLOT_ARRAYS + 16) as usize + i as usize * SLOT_SIZE;
+        let info = rd(s + 0x10) as usize;
+        let steps = rd(info + 0x14) as usize;
+        wr(info + 0x20, (rd(info + 0x20) & 0xFF9F_FC00) | 0x10_0000);
+        for o in [4, 8, 0x0C, 0x10, 0x18] {
+            wr(info + o, 0);
+        }
+        wr(info + 0x1C, 0x00A8_1620);
+        wr(info + 0x778, CHUNK_POOLS as u32 + pool * 0x58);
+        *((info + 0x772) as *mut u16) = id as u16;
+        let mut parts = false;
+        wr(steps + 0x208, 0);
+        wr(steps, 0);
+        if id as u16 == 0xFFFF {
+            out_none(out);
+            return;
+        }
+        let mut meshes = [0u32; 0x81];
+        let mut anims = [0u32; 0x80];
+        let mut wanted = [0u32; 0x80];
+        let (mut mesh_count, mut anim_count) = (0u32, 0u32);
+        game_call_n(
+            EXTRAS_COLLECT_PARTS,
+            0,
+            meshes.as_mut_ptr() as u32,
+            list,
+            0,
+            &[
+                anims.as_mut_ptr() as u32,
+                &mut anim_count as *mut u32 as u32,
+                &mut mesh_count as *mut u32 as u32,
+                count,
+                id,
+            ],
+        );
+        if mesh_count as i32 > 0 {
+            let filter_args = [wanted.as_mut_ptr() as u32, meshes.as_ptr() as u32, mesh_count, id];
+            let n = game_call_n(SMESH_CACHE_FILTER_REQUESTS, 0, 0, 0, 0, &filter_args).0;
+            if n as i32 > 0 {
+                let template = game_call(OBJECT_TEMPLATE_FIND, 0, wanted[0], 0, 0, [0; 3]) as usize;
+                let align = *(MESH_ALIGN as *const u16);
+                step_init_multipart(steps, n, wanted.as_ptr(), rd(template + 8), align, 0, 0x00A8_1160, 0x00A8_1200);
+                wr(steps + 0x240, 0x00A8_1610);
+                parts = true;
+            }
+        }
+        let step1 = steps + 0x244;
+        wr(step1 + 0x208, 0);
+        wr(step1, 0);
+        if anim_count as i32 > 0 {
+            let extra = ANIM_POOLS as u32 + pool * 0x54;
+            step_init_multipart(step1, anim_count, anims.as_ptr(), anims[0], 0x10, extra, 0x00A8_0FA0, 0x00A8_1040);
+            wr(step1 + 0x240, 0x00A8_1610);
+            parts = true;
+        }
+        let exists = file_exists(name) != 0;
+        call(CRT_STRNCPY, &[(info + 0x6F0) as u32, name, 0x41]);
+        wb(info + 0x730, 0);
+        let step2 = steps + 0x488;
+        step_init(step2, if exists { (info + 0x6F0) as u32 } else { 0 }, 0x40, 0x00A8_14D0, 0, 0, 0x00A8_1530);
+        wr(step2 + 0x240, 0x00A8_1610);
+        if !exists && !parts {
+            out_none(out);
+            return;
+        }
+        wr(s + 4, 1);
+        wr(s + 8, 0);
+        wr(s + 0x0C, 0);
+        requeue(s);
+        wr(out, 0x4_0000 | (i & 0xFFFF));
+    }
+}
+
+/// `streamman_request_chunk_extras` (0xA84510; ECX = chunk pool; cdecl (out,
+/// chunk id, name, u16 old chunk id) -> out). Needs a free extras slot and one of
+/// the 3 chunk pools. A network client sends message 0x7E instead (and remembers
+/// the request); otherwise the old chunk's extras list is released, this chunk's
+/// list fetched and stored, and the impl does the rest.
+unsafe fn request_extras(pool_obj: u32, out: usize, id: u32, name: u32, old: u32) {
+    unsafe {
+        if streaming_off() || free_extras_slot().is_none() {
+            out_none(out);
+            return;
+        }
+        let Some(pool) = (0..3u32).find(|&k| CHUNK_POOLS as u32 + k * 0x58 == pool_obj) else {
+            out_none(out);
+            return;
+        };
+        let net = rd(NETWORK) as usize;
+        let client = net != 0 && ((rb(0x0252_8B56) != 0 && rb(0x0252_8B2B) == 0) || rb(net + 0x3F8) == 0);
+        if client {
+            for k in (0..rd(NET_PENDING + 8) as i32).rev() {
+                if *((rd(NET_PENDING) as usize + k as usize * 8) as *const u16) == id as u16 {
+                    game_call(NET_PENDING_REMOVE, 0, k as u32, 0, 0, [0; 3]);
+                }
+            }
+            let count = rd(NET_PENDING + 8);
+            let seq = rd(NET_SEQUENCE);
+            wr(NET_SEQUENCE, seq.wrapping_add(1));
+            if count as i32 + 1 <= rd(NET_PENDING + 4) as i32 {
+                wr(NET_PENDING + 8, count + 1);
+                // The original stores the id over the low word of the name argument's slot.
+                let entry = rd(NET_PENDING) as usize + count as usize * 8;
+                wr(entry, (name & 0xFFFF_0000) | (id & 0xFFFF));
+                wr(entry + 4, seq);
+            }
+            let mut msg = [0u8; 0x20];
+            msg[0] = 0x7E;
+            let o = if rb(NET_HEADER_LONG) != 0 { 4 } else { 3 };
+            msg[o] = 0;
+            msg[o + 1..o + 3].copy_from_slice(&(id as u16).to_le_bytes());
+            msg[o + 3..o + 7].copy_from_slice(&seq.to_le_bytes());
+            msg[o + 7..o + 11].copy_from_slice(&pool.to_le_bytes());
+            let len = o + 11;
+            msg[1..3].copy_from_slice(&((len - 3) as u16).to_le_bytes());
+            call(NET_SEND, &[msg.as_ptr() as u32, len as u32]);
+            out_none(out);
+            return;
+        }
+        if old as u16 != 0xFFFF {
+            game_call_full(EXTRAS_LIST_RELEASE, 0, 0, 1, 0, old, &[]);
+        }
+        let mut list = [0u8; 0x5D8];
+        let mut count = 0u32;
+        game_call_n(EXTRAS_LIST_GET, &mut count as *mut u32 as u32, 0, id, 0, &[list.as_mut_ptr() as u32]);
+        game_call_n(EXTRAS_LIST_STORE, count, 0, 0, 0, &[list.as_mut_ptr() as u32, id, 1]);
+        request_extras_impl_hook(out as u32, id, name, pool, list.as_mut_ptr() as u32, count);
+    }
+}
+
+regs_entry!(request_extras_entry, request_extras_hook);
+
+extern "C" fn request_extras_hook(regs: *const [u32; 3], args: *const u32) -> u32 {
+    CALLS[REQUEST_EXTRAS].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let r = *regs;
+        let a: [u32; 4] = stack_args(args);
+        if PUMP_RUST {
+            request_extras(r[1], a[0] as usize, a[1], a[2], a[3]);
+        } else {
+            game_call_n(orig(REQUEST_EXTRAS), r[0], r[1], r[2], 0, &a);
+        }
+        a[0]
+    }
+}
+
+extern "C" fn request_extras_impl_hook(out: u32, id: u32, name: u32, pool: u32, list: u32, count: u32) -> u32 {
+    CALLS[REQUEST_EXTRAS_IMPL].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        if PUMP_RUST {
+            request_extras_impl(out as usize, id, name, pool, list, count);
+        } else {
+            let f: extern "C" fn(u32, u32, u32, u32, u32, u32) -> u32 = std::mem::transmute(orig(REQUEST_EXTRAS_IMPL));
+            f(out, id, name, pool, list, count);
+        }
+        event(describe_request("extras", out as usize));
+        out
+    }
+}
+
+// --- request_chunk -------------------------------------------------------------------
+
+const WORLD_CHUNK_FIND_ID: usize = 0x004A_9840; // ECX = name -> AX
+const HISTORY: usize = 0x02F9_B8A8; // 10 x {u16 chunk id, .., +0xC frame}
+const HISTORY_FIND: usize = 0x00A8_0DE0; // EDX = chunk id -> index or -1
+const HISTORY_REMOVE: usize = 0x00A8_0EA0; // EDX = chunk id
+const HISTORY_ADD: usize = 0x00A8_0D40; // cdecl (chunk id)
+const FRAME: usize = 0x0252_A3C0;
+const RESERVATIONS: usize = 0x00F6_FBD8; // pool reservation*[]: +8 u16 chunk id, +0x10 pool, +0x14 name, +0x1C flags, +0x20 state, +0x24
+const RESERVATION_COUNT: usize = 0x00F6_FBC4;
+const CHUNK_POOL_PICK: usize = 0x004A_A930; // cdecl (*0x27718D0) -> pool
+const CHUNK_POOL_PICK_ARG: usize = 0x0277_18D0;
+const SPECIAL_POOL: usize = 0x0277_32AC; // pool for special (req+0x1A) chunks
+const SPECIAL_POOL_NEEDED: usize = 0x0277_32E8;
+const EXT_CHUNK: usize = 0x00DD_B180; // "chunk_pc"
+const EXT_G_CHUNK: usize = 0x00E0_0B0C; // "g_chunk_pc"
+const EXT_PVS: usize = 0x00E4_4590; // ".pvs_pc"
+const EXT_CTS: usize = 0x00E3_8490; // ".cts"
+const EXT_PEG: usize = 0x00DD_B0B0; // ".peg_pc"
+
+/// A handle the sub-requests count as "none": 0xFFFF0000 exactly.
+fn is_none(h: u32) -> bool {
+    h >> 16 == 0xFFFF && h & 0xFFFF == 0
+}
+
+unsafe fn any_idle(t: u32) -> bool {
+    unsafe {
+        (0..rd(SLOT_COUNTS + t as usize * 4)).any(|i| {
+            let s = slot(t << 16 | (i & 0xFFFF));
+            s == 0 || matches!(rd(s + 4), 0 | 3 | 4)
+        })
+    }
+}
+
+unsafe fn clear_slot_state(h: u32) {
+    unsafe {
+        let s = slot(h);
+        wr(s + 4, 0);
+        wr(s + 8, 0);
+        wr(s + 0x0C, 0);
+    }
+}
+
+/// `streamman_request_chunk` (0xA80360; cdecl (out, req) -> out): request a
+/// world chunk as three loads (extras, peg, geom) into a chunk pool. Request:
+/// +0 name, +4 peg name (or 0), +8 reservation name, +0xC count and +0x10 u16
+/// list of chunk ids allowed to stay, +0x14 pool (0: pick), +0x18 u8 wait, +0x19
+/// u8 no history, +0x1A u8 special, +0x1B u8 geom without peg.
+///
+/// Refuses (none) when: special requests are disabled; the chunk is already
+/// loaded; the geom slot is busy; a special request finds a peg slot busy; a
+/// reservation is in state 3; the matched reservation is in state 7/8 (it is
+/// marked 9 and its pegs/extras unloaded) or 9; no peg or extras slot is free.
+/// Before that it records the chunk in the request history, unloads a geom
+/// that is not on the keep list, and aborts a current flagged geom (unless
+/// special) and a current extras load. With `wait`, it waits for the loads and
+/// clears their slots.
+unsafe fn request_chunk(out: usize, req: usize) {
+    unsafe {
+        let b = |o: usize| rb(req + o);
+        if rb(UNLOAD_FLAGGED_GEOM_FLAG) == 0 && b(0x1A) != 0 {
+            out_none(out);
+            return;
+        }
+        let id = game_call(WORLD_CHUNK_FIND_ID, 0, rd(req), 0, 0, [0; 3]) & 0xFFFF;
+        if id != 0xFFFF && id < 0x866 && rd(WORLD_CHUNKS + id as usize * 4) != 0 {
+            out_none(out);
+            return;
+        }
+        if b(0x19) == 0 {
+            let e = game_call_edx(HISTORY_FIND, 0, 0, id, 0, 0, [0; 3]).0;
+            if e == u32::MAX {
+                call(HISTORY_ADD, &[id]);
+            } else {
+                let entry = HISTORY + e as usize * 16;
+                let frame = rd(FRAME);
+                if rd(entry + 0x0C) == frame.wrapping_sub(1) {
+                    wr(entry + 0x0C, frame);
+                } else {
+                    game_call_edx(HISTORY_REMOVE, entry as u32, 0, id, 0, 0, [0; 3]);
+                    call(HISTORY_ADD, &[id]);
+                }
+            }
+        }
+        if is_idle_hook(0) as u8 == 0 {
+            let geom_id = *((rd(rd(SLOT_ARRAYS) as usize + 0x10) as usize + 0x52E) as *const u16);
+            let n = rd(req + 0x0C) as i32;
+            if n > 0 {
+                let keep = (0..n as usize).any(|k| *((rd(req + 0x10) as usize + k * 2) as *const u16) == geom_id);
+                if !keep {
+                    unload_hook(0);
+                }
+            }
+        }
+        let mut cur = rd(CURRENT) as usize;
+        if b(0x1A) == 0 && cur != 0 && rd(cur) == 0 && rb(rd(cur + 0x10) as usize + 0x542) != 0 {
+            abort_current_hook(0);
+            cur = rd(CURRENT) as usize;
+        }
+        let geom = rd(SLOT_ARRAYS) as usize;
+        if geom != 0 && !matches!(rd(geom + 4), 0 | 3 | 4) {
+            out_none(out);
+            return;
+        }
+        if cur != 0 && rd(cur) == 4 {
+            abort_current_hook(1);
+        }
+        if b(0x1A) != 0 {
+            for i in 0..rd(SLOT_COUNTS + 4) {
+                let s = slot(0x1_0000 | (i & 0xFFFF));
+                if s != 0 && !matches!(rd(s + 4), 0 | 3 | 4) {
+                    out_none(out);
+                    return;
+                }
+            }
+        }
+        let res = |i: i32| rd(RESERVATIONS + i as usize * 4) as usize;
+        let last = rd(RESERVATION_COUNT) as i32 - 1;
+        let mut i = last;
+        while i >= 0 {
+            if rd(res(i) + 0x20) == 3 {
+                out_none(out);
+                return;
+            }
+            if rd(res(i) + 0x1C) & 1 != 0 {
+                break;
+            }
+            i -= 1;
+        }
+        let mut r = -1i32;
+        let res_name = rd(req + 8);
+        if res_name != 0 {
+            let mut k = last;
+            while k >= 0 {
+                if call(CRT_STRICMP, &[res_name, rd(res(k) + 0x14)]) == 0 && rd(res(k) + 0x1C) & 1 == 0 {
+                    r = k;
+                    break;
+                }
+                k -= 1;
+            }
+        }
+        if b(0x18) == 0 && b(0x1A) == 0 && r != -1 {
+            let state = rd(res(r) + 0x20);
+            if (7..=8).contains(&(state as i32)) {
+                if res(r) != 0 {
+                    wr(res(r) + 0x20, 9);
+                    wr(res(r) + 0x24, u32::MAX);
+                }
+                unload_chunk_pegs_extras_hook(*((res(r) + 8) as *const u16) as u32);
+                out_none(out);
+                return;
+            }
+            if state == 9 {
+                out_none(out);
+                return;
+            }
+        }
+        if !any_idle(1) || !any_idle(4) {
+            out_none(out);
+            return;
+        }
+        let mut pool = rd(req + 0x14);
+        if pool == 0 {
+            pool = if r >= 0 {
+                rd(res(r) + 0x10)
+            } else if b(0x1A) == 0 {
+                call(CHUNK_POOL_PICK, &[rd(CHUNK_POOL_PICK_ARG)])
+            } else {
+                let sp = SPECIAL_POOL;
+                if thiscall(vslot(sp, 3), sp, [0; 3]) >= rd(SPECIAL_POOL_NEEDED)
+                    && thiscall(vslot(sp, 4), sp, [0; 3]) == 0
+                {
+                    sp as u32
+                } else {
+                    0
+                }
+            };
+        }
+        let name = rd(req);
+        let mut chunk_pc = [0u8; 0x40];
+        let mut g_chunk_pc = [0u8; 0x40];
+        let mut pvs = [0u8; 0x41];
+        let mut cts = [0u8; 0x41];
+        let mut peg = [0u8; 0x41];
+        game_call(PATH_CHANGE_EXTENSION, 0, name, 0, 0, [chunk_pc.as_mut_ptr() as u32, 0x40, EXT_CHUNK as u32]);
+        game_call(PATH_CHANGE_EXTENSION, 0, name, 0, 0, [g_chunk_pc.as_mut_ptr() as u32, 0x40, EXT_G_CHUNK as u32]);
+        let base = chunk_pc.as_ptr() as u32;
+        game_call(PATH_CHANGE_EXTENSION, 0, base, 0, 0, [pvs.as_mut_ptr() as u32, 0x41, EXT_PVS as u32]);
+        game_call(PATH_CHANGE_EXTENSION, 0, base, 0, 0, [cts.as_mut_ptr() as u32, 0x41, EXT_CTS as u32]);
+        let peg_src = if rd(req + 4) != 0 { rd(req + 4) } else { name };
+        game_call(PATH_CHANGE_EXTENSION, 0, peg_src, 0, 0, [peg.as_mut_ptr() as u32, 0x41, EXT_PEG as u32]);
+
+        let (mut geom_h, mut peg_h, mut extras_h) = (0xFFFF_0000u32, 0xFFFF_0000u32, 0xFFFF_0000u32);
+        if pool != 0 {
+            if b(0x1A) == 0 {
+                let old = if r != -1 { *((res(r) + 8) as *const u16) as u32 } else { 0xFFFF };
+                let mut h = 0u32;
+                request_extras(pool, &mut h as *mut u32 as usize, id, cts.as_ptr() as u32, old);
+                extras_h = h;
+            }
+            // Peg request: {name, u16 id, pool, value 0, u8 wait}.
+            let mut peg_req = [0u32; 5];
+            peg_req[0] = peg.as_ptr() as u32;
+            peg_req[1] = id;
+            peg_req[2] = pool;
+            peg_req[4] = b(0x18) as u32;
+            let mut h = 0u32;
+            request_peg_hook(&mut h as *mut u32 as u32, peg_req.as_ptr() as u32);
+            peg_h = h;
+            // Geom request: {chunk_pc, g_chunk_pc, pvs, u16 id, pool, u8 wait, u8 no history,
+            // u8 special, reservation, u8 no peg}.
+            let mut geom_req = [0u8; 0x20];
+            let w = |g: &mut [u8; 0x20], o: usize, v: u32| g[o..o + 4].copy_from_slice(&v.to_le_bytes());
+            w(&mut geom_req, 0, chunk_pc.as_ptr() as u32);
+            w(&mut geom_req, 4, g_chunk_pc.as_ptr() as u32);
+            w(&mut geom_req, 8, pvs.as_ptr() as u32);
+            geom_req[0x0C..0x0E].copy_from_slice(&(id as u16).to_le_bytes());
+            w(&mut geom_req, 0x10, pool);
+            geom_req[0x14] = b(0x18);
+            geom_req[0x15] = b(0x19);
+            geom_req[0x16] = b(0x1A);
+            w(&mut geom_req, 0x18, r as u32);
+            geom_req[0x1C] = (is_none(peg_h) || b(0x1B) != 0) as u8;
+            let mut h = 0u32;
+            request_geom(geom_req.as_ptr() as usize, &mut h as *mut u32 as usize);
+            event(describe_request("geom", &mut h as *mut u32 as usize));
+            geom_h = h;
+        }
+        if is_none(geom_h) {
+            if !is_none(peg_h) {
+                unload_hook(peg_h);
+            }
+            if !is_none(extras_h) {
+                unload_hook(extras_h);
+            }
+            out_none(out);
+            return;
+        }
+        if b(0x18) != 0 {
+            let loaded = wait_hook(geom_h);
+            clear_slot_state(geom_h);
+            if loaded as u8 == 0 {
+                *(out as *mut u16) = 0;
+                *((out + 2) as *mut u16) = 0xFFFF;
+                return;
+            }
+            if !is_none(peg_h) {
+                wait_hook(peg_h);
+                clear_slot_state(peg_h);
+            }
+            if !is_none(extras_h) && (rb(0x0252_7D14) == 0 || rb(rd(0x0252_7D10) as usize + 0xAFF) != 0) {
+                wait_hook(extras_h);
+                clear_slot_state(extras_h);
+            }
+        }
+        wr(out, geom_h);
+    }
+}
+
+extern "C" fn request_chunk_hook(out: u32, req: u32) -> u32 {
+    CALLS[REQUEST_CHUNK].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let e = format!("req_chunk {}", cstr_lossy(rd(req as usize)));
+        if PUMP_RUST {
+            request_chunk(out as usize, req as usize);
+        } else {
+            let f: extern "C" fn(u32, u32) -> u32 = std::mem::transmute(orig(REQUEST_CHUNK));
+            f(out, req);
+        }
+        let h = rd(out as usize);
+        event(format!("{e} -> {}", if h >> 16 == 0xFFFF { "none".to_string() } else { format!("{h:#x}") }));
+        out
+    }
+}
+
 // --- Install and report ---------------------------------------------------------------
 
 fn hook_address(i: usize) -> usize {
@@ -2666,6 +3200,9 @@ fn hook_address(i: usize) -> usize {
         REQUEST_VEHICLE => request_vehicle_entry as extern "C" fn() as usize,
         REQUEST_GEOM => request_geom_entry as extern "C" fn() as usize,
         REQUEST_PEG => request_peg_hook as extern "C" fn(u32, u32) -> u32 as usize,
+        REQUEST_EXTRAS => request_extras_entry as extern "C" fn() as usize,
+        REQUEST_EXTRAS_IMPL => request_extras_impl_hook as extern "C" fn(u32, u32, u32, u32, u32, u32) -> u32 as usize,
+        REQUEST_CHUNK => request_chunk_hook as extern "C" fn(u32, u32) -> u32 as usize,
         _ => unreachable!(),
     }
 }

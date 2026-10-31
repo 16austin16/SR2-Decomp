@@ -63,4 +63,5 @@ original. The standalone build can move to 64-bit later.
 25. ✅ `start_load` and `check_batch` in Rust: original and Rust event logs match for every deterministic load, completion and abort in the teleport test.
 26. ✅ The rest of the per-resource streamer in Rust: finish_current, the chunk-extras start and poll, process_sequential (not exercised yet). Teleport test: original and Rust event logs match.
 27. ✅ Request side, part 1, in Rust: step_init, the typed requests (animation, character, vehicle, chunk geom, chunk peg) and the unload helpers. 646 geom and 23 peg requests identical to the original in the teleport test. A chunk-extras difference seen in 2 of 3 Rust runs turned out to be ordering variance that the original shows too (05_streamer.md).
-28. Next: request_chunk and request_chunk_extras, the completion/step callbacks, then rsched and the io scheduler; then the vint UI (mapped in 06_vint.md) and the D3D wrappers.
+28. ✅ Request side, part 2: request_chunk and the chunk-extras request in Rust; 655 chunk and 20 extras requests identical to the original in the teleport test.
+29. Next: the step/completion callbacks (geom, peg, character, vehicle, extras, animation), then rsched and the io scheduler; then the render executor (07_render.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).

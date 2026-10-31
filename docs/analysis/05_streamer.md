@@ -1286,3 +1286,31 @@ With the `pop_best` rule above (a 1 keeps the current best only when best < cand
 Request time plays no part. Two chunk-extras requests start in the order of their slot indices (4:0 before 4:1), whichever was requested first.
 
 So if a request lands on a different slot, two neighbouring chunks' extras swap their start order. Which slot a request lands on is the first type-4 slot in state 0, 3 or 4 at the time of `_impl`, so it depends on when the previous extras slots went back to idle. This is the effect seen in the teleport test, where an extras start landed on slot 4:1 instead of 4:0.
+
+### Request side in Rust (part 2): request_chunk and the extras request
+
+`streamman_request_chunk` (`0xA80360`), `request_chunk_extras` (`0xA84510`, ECX = pool, through the
+register entry thunk), `_impl` (`0xA82EA0`) and `step_init_multipart` (`0xA80EE0`, Rust-internal)
+are in Rust now. That covers the whole request side except the step and completion callbacks.
+
+Teleport test, original vs Rust: identical events for all 655 distinct chunk requests (mission
+interiors included) and 20 extras requests (2,004 distinct non-ambient events each). The one
+differing event was an extras request without meshes. Its step 0 keeps whatever the slot's
+previous request left in alignment and callbacks, because only the file and +0x208 are cleared.
+Which slot it got is timing, as above. The step has no file, so it is never read.
+
+Corrections to "Request side, step by step" (checked against the disassembly):
+- request_chunk, matched reservation: state 7/8 → mark it 9, unload its pegs/extras, return
+  none. State 9 → none. Any other state → continue. (The notes had 9 and "other" swapped.)
+- The geom is unloaded only when the keep list (req+0xC count) is non-empty and does not
+  contain its id; an empty list unloads nothing.
+- The peg name is built from req+4 when that is set, else req+0.
+- A sub-request counts as none only for exactly 0xFFFF0000. A failed geom wait writes a zero
+  low word, then 0xFFFF.
+- A special request (req+0x1A) without a pool uses `0x27732AC` only if `vf3() >= *0x27732E8` and
+  `vf4() == 0`.
+- request_chunk_geom: steps are at info+0x14 (pointer). Without a g_chunk_pc, step 1's size and
+  dest are cleared, not its file.
+- request_vehicle: the register inputs are EDX = size A and ECX = dest B; EAX is read from the
+  stack.
+
