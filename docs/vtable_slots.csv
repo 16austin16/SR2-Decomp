@@ -448,3 +448,7 @@ special_vehicle_spawn_group,8,reset,"from 0x957550; subclasses clear their state
 special_vehicle_spawn_group,9,update_streaming,"every frame from the spawn group manager 0x957250; requests the group's vehicle / character streaming (0xA79240) (caller survey, 37)"
 special_vehicle_spawn_group,10,update,"every frame from the spawn group manager 0x957250 (notoriety: picks fbi / cop units) (caller survey, 37)"
 special_vehicle_spawn_group,11,is_active,"small getter used by update_streaming, update and the manager (caller survey, 37)"
+object,2,get_world_bbox,"(vec3 *min, vec3 *max): calls get_local_bbox, then transforms by the position (+0x14) and orientation (+0x20) (0xBF58D0) (caller survey, 37)"
+object,3,get_local_bbox,"(vec3 *min, vec3 *max): copies the local bounds (human: +0xDC / +0xE8) (caller survey, 37)"
+multi_core_object_registration,7,on_net_tick,"once per network update for each registration type, from 0x814BB0; a no-op except player_multi_registration, which updates the local player (0x21703D4) via 0x9BCED0 (caller survey, 37)"
+diversion_type_info,21,on_human_killed,"dispatched to every diversion type by game_event_human_killed (0x68F6F0 -> 0x604890) (caller survey, 37)"
