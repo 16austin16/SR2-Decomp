@@ -247,3 +247,8 @@ gamespy_module,0,init,"in-game caller: the module setup ('Initializing Modules.'
 gamespy_module,1,update,"called once per frame by 0x8CCEB0 (7,580 calls in the run, same as the frame count) (caller survey)"
 mp_bh_custom_match_category,2,load_from_table,"in-game caller chain: the custom_matches.xtbl loader (0x89B710) -> mp_bh_custom_match_info -> each category (caller survey)"
 character,2,on_loaded,"in-game callers: character_on_loaded (streamer completion) and the SR2_Main_Rig.rig setup for distant characters (caller survey)"
+trigger_base,1,begin,"interface of event_trigger / scheduling_trigger: count++; same callers in the survey (city_render, game_render_thread, gameaudio)"
+trigger_base,3,end,"count--, signals when it reaches zero while armed"
+trigger_base,4,wait,"arms and waits for the count to reach zero"
+vint_element_base,18,get_anchor,"property getter: tag 7 (vec2) from +0x5C/+0x60; called by luafn_vint_get_global_anchor (caller survey)"
+diversion_type_info,4,update,"per frame for every diversion type: 226,884 calls in the survey = ~30 types x 7,580 frames, from under sim_frame; base ret, overrides do the work"
