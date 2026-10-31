@@ -498,7 +498,7 @@ This covers what `game_render_thread_frame`'s "build_render_batch" block does be
 - Every per-instance step calls it.
 
 **`city_build_render_batches`** (0x4B7CC0, city_render.cpp), in order:
-1. `0xFA6C28 = 0x2784990` (a timestamp, for the "citycul" stat).
+1. `0xFA6C28` = the pass 0 list count `0x2784990` (for the stat at step 15).
 2. Camera vectors from 0x4D9120 / 0x4D91E0 → `0x2615720..0x2615734`. This is done twice, the second for the current view. The camera position `0x319BEB4..BC` → `0x2612D04..0C`.
 3. Clear each streamed chunk's visibility bitmap: for each of the `0xF6FBC4` entries of `0xF6FBD8[]`, memset(+0x58, 0, +0x54).
 4. Profile "citycul:1".
@@ -516,16 +516,16 @@ This covers what `game_render_thread_frame`'s "build_render_batch" block does be
 8. **Per-view batches.** Begin A with 0x4B6520 (per entry 0x4B5FF0: `frustum_test_aabb` against view N, then 0x4B6160 / 0x4B6310, which read the instance and its LOD and add it). For each remaining view N (0x280-byte records at `0x2612D18`, count `0x2526CCC`) with flag 0x100, call `0x4B6CC0(N)`. Flush A.
 9. Dynamic water: `0xB779C0` ("Dynamic water", picks the water instances).
 10. `0x4B7870`: time-of-day lights.
-11. `city_render_func` (0x4B6760): allocates the frame's batch lists through 0xBF3F50 / 0xBF3700.
+11. `city_batch_job_release` (0x4B6760): waits for the batch job object `0x2526CC8`, then releases it.
 12. Profile "citybrb:5".
-13. `0x4B74D0` (0x4B8280, 0x4B5510): builds the draw lists from the visible instances.
-14. `city_render_func_2` (0x4B72E0): finalises the lists.
-15. `0xFA6C24 = now − 0xFA6C28` (time spent).
+13. `city_submit_chunk_extras` (0x4B74D0): each chunk's extra instances go to pass 4.
+14. `city_submit_visible_instances` (0x4B72E0): every visible instance goes to the render lists, in jobs of 75 (next section).
+15. `0xFA6C24` = pass 0 count − `0xFA6C28`: how many pass 0 entries the city added.
 
 After this, `game_render_thread_frame` runs:
 - 0x9FA9E0, 0x533910 and 0x533A70 (wake the job workers), then 0x533CD0;
 - the two instance passes: `city_instance_batch_begin(0x4B6550)` + 0x4B6E10, then `city_instance_batch_begin(0x4B6580)` + 0x4B7070, each followed by `city_instance_batch_flush` when `0xF83AF4` is non-zero;
-- then 0x4B6760.
+- then `city_batch_job_release` again.
 
 0x4B6550 / 0x4B6580 call 0x4B6160 / 0x4B6310 per entry: the same instance-add path as above, for the shadow and main instance lists.
 
@@ -536,17 +536,165 @@ After this, `game_render_thread_frame` runs:
 | culling (5, 8) | the chunks' visibility bitmaps (+0x58), and the per-view instance lists through 0x4B6160 / 0x4B6310 (LOD pick, `rl_*` pre-render) |
 | water (9) | the water instance list |
 | lights (10) | `+0x2E6` on the light records, through `cmd_r_force_time_of_day_lights` / 0x52F910 |
-| lists (11-14) | the frame's batch lists that `render_frame` consumes (render2:a3 / render4) |
+| lists (11-14) | the global render lists (next section), which `render_frame`'s stages consume |
 
 **Porting order (leaves first):**
 1. `frustum_test_aabb` (pure maths).
 2. The two accumulators (begin / flush) and the job object (can start synchronous: call the callback inline).
 3. The per-entry functions 0x4B5C40, 0x4B5FF0, 0x4B6160, 0x4B6310.
 4. `city_build_render_batches` steps 1-8.
-5. Water (0xB779C0), lights (0x4B7870) and the list build (0x4B6760, 0x4B74D0, 0x4B72E0).
+5. Water (0xB779C0), lights (0x4B7870) and the list build (0x4B6760, 0x4B74D0, 0x4B72E0; next section).
 6. `render_frame`'s stages (table above), which consume the lists through `rl_*::render` (`rl_mesh_inst::render` 0xCF8C90: `gfx_set_shader_state3`, `mesh_render_pass7`, `mesh_render_depth`, `mesh_render_generic`).
 
-**Open:** the list layouts written in steps 11-14, and how `rl_mesh_inst::render` turns a list entry into `gfx_cmd_*` calls (`mesh_render_*`). Those need their own step-by-step pass.
+### Render lists and mesh drawing, for porting
+
+The batch lists are fixed global arrays, not allocated per frame. Each holds 0x14-byte entries:
+
+| Off | Field |
+|---|---|
+| +0 | instance (`rl_*_inst *`) |
+| +4 | render flags (the flags record's first dword) |
+| +8 | per-list argument (a bool, a byte mask or a u16) |
+| +0xC | visibility dword, or 0 |
+
+Each list keeps its count right after its last slot. An adder does `n = InterlockedIncrement(&count)`, writes slot `n − 1`, and clamps the count at the capacity, so the lists can be filled from the job workers.
+
+| List | Adder | First entry | Count | Capacity | Consumers (render call) |
+|---|---|---|---|---|---|
+| pass 0 | `render_list0_add` 0x52FDA0 | 0x277D190 | 0x2784990 | 1536 | 0x5258B0 (`render(7, 0)`), 0x526C50 per view (`render(4, …)`), 0x524290, 0x526A90, 0x528820, `render_shadows` |
+| pass 0, flag 0x40 | `render_list0b_add` 0x52FE10 | 0x2784998 | 0x2789998 | 1024 | 0x524290, 0x527020 |
+| visibility u16 set | `render_list_vis_add` 0x52FE80 | 0x27899A0 | 0x278C1A0 | 512 | 0x524750 (`render(5, 0)`), 0x529AC0 |
+| pass 1 | `render_list_small_add` 0x52FEF0 (`EDI` = list) | 0x278C1A8 | 0x278D5A8 | 256 | `render_stage2_a4(2, bit)`: entries whose +8 mask has the bit, `render(8, view)` |
+| pass 2 | same | 0x278D5B0 | 0x278E9B0 | 256 | `render_stage2_a4(1)`: all entries |
+| pass 3 | `render_list3_add` 0x52FF60 | 0x278E9B8 | 0x278EC38 | 32 | `render_env_cubemap` 0x532810 (`render(0, 0)` per cube face), `render_stage2_a4(0, bit)`, 0x525BB0 (`render(0, 0)`) |
+| pass 4 | `render_list4_add` 0x52FFD0 | 0x278EC40 | 0x278ED80 | 16 | 0x529EB0 in render1 (`render(0xA, 0)`) |
+| pass 5 | `render_list_small_add` | 0x278ED88 | 0x2790188 | 256 | 0x531840 (character poses) |
+| pass 6 | `render_list6_add` 0x530030 | 0x2790190 | 0x2790D48 | 150 | 0x527A60 in render4 (`render(8, view 0x2612D10)`) |
+| pass 7 | `render_list7_add` 0x5300A0 | 0x2790D50 | 0x2791840 | 140 | 0x5293D0 in render4 |
+| all instances | `render_list_add` | 0x1406C30 (pointers) | 0x25273EC | 2048 | `game_render_do_pre_render_jobs` |
+
+`render_lists_reset` (0x52E7C0) zeroes every count at the start of the frame, along with the frame allocator stats (`0xFA6C20`), `0xFA6C24 = 0` and `0xFA6C28 = −1`.
+
+`render_stage2_a4` handles two flags:
+- Entries with flag 0x10 are drawn with render states 7 and 14 off, then back on.
+- Entries with flag 0x20 set state 24 to 0xA0 or 3 (stencil).
+
+It picks the shader set from the flags with `(f >> 4 & 0x200 | f & 0x180) >> 7` (0x5230B0).
+
+**From a world instance to a list entry:**
+1. `city_submit_visible_instances` (0x4B72E0) walks each streamed chunk's instances:
+   - It collects `{chunk, index}` for each instance whose visibility entry is set (chunk+0x58, 8 bytes per instance).
+   - It groups them in 75s and runs `city_submit_job` (0x4B72A0) on a job for each group.
+2. `city_instance_submit` (0x4B5510; cdecl `(chunk, index, bool alt, pass)`):
+   - The instance record is at chunk+0x4C + index × 0x50:
+
+     | Off | Field |
+     |---|---|
+     | +0 / +0x10 | AABB min / max |
+     | +0xC | the object |
+     | +0x1C | LOD distance |
+     | +0x30 / +0x34 | flags |
+     | +0x38 | frame stamp (set to `0x2526CD0`) |
+     | +0x40 | mesh |
+     | +0x48 | alternate mesh, used when flag 0x10000 is set |
+   - It filters on:
+     - the flag words (0xC1388020 / 0x22000 exclude);
+     - the cutscene and LOD state;
+     - the fade (+0x4C of the mesh).
+   - Then it calls `world_mesh_submit`, or `world_mesh_submit_alt` when `alt` is set.
+   - Two other paths use it:
+     - `city_submit_chunk_extras` (0x4B74D0) submits each chunk's extra list (+0x20C count, +0x210 indices) as pass 4.
+     - The per-view culls (`city_instances_cull_view` 0x4B6160 / `_2` 0x4B6310) submit passes 1 and 2 through `city_instance_add` (0x4B5A20).
+3. `world_mesh_submit` (0x52F910; `EAX` = the flags record; cdecl `(pass, mesh, chunk, index, scale *)`):
+   1. Allocate 0x350 bytes from the frame allocator `0x2791848` (vtable +0x1C). Failure sets `0x25273E6` (out of memory).
+   2. Set the vtable to `rl_lod_mesh_inst` (0xDE2574) and +4 = 1 (type).
+   3. `rl_renderable_init_transform` (0xCF62A0) fills:
+
+      | Off | Field |
+      |---|---|
+      | +8 | position |
+      | +0x14 | rotation (3×3) |
+      | +0x38 | scale |
+      | +0x44 | flags (bit 0 = hidden) |
+      | +0x50 / +0x60 | scaled AABB |
+      | +0x5C | a byte |
+   4. Material and lighting setup: 0x530150 (the flags record's +4 / +8 / +0x248…), 0xD098B0.
+   5. `render_list_add` (0x52E840; `ESI` = the flags record; cdecl `(pass, inst, vis *)`) checks the visibility entry and appends to a list:
+      - the pass's own list; for pass 0, the 0b list when flag 0x40 is set;
+      - also the visibility list when the entry's `vis+4` u16 is set;
+      - with a group at flags+0x2B0, the first instance goes into the group.
+   6. `world_decal_submit` (0x52E550): a 0x90-byte `rl_decal_inst` (type 5) through the same path, pass 0.
+
+**`rl_mesh_inst::render`** (0xCF8C90; `ECX` = instance, cdecl `(pass, arg)` → bool):
+1. Return 1 if hidden (+0x44 bit 0).
+2. `mesh = vtable[+0x28]()`.
+3. If the fade (+0x74) is below 1, `gfx_set_instance_fade(fade)` (0xD1A620).
+4. `gfx_set_shader_state3`.
+5. Build a 0x40-byte draw descriptor on the stack:
+
+   | Off | From |
+   |---|---|
+   | +0 | &inst+8 (position) |
+   | +4 | &inst+0x14 (rotation) |
+   | +8 / +0xC | &inst+0x50 / +0x60 (AABB) |
+   | +0x10 | mesh |
+   | +0x14 | &inst+0x98 (cached light set, 0x144 bytes, valid flag +0x140) |
+   | +0x18 | &inst+0x1DC (cached camera distance²) |
+   | +0x1C | byte flags from inst+0x95 (1 → 2, 2 → 4, 4 → 8) |
+   | +0x1D | byte inst+0x5C |
+   | +0x20 | *(inst+0x328) or 0 |
+   | +0x24 | inst+0x78 |
+   | +0x28..+0x30 | scale (inst+0x38..+0x40) |
+   | +0x38 | byte inst+0x94 |
+   | +0x3A | 1 when +0x3C is the fallback |
+   | +0x3C | material set: inst+0x1E4, or *(inst+0x1E0), or mesh+0xC → +8 |
+6. Pass 7 → `mesh_render_pass7` (0xD06940). Pass 3 → `mesh_render_depth` (0xD05130). Anything else → `mesh_render_generic(desc, pass, arg)` (0xD06430).
+7. Restore the fade to 1.0.
+
+**`mesh_render_generic`** (0xD06430), step by step:
+1. **Lighting.** If the cached light set is valid and `0x252A338` is set, apply it (0xD23660) and reuse the cached distance. Otherwise:
+   - compute the squared distance from the camera (`gfx_get_thread_state()`) to the AABB (SSE);
+   - copy the 0x144-byte light set for the current view (`thread_state + 0x1554` index) into the cache and mark it valid.
+2. 0xD04FC0(mesh).
+3. **Index buffer:** mesh+8 → +0x10. If it differs from the cache `0x252A310`, write command 10 (SetIndices).
+4. `gfx_set_material_constants(desc+4, arg, desc+0x28)` (0xD1B100): the world transform constants.
+5. **For each submesh.** The count is the u16 at mesh+2, and each submesh is a 16-byte record from mesh+4:
+
+   | Off | Field |
+   |---|---|
+   | +0 | vertex-buffer index |
+   | +4 | start index |
+   | +8 | base vertex |
+   | +0xC | index count |
+   | +0xE | material |
+
+   For each one:
+   1. The vertex buffer record is (mesh+8)+8 + vb × 0x10: +0 / +1 declaration indices, +2 u16 stride, +0xC buffer.
+   2. `gfx_bind_vertex_stream`. If it returns 0, look up the declaration in `ctx+0x308[a × 5 + b]` and write command 5 if it changed (cache `0x252A30C`).
+   3. Stream source: command 8 `{0, buffer, base × stride, stride}`, unless it matches the cache `0x2304D8C / 0x2304D6C / 0x2304D7C`.
+   4. Material (`(mesh+0xC)+4 + material × 0x18`):
+      - its shader id goes through 0xD01DA0 / 0xD01D20, optionally remapped by `0x2302D0C` when `0x252A339` is set;
+      - its sampler states (count +0xC, 6-byte `{stage, type, value}` at +0x14) go out as command 0x13, cached in `0x22F52F0[stage × 16 + type]` (stages below 20, types below 16).
+   5. 0xD049E0 (textures and constants from the material set at desc+0x3C).
+   6. 0xD19D00(distance).
+   7. `gfx_bind_shaders(pass, 0, decl a, decl b)` (0xD1A860): the pass picks the shader variant.
+   8. If there are any primitives: `gfx_cmd_draw_indexed(5 = D3DPT_TRIANGLESTRIP, start index, index count − 2)` (0xD21650).
+   9. For each bone-matrix slot of the material set below −1: 0xD19FA0. Then 0xD17D40.
+6. Decrement the thread state's nesting counter (+0x1554).
+
+**Porting order:**
+1. The list adders and `render_lists_reset`: plain arrays with an atomic counter.
+2. `render_list_add`.
+3. `rl_renderable_init_transform`.
+4. `world_mesh_submit` and `world_decal_submit`, on a Rust frame allocator.
+5. `city_instance_submit` and its callers.
+6. The descriptor build in `rl_mesh_inst::render`.
+7. `mesh_render_generic`. It sits on functions that are already ported: `gfx_cmd_*`, `gfx_bind_shaders` and `gfx_set_material_constants`.
+8. `mesh_render_depth` and `mesh_render_pass7`, which follow the same shape.
+
+**Open:**
+- What each of passes 0-7 is (opaque, alpha, decal, water, sky).
+- 0xD04FC0, 0xD049E0 and the light-set layout.
 
 ## render_frame (0x52A710), by profiler stage
 
