@@ -70,7 +70,7 @@ def sizes(data, starts, hi):
 
 def load_functions():
     rows = list(csv.DictReader(open(ROOT / "docs/functions.csv", encoding="utf-8")))
-    return [(int(r["address"], 16), r["name"], r["subsystem"], r["status"]) for r in rows]
+    return [(int(r["address"], 16), r["name"], r["subsystem"], r["status"], r["notes"]) for r in rows]
 
 
 def fill(x, y, width, height, frac, cls):
@@ -111,8 +111,11 @@ def render(stats, areas, out):
     parts.append(bar(pad, y, inner, s["rust_b"] / s["total_b"], "Code size running in Rust",
                      f'{s["rust_b"] / 1024:.1f} KB of ~{s["total_b"] / 1048576:.1f} MB ({100 * s["rust_b"] / s["total_b"]:.2f}%)', "rust"))
     y += 52
-    parts.append(bar(pad, y, inner, s["known_n"] / s["total_n"], "Functions identified (named and documented, incl. Rust)",
-                     f'{s["known_n"]} of ~{s["total_n"]:,} ({100 * s["known_n"] / s["total_n"]:.2f}%)', "known"))
+    parts.append(bar(pad, y, inner, s["known_n"] / s["total_n"], "Functions identified (incl. auto-named: script bindings, library matches, vtable slots)",
+                     f'{s["known_n"]:,} of ~{s["total_n"]:,} ({100 * s["known_n"] / s["total_n"]:.1f}%)', "known"))
+    y += 52
+    parts.append(bar(pad, y, inner, s["hand_n"] / s["total_n"], "Functions analysed by hand (named and documented, incl. Rust)",
+                     f'{s["hand_n"]} of ~{s["total_n"]:,} ({100 * s["hand_n"] / s["total_n"]:.2f}%)', "known"))
     y += 40
     parts.append(f'<text x="{pad}" y="{y}" class="label" font-weight="600">By area (functions in Rust / identified)</text>')
     y += 10
@@ -154,9 +157,10 @@ def main(exe, out):
         "rust_n": len(rust),
         "rust_b": sum(sz.get(a, 0) for a, *_ in rust),
         "known_n": len(funcs),
+        "hand_n": sum(not f[4].startswith("auto") for f in funcs),
     }
     by_area = defaultdict(lambda: [0, 0])
-    for _, _, area, status in funcs:
+    for _, _, area, status, _ in funcs:
         by_area[area][1] += 1
         by_area[area][0] += status == "rust"
     areas = sorted(((k, tuple(v)) for k, v in by_area.items()), key=lambda kv: (-kv[1][0], -kv[1][1], kv[0]))
