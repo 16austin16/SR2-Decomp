@@ -43,6 +43,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
         log(&crate::rsched::summary());
         log(&crate::input::summary());
         log(&crate::render::summary());
+        log(&crate::gfx_cmd::summary());
         if SURVEY {
             crate::survey::report(&format!("frame {n}"));
         }
@@ -175,7 +176,7 @@ struct VppEntry {
 const SURVEY: bool = false;
 /// Teleport the player around a loop after a save loads (teleport.rs), to exercise
 /// streaming. Test runs only (tools/ingame/run_teleport.ps1): it moves the player.
-const TELEPORT_TEST: bool = false;
+const TELEPORT_TEST: bool = true;
 
 /// Run the verify pass once the main menu is up (packfiles mounted at boot).
 const FIND_RECORD_VERIFY_FRAME: u32 = 300;
@@ -2108,6 +2109,7 @@ pub fn install_all() {
         crate::rsched::install();
         crate::input::install();
         crate::render::install();
+        crate::gfx_cmd::install();
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }

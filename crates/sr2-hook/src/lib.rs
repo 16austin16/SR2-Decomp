@@ -22,6 +22,7 @@ mod caller_targets;
 mod callers;
 mod crash;
 mod detour;
+mod gfx_cmd;
 mod hddio;
 mod hooks;
 mod input;
