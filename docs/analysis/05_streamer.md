@@ -299,3 +299,5 @@ Identified from their consumers (2026-10-30). The loader adds a chunk to a per-f
 The chunk record's bounding box is rec+0x28..+0x3C (min x/y/z, max x/y/z, from header words 0x35..0x3A).
 
 Still unidentified: sections 0x01, 0x02, 0x07, 0x08, 0x0A (probably roads), 0x0C, 0x0D, 0x0F, 0x11–0x14, 0x17, 0x18, 0x1B, 0x1E–0x24. They are not on a per-feature list, so finding their consumers means searching for reads of their record offsets.
+Searching for reads of the remaining record offsets in functions that touch chunk records gives false positives. The same small offsets are fields of other objects (for example `general_mover_init`, `0x9F9EA0`, reads mover fields, not the chunk record). The better next step for those sections is to dump them from the shipped `.chunk_pc` files (several carry name strings) and identify them by content.
+

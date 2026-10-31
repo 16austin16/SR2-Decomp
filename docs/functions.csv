@@ -8728,3 +8728,4 @@ address,name,subsystem,status,notes
 0x0095e140,chunk_point_in_volume_flag8_2,streamman,documented,"EDI = point -> bool: same test as 0x4AB430 (05)"
 0x0046f770,audio_point_in_chunk_volume,streamman,documented,"EDI = point -> bool: in audio modes 5/6 (0x144E760[0xE96B7C]), point inside any section-0x1A volume. Called from gameaudio (05)"
 0x004aab50,chunk_point_in_volume_flag200,streamman,documented,"(point) -> bool: inside a chunk's bounds (rec+0x28..+0x3C, y from min - 0.025) and any 0x200-flag section-0x1A volume (05)"
+0x009f9ea0,general_mover_init,class,documented,"(mover, object, x, u16 id, bool) after 0x9FFDD0: copies position/orientation to the rest pose (+0x158..), links the chunk object (+0x13C via 0xF7AAE8[+0x48]), clears per-object flags, sets up via 0x9FA3A0 / 0x9FA700; reached from the chunk loader and script_mover (near the 'general_mover pool' code) (05)"
