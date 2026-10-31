@@ -15,6 +15,9 @@ changed; new rows get status `named` and a note saying where the name came from:
   several classes is named after the class with the fewest bases (where it was
   introduced). Scalar deleting destructors are recognised by their
   `test byte [esp+4], 1` prologue.
+  Slots worked out by hand go in docs/vtable_slots.csv (class, slot, method);
+  every override of a named slot in a subclass gets that method name, and
+  rows already named `vfN` are renamed.
 - ctor/dtor: constructors (write a vtable, return this) and destructors (write a
   vtable first, or called first by a scalar deleting destructor).
 - string: an error/log string that starts with a function name ("foo_bar: ...",
@@ -90,10 +93,23 @@ def nice_class(name):
     return name
 
 
+def slot_names():
+    """docs/vtable_slots.csv: (class, slot) -> method, worked out by hand."""
+    out = {}
+    for r in csv.DictReader(open(ROOT / "docs/vtable_slots.csv", encoding="utf-8")):
+        out[(r["class"], int(r["slot"]))] = r["method"]
+    return out
+
+
 def vtable_slots(x):
     owners = defaultdict(list)  # fn -> [(nbases, class, slot)]
+    lineage = {}  # class -> (itself and its bases, most derived first; virtual counts)
+    nvirt = {}
     for r in csv.DictReader(open(ROOT / "docs/rtti_classes.csv", encoding="utf-8")):
         nb = len([b for b in r["bases"].split(" ; ") if b])
+        cls = nice_class(r["name"])
+        nvirt[cls] = int(r["n_virtuals"] or 0)
+        lineage[cls] = [cls] + [nice_class(b) for b in r["bases"].split(" ; ") if b]
         for vt in filter(None, r["vtables"].split(" ")):
             va, off = vt.split("@")
             va = int(va, 16)
@@ -101,11 +117,22 @@ def vtable_slots(x):
                 f = x.u32(va + 4 * k)
                 if x.lo <= f < x.hi:
                     owners[f].append((nb, int(off, 16), nice_class(r["name"]), k))
+    named = slot_names()
     out = {}
     for f, os_ in owners.items():
         nb, off, cls, k = min(os_)
         body = x.d[f - BASE:f - BASE + 24]
-        if b"\xF6\x44\x24\x04\x01" in body or b"\xF6\x44\x24\x08\x01" in body:
+        # A slot named in docs/vtable_slots.csv for this class or one of its bases
+        # (primary vtable only, and only where that base has the slot).
+        method = None
+        if off == 0:
+            for a in lineage.get(cls, [cls]):
+                if (a, k) in named and k < nvirt.get(a, 0):
+                    method = named[(a, k)]
+                    break
+        if method:
+            name = f"{cls}::{method}"
+        elif b"\xF6\x44\x24\x04\x01" in body or b"\xF6\x44\x24\x08\x01" in body:
             name = f"{cls}::scalar_deleting_dtor"
         else:
             name = f"{cls}::vf{k}" + (f"_at{off:x}" if off else "")
@@ -168,6 +195,13 @@ def ctors_dtors(x, starts, names):
             j = bisect.bisect_right(starts, site) - 1
             if j >= 0:
                 by_fn[starts[j]].append((site, vts[imm][0]))
+    # `test eax, eax; je short; call X`: X runs on a fresh allocation, so a vtable
+    # writer called like this is a constructor (often with this in EAX, which it
+    # returns without a `mov eax, this`).
+    after_alloc = set()
+    for m in re.finditer(rb"\x85\xC0\x74.\xE8", t, re.S):
+        i = m.start() + 4
+        after_alloc.add(x.lo + i + 5 + struct.unpack_from("<i", t, i + 1)[0])
     out = {}
     for f, stores in by_fn.items():
         j = bisect.bisect_right(starts, f)
@@ -184,6 +218,9 @@ def ctors_dtors(x, starts, names):
         if returns_this(x, f, end):
             cls = stores[-1][1]
             out[f] = (f"{cls}::ctor", f"writes the {cls} vtable and returns this")
+        elif f in after_alloc:
+            cls = stores[-1][1]
+            out[f] = (f"{cls}::ctor", f"writes the {cls} vtable and is called on a fresh allocation")
         elif stores[0][0] - f <= 12 and b"\xE8" not in x.d[f - BASE:stores[0][0] - BASE]:
             cls = stores[0][1]
             out[f] = (f"{cls}::dtor", f"writes the {cls} vtable first and doesn't return this")
@@ -196,7 +233,7 @@ def ctors_dtors(x, starts, names):
         call = body.find(b"\xE8")
         if test and 0 <= call < test.start():
             tgt = f + call + 5 + struct.unpack_from("<i", body, call + 1)[0]
-            if x.lo <= tgt < x.hi:
+            if x.lo <= tgt < x.hi and tgt not in after_alloc:
                 out[tgt] = (f"{cls}::dtor", f"called first by {cls}::scalar_deleting_dtor")
     return out
 
@@ -274,10 +311,43 @@ def main(argv):
 
     def class_area(f, name):
         return "havok" if name.startswith(("hk", "Hk", "?$hk")) else "class"
-    add("vtable", vtable_slots(x), class_area)
+    slots = vtable_slots(x)
+    add("vtable", slots, class_area)
+    # Auto vtable rows are renamed when docs/vtable_slots.csv names their slot.
+    renamed = {}
+    for r in rows:
+        f = int(r["address"], 16)
+        if r["notes"].startswith("auto (vtable)") and f in slots:
+            want = slots[f][0]
+            if r["name"] != want and re.sub(r"_\d+$", "", r["name"]) != want:
+                used.discard(r["name"])
+                name, i = want, 2
+                while name in used:
+                    name = f"{want}_{i}"
+                    i += 1
+                used.add(name)
+                renamed[r["address"]] = name
+    print(f"vtable: {len(renamed)} renamed from docs/vtable_slots.csv")
     starts = sorted(set(function_starts(x.d, x.lo, x.hi - x.lo)) | known | set(new))
     names = {int(r["address"], 16): r["name"] for r in rows} | {f: r["name"] for f, r in new.items()}
-    add("ctor/dtor", ctors_dtors(x, starts, names), class_area)
+    cd = ctors_dtors(x, starts, names)
+    # Earlier ctor/dtor rows follow rule fixes (name and note).
+    fixed = 0
+    for r in rows:
+        f = int(r["address"], 16)
+        if r["notes"].startswith("auto (ctor/dtor)") and f in cd:
+            want, note = cd[f]
+            if re.sub(r"_\d+$", "", r["name"]) != want:
+                used.discard(r["name"])
+                name, i = want, 2
+                while name in used:
+                    name = f"{want}_{i}"
+                    i += 1
+                used.add(name)
+                renamed[r["address"]] = (name, f"auto (ctor/dtor): {note}")
+                fixed += 1
+    print(f"ctor/dtor: {fixed} existing rows corrected")
+    add("ctor/dtor", cd, class_area)
     add("string", string_names(x, starts), lambda f, n: "named")
 
     print(f"total new rows: {len(new)} (csv had {len(rows)})")
@@ -285,6 +355,15 @@ def main(argv):
         # Keep existing lines byte-for-byte and in their order (LF, notes always quoted);
         # the new ones go after them in address order.
         lines = CSV.read_text(encoding="utf-8").splitlines()
+        for n, ln in enumerate(lines):
+            addr, name, rest = ln.split(",", 2)
+            if addr in renamed:
+                new_name = renamed[addr]
+                if isinstance(new_name, tuple):
+                    new_name, note = new_name
+                    sub, status, _ = rest.split(",", 2)
+                    rest = f'{sub},{status},"{note}"'
+                lines[n] = f"{addr},{new_name},{rest}"
         for f in sorted(new):
             r = new[f]
             notes = r["notes"].replace('"', '""')
