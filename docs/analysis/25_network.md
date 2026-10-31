@@ -76,8 +76,52 @@ Earlier docs cite some of these numbers:
 
 Each wrapper is usually followed directly by its receive handler. For example, the sender at 0xA2B780 is followed by `scrpt_pkt_sub_25` at 0xA2B930. The receive handler maps the handle back through the remote-handle hash at `0x212E258`.
 
+## Sub-commands in detail
+
+`docs/net_subcommands.csv` lists all 307 sub-commands, one row each, with:
+- the receiver and its name;
+- every sender found (a function that writes the packet type and that sub-command into a header and calls a send function, any size);
+- the named functions that call those senders, up to two levels up: this says *which game feature uses the sub-command*;
+- the receiver's named callees and strings.
+
+A sub-command is renamed from `<packet>_sub_<nn>` only when the evidence says what it carries. Its sender gets the matching `<packet>_send_<meaning>`:
+
+| Packet | Sub | Receiver | Evidence |
+|---|---|---|---|
+| human_pkt | 0x06 | `human_pkt_on_death` 0x9B0030 | sender called by `human_on_death` and the remote do_frame updates |
+| human_pkt | 0x0E | `human_pkt_human_take_damage` 0x9844D0 | calls `human_take_damage` |
+| human_pkt | 0x12 | `human_pkt_deactivate` 0x97E920 | senders called by `human::deactivate` |
+| human_pkt | 0x16 | `human_pkt_reset` 0x4181D0 | sender called by `objects_reset` |
+| human_pkt | 0x1B / 0x1C | `human_pkt_object_teleport` / `_player_teleport` | call `object_teleport` / `player_teleport` |
+| human_pkt | 0x47 | `human_pkt_bullet_hit` 0x95F660 | sender called by `human_bullet_hit` |
+| veh_pkt | 0x07 | `veh_pkt_vehicle_ai_flags` 0xB4E040 | calls the `vehicle_ai_set_force_flag_*` setters |
+| act_packet | 0x00 | `act_packet_mission_failed` 0x6A3CC0 | `MISSION_FAILURE_PARTNER_*`; sender called by `mission_end` |
+| act_packet | 0x01 | `act_packet_mission_start` 0x6A3DB0 | "mission start" |
+| act_packet | 0x02 | `act_packet_mission_set_checkpoint` 0x6A8E40 | calls `mission_set_checkpoint` |
+| act_packet | 0x04 / 0x09 | `act_packet_level_complete` / `_2` | "Level Complete" |
+| act_packet | 0x06 | `act_packet_coop_gsi_score` 0x6AA030 | co-op score display |
+| act_packet | 0x1C | `act_packet_rebroadcast` 0x5E7F70 | forwards the packet with `net_broadcast_packet` |
+| act_packet | 0x30 | `act_packet_vandal_start` 0x66D480 | `ACT_VANDAL_START_*` |
+| act_packet | 0x42 | `act_packet_fuzz_objective` 0x5C2650 | fuzz objective text |
+| act_packet | 0x47 | `act_packet_diversion_progress` 0x53C380 | sender called by the stunt, windshield cannon and vehicle surfing diversions |
+| misc_packet | 0x00 | `misc_packet_confessional_forgive` 0x7A94A0 | confessional |
+| misc_packet | 0x01 | `misc_packet_tagging_remote_tag` 0x6210B0 | partner tagged a spot |
+| misc_packet | 0x02 | `misc_packet_partner_collected_item` 0x92FC00 | `OBJECT_PARTNER_COLLECTED` |
+| misc_packet | 0x08 | `misc_packet_saints_hq_upgrade` 0x545530 | calls `saints_hq_set_upgrade_level` |
+| misc_packet | 0x16 | `misc_packet_coop_join_cheat` 0x6885A0 | `COOP_JOIN_CHEAT` |
+| misc_packet | 0x1A / 0x1B / 0x1C | `misc_packet_coop_mission_start_prompt` / `_mission_partner_reply` / `_coop_mission_confirm` | co-op mission start handshake: prompt, busy / declined, confirm |
+| misc_packet | 0x1D / 0x1E | `misc_packet_zombie_invite` / `_zombie_partner_reply` | Zombie Uprising co-op invite |
+| misc_packet | 0x1F | `misc_packet_script_thread_create` 0x6A2FF0 | mission end / replay prompt, starts a script thread |
+| misc_packet | 0x20 | `misc_packet_mission_meta_game` 0x6A90E0 | "Mission Meta Game is %s" |
+
+**What the rest are used for**, from their senders' callers:
+- **`human_pkt` 0x1E-0x41**: human actions done by the crime events (`fuzz_crime_*`: purse snatch, littering, public indecency, arsonist, polygamy, …), activities (security, hitman, holdup customers, taxi) and diversions (mugging, driveby). Most senders are large action functions in 0x401000-0x470000, each next to its receiver.
+- **`human_pkt` 0x00-0x05, 0x43-0x4D**: followers, cell-phone spawns and activity NPCs (`followers_update`, `cell_spawn_group`, the activity level instances).
+- **`veh_pkt`**: the vehicle AI orders (31_traffic_vehicle_ai.md) from the convoy / heli objectives, road rage, chop shop, pimping and the notoriety spawn groups. 0x08 / 0x09 / 0x1D are a related set.
+- **`scrpt_pkt`**: the Lua binding wrappers in 0xA20000-0xA70000. Several receivers there are large blocks shared by many bindings, so their callee lists in the CSV are only hints.
+
 ## Open
 
-- What each sub-command does (most are named only by number).
-- Who sends each packet type. The senders build the header inline, so they have to be found by the type byte.
+- The ~275 sub-commands still named by number. The CSV lists who uses each; the payload layouts would name the rest.
+- Who sends each packet type, beyond the senders found by the header pattern.
 - The transport below `net_send_packet` (0x7FA400 / 0x7FA390), and the GameSpy gt2 / NAT layer under it.
