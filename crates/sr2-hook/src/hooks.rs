@@ -30,6 +30,14 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     }
     if n == FIND_RECORD_VERIFY_FRAME {
         find_record_verify();
+        find_entry_verify();
+    }
+    if n.is_multiple_of(3600) && FIND_ENTRY_SHADOW {
+        log(&format!(
+            "find_entry live: {} calls, {} mismatches",
+            FIND_ENTRY_CALLS.load(Ordering::Relaxed),
+            FIND_ENTRY_MISMATCHES.load(Ordering::Relaxed)
+        ));
     }
     original()
 }
@@ -447,6 +455,299 @@ extern "C" fn packfile_mount_thunk() {
     )
 }
 
+// --- 0xC0A970 packfile_mount_temp (every call logged) ----------------------
+
+/// LTCG: ECX = `const char* path`, EAX = `packfile** out_pf`, stack
+/// `file_handle** out_handle`, caller-clean, returns bool in AL. Restores ECX.
+/// Prologue `push ecx; push ebx; mov ebx,[esp+c]; push esi; push edi`: 8 bytes,
+/// stack-relative only, so it runs unchanged on the trampoline.
+const PACKFILE_MOUNT_TEMP: usize = 0x00C0_A970;
+const PACKFILE_MOUNT_TEMP_PROLOGUE: [u8; 8] = [0x51, 0x53, 0x8B, 0x5C, 0x24, 0x0C, 0x56, 0x57];
+
+const G_TEMP_PACKFILES: usize = 0x0234_8968; // *mut [u8; 0x180]
+const G_TEMP_PACKFILE_COUNT: usize = 0x0234_8960; // i32
+const G_TEMP_PACKFILE_MAX: usize = 0x0234_895C; // i32
+/// `i32[max_temp]`: the file-record count when each temp packfile was mounted
+/// (its records are appended after that, and dropped again on unmount).
+const G_TEMP_RECORD_MARKS: usize = 0x0234_8964;
+
+static MOUNT_TEMP_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// Called by the thunk with the original's convention: the trampoline, or
+/// [`packfile_mount_temp_rust_conv`].
+static MOUNT_TEMP_IMPL: AtomicUsize = AtomicUsize::new(0);
+const MOUNT_TEMP_USE_RUST: bool = true;
+
+/// `0xC0B5E0`: the temp packfile whose name (+0x8) `_stricmp`-matches `path`
+/// (the whole argument, not its basename).
+unsafe fn packfile_find_temp(path: &[u8]) -> Option<*mut u8> {
+    unsafe {
+        let base = *(G_TEMP_PACKFILES as *const *mut u8);
+        (0..*(G_TEMP_PACKFILE_COUNT as *const i32))
+            .map(|i| base.add(i as usize * PACKFILE_SIZE))
+            .find(|&pf| cstr(pf.add(8)).eq_ignore_ascii_case(path))
+    }
+}
+
+/// Rust port of `packfile_mount_temp` (0xC0A970). Unlike `packfile_mount`, it
+/// keeps the handle open (returned through `out_handle`) and registers the
+/// records without making the packfile permanent.
+extern "C" fn packfile_mount_temp_rust(path: *const u8, out_pf: *mut *mut u8, out_handle: *mut *mut u8) -> u32 {
+    unsafe {
+        // Already mounted: success, and neither output is written.
+        if packfile_find_temp(cstr(path)).is_some() {
+            return 1;
+        }
+        let count = G_TEMP_PACKFILE_COUNT as *mut i32;
+        if *count >= *(G_TEMP_PACKFILE_MAX as *const i32) {
+            return 0;
+        }
+        let h = file_open(path, STR_RB as *const u8, 1);
+        *out_handle = h;
+        if h.is_null() {
+            return 0;
+        }
+        let c = *count;
+        *(*(G_TEMP_RECORD_MARKS as *const *mut i32)).add(c as usize) = *(G_FILE_RECORD_COUNT as *const i32);
+        let slot = (*(G_TEMP_PACKFILES as *const *mut u8)).add(c as usize * PACKFILE_SIZE);
+        *out_pf = slot;
+        *count = c + 1;
+        if !packfile_load(slot, h, false, true) {
+            *count -= 1;
+            return 0;
+        }
+        let flags = slot.add(0x14C) as *mut u32;
+        match *(h.add(0x150) as *const u32) {
+            0 => *flags |= 0x8,
+            1 => *flags |= 0x10,
+            2 => *flags |= 0x4,
+            _ => {}
+        }
+        1
+    }
+}
+
+/// Original-convention entry for [`packfile_mount_temp_rust`].
+#[unsafe(naked)]
+extern "C" fn packfile_mount_temp_rust_conv() {
+    naked_asm!(
+        "push dword ptr [esp + 4]", // out_handle
+        "push eax",                 // out_pf
+        "push ecx",                 // path
+        "call {f}",
+        "add esp, 12",
+        "ret",
+        f = sym packfile_mount_temp_rust,
+    )
+}
+
+#[unsafe(naked)]
+extern "C" fn packfile_mount_temp_thunk() {
+    naked_asm!(
+        "push ecx",                  // path
+        "push eax",                  // out_pf
+        "push dword ptr [esp + 12]", // out_handle
+        "call dword ptr [{imp}]",    // EAX/ECX unchanged since entry
+        "add esp, 4",
+        // [esp] = out_pf, [esp+4] = path, [esp+8] = ret, [esp+12] = out_handle
+        "push eax",
+        "push dword ptr [esp + 12]", // caller
+        "push eax",                  // result
+        "push dword ptr [esp + 24]", // out_handle
+        "push dword ptr [esp + 16]", // out_pf
+        "push dword ptr [esp + 24]", // path
+        "call {log}",
+        "add esp, 20",
+        "pop eax",
+        "pop edx",
+        "pop ecx", // the original returns with ECX = path
+        "ret",
+        imp = sym MOUNT_TEMP_IMPL,
+        log = sym packfile_mount_temp_log,
+    )
+}
+
+extern "C" fn packfile_mount_temp_log(
+    path: *const u8,
+    out_pf: *const *const u8,
+    out_handle: *const *const u8,
+    result: u32,
+    caller: usize,
+) {
+    unsafe {
+        let count = *(G_TEMP_PACKFILE_COUNT as *const i32);
+        let mut line = format!(
+            "mount_temp {:?} from {caller:#x} -> {} | temp {count}",
+            String::from_utf8_lossy(cstr(path)),
+            result as u8
+        );
+        // The outputs are only written on a fresh mount; on "already mounted"
+        // they still hold whatever the caller had there, so range-check first.
+        let base = *(G_TEMP_PACKFILES as *const *const u8) as usize;
+        let pf = *out_pf;
+        let in_array = (pf as usize).wrapping_sub(base) < count.max(0) as usize * PACKFILE_SIZE;
+        if result as u8 != 0 && in_array {
+            let h = *out_handle;
+            let source = if h.is_null() { u32::MAX } else { *(h.add(0x150) as *const u32) };
+            let mark = *(*(G_TEMP_RECORD_MARKS as *const *const i32)).add((pf as usize - base) / PACKFILE_SIZE);
+            line += &format!(" | source {source} mark {mark}{}", packfile_fingerprint(pf));
+        }
+        log(&line);
+    }
+}
+
+// --- 0xC0AD80 packfile_find_entry (replaced, original shadow-checked) ------
+
+/// LTCG: ECX = `const char* path`, returns `vpp_entry*` in EAX, no stack args.
+/// Prologue `sub esp,48; mov eax,[__security_cookie]`: 8 bytes, absolute operands only.
+const PACKFILE_FIND_ENTRY: usize = 0x00C0_AD80;
+const PACKFILE_FIND_ENTRY_PROLOGUE: [u8; 8] = [0x83, 0xEC, 0x48, 0xA1, 0x50, 0x0B, 0xE8, 0x00];
+
+/// `packfile*` searched linearly before the hash table (NULL when unset).
+const G_PRIORITY_PACKFILE: usize = 0x0234_8944;
+const VPP_ENTRY_SIZE: usize = 0x1C;
+
+static FIND_ENTRY_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// Also run the original on every call and return its answer if they differ.
+/// The function only reads state, so running both is harmless.
+const FIND_ENTRY_SHADOW: bool = true;
+static FIND_ENTRY_CALLS: AtomicU32 = AtomicU32::new(0);
+static FIND_ENTRY_MISMATCHES: AtomicU32 = AtomicU32::new(0);
+
+/// Rust port of `packfile_find_entry`. The original also leaves the last
+/// candidate's full name in the thread's scratch string (TLS slot 0 + 0x18), as
+/// `packfile_find_record` does; nothing reads it back, so that is not reproduced.
+unsafe fn find_entry(path: *const u8) -> *const VppEntry {
+    unsafe {
+        let mut name = [0u8; 0x40];
+        path_basename(path, &mut name);
+        let q = name.as_ptr();
+        let pf = *(G_PRIORITY_PACKFILE as *const *const u8);
+        if !pf.is_null() {
+            let entries = *(pf.add(0x170) as *const *const u8);
+            for i in 0..*(pf.add(0x154) as *const i32) {
+                let e = entries.add(i as usize * VPP_ENTRY_SIZE) as *const VppEntry;
+                if query_matches_entry(q, &*e) {
+                    return e;
+                }
+            }
+        }
+        // Through the hook, so find_record's fallback switch still applies.
+        let rec = packfile_find_record_hook(q);
+        if rec.is_null() { std::ptr::null() } else { (*rec).entry }
+    }
+}
+
+/// Call an `ECX = arg -> EAX` function such as the find_entry trampoline.
+unsafe fn call_ecx(f: usize, arg: *const u8) -> usize {
+    let r: usize;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "call {f}",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) f,
+            in("ecx") arg,
+            lateout("eax") r,
+            clobber_abi("C"),
+        );
+    }
+    r
+}
+
+extern "C" fn packfile_find_entry_hook(path: *const u8) -> *const VppEntry {
+    if path.is_null() {
+        // The original would fault in path_basename; don't pretend otherwise.
+        return std::ptr::null();
+    }
+    let rust = unsafe { find_entry(path) };
+    let original = FIND_ENTRY_ORIGINAL.load(Ordering::Relaxed);
+    if FIND_ENTRY_SHADOW && original != 0 {
+        FIND_ENTRY_CALLS.fetch_add(1, Ordering::Relaxed);
+        let o = unsafe { call_ecx(original, path) } as *const VppEntry;
+        if o != rust {
+            if FIND_ENTRY_MISMATCHES.fetch_add(1, Ordering::Relaxed) < 10 {
+                log(&format!(
+                    "find_entry mismatch for {:?}: original {o:p}, rust {rust:p}",
+                    String::from_utf8_lossy(unsafe { cstr(path) })
+                ));
+            }
+            return o;
+        }
+    }
+    rust
+}
+
+#[unsafe(naked)]
+extern "C" fn packfile_find_entry_thunk() {
+    naked_asm!("push ecx", "call {f}", "add esp, 4", "ret", f = sym packfile_find_entry_hook)
+}
+
+/// Sweep every registered file (bare, under a directory, upper-cased, missing)
+/// through the original and the port.
+fn find_entry_verify() {
+    let tramp = FIND_ENTRY_ORIGINAL.load(Ordering::Relaxed);
+    if tramp == 0 {
+        return;
+    }
+    let (records, count) =
+        unsafe { (*(G_FILE_RECORDS as *const *const FileRecord), *(G_FILE_RECORD_COUNT as *const i32)) };
+    let (mut checked, mut hits, mut mismatches) = (0u32, 0u32, 0u32);
+    let mut check = |q: &[u8]| {
+        let (a, b) = unsafe { (call_ecx(tramp, q.as_ptr()) as *const VppEntry, find_entry(q.as_ptr())) };
+        checked += 1;
+        hits += (!a.is_null()) as u32;
+        if a != b {
+            mismatches += 1;
+            if mismatches <= 10 {
+                log(&format!(
+                    "find_entry verify mismatch for {:?}: original {a:p}, rust {b:p}",
+                    String::from_utf8_lossy(&q[..q.len() - 1])
+                ));
+            }
+        }
+    };
+    for k in 0..count.max(0) as usize {
+        let e = unsafe { &*(*records.add(k)).entry };
+        let mut full = unsafe { cstr(e.name) }.to_vec();
+        if !e.ext.is_null() && unsafe { *e.ext } != 0 {
+            full.push(b'.');
+            full.extend_from_slice(unsafe { cstr(e.ext) });
+        }
+        for variant in [
+            full.clone(),
+            [&b"data\\packfiles/"[..], &full].concat(),
+            full.to_ascii_uppercase(),
+            [&full[..], b"_nope"].concat(),
+        ] {
+            let mut z = variant;
+            z.push(0);
+            check(&z);
+        }
+    }
+    for q in [&b"\0"[..], b"dir\\\0", b"no_such_file.xtbl\0"] {
+        check(q);
+    }
+    let priority = unsafe { *(G_PRIORITY_PACKFILE as *const *const u8) };
+    let priority = if priority.is_null() {
+        "none".to_string()
+    } else {
+        format!("{:?}", String::from_utf8_lossy(unsafe { cstr(priority.add(8)) }))
+    };
+    if mismatches == 0 {
+        log(&format!(
+            "find_entry verify: {checked} queries, {hits} hits, priority packfile {priority}, all match"
+        ));
+    } else {
+        log(&format!("find_entry verify: {mismatches}/{checked} MISMATCH (live calls return the original's answer)"));
+    }
+}
+
 /// FNV-1a, used to fingerprint mount results so two boots can be diffed.
 fn fnv(h: &mut u32, bytes: &[u8]) {
     for &b in bytes {
@@ -470,37 +771,45 @@ extern "C" fn packfile_mount_log(path: *const u8, result: u32, caller: usize) {
         );
         if result as u8 != 0 && count > 0 {
             let pf = (*(G_PACKFILES as *const *const u8)).add((count as usize - 1) * PACKFILE_SIZE);
-            let rd = |o: usize| *(pf.add(o) as *const u32);
-            let mut h = 0x811C_9DC5u32;
-            let entries = rd(0x170) as *const u32;
-            for i in 0..rd(0x154) as usize {
-                let e = entries.add(i * 7);
-                fnv(&mut h, cstr(*e as *const u8));
-                fnv(&mut h, b".");
-                fnv(&mut h, cstr(*e.add(1) as *const u8));
-                for k in 2..6 {
-                    fnv(&mut h, &(*e.add(k)).to_le_bytes());
-                }
-                fnv(&mut h, &[(*e.add(6) as *const u8 == pf) as u8]);
-            }
-            let (recs, nrec) =
-                (*(G_FILE_RECORDS as *const *const FileRecord), *(G_FILE_RECORD_COUNT as *const i32));
-            let mut rh = 0x811C_9DC5u32;
-            for i in 0..nrec.max(0) as usize {
-                fnv(&mut rh, &(*recs.add(i)).hash.to_le_bytes());
-            }
-            line += &format!(
-                " | last {:?} flags {:#x} data {:#x} n {} dir {:#x} names {:#x} ext {:#x} entries#{h:08x} | records {nrec} #{rh:08x}",
-                String::from_utf8_lossy(cstr(pf.add(8))),
-                rd(0x14C),
-                rd(0x150),
-                rd(0x154),
-                rd(0x15C),
-                rd(0x160),
-                rd(0x164)
-            );
+            line += " | last";
+            line += &packfile_fingerprint(pf);
         }
         log(&line);
+    }
+}
+
+/// The packfile's header fields, a hash of its directory, and a hash of the
+/// global file-record table.
+unsafe fn packfile_fingerprint(pf: *const u8) -> String {
+    unsafe {
+        let rd = |o: usize| *(pf.add(o) as *const u32);
+        let mut h = 0x811C_9DC5u32;
+        let entries = rd(0x170) as *const u32;
+        for i in 0..rd(0x154) as usize {
+            let e = entries.add(i * 7);
+            fnv(&mut h, cstr(*e as *const u8));
+            fnv(&mut h, b".");
+            fnv(&mut h, cstr(*e.add(1) as *const u8));
+            for k in 2..6 {
+                fnv(&mut h, &(*e.add(k)).to_le_bytes());
+            }
+            fnv(&mut h, &[(*e.add(6) as *const u8 == pf) as u8]);
+        }
+        let (recs, nrec) = (*(G_FILE_RECORDS as *const *const FileRecord), *(G_FILE_RECORD_COUNT as *const i32));
+        let mut rh = 0x811C_9DC5u32;
+        for i in 0..nrec.max(0) as usize {
+            fnv(&mut rh, &(*recs.add(i)).hash.to_le_bytes());
+        }
+        format!(
+            " {:?} flags {:#x} data {:#x} n {} dir {:#x} names {:#x} ext {:#x} entries#{h:08x} | records {nrec} #{rh:08x}",
+            String::from_utf8_lossy(cstr(pf.add(8))),
+            rd(0x14C),
+            rd(0x150),
+            rd(0x154),
+            rd(0x15C),
+            rd(0x160),
+            rd(0x164)
+        )
     }
 }
 
@@ -554,6 +863,17 @@ pub fn install_all() {
             }
         }
 
+        match detour::install(
+            PACKFILE_FIND_ENTRY,
+            &PACKFILE_FIND_ENTRY_PROLOGUE,
+            packfile_find_entry_thunk as extern "C" fn() as usize,
+        ) {
+            Ok(tramp) => {
+                FIND_ENTRY_ORIGINAL.store(tramp, Ordering::Relaxed);
+                log("replaced packfile_find_entry @ 0xc0ad80 with Rust (shadow-checked, verify at frame 300)");
+            }
+            Err(e) => log(&format!("hook packfile_find_entry failed: {e:?}")),
+        }
     });
 }
 
@@ -593,5 +913,29 @@ pub fn install_early() {
             log(&format!("hooked packfile_mount @ 0xc0b410 ({which}), {waited:?} after attach"));
         }
         Err(e) => log(&format!("hook packfile_mount failed: {e:?}")),
+    }
+
+    // Same section, so already decrypted. Same ordering caveat as above.
+    if MOUNT_TEMP_USE_RUST {
+        MOUNT_TEMP_IMPL.store(packfile_mount_temp_rust_conv as extern "C" fn() as usize, Ordering::Relaxed);
+    }
+    match unsafe {
+        detour::install(
+            PACKFILE_MOUNT_TEMP,
+            &PACKFILE_MOUNT_TEMP_PROLOGUE,
+            packfile_mount_temp_thunk as extern "C" fn() as usize,
+        )
+    } {
+        Ok(tramp) => {
+            MOUNT_TEMP_ORIGINAL.store(tramp, Ordering::Relaxed);
+            let which = if MOUNT_TEMP_USE_RUST {
+                "Rust"
+            } else {
+                MOUNT_TEMP_IMPL.store(tramp, Ordering::Relaxed);
+                "original, observed"
+            };
+            log(&format!("hooked packfile_mount_temp @ 0xc0a970 ({which})"));
+        }
+        Err(e) => log(&format!("hook packfile_mount_temp failed: {e:?}")),
     }
 }

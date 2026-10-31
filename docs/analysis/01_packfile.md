@@ -183,11 +183,33 @@ Hand-decoded from the bytes (Observed). The stack frame has an `/GS` cookie (`[0
 
 - **Lesson:** the first port crashed inside `packfile_load` (0xBFE611, bad `os_file*` at handle+0x14C) until the shims saved and restored EBX/ESI/EDI/EBP around the call. LTCG callees are not guaranteed to preserve callee-saved registers, so **every shim into game code must save all four**.
 - **Verification:** an observe-only trampoline logged each mount's result, slot fields, an FNV fingerprint of the directory, and the record table (`golden/boot_mounts.txt`). The Rust build's log is byte-identical.
-- **Not yet exercised:** the already-mounted path, the failure paths, and later mounts (city load).
+- **Not yet exercised:** the already-mounted path and the failure paths. Loading a save makes no `packfile_mount` calls (2026-10-31), so all 16 + override mounts happen at boot.
+
+## 5b. `packfile_mount_temp` (0xC0A970) and `packfile_find_entry` (0xC0AD80)
+
+Hand-decoded with capstone (Observed).
+
+`packfile_mount_temp`: ECX = path, EAX = `packfile** out_pf`, stack `file_handle** out_handle`, caller-clean, AL = result, ECX restored on return.
+1. `0xC0B5E0(path)` (cdecl): `_stricmp` of the **whole path** against `pf+0x8` of each temp packfile. If found, return 1 **without writing either output**.
+2. If `temp_count (0x2348960) >= temp_max (0x234895C)`, return 0.
+3. `h = file_open(path, "rb", 1)`, then `*out_handle = h` (written even when NULL). If NULL, return 0.
+4. `marks(0x2348964)[c] = record_count`, `slot = temp_array + c*0x180`, `*out_pf = slot`, `temp_count = c+1`.
+5. `packfile_load(ESI=slot, h, 0, 1)`. On failure, `temp_count -= 1` and return 0.
+6. Flags from `h+0x150` as in `packfile_mount`. Return 1; **the handle stays open** (the caller owns it).
+
+`packfile_find_entry`: ECX = path, EAX = `vpp_entry*`.
+1. `path_basename(EDI=path, buf[0x40], 0x40)`.
+2. If the priority packfile `0x2348944` is set, scan its entries (`pf+0x170`, count `pf+0x154`, stride 0x1C) with `_stricmp(buf, "name.ext")`; the first match wins. The full name is built in the thread's scratch string (TLS slot 0 + 0x18), as in `find_record`.
+3. Otherwise `packfile_find_record(buf)->entry`, or NULL.
+
+**Ported (hooks.rs), 2026-10-31.**
+- `find_entry` is pure, so the hook runs Rust and the original on every call and returns the original's answer on a mismatch. A frame-300 sweep also queries every record as-is, under a directory, upper-cased, and as a miss: 212,127 queries matched. A city load made 37k live calls, 0 mismatches. The priority packfile is unset in this build.
+- `mount_temp` was logged observe-only first (`golden/temp_mounts.txt`), then switched to Rust; the log of a city load is identical.
+- Loading a save temp-mounts `hmaps.vpp_pc` (from 0xC0B70A) and then `city_load.vpp_pc` (from 0x69D26C), both in temp slot 0 with mark 53031, so `hmaps` is unmounted in between.
 
 ## 6. Open questions
 
-- Who calls `packfile_mount_temp`: 0x69d250 (also calls `packfile_mount`), 0xc0b640, 0xc0b6f0. These are probably the streaming/city-load paths (`city_load.vpp`, `misc_tables.vpp`). Not yet traced.
+- `packfile_mount_temp` callers: 0x69d250 mounts `city_load.vpp_pc` and 0xc0b6f0 mounts `hmaps.vpp_pc` on a save load. 0xc0b640 has not been seen yet. The temp unmount (it should rewind the record count to the mark) is not traced yet.
 - How the remaining archives get mounted (`shaders`, `startup`, `vint_docs`, `misc_tables_startup`, which are not in the 0xe98a28 table).
 - The search-path table `DAT_0234767c` contents and order (does disk override packfile?).
 - `FUN_00bff700` (path normalisation: strip directory? lowercase?), `FUN_00c0ae90` (is-mounted check), and `FUN_00bfd930`/`FUN_00bfdf30` (open/close).

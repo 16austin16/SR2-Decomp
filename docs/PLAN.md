@@ -44,4 +44,6 @@ original. The standalone build can move to 64-bit later.
 6. ✅ `packfile_find_record` @0xC0A3B0 → Rust (`hooks.rs`). Trampoline keeps the original; at frame 300 every registered file (53,018) is queried as-is, upper-cased and as a miss through both, and any mismatch flips the hook back to the original. 159,057/159,057 matched in-game.
 7. ✅ `packfile_mount` @0xC0B410 → Rust. Boot mounts run before the first `DirectInput8Create`, so this hook is installed from a thread spawned in `DllMain` that waits for SteamStub to decrypt the bytes (~270 ms). Verified by diffing a per-mount fingerprint log (slot fields, directory, record table) against a reference captured from the original: `docs/analysis/golden/boot_mounts.txt`, all 16 identical.
 8. ✅ First visible change: an override archive (`decomp.vpp_pc`, mounted after patch) plus a peg reader/writer, used to add "Decomp" to the main-menu logo. See `docs/analysis/02_ui_textures_and_overrides.md`.
-6. Get computer control working (desktop app) to test gameplay-dependent rewrites.
+9. ✅ City load tested: Continue → crib with every Rust hook live, no fallbacks. Game input works through `SendInput` scancodes.
+10. ✅ `packfile_find_entry` @0xC0AD80 → Rust, shadow-checked against the original on every call (212k-query sweep plus 37k live calls, 0 mismatches). `packfile_mount_temp` @0xC0A970 → Rust; its city-load log is identical to `docs/analysis/golden/temp_mounts.txt`.
+11. Next: the file layer above (`file_open`, `file_resolve` and the search-path table, `file_read`), and the temp unmount.

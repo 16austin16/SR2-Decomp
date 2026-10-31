@@ -1,0 +1,2 @@
+mount_temp "hmaps.vpp_pc" from 0xc0b70a -> 1 | temp 1 | source 0 mark 53031 "hmaps.vpp_pc" flags 0xa data 0x9000 n 730 dir 0x4fd8 names 0x2b9e ext 0x8 entries#323b8c2c | records 53761 #50700932
+mount_temp "city_load.vpp_pc" from 0x69d26c -> 1 | temp 1 | source 0 mark 53031 "city_load.vpp_pc" flags 0xa data 0x8000 n 624 dir 0x4440 names 0x27f0 ext 0x9 entries#9dc435dc | records 53655 #5aabcd9a
