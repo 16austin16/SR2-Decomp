@@ -82,7 +82,7 @@ The .vint_doc XML tags: `vint_doc_type`, `vint_document`, `vint_doc_version`, `d
 
 **Per frame:** `vint_update_documents(dt)` (0xB8BC10):
 1. Clamp dt to 0.5.
-2. For each document: unless paused, time += dt. Then `vint_object_tree_update` on its two roots, which calls vtable slot 3 `update` on every object.
+2. For each document: unless paused, time += dt. Then `vint_object_tree_update` on its two roots, which calls vtable slot 3 `update` on every object. Every vint `update` slot is an empty `ret` in this build (see "The non-render side").
 3. Then destroy the documents with unload pending: 0xB91400, the hook `0x252A1EC`, 0xB8A9F0, 0xB8ABD0.
 
 **Rendering:** `vint_render_documents` (0xB8BD40):
@@ -259,6 +259,187 @@ The current state is `0xE8CF80` and the pending one `0xE8CF7C` (-2 = none). `0x7
 
 **Virtual keyboard:** `interface_vkeyboard_poll` (0x7F3450) delivers a finished on-screen keyboard result to the Lua function named at `0x1FD507C`, in a new thread whose +0x14 is the document handle at `0x2528B08`.
 
+## The non-render side, step by step, for porting
+
+**`interface_do_frame`** (0x7F3500) is the per-frame entry for everything below. It returns at once unless the interface is ready (`0x2528AFF`). Then:
+1. If the player's state changed (0x9B9030 / 0x9B9070 on `0x21703D4`, cached in `0x347AF34`), refresh the localised image tags (0x7F2040).
+2. 0x7EC170, then `interface_vkeyboard_poll` (0x7F3450).
+3. `vint_dataitems_notify_all` (0xB95290).
+4. `vint_datagroups_deliver_all` (0xB94560).
+5. `vint_tweens_do_frame` (0xB9EA70).
+6. `vint_update_documents(*0xE87998)` (the frame time).
+
+`vint_input_do_frame` is called separately, from `game_frame_tick`.
+
+### Input dispatch
+
+**`vint_input_do_frame`** (0xB99550):
+1. Clear the 34 per-event "consumed" bytes `0x22EF550` and set "dispatching" `0x252A17E = 1`.
+2. Walk the subscription list `0x252A234` in priority order. Skip records with +0x28 = 1 (remove pending). Then:
+   - kind (+0x24) 0 → `vint_input_check_event(sub)`;
+   - kind 1 → `vint_input_check_raw(sub)` (0xB996C0).
+3. Walk the list again: `vint_input_mark_consumed` (`EDI` = sub) for every record.
+4. Walk it a third time and delete the records marked for removal (0xB99620).
+5. `0x252A17E = 0`.
+
+**Subscription record** (0x4C bytes; the first fields are in the table above):
+
+| Off | Field |
+|---|---|
+| +0 / +4 | list links |
+| +0x18 / +0x1C | callback reference {tag 8, handle} / callback object |
+| +0x20 | handle |
+| +0x24 | kind |
+| +0x28 | remove pending |
+| +0x2C | event index (kind 0), or the last value as f32 (kind 1) |
+| +0x30 | armed (kind 0), or the raw binding index (kind 1) |
+| +0x34 | repeat speed |
+| +0x38 | repeat output |
+| +0x3C | u8 "first press" |
+| +0x3D | u8 accelerate |
+| +0x40 | speed multiplier |
+| +0x44 | maximum speed |
+| +0x48 | base delay (s) |
+
+**`vint_input_check_event`** (0xB99A60; cdecl `(sub)`):
+1. Return if input is disabled (`0x252A54D`) or the event is already consumed this frame.
+2. Event 26 is special: call 0xC06C30, mark it consumed and return.
+3. Repeat timing: the per-event record is `0x22EF3B8 + event × 12` = {last fire ms, delay ms, handle}. Elapsed = `0x252A3CC` (ms clock) − last, with wrap handling.
+4. Match the event's bindings. The first hit goes to **fire**:
+
+   | Binding table | Entry | Fields | Hit when |
+   |---|---|---|---|
+   | buttons `0x252A218`, count `0x252A21C` | 0x14 | +0 controller, +4 button, +8 event, +0xC u8 mode, +0x10 u8 repeat | mode 1: `0xC067F0` (edge); also sets sub+0x3C when the button is down and not eaten. Otherwise: down (`0x23478D4 + controller × 0x104C + button × 0x24`) and not eaten (+4) |
+   | sticks `0x252A220`, count `0x252A224` | 0x18 | +0 controller, +4 stick, +8 direction, +0xC f32 threshold, +0x10 event | read the stick (0xC066F0 → x, y). Direction 0: y > threshold; 1: y < threshold (y negated when 0xC06A10, invert); 2: x < threshold; 3: x > threshold (x negated when 0xC069F0) |
+   | keys `0x252A228`, count `0x252A22C` | 8 | +0 key, +4 event | `input_key_down` (0xC111D0) |
+5. **Fire.** If the subscription is armed (+0x30) and elapsed > delay:
+   1. `cb = vint_callback_from_ref(&sub+0x18)` (0xB93750).
+   2. `vint_input_repeat_next(repeat byte)` (0xB99980; `ECX` = sub, `ESI` = timing record) computes the next delay.
+   3. `cb->vtable[1](sub+0x1C → +0x4C (document handle), 0, sub, 0x4C)`.
+   4. Mark the event consumed, then set last = now and handle = sub+0x20.
+
+   Either way, call 0xC06C30 and return.
+6. **No hit:** armed = 1, delay = 0, +0x3C = 1, so the next press fires at once.
+
+**`vint_input_repeat_next`** (0xB99980): the hold-to-repeat curve.
+- `base` = sub+0x48 when the binding repeats, else 50000 (no repeat).
+- On the first press (+0x3C), speed = 1. Otherwise speed ×= multiplier (+0x40), or with acceleration (+0x3D) by `(dt × base + 1) × multiplier`.
+- Speed is clamped to the maximum (+0x44).
+- Accelerating repeats set +0x38 = `base × dt × speed` and delay 0. Otherwise +0x38 = 1 and delay = `round(base × 1000 / speed)` ms.
+- Finally clear +0x3C.
+
+**`vint_input_check_raw`** (0xB996C0). The binding is `0x252A240 + sub+0x30 × 0x18` (count `0x252A23C`): +0 controller, +4 kind (0 button, 1 stick), +8 button / stick, +0xC u8 axis, +0x14 name.
+- **Button:**
+  - value = 0 if eaten, else `input_button_analog` (0xC06870);
+  - mark it eaten (controller 0);
+  - names "inventory_left / right / up / down" also eat the matching d-pad bytes (`0x2348070` / `0x23483F4`, `0x2348094` / `0x23483AC`, `0x2348028` / `0x23483D0`, `0x234804C` / `0x2348418`).
+- **Stick:**
+  - read it (0xC066F0, 0xC06BF0);
+  - for stick kind 2, mark axis eaten bytes `0x2348502/3` and `0x2348542/3`;
+  - value = x (axis 0) or y (axis 1).
+- **Fire** when the previous value (sub+0x2C) is negative or differs by ≥ 0.05: store the value and call `cb->vtable[1](doc handle, 0, sub, 0x4C)`. There is no consumed flag and no repeat.
+
+**`vint_input_mark_consumed`** (0xB99DB0; `EDI` = sub). For kind 0 subscriptions whose event was consumed, every binding of that event on controller 0 sets the game's eaten byte:
+- buttons: `0x23478D8 + button × 0x24` (button < 0x57);
+- stick directions 0 / 1: `0x2348503 + stick × 0x40`;
+- stick directions 2 / 3: `0x2348502 + stick × 0x40` (stick < 8);
+- keys: `0x2348B82 + key × 0xC` (key < 0x100).
+
+The game's own input code (Rust `input.rs`) then reads these as eaten.
+
+`vint_callback_from_ref` (0xB93750; `EAX` = &{tag, handle}) returns the callback whose +0x18 equals the handle in the 64-bucket hash `0x22F2670[handle & 0x3F]` (chain +8). It returns 0 unless tag = 8.
+
+### Data items and data groups
+
+- **`vint_dataitems_notify_all`** (0xB95290) walks the data items `0x252A1F4` (next +0xC). For each, `vint_dataitem_notify` (0xB952F0; `ESI` = item):
+  - If "dirty" (+0x229) and it has a value (+0x21C), 0xB944C0(value).
+  - If "changed" (+0x228), call each subscriber (list +0x220, next +0x14) as `callback(+0xC handle)->vtable[1](+8, 2)`, then 0xB94420(value).
+  - Clear both flags.
+- **`vint_datagroups_deliver_all`** (0xB94560) walks the data groups `0x252A204`. For each, `vint_datagroup_deliver` (0xB945E0) takes every queued item (list +0x10):
+  - calls each subscriber of kind 5 (list +0x18, next +0x14; handle +0xC) as `vtable[1](+8, 5, item, 0x22C)`;
+  - unlinks the item and frees it (0xB94980).
+
+  A group with +0x1C set is then destroyed (0xB93BC0).
+
+These are the Lua `vint_dataitem_*` / `vint_datagroup_*` bindings' delivery side. Items are 0x22C bytes.
+
+### Tweens
+
+All `update` slots (vtable +0xC) of the vint classes are an empty `ret`: base, group, animation, tween, and every element type. So the `vint_object_tree_update` walk in `vint_update_documents` calls nothing in this build. A port can keep only the time step and the unload pass. The animation work is all in `vint_tweens_do_frame`.
+
+**`vint_tweens_do_frame`** (0xB9EA70):
+1. Point three event queues at stack buffers: start `0x252A278` (count `0x252A284`), per-frame `0x252A280` (`0x252A28C`), end `0x252A27C` (`0x252A288`), 64 `{tween handle, callback handle}` pairs each. Also point the tween list `0x252A290` (count `0x252A294`) at a stack array.
+2. From the type registry (`0x22F2370 + type × 0x10`, type `*0xEBE2F8` = tween), call the pool's for-each (vtable +0x14) with `vint_tween_collect` (0xB9EA00). That appends every object that is a tween with a live handle (+0x28).
+3. qsort the list by +0x78 (`vint_tween_compare` 0xB9EA50), then `vint_tween_step` on each.
+4. Deliver the events: start, then per-frame, then end. Each entry's tween is found in the object hash `0x22EF2B8` (handle at +0x28, chain +0xC), its callback with `vint_callback_from_ref`. Then `callback->vtable[1](tween+0x30 → +0x4C (document handle), 1, …, 8)`.
+5. Clear the queue pointers and the count.
+
+**Tween fields** used by the step:
+
+| Off | Field |
+|---|---|
+| +0x24 | parent animation (or 0) |
+| +0x28 | own handle (0 = dead) |
+| +0x30 | document |
+| +0x54 | target property type |
+| +0x64 | start value type (must equal +0x54) |
+| +0x74 | start time |
+| +0x78 | sort key |
+| +0x7C | duration |
+| +0x94 | end value (its type at +4 must equal +0x54, or be 0xD) |
+| +0x98 | loop mode: 0 none, 1 cycle, 2 bounce |
+| +0x9C | algorithm: index into the interpolators `0xE86E18` |
+| +0xA0 | max loops |
+| +0xA4 | state: 0 idle, 1 running, 2 / 3 not stepped, 4 done |
+| +0xA8 | progress (negative while a bounce runs backwards) |
+| +0xE4 | started |
+
+**`vint_tween_step`** (0xB9EDB0; cdecl `(tween)`):
+1. **Skip** it if:
+   - its handle is 0;
+   - it is in state 2 or 3;
+   - the value types don't match;
+   - the target (0xB9E930) is missing.
+2. **Local time**:
+   - With a parent animation (`is_type(animation)`, vtable +0x18): `doc time (+0x45C) + anim+0x5C − anim+0x54`.
+   - Otherwise: the document's time.
+
+   Then subtract the start time (+0x74).
+3. **State**:
+   - **No loop:**
+     - Before the end: state 1 and started; this is a start event (unless it was already running).
+     - Past the duration: state 4, an end event, plus a start event if it was idle.
+   - **Cycle / bounce:**
+     - With max loops > 0 and time > duration × loops: state 4 and an end event.
+     - Else, when time > 0 and not yet running: state 1 and a start event.
+4. If the time is negative, return. If the tween was already done, return. If idle, return.
+5. **Fraction `t`**:
+   - **No loop:** `time / duration`, capped at 1.
+   - **Cycle:** `fmod(time, duration) / duration` (0x4DA540), stored in +0xA8. Every step counts as a start event.
+   - **Bounce:** the same fraction. On odd periods (0x427600 / 0xDA0140) use `1 − t` and store it negated. A change of direction raises the end or start event.
+6. **Interpolate** with `f = 0xE86E18[algorithm]` (`f(t, start, delta)`):
+   - **Type 3** (an angle): the start and end go through 0x5E4970 (wrap), interpolate, then 0x7903D0.
+   - **Type 6** (three components): read both values (0xB956B0) and interpolate each component, then 0xB9DBE0.
+   - **Type 7** (two components): read with 0xB8CF80 and interpolate each, then 0xB9DC10.
+   - **Other types, or no interpolator:** 0xB93620 (take the end value).
+7. Write the value to the target property (0xB8A2A0).
+8. **Queue events** (64 each). The callback handles come through `vint_callback_from_ref` on the tween's event references:
+   - a start event when flagged;
+   - an end event when flagged;
+   - a per-frame event every step.
+9. 0xB93790.
+
+**Porting order:**
+1. `vint_callback_from_ref` and the object-handle hash.
+2. Input:
+   1. `vint_input_repeat_next`;
+   2. `vint_input_check_event` and `vint_input_check_raw` (they need the controller tables that `input.rs` already owns);
+   3. `vint_input_mark_consumed`;
+   4. `vint_input_do_frame`.
+3. Data delivery (`vint_dataitem_notify`, `vint_datagroup_deliver`) once the item layout is ported.
+4. Tweens: the interpolator table (`0xE86E18`, one function per algorithm), `vint_tween_step`, `vint_tweens_do_frame`. The property write (0xB8A2A0) goes through the property descriptors described above.
+5. `vint_update_documents` reduces to the time step and the unload pass.
+
 ## Platform draw callbacks
 
 vint never draws directly. Everything goes through the table at `0x1FD52B0` (global `0x252A1D8`), filled by `interface_init`, which calls the game's 2D layer (0xD0xxxx / 0xD14xxx, render state `0x2A14B28`). The vint-side wrappers are 0xB92340-0xB925D0, one per slot.
@@ -350,4 +531,4 @@ The other three tables:
 
 ## Open
 
-- The datagroup / dataitem binding system (0xB94xxx-0xB95xxx).
+- The data item / group layouts beyond the delivery side.
