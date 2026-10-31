@@ -18,6 +18,9 @@ use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
 mod detour;
 mod hooks;
+mod mempool;
+#[allow(dead_code)] // enabled by hand when surveying a class family
+mod survey;
 
 /// Image base the original exe was linked at (no ASLR expected; verified at attach).
 const SR2_IMAGE_BASE: usize = 0x0040_0000;

@@ -34,6 +34,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     }
     if n == 1 || n == FIND_RECORD_VERIFY_FRAME || n.is_multiple_of(3600) {
         log(&file_resolve_summary());
+        log(&crate::mempool::summary());
     }
     if n.is_multiple_of(60) {
         file_read_log_flush();
@@ -1962,7 +1963,7 @@ fn fnv(h: &mut u32, bytes: &[u8]) {
     }
 }
 
-unsafe fn cstr<'a>(p: *const u8) -> &'a [u8] {
+pub(crate) unsafe fn cstr<'a>(p: *const u8) -> &'a [u8] {
     if p.is_null() { b"<null>" } else { unsafe { std::ffi::CStr::from_ptr(p.cast()) }.to_bytes() }
 }
 
@@ -2081,6 +2082,9 @@ pub fn install_all() {
             }
             Err(e) => log(&format!("hook packfile_find_entry failed: {e:?}")),
         }
+
+        // crate::survey::install(); // method-count survey (conflicts with vtable ports while on)
+        crate::mempool::install();
     });
 }
 
