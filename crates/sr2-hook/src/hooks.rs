@@ -42,6 +42,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
         log(&crate::hddio::summary());
         log(&crate::rsched::summary());
         log(&crate::input::summary());
+        log(&crate::render::summary());
         if SURVEY {
             crate::survey::report(&format!("frame {n}"));
         }
@@ -2100,11 +2101,13 @@ pub fn install_all() {
             Err(e) => log(&format!("hook packfile_find_entry failed: {e:?}")),
         }
 
+        crate::crash::install();
         crate::mempool::install();
         crate::streamman::install();
         crate::hddio::install();
         crate::rsched::install();
         crate::input::install();
+        crate::render::install();
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }

@@ -20,11 +20,13 @@ use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 mod caller_targets;
 #[cfg(feature = "caller-survey")]
 mod callers;
+mod crash;
 mod detour;
 mod hddio;
 mod hooks;
 mod input;
 mod mempool;
+mod render;
 mod rsched;
 mod streamman;
 mod teleport;

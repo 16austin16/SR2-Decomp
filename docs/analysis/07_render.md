@@ -202,6 +202,37 @@ Resources are created directly on the calling thread (`CreateTexture` / `CreateV
 - They are the game's own implementations of IDirect3DVertexBuffer9 / IDirect3DIndexBuffer9 (Lock / Unlock / GetDesc) over game-owned memory.
 - They are built at 0xBD8200 / 0xBD88E0 and used for dynamic geometry such as distant vehicle headlights.
 
+## In Rust (render.rs)
+
+`gfx_execute_commands` and `gfx_command_buffer_wait` run in Rust (`MODE` in render.rs).
+
+**How it was checked.** Direct3D calls cannot be made twice, so the shadow check runs the
+original live and the Rust "dry":
+1. The device pointer `0x252A2D0` is aimed at a proxy for the original's run. Its vtable records
+   the 24 methods the executor uses (method, device, arguments, and a hash of what pointer
+   arguments point at) and forwards all 119 methods to the device that was current. The device
+   object itself is not touched: its vtable lives inside the object here, because a D3D wrapper
+   (DFEngine.dll in the game folder) owns it, and swapping it crashed the game.
+2. QueryPerformanceCounter / Frequency and Sleep are taped. `gfx_check_device` and the readback
+   helper `0xD1C530` (command 31) run with recording paused, on the recording thread only, and
+   only their outcome is taped (the device left current, the readback index).
+3. The Rust executor then runs over the same ring stretch with no side effects: globals go to an
+   overlay over a snapshot taken before the original ran, calls to a list, Windows results from
+   the tape. Lists, globals and tape are compared.
+4. The ring rewind takes a lock that the check holds, so the stretch cannot be reused meanwhile.
+
+Result over a scripted play run: 186,441,272 Direct3D calls compared, 0 differences, 0 tape
+mismatches. Commands 22 (float texture upload) and 25/26 (query Issue) are not compared (they
+call texture / query objects, not the device). Live, the Rust executor renders the game normally.
+
+Corrections and details:
+- `gfx_prim_vertex_count` returns n + 1 for triangle fans (D3D needs n + 2), so a fan's
+  DrawPrimitiveUP data in the ring is sized one vertex short.
+- The readback helper `0xD1C530` is cdecl (index, u32* out, bool) and returns the data pointer;
+  it is also called from the render thread (render_frame) and other places.
+- The null device's slot 25 (0xCF5710) forwards to the real device's slot 25; most other slots
+  are stubs returning 0.
+
 ## Port seam
 
 A Rust renderer can:
