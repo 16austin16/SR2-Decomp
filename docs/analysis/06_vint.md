@@ -11,7 +11,7 @@ Names below are in `docs/functions.csv` (subsystem `vint`) and the method names 
 | `interface_init` | 0x7F3010 | once, from game init 0x51F600 |
 | `interface_do_frame` | 0x7F3500 | per frame: from `sim_frame` in gameplay, and from the menu game states |
 | `interface_render` | 0x7F33B0 | per frame from the menu game states (main menu, multiplayer menus, loading) |
-| `hud_document_render` | 0x799010 | renders only the HUD document (handle `0x252853C`); no direct callers or pointer references were found, so how it is reached in gameplay is still open |
+| `hud_render` | 0x75A230 | gameplay: `gameplay_do_frame` → `gameplay_ui_frame` (0x68D2F0) → `hud_render`, which renders the active overlays and then tail-jumps (`jmp`, not `call`) to `interface_render`. The HUD is an ordinary vint document drawn there |
 
 The path from the frame is:
 - `game_frame_tick` (0x520450) → `game_state_frame` (0x697780) → `game_state_dispatch` (0x697490).
@@ -200,9 +200,91 @@ Correction: the earlier caller-survey name `vint_object_tween::set_property` (sl
 - Each document's script runs in its own Lua thread. `vint_lua_current_document` (0xB8E020) maps the running thread to its document through the context stack `0x2526360` (thread +0x14 = document handle), so bindings that take names resolve them in the calling document.
 - Callbacks into Lua (input events, data subscriptions, tween events) are `vint_callback_lua` objects. Native ones are `vint_callback_native`.
 
+## HUD render path (resolved)
+
+- In gameplay: `gameplay_do_frame` → `gameplay_ui_frame` (0x68D2F0) → `hud_render` (0x75A230).
+- `hud_render`:
+  1. For each active overlay (indices at `0x1F768E4`, count `0x2527FF4`), calls the render callback at `0xE8E730 + idx*0x14 + 0xC`.
+  2. 0x755B80, 0x6C6BE0, then 0x7552D0(0xEAC208).
+  3. Tail-jumps (`jmp`) to `interface_render`, which draws every vint document, the HUD included.
+- The earlier graph search missed this path because it only followed `call`.
+- `hud_document_render` (0x799010) has no callers at all, by `call`, `jmp` or pointer. It is dead code.
+
+## Screen states
+
+`interface_do_frame` first runs `interface_screen_state_frame` (0x7EC170), a small state machine over 21 UI screen states. Each state has a 0x10-byte entry in `0xE8CF88`:
+
+| Off | Callback |
+|---|---|
+| +0 | enter |
+| +4 | exit |
+| +8 | frame |
+| +0xC | render (run by `interface_render`) |
+
+The current state is `0xE8CF80` and the pending one `0xE8CF7C` (-2 = none). `0x7EC060` handles a 0.25 s idle timeout in some states.
+
+## Input path
+
+- `game_frame_tick` calls `vint_input_do_frame` (0xB99550) directly, every frame.
+- Lua subscribes with `vint_subscribe_to_input_event(event, function, priority)` (0xB90250):
+  1. The event name is looked up in the 34-name table `0x252A238` ("select", …) by `vint_input_event_index` (0xB99F70).
+  2. The Lua function is wrapped in a `vint_callback_lua` (0xBA0950 find / 0xB8DBB0 create).
+  3. `vint_input_subscribe` (0xB99380) takes a 0x4C-byte record from the free list `0x252A230`, gives it a handle (index | generation `0xE86E88` << 16) and inserts it by priority into the active list `0x252A234` (0xB992D0).
+  `vint_subscribe_to_raw_input` does the same with kind 1.
+
+| Off | Subscription field |
+|---|---|
+| +0x18, +0x1C | callback |
+| +0x20 | handle |
+| +0x24 | kind (0 event, 1 raw) |
+| +0x28 | u8 remove pending |
+| +0x2C | event index |
+| +0x30 | u8 armed |
+
+**Per frame** (`vint_input_do_frame`):
+1. Clear the per-event consumed flags (`0x22EF550`, 34 bytes) and set "dispatching" (`0x252A17E`).
+2. In priority order, run each subscription that is not pending removal:
+   - **kind 0**, `vint_input_check_event` (0xB99A60): the event's bindings come from the project and are matched against the controller state:
+
+     | Bindings | Entries |
+     |---|---|
+     | `0x252A218` / `0x252A21C` | buttons, 0x14 bytes |
+     | `0x252A220` / `0x252A224` | stick axes with a threshold, 0x18 bytes |
+     | `0x252A228` / `0x252A22C` | keys, 8 bytes |
+
+     On a press, past the repeat delay (per-event timestamps in `0x22EF3B8`), it calls the callback's vtable slot 1 with (document handle, 0, subscription, 0x4C) and marks the event consumed, so lower-priority subscribers do not get it.
+   - **kind 1**, raw input (0xB996C0): inventory_left / right / up, …
+3. `vint_input_mark_consumed` (0xB99DB0) sets the game's "eaten" flags for every binding of a consumed event: buttons `0x23478D8`, axes `0x2348502/3`, keys `0x2348B82`. The game itself then ignores that input.
+4. Remove subscriptions marked for removal, then clear the dispatching flag.
+
+**Virtual keyboard:** `interface_vkeyboard_poll` (0x7F3450) delivers a finished on-screen keyboard result to the Lua function named at `0x1FD507C`, in a new thread whose +0x14 is the document handle at `0x2528B08`.
+
+## Platform draw callbacks
+
+vint never draws directly. Everything goes through the table at `0x1FD52B0` (global `0x252A1D8`), filled by `interface_init`, which calls the game's 2D layer (0xD0xxxx / 0xD14xxx, render state `0x2A14B28`). The vint-side wrappers are 0xB92340-0xB925D0, one per slot.
+
+| Slot | Target | Use |
+|---|---|---|
+| +0x00 | 0x7F0AB0 | begin document: resets the clip state, 0x7F0950, sets the full-screen viewport (0xD14D20) |
+| +0x04 | 0x7F0BA0 | end: 0xD14840, 0xD147E0 |
+| +0x08 | 0x7F0B00 | mask end (stencil mode) |
+| +0x0C | 0x7F0B20 | mask begin |
+| +0x10 | 0x7F0A70 | clip begin (viewport/scissor 0xD14D20); used by `vint_element_clip` |
+| +0x14 | 0x7F0A90 | clip end (full screen) |
+| +0x18 | 0x7F0A50 | per element (empty) |
+| +0x1C | 0x7F1350 | bitmap quad: `vint_element_bitmap` render → 0xB9C030 |
+| +0x20 | 0x7F0D20 | bitmap circle: `vint_element_bitmap_circle` → 0xB9C190 |
+| +0x24 | 0x7F16A0 | gradient: `vint_element_gradient` → 0xB9BF80 → 0xB92420 |
+| +0x28 | 0x7F1BD0 | text: `vint_element_text` → 0xBA8A90, glyph runs through 0xD15E80 |
+| +0x2C | 0x7F1C50 | text helper (0xD0B020) |
+| +0x30 | 0x7F1C90 | filled rectangle (0xD0E7F0) |
+
+The other three tables:
+- `0x1FD4FEC` (global `0x252A1D4`): resources, such as bitmap lookup and pegs.
+- `0x1FD52E8` (global `0x252A1DC`): sound.
+- `0x1FD509C` (global `0x252A1E0`): text input.
+
 ## Open
 
-- How `hud_document_render` (0x799010) is reached in gameplay. No direct call and no stored pointer was found; it may be reached through a computed table.
-- The render-thread side of the platform draw callbacks (`0x1FD52B0`: 0x7F0A50 … 0x7F1C90).
-- The input path (0x7EC170, 0x7F3450, `vint_subscribe_to_input_event`).
 - The datagroup / dataitem binding system (0xB94xxx-0xB95xxx).
+- The exact argument layouts of the draw-table slots. Each wrapper in 0xB92340-0xB925D0 passes its arguments straight through.

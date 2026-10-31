@@ -1268,3 +1268,18 @@ chunks sharing objects being started in the opposite order, so their shared mesh
 are loaded by the other chunk. That may be a timing effect of the hook, but it reproduces too
 exactly to dismiss. Next step: log the order of extras starts and polls, and the record states.
 
+
+## Request order: the queue compare (0xA7CF30)
+
+The request queue `0x2F9B88C` is set up by `streamman_init` (0xA7D400) with 10 nodes and the compare `streamman_request_compare` (0xA7CF30) at +0x14. The compare gets two slot pointers and compares their **type** (slot +0):
+- best type < candidate type → 0 (keep best);
+- equal → 1;
+- best type > candidate type → 2 (take candidate).
+
+With the `pop_best` rule above (a 1 keeps the current best only when best < candidate as values, i.e. by slot address):
+1. Lower types always go first: chunk geom 0, peg 1, …, extras 4.
+2. Within one type, the slot with the **lowest address**, i.e. the lowest slot index, goes first.
+
+Request time plays no part. Two chunk-extras requests start in the order of their slot indices (4:0 before 4:1), whichever was requested first.
+
+So if a request lands on a different slot, two neighbouring chunks' extras swap their start order. Which slot a request lands on is the first type-4 slot in state 0, 3 or 4 at the time of `_impl`, so it depends on when the previous extras slots went back to idle. This is the effect seen in the teleport test, where an extras start landed on slot 4:1 instead of 4:0.
