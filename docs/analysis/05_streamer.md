@@ -1169,3 +1169,70 @@ the original.
 - Calls that need EDX as an input (or return EDX:EAX) go through `game_call_edx`. `async_io_free`
   takes four arguments, so it has its own helper (`io_free`).
 
+
+## Chunk-extras mesh part state machine (0xA81160 / 0xA81200)
+
+**These callbacks never run in the PC build.** `_impl` stores them in the type-4 steps, but only the step-callback paths call step callbacks:
+- `streamman_start_load` / `check_batch`, reached through `process_generic` for types 0-3, 5, 7-9;
+- `process_sequential`, type 6 only.
+
+Type 4 goes to `start_chunk_extras` / `poll_chunk_extras`. Those read the step data (+0x208 part count, the part list at +8, the allocator at +0x220) but never read +0x22C..+0x240.
+
+There are no other references to 0xA81160, 0xA81200, 0xA80FA0, 0xA81040, 0xA814D0, 0xA81530 or 0xA81610 besides the pushes in `_impl` (0xA83039..0xA8315C). They look like the original sequential design, which `start_chunk_extras` replaced with batched part reads. They are documented here so a port can leave them out knowingly.
+
+Step 0 is a multi-part step (+4 = 1). Its state:
+
+| Off | Field |
+|---|---|
+| +0x208 | object count |
+| +0x20C | current object index |
+| +8.. | the object names |
+| +0x228 | part state of the current object: 0 smesh, 1 g_smesh, 2 peg, 3 g_peg, 4 done |
+| +0x224 | bytes allocated for the part |
+| +0x220 | the record's mesh object (record+0x10C); its +0x54 is the GPU allocator |
+| +0 (file) | the record's name field for the part |
+
+**Begin, 0xA81160** (cdecl info*):
+1. step0+0x224 = 0.
+2. Pick the allocator by part state:
+   - 0 or 2: `alloc = step0+0x220`;
+   - 1 or 3: `alloc = step0+0x220 -> +0x54`;
+   - anything else: return false.
+3. `free = alloc->vtable[+0xC]() - align` (align = u16 at step0+0x214). If free <= 0, return **true** with nothing allocated.
+4. `dest = alloc->vtable[+0x1C](free, align)` → step0+0x218. If dest is 0, return true.
+5. Otherwise `memset(dest, 0, free)`, step0+0x224 = free, info+8 = dest, info+0xC = free, return true.
+
+**After, 0xA81200** (cdecl info*):
+1. `rec = smesh_cache_find(EDX = object_template_find(ECX = names[+0x20C]))`. If rec+0x122 (loaded) is set, go to step 4.
+2. Let `size` = step0+0x210 (bytes read) and `slack` = +0x224 - size.
+   - If size == 0: part state = 4.
+   - Otherwise, by part state:
+
+   | State | Action | Next state |
+   |---|---|---|
+   | 2, peg | rec+0x12C = dest, rec+0x130 = size. If rec+0xCB (g_peg name) is empty: `0xC08B80(ESI = rec+0x12C, ECX = rec+0x8A; size, 0)`. Then shrink the CPU allocator: `rec+0x10C` vtable +0x34(alloc+0x44 - slack), keeping alloc+0x48 | 4 if g_peg is empty, else 3 |
+   | 3, g_peg | `0xC08B80(ESI = rec+0x12C, ECX = rec+0x8A; rec+0x130, dest)`; `smesh_table_find(path_change_extension(step0 file, ".smesh_pc"))` (result unused); GPU allocator vtable +0x38(slack) | 4 |
+   | 0, smesh | rec+0x124 = dest. If rec+0x49 (g_smesh name) is empty: `smesh_table_add_streamed(ECX = names[+0x20C], EDX = step0 file; dest, 0)`, then `0xA84BE0(ESI = rec+0x10C; slack)`, the CPU shrink | 2 if g_smesh is empty, else 1 (with the same CPU shrink) |
+   | 1, g_smesh | `smesh_table_add_streamed(ECX = name, EDX = file; rec+0x124, dest)`; GPU allocator vtable +0x38(slack) | 2 |
+
+3. Point the step at the next part and return true:
+   - state 1 → step0 file = rec+0x49;
+   - state 3 → rec+0xCB;
+   - state 2 → rec+0x8A;
+   - state 4 → fall through to step 4.
+4. **Object done:** rec+0x122 = 1, +0x20C += 1, part state = 0.
+   - If +0x20C == +0x208: step0 file = 0, return true.
+   - Otherwise `rec = smesh_cache_find(object_template_find(next name))`, file = rec+8 (its .smesh_pc name), +0x220 = rec+0x10C, return true.
+
+Unlike in `poll_chunk_extras`, the g_peg call here passes the data and size swapped between the two peg states. That only matters if the code is ever revived.
+
+`0xA84BE0` takes ESI = allocator, stack (n), and is `ret 4`. It calls `vtable[+0x34](alloc+0x44 - n)` and restores alloc+0x48: a shrink to the used size.
+
+## What requests a type-6 (animation) load
+
+- The only caller of `streamman_request_animation` (0xA88240) is `rsched_job_start_next` (0xA77CCF), for scheduler kind 4 (ids with high byte 4). Nothing else references the type-6 slot pointer `0x2225B54`.
+- So `process_sequential` runs only when something calls `rsched_add_ref` on scheduler 4 (`0x2F9B2E8 + 4*0xD4`) with load_now set, and `rsched_update` then queues a job.
+- The `rsched_add_ref` call sites (`0x57CF34` vehicle_kill_objective, `0x671BE1` escort, `0x69CB24`/`0x69CDCC`, `0x6D01C5`/`0x6D0695`, `0x888E16`, `0x8A203D`/`0x8A2110`, `0x8AE55F`/`0x8AE588`, `0xA75D33`, `0xA791F4`, `0xA79E33`, `0xA7A03D`) all take the scheduler from the id's high byte at run time, so which of them pass kind-4 ids depends on data.
+- No code builds a kind-4 id from a constant. The registry id builder (`0xA77540`, kind << 24 | index) is only reached from `0xA798C0`, which nothing calls or references.
+
+So the kind-4 ids must come from data tables. A runtime log is the practical way to find a trigger: log `rsched_add_ref` when EAX = 0x2F9B638, or calls to 0xA88240, while playing missions and activities. Cutscene and activity scripts are the likely users.
