@@ -71,4 +71,5 @@ original. The standalone build can move to 64-bit later.
 33. ✅ Input in Rust: input_do_frame and its tree (keyboard events, keyboard/mouse mapping, button and stick state, idle time), the window procedure's key callback and the key queue. Shadow-checked against the original every call in a scripted play run (8,902 frames, 0 differences).
 34. ✅ The XInput poll, its dead zone and mouse_update in Rust; the shadow check now replays the Windows calls (the call tape), and a 5,000-poll fake-pad self-test found 0 differences.
 35. ✅ The D3D command executor (gfx_execute_commands) and the ring rewind in Rust: 186 million Direct3D calls compared with the original (dry run against a recording proxy), 0 differences; the game renders with it.
-36. Next: the deferred command lists and the gfx_* API layer (18_scene.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).
+36. ✅ The ring writers and the first 22 graphics API functions in Rust (38 functions in one batch): predicted by Rust, compared with the original live, about 30 million calls, 0 differences; the game renders with them.
+37. Next: the rest of the gfx_* layer (2D add, shader params, text) and the deferred queue / handlers (18_scene.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).

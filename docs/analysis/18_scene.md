@@ -152,6 +152,42 @@ A shadow check must compare the ring bytes *after* these caches. The same call c
 
 Each API function's deferred path and immediate path can be ported together: the deferred path is only the `render_deferred_queue` call.
 
+### In Rust (gfx_cmd.rs)
+
+Ported and verified in one batch: 16 ring writers (`gfx_cmd_*`, steps 1-2) and 22 API
+functions (steps 2-5): `gfx_set_texture_cached`, `gfx_apply_render_state_block`, set / invalidate
+state block, viewport rect and its reset (0xD14D90), scissor rect, color, alpha, bitmap, the
+depth and slope bias stacks, the two clears, `gfx_restore_default_targets`, `gfx_2d_flush`, and
+the strip / list begin and end. Their deferred path calls the original `render_deferred_queue`.
+
+**Check.** Several of these publish the ring, which cannot be undone, so the Rust runs first as
+a prediction: writes to an overlay, publishes and `render_deferred_queue` calls to a list. Then
+the original runs live with `InterlockedExchangeAdd` (import 0xDB809C) and the queue taped, and
+every predicted dword, about 1,500 watched cache dwords, the publishes and the queued calls
+(type and arguments) are compared. A hooked function reached inside a check runs as the original.
+Result over a scripted play run: about 30 million calls, 0 differences; then the Rust drew the
+game normally.
+
+Not ported yet: `gfx_cmd_set_vertex_declaration`, the three shader-constant writers and
+`gfx_cmd_draw`. They never ran in the play run (those commands are written inline elsewhere),
+so they stay original. Also not yet: the 2D `_add` functions (they allocate through 0xD1E070 /
+0xD19070), `gfx_set_ps_params3`, the clip plane, text and the queue / handlers / execute.
+
+Details:
+- `gfx_apply_render_state_block`: blend modes 0-12 (0 off; 1 one/one add; 2 srcalpha/one add;
+  4 destalpha/one add; 5 srcalpha/invsrcalpha; 6 destalpha/invdestalpha; 7 invdestalpha/
+  destalpha; 9 one/one revsubtract; 10 srcalpha/one revsubtract; 12 destcolor/zero add; 3, 8,
+  11 change nothing), address mode (0 wrap, 1 clamp, sampler 0 U and V), depth (0 off; 1
+  lessequal, no write; 2 equal, no write; 4 lessequal + write), alpha test / stencil (0 stencil
+  off; 1 alpha > 0 and stencil replace 1; 2 stencil equal 1, keep), cull (0 none, 1 CCW).
+- `gfx_clear` (ECX) clears the **stencil** to ECX (flags 4, color 0). `gfx_clear_region` (CL,
+  DL, cdecl 2 bytes) clears all three to color cl<<24 | a<<16 | b<<8 | dl, then re-applies the
+  state block at 0xEC2748.
+- The deferral test is: force-immediate clear and (raw context is the render context, or the
+  render-thread byte is clear and the raw context is the game context).
+- `gfx_get_thread_state` returns the TLS state; 0x31BF4B0 only when that state is 0x31C0C20
+  and the thread is not the device owner (the 07 note had it the other way round).
+
 ## render_frame (0x52A710), by profiler stage
 
 | Stage | Calls | What |
