@@ -1,0 +1,1063 @@
+name,mangled,type_descriptor,vtables,n_virtuals,bases,multiple_inheritance
+?$_Iosb@H@std@@,.?AV?$_Iosb@H@std@@,0x00ed429c,,0,,
+?$allocator@Uactive_lightning_strike@@@@,.?AV?$allocator@Uactive_lightning_strike@@@@,0x00ed403c,0x00ddca74@0x0,10,IAllocator,0
+?$allocator@Uactivity_bonus_message@@@@,.?AV?$allocator@Uactivity_bonus_message@@@@,0x00ed4994,0x00de357c@0x0,10,IAllocator,0
+?$allocator@Uambulance_info@@@@,.?AV?$allocator@Uambulance_info@@@@,0x00edc3e8,0x00e44c08@0x0,10,IAllocator,0
+?$allocator@Udelayed_ownership_give@@@@,.?AV?$allocator@Udelayed_ownership_give@@@@,0x00ed86d0,0x00e267b8@0x0,10,IAllocator,0
+?$allocator@Uexplosion_event_data@@@@,.?AV?$allocator@Uexplosion_event_data@@@@,0x00ed8f5c,0x00e2889c@0x0,10,IAllocator,0
+?$allocator@Ufollower_sim_event@@@@,.?AV?$allocator@Ufollower_sim_event@@@@,0x00edb9d4,0x00e3b8fc@0x0,10,IAllocator,0
+?$allocator@Ugarage_slot@@@@,.?AV?$allocator@Ugarage_slot@@@@,0x00ed4a74,0x00de66dc@0x0,10,IAllocator,0
+?$allocator@Uhavok_trigger@@@@,.?AV?$allocator@Uhavok_trigger@@@@,0x00ed742c,0x00e18efc@0x0,10,IAllocator,0
+?$allocator@Uheli_ai_packet_data@@@@,.?AV?$allocator@Uheli_ai_packet_data@@@@,0x00edcd88,0x00e495f4@0x0,10,IAllocator,0
+?$allocator@Uhookup_event_data@@@@,.?AV?$allocator@Uhookup_event_data@@@@,0x00edb75c,0x00e39bb4@0x0,10,IAllocator,0
+?$allocator@Uicon_hookup_event_data@@@@,.?AV?$allocator@Uicon_hookup_event_data@@@@,0x00ed82e0,0x00e1f468@0x0,10,IAllocator,0
+?$allocator@Uinventory_list_item@@@@,.?AV?$allocator@Uinventory_list_item@@@@,0x00eda990,0x00e2c27c@0x0,10,IAllocator,0
+?$allocator@Umeter_maid_info@@@@,.?AV?$allocator@Umeter_maid_info@@@@,0x00edc92c,0x00e461c4@0x0,10,IAllocator,0
+?$allocator@Umulti_parked_vehicle@@@@,.?AV?$allocator@Umulti_parked_vehicle@@@@,0x00eda9f0,0x00e2c918@0x0,10,IAllocator,0
+?$allocator@Unpc_creation_data@@@@,.?AV?$allocator@Unpc_creation_data@@@@,0x00ed997c,0x00e2aef4@0x0,10,IAllocator,0
+?$allocator@Uobject_create_data@@@@,.?AV?$allocator@Uobject_create_data@@@@,0x00ed876c,0x00e26734@0x0,10,IAllocator,0
+?$allocator@Uobject_destroy_data@@@@,.?AV?$allocator@Uobject_destroy_data@@@@,0x00ed8738,0x00e26760@0x0,10,IAllocator,0
+?$allocator@Uobject_indicator@@@@,.?AV?$allocator@Uobject_indicator@@@@,0x00edb78c,0x00e39b88@0x0,10,IAllocator,0
+?$allocator@Uobject_new_owner_data@@@@,.?AV?$allocator@Uobject_new_owner_data@@@@,0x00ed8704,0x00e2678c@0x0,10,IAllocator,0
+?$allocator@Upending_lightning_strike@@@@,.?AV?$allocator@Upending_lightning_strike@@@@,0x00ed4074,0x00ddca48@0x0,10,IAllocator,0
+?$allocator@Upersona_override_sim_event@@@@,.?AV?$allocator@Upersona_override_sim_event@@@@,0x00ed69d0,0x00e06c7c@0x0,10,IAllocator,0
+?$allocator@Upersona_situation_override@@@@,.?AV?$allocator@Upersona_situation_override@@@@,0x00ed6a08,0x00e06c50@0x0,10,IAllocator,0
+?$allocator@Uplane_ai_packet_data@@@@,.?AV?$allocator@Uplane_ai_packet_data@@@@,0x00edcdbc,0x00e49670@0x0,10,IAllocator,0
+?$allocator@Uplayer_component_event_data@@@@,.?AV?$allocator@Uplayer_component_event_data@@@@,0x00ed8de8,0x00e28038@0x0,10,IAllocator,0
+?$allocator@Uplayer_levels_available@@@@,.?AV?$allocator@Uplayer_levels_available@@@@,0x00ed8fd0,0x00e29620@0x0,10,IAllocator,0
+?$allocator@Uplayer_morph_event_data@@@@,.?AV?$allocator@Uplayer_morph_event_data@@@@,0x00ed8e24,0x00e2800c@0x0,10,IAllocator,0
+?$allocator@Uplayer_respawn_data@@@@,.?AV?$allocator@Uplayer_respawn_data@@@@,0x00ed8e5c,0x00e27fe0@0x0,10,IAllocator,0
+?$allocator@Uplayer_send_component_event_data@@@@,.?AV?$allocator@Uplayer_send_component_event_data@@@@,0x00ed8d6c,0x00e28090@0x0,10,IAllocator,0
+?$allocator@Uplayer_send_morph_event_data@@@@,.?AV?$allocator@Uplayer_send_morph_event_data@@@@,0x00ed8dac,0x00e28064@0x0,10,IAllocator,0
+?$allocator@Upotential_trigger_use@@@@,.?AV?$allocator@Upotential_trigger_use@@@@,0x00edc0b0,0x00e43f58@0x0,10,IAllocator,0
+?$allocator@Uscript_tagging_spot@@@@,.?AV?$allocator@Uscript_tagging_spot@@@@,0x00edc04c,0x00e43864@0x0,10,IAllocator,0
+?$allocator@Uspawn_character@@@@,.?AV?$allocator@Uspawn_character@@@@,0x00edb878,0x00e3a350@0x0,10,IAllocator,0
+?$allocator@Uspawn_vehicle@@@@,.?AV?$allocator@Uspawn_vehicle@@@@,0x00edb84c,0x00e3a37c@0x0,10,IAllocator,0
+?$allocator@Usub_box@@@@,.?AV?$allocator@Usub_box@@@@,0x00edaa5c,0x00e2c8c0@0x0,10,IAllocator,0
+?$allocator@Utagging_spot@@@@,.?AV?$allocator@Utagging_spot@@@@,0x00ed6174,0x00df78d0@0x0,14,IAllocator,0
+?$allocator@Utaxi_info@@@@,.?AV?$allocator@Utaxi_info@@@@,0x00edcb0c,0x00e48124@0x0,10,IAllocator,0
+?$allocator@Utrigger_sim_event@@@@,.?AV?$allocator@Utrigger_sim_event@@@@,0x00edc080,0x00e43f84@0x0,10,IAllocator,0
+?$allocator@Utrigger_state_data@@@@,.?AV?$allocator@Utrigger_state_data@@@@,0x00eda4e0,0x00e2b910@0x0,10,IAllocator,0
+?$allocator@Uturf_tag@@@@,.?AV?$allocator@Uturf_tag@@@@,0x00edae6c,0x00e2dee8@0x0,10,IAllocator,0
+?$allocator@Uvariant_update_data@@@@,.?AV?$allocator@Uvariant_update_data@@@@,0x00ed8f28,0x00e28858@0x0,10,IAllocator,0
+?$allocator@Uvehicle_creation_data@@@@,.?AV?$allocator@Uvehicle_creation_data@@@@,0x00eda574,0x00e2bc8c@0x0,10,IAllocator,0
+?$allocator@Uvehicle_cust_color_instance@@@@,.?AV?$allocator@Uvehicle_cust_color_instance@@@@,0x00edc824,0x00e45a10@0x0,10,IAllocator,0
+?$allocator@Uvehicle_cust_component_instance@@@@,.?AV?$allocator@Uvehicle_cust_component_instance@@@@,0x00edc860,0x00e459e4@0x0,10,IAllocator,0
+?$allocator@Uvehicle_cust_instance@@@@,.?AV?$allocator@Uvehicle_cust_instance@@@@,0x00edc8a0,0x00e459b8@0x0,10,IAllocator,0
+?$allocator@Uvehicle_damage_sim_event@@@@,.?AV?$allocator@Uvehicle_damage_sim_event@@@@,0x00edc44c,0x00e45300@0x0,10,IAllocator,0
+?$allocator@Uvehicle_ownership_sim_data@@@@,.?AV?$allocator@Uvehicle_ownership_sim_data@@@@,0x00eda53c,0x00e2bcb8@0x0,10,IAllocator,0
+?$allocator@Uvehicle_repair_sim_event@@@@,.?AV?$allocator@Uvehicle_repair_sim_event@@@@,0x00edc414,0x00e4532c@0x0,10,IAllocator,0
+?$allocator@Uvehicle_respawn_request@@@@,.?AV?$allocator@Uvehicle_respawn_request@@@@,0x00edaa24,0x00e2c8ec@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uitem_data_bundle@@$00@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uitem_data_bundle@@$00@@@@,0x00ed9078,0x00e29840@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uitem_data_bundle@@$07@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uitem_data_bundle@@$07@@@@,0x00ed9120,0x00e297e8@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uitem_data_bundle@@$0M@@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uitem_data_bundle@@$0M@@@@@,0x00ed90c8,0x00e29814@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Umover_data_bundle@@$00@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Umover_data_bundle@@$00@@@@,0x00ed9360,0x00e2acf8@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Umover_data_bundle@@$07@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Umover_data_bundle@@$07@@@@,0x00ed9410,0x00e2aca0@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Umover_data_bundle@@$0M@@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Umover_data_bundle@@$0M@@@@@,0x00ed93b8,0x00e2accc@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Unpc_data_bundle@@$00@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Unpc_data_bundle@@$00@@@@,0x00ed9600,0x00e2b0d8@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Unpc_data_bundle@@$07@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Unpc_data_bundle@@$07@@@@,0x00ed96a0,0x00e2b080@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Unpc_data_bundle@@$0M@@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Unpc_data_bundle@@$0M@@@@@,0x00ed9650,0x00e2b0ac@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$00@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$00@@@@,0x00ed9a60,0x00e2b2cc@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$07@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$07@@@@,0x00ed9b10,0x00e2b274@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$0M@@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$0M@@@@@,0x00ed9ab8,0x00e2b2a0@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uplayer_data_bundle@@$00@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uplayer_data_bundle@@$00@@@@,0x00ed9d10,0x00e2b538@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uplayer_data_bundle@@$07@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uplayer_data_bundle@@$07@@@@,0x00ed9dc0,0x00e2b4e0@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uplayer_data_bundle@@$0M@@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uplayer_data_bundle@@$0M@@@@@,0x00ed9d68,0x00e2b50c@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uprop_data_bundle@@$00@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uprop_data_bundle@@$00@@@@,0x00eda070,0x00e2b6d8@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uprop_data_bundle@@$07@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uprop_data_bundle@@$07@@@@,0x00eda118,0x00e2b680@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uprop_data_bundle@@$0M@@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uprop_data_bundle@@$0M@@@@@,0x00eda0c0,0x00e2b6ac@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Urocket_data_bundle@@$00@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Urocket_data_bundle@@$00@@@@,0x00eda2a0,0x00e2b870@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Urocket_data_bundle@@$07@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Urocket_data_bundle@@$07@@@@,0x00eda350,0x00e2b818@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Urocket_data_bundle@@$0M@@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Urocket_data_bundle@@$0M@@@@@,0x00eda2f8,0x00e2b844@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$00@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$00@@@@,0x00eda5e8,0x00e2bc34@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$07@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$07@@@@,0x00eda698,0x00e2bbdc@0x0,10,IAllocator,0
+?$allocator@V?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$0M@@@@@,.?AV?$allocator@V?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$0M@@@@@,0x00eda640,0x00e2bc08@0x0,10,IAllocator,0
+?$allocator@V?$farray@H$07@@@@,.?AV?$allocator@V?$farray@H$07@@@@,0x00eda9c4,0x00e2c944@0x0,10,IAllocator,0
+?$allocator@Varbitration_mover_client_request@@@@,.?AV?$allocator@Varbitration_mover_client_request@@@@,0x00ed92a8,0x00e2ad7c@0x0,10,IAllocator,0
+?$allocator@Varbitration_mover_server_tracker@@@@,.?AV?$allocator@Varbitration_mover_server_tracker@@@@,0x00ed92e8,0x00e2ad50@0x0,10,IAllocator,0
+?$allocator@Vdc_master_object@@@@,.?AV?$allocator@Vdc_master_object@@@@,0x00ed86a0,0x00e265b4@0x0,10,IAllocator,0
+?$allocator@Vdc_object@@@@,.?AV?$allocator@Vdc_object@@@@,0x00ed864c,0x00e2660c@0x0,10,IAllocator,0
+?$allocator@Vdc_state_list@@@@,.?AV?$allocator@Vdc_state_list@@@@,0x00ed8674,0x00e265e0@0x0,10,IAllocator,0
+?$allocator@Vdistant_ped@@@@,.?AV?$allocator@Vdistant_ped@@@@,0x00edce48,0x00e4b1bc@0x0,10,IAllocator,0
+?$allocator@Vdistant_vehicle@@@@,.?AV?$allocator@Vdistant_vehicle@@@@,0x00edce74,0x00e4b4fc@0x0,10,IAllocator,0
+?$allocator@Vmulti_game_sim_event@@@@,.?AV?$allocator@Vmulti_game_sim_event@@@@,0x00ed8ed4,0x00e28800@0x0,10,IAllocator,0
+?$allocator@Vmulti_game_sim_item_state@@@@,.?AV?$allocator@Vmulti_game_sim_item_state@@@@,0x00ed903c,0x00e2986c@0x0,10,IAllocator,0
+?$allocator@Vmulti_game_sim_mover_state@@@@,.?AV?$allocator@Vmulti_game_sim_mover_state@@@@,0x00ed9328,0x00e2ad24@0x0,10,IAllocator,0
+?$allocator@Vmulti_game_sim_npc_state@@@@,.?AV?$allocator@Vmulti_game_sim_npc_state@@@@,0x00ed95c4,0x00e2b104@0x0,10,IAllocator,0
+?$allocator@Vmulti_game_sim_object_state@@@@,.?AV?$allocator@Vmulti_game_sim_object_state@@@@,0x00eda034,0x00e2b704@0x0,10,IAllocator,0
+?$allocator@Vmulti_game_sim_player_state@@@@,.?AV?$allocator@Vmulti_game_sim_player_state@@@@,0x00ed9cd4,0x00e2b564@0x0,10,IAllocator,0
+?$allocator@Vmulti_game_sim_vehicle_state@@@@,.?AV?$allocator@Vmulti_game_sim_vehicle_state@@@@,0x00eda5a8,0x00e2bc60@0x0,10,IAllocator,0
+?$allocator@Vplayer_score@@@@,.?AV?$allocator@Vplayer_score@@@@,0x00edabd0,0x00e2ca78@0x0,10,IAllocator,0
+?$allocator@Vteam_score@@@@,.?AV?$allocator@Vteam_score@@@@,0x00edaba8,0x00e2caa4@0x0,10,IAllocator,0
+?$basic_filebuf@DU?$char_traits@D@std@@@std@@,.?AV?$basic_filebuf@DU?$char_traits@D@std@@@std@@,0x00ed447c,0x00dde5ac@0x0,14,?$basic_streambuf@DU?$char_traits@D@std@@@std@@,0
+?$basic_ifstream@DU?$char_traits@D@std@@@std@@,.?AV?$basic_ifstream@DU?$char_traits@D@std@@@std@@,0x00ed4440,0x00dde5e8@0x58,1,?$basic_istream@DU?$char_traits@D@std@@@std@@ ; ?$basic_ios@DU?$char_traits@D@std@@@std@@ ; std::ios_base ; ?$_Iosb@H@std@@,0
+?$basic_ios@DU?$char_traits@D@std@@@std@@,.?AV?$basic_ios@DU?$char_traits@D@std@@@std@@,0x00ed4264,0x00dde1d4@0x0,1,std::ios_base ; ?$_Iosb@H@std@@,0
+?$basic_istream@DU?$char_traits@D@std@@@std@@,.?AV?$basic_istream@DU?$char_traits@D@std@@@std@@,0x00ed41ec,0x00dde218@0x8,1,?$basic_ios@DU?$char_traits@D@std@@@std@@ ; std::ios_base ; ?$_Iosb@H@std@@,0
+?$basic_ofstream@DU?$char_traits@D@std@@@std@@,.?AV?$basic_ofstream@DU?$char_traits@D@std@@@std@@,0x00ed4404,0x00dde5f8@0x54,1,?$basic_ostream@DU?$char_traits@D@std@@@std@@ ; ?$basic_ios@DU?$char_traits@D@std@@@std@@ ; std::ios_base ; ?$_Iosb@H@std@@,0
+?$basic_ostream@DU?$char_traits@D@std@@@std@@,.?AV?$basic_ostream@DU?$char_traits@D@std@@@std@@,0x00ed44b8,0x00dde59c@0x4,1,?$basic_ios@DU?$char_traits@D@std@@@std@@ ; std::ios_base ; ?$_Iosb@H@std@@,0
+?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@,.?AV?$basic_ostringstream@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@,0x00ed44f8,0x00ddeb88@0x4c,1,?$basic_ostream@DU?$char_traits@D@std@@@std@@ ; ?$basic_ios@DU?$char_traits@D@std@@@std@@ ; std::ios_base ; ?$_Iosb@H@std@@,0
+?$basic_streambuf@DU?$char_traits@D@std@@@std@@,.?AV?$basic_streambuf@DU?$char_traits@D@std@@@std@@,0x00ed4228,0x00dde1dc@0x0,14,,0
+?$basic_stringbuf@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@,.?AV?$basic_stringbuf@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@,0x00ed4550,0x00ddeb4c@0x0,14,?$basic_streambuf@DU?$char_traits@D@std@@@std@@,0
+?$codecvt@DDH@std@@,.?AV?$codecvt@DDH@std@@,0x00ed4334,0x00dde668@0x0,8,std::codecvt_base ; std::locale::facet,0
+?$ctype@D@std@@,.?AV?$ctype@D@std@@,0x00ed4190,0x00dde230@0x0,11,std::ctype_base ; std::locale::facet,0
+?$deltacomp_state_data@Uitem_data_bundle@@@@,.?AV?$deltacomp_state_data@Uitem_data_bundle@@@@,0x00ed9244,0x00e29788@0x0,5,,0
+?$deltacomp_state_data@Umover_data_bundle@@@@,.?AV?$deltacomp_state_data@Umover_data_bundle@@@@,0x00ed953c,0x00e2ac40@0x0,5,,0
+?$deltacomp_state_data@Unpc_data_bundle@@@@,.?AV?$deltacomp_state_data@Unpc_data_bundle@@@@,0x00ed97b8,0x00e2b020@0x0,5,,0
+?$deltacomp_state_data@Upipebomb_data_bundle@@@@,.?AV?$deltacomp_state_data@Upipebomb_data_bundle@@@@,0x00ed9c40,0x00e2b214@0x0,5,,0
+?$deltacomp_state_data@Uplayer_data_bundle@@@@,.?AV?$deltacomp_state_data@Uplayer_data_bundle@@@@,0x00ed9eec,0x00e2b480@0x0,5,,0
+?$deltacomp_state_data@Uprop_data_bundle@@@@,.?AV?$deltacomp_state_data@Uprop_data_bundle@@@@,0x00eda23c,0x00e2b620@0x0,5,,0
+?$deltacomp_state_data@Urocket_data_bundle@@@@,.?AV?$deltacomp_state_data@Urocket_data_bundle@@@@,0x00eda47c,0x00e2b7b8@0x0,5,,0
+?$deltacomp_state_data@Uvehicle_data_bundle@@@@,.?AV?$deltacomp_state_data@Uvehicle_data_bundle@@@@,0x00eda7c4,0x00e2bb7c@0x0,5,,0
+?$deltacomp_state_data_impl@Uitem_data_bundle@@$00@@,.?AV?$deltacomp_state_data_impl@Uitem_data_bundle@@$00@@,0x00ed9170,0x00e297d0@0x0,5,?$deltacomp_state_data@Uitem_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uitem_data_bundle@@$07@@,.?AV?$deltacomp_state_data_impl@Uitem_data_bundle@@$07@@,0x00ed9200,0x00e297a0@0x0,5,?$deltacomp_state_data@Uitem_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uitem_data_bundle@@$0M@@@,.?AV?$deltacomp_state_data_impl@Uitem_data_bundle@@$0M@@@,0x00ed91b8,0x00e297b8@0x0,5,?$deltacomp_state_data@Uitem_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Umover_data_bundle@@$00@@,.?AV?$deltacomp_state_data_impl@Umover_data_bundle@@$00@@,0x00ed9468,0x00e2ac88@0x0,5,?$deltacomp_state_data@Umover_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Umover_data_bundle@@$07@@,.?AV?$deltacomp_state_data_impl@Umover_data_bundle@@$07@@,0x00ed94f8,0x00e2ac58@0x0,5,?$deltacomp_state_data@Umover_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Umover_data_bundle@@$0M@@@,.?AV?$deltacomp_state_data_impl@Umover_data_bundle@@$0M@@@,0x00ed94b0,0x00e2ac70@0x0,5,?$deltacomp_state_data@Umover_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Unpc_data_bundle@@$00@@,.?AV?$deltacomp_state_data_impl@Unpc_data_bundle@@$00@@,0x00ed96f0,0x00e2b068@0x0,5,?$deltacomp_state_data@Unpc_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Unpc_data_bundle@@$07@@,.?AV?$deltacomp_state_data_impl@Unpc_data_bundle@@$07@@,0x00ed9778,0x00e2b038@0x0,5,?$deltacomp_state_data@Unpc_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Unpc_data_bundle@@$0M@@@,.?AV?$deltacomp_state_data_impl@Unpc_data_bundle@@$0M@@@,0x00ed9730,0x00e2b050@0x0,5,?$deltacomp_state_data@Unpc_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$00@@,.?AV?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$00@@,0x00ed9b68,0x00e2b25c@0x0,5,?$deltacomp_state_data@Upipebomb_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$07@@,.?AV?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$07@@,0x00ed9bf8,0x00e2b22c@0x0,5,?$deltacomp_state_data@Upipebomb_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$0M@@@,.?AV?$deltacomp_state_data_impl@Upipebomb_data_bundle@@$0M@@@,0x00ed9bb0,0x00e2b244@0x0,5,?$deltacomp_state_data@Upipebomb_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uplayer_data_bundle@@$00@@,.?AV?$deltacomp_state_data_impl@Uplayer_data_bundle@@$00@@,0x00ed9e18,0x00e2b4c8@0x0,5,?$deltacomp_state_data@Uplayer_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uplayer_data_bundle@@$07@@,.?AV?$deltacomp_state_data_impl@Uplayer_data_bundle@@$07@@,0x00ed9ea8,0x00e2b498@0x0,5,?$deltacomp_state_data@Uplayer_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uplayer_data_bundle@@$0M@@@,.?AV?$deltacomp_state_data_impl@Uplayer_data_bundle@@$0M@@@,0x00ed9e60,0x00e2b4b0@0x0,5,?$deltacomp_state_data@Uplayer_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uprop_data_bundle@@$00@@,.?AV?$deltacomp_state_data_impl@Uprop_data_bundle@@$00@@,0x00eda168,0x00e2b668@0x0,5,?$deltacomp_state_data@Uprop_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uprop_data_bundle@@$07@@,.?AV?$deltacomp_state_data_impl@Uprop_data_bundle@@$07@@,0x00eda1f8,0x00e2b638@0x0,5,?$deltacomp_state_data@Uprop_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uprop_data_bundle@@$0M@@@,.?AV?$deltacomp_state_data_impl@Uprop_data_bundle@@$0M@@@,0x00eda1b0,0x00e2b650@0x0,5,?$deltacomp_state_data@Uprop_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Urocket_data_bundle@@$00@@,.?AV?$deltacomp_state_data_impl@Urocket_data_bundle@@$00@@,0x00eda3a8,0x00e2b800@0x0,5,?$deltacomp_state_data@Urocket_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Urocket_data_bundle@@$07@@,.?AV?$deltacomp_state_data_impl@Urocket_data_bundle@@$07@@,0x00eda438,0x00e2b7d0@0x0,5,?$deltacomp_state_data@Urocket_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Urocket_data_bundle@@$0M@@@,.?AV?$deltacomp_state_data_impl@Urocket_data_bundle@@$0M@@@,0x00eda3f0,0x00e2b7e8@0x0,5,?$deltacomp_state_data@Urocket_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$00@@,.?AV?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$00@@,0x00eda6f0,0x00e2bbc4@0x0,5,?$deltacomp_state_data@Uvehicle_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$07@@,.?AV?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$07@@,0x00eda780,0x00e2bb94@0x0,5,?$deltacomp_state_data@Uvehicle_data_bundle@@@@,0
+?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$0M@@@,.?AV?$deltacomp_state_data_impl@Uvehicle_data_bundle@@$0M@@@,0x00eda738,0x00e2bbac@0x0,5,?$deltacomp_state_data@Uvehicle_data_bundle@@@@,0
+?$hkpSymmetricAgent@VhkpBvAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpBvAgent@@@@,0x00edf5f8,0x00e568ac@0x0,14,?$hkpSymmetricAgentLinearCast@VhkpBvAgent@@@@ ; hkpBvAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgent@VhkpBvTreeAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpBvTreeAgent@@@@,0x00edf7ec,0x00e56b74@0x0,14,?$hkpSymmetricAgentLinearCast@VhkpBvTreeAgent@@@@ ; hkpBvTreeAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgent@VhkpBvTreeStreamAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpBvTreeStreamAgent@@@@,0x00edf55c,0x00e56538@0x0,14,?$hkpSymmetricAgentLinearCast@VhkpBvTreeStreamAgent@@@@ ; hkpBvTreeStreamAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgent@VhkpConvexListAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpConvexListAgent@@@@,0x00edeecc,0x00e55f84@0x0,15,?$hkpSymmetricAgentLinearCast@VhkpConvexListAgent@@@@ ; hkpConvexListAgent ; hkpPredGskfAgent ; hkpGskfAgent ; hkpGskBaseAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgent@VhkpHeightFieldAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpHeightFieldAgent@@@@,0x00edf16c,0x00e56040@0x0,14,?$hkpSymmetricAgentLinearCast@VhkpHeightFieldAgent@@@@ ; hkpHeightFieldAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgent@VhkpListAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpListAgent@@@@,0x00edee38,0x00e55d44@0x0,15,?$hkpSymmetricAgentLinearCast@VhkpListAgent@@@@ ; hkpListAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgent@VhkpMoppAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpMoppAgent@@@@,0x00edf87c,0x00e56c28@0x0,14,?$hkpSymmetricAgentLinearCast@VhkpMoppAgent@@@@ ; hkpMoppAgent ; hkpBvTreeAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgent@VhkpMultiRayConvexAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpMultiRayConvexAgent@@@@,0x00edf4b0,0x00e5646c@0x0,14,?$hkpSymmetricAgentLinearCast@VhkpMultiRayConvexAgent@@@@ ; hkpMultiRayConvexAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgent@VhkpMultiSphereAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpMultiSphereAgent@@@@,0x00edf68c,0x00e56960@0x0,14,?$hkpSymmetricAgentLinearCast@VhkpMultiSphereAgent@@@@ ; hkpMultiSphereAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgent@VhkpShapeCollectionAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpShapeCollectionAgent@@@@,0x00edef78,0x00e55f0c@0x0,14,?$hkpSymmetricAgentLinearCast@VhkpShapeCollectionAgent@@@@ ; hkpShapeCollectionAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgent@VhkpTransformAgent@@@@,.?AV?$hkpSymmetricAgent@VhkpTransformAgent@@@@,0x00edf734,0x00e56a6c@0x0,14,?$hkpSymmetricAgentLinearCast@VhkpTransformAgent@@@@ ; hkpTransformAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpBvAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpBvAgent@@@@,0x00edf5bc,0x00e568e8@0x0,14,hkpBvAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpBvTreeAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpBvTreeAgent@@@@,0x00edf7ac,0x00e56bb0@0x0,14,hkpBvTreeAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpBvTreeStreamAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpBvTreeStreamAgent@@@@,0x00edf518,0x00e56574@0x0,14,hkpBvTreeStreamAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpCapsuleTriangleAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpCapsuleTriangleAgent@@@@,0x00edf380,0x00e5637c@0x0,14,hkpCapsuleTriangleAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpConvexListAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpConvexListAgent@@@@,0x00edee88,0x00e55fc4@0x0,15,hkpConvexListAgent ; hkpPredGskfAgent ; hkpGskfAgent ; hkpGskBaseAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpHeightFieldAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpHeightFieldAgent@@@@,0x00edf128,0x00e5607c@0x0,14,hkpHeightFieldAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpListAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpListAgent@@@@,0x00ededfc,0x00e55d84@0x0,15,hkpListAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpMoppAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpMoppAgent@@@@,0x00edf840,0x00e56c64@0x0,14,hkpMoppAgent ; hkpBvTreeAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpMultiRayConvexAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpMultiRayConvexAgent@@@@,0x00edf468,0x00e564a8@0x0,14,hkpMultiRayConvexAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpMultiSphereAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpMultiSphereAgent@@@@,0x00edf648,0x00e5699c@0x0,14,hkpMultiSphereAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpMultiSphereTriangleAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpMultiSphereTriangleAgent@@@@,0x00edf3f0,0x00e563f4@0x0,14,hkpMultiSphereTriangleAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpShapeCollectionAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpShapeCollectionAgent@@@@,0x00edef30,0x00e55f48@0x0,14,hkpShapeCollectionAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpSphereBoxAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpSphereBoxAgent@@@@,0x00edf2f0,0x00e562c8@0x0,14,hkpSphereBoxAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpSphereCapsuleAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpSphereCapsuleAgent@@@@,0x00edf210,0x00e561d8@0x0,14,hkpSphereCapsuleAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpSphereTriangleAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpSphereTriangleAgent@@@@,0x00edf280,0x00e56250@0x0,14,hkpSphereTriangleAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkpSymmetricAgentLinearCast@VhkpTransformAgent@@@@,.?AV?$hkpSymmetricAgentLinearCast@VhkpTransformAgent@@@@,0x00edf6f0,0x00e56aa8@0x0,14,hkpTransformAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+?$hkSingleton@VhkBuiltinTypeRegistry@@@@,.?AV?$hkSingleton@VhkBuiltinTypeRegistry@@@@,0x00edcf00,,0,,
+?$hkSingleton@VhkDefaultClassNameRegistry@@@@,.?AV?$hkSingleton@VhkDefaultClassNameRegistry@@@@,0x00edfafc,,0,,
+?$hkSingleton@VhkDummySingleton@@@@,.?AV?$hkSingleton@VhkDummySingleton@@@@,0x00edf96c,,0,,
+?$hkSingleton@VhkError@@@@,.?AV?$hkSingleton@VhkError@@@@,0x00edf92c,,0,,
+?$hkSingleton@VhkFileSystem@@@@,.?AV?$hkSingleton@VhkFileSystem@@@@,0x00edf9e0,,0,,
+?$hkSingleton@VhkStatisticsCollectorClassListener@@@@,.?AV?$hkSingleton@VhkStatisticsCollectorClassListener@@@@,0x00edfd98,,0,,
+?$hkSingleton@VhkTraceStream@@@@,.?AV?$hkSingleton@VhkTraceStream@@@@,0x00edfc04,,0,,
+?$hkSingleton@VhkTypeInfoRegistry@@@@,.?AV?$hkSingleton@VhkTypeInfoRegistry@@@@,0x00edfb64,,0,,
+?$hkSingleton@VhkVersionRegistry@@@@,.?AV?$hkSingleton@VhkVersionRegistry@@@@,0x00edd04c,,0,,
+?$hkSingleton@VhkVtableClassRegistry@@@@,.?AV?$hkSingleton@VhkVtableClassRegistry@@@@,0x00edfaa0,,0,,
+?$num_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@,.?AV?$num_put@DV?$ostreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@,0x00ed4370,0x00dde638@0x0,9,std::locale::facet,0
+?$numpunct@D@std@@,.?AV?$numpunct@D@std@@,0x00ed43c4,0x00dde61c@0x0,6,std::locale::facet,0
+?$reset_function_handles_functor@Vscript_npc@@@?A0x095bbb25@@,.?AU?$reset_function_handles_functor@Vscript_npc@@@?A0x095bbb25@@,0x00edadf0,0x00e2dc8c@0x0,1,for_each_functor_base,0
+?$reset_function_handles_functor@Vscript_vehicle@@@?A0x095bbb25@@,.?AU?$reset_function_handles_functor@Vscript_vehicle@@@?A0x095bbb25@@,0x00edada0,0x00e2dc94@0x0,1,for_each_functor_base,0
+?$split_mempool_template@Vmempool@@V1@@@,.?AV?$split_mempool_template@Vmempool@@V1@@@,0x00ed46bc,0x00de186c@0x0,25,mempool ; static_mempool_base ; mempool_base,0
+?$vhashtable@IGUhash_functor@@@@,.?AV?$vhashtable@IGUhash_functor@@@@,0x00edc8d4,0x00e45e30@0x0,7,,0
+?$vhashtable@IPAUscript_navpoint@@Unav_functor@@@@,.?AV?$vhashtable@IPAUscript_navpoint@@Unav_functor@@@@,0x00edbf4c,0x00e43278@0x0,7,,0
+?$vhashtable@PAVgmm_broadphase_handle@@GUbh_hashtable_functor@@@@,.?AV?$vhashtable@PAVgmm_broadphase_handle@@GUbh_hashtable_functor@@@@,0x00edbcb0,0x00e3e200@0x0,7,,0
+?$vhashtable@Ucmo_hash_key@@GUcmo_hash_functor@@@@,.?AV?$vhashtable@Ucmo_hash_key@@GUcmo_hash_functor@@@@,0x00ed3fb4,0x00ddb0bc@0x0,7,,0
+?$vhashtable@Ucollision_event_key@@GUcollision_event_functor@@@@,.?AV?$vhashtable@Ucollision_event_key@@GUcollision_event_functor@@@@,0x00ed70f0,0x00e18b94@0x0,7,,0
+?$vhashtable@Ucontact_event_key@@GUcontact_event_functor@@@@,.?AV?$vhashtable@Ucontact_event_key@@GUcontact_event_functor@@@@,0x00ed7048,0x00e18bd8@0x0,7,,0
+?$vhashtable@Vchecksum_stri@@IUbitmap_image_hasher@@@@,.?AV?$vhashtable@Vchecksum_stri@@IUbitmap_image_hasher@@@@,0x00edd128,0x00e4c734@0x0,7,,0
+?$vhashtable@Vchecksum_stri@@Uhash_pair@string_hash_table_pair@@$$CBUstring_hasher@3@@@,.?AV?$vhashtable@Vchecksum_stri@@Uhash_pair@string_hash_table_pair@@$$CBUstring_hasher@3@@@,0x00edc168,0x00e441b0@0x0,7,,0
+?$vhashtable@VhkpBroadPhaseHandlePair@@GUbpair_hashtable_functor@@@@,.?AV?$vhashtable@VhkpBroadPhaseHandlePair@@GUbpair_hashtable_functor@@@@,0x00edbb98,0x00e3e268@0x0,7,,0
+?$vhashtable_inplace@PAVgmm_broadphase_handle@@G$0CAAA@Ubh_hashtable_functor@@@@,.?AV?$vhashtable_inplace@PAVgmm_broadphase_handle@@G$0CAAA@Ubh_hashtable_functor@@@@,0x00edbc50,0x00e3e220@0x0,8,?$vhashtable@PAVgmm_broadphase_handle@@GUbh_hashtable_functor@@@@,0
+?$vhashtable_inplace@Ucollision_event_key@@G$0ELA@Ucollision_event_functor@@@@,.?AV?$vhashtable_inplace@Ucollision_event_key@@G$0ELA@Ucollision_event_functor@@@@,0x00ed7140,0x00e18b70@0x0,8,?$vhashtable@Ucollision_event_key@@GUcollision_event_functor@@@@,0
+?$vhashtable_inplace@Ucontact_event_key@@G$0PKA@Ucontact_event_functor@@@@,.?AV?$vhashtable_inplace@Ucontact_event_key@@G$0PKA@Ucontact_event_functor@@@@,0x00ed7098,0x00e18bb4@0x0,8,?$vhashtable@Ucontact_event_key@@GUcontact_event_functor@@@@,0
+?$vhashtable_inplace@VhkpBroadPhaseHandlePair@@G$0CAAA@Ubpair_hashtable_functor@@@@,.?AV?$vhashtable_inplace@VhkpBroadPhaseHandlePair@@G$0CAAA@Ubpair_hashtable_functor@@@@,0x00edbbf0,0x00e3e244@0x0,8,?$vhashtable@VhkpBroadPhaseHandlePair@@GUbpair_hashtable_functor@@@@,0
+?$vint_object_factory_imp@Vvint_element_bitmap@@@@,.?AV?$vint_object_factory_imp@Vvint_element_bitmap@@@@,0x00edd384,0x00e4d940@0x0,6,vint_object_factory,0
+?$vint_object_factory_imp@Vvint_element_bitmap_circle@@@@,.?AV?$vint_object_factory_imp@Vvint_element_bitmap_circle@@@@,0x00edd578,0x00e4e040@0x0,6,vint_object_factory,0
+?$vint_object_factory_imp@Vvint_element_clip@@@@,.?AV?$vint_object_factory_imp@Vvint_element_clip@@@@,0x00edd514,0x00e4df00@0x0,6,vint_object_factory,0
+?$vint_object_factory_imp@Vvint_element_gradient@@@@,.?AV?$vint_object_factory_imp@Vvint_element_gradient@@@@,0x00edd3e8,0x00e4daf0@0x0,6,vint_object_factory,0
+?$vint_object_factory_imp@Vvint_element_group@@@@,.?AV?$vint_object_factory_imp@Vvint_element_group@@@@,0x00edd1cc,0x00e4d40c@0x0,6,vint_object_factory,0
+?$vint_object_factory_imp@Vvint_element_point@@@@,.?AV?$vint_object_factory_imp@Vvint_element_point@@@@,0x00edd4b0,0x00e4de08@0x0,6,vint_object_factory,0
+?$vint_object_factory_imp@Vvint_element_sr2_map@@@@,.?AV?$vint_object_factory_imp@Vvint_element_sr2_map@@@@,0x00edd5f0,0x00e4e140@0x0,6,vint_object_factory,0
+?$vint_object_factory_imp@Vvint_element_text@@@@,.?AV?$vint_object_factory_imp@Vvint_element_text@@@@,0x00edd450,0x00e4dd30@0x0,6,vint_object_factory,0
+?$vint_object_factory_imp@Vvint_element_video@@@@,.?AV?$vint_object_factory_imp@Vvint_element_video@@@@,0x00edd654,0x00e4e238@0x0,9,vint_object_factory,0
+?$vint_object_factory_imp@Vvint_object_animation@@@@,.?AV?$vint_object_factory_imp@Vvint_object_animation@@@@,0x00edd298,0x00e4d49c@0x0,6,vint_object_factory,0
+?$vint_object_factory_imp@Vvint_object_tween@@@@,.?AV?$vint_object_factory_imp@Vvint_object_tween@@@@,0x00edd300,0x00e4d7e4@0x0,6,vint_object_factory,0
+activity_info,.?AVactivity_info@@,0x00ed4c0c,0x00de86ac@0x0,26,,0
+activity_instance,.?AVactivity_instance@@,0x00ed4bec,0x00de8718@0x0,11,,0
+activity_level_instance,.?AVactivity_level_instance@@,0x00ed4bc4,0x00de874c@0x0,21,,0
+air_complication,.?AVair_complication@@,0x00ed66d0,0x00dfe438@0x0,14,drive_complication ; complication,0
+aircraft_kill_objective,.?AVaircraft_kill_objective@@,0x00ed4d64,0x00de915c@0x0,22,heli_objective,0
+ambulance_diversion_instance,.?AVambulance_diversion_instance@@,0x00ed59c8,0x00df1d74@0x0,19,diversion_instance,0
+ambulance_diversion_type_info,.?AVambulance_diversion_type_info@@,0x00ed599c,0x00df1dc4@0x0,41,diversion_type_info,0
+async_mempool,.?AVasync_mempool@@,0x00ed46f4,0x00de1b94@0x0,22,static_mempool_base ; mempool_base,0
+async_virtual_mempool,.?AVasync_virtual_mempool@@,0x00ee0118,0x00e5a744@0x0,25,virtual_mempool ; static_mempool_base ; mempool_base,0
+audio_player_widget,.?AVaudio_player_widget@@,0x00ed80d4,0x00e1bb2c@0x0,5,menu_widget,0
+barnstorming_diversion_type,.?AVbarnstorming_diversion_type@@,0x00ed5a40,0x00df210c@0x0,35,diversion_type_info,0
+base_jumping_diversion_instance,.?AVbase_jumping_diversion_instance@@,0x00ed5a9c,0x00df2454@0x0,4,,0
+base_jumping_diversion_type_info,.?AVbase_jumping_diversion_type_info@@,0x00ed5a6c,0x00df246c@0x0,37,diversion_type_info,0
+bit_data_noncompressor,.?AVbit_data_noncompressor@@,0x00ed85e0,0x00e264d8@0x0,4,compressor,0
+bitmap_writer,.?AVbitmap_writer@@,0x00ee0160,0x00e5ad08@0x0,8,image_writer,0
+blackjack_diversion_instance,.?AVblackjack_diversion_instance@@,0x00ed5acc,0x00df288c@0x0,22,diversion_instance,0
+blackjack_diversion_type_info,.?AVblackjack_diversion_type_info@@,0x00ed5af8,0x00df27fc@0x0,35,diversion_type_info,0
+blocking_animation_compressor_full,.?AVblocking_animation_compressor_full@@,0x00ed99ac,0x00e2aee0@0x0,4,blocking_animation_compressor_partial ; compressor,0
+blocking_animation_compressor_partial,.?AVblocking_animation_compressor_partial@@,0x00ed99e0,0x00e2aecc@0x0,4,compressor,0
+boat_kill_objective,.?AVboat_kill_objective@@,0x00ed4d8c,0x00de90fc@0x0,22,heli_objective,0
+brass,.?AVbrass@@,0x00ed4004,0x00ddbc8c@0x0,10,object,0
+button_mashing_complication,.?AVbutton_mashing_complication@@,0x00ed6634,0x00dfe528@0x0,14,combo_complication ; complication,0
+byte_data_noncompressor,.?AVbyte_data_noncompressor@@,0x00ed8608,0x00e264c4@0x0,4,compressor,0
+c_cover_node,.?AVc_cover_node@@,0x00edbd80,,0,,
+camera_compressor,.?AVcamera_compressor@@,0x00ed9fc0,0x00e2b3d0@0x0,4,compressor,0
+cash_widget,.?AVcash_widget@@,0x00ed8378,0x00e1fc4c@0x0,6,menu_widget,0
+cat_and_mouse_diversion_instance,.?AVcat_and_mouse_diversion_instance@@,0x00ed6380,0x00dfab94@0x0,21,diversion_instance,0
+cat_and_mouse_diversion_type_info,.?AVcat_and_mouse_diversion_type_info@@,0x00ed63b0,0x00dfaafc@0x0,36,diversion_type_info,0
+cell_spawn_group,.?AVcell_spawn_group@@,0x00ed821c,0x00e1d3dc@0x0,27,special_vehicle_spawn_group,0
+character,.?AVcharacter@@,0x00ed6a70,0x00e0db38@0x0,4,,0
+character_controller,.?AVcharacter_controller@@,0x00ed7654,0x00e193ac@0x0,3,hkReferencedObject ; hkBaseObject,0
+character_post_load_data,.?AUcharacter_post_load_data@@,0x00ed3f5c,0x00dda82c@0x0,1,stream_resource_post_load_data,0
+charNode,.?AVcharNode@@,0x00e81a5c,0x00dc542c@0x0,3,DNameNode,0
+chop_shop_diversion_type,.?AVchop_shop_diversion_type@@,0x00ed5b24,0x00df2cb4@0x0,35,diversion_type_info,0
+choplifter_objective,.?AVchoplifter_objective@@,0x00ed4cd0,0x00de92dc@0x0,22,heli_objective,0
+ci_browser_cwidget,.?AVci_browser_cwidget@@,0x00ed8418,0x00e20f74@0x0,5,menu_widget,0
+ci_browser_ovl,.?AVci_browser_ovl@@,0x00ed83f8,0x00e20f8c@0x0,7,ovl_base,0
+Clear1nTracksFilter@?A0xd7aebf48@@,.?AVClear1nTracksFilter@?A0xd7aebf48@@,0x00edd750,0x00e4e770@0x0 0x00e4e780@0x8 0x00e4e78c@0xc 0x00e4e7a0@0x10 0x00e4e7ac@0x14,4,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter,1
+color_picker_widget,.?AVcolor_picker_widget@@,0x00ed8354,0x00e1fc68@0x0,5,menu_widget,0
+combat_trick,.?AVcombat_trick@@,0x00ed5ba0,0x00df31f8@0x0,5,,0
+combat_trick_multikill,.?AVcombat_trick_multikill@@,0x00ed5b78,0x00df3210@0x0,5,combat_trick,0
+combat_tricks_diversion_type,.?AVcombat_tricks_diversion_type@@,0x00ed5b4c,0x00df322c@0x0,35,diversion_type_info,0
+combo_complication,.?AVcombo_complication@@,0x00ed681c,0x00dfe190@0x0,14,complication,0
+compacting_mempool,.?AVcompacting_mempool@@,0x00ed4698,0x00de18d4@0x0,21,static_mempool_base ; mempool_base,0
+complication,.?AVcomplication@@,0x00ed6800,0x00dfe348@0x0,14,,0
+component_compressor,.?AVcomponent_compressor@@,0x00eda8e4,0x00e2baf0@0x0,4,compressor,0
+compressor,.?AVcompressor@@,0x00ed8630,0x00e264b0@0x0,4,,0
+constraint_instance_breakable_listener,.?AVconstraint_instance_breakable_listener@@,0x00ed719c,0x00e18c04@0x0,2,hkpBreakableListener,0
+contact_collector,.?AVcontact_collector@@,0x00ed6b4c,0x00e18aa0@0x0,2,hkpCdPointCollector,0
+convoy_kill_objective,.?AVconvoy_kill_objective@@,0x00ed4e00,0x00de8fdc@0x0,22,heli_objective,0
+crash_complication,.?AVcrash_complication@@,0x00ed66f0,0x00dfe3fc@0x0,14,drive_complication ; complication,0
+critical_locked_msg,.?AVcritical_locked_msg@@,0x00ed6990,0x00e00ccc@0x0,8,ovl_message ; ovl_base,0
+CSpeedWind,.?AVCSpeedWind@@,0x00ed4354,0x00dde660@0x0,1,,0
+customers_holdup_instance,.?AVcustomers_holdup_instance@@,0x00ed49c8,0x00de4140@0x0,4,customers_scripting_instance,0
+customers_purchase_instance,.?AVcustomers_purchase_instance@@,0x00ed49f0,0x00de412c@0x0,4,customers_scripting_instance,0
+customers_scripting_instance,.?AVcustomers_scripting_instance@@,0x00ed4a1c,0x00de4118@0x0,4,,0
+death_tag_diversion_instance,.?AVdeath_tag_diversion_instance@@,0x00ed63e0,0x00dfae2c@0x0,19,diversion_instance,0
+death_tag_diversion_type_info,.?AVdeath_tag_diversion_type_info@@,0x00ed640c,0x00dfad94@0x0,36,diversion_type_info,0
+demo_derby_info,.?AVdemo_derby_info@@,0x00ed58dc,0x00df0e1c@0x0,29,activity_info,0
+demo_derby_instance,.?AVdemo_derby_instance@@,0x00ed58b8,0x00df0e94@0x0,11,activity_instance,0
+demo_derby_level_instance,.?AVdemo_derby_level_instance@@,0x00ed58fc,0x00df0dc4@0x0,21,activity_level_instance,0
+demo_derby_sp_info,.?AVdemo_derby_sp_info@@,0x00ed5978,0x00df11bc@0x0,26,activity_info,0
+demo_derby_sp_instance,.?AVdemo_derby_sp_instance@@,0x00ed5950,0x00df1228@0x0,11,activity_instance,0
+demo_derby_sp_level_instance,.?AVdemo_derby_sp_level_instance@@,0x00ed5924,0x00df125c@0x0,25,activity_level_instance,0
+deprecated_slider_widget,.?AVdeprecated_slider_widget@@,0x00ed7f68,0x00e1afa4@0x0,5,menu_widget,0
+destroy_functor@?A0x351ec112@@,.?AUdestroy_functor@?A0x351ec112@@,0x00edbe4c,0x00e3e9c0@0x0,1,for_each_functor_base,0
+detour_hull_object,.?AVdetour_hull_object@@,0x00edb670,0x00e38a34@0x0,9,object,0
+detour_multi_registration,.?AVdetour_multi_registration@@,0x00ed8d14,0x00e27edc@0x0,22,multi_core_object_registration,0
+distant_human_character,.?AVdistant_human_character@@,0x00ed6a48,0x00e0db4c@0x0,4,character,0
+diversion_cds_functor@?1??diversion_cds_init@@YAXXZ@,.?AUdiversion_cds_functor@?1??diversion_cds_init@@YAXXZ@,0x00ed5bc0,0x00df33a8@0x0,1,for_each_functor_base,0
+diversion_cds_functor@?4??unused_dcf_diversion_collect_cds@@YAXXZ@,.?AUdiversion_cds_functor@?4??unused_dcf_diversion_collect_cds@@YAXXZ@,0x00ed5c28,0x00df33a0@0x0,1,for_each_functor_base,0
+diversion_instance,.?AVdiversion_instance@@,0x00ed5a18,0x00df1c94@0x0,19,,0
+diversion_type_info,.?AVdiversion_type_info@@,0x00ed59f4,0x00df1ce4@0x0,35,,0
+DNameNode,.?AVDNameNode@@,0x00e81a44,0x00dc541c@0x0,3,,0
+DNameStatusNode,.?AVDNameStatusNode@@,0x00e81a90,0x00dc544c@0x0,3,DNameNode,0
+drift_complication,.?AVdrift_complication@@,0x00ed6688,0x00dfe4b0@0x0,14,drive_complication ; complication,0
+drive_by_complication,.?AVdrive_by_complication@@,0x00ed66ac,0x00dfe474@0x0,14,drive_complication ; complication,0
+drive_complication,.?AVdrive_complication@@,0x00ed67dc,0x00dfe1cc@0x0,14,complication,0
+drive_fast_complication,.?AVdrive_fast_complication@@,0x00ed6734,0x00dfe384@0x0,14,drive_complication ; complication,0
+driveby_diversion_instance,.?AVdriveby_diversion_instance@@,0x00ed5ca4,0x00df3fc4@0x0,19,diversion_instance,0
+driveby_diversion_type_info,.?AVdriveby_diversion_type_info@@,0x00ed5c78,0x00df4014@0x0,35,diversion_type_info,0
+driver_bailout_diversion_type_info,.?AVdriver_bailout_diversion_type_info@@,0x00ed5cd0,0x00df41cc@0x0,38,diversion_type_info,0
+drop_delete_functor,.?AUdrop_delete_functor@@,0x00edbe28,0x00e3e9c8@0x0,1,for_each_functor_base,0
+drop_give_functor,.?AUdrop_give_functor@@,0x00edbe08,0x00e3e9d0@0x0,1,for_each_functor_base,0
+effect_functor@?5??set_tutorial_triggers@@YAXXZ@,.?AUeffect_functor@?5??set_tutorial_triggers@@YAXXZ@,0x00ed8f90,0x00e2964c@0x0,1,for_each_functor_base,0
+effect_object,.?AVeffect_object@@,0x00ed45d4,0x00de039c@0x0,9,object,0
+escort_enemy_spawn_group,.?AVescort_enemy_spawn_group@@,0x00ed6840,0x00dfe8e4@0x0,27,special_vehicle_spawn_group,0
+escort_info,.?AVescort_info@@,0x00ed677c,0x00dfe2ac@0x0,26,activity_info,0
+escort_instance,.?AVescort_instance@@,0x00ed675c,0x00dfe318@0x0,11,activity_instance,0
+escort_level_instance,.?AVescort_level_instance@@,0x00ed67b8,0x00dfe20c@0x0,21,activity_level_instance,0
+escort_spawn_group,.?AVescort_spawn_group@@,0x00ed6868,0x00dfe874@0x0,27,special_vehicle_spawn_group,0
+event_trigger,.?AVevent_trigger@@,0x00ee0018,0x00e58c5c@0x0,5,trigger_base,0
+exploration_diversion_type,.?AVexploration_diversion_type@@,0x00ed5d04,0x00df4494@0x0,39,diversion_type_info,0
+fight_club_activity_info,.?AVfight_club_activity_info@@,0x00ed5890,0x00df0024@0x0,26,activity_info,0
+fight_club_activity_instance,.?AVfight_club_activity_instance@@,0x00ed5864,0x00df0090@0x0,11,activity_instance,0
+fight_club_activity_level_instance,.?AVfight_club_activity_level_instance@@,0x00ed5830,0x00df00c4@0x0,21,activity_level_instance,0
+find_closest_respawn_nav_functor@?A0x55384e53@@,.?AUfind_closest_respawn_nav_functor@?A0x55384e53@@,0x00edaac0,0x00e2c8b0@0x0,1,for_each_functor_base,0
+find_ffa_respawn_functor@?A0x55384e53@@,.?AUfind_ffa_respawn_functor@?A0x55384e53@@,0x00edaafc,0x00e2c8a8@0x0,1,for_each_functor_base,0
+find_functor@?1??osd_get_spawn_region@@YAPBVscript_spawn_region@@XZ@,.?AUfind_functor@?1??osd_get_spawn_region@@YAPBVscript_spawn_region@@XZ@,0x00edb7f8,0x00e3a3a8@0x0,1,for_each_functor_base,0
+find_respawn_around_pos_functor@?A0x55384e53@@,.?AUfind_respawn_around_pos_functor@?A0x55384e53@@,0x00edaa84,0x00e2c8b8@0x0,1,for_each_functor_base,0
+find_team_respawn_functor@?A0x55384e53@@,.?AUfind_team_respawn_functor@?A0x55384e53@@,0x00edab30,0x00e2c8a0@0x0,1,for_each_functor_base,0
+find_vehicle_respawn_functor@?A0x55384e53@@,.?AUfind_vehicle_respawn_functor@?A0x55384e53@@,0x00edab68,0x00e2c898@0x0,1,for_each_functor_base,0
+firetruck_diversion_instance,.?AVfiretruck_diversion_instance@@,0x00ed5d5c,0x00df4ee4@0x0,19,diversion_instance,0
+firetruck_diversion_type_info,.?AVfiretruck_diversion_type_info@@,0x00ed5d30,0x00df4f34@0x0,35,diversion_type_info,0
+flashing_diversion_instance,.?AVflashing_diversion_instance@@,0x00ed5d88,0x00df5354@0x0,19,diversion_instance,0
+flashing_diversion_type,.?AVflashing_diversion_type@@,0x00ed5db4,0x00df52c4@0x0,35,diversion_type_info,0
+float_compressor,.?AVfloat_compressor@@,0x00ed85c0,0x00e264ec@0x0,4,compressor,0
+fober_lock_free_queue,.?AVfober_lock_free_queue@@,0x00edc124,0x00e44198@0x0,5,list_interface,0
+for_each_functor_base,.?AUfor_each_functor_base@@,0x00ed5c04,0x00df33b0@0x0,1,,0
+fraud_info,.?AVfraud_info@@,0x00ed647c,0x00dfbc44@0x0,26,activity_info,0
+fraud_instance,.?AVfraud_instance@@,0x00ed645c,0x00dfbcb0@0x0,11,activity_instance,0
+fraud_level_instance,.?AVfraud_level_instance@@,0x00ed6438,0x00dfbce4@0x0,21,activity_level_instance,0
+functor_count_script_objects_runtime_created,.?AVfunctor_count_script_objects_runtime_created@@,0x00edbe78,0x00e42fcc@0x0,1,for_each_functor_base,0
+fuzz_crime,.?AVfuzz_crime@@,0x00ed5814,0x00dee754@0x0,22,,0
+fuzz_crime_arsonist,.?AVfuzz_crime_arsonist@@,0x00ed5350,0x00def354@0x0,22,fuzz_crime,0
+fuzz_crime_assassin,.?AVfuzz_crime_assassin@@,0x00ed54e4,0x00deef34@0x0,22,fuzz_crime,0
+fuzz_crime_bank_robber,.?AVfuzz_crime_bank_robber@@,0x00ed544c,0x00def0b4@0x0,22,fuzz_crime,0
+fuzz_crime_car_bomb,.?AVfuzz_crime_car_bomb@@,0x00ed5474,0x00def054@0x0,22,fuzz_crime,0
+fuzz_crime_chainsaw_massacre,.?AVfuzz_crime_chainsaw_massacre@@,0x00ed5324,0x00def3b4@0x0,22,fuzz_crime,0
+fuzz_crime_dispute,.?AVfuzz_crime_dispute@@,0x00ed539c,0x00def294@0x0,22,fuzz_crime_gang_fight ; fuzz_crime,0
+fuzz_crime_domestic_dispute,.?AVfuzz_crime_domestic_dispute@@,0x00ed55c8,0x00deecf4@0x0,22,fuzz_crime,0
+fuzz_crime_drug_deal,.?AVfuzz_crime_drug_deal@@,0x00ed5408,0x00def174@0x0,22,fuzz_crime,0
+fuzz_crime_drunk_and_disorderly,.?AVfuzz_crime_drunk_and_disorderly@@,0x00ed57e4,0x00dee7b4@0x0,22,fuzz_crime,0
+fuzz_crime_dui,.?AVfuzz_crime_dui@@,0x00ed563c,0x00deebd4@0x0,22,fuzz_crime,0
+fuzz_crime_ecoterrorist,.?AVfuzz_crime_ecoterrorist@@,0x00ed5374,0x00def2f4@0x0,22,fuzz_crime,0
+fuzz_crime_environmentalist,.?AVfuzz_crime_environmentalist@@,0x00ed5498,0x00deeff4@0x0,22,fuzz_crime,0
+fuzz_crime_gang_fight,.?AVfuzz_crime_gang_fight@@,0x00ed5618,0x00deec34@0x0,22,fuzz_crime,0
+fuzz_crime_hells_angels,.?AVfuzz_crime_hells_angels@@,0x00ed51dc,0x00def6b4@0x0,22,fuzz_crime,0
+fuzz_crime_hit_and_run,.?AVfuzz_crime_hit_and_run@@,0x00ed55a0,0x00deed54@0x0,22,fuzz_crime,0
+fuzz_crime_hooker_revolt,.?AVfuzz_crime_hooker_revolt@@,0x00ed5530,0x00deee74@0x0,22,fuzz_crime,0
+fuzz_crime_human_torch,.?AVfuzz_crime_human_torch@@,0x00ed5204,0x00def654@0x0,22,fuzz_crime,0
+fuzz_crime_insurance_fraud,.?AVfuzz_crime_insurance_fraud@@,0x00ed52ac,0x00def4d4@0x0,22,fuzz_crime,0
+fuzz_crime_j_walking,.?AVfuzz_crime_j_walking@@,0x00ed57c0,0x00dee814@0x0,23,fuzz_crime,0
+fuzz_crime_littering,.?AVfuzz_crime_littering@@,0x00ed579c,0x00dee874@0x0,22,fuzz_crime,0
+fuzz_crime_littering_from_car,.?AVfuzz_crime_littering_from_car@@,0x00ed56d0,0x00deea54@0x0,22,fuzz_crime,0
+fuzz_crime_mayhem,.?AVfuzz_crime_mayhem@@,0x00ed5190,0x00def774@0x0,22,fuzz_crime,0
+fuzz_crime_militant_uprising,.?AVfuzz_crime_militant_uprising@@,0x00ed51b0,0x00def714@0x0,22,fuzz_crime_environmentalist ; fuzz_crime,0
+fuzz_crime_no_helmet,.?AVfuzz_crime_no_helmet@@,0x00ed5728,0x00dee994@0x0,22,fuzz_crime,0
+fuzz_crime_noise_violation,.?AVfuzz_crime_noise_violation@@,0x00ed574c,0x00dee934@0x0,22,fuzz_crime,0
+fuzz_crime_pirates_vs_ninjas,.?AVfuzz_crime_pirates_vs_ninjas@@,0x00ed522c,0x00def5f4@0x0,22,fuzz_crime_gang_fight ; fuzz_crime,0
+fuzz_crime_polygamy,.?AVfuzz_crime_polygamy@@,0x00ed55f4,0x00deec94@0x0,22,fuzz_crime,0
+fuzz_crime_postal,.?AVfuzz_crime_postal@@,0x00ed542c,0x00def114@0x0,22,fuzz_crime,0
+fuzz_crime_public_indecency,.?AVfuzz_crime_public_indecency@@,0x00ed56fc,0x00dee9f4@0x0,22,fuzz_crime,0
+fuzz_crime_purse_snatch,.?AVfuzz_crime_purse_snatch@@,0x00ed56a8,0x00deeab4@0x0,22,fuzz_crime,0
+fuzz_crime_riot,.?AVfuzz_crime_riot@@,0x00ed54c4,0x00deef94@0x0,22,fuzz_crime,0
+fuzz_crime_road_rage,.?AVfuzz_crime_road_rage@@,0x00ed5558,0x00deee14@0x0,22,fuzz_crime,0
+fuzz_crime_roid_dealer,.?AVfuzz_crime_roid_dealer@@,0x00ed53e0,0x00def1d4@0x0,22,fuzz_crime_drug_deal ; fuzz_crime,0
+fuzz_crime_septic,.?AVfuzz_crime_septic@@,0x00ed5170,0x00def7d4@0x0,22,fuzz_crime,0
+fuzz_crime_skaters,.?AVfuzz_crime_skaters@@,0x00ed5258,0x00def594@0x0,22,fuzz_crime,0
+fuzz_crime_slow_driver,.?AVfuzz_crime_slow_driver@@,0x00ed565c,0x00deeb74@0x0,22,fuzz_crime,0
+fuzz_crime_speeding,.?AVfuzz_crime_speeding@@,0x00ed5778,0x00dee8d4@0x0,22,fuzz_crime,0
+fuzz_crime_stolen_apc,.?AVfuzz_crime_stolen_apc@@,0x00ed557c,0x00deedb4@0x0,22,fuzz_crime,0
+fuzz_crime_stolen_car,.?AVfuzz_crime_stolen_car@@,0x00ed5300,0x00def414@0x0,22,fuzz_crime,0
+fuzz_crime_stolen_heli,.?AVfuzz_crime_stolen_heli@@,0x00ed5508,0x00deeed4@0x0,22,fuzz_crime,0
+fuzz_crime_streaking,.?AVfuzz_crime_streaking@@,0x00ed5684,0x00deeb14@0x0,22,fuzz_crime,0
+fuzz_crime_street_racing,.?AVfuzz_crime_street_racing@@,0x00ed52d8,0x00def474@0x0,22,fuzz_crime,0
+fuzz_crime_strike,.?AVfuzz_crime_strike@@,0x00ed53c0,0x00def234@0x0,22,fuzz_crime,0
+fuzz_crime_to_catch_a_predator,.?AVfuzz_crime_to_catch_a_predator@@,0x00ed527c,0x00def534@0x0,22,fuzz_crime,0
+fuzz_info,.?AVfuzz_info@@,0x00ed513c,0x00def864@0x0,26,activity_info,0
+fuzz_instance,.?AVfuzz_instance@@,0x00ed5154,0x00def830@0x0,11,activity_instance,0
+fuzz_level_instance,.?AVfuzz_level_instance@@,0x00ed5118,0x00def8d4@0x0,21,activity_level_instance,0
+game_havok_world,.?AVgame_havok_world@@,0x00ed6eb4,0x00e18850@0x0,3,hkpWorld ; hkReferencedObject ; hkBaseObject,0
+gamespy_atlas_module,.?AVgamespy_atlas_module@@,0x00edb3c4,0x00e32df0@0x0 0x00e32e10@0x10,7,gamespy_module ; gamespy_login_dependent_module,1
+gamespy_login_dependent_module,.?AVgamespy_login_dependent_module@@,0x00edb3e8,0x00e32de4@0x0,2,,0
+gamespy_login_module,.?AVgamespy_login_module@@,0x00edb438,0x00e33228@0x0,7,gamespy_module,0
+gamespy_matchmaking_module,.?AVgamespy_matchmaking_module@@,0x00edb45c,0x00e3340c@0x0,7,gamespy_module,0
+gamespy_module,.?AVgamespy_module@@,0x00edb418,0x00e32dc4@0x0,7,,0
+gamespy_presence_module,.?AVgamespy_presence_module@@,0x00edb488,0x00e33434@0x0 0x00e33454@0x10,7,gamespy_module ; gamespy_login_dependent_module,1
+gamespy_sake_module,.?AVgamespy_sake_module@@,0x00edb4b0,0x00e33508@0x0,7,gamespy_module,0
+gamespy_voice_module,.?AVgamespy_voice_module@@,0x00edb4d4,0x00e33528@0x0,7,gamespy_module,0
+gang_fight_objective,.?AVgang_fight_objective@@,0x00ed4d1c,0x00de921c@0x0,22,heli_objective,0
+garage_cash_widget,.?AVgarage_cash_widget@@,0x00ed4ad8,0x00de66a4@0x0,5,menu_widget,0
+general_mover,.?AVgeneral_mover@@,0x00edbb5c,0x00e3e1a4@0x0,17,object_mover ; object,0
+GeneralCollisionListener,.?AVGeneralCollisionListener@@,0x00ed6ef8,0x00e18838@0x0,5,hkpCollisionListener,0
+gr_index_buffer,.?AVgr_index_buffer@@,0x00edfe88,0x00e58410@0x0,14,IDirect3DIndexBuffer9 ; IDirect3DResource9 ; IUnknown,0
+gr_vertex_buffer,.?AVgr_vertex_buffer@@,0x00edff0c,0x00e583d4@0x0,14,IDirect3DVertexBuffer9 ; IDirect3DResource9 ; IUnknown,0
+group_unload_functor@?A0x095bbb25@@,.?AUgroup_unload_functor@?A0x095bbb25@@,0x00edae3c,0x00e2dc84@0x0,1,for_each_functor_base,0
+gsi_information_indicator,.?AVgsi_information_indicator@@,0x00ed823c,0x00e1dcd0@0x0,4,gsi_widget,0
+gsi_meter,.?AVgsi_meter@@,0x00ed8264,0x00e1dcbc@0x0,4,gsi_widget,0
+gsi_timer,.?AVgsi_timer@@,0x00ed827c,0x00e1dca8@0x0,4,gsi_widget,0
+gsi_widget,.?AVgsi_widget@@,0x00ed82b8,0x00e1dc80@0x0,4,,0
+gsi_x_of_y_indicator,.?AVgsi_x_of_y_indicator@@,0x00ed8294,0x00e1dc94@0x0,4,gsi_widget,0
+guardian_angel_info,.?AVguardian_angel_info@@,0x00ed4ba0,0x00de87a4@0x0,26,activity_info,0
+guardian_angel_instance,.?AVguardian_angel_instance@@,0x00ed4b78,0x00de8810@0x0,11,activity_instance,0
+guardian_angel_level_instance,.?AVguardian_angel_level_instance@@,0x00ed4b4c,0x00de8844@0x0,21,activity_level_instance,0
+havok_all_linear_cast_collector,.?AVhavok_all_linear_cast_collector@@,0x00ed6c84,0x00e18a10@0x0,2,hkpAllCdPointCollector ; hkpCdPointCollector,0
+havok_all_ray_hit_collector,.?AVhavok_all_ray_hit_collector@@,0x00ed6ce8,0x00e189f8@0x0,2,hkpAllRayHitCollector ; hkpRayHitCollector,0
+havok_closest_linear_cast_collector,.?AVhavok_closest_linear_cast_collector@@,0x00ed6cb4,0x00e18a04@0x0,2,hkpClosestCdPointCollector ; hkpCdPointCollector,0
+havok_closest_ray_hit_collector,.?AVhavok_closest_ray_hit_collector@@,0x00ed6d14,0x00e189ec@0x0,2,hkpClosestRayHitCollector ; hkpRayHitCollector,0
+havok_custom_character_collector,.?AVhavok_custom_character_collector@@,0x00ed75b4,0x00e19278@0x0,2,hkpAllCdPointCollector ; hkpCdPointCollector,0
+havok_filter_shape_collection,.?AVhavok_filter_shape_collection@@,0x00ed7270,0x00e18c30@0x0 0x00e18c58@0x10,9,hkpListShape ; hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+havok_game_filter,.?AVhavok_game_filter@@,0x00ed7340,0x00e18cb8@0x0 0x00e18cdc@0x8 0x00e18ce8@0xc 0x00e18cfc@0x10 0x00e18d08@0x14,8,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter,1
+havok_navmesh_shape,.?AVhavok_navmesh_shape@@,0x00ed7388,0x00e18e40@0x0 0x00e18e68@0x10,9,hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+havok_rigid_body,.?AVhavok_rigid_body@@,0x00ed6c64,0x00e18a1c@0x0,7,hkpRigidBody ; hkpEntity ; hkpWorldObject ; hkReferencedObject ; hkBaseObject,0
+heli_info,.?AVheli_info@@,0x00ed4c68,0x00de945c@0x0,27,activity_info,0
+heli_instance,.?AVheli_instance@@,0x00ed4c4c,0x00de94cc@0x0,11,activity_instance,0
+heli_level_instance,.?AVheli_level_instance@@,0x00ed4c28,0x00de94fc@0x0,22,activity_level_instance,0
+heli_objective,.?AVheli_objective@@,0x00ed4e24,0x00de93fc@0x0,22,,0
+hit_points_compressor,.?AVhit_points_compressor@@,0x00ed9a14,0x00e2aeb8@0x0,4,compressor,0
+hitch_pos_compressor,.?AVhitch_pos_compressor@@,0x00eda84c,0x00e2bb40@0x0,4,compressor,0
+hitman_diversion_type,.?AVhitman_diversion_type@@,0x00ed635c,0x00dfa2ac@0x0,35,diversion_type_info,0
+hk_anti_gravity_action,.?AVhk_anti_gravity_action@@,0x00ed701c,0x00e18b4c@0x0,8,hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hk_broadphase_border,.?AVhk_broadphase_border@@,0x00ed6c28,0x00e18a60@0x0 0x00e18a78@0x8 0x00e18a84@0xc,5,hkpBroadPhaseBorder ; hkReferencedObject ; hkBaseObject ; hkpWorldDeletionListener ; hkpPhantomOverlapListener,1
+hk_character_shape_phantom,.?AVhk_character_shape_phantom@@,0x00ed7524,0x00e191c4@0x0,20,hkpCachingShapePhantom ; hkpShapePhantom ; hkpPhantom ; hkpWorldObject ; hkReferencedObject ; hkBaseObject,0
+hk_custom_airplane_instance,.?AVhk_custom_airplane_instance@@,0x00edcbac,0x00e48244@0x0,18,hk_custom_vehicle_instance ; hkpVehicleInstance ; hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hk_custom_character_proxy,.?AVhk_custom_character_proxy@@,0x00ed7604,0x00e19230@0x0 0x00e19248@0x8 0x00e19260@0xc,5,hkpCharacterProxy ; hkReferencedObject ; hkBaseObject ; hkpEntityListener ; hkpPhantomListener,1
+hk_custom_helicopter_instance,.?AVhk_custom_helicopter_instance@@,0x00edcbd8,0x00e48290@0x0,10,hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hk_custom_memory_manager,.?AVhk_custom_memory_manager@@,0x00ed762c,0x00e192f4@0x0,32,hkMemory,0
+hk_custom_motorcycle_instance,.?AVhk_custom_motorcycle_instance@@,0x00edc4d4,0x00e452b4@0x0,18,hk_custom_vehicle_instance ; hkpVehicleInstance ; hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hk_custom_vehicle_brakes,.?AVhk_custom_vehicle_brakes@@,0x00edc5cc,0x00e45274@0x0,4,hkpVehicleDefaultBrake ; hkpVehicleBrake ; hkReferencedObject ; hkBaseObject,0
+hk_custom_vehicle_driver_input,.?AVhk_custom_vehicle_driver_input@@,0x00edc64c,0x00e45250@0x0,8,hkpVehicleDefaultAnalogDriverInput ; hkpVehicleDriverInput ; hkReferencedObject ; hkBaseObject,0
+hk_custom_vehicle_engine,.?AVhk_custom_vehicle_engine@@,0x00edc6c4,0x00e45234@0x0,6,hkpVehicleDefaultEngine ; hkpVehicleEngine ; hkReferencedObject ; hkBaseObject,0
+hk_custom_vehicle_extra_downforce,.?AVhk_custom_vehicle_extra_downforce@@,0x00edcc04,0x00e482bc@0x0,11,hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hk_custom_vehicle_instance,.?AVhk_custom_vehicle_instance@@,0x00edc4a8,0x00e482ec@0x0,18,hkpVehicleInstance ; hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hk_custom_vehicle_raycast_wheel_collide,.?AVhk_custom_vehicle_raycast_wheel_collide@@,0x00edc740,0x00e451fc@0x0,13,hkpVehicleRaycastWheelCollide ; hkpVehicleWheelCollide ; hkReferencedObject ; hkBaseObject,0
+hk_custom_vehicle_steering,.?AVhk_custom_vehicle_steering@@,0x00edcc80,0x00e48338@0x0,5,hkpVehicleDefaultSteering ; hkpVehicleSteering ; hkReferencedObject ; hkBaseObject,0
+hk_custom_vehicle_transmission,.?AVhk_custom_vehicle_transmission@@,0x00edc554,0x00e45288@0x0,10,hkpVehicleDefaultTransmission ; hkpVehicleTransmission ; hkReferencedObject ; hkBaseObject,0
+hk_custom_watercraft_instance,.?AVhk_custom_watercraft_instance@@,0x00edccac,0x00e48350@0x0,8,hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hk_door_constraint_motor,.?AVhk_door_constraint_motor@@,0x00edcd58,0x00e48374@0x0,4,hkpCallbackConstraintMotor ; hkpLimitedForceConstraintMotor ; hkpConstraintMotor ; hkReferencedObject ; hkBaseObject,0
+hk_phantom_in_water_listener,.?AVhk_phantom_in_water_listener@@,0x00ed7480,0x00e190b0@0x0,5,hkpPhantomListener,0
+hk_rigid_body_in_water_listener,.?AVhk_rigid_body_in_water_listener@@,0x00ed74cc,0x00e19098@0x0,5,hkpEntityListener,0
+hk_suspend_inactive_agents_util,.?AVhk_suspend_inactive_agents_util@@,0x00ed6b00,0x00e18b04@0x0 0x00e18b18@0x8 0x00e18b28@0xc,4,hkpSuspendInactiveAgentsUtil ; hkReferencedObject ; hkBaseObject ; hkpIslandActivationListener ; hkpWorldDeletionListener,1
+hkArrayStreamWriter,.?AVhkArrayStreamWriter@@,0x00edfa48,0x00e573e0@0x0,10,hkStreamWriter ; hkReferencedObject ; hkBaseObject,0
+hkBaseObject,.?AVhkBaseObject@@,0x00ed6f64,0x00dbe44c@0x0,1,,0
+hkBindingClassNameRegistry,.?AVhkBindingClassNameRegistry@@,0x00edd0f8,0x00e4bc68@0x0,14,hkChainedClassNameRegistry ; hkDynamicClassNameRegistry ; hkClassNameRegistry ; hkReferencedObject ; hkBaseObject,0
+hkBsdSocket,.?AVhkBsdSocket@@,0x00edfe10,0x00e583a4@0x0,11,hkSocket ; hkReferencedObject ; hkBaseObject,0
+hkBufferedStreamReader,.?AVhkBufferedStreamReader@@,0x00edfcbc,0x00e58138@0x0,13,hkStreamReader ; hkReferencedObject ; hkBaseObject,0
+hkBufferedStreamWriter,.?AVhkBufferedStreamWriter@@,0x00edfbbc,0x00e58020@0x0,9,hkStreamWriter ; hkReferencedObject ; hkBaseObject,0
+hkBuiltinTypeRegistry,.?AVhkBuiltinTypeRegistry@@,0x00edcf38,0x00e4b7fc@0x0,7,hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkBuiltinTypeRegistry@@@@,1
+hkChainedClassNameRegistry,.?AVhkChainedClassNameRegistry@@,0x00edd0cc,0x00e4bca4@0x0,11,hkDynamicClassNameRegistry ; hkClassNameRegistry ; hkReferencedObject ; hkBaseObject,0
+hkClassNameRegistry,.?AVhkClassNameRegistry@@,0x00edcf84,0x00e4b83c@0x0,6,hkReferencedObject ; hkBaseObject,0
+hkCrc32StreamWriter,.?AVhkCrc32StreamWriter@@,0x00edfd70,0x00e5822c@0x0,9,hkStreamWriter ; hkReferencedObject ; hkBaseObject,0
+hkCustomTrackConstraintData,.?AVhkCustomTrackConstraintData@@,0x00edb9a0,0x00e3ab50@0x0,12,hkpPointToPathConstraintData ; hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkDebugMemory,.?AVhkDebugMemory@@,0x00ed6e80,0x00e18864@0x0,35,hkMemory,0
+hkDefaultBuiltinTypeRegistry,.?AVhkDefaultBuiltinTypeRegistry@@,0x00edced4,0x00e4b81c@0x0,7,hkBuiltinTypeRegistry ; hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkBuiltinTypeRegistry@@@@,1
+hkDefaultClassNameRegistry,.?AVhkDefaultClassNameRegistry@@,0x00edfb38,0x00e57d88@0x0,11,hkDynamicClassNameRegistry ; hkClassNameRegistry ; hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkDefaultClassNameRegistry@@@@,1
+hkDefaultError,.?AVhkDefaultError@@,0x00edf90c,0x00e57318@0x0,9,hkError ; hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkError@@@@,1
+hkDummySingleton,.?AVhkDummySingleton@@,0x00edf99c,0x00e57290@0x0,4,hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkDummySingleton@@@@,1
+hkDynamicClassNameRegistry,.?AVhkDynamicClassNameRegistry@@,0x00edd0a0,0x00e4bbb4@0x0,11,hkClassNameRegistry ; hkReferencedObject ; hkBaseObject,0
+hkEntitySelectorAll@?A0x0875f0ce@@,.?AVhkEntitySelectorAll@?A0x0875f0ce@@,0x00eddacc,0x00e4f1c4@0x0,2,hkpSaveContactPointsUtil::EntitySelector,0
+hkEntitySelectorListed@?A0x0875f0ce@@,.?AVhkEntitySelectorListed@?A0x0875f0ce@@,0x00edda98,0x00e4f1d0@0x0,2,hkpSaveContactPointsUtil::EntitySelector,0
+hkError,.?AVhkError@@,0x00edf954,0x00e572f0@0x0,9,hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkError@@@@,1
+hkErrStream,.?AVhkErrStream@@,0x00edfa84,0x00e57b6c@0x0,3,hkOstream ; hkReferencedObject ; hkBaseObject,0
+hkFileSystem,.?AVhkFileSystem@@,0x00edfa0c,0x00e57258@0x0,6,hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkFileSystem@@@@,1
+hkHeightFieldRayForwardingCollector,.?AVhkHeightFieldRayForwardingCollector@@,0x00edf0f0,0x00e560b8@0x0,2,hkpRayHitCollector,0
+hkMemory,.?AVhkMemory@@,0x00ed6e68,0x00e57344@0x0,30,,0
+hkMoppBvTreeShapeBase,.?AVhkMoppBvTreeShapeBase@@,0x00ede76c,0x00e54680@0x0,12,hkpBvTreeShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkNativeFileSystem,.?AVhkNativeFileSystem@@,0x00edf9bc,0x00e57274@0x0,6,hkFileSystem ; hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkFileSystem@@@@,1
+hkOArchive,.?AVhkOArchive@@,0x00edfbe4,0x00e58054@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkObjectCopier,.?AVhkObjectCopier@@,0x00edd000,0x00e4bb3c@0x0,5,hkReferencedObject ; hkBaseObject,0
+hkOstream,.?AVhkOstream@@,0x00edfa6c,0x00e573d0@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkp3AxisSweep,.?AVhkp3AxisSweep@@,0x00e8031c,0x00dbe754@0x0,28,hkpBroadPhase ; hkReferencedObject ; hkBaseObject,0
+hkpAabbPhantom,.?AVhkpAabbPhantom@@,0x00ede210,0x00e52e98@0x0,13,hkpPhantom ; hkpWorldObject ; hkReferencedObject ; hkBaseObject,0
+hkpAction,.?AVhkpAction@@,0x00ed6f4c,0x00e18808@0x0,8,hkReferencedObject ; hkBaseObject,0
+hkpAllCdBodyPairCollector,.?AVhkpAllCdBodyPairCollector@@,0x00ed7458,0x00e18ef0@0x0,2,hkpCdBodyPairCollector,0
+hkpAllCdPointCollector,.?AVhkpAllCdPointCollector@@,0x00ed6d44,0x00e189e0@0x0,2,hkpCdPointCollector,0
+hkpAllRayHitCollector,.?AVhkpAllRayHitCollector@@,0x00ed6dbc,0x00e189c8@0x0,2,hkpRayHitCollector,0
+hkpAngularDashpotAction,.?AVhkpAngularDashpotAction@@,0x00edd7b0,0x00e4e7d0@0x0,8,hkpBinaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hkpBallAndSocketConstraintData,.?AVhkpBallAndSocketConstraintData@@,0x00eddea0,0x00e4fe1c@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpBallSocketChainData,.?AVhkpBallSocketChainData@@,0x00ede36c,0x00e539a4@0x0,13,hkpConstraintChainData ; hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpBinaryAction,.?AVhkpBinaryAction@@,0x00edd6d8,0x00e4e340@0x0,8,hkpAction ; hkReferencedObject ; hkBaseObject,0
+hkpBoxBoxAgent,.?AVhkpBoxBoxAgent@@,0x00edf1cc,0x00e56124@0x0,14,hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpBoxMotion,.?AVhkpBoxMotion@@,0x00edde84,0x00e4fc0c@0x0,25,hkpMotion ; hkReferencedObject ; hkBaseObject,0
+hkpBoxShape,.?AVhkpBoxShape@@,0x00edea08,0x00e552d4@0x0,16,hkpConvexShape ; hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpBreakableConstraintData,.?AVhkpBreakableConstraintData@@,0x00ede27c,0x00e537cc@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpBreakableListener,.?AVhkpBreakableListener@@,0x00ed71d4,0x00e18bf8@0x0,2,,0
+hkpBroadPhase,.?AVhkpBroadPhase@@,0x00e80338,0x00dbebfc@0x0,27,hkReferencedObject ; hkBaseObject,0
+hkpBroadPhaseBorder,.?AVhkpBroadPhaseBorder@@,0x00ed6c04,0x00e53350@0x0 0x00e53368@0x8 0x00e53374@0xc,5,hkReferencedObject ; hkBaseObject ; hkpWorldDeletionListener ; hkpPhantomOverlapListener,1
+hkpBroadPhaseBorderListener,.?AVhkpBroadPhaseBorderListener@@,0x00eddc50,0x00e4fb5c@0x0 0x00e4fb6c@0x8,3,hkReferencedObject ; hkBaseObject ; hkpBroadPhaseListener,1
+hkpBroadPhaseCastCollector,.?AVhkpBroadPhaseCastCollector@@,0x00ed6f20,0x00e1882c@0x0,2,,0
+hkpBroadPhaseListener,.?AVhkpBroadPhaseListener@@,0x00eddd48,0x00e4fab8@0x0,3,,0
+hkpBvAgent,.?AVhkpBvAgent@@,0x00edf628,0x00e56870@0x0,14,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpBvShape,.?AVhkpBvShape@@,0x00edea24,0x00e5536c@0x0,9,hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpBvTreeAgent,.?AVhkpBvTreeAgent@@,0x00edf820,0x00e56b38@0x0,14,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpBvTreeShape,.?AVhkpBvTreeShape@@,0x00ede790,0x00e5464c@0x0,12,hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpBvTreeStreamAgent,.?AVhkpBvTreeStreamAgent@@,0x00edf598,0x00e564fc@0x0,14,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpCachingShapePhantom,.?AVhkpCachingShapePhantom@@,0x00ed7550,0x00e1917c@0x0,16,hkpShapePhantom ; hkpPhantom ; hkpWorldObject ; hkReferencedObject ; hkBaseObject,0
+hkpCallbackConstraintMotor,.?AVhkpCallbackConstraintMotor@@,0x00edcd2c,0x00e50fa0@0x0,4,hkpLimitedForceConstraintMotor ; hkpConstraintMotor ; hkReferencedObject ; hkBaseObject,0
+hkpCapsuleCapsuleAgent,.?AVhkpCapsuleCapsuleAgent@@,0x00edf354,0x00e56304@0x0,14,hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpCapsuleShape,.?AVhkpCapsuleShape@@,0x00edea40,0x00e5542c@0x0,16,hkpConvexShape ; hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpCapsuleTriangleAgent,.?AVhkpCapsuleTriangleAgent@@,0x00edf3c8,0x00e56340@0x0,14,hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpCdBodyPairCollector,.?AVhkpCdBodyPairCollector@@,0x00ed6b6c,0x00e18af8@0x0,2,,0
+hkpCdPointCollector,.?AVhkpCdPointCollector@@,0x00ed6d6c,0x00e18aec@0x0,2,,0
+hkpCharacterMotion,.?AVhkpCharacterMotion@@,0x00eddb94,0x00e4f5ac@0x0,25,hkpMotion ; hkReferencedObject ; hkBaseObject,0
+hkpCharacterProxy,.?AVhkpCharacterProxy@@,0x00ed75e4,0x00e4efe8@0x0 0x00e4f000@0x8 0x00e4f018@0xc,5,hkReferencedObject ; hkBaseObject ; hkpEntityListener ; hkpPhantomListener,1
+hkpCharacterProxyListener,.?AVhkpCharacterProxyListener@@,0x00ed7678,0x00e193bc@0x0,6,,0
+hkpClosestCdPointCollector,.?AVhkpClosestCdPointCollector@@,0x00ed6d90,0x00e189d4@0x0,2,hkpCdPointCollector,0
+hkpClosestRayHitCollector,.?AVhkpClosestRayHitCollector@@,0x00ed6de0,0x00e189bc@0x0,2,hkpRayHitCollector,0
+hkpCollidableCollidableFilter,.?AVhkpCollidableCollidableFilter@@,0x00ed72f0,0x00e18d20@0x0,2,,0
+hkpCollisionAgent,.?AVhkpCollisionAgent@@,0x00edebc0,0x00e55a7c@0x0,14,hkReferencedObject ; hkBaseObject,0
+hkpCollisionDispatcher,.?AVhkpCollisionDispatcher@@,0x00edeb98,0x00e55a30@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpCollisionFilter,.?AVhkpCollisionFilter@@,0x00ed731c,0x00e557b8@0x0 0x00e557c8@0x8 0x00e557d4@0xc 0x00e557e8@0x10 0x00e557f4@0x14,4,hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter,1
+hkpCollisionFilterList,.?AVhkpCollisionFilterList@@,0x00edea60,0x00e554b0@0x0 0x00e554c0@0x8 0x00e554cc@0xc 0x00e554e0@0x10 0x00e554ec@0x14,4,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter,1
+hkpCollisionListener,.?AVhkpCollisionListener@@,0x00ed6ed4,0x00e18ad4@0x0,5,,0
+hkpConstrainedSystemFilter,.?AVhkpConstrainedSystemFilter@@,0x00edd7d8,0x00e4e82c@0x0 0x00e4e83c@0x8 0x00e4e848@0xc 0x00e4e85c@0x10 0x00e4e868@0x14 0x00e4e874@0x30,4,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter ; hkpConstraintListener,1
+hkpConstraintChainData,.?AVhkpConstraintChainData@@,0x00ede344,0x00e53934@0x0,13,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpConstraintChainInstance,.?AVhkpConstraintChainInstance@@,0x00eddfa8,0x00e511c8@0x0,7,hkpConstraintInstance ; hkReferencedObject ; hkBaseObject,0
+hkpConstraintChainInstanceAction,.?AVhkpConstraintChainInstanceAction@@,0x00eddffc,0x00e51c8c@0x0,8,hkpAction ; hkReferencedObject ; hkBaseObject,0
+hkpConstraintCollisionFilter,.?AVhkpConstraintCollisionFilter@@,0x00edda6c,0x00e4ef68@0x0 0x00e4ef78@0x8 0x00e4ef84@0xc 0x00e4ef98@0x10 0x00e4efa4@0x14 0x00e4efb0@0x40,4,hkpPairCollisionFilter ; hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter ; hkpConstraintListener,1
+hkpConstraintData,.?AVhkpConstraintData@@,0x00edb954,0x00e4f728@0x0,12,hkReferencedObject ; hkBaseObject,0
+hkpConstraintInstance,.?AVhkpConstraintInstance@@,0x00eddc2c,0x00e4f75c@0x0,7,hkReferencedObject ; hkBaseObject,0
+hkpConstraintListener,.?AVhkpConstraintListener@@,0x00edd804,0x00e4e81c@0x0,3,,0
+hkpConstraintMotor,.?AVhkpConstraintMotor@@,0x00edccd8,0x00e50f78@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpConstraintOwner,.?AVhkpConstraintOwner@@,0x00ede2d4,0x00e53894@0x0,7,hkReferencedObject ; hkBaseObject,0
+hkpContactMgr,.?AVhkpContactMgr@@,0x00edddfc,0x00dbe8f8@0x0,10,hkReferencedObject ; hkBaseObject,0
+hkpContactMgrFactory,.?AVhkpContactMgrFactory@@,0x00edddb4,0x00e4fa64@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpContinuousSimulation,.?AVhkpContinuousSimulation@@,0x00ede494,0x00dbeaec@0x0,18,hkpSimulation ; hkReferencedObject ; hkBaseObject,0
+hkpConvexListAgent,.?AVhkpConvexListAgent@@,0x00edf080,0x00e55e3c@0x0,15,hkpPredGskfAgent ; hkpGskfAgent ; hkpGskBaseAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpConvexListFilter,.?AVhkpConvexListFilter@@,0x00edddd8,0x00e4fa50@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpConvexListShape,.?AVhkpConvexListShape@@,0x00edea88,0x00e5554c@0x0 0x00e55590@0x14,16,hkpConvexShape ; hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpConvexPieceMeshShape,.?AVhkpConvexPieceMeshShape@@,0x00edeaac,0x00e555ec@0x0 0x00e55614@0x10,9,hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpConvexPieceShape,.?AVhkpConvexPieceShape@@,0x00edf8cc,0x00e56cac@0x0 0x00e56cf0@0x14,16,hkpConvexShape ; hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpConvexPieceStreamData,.?AVhkpConvexPieceStreamData@@,0x00e801f8,0x00dbe464@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpConvexShape,.?AVhkpConvexShape@@,0x00ed73ec,0x00e18d5c@0x0,16,hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpConvexTransformShape,.?AVhkpConvexTransformShape@@,0x00edead4,0x00e55664@0x0,16,hkpConvexShape ; hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpConvexTranslateShape,.?AVhkpConvexTranslateShape@@,0x00edeafc,0x00e556c4@0x0,16,hkpConvexShape ; hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpConvexVerticesConnectivity,.?AVhkpConvexVerticesConnectivity@@,0x00edeb24,0x00e5574c@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpConvexVerticesShape,.?AVhkpConvexVerticesShape@@,0x00ede720,0x00e54584@0x0,16,hkpConvexShape ; hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpCylinderShape,.?AVhkpCylinderShape@@,0x00edeb50,0x00e5580c@0x0,16,hkpConvexShape ; hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpDashpotAction,.?AVhkpDashpotAction@@,0x00edd828,0x00e4e8a0@0x0,8,hkpBinaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hkpDefaultConvexListFilter,.?AVhkpDefaultConvexListFilter@@,0x00eddcf4,0x00e4fb10@0x0,4,hkpConvexListFilter ; hkReferencedObject ; hkBaseObject,0
+hkpDefaultToiResourceMgr,.?AVhkpDefaultToiResourceMgr@@,0x00e80530,0x00dbf008@0x0,7,hkpToiResourceMgr ; hkReferencedObject ; hkBaseObject,0
+hkpDefaultWorldMaintenanceMgr,.?AVhkpDefaultWorldMaintenanceMgr@@,0x00ede61c,0x00e53c90@0x0,6,hkpWorldMaintenanceMgr ; hkReferencedObject ; hkBaseObject,0
+hkpDeferredConstraintOwner,.?AVhkpDeferredConstraintOwner@@,0x00ede698,0x00e53ce4@0x0,7,hkpConstraintOwner ; hkReferencedObject ; hkBaseObject,0
+hkpDisableEntityCollisionFilter,.?AVhkpDisableEntityCollisionFilter@@,0x00edd848,0x00e4e8f8@0x0 0x00e4e908@0x8 0x00e4e914@0xc 0x00e4e928@0x10 0x00e4e934@0x14 0x00e4e940@0x30,5,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter ; hkpEntityListener,1
+hkpDynamicsContactMgr,.?AVhkpDynamicsContactMgr@@,0x00ede51c,0x00e53b94@0x0,18,hkpContactMgr ; hkReferencedObject ; hkBaseObject,0
+hkpEntity,.?AVhkpEntity@@,0x00ed6fc4,0x00e4fbec@0x0,6,hkpWorldObject ; hkReferencedObject ; hkBaseObject,0
+hkpEntityDeactivator,.?AVhkpEntityDeactivator@@,0x00ede0f8,0x00e527d0@0x0,5,hkReferencedObject ; hkBaseObject,0
+hkpEntityEntityBroadPhaseListener,.?AVhkpEntityEntityBroadPhaseListener@@,0x00ede5ec,0x00e53c54@0x0 0x00e53c64@0x8,3,hkReferencedObject ; hkBaseObject ; hkpBroadPhaseListener,1
+hkpEntityListener,.?AVhkpEntityListener@@,0x00ed74ac,0x00e190c8@0x0,5,,0
+hkpExtendedMeshShape,.?AVhkpExtendedMeshShape@@,0x00ede8f0,0x00e54ac8@0x0 0x00e54af8@0x10,11,hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpFakeRigidBodyDeactivator,.?AVhkpFakeRigidBodyDeactivator@@,0x00ede0a4,0x00e52804@0x0,6,hkpRigidBodyDeactivator ; hkpEntityDeactivator ; hkReferencedObject ; hkBaseObject,0
+hkpFastMeshShape,.?AVhkpFastMeshShape@@,0x00ede6e0,0x00e54214@0x0 0x00e54240@0x10,10,hkpMeshShape ; hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpFixedRigidMotion,.?AVhkpFixedRigidMotion@@,0x00edde38,0x00e4fcdc@0x0,28,hkpKeyframedRigidMotion ; hkpMotion ; hkReferencedObject ; hkBaseObject,0
+hkpFlagCdBodyPairCollector,.?AVhkpFlagCdBodyPairCollector@@,0x00edf018,0x00e55ef4@0x0,2,hkpCdBodyPairCollector,0
+hkpGenericConstraintData,.?AVhkpGenericConstraintData@@,0x00ede2f8,0x00e538b4@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpGroupCollisionFilter,.?AVhkpGroupCollisionFilter@@,0x00edd878,0x00e4e998@0x0 0x00e4e9a8@0x8 0x00e4e9b4@0xc 0x00e4e9c8@0x10 0x00e4e9d4@0x14,4,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter,1
+hkpGroupFilter,.?AVhkpGroupFilter@@,0x00ede700,0x00e542bc@0x0 0x00e542d0@0x8 0x00e542dc@0xc 0x00e542f0@0x10 0x00e542fc@0x14,4,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter,1
+hkpGskBaseAgent,.?AVhkpGskBaseAgent@@,0x00edf0a4,0x00e55e00@0x0,14,hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpGskfAgent,.?AVhkpGskfAgent@@,0x00edf044,0x00e55e7c@0x0,14,hkpGskBaseAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpHeightFieldAgent,.?AVhkpHeightFieldAgent@@,0x00edf1a8,0x00e56004@0x0,14,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpHeightFieldShape,.?AVhkpHeightFieldShape@@,0x00ede838,0x00e547e4@0x0,11,hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpHingeConstraintData,.?AVhkpHingeConstraintData@@,0x00ede170,0x00e52a38@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpHingeLimitsData,.?AVhkpHingeLimitsData@@,0x00ede198,0x00e52a98@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpIslandActivationListener,.?AVhkpIslandActivationListener@@,0x00ed6aa8,0x00e4e6e0@0x0,3,,0
+hkpIterativeLinearCastAgent,.?AVhkpIterativeLinearCastAgent@@,0x00edf0c4,0x00e55dc4@0x0,14,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpKeyframedRigidMotion,.?AVhkpKeyframedRigidMotion@@,0x00eddb4c,0x00e4f684@0x0,27,hkpMotion ; hkReferencedObject ; hkBaseObject,0
+hkpLimitedForceConstraintMotor,.?AVhkpLimitedForceConstraintMotor@@,0x00edccfc,0x00e50f8c@0x0,4,hkpConstraintMotor ; hkReferencedObject ; hkBaseObject,0
+hkpLimitedHingeConstraintData,.?AVhkpLimitedHingeConstraintData@@,0x00edded0,0x00e4fefc@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpLinearParametricCurve,.?AVhkpLinearParametricCurve@@,0x00ede1bc,0x00e52b60@0x0,12,hkpParametricCurve ; hkReferencedObject ; hkBaseObject,0
+hkpListAgent,.?AVhkpListAgent@@,0x00edee6c,0x00e55d04@0x0,15,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpListShape,.?AVhkpListShape@@,0x00ed7254,0x00e54ffc@0x0 0x00e55024@0x10,9,hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpMalleableConstraintData,.?AVhkpMalleableConstraintData@@,0x00ede2a8,0x00e53800@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpMapPointsToSubShapeContactMgr,.?AVhkpMapPointsToSubShapeContactMgr@@,0x00edefb8,0x00dbe924@0x0,10,hkpContactMgr ; hkReferencedObject ; hkBaseObject,0
+hkpMaxSizeMotion,.?AVhkpMaxSizeMotion@@,0x00eddb74,0x00e4f614@0x0,27,hkpKeyframedRigidMotion ; hkpMotion ; hkReferencedObject ; hkBaseObject,0
+hkpMeshShape,.?AVhkpMeshShape@@,0x00ede6c4,0x00e55ae0@0x0 0x00e55b0c@0x10,10,hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpMoppAgent,.?AVhkpMoppAgent@@,0x00edf8b0,0x00e56bec@0x0,14,hkpBvTreeAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpMoppBvTreeShape,.?AVhkpMoppBvTreeShape@@,0x00ede748,0x00e546b4@0x0,12,hkMoppBvTreeShapeBase ; hkpBvTreeShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpMoppCode,.?AVhkpMoppCode@@,0x00ed740c,0x00dbe578@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpMoppModifier,.?AVhkpMoppModifier@@,0x00ede88c,0x00e548a0@0x0,3,,0
+hkpMotion,.?AVhkpMotion@@,0x00eddb34,0x00e4f474@0x0,25,hkReferencedObject ; hkBaseObject,0
+hkpMotorAction,.?AVhkpMotorAction@@,0x00edd8a0,0x00e4ea14@0x0,8,hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hkpMouseSpringAction,.?AVhkpMouseSpringAction@@,0x00edd8c0,0x00e4eae0@0x0,8,hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hkpMultiRayConvexAgent,.?AVhkpMultiRayConvexAgent@@,0x00edf4ec,0x00e56430@0x0,14,hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpMultiRayShape,.?AVhkpMultiRayShape@@,0x00ede7d8,0x00e54734@0x0,9,hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpMultiSphereAgent,.?AVhkpMultiSphereAgent@@,0x00edf6c8,0x00e56924@0x0,14,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpMultiSphereShape,.?AVhkpMultiSphereShape@@,0x00ede7f8,0x00e54784@0x0,11,hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpMultiSphereTriangleAgent,.?AVhkpMultiSphereTriangleAgent@@,0x00edf43c,0x00e563b8@0x0,14,hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpMultiThreadedSimulation,.?AVhkpMultiThreadedSimulation@@,0x00ede4bc,0x00e53a64@0x0,21,hkpContinuousSimulation ; hkpSimulation ; hkReferencedObject ; hkBaseObject,0
+hkpMultiThreadedSimulation::MtBroadPhaseBorderListener,.?AVMtBroadPhaseBorderListener@hkpMultiThreadedSimulation@@,0x00ede3b8,0x00e53adc@0x0,3,hkpBroadPhaseListener,0
+hkpMultiThreadedSimulation::MtEntityEntityBroadPhaseListener,.?AVMtEntityEntityBroadPhaseListener@hkpMultiThreadedSimulation@@,0x00ede448,0x00e53abc@0x0,3,hkpBroadPhaseListener,0
+hkpMultiThreadedSimulation::MtPhantomBroadPhaseListener,.?AVMtPhantomBroadPhaseListener@hkpMultiThreadedSimulation@@,0x00ede400,0x00e53acc@0x0,3,hkpBroadPhaseListener,0
+hkpNullAgent,.?AVhkpNullAgent@@,0x00edebe0,0x00e55a40@0x0,14,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpNullBroadPhaseListener,.?AVhkpNullBroadPhaseListener@@,0x00edeb70,0x00e5587c@0x0 0x00e5588c@0x8,3,hkReferencedObject ; hkBaseObject ; hkpBroadPhaseListener,1
+hkpNullCollisionFilter,.?AVhkpNullCollisionFilter@@,0x00eddd20,0x00e4fac8@0x0 0x00e4fad8@0x8 0x00e4fae4@0xc 0x00e4faf8@0x10 0x00e4fb04@0x14,4,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter,1
+hkpNullContactMgr,.?AVhkpNullContactMgr@@,0x00eddd94,0x00e4fa78@0x0,10,hkpContactMgr ; hkReferencedObject ; hkBaseObject,0
+hkpNullContactMgrFactory,.?AVhkpNullContactMgrFactory@@,0x00eddd6c,0x00e4faa4@0x0,4,hkpContactMgrFactory ; hkReferencedObject ; hkBaseObject,0
+hkpPairCollisionFilter,.?AVhkpPairCollisionFilter@@,0x00edda44,0x00e4f170@0x0 0x00e4f180@0x8 0x00e4f18c@0xc 0x00e4f1a0@0x10 0x00e4f1ac@0x14,4,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter,1
+hkpPairwiseCollisionFilter,.?AVhkpPairwiseCollisionFilter@@,0x00edd8e4,0x00e4eb58@0x0 0x00e4eb6c@0x8 0x00e4eb78@0xc 0x00e4eb8c@0x10 0x00e4eb98@0x14 0x00e4eba4@0x30,5,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter ; hkpEntityListener,1
+hkpParametricCurve,.?AVhkpParametricCurve@@,0x00edcb88,0x00e481d4@0x0,12,hkReferencedObject ; hkBaseObject,0
+hkpPhantom,.?AVhkpPhantom@@,0x00ed7598,0x00e190fc@0x0,13,hkpWorldObject ; hkReferencedObject ; hkBaseObject,0
+hkpPhantomAgent,.?AVhkpPhantomAgent@@,0x00edf78c,0x00e56ae4@0x0,14,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpPhantomBroadPhaseListener,.?AVhkpPhantomBroadPhaseListener@@,0x00eddc7c,0x00e4fb3c@0x0 0x00e4fb4c@0x8,3,hkReferencedObject ; hkBaseObject ; hkpBroadPhaseListener,1
+hkpPhantomListener,.?AVhkpPhantomListener@@,0x00ed74fc,0x00e19080@0x0,5,,0
+hkpPhantomOverlapListener,.?AVhkpPhantomOverlapListener@@,0x00ed6bb4,0x00e53384@0x0,3,,0
+hkpPhysicsData,.?AVhkpPhysicsData@@,0x00edd910,0x00e4ebe0@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpPhysicsSystem,.?AVhkpPhysicsSystem@@,0x00edd95c,0x00e4ec1c@0x0,5,hkReferencedObject ; hkBaseObject,0
+hkpPhysicsSystemWithContacts,.?AVhkpPhysicsSystemWithContacts@@,0x00edd930,0x00e4ec34@0x0,5,hkpPhysicsSystem ; hkReferencedObject ; hkBaseObject,0
+hkpPlaneShape,.?AVhkpPlaneShape@@,0x00ede81c,0x00e54814@0x0,11,hkpHeightFieldShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpPointToPathConstraintData,.?AVhkpPointToPathConstraintData@@,0x00edb974,0x00e52cfc@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpPointToPlaneConstraintData,.?AVhkpPointToPlaneConstraintData@@,0x00eddefc,0x00e50b90@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpPositionConstraintMotor,.?AVhkpPositionConstraintMotor@@,0x00ede1e4,0x00e52e54@0x0,4,hkpLimitedForceConstraintMotor ; hkpConstraintMotor ; hkReferencedObject ; hkBaseObject,0
+hkpPoweredChainData,.?AVhkpPoweredChainData@@,0x00ede320,0x00e5396c@0x0,13,hkpConstraintChainData ; hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpPoweredChainMapper,.?AVhkpPoweredChainMapper@@,0x00edd97c,0x00e4ecf8@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpPredGskfAgent,.?AVhkpPredGskfAgent@@,0x00edf060,0x00e55eb8@0x0,14,hkpGskfAgent ; hkpGskBaseAgent ; hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpPrismaticConstraintData,.?AVhkpPrismaticConstraintData@@,0x00eddc00,0x00e4f6f4@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpPulleyConstraintData,.?AVhkpPulleyConstraintData@@,0x00eddfd4,0x00e51238@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpRagdollConstraintData,.?AVhkpRagdollConstraintData@@,0x00ede02c,0x00e51d7c@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpRagdollLimitsData,.?AVhkpRagdollLimitsData@@,0x00ede054,0x00e52470@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpRayCollidableFilter,.?AVhkpRayCollidableFilter@@,0x00ed729c,0x00e18d2c@0x0,2,,0
+hkpRayHitCollector,.?AVhkpRayHitCollector@@,0x00ed6ff8,0x00e187dc@0x0,2,,0
+hkpRayShapeCollectionFilter,.?AVhkpRayShapeCollectionFilter@@,0x00ed72c4,0x00e18d14@0x0,2,,0
+hkpRejectRayChassisListener,.?AVhkpRejectRayChassisListener@@,0x00ee0198,0x00e5ae08@0x0 0x00e5ae18@0x8,3,hkReferencedObject ; hkBaseObject ; hkpPhantomOverlapListener,1
+hkpRemoveTerminalsMoppModifier,.?AVhkpRemoveTerminalsMoppModifier@@,0x00ede85c,0x00e548b0@0x0 0x00e548c0@0x8,3,hkReferencedObject ; hkBaseObject ; hkpMoppModifier,1
+hkpReorientAction,.?AVhkpReorientAction@@,0x00edd9c8,0x00e4ed74@0x0,8,hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hkpReportContactMgr,.?AVhkpReportContactMgr@@,0x00ede5c8,0x00e53bf4@0x0,18,hkpDynamicsContactMgr ; hkpContactMgr ; hkReferencedObject ; hkBaseObject,0
+hkpReportContactMgr::Factory,.?AVFactory@hkpReportContactMgr@@,0x00ede59c,0x00e53c40@0x0,4,hkpContactMgrFactory ; hkReferencedObject ; hkBaseObject,0
+hkpRigidBody,.?AVhkpRigidBody@@,0x00ed6fdc,0x00e187e8@0x0,7,hkpEntity ; hkpWorldObject ; hkReferencedObject ; hkBaseObject,0
+hkpRigidBodyDeactivator,.?AVhkpRigidBodyDeactivator@@,0x00ede0d0,0x00e527e8@0x0,6,hkpEntityDeactivator ; hkReferencedObject ; hkBaseObject,0
+hkpRotationalConstraintData,.?AVhkpRotationalConstraintData@@,0x00ede078,0x00e52780@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpSampledHeightFieldShape,.?AVhkpSampledHeightFieldShape@@,0x00ede944,0x00e54f54@0x0,13,hkpHeightFieldShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpSaveContactPointsUtil::EntitySelector,.?AVEntitySelector@hkpSaveContactPointsUtil@@,0x00eddafc,0x00e4f1b8@0x0,2,,0
+hkpSerializedAgentNnEntry,.?AUhkpSerializedAgentNnEntry@@,0x00edd728,0x00e4e6d0@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpSerializedDisplayMarker,.?AVhkpSerializedDisplayMarker@@,0x00edd9e8,0x00e4edb4@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpSerializedDisplayMarkerList,.?AVhkpSerializedDisplayMarkerList@@,0x00edda14,0x00e4edec@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpSerializedDisplayRbTransforms,.?AVhkpSerializedDisplayRbTransforms@@,0x00edd6f8,0x00e4e4d4@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpShape,.?AVhkpShape@@,0x00ed7218,0x00e18da0@0x0,9,hkReferencedObject ; hkBaseObject,0
+hkpShapeCollection,.?AVhkpShapeCollection@@,0x00ed7230,0x00e54928@0x0 0x00e54950@0x10,9,hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpShapeCollectionAgent,.?AVhkpShapeCollectionAgent@@,0x00edef04,0x00e569d8@0x0,14,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpShapeCollectionFilter,.?AVhkpShapeCollectionFilter@@,0x00ed7360,0x00e18ca4@0x0,4,,0
+hkpShapeContainer,.?AVhkpShapeContainer@@,0x00ed71f8,0x00e18d38@0x0,8,,0
+hkpShapePhantom,.?AVhkpShapePhantom@@,0x00ed7578,0x00e19134@0x0,16,hkpPhantom ; hkpWorldObject ; hkReferencedObject ; hkBaseObject,0
+hkpSimpleClosestContactCollector,.?AVhkpSimpleClosestContactCollector@@,0x00edefe8,0x00e55f00@0x0,2,hkpCdPointCollector,0
+hkpSimpleConstraintContactMgr,.?AVhkpSimpleConstraintContactMgr@@,0x00ede540,0x00e53b44@0x0,18,hkpDynamicsContactMgr ; hkpContactMgr ; hkReferencedObject ; hkBaseObject,0
+hkpSimpleConstraintContactMgr::Factory,.?AVFactory@hkpSimpleConstraintContactMgr@@,0x00ede4e8,0x00e53be0@0x0,4,hkpContactMgrFactory ; hkReferencedObject ; hkBaseObject,0
+hkpSimpleContactConstraintData,.?AVhkpSimpleContactConstraintData@@,0x00ede56c,0x00e53b04@0x0,14,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpSimpleMeshShape,.?AVhkpSimpleMeshShape@@,0x00ede8ac,0x00e54974@0x0 0x00e5499c@0x10,9,hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpSimpleShapePhantom,.?AVhkpSimpleShapePhantom@@,0x00ede11c,0x00e5286c@0x0,16,hkpShapePhantom ; hkpPhantom ; hkpWorldObject ; hkReferencedObject ; hkBaseObject,0
+hkpSimpleWorldRayCaster,.?AVhkpSimpleWorldRayCaster@@,0x00eddccc,0x00e4fb24@0x0,2,hkpBroadPhaseCastCollector,0
+hkpSimulation,.?AVhkpSimulation@@,0x00ede230,0x00e5302c@0x0,15,hkReferencedObject ; hkBaseObject,0
+hkpSimulationIsland,.?AVhkpSimulationIsland@@,0x00ede394,0x00e53a40@0x0,7,hkpConstraintOwner ; hkReferencedObject ; hkBaseObject,0
+hkpSingleShapeContainer,.?AVhkpSingleShapeContainer@@,0x00ede7b0,0x00e54628@0x0,8,hkpShapeContainer,0
+hkpSpatialRigidBodyDeactivator,.?AVhkpSpatialRigidBodyDeactivator@@,0x00ede140,0x00e529c4@0x0,6,hkpRigidBodyDeactivator ; hkpEntityDeactivator ; hkReferencedObject ; hkBaseObject,0
+hkpSphereBoxAgent,.?AVhkpSphereBoxAgent@@,0x00edf334,0x00e5628c@0x0,14,hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpSphereCapsuleAgent,.?AVhkpSphereCapsuleAgent@@,0x00edf258,0x00e5619c@0x0,14,hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpSphereMotion,.?AVhkpSphereMotion@@,0x00eddbe0,0x00e4f4dc@0x0,25,hkpMotion ; hkReferencedObject ; hkBaseObject,0
+hkpSphereRepShape,.?AVhkpSphereRepShape@@,0x00ed73cc,0x00e18e10@0x0,11,hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpSphereShape,.?AVhkpSphereShape@@,0x00ede8d0,0x00e54a44@0x0,16,hkpConvexShape ; hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpSphereSphereAgent,.?AVhkpSphereSphereAgent@@,0x00edf1ec,0x00e56160@0x0,14,hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpSphereTriangleAgent,.?AVhkpSphereTriangleAgent@@,0x00edf2c8,0x00e56214@0x0,14,hkpIterativeLinearCastAgent ; hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpSpringAction,.?AVhkpSpringAction@@,0x00edd6b8,0x00e4e364@0x0,8,hkpBinaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hkpSpringDamperConstraintMotor,.?AVhkpSpringDamperConstraintMotor@@,0x00ede24c,0x00e533c4@0x0,4,hkpLimitedForceConstraintMotor ; hkpConstraintMotor ; hkReferencedObject ; hkBaseObject,0
+hkpStabilizedBoxMotion,.?AVhkpStabilizedBoxMotion@@,0x00edde5c,0x00e4fc74@0x0,25,hkpBoxMotion ; hkpMotion ; hkReferencedObject ; hkBaseObject,0
+hkpStabilizedSphereMotion,.?AVhkpStabilizedSphereMotion@@,0x00eddbb8,0x00e4f544@0x0,25,hkpSphereMotion ; hkpMotion ; hkReferencedObject ; hkBaseObject,0
+hkpStiffSpringChainData,.?AVhkpStiffSpringChainData@@,0x00ede670,0x00e53cac@0x0,13,hkpConstraintChainData ; hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpStiffSpringConstraintData,.?AVhkpStiffSpringConstraintData@@,0x00eddf28,0x00e50d78@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpStorageExtendedMeshShape,.?AVhkpStorageExtendedMeshShape@@,0x00edec7c,0x00e55b9c@0x0 0x00e55bcc@0x10,11,hkpExtendedMeshShape ; hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpStorageExtendedMeshShape::MeshSubpartStorage,.?AUMeshSubpartStorage@hkpStorageExtendedMeshShape@@,0x00edec3c,0x00e55bf0@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpStorageExtendedMeshShape::ShapeSubpartStorage,.?AUShapeSubpartStorage@hkpStorageExtendedMeshShape@@,0x00edebfc,0x00e55c00@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpStorageMeshShape,.?AVhkpStorageMeshShape@@,0x00edecdc,0x00e55c10@0x0 0x00e55c3c@0x10,10,hkpMeshShape ; hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpStorageMeshShape::SubpartStorage,.?AUSubpartStorage@hkpStorageMeshShape@@,0x00edeca8,0x00e55c60@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpStorageSampledHeightFieldShape,.?AVhkpStorageSampledHeightFieldShape@@,0x00ede914,0x00e54f8c@0x0,13,hkpSampledHeightFieldShape ; hkpHeightFieldShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpSurfaceVelocityUtil,.?AVhkpSurfaceVelocityUtil@@,0x00edd9a0,0x00e4ed08@0x0 0x00e4ed18@0x8 0x00e4ed30@0xc,5,hkReferencedObject ; hkBaseObject ; hkpCollisionListener ; hkpEntityListener,1
+hkpSuspendInactiveAgentsUtil,.?AVhkpSuspendInactiveAgentsUtil@@,0x00ed6ad4,0x00e4e6fc@0x0 0x00e4e70c@0x8 0x00e4e71c@0xc,3,hkReferencedObject ; hkBaseObject ; hkpIslandActivationListener ; hkpWorldDeletionListener,1
+hkpSymmetricAgentFlipBodyCollector,.?AVhkpSymmetricAgentFlipBodyCollector@@,0x00eded64,0x00e55cf8@0x0,2,hkpCdBodyPairCollector,0
+hkpSymmetricAgentFlipCastCollector,.?AVhkpSymmetricAgentFlipCastCollector@@,0x00eded98,0x00e55cec@0x0,2,hkpCdPointCollector,0
+hkpSymmetricAgentFlipCollector,.?AVhkpSymmetricAgentFlipCollector@@,0x00ededcc,0x00e55ce0@0x0,2,hkpCdPointCollector,0
+hkpThinBoxMotion,.?AVhkpThinBoxMotion@@,0x00edde18,0x00e4fd54@0x0,25,hkpBoxMotion ; hkpMotion ; hkReferencedObject ; hkBaseObject,0
+hkpToiResourceMgr,.?AVhkpToiResourceMgr@@,0x00e80510,0x00dbefcc@0x0,7,hkReferencedObject ; hkBaseObject,0
+hkpTransformAgent,.?AVhkpTransformAgent@@,0x00edf76c,0x00e56a30@0x0,14,hkpCollisionAgent ; hkReferencedObject ; hkBaseObject,0
+hkpTransformShape,.?AVhkpTransformShape@@,0x00ede980,0x00e5505c@0x0,9,hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpTriangleShape,.?AVhkpTriangleShape@@,0x00ed73ac,0x00e18dcc@0x0,16,hkpConvexShape ; hkpSphereRepShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpTriSampledHeightFieldBvTreeShape,.?AVhkpTriSampledHeightFieldBvTreeShape@@,0x00ede9a0,0x00e550e8@0x0,12,hkpBvTreeShape ; hkpShape ; hkReferencedObject ; hkBaseObject,0
+hkpTriSampledHeightFieldCollection,.?AVhkpTriSampledHeightFieldCollection@@,0x00ede9d4,0x00e55168@0x0 0x00e55190@0x10,9,hkpShapeCollection ; hkpShape ; hkReferencedObject ; hkBaseObject ; hkpShapeContainer,1
+hkpTyremarksInfo,.?AVhkpTyremarksInfo@@,0x00ee01e4,0x00e5aefc@0x0,5,hkReferencedObject ; hkBaseObject,0
+hkpTyremarksWheel,.?AVhkpTyremarksWheel@@,0x00ee01c4,0x00e5af14@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpUnaryAction,.?AVhkpUnaryAction@@,0x00ed6e08,0x00e18998@0x0,8,hkpAction ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleAerodynamics,.?AVhkpVehicleAerodynamics@@,0x00ee0250,0x00e5b1d0@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpVehicleBrake,.?AVhkpVehicleBrake@@,0x00edc584,0x00e5b3c0@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpVehicleData,.?AVhkpVehicleData@@,0x00ee0204,0x00e5b154@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpVehicleDefaultAerodynamics,.?AVhkpVehicleDefaultAerodynamics@@,0x00ee0224,0x00e5b1e4@0x0,6,hkpVehicleAerodynamics ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleDefaultAnalogDriverInput,.?AVhkpVehicleDefaultAnalogDriverInput@@,0x00edc618,0x00e5b2e0@0x0,8,hkpVehicleDriverInput ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleDefaultBrake,.?AVhkpVehicleDefaultBrake@@,0x00edc5a4,0x00e5b3d4@0x0,4,hkpVehicleBrake ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleDefaultEngine,.?AVhkpVehicleDefaultEngine@@,0x00edc69c,0x00e5b560@0x0,4,hkpVehicleEngine ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleDefaultSteering,.?AVhkpVehicleDefaultSteering@@,0x00edcc58,0x00e5b7f8@0x0,5,hkpVehicleSteering ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleDefaultSuspension,.?AVhkpVehicleDefaultSuspension@@,0x00edc7d4,0x00e451c0@0x0,4,hkpVehicleSuspension ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleDefaultTransmission,.?AVhkpVehicleDefaultTransmission@@,0x00edc528,0x00e5b8c0@0x0,9,hkpVehicleTransmission ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleDefaultVelocityDamper,.?AVhkpVehicleDefaultVelocityDamper@@,0x00ee0278,0x00e5b95c@0x0,4,hkpVehicleVelocityDamper ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleDriverInput,.?AVhkpVehicleDriverInput@@,0x00edc5f4,0x00e5b2cc@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpVehicleDriverInputAnalogStatus,.?AVhkpVehicleDriverInputAnalogStatus@@,0x00edc778,0x00e451e8@0x0,4,hkpVehicleDriverInputStatus ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleDriverInputStatus,.?AVhkpVehicleDriverInputStatus@@,0x00edc7a8,0x00e451d4@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpVehicleEngine,.?AVhkpVehicleEngine@@,0x00edc67c,0x00e5b54c@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpVehicleInstance,.?AVhkpVehicleInstance@@,0x00edc484,0x00e5bc04@0x0,14,hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleRaycastWheelCollide,.?AVhkpVehicleRaycastWheelCollide@@,0x00edc714,0x00e5ae28@0x0,11,hkpVehicleWheelCollide ; hkReferencedObject ; hkBaseObject,0
+hkpVehicleSteering,.?AVhkpVehicleSteering@@,0x00edcc34,0x00e5b7e4@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpVehicleSuspension,.?AVhkpVehicleSuspension@@,0x00edc800,0x00e451ac@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpVehicleTransmission,.?AVhkpVehicleTransmission@@,0x00edc500,0x00e5b8ac@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpVehicleVelocityDamper,.?AVhkpVehicleVelocityDamper@@,0x00ee02a8,0x00e5b948@0x0,4,hkReferencedObject ; hkBaseObject,0
+hkpVehicleWheelCollide,.?AVhkpVehicleWheelCollide@@,0x00edc6ec,0x00e5ade8@0x0,7,hkReferencedObject ; hkBaseObject,0
+hkpVelocityConstraintMotor,.?AVhkpVelocityConstraintMotor@@,0x00eddf54,0x00e51040@0x0,4,hkpLimitedForceConstraintMotor ; hkpConstraintMotor ; hkReferencedObject ; hkBaseObject,0
+hkpWheelConstraintData,.?AVhkpWheelConstraintData@@,0x00eddf80,0x00e51168@0x0,12,hkpConstraintData ; hkReferencedObject ; hkBaseObject,0
+hkpWorld,.?AVhkpWorld@@,0x00ed6e9c,0x00e4fa40@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpWorldCinfo,.?AVhkpWorldCinfo@@,0x00ed6b30,0x00e18ac4@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkpWorldDeletionListener,.?AVhkpWorldDeletionListener@@,0x00ed6bdc,0x00e4e6f0@0x0,2,,0
+hkpWorldLinearCaster,.?AVhkpWorldLinearCaster@@,0x00eddca8,0x00e4fb30@0x0,2,hkpBroadPhaseCastCollector,0
+hkpWorldMaintenanceMgr,.?AVhkpWorldMaintenanceMgr@@,0x00ede648,0x00e53c74@0x0,6,hkReferencedObject ; hkBaseObject,0
+hkpWorldObject,.?AVhkpWorldObject@@,0x00ed6fa4,0x00e19218@0x0,5,hkReferencedObject ; hkBaseObject,0
+hkpWorldRayCaster,.?AVhkpWorldRayCaster@@,0x00ed6e28,0x00e1898c@0x0,2,hkpBroadPhaseCastCollector,0
+hkReferencedObject,.?AVhkReferencedObject@@,0x00ed6f80,0x00dbe454@0x0,3,hkBaseObject,0
+hkRelocationInfo::StringPool,.?AUStringPool@hkRelocationInfo@@,0x00edcfd4,0x00e4ba5c@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkRenamedClassNameRegistry,.?AVhkRenamedClassNameRegistry@@,0x00edcfa8,0x00e4ba40@0x0,6,hkClassNameRegistry ; hkReferencedObject ; hkBaseObject,0
+hkSeekableStreamReader,.?AVhkSeekableStreamReader@@,0x00edfc74,0x00e580d0@0x0,12,hkStreamReader ; hkReferencedObject ; hkBaseObject,0
+hkSocket,.?AVhkSocket@@,0x00edfd58,0x00e581a0@0x0,11,hkReferencedObject ; hkBaseObject,0
+hkSocket::ReaderAdapter,.?AVReaderAdapter@hkSocket@@,0x00edfd30,0x00e581d0@0x0,12,hkStreamReader ; hkReferencedObject ; hkBaseObject,0
+hkSocket::WriterAdapter,.?AVWriterAdapter@hkSocket@@,0x00edfd08,0x00e58204@0x0,9,hkStreamWriter ; hkReferencedObject ; hkBaseObject,0
+hkSplineParametricCurve,.?AVhkSplineParametricCurve@@,0x00edcb60,0x00e48208@0x0,13,hkpParametricCurve ; hkReferencedObject ; hkBaseObject,0
+hkStackTracer,.?AVhkStackTracer@@,0x00edf8f0,0x00e570f4@0x0,3,hkReferencedObject ; hkBaseObject,0
+hkStaticClassNameRegistry,.?AVhkStaticClassNameRegistry@@,0x00edcf5c,0x00e4b858@0x0,6,hkClassNameRegistry ; hkReferencedObject ; hkBaseObject,0
+hkStatisticsCollectorClassListener,.?AVhkStatisticsCollectorClassListener@@,0x00edfddc,0x00e582fc@0x0,4,hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkStatisticsCollectorClassListener@@@@,1
+hkStdioStreamReader,.?AVhkStdioStreamReader@@,0x00edfc50,0x00e58104@0x0,12,hkSeekableStreamReader ; hkStreamReader ; hkReferencedObject ; hkBaseObject,0
+hkStdioStreamWriter,.?AVhkStdioStreamWriter@@,0x00edfce4,0x00e58170@0x0,10,hkStreamWriter ; hkReferencedObject ; hkBaseObject,0
+hkStlDebugMemory,.?AVhkStlDebugMemory@@,0x00ed6e48,0x00e188f4@0x0,37,hkDebugMemory ; hkMemory,0
+hkStreamReader,.?AVhkStreamReader@@,0x00edfc9c,0x00e5809c@0x0,12,hkReferencedObject ; hkBaseObject,0
+hkStreamWriter,.?AVhkStreamWriter@@,0x00edfa28,0x00e5740c@0x0,9,hkReferencedObject ; hkBaseObject,0
+hkThreadMemory,.?AVhkThreadMemory@@,0x00ed76c4,0x00e19558@0x0,7,,0
+hkTraceStream,.?AVhkTraceStream@@,0x00edfc34,0x00e5808c@0x0,3,hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkTraceStream@@@@,1
+hkTypeInfoRegistry,.?AVhkTypeInfoRegistry@@,0x00edfb98,0x00e57db8@0x0,7,hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkTypeInfoRegistry@@@@,1
+hkVersionRegistry,.?AVhkVersionRegistry@@,0x00edd080,0x00e4bbe4@0x0,3,hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkVersionRegistry@@@@,1
+hkVtableClassRegistry,.?AVhkVtableClassRegistry@@,0x00edfad8,0x00e57d70@0x0,5,hkReferencedObject ; hkBaseObject ; ?$hkSingleton@VhkVtableClassRegistry@@@@,1
+horizontal_text_widget,.?AVhorizontal_text_widget@@,0x00ed7728,0x00e1a040@0x0,6,menu_widget,0
+horizontal_yes_no_widget,.?AVhorizontal_yes_no_widget@@,0x00ed8478,0x00e231fc@0x0,6,horizontal_text_widget ; menu_widget,0
+hostage_diversion_instance,.?AVhostage_diversion_instance@@,0x00ed5ddc,0x00df5714@0x0,19,diversion_instance,0
+hostage_diversion_type_info,.?AVhostage_diversion_type_info@@,0x00ed5e08,0x00df5684@0x0,35,diversion_type_info,0
+human,.?AVhuman@@,0x00edbad0,0x00e3c714@0x0,12,object,0
+human_character,.?AVhuman_character@@,0x00ed6a88,0x00e0db80@0x0,4,character,0
+human_enemy_objective,.?AVhuman_enemy_objective@@,0x00ed4d40,0x00de91bc@0x0,22,heli_objective,0
+human_torch_event,.?AVhuman_torch_event@@,0x00ed4ef8,0x00deaaec@0x0,6,,0
+human_torch_info,.?AVhuman_torch_info@@,0x00ed4eb8,0x00dea50c@0x0,26,activity_info,0
+human_torch_instance,.?AVhuman_torch_instance@@,0x00ed4e94,0x00dea578@0x0,11,activity_instance,0
+human_torch_level_instance,.?AVhuman_torch_level_instance@@,0x00ed4e68,0x00dea5ac@0x0,21,activity_level_instance,0
+human_torch_race,.?AVhuman_torch_race@@,0x00ed4ed8,0x00deab08@0x0,6,human_torch_event,0
+hydraulics_compressor,.?AVhydraulics_compressor@@,0x00eda828,0x00e2bb54@0x0,4,compressor,0
+IAllocator,.?AVIAllocator@@,0x00ed40ac,0x00ddca1c@0x0,10,,0
+IDirect3DDevice9,.?AUIDirect3DDevice9@@,0x00edff60,,0,,
+IDirect3DDevice9Lost,.?AVIDirect3DDevice9Lost@@,0x00edff80,0x00e584a4@0x0,119,IDirect3DDevice9 ; IUnknown,0
+IDirect3DIndexBuffer9,.?AUIDirect3DIndexBuffer9@@,0x00edfe64,,0,,
+IDirect3DResource9,.?AUIDirect3DResource9@@,0x00edfec0,,0,,
+IDirect3DVertexBuffer9,.?AUIDirect3DVertexBuffer9@@,0x00edfee4,,0,,
+image_writer,.?AVimage_writer@@,0x00ee017c,0x00e5ace4@0x0,8,,0
+inventory_item,.?AUinventory_item@@,0x00ed83b4,0x00e20304@0x0,9,object,0
+item_multi_registration,.?AVitem_multi_registration@@,0x00ed9280,0x00e2972c@0x0,22,multi_core_object_registration,0
+IUnknown,.?AUIUnknown@@,0x00edfea8,,0,,
+killed_data_compressor,.?AVkilled_data_compressor@@,0x00ed9a38,0x00e2aea4@0x0,4,compressor,0
+large_convoy_objective,.?AVlarge_convoy_objective@@,0x00ed4cf4,0x00de927c@0x0,22,heli_objective,0
+liberator_objective,.?AVliberator_objective@@,0x00ed4cac,0x00de933c@0x0,22,heli_objective,0
+list_interface,.?AVlist_interface@@,0x00edc148,0x00e44180@0x0,5,,0
+lookat_compressor,.?AVlookat_compressor@@,0x00ed98e4,0x00e2afa8@0x0,4,compressor,0
+mempool,.?AVmempool@@,0x00ed3f28,0x00e58cd4@0x0,25,static_mempool_base ; mempool_base,0
+mempool_base,.?AVmempool_base@@,0x00ed3ee8,0x00e58c8c@0x0,17,,0
+menu_widget,.?AVmenu_widget@@,0x00ed4abc,0x00de6708@0x0,5,,0
+migrate_give_functor,.?AUmigrate_give_functor@@,0x00edbde4,0x00e3e9d8@0x0,1,for_each_functor_base,0
+misc_data_compressor,.?AVmisc_data_compressor@@,0x00ed9f50,0x00e2b40c@0x0,4,compressor,0
+mover_data_compressor,.?AVmover_data_compressor@@,0x00ed95a0,0x00e2abd0@0x0,4,compressor,0
+mover_multi_registration,.?AVmover_multi_registration@@,0x00ed9578,0x00e2abe4@0x0,22,multi_core_object_registration,0
+mp3_playlist,.?AVmp3_playlist@@,0x00ed69b4,0x00e018d0@0x0,8,,0
+mp_bh_activity_brawl_host_instance,.?AVmp_bh_activity_brawl_host_instance@@,0x00edaecc,0x00e2e3a4@0x0,22,mp_bh_activity_host_instance,0
+mp_bh_activity_brawl_info,.?AVmp_bh_activity_brawl_info@@,0x00edaf00,0x00e2e38c@0x0,5,mp_bh_activity_info,0
+mp_bh_activity_brawl_participant_instance,.?AVmp_bh_activity_brawl_participant_instance@@,0x00edae94,0x00e2e404@0x0,27,mp_bh_activity_participant_instance,0
+mp_bh_activity_derby_host_instance,.?AVmp_bh_activity_derby_host_instance@@,0x00edaf94,0x00e2e864@0x0,22,mp_bh_activity_host_instance,0
+mp_bh_activity_derby_info,.?AVmp_bh_activity_derby_info@@,0x00edafc8,0x00e2e84c@0x0,5,mp_bh_activity_info,0
+mp_bh_activity_derby_participant_instance,.?AVmp_bh_activity_derby_participant_instance@@,0x00edaf5c,0x00e2e8c4@0x0,31,mp_bh_activity_participant_instance,0
+mp_bh_activity_fraud_host_instance,.?AVmp_bh_activity_fraud_host_instance@@,0x00edb028,0x00e2f11c@0x0,22,mp_bh_activity_host_instance,0
+mp_bh_activity_fraud_info,.?AVmp_bh_activity_fraud_info@@,0x00edb05c,0x00e2f104@0x0,5,mp_bh_activity_info,0
+mp_bh_activity_fraud_participant_instance,.?AVmp_bh_activity_fraud_participant_instance@@,0x00edaff0,0x00e2f17c@0x0,30,mp_bh_activity_participant_instance,0
+mp_bh_activity_hitman_host_instance,.?AVmp_bh_activity_hitman_host_instance@@,0x00edb0c0,0x00e2f534@0x0,22,mp_bh_activity_host_instance,0
+mp_bh_activity_hitman_info,.?AVmp_bh_activity_hitman_info@@,0x00edb11c,0x00e2f514@0x0,5,mp_bh_activity_info,0
+mp_bh_activity_hitman_participant_instance,.?AVmp_bh_activity_hitman_participant_instance@@,0x00edb084,0x00e2f594@0x0,27,mp_bh_activity_participant_instance,0
+mp_bh_activity_host_instance,.?AVmp_bh_activity_host_instance@@,0x00edabfc,0x00e2d35c@0x0,22,,0
+mp_bh_activity_info,.?AVmp_bh_activity_info@@,0x00edac28,0x00e2d344@0x0,5,,0
+mp_bh_activity_mayhem_host_instance,.?AVmp_bh_activity_mayhem_host_instance@@,0x00edb184,0x00e2faf4@0x0,22,mp_bh_activity_host_instance,0
+mp_bh_activity_mayhem_info,.?AVmp_bh_activity_mayhem_info@@,0x00edb1b8,0x00e2fadc@0x0,5,mp_bh_activity_info,0
+mp_bh_activity_mayhem_participant_instance,.?AVmp_bh_activity_mayhem_participant_instance@@,0x00edb148,0x00e2fb54@0x0,30,mp_bh_activity_participant_instance,0
+mp_bh_activity_participant_instance,.?AVmp_bh_activity_participant_instance@@,0x00edaf28,0x00e2e31c@0x0,27,,0
+mp_bh_activity_racing_host_instance,.?AVmp_bh_activity_racing_host_instance@@,0x00edb1e4,0x00e301ec@0x0,22,mp_bh_activity_host_instance,0
+mp_bh_activity_racing_info,.?AVmp_bh_activity_racing_info@@,0x00edb254,0x00e30164@0x0,5,mp_bh_activity_info,0
+mp_bh_activity_racing_participant_instance,.?AVmp_bh_activity_racing_participant_instance@@,0x00edb218,0x00e3017c@0x0,27,mp_bh_activity_participant_instance,0
+mp_bh_activity_snatch_host_instance,.?AVmp_bh_activity_snatch_host_instance@@,0x00edb280,0x00e30cc4@0x0,24,mp_bh_activity_host_instance,0
+mp_bh_activity_snatch_info,.?AVmp_bh_activity_snatch_info@@,0x00edb2f0,0x00e30c3c@0x0,5,mp_bh_activity_info,0
+mp_bh_activity_snatch_participant_instance,.?AVmp_bh_activity_snatch_participant_instance@@,0x00edb2b4,0x00e30c54@0x0,27,mp_bh_activity_participant_instance,0
+mp_bh_activity_trafficking_host_instance,.?AVmp_bh_activity_trafficking_host_instance@@,0x00edb31c,0x00e31314@0x0,22,mp_bh_activity_host_instance,0
+mp_bh_activity_trafficking_info,.?AVmp_bh_activity_trafficking_info@@,0x00edb354,0x00e312fc@0x0,5,mp_bh_activity_info,0
+mp_bh_activity_trafficking_participant_instance,.?AVmp_bh_activity_trafficking_participant_instance@@,0x00edb384,0x00e3128c@0x0,27,mp_bh_activity_participant_instance,0
+mp_bh_custom_match_activities,.?AVmp_bh_custom_match_activities@@,0x00edad1c,0x00e2dac8@0x0,3,mp_bh_custom_match_category,0
+mp_bh_custom_match_category,.?AVmp_bh_custom_match_category@@,0x00edad74,0x00e2daa8@0x0,3,,0
+mp_bh_custom_match_extra,.?AVmp_bh_custom_match_extra@@,0x00edac4c,0x00e2db18@0x0,3,mp_bh_custom_match_category,0
+mp_bh_custom_match_general,.?AVmp_bh_custom_match_general@@,0x00edad48,0x00e2dab8@0x0,3,mp_bh_custom_match_category,0
+mp_bh_custom_match_info,.?AVmp_bh_custom_match_info@@,0x00edacf4,0x00e2dad8@0x0,3,mp_bh_custom_match_category,0
+mp_bh_custom_match_tags,.?AVmp_bh_custom_match_tags@@,0x00edac74,0x00e2db08@0x0,3,mp_bh_custom_match_category,0
+mp_bh_custom_match_vehicles,.?AVmp_bh_custom_match_vehicles@@,0x00edac9c,0x00e2daf8@0x0,3,mp_bh_custom_match_category,0
+mp_bh_custom_match_weapons,.?AVmp_bh_custom_match_weapons@@,0x00edacc8,0x00e2dae8@0x0,3,mp_bh_custom_match_category,0
+mp_hitman_target_instance,.?AVmp_hitman_target_instance@@,0x00edb0f4,0x00e2f52c@0x0,1,,0
+mugging_diversion_type,.?AVmugging_diversion_type@@,0x00ed5e34,0x00df5784@0x0,35,diversion_type_info,0
+multi_core_object_registration,.?AVmulti_core_object_registration@@,0x00ed8d3c,0x00e27e7c@0x0,22,,0
+multi_game_havok_corrector,.?AVmulti_game_havok_corrector@@,0x00ed8ce0,0x00e277cc@0x0,8,hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+multi_human_state,.?AUmulti_human_state@@,0x00ed8e90,0x00e27fd8@0x0,1,,0
+multi_npc_state,.?AVmulti_npc_state@@,0x00ed8f08,0x00e2882c@0x0,4,multi_human_state,0
+multi_player_state,.?AVmulti_player_state@@,0x00ed8eb0,0x00e27fd0@0x0,1,multi_human_state,0
+multi_session_base,.?AVmulti_session_base@@,0x00ed8c50,0x00e26924@0x0,21,,0
+multi_session_info_base,.?AVmulti_session_info_base@@,0x00ed68b0,0x00dffd54@0x0,12,,0
+MyAction,.?AVMyAction@@,0x00ed6c4c,0x00e18a3c@0x0,8,hkpUnaryAction ; hkpAction ; hkReferencedObject ; hkBaseObject,0
+MyCharacterListener,.?AVMyCharacterListener@@,0x00ed76a0,0x00e19380@0x0 0x00e19390@0x8,6,hkReferencedObject ; hkBaseObject ; hkpCharacterProxyListener,1
+nav_finder@?8??crib_store_enter@@YAXXZ@,.?AUnav_finder@?8??crib_store_enter@@YAXXZ@,0x00ed8320,0x00e1fa68@0x0,1,for_each_functor_base,0
+near_miss_complication,.?AVnear_miss_complication@@,0x00ed6660,0x00dfe4ec@0x0,14,drive_complication ; complication,0
+NearestHitCollector@?A0x58d253bd@@,.?AUNearestHitCollector@?A0x58d253bd@@,0x00eded34,0x00e55c70@0x0,2,hkpRayHitCollector,0
+NeverCollideFilter@?A0xd7aebf48@@,.?AVNeverCollideFilter@?A0xd7aebf48@@,0x00edd780,0x00e4e728@0x0 0x00e4e738@0x8 0x00e4e744@0xc 0x00e4e758@0x10 0x00e4e764@0x14,4,hkpCollisionFilter ; hkReferencedObject ; hkBaseObject ; hkpCollidableCollidableFilter ; hkpShapeCollectionFilter ; hkpRayShapeCollectionFilter ; hkpRayCollidableFilter,1
+notoriety_spawn_group,.?AVnotoriety_spawn_group@@,0x00edb71c,0x00e397a4@0x0,30,special_vehicle_spawn_group,0
+notoriety_spawn_group_gang,.?AVnotoriety_spawn_group_gang@@,0x00edb694,0x00e39924@0x0,30,notoriety_spawn_group ; special_vehicle_spawn_group,0
+notoriety_spawn_group_police,.?AVnotoriety_spawn_group_police@@,0x00edb6f0,0x00e39824@0x0,30,notoriety_spawn_group ; special_vehicle_spawn_group,0
+notoriety_spawn_group_police_heli,.?AVnotoriety_spawn_group_police_heli@@,0x00edb6c0,0x00e398a4@0x0,30,notoriety_spawn_group ; special_vehicle_spawn_group,0
+npc,.?AVnpc@@,0x00edbabc,0x00e3c748@0x0,12,human ; object,0
+npc_fast_data_compressor,.?AVnpc_fast_data_compressor@@,0x00ed992c,0x00e2af80@0x0,4,compressor,0
+npc_havok_weapon_compressor,.?AVnpc_havok_weapon_compressor@@,0x00ed97f0,0x00e2b00c@0x0,4,compressor,0
+npc_multi_registration,.?AVnpc_multi_registration@@,0x00ed9954,0x00e2af24@0x0,22,multi_core_object_registration,0
+npc_orientation_heading_compressor,.?AVnpc_orientation_heading_compressor@@,0x00ed98b0,0x00e2afbc@0x0,4,compressor,0
+npc_orientation_quaternion_compressor,.?AVnpc_orientation_quaternion_compressor@@,0x00ed987c,0x00e2afd0@0x0,4,compressor,0
+npc_slow_data_compressor,.?AVnpc_slow_data_compressor@@,0x00ed9904,0x00e2af94@0x0,4,compressor,0
+npc_spline_pathfind_compressed,.?AVnpc_spline_pathfind_compressed@@,0x00ed981c,0x00e2aff8@0x0,4,compressor,0
+npc_spline_pathfind_uncompressed,.?AVnpc_spline_pathfind_uncompressed@@,0x00ed984c,0x00e2afe4@0x0,4,compressor,0
+numerical_slider_widget,.?AVnumerical_slider_widget@@,0x00ed76e4,0x00e1a074@0x0,5,menu_widget,0
+object,.?AVobject@@,0x00ed4018,0x00ddbc64@0x0,9,,0
+object_collector,.?AVobject_collector@@,0x00ed6b94,0x00e18a94@0x0,2,hkpCdBodyPairCollector,0
+object_debris,.?AVobject_debris@@,0x00edb740,0x00e39b30@0x0,9,object,0
+object_item,.?AVobject_item@@,0x00edb7bc,0x00e39f34@0x0,9,object,0
+object_mover,.?AVobject_mover@@,0x00edbb78,0x00e3e15c@0x0,17,object,0
+object_prop,.?AVobject_prop@@,0x00edb7d8,0x00e3a1c8@0x0,9,object,0
+orientation_heading_compressor,.?AVorientation_heading_compressor@@,0x00ed8524,0x00e2653c@0x0,4,compressor,0
+orientation_quaternion_compressor,.?AVorientation_quaternion_compressor@@,0x00ed84f4,0x00e26550@0x0,4,compressor,0
+ovl_activity_type,.?AVovl_activity_type@@,0x00ed7790,0x00e1a8c0@0x0,7,ovl_base,0
+ovl_base,.?AVovl_base@@,0x00ed45bc,0x00de02c8@0x0,7,,0
+ovl_buysell,.?AVovl_buysell@@,0x00ed77b0,0x00e1a8e0@0x0,7,ovl_base,0
+ovl_chat_message,.?AVovl_chat_message@@,0x00ed77cc,0x00e1aa04@0x0,7,ovl_base,0
+ovl_customize_remote,.?AVovl_customize_remote@@,0x00ed843c,0x00e21664@0x0,7,ovl_base,0
+ovl_framerate,.?AVovl_framerate@@,0x00ed45a0,0x00de02e8@0x0,7,ovl_base,0
+ovl_garage,.?AVovl_garage@@,0x00ed4aa0,0x00de66bc@0x0,7,ovl_base,0
+ovl_hair_salon,.?AVovl_hair_salon@@,0x00ed8394,0x00e1fc2c@0x0,7,ovl_base,0
+ovl_ingame_main_menu,.?AVovl_ingame_main_menu@@,0x00ed776c,0x00e1a7a8@0x0,7,ovl_base,0
+ovl_login,.?AVovl_login@@,0x00ed7a4c,0x00e1aba0@0x0,7,ovl_base,0
+ovl_message,.?AVovl_message@@,0x00ed68d8,0x00e1abc0@0x0,7,ovl_base,0
+ovl_pending_message,.?AVovl_pending_message@@,0x00ed68f4,0x00dffd34@0x0,7,ovl_message ; ovl_base,0
+ovl_selection_menu,.?AVovl_selection_menu@@,0x00ed7f24,0x00e1aeac@0x0,7,ovl_base,0
+ovl_text_entry,.?AVovl_text_entry@@,0x00ed7f48,0x00e1aecc@0x0,7,ovl_base,0
+ovl_unlockable,.?AVovl_unlockable@@,0x00ed7f90,0x00e1b2d0@0x0,7,ovl_base,0
+page_mempool,.?AVpage_mempool@@,0x00ee0140,0x00e5ac64@0x0,25,static_mempool_base ; mempool_base,0
+parking_spot,.?AVparking_spot@@,0x00edb8f8,0x00e3a6c0@0x0,6,script_positionable_object ; script_object,0
+pc_multi_session,.?AVpc_multi_session@@,0x00ed8c74,0x00e2698c@0x0,21,multi_session_base,0
+pc_multi_session_info,.?AVpc_multi_session_info@@,0x00ed688c,0x00dffd88@0x0,12,multi_session_info_base,0
+pcharNode,.?AVpcharNode@@,0x00e81ab0,0x00dc545c@0x0,3,DNameNode,0
+pDNameNode,.?AVpDNameNode@@,0x00e81a74,0x00dc543c@0x0,3,DNameNode,0
+pending_menu_widget,.?AVpending_menu_widget@@,0x00ed6918,0x00dffd1c@0x0,5,menu_widget,0
+pimping_info,.?AVpimping_info@@,0x00ed64e4,0x00dfc524@0x0,26,activity_info,0
+pimping_instance,.?AVpimping_instance@@,0x00ed64c4,0x00dfc590@0x0,11,activity_instance,0
+pimping_level_instance,.?AVpimping_level_instance@@,0x00ed649c,0x00dfc5c4@0x0,21,activity_level_instance,0
+pipebomb_multi_registration,.?AVpipebomb_multi_registration@@,0x00ed9ca8,0x00e2b1a4@0x0,22,multi_core_object_registration,0
+piracy_info,.?AVpiracy_info@@,0x00ed4f38,0x00deb384@0x0,26,activity_info,0
+piracy_instance,.?AVpiracy_instance@@,0x00ed4f18,0x00deb3f0@0x0,11,activity_instance,0
+piracy_level_instance,.?AVpiracy_level_instance@@,0x00ed4f54,0x00deb32c@0x0,21,activity_level_instance,0
+player,.?AVplayer@@,0x00edbae4,0x00e3cc50@0x0,12,human ; object,0
+player_data_compressor,.?AVplayer_data_compressor@@,0x00eda00c,0x00e2b3a8@0x0,4,compressor,0
+player_multi_registration,.?AVplayer_multi_registration@@,0x00ed9f28,0x00e2b424@0x0,22,multi_core_object_registration,0
+player_ragdolling_compressor,.?AVplayer_ragdolling_compressor@@,0x00ed9fe0,0x00e2b3bc@0x0,4,compressor,0
+poker_diversion_instance,.?AVpoker_diversion_instance@@,0x00ed62ac,0x00df99b4@0x0,22,diversion_instance,0
+poker_diversion_type_info,.?AVpoker_diversion_type_info@@,0x00ed62d4,0x00df9924@0x0,35,diversion_type_info,0
+projectile,.?AVprojectile@@,0x00edb914,0x00e3a6f8@0x0,9,object,0
+prop_multi_registration,.?AVprop_multi_registration@@,0x00eda278,0x00e2b5c4@0x0,22,multi_core_object_registration,0
+r_distant_ped_mesh_inst,.?AVr_distant_ped_mesh_inst@@,0x00ed47f4,0x00de265c@0x0,15,rl_lod_mesh_inst ; rl_mesh_inst ; rl_renderable_inst ; rl_renderable_base_inst,0
+r_distant_vehicle_headlight_inst,.?AVr_distant_vehicle_headlight_inst@@,0x00edcea4,0x00e4b4d4@0x0,9,rl_renderable_base_inst,0
+r_dynamic_license_plate_inst,.?AVr_dynamic_license_plate_inst@@,0x00edcb34,0x00e481ac@0x0,9,rl_renderable_base_inst,0
+r_dynamic_water_detailed_inst,.?AVr_dynamic_water_detailed_inst@@,0x00edce1c,0x00e4af6c@0x0,9,rl_renderable_base_inst,0
+r_dynamic_water_simple_inst,.?AVr_dynamic_water_simple_inst@@,0x00edcdf0,0x00e4af94@0x0,9,rl_renderable_base_inst,0
+r_particle_inst,.?AVr_particle_inst@@,0x00ed461c,0x00de05f8@0x0,9,rl_renderable_base_inst,0
+r_particle_ribbon_inst,.?AVr_particle_ribbon_inst@@,0x00ed45f4,0x00de0620@0x0,9,rl_renderable_base_inst,0
+r_tree_inst,.?AVr_tree_inst@@,0x00edc3cc,0x00e448a4@0x0,9,rl_renderable_base_inst,0
+racing_activity_info,.?AVracing_activity_info@@,0x00ed4fd0,0x00deb464@0x0,26,activity_info,0
+racing_activity_instance,.?AVracing_activity_instance@@,0x00ed4fa8,0x00deb4d0@0x0,11,activity_instance,0
+racing_activity_level_instance,.?AVracing_activity_level_instance@@,0x00ed4f78,0x00deb504@0x0,21,activity_level_instance,0
+racing_diversion_instance,.?AVracing_diversion_instance@@,0x00ed5e5c,0x00df58a4@0x0,21,diversion_instance,0
+racing_diversion_type_info,.?AVracing_diversion_type_info@@,0x00ed5e84,0x00df5814@0x0,35,diversion_type_info,0
+rails_compressed,.?AVrails_compressed@@,0x00eda8a0,0x00e2bb18@0x0,4,compressor,0
+rails_uncompressed,.?AVrails_uncompressed@@,0x00eda8c0,0x00e2bb04@0x0,4,compressor,0
+reflection_data_base,.?AVreflection_data_base@@,0x00ed4970,0x00de2994@0x0,2,,0
+reflection_data_vehicle,.?AVreflection_data_vehicle@@,0x00ed4948,0x00de29a0@0x0,2,reflection_data_base,0
+reflection_data_water,.?AVreflection_data_water@@,0x00ed4924,0x00de29ac@0x0,2,reflection_data_base,0
+rl_animated_mesh_inst,.?AVrl_animated_mesh_inst@@,0x00ed4838,0x00de25f4@0x0,15,rl_variant_mesh_inst ; rl_lod_mesh_inst ; rl_mesh_inst ; rl_renderable_inst ; rl_renderable_base_inst,0
+rl_container_inst,.?AVrl_container_inst@@,0x00edba10,0x00e3c0a4@0x0,9,rl_renderable_base_inst,0
+rl_decal_inst,.?AVrl_decal_inst@@,0x00ed481c,0x00de2634@0x0,9,rl_renderable_inst ; rl_renderable_base_inst,0
+rl_lod_mesh_inst,.?AVrl_lod_mesh_inst@@,0x00ed4880,0x00de2574@0x0,15,rl_mesh_inst ; rl_renderable_inst ; rl_renderable_base_inst,0
+rl_mesh_inst,.?AVrl_mesh_inst@@,0x00ed48a0,0x00de253c@0x0,13,rl_renderable_inst ; rl_renderable_base_inst,0
+rl_morph_mesh_inst,.?AVrl_morph_mesh_inst@@,0x00edff3c,0x00e58464@0x0,15,rl_variant_mesh_inst ; rl_lod_mesh_inst ; rl_mesh_inst ; rl_renderable_inst ; rl_renderable_base_inst,0
+rl_renderable_base_inst,.?AVrl_renderable_base_inst@@,0x00ed463c,0x00de05d0@0x0,9,,0
+rl_renderable_inst,.?AVrl_renderable_inst@@,0x00ed48bc,0x00de2514@0x0,9,rl_renderable_base_inst,0
+rl_variant_mesh_inst,.?AVrl_variant_mesh_inst@@,0x00ed485c,0x00de25b4@0x0,15,rl_lod_mesh_inst ; rl_mesh_inst ; rl_renderable_inst ; rl_renderable_base_inst,0
+rocket_multi_registration,.?AVrocket_multi_registration@@,0x00eda4b8,0x00e2b75c@0x0,22,multi_core_object_registration,0
+RotateNormalHitCollector@?A0x58d253bd@@,.?AURotateNormalHitCollector@?A0x58d253bd@@,0x00eded00,0x00e55c7c@0x0,2,hkpRayHitCollector,0
+safecracking_diversion_type_info,.?AVsafecracking_diversion_type_info@@,0x00ed5eb0,0x00df5984@0x0,35,diversion_type_info,0
+satellite_objective,.?AVsatellite_objective@@,0x00ed4e44,0x00de8f7c@0x0,22,heli_objective,0
+save_game_functor@?1??save_triggers@@YAXPAUbb_save_game@@_N@Z@,.?AUsave_game_functor@?1??save_triggers@@YAXPAUbb_save_game@@_N@Z@,0x00ed6940,0x00e008d0@0x0,1,for_each_functor_base,0
+scheduling_trigger,.?AVscheduling_trigger@@,0x00edfff4,0x00e58c74@0x0,5,trigger_base,0
+script_cover_node,.?AVscript_cover_node@@,0x00edbd9c,0x00e3e3a8@0x0,4,c_cover_node ; script_object,1
+script_group,.?AVscript_group@@,0x00edbeb4,0x00e42fb8@0x0,4,script_object,0
+script_group_object,.?AVscript_group_object@@,0x00edbed0,0x00e42fd4@0x0,14,script_streamable_object ; script_positionable_object ; script_object,0
+script_interior,.?AUscript_interior@@,0x00edbef4,0x00e430e0@0x0,4,script_object,0
+script_item,.?AVscript_item@@,0x00edbf14,0x00e43154@0x0,14,script_group_object ; script_streamable_object ; script_positionable_object ; script_object,0
+script_mover,.?AUscript_mover@@,0x00edbf30,0x00e431d0@0x0,14,script_streamable_object ; script_positionable_object ; script_object,0
+script_navpoint,.?AUscript_navpoint@@,0x00edbf8c,0x00e43264@0x0,4,script_object,0
+script_npc,.?AVscript_npc@@,0x00edbfac,0x00e43554@0x0,14,script_group_object ; script_streamable_object ; script_positionable_object ; script_object,0
+script_object,.?AVscript_object@@,0x00edb8b0,0x00e3e3bc@0x0,4,,0
+script_path,.?AVscript_path@@,0x00edbfc8,0x00e435a0@0x0,4,script_object,0
+script_positionable_object,.?AVscript_positionable_object@@,0x00edb8cc,0x00e435b4@0x0,6,script_object,0
+script_respawn,.?AVscript_respawn@@,0x00edbfe4,0x00e4362c@0x0,6,script_positionable_object ; script_object,0
+script_searchlight,.?AVscript_searchlight@@,0x00edc004,0x00e436d0@0x0,14,script_streamable_object ; script_positionable_object ; script_object,0
+script_spawn_region,.?AVscript_spawn_region@@,0x00edc028,0x00e4380c@0x0,4,script_object,0
+script_streamable_object,.?AVscript_streamable_object@@,0x00edbdbc,0x00e3e7a4@0x0,14,script_positionable_object ; script_object,0
+script_trigger,.?AVscript_trigger@@,0x00edc0e4,0x00e43ef4@0x0 0x00e43f1c@0xb4,14,object ; script_streamable_object ; script_positionable_object ; script_object,1
+script_vehicle,.?AVscript_vehicle@@,0x00edc104,0x00e4408c@0x0,14,script_group_object ; script_streamable_object ; script_positionable_object ; script_object,0
+scripted_gang_fight_objective,.?AVscripted_gang_fight_objective@@,0x00ed4c80,0x00de939c@0x0,22,heli_objective,0
+searchlight,.?AVsearchlight@@,0x00edb938,0x00e3a9bc@0x0,10,object,0
+security_info,.?AVsecurity_info@@,0x00ed503c,0x00dece74@0x0,26,activity_info,0
+security_instance,.?AVsecurity_instance@@,0x00ed501c,0x00decee0@0x0,11,activity_instance,0
+security_level_instance,.?AVsecurity_level_instance@@,0x00ed4ff4,0x00decf14@0x0,21,activity_level_instance,0
+sewage_info,.?AVsewage_info@@,0x00ed509c,0x00ded4dc@0x0,26,activity_info,0
+sewage_instance,.?AVsewage_instance@@,0x00ed507c,0x00ded548@0x0,11,activity_instance,0
+sewage_level_instance,.?AVsewage_level_instance@@,0x00ed5058,0x00ded57c@0x0,21,activity_level_instance,0
+skirmish_spawn_group,.?AVskirmish_spawn_group@@,0x00ed4b28,0x00de7a8c@0x0,27,special_vehicle_spawn_group,0
+slider_widget,.?AVslider_widget@@,0x00ed770c,0x00e1a05c@0x0,5,menu_widget,0
+special_vehicle_spawn_group,.?AVspecial_vehicle_spawn_group@@,0x00ed4afc,0x00e3a9ec@0x0,27,,0
+split_page_mempool,.?AVsplit_page_mempool@@,0x00ee00f0,0x00e5a6c4@0x0,30,static_mempool_base ; mempool_base,0
+static_mempool_base,.?AVstatic_mempool_base@@,0x00ed3f04,0x00e59484@0x0,20,mempool_base,0
+std::__non_rtti_object,.?AV__non_rtti_object@std@@,0x00e80b28,0x00dbf41c@0x0,3,std::bad_typeid ; std::exception,0
+std::bad_alloc,.?AVbad_alloc@std@@,0x00edfe48,0x00dbf214@0x0,2,std::exception,0
+std::bad_cast,.?AVbad_cast@std@@,0x00e80aec,0x00dbf404@0x0,2,std::exception,0
+std::bad_exception,.?AVbad_exception@std@@,0x00e81820,0x00dc4308@0x0,2,std::exception,0
+std::bad_typeid,.?AVbad_typeid@std@@,0x00e80b08,0x00dbf410@0x0,2,std::exception,0
+std::codecvt_base,.?AVcodecvt_base@std@@,0x00ed43e4,0x00dde608@0x0,4,std::locale::facet,0
+std::ctype_base,.?AUctype_base@std@@,0x00ed41ac,0x00dde228@0x0,1,std::locale::facet,0
+std::exception,.?AVexception@std@@,0x00edfe2c,0x00dbf3e4@0x0,2,,0
+std::invalid_argument,.?AVinvalid_argument@std@@,0x00e805ac,0x00dbf234@0x0,2,std::logic_error ; std::exception,0
+std::ios_base,.?AVios_base@std@@,0x00ed42b8,0x00dde1cc@0x0,1,?$_Iosb@H@std@@,0
+std::ios_base::failure,.?AVfailure@ios_base@std@@,0x00ed416c,0x00dde260@0x0,3,std::runtime_error ; stdext::exception,0
+std::istrstream,.?AVistrstream@std@@,0x00ed40ec,0x00dde2ac@0x5c,1,?$basic_istream@DU?$char_traits@D@std@@@std@@ ; ?$basic_ios@DU?$char_traits@D@std@@@std@@ ; std::ios_base ; ?$_Iosb@H@std@@,0
+std::length_error,.?AVlength_error@std@@,0x00ed42f4,0x00dde69c@0x0,3,std::logic_error ; stdext::exception,0
+std::locale::_Locimp,.?AV_Locimp@locale@std@@,0x00e80584,0x00dbf228@0x0,1,std::locale::facet,0
+std::locale::facet,.?AVfacet@locale@std@@,0x00ed41cc,0x00dbf220@0x0,1,,0
+std::logic_error,.?AVlogic_error@std@@,0x00ed4314,0x00dde68c@0x0,3,stdext::exception,0
+std::out_of_range,.?AVout_of_range@std@@,0x00ed42d4,0x00dde6ac@0x0,3,std::logic_error ; stdext::exception,0
+std::runtime_error,.?AVruntime_error@std@@,0x00ed414c,0x00dde2e8@0x0,3,stdext::exception,0
+std::strstreambuf,.?AVstrstreambuf@std@@,0x00ed410c,0x00dde270@0x0,14,?$basic_streambuf@DU?$char_traits@D@std@@@std@@,0
+stdext::bad_alloc,.?AVbad_alloc@stdext@@,0x00ed40cc,0x00dde2d8@0x0,3,stdext::exception,0
+stdext::exception,.?AVexception@stdext@@,0x00ed412c,0x00dde2c8@0x0,3,,0
+steering_acceleration_compressor,.?AVsteering_acceleration_compressor@@,0x00eda870,0x00e2bb2c@0x0,4,compressor,0
+stick_compressor,.?AVstick_compressor@@,0x00ed9fa0,0x00e2b3e4@0x0,4,compressor,0
+stick_rotation_complication,.?AVstick_rotation_complication@@,0x00ed6608,0x00dfe564@0x0,14,combo_complication ; complication,0
+sticky_data_compressor,.?AVsticky_data_compressor@@,0x00ed9c80,0x00e2b200@0x0,4,compressor,0
+stop_complication,.?AVstop_complication@@,0x00ed6714,0x00dfe3c0@0x0,14,drive_complication ; complication,0
+streaking_diversion_instance,.?AVstreaking_diversion_instance@@,0x00ed5ee0,0x00df5d4c@0x0,19,diversion_instance,0
+streaking_diversion_type,.?AVstreaking_diversion_type@@,0x00ed5f0c,0x00df5cbc@0x0,35,diversion_type_info,0
+stream_resource_post_load_data,.?AUstream_resource_post_load_data@@,0x00ed3f84,0x00dda824@0x0,1,,0
+streamman_animation_loading_info,.?AUstreamman_animation_loading_info@@,0x00edc1d0,0x00e44780@0x0,2,streamman_resource_loading_info_base,0
+streamman_chunk_extras_loading_info,.?AUstreamman_chunk_extras_loading_info@@,0x00edc304,0x00e44738@0x0,2,streamman_resource_loading_info_base,0
+streamman_chunk_geom_loading_info,.?AUstreamman_chunk_geom_loading_info@@,0x00edc368,0x00e44720@0x0,2,streamman_resource_loading_info_base,0
+streamman_chunk_peg_loading_info,.?AUstreamman_chunk_peg_loading_info@@,0x00edc338,0x00e4472c@0x0,2,streamman_resource_loading_info_base,0
+streamman_peg_loading_info,.?AUstreamman_peg_loading_info@@,0x00edc2d8,0x00e44744@0x0,2,streamman_resource_loading_info_base,0
+streamman_resource_character_loading_info,.?AUstreamman_resource_character_loading_info@@,0x00edc26c,0x00e4475c@0x0,2,streamman_resource_loading_info_base,0
+streamman_resource_loading_info_base,.?AUstreamman_resource_loading_info_base@@,0x00edc398,0x00e44714@0x0,2,,0
+streamman_resource_logo_loading_info,.?AUstreamman_resource_logo_loading_info@@,0x00edc238,0x00e44768@0x0,2,streamman_resource_loading_info_base,0
+streamman_resource_vehicle_loading_info,.?AUstreamman_resource_vehicle_loading_info@@,0x00edc200,0x00e44774@0x0,2,streamman_resource_loading_info_base,0
+streamman_static_mesh_loading_info,.?AUstreamman_static_mesh_loading_info@@,0x00edc2a4,0x00e44750@0x0,2,streamman_resource_loading_info_base,0
+string_hash_table,.?AVstring_hash_table@@,0x00ee00d0,0x00e5959c@0x0,25,string_pool ; mempool ; static_mempool_base ; mempool_base,0
+string_pool,.?AVstring_pool@@,0x00ed3f40,0x00dda834@0x0,25,mempool ; static_mempool_base ; mempool_base,0
+stub_multi_session,.?AVstub_multi_session@@,0x00ed8c94,0x00e26a1c@0x0,27,multi_session_base,0
+stub_multi_session_info,.?AVstub_multi_session_info@@,0x00ed8cb8,0x00e269e4@0x0,12,multi_session_info_base,0
+stunt_back_seat_driver_diversion_type,.?AVstunt_back_seat_driver_diversion_type@@,0x00ed5f34,0x00df5e54@0x0,35,diversion_type_info,0
+stunt_drifting_diversion_type,.?AVstunt_drifting_diversion_type@@,0x00ed5fa8,0x00df630c@0x0,35,diversion_type_info,0
+stunt_hydraulics_diversion_type,.?AVstunt_hydraulics_diversion_type@@,0x00ed5fd4,0x00df64d4@0x0,35,diversion_type_info,0
+stunt_jumping_diversion_type,.?AVstunt_jumping_diversion_type@@,0x00ed5f68,0x00df619c@0x0,35,diversion_type_info,0
+stunt_low_flying_diversion_type,.?AVstunt_low_flying_diversion_type@@,0x00ed6004,0x00df65dc@0x0,35,diversion_type_info,0
+stunt_near_miss_diversion_type,.?AVstunt_near_miss_diversion_type@@,0x00ed6034,0x00df6724@0x0,35,diversion_type_info,0
+stunt_oncoming_traffic_diversion_type,.?AVstunt_oncoming_traffic_diversion_type@@,0x00ed6064,0x00df685c@0x0,35,diversion_type_info,0
+stunt_peel_out_diversion_type,.?AVstunt_peel_out_diversion_type@@,0x00ed6098,0x00df6994@0x0,35,diversion_type_info,0
+stunt_wheels_diversion_type,.?AVstunt_wheels_diversion_type@@,0x00ed60c4,0x00df6b1c@0x0,35,diversion_type_info,0
+supported_by_car_compressor,.?AVsupported_by_car_compressor@@,0x00ed9f74,0x00e2b3f8@0x0,4,compressor,0
+survival_diversion_instance,.?AVsurvival_diversion_instance@@,0x00ed60f0,0x00df7154@0x0,21,diversion_instance,0
+survival_diversion_type_info,.?AVsurvival_diversion_type_info@@,0x00ed611c,0x00df70c4@0x0,35,diversion_type_info,0
+tagging_diversion_type_info,.?AVtagging_diversion_type_info@@,0x00ed6148,0x00df77ec@0x0,35,diversion_type_info,0
+taunting_diversion_type,.?AVtaunting_diversion_type@@,0x00ed61a0,0x00df7a14@0x0,35,diversion_type_info,0
+taxi_diversion_instance,.?AVtaxi_diversion_instance@@,0x00ed61c8,0x00df8b1c@0x0,20,diversion_instance,0
+taxi_diversion_type_info,.?AVtaxi_diversion_type_info@@,0x00ed61f0,0x00df8a8c@0x0,35,diversion_type_info,0
+text_widget,.?AVtext_widget@@,0x00ed7750,0x00e1a028@0x0,5,menu_widget,0
+thin_control,.?AVthin_control@@,0x00ed80b8,0x00e1b3f0@0x0,5,,0
+thin_control_color_picker,.?AVthin_control_color_picker@@,0x00ed7fd4,0x00e1b480@0x0,5,thin_control_group ; thin_control,0
+thin_control_group,.?AVthin_control_group@@,0x00ed8020,0x00e1b450@0x0,5,thin_control,0
+thin_control_list_box,.?AVthin_control_list_box@@,0x00ed7fb0,0x00e1b498@0x0,5,thin_control,0
+thin_control_slider,.?AVthin_control_slider@@,0x00ed7ffc,0x00e1b468@0x0,5,thin_control,0
+thin_control_text,.?AVthin_control_text@@,0x00ed8098,0x00e1b408@0x0,5,thin_control,0
+thin_control_text_button,.?AVthin_control_text_button@@,0x00ed8070,0x00e1b420@0x0,5,thin_control_text ; thin_control,0
+thin_control_toggle_button,.?AVthin_control_toggle_button@@,0x00ed8044,0x00e1b438@0x0,5,thin_control,0
+tow_truck_diversion_instance,.?AVtow_truck_diversion_instance@@,0x00ed6218,0x00df9164@0x0,19,diversion_instance,0
+tow_truck_diversion_type_info,.?AVtow_truck_diversion_type_info@@,0x00ed6244,0x00df90d4@0x0,35,diversion_type_info,0
+tracked_mempool,.?AVtracked_mempool@@,0x00ee00b0,0x00e594dc@0x0,29,mempool ; static_mempool_base ; mempool_base,0
+trafficking_info,.?AVtrafficking_info@@,0x00ed6524,0x00dfd154@0x0,26,activity_info,0
+trafficking_instance,.?AVtrafficking_instance@@,0x00ed6500,0x00dfd1c0@0x0,11,activity_instance,0
+trafficking_level_instance,.?AVtrafficking_level_instance@@,0x00ed6544,0x00dfd0f4@0x0,23,activity_level_instance,0
+trailer_data_compressor,.?AVtrailer_data_compressor@@,0x00eda800,0x00e2bb68@0x0,4,compressor,0
+trigger_base,.?AVtrigger_base@@,0x00ee0034,0x00e58c44@0x0,5,,0
+trigger_multi_registration,.?AVtrigger_multi_registration@@,0x00eda510,0x00e2b8b4@0x0,22,multi_core_object_registration,0
+trip_complication,.?AVtrip_complication@@,0x00ed6798,0x00dfe264@0x0,16,complication,0
+type_info,.?AVtype_info@@,0x00e80694,0x00dbf37c@0x0,1,,0
+ValidatedClassNameRegistry,.?AVValidatedClassNameRegistry@@,0x00edd020,0x00e4bbf4@0x0,11,hkDynamicClassNameRegistry ; hkClassNameRegistry ; hkReferencedObject ; hkBaseObject,0
+vandalism_info,.?AVvandalism_info@@,0x00ed6594,0x00dfdbcc@0x0,26,activity_info,0
+vandalism_instance,.?AVvandalism_instance@@,0x00ed6570,0x00dfdc38@0x0,11,activity_instance,0
+vandalism_level_instance,.?AVvandalism_level_instance@@,0x00ed65e0,0x00dfdb04@0x0,21,activity_level_instance,0
+vandalism_news_spawn_group,.?AVvandalism_news_spawn_group@@,0x00ed65b4,0x00dfdb5c@0x0,27,special_vehicle_spawn_group,0
+vector2_compressor,.?AVvector2_compressor@@,0x00ed8578,0x00e26514@0x0,4,compressor,0
+vector3_compressor,.?AVvector3_compressor@@,0x00ed859c,0x00e26500@0x0,4,compressor,0
+vector3_uncompressed,.?AVvector3_uncompressed@@,0x00ed8554,0x00e26528@0x0,4,compressor,0
+vehicle,.?AVvehicle@@,0x00edcaf4,0x00e465cc@0x0,9,object,0
+vehicle_aerolight_manager,.?AVvehicle_aerolight_manager@@,0x00edc9a4,0x00e46874@0x0,21,vehicle_light_manager,0
+vehicle_brakelight_manager,.?AVvehicle_brakelight_manager@@,0x00edca7c,0x00e466b4@0x0,21,vehicle_light_manager,0
+vehicle_headlight_manager,.?AVvehicle_headlight_manager@@,0x00edcaa8,0x00e4664c@0x0,24,vehicle_light_manager,0
+vehicle_hit_points_compressor,.?AVvehicle_hit_points_compressor@@,0x00eda908,0x00e2badc@0x0,4,vehicle_killed_data_compressor ; compressor,0
+vehicle_kill_objective,.?AVvehicle_kill_objective@@,0x00ed4dd8,0x00de903c@0x0,22,heli_objective,0
+vehicle_killed_data_compressor,.?AVvehicle_killed_data_compressor@@,0x00eda934,0x00e2bac8@0x0,4,compressor,0
+vehicle_light_manager,.?AVvehicle_light_manager@@,0x00edcad0,0x00e465f4@0x0,21,,0
+vehicle_multi_registration,.?AVvehicle_multi_registration@@,0x00eda964,0x00e2ba6c@0x0,22,multi_core_object_registration,0
+vehicle_post_load_data,.?AUvehicle_post_load_data@@,0x00edc904,0x00e461b0@0x0,1,stream_resource_post_load_data,0
+vehicle_protect_objective,.?AVvehicle_protect_objective@@,0x00ed4db0,0x00de909c@0x0,22,heli_objective,0
+vehicle_reverselight_manager,.?AVvehicle_reverselight_manager@@,0x00edca24,0x00e4676c@0x0,21,vehicle_light_manager,0
+vehicle_runninglight_manager,.?AVvehicle_runninglight_manager@@,0x00edc9cc,0x00e4681c@0x0,21,vehicle_light_manager,0
+vehicle_sirenlight_manager,.?AVvehicle_sirenlight_manager@@,0x00edc9f8,0x00e467c4@0x0,21,vehicle_light_manager,0
+vehicle_surfing_style_two_diversion_type_info,.?AVvehicle_surfing_style_two_diversion_type_info@@,0x00ed6270,0x00df946c@0x0,35,diversion_type_info,0
+vehicle_turn_signal_manager,.?AVvehicle_turn_signal_manager@@,0x00edca50,0x00e4670c@0x0,22,vehicle_light_manager,0
+vint_callback,.?AVvint_callback@@,0x00edd18c,0x00e4cebc@0x0,6,,0
+vint_callback_lua,.?AVvint_callback_lua@@,0x00edd16c,0x00e4ced8@0x0,12,vint_callback,0
+vint_callback_native,.?AVvint_callback_native@@,0x00edd360,0x00e4d800@0x0,7,vint_callback,0
+vint_element_base,.?AVvint_element_base@@,0x00edd254,0x00e4d274@0x0,46,vint_object_base,0
+vint_element_bitmap,.?AVvint_element_bitmap@@,0x00edd3c4,0x00e4d85c@0x0,56,vint_element_base ; vint_object_base,0
+vint_element_bitmap_circle,.?AVvint_element_bitmap_circle@@,0x00edd5c0,0x00e4df54@0x0,58,vint_element_base ; vint_object_base,0
+vint_element_clip,.?AVvint_element_clip@@,0x00edd554,0x00e4de34@0x0,50,vint_element_base ; vint_object_base,0
+vint_element_gradient,.?AVvint_element_gradient@@,0x00edd42c,0x00e4d9cc@0x0,72,vint_element_bitmap ; vint_element_base ; vint_object_base,0
+vint_element_group,.?AVvint_element_group@@,0x00edd230,0x00e4d334@0x0,46,vint_element_base ; vint_object_base,0
+vint_element_point,.?AVvint_element_point@@,0x00edd4f0,0x00e4dd4c@0x0,46,vint_element_base ; vint_object_base,0
+vint_element_sr2_map,.?AVvint_element_sr2_map@@,0x00edd630,0x00e4e074@0x0,50,vint_element_base ; vint_object_base,0
+vint_element_text,.?AVvint_element_text@@,0x00edd490,0x00e4dbf4@0x0,78,vint_element_base ; vint_object_base,0
+vint_element_video,.?AVvint_element_video@@,0x00edd694,0x00e4e174@0x0,48,vint_element_base ; vint_object_base,0
+vint_object_animation,.?AVvint_object_animation@@,0x00edd2dc,0x00e4d454@0x0,17,vint_object_base,0
+vint_object_base,.?AVvint_object_base@@,0x00edd274,0x00e4d240@0x0,11,,0
+vint_object_factory,.?AVvint_object_factory@@,0x00edd20c,0x00e4d3f0@0x0,6,,0
+vint_object_tween,.?AVvint_object_tween@@,0x00edd340,0x00e4d734@0x0,43,vint_object_base,0
+vint_resource_bitmap,.?AVvint_resource_bitmap@@,0x00edd1a8,0x00e4d234@0x0,2,,0
+virtual_mempool,.?AVvirtual_mempool@@,0x00ee0090,0x00e593a4@0x0,25,static_mempool_base ; mempool_base,0
+whoring_diversion_type_info,.?AVwhoring_diversion_type_info@@,0x00ed62fc,0x00df9d1c@0x0,35,diversion_type_info,0
+widget_activities,.?AVwidget_activities@@,0x00ed80f8,0x00e1caec@0x0,5,menu_widget,0
+widget_divider,.?AVwidget_divider@@,0x00ed8138,0x00e1cb80@0x0,5,menu_widget,0
+widget_info,.?AVwidget_info@@,0x00ed8174,0x00e1ce58@0x0,5,menu_widget,0
+widget_messages_list,.?AVwidget_messages_list@@,0x00ed81b4,0x00e1cf20@0x0,5,menu_widget,0
+widget_messages_title,.?AVwidget_messages_title@@,0x00ed8190,0x00e1cf38@0x0,5,widget_messages_list ; menu_widget,0
+widget_objectives_list,.?AVwidget_objectives_list@@,0x00ed81d8,0x00e1d17c@0x0,5,menu_widget,0
+widget_story,.?AVwidget_story@@,0x00ed8200,0x00e1d1fc@0x0,5,menu_widget,0
+widget_tabbar,.?AVwidget_tabbar@@,0x00ed8158,0x00e1ce70@0x0,5,menu_widget,0
+widget_tagging,.?AVwidget_tagging@@,0x00ed8118,0x00e1cb98@0x0,5,menu_widget,0
+windshield_cannon_diversion_type_info,.?AVwindshield_cannon_diversion_type_info@@,0x00ed6328,0x00df9e84@0x0,39,diversion_type_info,0
+zombie_info,.?AVzombie_info@@,0x00ed50fc,0x00dede3c@0x0,27,activity_info,0
+zombie_instance,.?AVzombie_instance@@,0x00ed50dc,0x00dedeac@0x0,11,activity_instance,0
+zombie_level_instance,.?AVzombie_level_instance@@,0x00ed50b8,0x00dededc@0x0,21,activity_level_instance,0

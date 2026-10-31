@@ -37,7 +37,7 @@ original. The standalone build can move to 64-bit later.
 
 ## Milestones
 1. ✅ Unpack DRM and get a clean exe for static analysis.
-2. ✅ Ghidra baseline: startup chain, window, D3D and input entry points (docs/analysis/00_initial_overview.md). ⏳ Still to do: RTTI class list.
+2. ✅ Ghidra baseline: startup chain, window, D3D and input entry points (docs/analysis/00_initial_overview.md). RTTI class list: `docs/rtti_classes.csv` (1,062 classes with vtables and bases, `tools/rtti_dump.py`), grouped by subsystem in `docs/analysis/03_rtti_classes.md`.
 3. ✅ Rust workspace and toolchain; hook DLL (proxy `dinput8.dll`) loads in-game (log: `exe base 0x400000`).
 4. ✅ `sr2-formats::vpp`: parses all 18 shipped archives (`cargo run --release -p sr2-formats --example vpp -- check <dir>/*.vpp_pc`). ⏳ Still to do: map the in-game loader.
 5. ✅ First Rust replacement: `hash_filename_ci` @0xBF2BD0 → `sr2_formats::hash` (self-tested against the original in-process; main menu loads).
@@ -52,4 +52,5 @@ original. The standalone build can move to 64-bit later.
 14. ✅ Save tested: a new save slot written through the Rust `file_open` loads back fine, so writes are on Rust too. Menu input: Esc opens the pause menu, Ctrl/Shift switch tabs, arrow keys are extended scancodes.
 15. ✅ Temp unmount (`0xC0B8E0` plus record unregister `0xC0B2A0`) → Rust. All three unmounts in a save load leave the same state as the original's (`golden/temp_unmounts.txt`).
 16. ✅ `file_write` @0xBFE360 and `file_close` @0xBFDF30 → Rust. A save written and closed by Rust loads back, and 9,770 distinct closes match the original. The whole file API (open/resolve/read/write/close) is now Rust.
-17. Next: the stream layer underneath (`0xC18450` packfile read, `0xC18500` OS read, `0xC18300`/`0xC181C0` source open), or move on to the RTTI class list to pick the next subsystem.
+17. ✅ RTTI class map (`docs/analysis/03_rtti_classes.md`): 517 game classes across objects, memory pools, streaming, renderer, D3D wrappers, vint UI, scripting, activities, multiplayer; about 305 Havok.
+18. Next subsystem, by the class map: memory pools (`mempool_base` family), then the streamer (`streamman_*`), the vint UI, and the D3D wrappers. The low-level stream readers (`0xC18450`, `0xC18500`) are still on the original.
