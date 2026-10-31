@@ -251,6 +251,27 @@ Hand-decoded with capstone (Observed). It takes ECX = path and stack `(mode, boo
 - A boot plus save load with the original made 19,421 calls; the Rust run made 19,433. All 9,843 distinct calls seen in both runs gave identical results, including 69 NULLs on each side. The rest are ambient pedestrians and cars that differ between runs; all of them opened fine.
 - Only `rb` (flag 0 and 1) occurs on that path. **Write/append opens (saves, settings) are still routed to the original** (`FILE_OPEN_WRITE_IN_RUST = false`) until a save has been tested.
 
+## 5e. `file_read` (0xBFE170)
+
+Hand-decoded with capstone (Observed). It takes EAX = size and stack `(void* dst, file_handle* h)`, caller-clean, and returns the number of bytes read. The handle state at +0x158 is 0 = ok, 1 = EOF or short read, 3 = one-shot read done.
+
+1. State != 0 → return 0. Access (+0x154) != 1 (not a read handle) → state = 1, return 0.
+2. `pos >= size` → state = 1, return 0. `n == 0` → return 0. `pos + n > size` → clamp `n` to what is left, state = 1.
+3. By type (+0x148):
+   - **0, OS file:** `0xC18500(ESI=stream, ECX=dst, EDI=n, arg, pos)`. This is `ReadFile`, with an OVERLAPPED path when stream flag 1 is set.
+   - **1, packfile entry:** `0xC18450(EAX=stream, ECX=arg, dst, len, pos)`, where the stream is `{.., +4 vpp_entry*}`.
+     - If the entry's packfile (`entry+0x18`) has flag 1 (compressed), only a whole-file read works: `n` must equal the size, `len` = the packed size `entry+0x14`, and otherwise 0 bytes are read.
+     - Otherwise `len = n`.
+   - **2, memory:** `memcpy(dst, stream + pos, n)`.
+   - Any other type → return 0. The position is unchanged, though the clamp may already have set state 1.
+4. `pos += got`. If flag bit 8 (+0x168) is set, `0xBFDB20` clears bit 8 on the handle and on its stream (type 0: `stream+8`; type 1: `(*stream)+8`), and state = 3. Otherwise, if `got != n`, state = 1.
+
+**Ported (hooks.rs), 2026-10-31.** Rust covers the whole function; the OS and packfile reads go through shims, and memory reads use the game's `memcpy`. Verified with the same per-call log comparison as `file_open`, adding a 64-bit FNV hash of the bytes read.
+- A boot plus save load makes about 2.18M reads: 161 OS-file reads (archive headers), 19.3k packfile-entry reads, and 2.16M 1- and 4-byte reads from a "mem mapped file" (type 2).
+- All 2,170,333 distinct reads seen in both runs were identical: bytes, position and state. The remaining ~50 per run are ambient NPCs that differ between runs.
+- **Not exercised:** EOF/clamp, short reads, compressed packfiles and flag bit 8. Every read in the run ended in state 0.
+- The per-call logs (`LOG_FILE_CALLS`) are off by default, since a run writes about 200 MB.
+
 ## 6. Open questions
 
 - `packfile_mount_temp` callers: 0x69d250 mounts `city_load.vpp_pc` and 0xc0b6f0 mounts `hmaps.vpp_pc` on a save load. 0xc0b640 has not been seen yet. The temp unmount (it should rewind the record count to the mark) is not traced yet.

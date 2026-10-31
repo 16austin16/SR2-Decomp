@@ -48,4 +48,5 @@ original. The standalone build can move to 64-bit later.
 10. ✅ `packfile_find_entry` @0xC0AD80 → Rust, shadow-checked against the original on every call (212k-query sweep plus 37k live calls, 0 mismatches). `packfile_mount_temp` @0xC0A970 → Rust; its city-load log is identical to `docs/analysis/golden/temp_mounts.txt`.
 11. ✅ `file_resolve` @0xBFD880 → Rust (kinds 0 and 1; kind 2 shimmed), shadow-checked on every call: 22,159 calls in a boot plus city load, 0 mismatches. The search order is packfile, disk, packfile, so archives win over loose files.
 12. ✅ `file_open` @0xBFDC20 → Rust for reads. 9,843 distinct calls over a boot plus save load gave the same results as the original. Writes and appends stay on the original until a save is tested.
-13. Next: test a save (to enable Rust writes), `file_read` (0xBFE170), and the temp unmount.
+13. ✅ `file_read` @0xBFE170 → Rust. All 2,170,333 distinct reads in a boot plus save load are identical to the original, including a hash of the bytes. The EOF and compressed paths have not been exercised yet.
+14. Next: test a save (to enable Rust writes), the temp unmount, and the packfile/OS stream readers (`0xC18450`, `0xC18500`).

@@ -35,6 +35,9 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if n == 1 || n == FIND_RECORD_VERIFY_FRAME || n.is_multiple_of(3600) {
         log(&file_resolve_summary());
     }
+    if n.is_multiple_of(60) {
+        file_read_log_flush();
+    }
     if n.is_multiple_of(3600) && FIND_ENTRY_SHADOW {
         log(&format!(
             "find_entry live: {} calls, {} mismatches",
@@ -1206,10 +1209,18 @@ extern "C" fn file_open_thunk() {
 
 static FILE_OPEN_LOG: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
 
+/// Log every file_open / file_read call to sr2-fileopen.log / sr2-fileread.log
+/// for comparing a run of the original against the port. Off once verified:
+/// a save load is ~20k opens and ~2.2M reads (about 200 MB of log).
+const LOG_FILE_CALLS: bool = false;
+
 /// One line per call to `sr2-fileopen.log`: the inputs and every handle field
 /// except the stream pointer (only whether it is set).
 extern "C" fn file_open_log(path: *const u8, mode: *const u8, flag: u32, h: *const u8, caller: usize) {
     use std::io::Write as _;
+    if !LOG_FILE_CALLS {
+        return;
+    }
     let mut line = unsafe {
         format!(
             "{caller:#x} {:?} {:?} {} ->",
@@ -1244,6 +1255,242 @@ extern "C" fn file_open_log(path: *const u8, mode: *const u8, flag: u32, h: *con
     }
     if let Some(f) = guard.as_mut() {
         let _ = writeln!(f, "{line}");
+    }
+}
+
+// --- 0xBFE170 file_read (every call logged to sr2-fileread.log) -----------
+
+/// LTCG: EAX = size, stack `(void* dst, file_handle* h)`, caller-clean,
+/// returns bytes read. Prologue `mov ecx,[esp+4]; push ebp; mov ebp,[esp+c]`:
+/// 9 bytes, stack-relative only.
+const FILE_READ: usize = 0x00BF_E170;
+const FILE_READ_PROLOGUE: [u8; 9] = [0x8B, 0x4C, 0x24, 0x04, 0x55, 0x8B, 0x6C, 0x24, 0x0C];
+
+const OS_FILE_READ: usize = 0x00C1_8500; // ESI = os_file, ECX = dst, EDI = n, stack (arg, pos), caller-clean
+const PACKFILE_STREAM_READ: usize = 0x00C1_8450; // EAX = stream, ECX = arg, stack (dst, n, pos), caller-clean
+const CRT_MEMCPY: usize = 0x00CA_0850;
+
+static FILE_READ_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static FILE_READ_IMPL: AtomicUsize = AtomicUsize::new(0);
+const FILE_READ_USE_RUST: bool = true;
+
+unsafe fn os_file_read(stream: *mut u8, dst: *mut u8, n: u32, arg: u32, pos: u32) -> u32 {
+    let r: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "mov esi, {stream}",
+            "mov edi, {n}",
+            "push {pos}",
+            "push {arg}",
+            "call {f}",
+            "add esp, 8",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) OS_FILE_READ,
+            stream = in(reg) stream,
+            n = in(reg) n,
+            pos = in(reg) pos,
+            arg = in(reg) arg,
+            in("ecx") dst,
+            lateout("eax") r,
+            clobber_abi("C"),
+        );
+    }
+    r
+}
+
+unsafe fn packfile_stream_read(stream: *mut u8, arg: u32, dst: *mut u8, n: u32, pos: u32) -> u32 {
+    let r: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "push {pos}",
+            "push {n}",
+            "push {dst}",
+            "call {f}",
+            "add esp, 12",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) PACKFILE_STREAM_READ,
+            pos = in(reg) pos,
+            n = in(reg) n,
+            dst = in(reg) dst,
+            in("ecx") arg,
+            inout("eax") stream => r,
+            clobber_abi("C"),
+        );
+    }
+    r
+}
+
+/// Rust port of `file_read` (0xBFE170), docs/analysis/01_packfile.md §5e.
+/// State +0x158: 0 ok, 1 EOF/short read, 3 one-shot read done (flag bit 8).
+extern "C" fn file_read_rust(n: u32, dst: *mut u8, h: *mut u8) -> u32 {
+    unsafe {
+        let field = |o: usize| h.add(o) as *mut u32;
+        if *field(0x158) != 0 {
+            return 0;
+        }
+        if *field(0x154) != 1 {
+            *field(0x158) = 1;
+            return 0;
+        }
+        let (pos, size) = (*field(0x15C), *field(0x160));
+        if pos >= size {
+            *field(0x158) = 1;
+            return 0;
+        }
+        if n == 0 {
+            return 0;
+        }
+        let mut n = n;
+        if pos.wrapping_add(n) > size {
+            n = size - pos;
+            *field(0x158) = 1;
+        }
+        let stream = *field(0x14C) as *mut u8;
+        let got = match *field(0x148) {
+            0 => os_file_read(stream, dst, n, *field(0x150), pos),
+            1 => {
+                // stream = {.., +4 vpp_entry*}; entry +0x18 = its packfile. A
+                // packfile with flag 1 (compressed) can only be read whole.
+                let entry = *(stream.add(4) as *const *const u8);
+                let pf = *(entry.add(0x18) as *const *const u8);
+                if *(pf.add(0x14C) as *const u32) & 1 != 0 {
+                    if n != size {
+                        0
+                    } else {
+                        let packed = *(entry.add(0x14) as *const u32);
+                        packfile_stream_read(stream, *field(0x150), dst, packed, pos)
+                    }
+                } else {
+                    packfile_stream_read(stream, *field(0x150), dst, n, pos)
+                }
+            }
+            2 => {
+                let memcpy: extern "C" fn(*mut u8, *const u8, u32) -> *mut u8 = std::mem::transmute(CRT_MEMCPY);
+                memcpy(dst, stream.add(pos as usize), n);
+                n
+            }
+            _ => return 0,
+        };
+        *field(0x15C) = pos.wrapping_add(got);
+        if *field(0x168) & 8 != 0 {
+            // 0xBFDB20: clear the one-shot bit on the handle and its stream.
+            *field(0x168) &= !8;
+            match *field(0x148) {
+                0 => *(stream.add(8) as *mut u32) &= !8,
+                1 => *((*(stream as *const *mut u8)).add(8) as *mut u32) &= !8,
+                _ => {}
+            }
+            *field(0x158) = 3;
+        } else if got != n {
+            *field(0x158) = 1;
+        }
+        got
+    }
+}
+
+#[unsafe(naked)]
+extern "C" fn file_read_rust_conv() {
+    naked_asm!(
+        "push dword ptr [esp + 8]", // h
+        "push dword ptr [esp + 8]", // dst
+        "push eax",                 // n
+        "call {f}",
+        "add esp, 12",
+        "ret",
+        f = sym file_read_rust,
+    )
+}
+
+#[unsafe(naked)]
+extern "C" fn file_read_thunk() {
+    naked_asm!(
+        "push eax",                  // n, kept for the log
+        "push dword ptr [esp + 4]",  // pos before, filled in below
+        "mov ecx, [esp + 16]",       // h
+        "mov ecx, [ecx + 0x15c]",
+        "mov [esp], ecx",
+        "push dword ptr [esp + 16]", // h
+        "push dword ptr [esp + 16]", // dst
+        "call dword ptr [{imp}]",    // EAX = n unchanged
+        "add esp, 8",
+        // [esp] = pos, [esp+4] = n, [esp+8] = ret, [esp+12] = dst, [esp+16] = h
+        "push eax",
+        "push eax",                  // got
+        "push dword ptr [esp + 8]",  // pos before
+        "push dword ptr [esp + 16]", // n
+        "push dword ptr [esp + 28]", // dst
+        "push dword ptr [esp + 36]", // h
+        "call {log}",
+        "add esp, 20",
+        "pop eax",
+        "add esp, 8",
+        "ret",
+        imp = sym FILE_READ_IMPL,
+        log = sym file_read_log,
+    )
+}
+
+static FILE_READ_LOG: std::sync::Mutex<Option<std::io::BufWriter<std::fs::File>>> = std::sync::Mutex::new(None);
+
+/// One line per call: handle name, request, position, result, state and
+/// position afterwards, and a hash of the bytes read.
+extern "C" fn file_read_log(h: *const u8, dst: *const u8, n: u32, pos: u32, got: u32) {
+    use std::io::Write as _;
+    if !LOG_FILE_CALLS {
+        return;
+    }
+    let line = unsafe {
+        let rd = |o: usize| *(h.add(o) as *const u32);
+        let data = std::slice::from_raw_parts(dst, if dst.is_null() { 0 } else { got as usize });
+        let mut x = 0xCBF2_9CE4_8422_2325u64;
+        let (words, tail) = data.as_chunks::<8>();
+        for w in words {
+            x = (x ^ u64::from_le_bytes(*w)).wrapping_mul(0x0100_0000_01B3);
+        }
+        for &b in tail {
+            x = (x ^ b as u64).wrapping_mul(0x0100_0000_01B3);
+        }
+        format!(
+            "{:?} type {} n {n:#x} pos {pos:#x} -> {got:#x} state {} pos {:#x} data {x:016x}",
+            String::from_utf8_lossy(cstr(h)),
+            rd(0x148) as i32,
+            rd(0x158),
+            rd(0x15C)
+        )
+    };
+    let mut guard = FILE_READ_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        *guard = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("sr2-fileread.log")
+            .ok()
+            .map(std::io::BufWriter::new);
+    }
+    if let Some(f) = guard.as_mut() {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Flush the buffered read log (called from the frame tick).
+fn file_read_log_flush() {
+    use std::io::Write as _;
+    if let Some(f) = FILE_READ_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        let _ = f.flush();
     }
 }
 
@@ -1487,5 +1734,22 @@ pub fn install_early() {
             log(&format!("hooked file_open @ 0xbfdc20 ({which}), calls in sr2-fileopen.log"));
         }
         Err(e) => log(&format!("hook file_open failed: {e:?}")),
+    }
+
+    if FILE_READ_USE_RUST {
+        FILE_READ_IMPL.store(file_read_rust_conv as extern "C" fn() as usize, Ordering::Relaxed);
+    }
+    match unsafe { detour::install(FILE_READ, &FILE_READ_PROLOGUE, file_read_thunk as extern "C" fn() as usize) } {
+        Ok(tramp) => {
+            FILE_READ_ORIGINAL.store(tramp, Ordering::Relaxed);
+            let which = if FILE_READ_USE_RUST {
+                "Rust"
+            } else {
+                FILE_READ_IMPL.store(tramp, Ordering::Relaxed);
+                "original, observed"
+            };
+            log(&format!("hooked file_read @ 0xbfe170 ({which}), calls in sr2-fileread.log"));
+        }
+        Err(e) => log(&format!("hook file_read failed: {e:?}")),
     }
 }
