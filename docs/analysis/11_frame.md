@@ -152,7 +152,7 @@ The order of calls, grouped by the profiler sections. Unnamed calls are listed w
    2. Lighting, sky and weather (0x4D9DD0, 0x4D4820 … 0x4E69D0), effects (0x46CCD0, 0xD08310, 0x4C7190), 0x728AB0, 0x51A880, 0x51A4A0, 0x9FAA20.
    3. Pick the listener / LOD distance by the camera mode.
    4. Then 0xAE1020, 0x52E7C0, 0x5250E0, 0x522FC0.
-8. **Double buffer swap**: exchange `0x2305978` and `0x230597C` (the render lists) and clear their counts.
+8. **Double buffer swap**: exchange `0x2305978` and `0x230597C` (the deferred render-state command lists, 18_scene.md) and clear their counts.
 9. Finish the audio job (`job->wait`) and release it.
 10. Signal the render thread: `[0x2774198]` vtable +0xC.
 11. `Sleep(1)` until it acknowledges (`0x277419C`). Without `0x252737E`, also wait for `0x27741AC`.
