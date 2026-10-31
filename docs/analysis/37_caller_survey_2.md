@@ -57,11 +57,41 @@ Containers forward slots 4-8 to their children, which is how the slots' types we
 - slot 7 returns the first non-zero child;
 - slot 8 is the minimum over the children.
 
+## Third pass: LOD, shadows, movers, script objects, game events
+
+**Meshes.**
+- `rl_renderable_base_inst` slot 5 `render_shadow` (pass, ctx).
+- `rl_mesh_inst` slots 9-12: `get_lod_entry`, `select_lod_entry`, `get_shadow_lod_entry`, `select_shadow_lod_entry`. These are 16-byte entries of the mesh's render table (`[+0x70]+0x20`) and shadow table (`+0x24`).
+- `rl_lod_mesh_inst` slots 13 `select_lod` (cached at +0x348, override +0x349) and 14 `get_lod`.
+
+**Movers.** `object_mover` slot 15 `take_damage` (raises the damage / killed events) and slot 16 `on_destroyed`.
+
+**Script objects** (`script_streamable_object`, which covers items, NPCs, movers and the rest): slot 10 `on_object_spawned`, slot 11 `is_spawned`, slot 13 `get_object`.
+
+**Game events.** The game-event block 0x68F650-0x68FB10 has one small function per event. Each calls the game mode's callback at `0xE96C10 + mode × 0x6C + 4 × n`, so the **event number n is the callback offset / 4**. Some also call a diversion dispatcher.
+
+| Event | Function | Diversion slot |
+|---|---|---|
+| 3 | `game_event_3` 0x68F650 | - |
+| 5 | `game_event_5` 0x68F800 (from 0x969790, near the hit-point code) | 24 |
+| 8 / 9 | `game_event_player_joined` / `_left` | - / 0x604940 |
+| 10 | `game_event_human_killed` | 21 |
+| 11 / 12 / 14 | object killed / vehicle destroyed / object damaged | 22 / 23 / 25 |
+| 15 | `game_event_15` 0x68F8C0 (from 0xA98070, vehicle code that reads human hit points) | 26 |
+| 16 | `game_event_16` 0x68FA00 | - |
+| 17 | `game_event_player_respawned` | - |
+| 18 | `game_event_18` 0x68FAE0 | 33 |
+| 20 / 21 / 22 | `game_event_20` / `_21` / `_22` | 27 / 28 / 29 |
+| 23-26 | `game_event_23` … `_26` | - |
+
+The unnamed events have no direct callers in the binary: they're reached through jumps or pointers. Their meaning needs a trace. The diversion slots are named `on_game_event_<n>` to match.
+
 ## Reached but left unnamed
 
 Mostly small accessors whose callers don't say what they return:
-- the render instance slot 5 and the `rl_lod_mesh_inst` slots 10-14;
+- `object_mover` slots 9, 10, 12-14 (physics body helpers);
+- `script_streamable_object` slots 0 and 12, which store or return the same fields as their neighbours;
 - the `pc_multi_session` methods (one call each, at session start);
-- several `script_*` and diversion event slots (26-29, 33) whose game events have no telling caller yet.
+- the meaning of game events 3, 5, 15, 16, 18 and 20-26.
 
 These need either reading each body in context or a targeted in-game trace.
