@@ -40,12 +40,27 @@ Game events, next to the three known ones (`game_event_object_killed` 11, `vehic
 - `game_event_human_killed` (0x68F6F0): diversions slot 21 and the co-op kill scoring;
 - `game_event_player_respawned` (0x68FA30).
 
+## Accessors read in full
+
+After reading the bodies of the reached accessors, these slots are named too (120 methods across the subclasses):
+
+| Family | Slots |
+|---|---|
+| `rl_renderable_base_inst` (meshes, particles, decals, water, trees, plates, distant peds) | 3 compute_pass_data, 4 prepare_pass (pass index; meshes keep the result at +0x1E8 + pass*20), 6 is_ready, 7 get_env_handle (picks the environment texture through 0x5336E0), 8 min_plane_distance (FLT_MAX-seeded minimum of dot(n, p) + d) |
+| `deltacomp_state_data_impl<>` (every replicated object's state data) | 0 clear_dirty_mask (the u16 field mask after the data), 1 get_data (this+4) |
+| `vint_object_base` | 1 init (from the object setup 0xB971E0) |
+| `object` | 0 get_attach_point (vec3 *out, index): human bone position / vehicle point table at +0x560 |
+
+Containers forward slots 4-8 to their children, which is how the slots' types were read:
+- slot 4 calls every child;
+- slot 6 is true only if every child is;
+- slot 7 returns the first non-zero child;
+- slot 8 is the minimum over the children.
+
 ## Reached but left unnamed
 
 Mostly small accessors whose callers don't say what they return:
-- the render instance slots 3-8 (`rl_*` / `r_*`; slot 7 is a one-line getter, slot 8 a cull / sort helper);
-- the `deltacomp_state_data_impl<>` slots 0 / 1 (one-line accessors used by `capture_snapshot`);
-- the vint object slot 1 (0xB971E0);
+- the render instance slot 5 and the `rl_lod_mesh_inst` slots 10-14;
 - the `pc_multi_session` methods (one call each, at session start);
 - several `script_*` and diversion event slots (26-29, 33) whose game events have no telling caller yet.
 
