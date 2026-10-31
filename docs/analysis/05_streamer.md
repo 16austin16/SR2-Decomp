@@ -242,3 +242,49 @@ Cancel/release: `async_io_cancel_impl` (`0xA73430`) moves a queued request to th
 Blocking waits: `hdd_make_urgent` (`0xA73AC0`) bumps queued requests to priority 0x75 and attaches events. `async_io_wait` (`0xA738B0`) / `async_io_wait_event` (`0xA73850`) wait on them. `async_io_wait_done` (`0xA73900`) waits using the calling thread's event (TLS +0x78). Wait events come from a small pool object at `0xEB80C0` (vtable slot 1 free, slot 2 alloc).
 
 Debug: flag `0x2529DDB` makes reads of `player.cvtf` copy from memory (`0x2223CC0`); flags `0x2529DD5..DD7` force release modes; `0x2529DDA` changes how files are opened and skips `0xBFE600` after a read.
+
+## Chunk sections
+
+`chunk_load_from_memory` walks the header's section table (`header[4]` entries of 12 bytes, `{type, ?, offset}`). Each type fills fields of the 0x250-byte chunk record ("rec"). Offsets inside a section are relative to the chunk data, and the handlers turn them into pointers. Most handlers follow one of two patterns: `count` then a 16-byte-aligned array, or `-1 = NULL` offset fix-ups. No handler contains a string except section 5, so names are given only where the evidence is direct. Handlers are named `chunk_section_XX[_what]` in functions.csv, and the full field list is in each row's note.
+
+| Type | Handler | What it fills |
+|---|---|---|
+| 0x00 | `0x4ACDF0` objects | The main section. Object names (rec+0xEC/+0xF0); objects, 0x50 bytes each (rec+0x48 count, +0x4C), each pointing to a 0x60-byte render-info entry (rec+0x40/+0x44) and given a squared fade distance from the table `0x144EA40`; 3-level LOD sets; several typed arrays; 0x54-byte entries flagged 0x80000/0x100000 spawn entities through `0xA69E00` (kinds 0xF / 0x14) |
+| 0x01 | `0x4ADCD0` | 0x94-byte named entries (rec+0x104/+0x108) with per-entry scale floats and u16 lists |
+| 0x02 | `0x4A35E0` | 0x28-byte entries (rec+0x134/+0x138), then `0x7F63B0` |
+| 0x03 | inline | count/pointer at rec+0x10C/+0x110 |
+| 0x04 | `0x4ADF20` | rec+0x5C/+0x60/+0x64; dropped for flag-bit-0 chunks |
+| 0x05 | `0x4ADF70` collision_models | Collision models via `0x7051C0` (indices rec+0x1F0/+0x1F4); remaps object collision indices (+0x3C/+0x3E). The only section with a string ("city_objects_load: Failed to load the collision models…") |
+| 0x06 | `0x4AE0C0` placed_spawns | 0x34-byte placements (rec+0x19C/+0x1A0); type-name hash → table `0x263AF98`; created by `0x4C61C0` at position/orientation, not within 15 m of the player |
+| 0x07, 0x08 | `0x4AE240`, `0x4AE280` | Two count/array pairs each (rec+0x68..+0x74, +0x78..+0x84); cleared when chunk flags & 0x13 |
+| 0x09 | inline | count/pointer at rec+0x88/+0x8C |
+| 0x0A | `0xA8AC00` | 0x3C- and 0x28-byte entries (rec+0x13C..+0x148), then `0xA8D970` with the traffic globals `0x2225B64`. Probably the road/lane network (unverified) |
+| 0x0B | inline | count/pointer at rec+0x14C/+0x150 |
+| 0x0C | `0x4AE320` | Node tree at rec+0x154, fixed up recursively by `0xBF6A40` |
+| 0x0D | `0x4AE380` | 0x28-byte entries with vec3 lists (rec+0x158/+0x15C), registered with `0x6F9590` → rec+0x160 |
+| 0x0E | `0x4AE460` physics_mesh_geometry | N meshes (rec+0x164/+0x168): 16-byte vertices, u16×3 triangles |
+| 0x0F | `0x4AE510` | rec+0x174/+0x178; advances a gpu-side offset |
+| 0x10 | inline | count/pointer at rec+0x180/+0x184 |
+| 0x11 | `0x4AE590` | 0x54-byte entries (rec+0x188/+0x18C), tail at rec+0x190 |
+| 0x12 | `0x4AE620` | rec+0x1AC if `0x70D740` accepts it |
+| 0x13 | `0x4AE640` | rec+0x1B0/+0x1B4 |
+| 0x14 | `0x4AE690` | 0x3C-byte entries (rec+0x194/+0x198) |
+| 0x15 | `0x4AE6F0` physics_mesh_info | Per physics mesh: descriptor with counts/arrays and a name (rec+0x16C) |
+| 0x16 | `0x4AE7E0` physics_mesh_havok | Per physics mesh: Havok object from `0x7281D0` (rec+0x170) |
+| 0x17 | `0x4AE8C0` | 0x34-byte entries (rec+0x1A4/+0x1A8), chunk id stored in each |
+| 0x18 | `0x4AE990` | 0x34-byte entries (rec+0x1B8/+0x1BC); `0x6C7E90` in some modes |
+| 0x19 | — | not handled |
+| 0x1A | `0x4AEA20` | 0x84-byte entries with meshes (rec+0x1C0/+0x1C4) |
+| 0x1B, 0x1C | `0x4AEAB0`, `0x4AEAE0` | count/array rec+0x1D4/+0x1D8, rec+0x1DC/+0x1E0 |
+| 0x1D | — | not handled |
+| 0x1E | `0x4AEB10` | 0x10-byte entries with 0x14-byte sub-arrays (rec+0x204/+0x208) |
+| 0x1F | `0x4AEB80` | count/array rec+0x20C/+0x210 |
+| 0x20 | `0x4AEBB0` | 12-byte {object, hash → `0x21F2AA0` entry, hash → `0x27923E0` index} (rec+0x214/+0x218) |
+| 0x21 | `0x4AECB0` | 0x38-byte entries with arrays and a mesh (rec+0x21C/+0x220) |
+| 0x22 | `0x4AEDB0` | rec+0x224 |
+| 0x23 | `0x4AEF00` | per-object 8-byte array (rec+0x54/+0x58) |
+| 0x24 | `0x4AEF60` | per-object array (rec+0x230/+0x234) |
+| 0x25 | `0x4AEFA0` object_groups | Named object groups (rec+0x238/+0x23C): name, object (flagged +0x34 \|= 0x40000), indices into rec+0xA0 |
+| 0x26 | `0x4AEDD0` speedtree_instances | Trees (rec+0x228/+0x22C): hash → SpeedTree table `0x26B5DE8` (count `0x2527288`), the table the SpeedTree loader `0xA8DAFB` fills |
+
+Versions below 0x78 copy some arrays into the cpu pool instead of pointing into the file (sections 0, 0x0E, 0x15, 0x16). The loader only accepts 0x79, so those paths are dead for shipped data.
