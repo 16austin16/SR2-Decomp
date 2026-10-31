@@ -530,3 +530,178 @@ Extras start details that the port keeps:
 - With nothing queued, the batch goes back on the free list and the slot stays requested, so it
   is retried on the next pump.
 
+
+## Read scheduler API, exact behaviour (for porting)
+
+Manager `mgr = *(*0xEB80E0)`. Request records are 0x48 bytes (layout in the read scheduler section above), 256 of them at mgr+0x40. Lists are circular and doubly linked through request +0x40 (prev) / +0x44 (next). The writes to `0x2529E28` from `*0x2529E24` scattered through these functions are debug checks only; they change no state.
+
+| Function | Convention | Returns |
+|---|---|---|
+| `async_io_submit` 0xA73290 | stdcall `ret 0xC`: (mgr, desc*, u8 attach_event) | EAX = request, EDX = sequence (after the bump) |
+| `async_io_status` 0xA741A0 | cdecl (request, sequence) | EAX: 0 for NULL or state < 2; state 2 → 1; 3, 4 → 2; 6 → 3; 5 → 4; 7, 8, 9 → 5; anything above 9 → 0 |
+| `async_io_cancel` 0xA74150 | cdecl (request, sequence) | none; calls `async_io_cancel_impl` (EDI = request->mgr, stack request, sequence) |
+| `async_io_release` 0xA74270 | cdecl (request, sequence, mode) | none; calls `async_io_free(request->mgr (+0x3C), request, sequence, mode)` |
+| `async_io_free` 0xA73650 | stdcall `ret 0x10`: (mgr, request, sequence, mode) | none |
+| `async_io_error_code` 0xA74340 | cdecl (request, sequence) | index into the state-name table `0xE87BEC` |
+| `async_io_set_state` 0xA739A0 | EAX = request, stack (mgr, state), caller-clean | none |
+
+A wrong sequence does not change the result anywhere; it only reaches the debug check. `async_io_status` still reads the state.
+
+Correction: the read scheduler section above calls `async_io_submit` cdecl. It is stdcall (`ret 0xC`), as in the table here.
+
+### Submit
+
+The whole of submit runs under mgr+8:
+1. Take the head of the free list (+0x30). There is no empty check: with all 256 in use it dereferences NULL.
+2. Unlink it, sequence++, and clear +0x24, +0x28, +0x30, +0x3C and the u8 +0x38. Set state 1.
+3. Copy the 8 description dwords to +0x04..+0x20 (file name, suffix, offset, size, destination, priority byte at +0x18, +0x1C, +0x20) and set +0x3C = mgr.
+4. Set state 2 with `async_io_set_state`.
+5. If `attach_event` is set, call `hdd_attach_wait_event`.
+6. Insert into the pending list (+0x34) before the first request whose priority byte is lower, so equal priorities keep FIFO order. If it becomes the highest priority, it becomes the head.
+7. SetEvent(mgr+0).
+
+### Free
+
+1. If `request` is NULL, return.
+2. Under the lock, the debug flags `0x2529DD5` / `0x2529DD6` force mode 2 / 1.
+3. In flight means state 2, 3 or 4.
+   - Normally (`0x2529DD7` clear) with an in-flight request: mode 0 or 1 only sets released (+0x38 = 1) and returns. `hdd_finish_current` recycles the record when the read ends. Mode 2 waits with `async_io_wait_done`, outside the lock, then carries on.
+   - With `0x2529DD7` set, it polls with Sleep(1) until the request is no longer in flight.
+4. Remove it from the finished list (+0x38), sequence++, state 1, append to the tail of the free list, released = 1.
+
+### State flow
+
+- Submit → 2 (PENDING).
+- `hdd_service` takes the pending head → 3 (ACTIVE).
+- The end result is one of:
+  - 6 DONE_SUCCESS: read OK, read-cache hit, or the debug player.cvtf copy.
+  - 7 CANNOT_OPEN: `file_open` returned NULL.
+  - 5 CANCELED: cancelled while queued, cancelled before the read, or file error 3.
+  - 9 ERROR_UNKNOWN: any other file error.
+- `async_io_cancel_impl` on a request that is ACTIVE sets 4 (CANCEL_PENDING) and aborts the file read; the thread then finishes it as 5.
+- Free → 1 (UNUSED).
+
+`async_io_set_state` SetEvents the one-shot waiter (+0x30, then clears it) and the attached event (+0x34) whenever the new state is not 2, 3 or 4.
+
+### hdd_service read path (0xA73C50, ECX = mgr)
+
+Each request is taken under the lock as above. If state is already 4 → finish with 5. Then:
+1. **Debug copy.** `0x2529DDB` and name "player.cvtf" → memcpy from `0x2223CC0`, then 6.
+2. **Read cache.** `read_cache_lookup` (0xA74A40, ESI = request+4) → served from memory, then 6.
+3. **Open.** `file_open(ECX = name, "rb", 0x2529DDA == 0)`. NULL → 7.
+4. **Seek.** If state is 4 now: under the lock, `file_close` and finish with 5. Otherwise, if offset (+0xC) is non-zero, seek inline in the file handle:
+   - type +0x148 == 2 (memory): set position +0x15C;
+   - type 0 (OS file) with no packfile (+0x150 == 0): `os_file_seek(+0x14C, offset)` and on success set +0x15C;
+   - type 1 (packfile): no seek.
+
+   A packfile-backed handle (+0x154 == 1) only seeks if offset <= +0x160.
+5. **Read.** `file_read(EAX = size (+0x10), dest (+0x14), handle)` → +0x28. Then `read_cache_store` (EAX = request+4), and `0xBFE600(handle)` unless `0x2529DDA` is set.
+6. **Close.** Under the lock, `file_close` and +0x24 = 0. The handle's error field +0x158 gives the state: 0 → 6, 3 → 5, else 9.
+
+There is no decompression in the scheduler. Compressed packfile entries are handled inside `file_open` / `file_read`, which are already Rust.
+
+**Read cache** (0xA745F0-0xA74AB0, CS `0x2F9B1E4`): an optional in-memory cache.
+- `0x2529E34` is the cache, set or cleared by `0xA74940` / `0xA749E0`, which `0x7F6F50` calls. `0x2529E2C` is its allocator.
+- It holds up to 0x20 entries of {name, data, size} at cache+0x28 (count at +0x1A4).
+- Only names passing `read_cache_accepts` (prefix list) are stored. A hit skips the disk read entirely.
+
+## Resource slot scheduler (0xA75030-0xA79C00): the other streamman_queue users
+
+The ~20 queue calls in `0xA75900`-`0xA77E90` are not part of the I/O scheduler. They belong to a **resource slot scheduler**. It decides which characters, vehicles and animations stay resident in a fixed number of memory slots (spawning, "multi registration", notoriety groups and component streaming call it). It feeds the streamer through its own job queue. Names use the `rsched_` prefix.
+
+**Six schedulers** at `0x2F9B2E8` (0xD4 bytes each, kind = index = id >> 24), set up once by `rsched_init_all` (0xA78E60) from a config table built on the stack at 0x51F700. The config is 0x30 bytes per kind:
+
+| Off | Config field |
+|---|---|
+| +0x00, +0x04 | buffer base A and per-slot stride A |
+| +0x08, +0x0C | buffer base B and stride B |
+| +0x10 | slot count |
+| +0x14 | request count |
+| +0x18 | group count |
+| +0x1C | u8 flag |
+| +0x20..+0x2C | callbacks, copied to `0x22248F8 + kind*0x10` |
+
+The values set at boot:
+
+| Kind | What | Slots | Requests | Groups | Buffers |
+|---|---|---|---|---|---|
+| 0 | characters | 10 | 0x40 | 9 | A `*0x2527338` stride 0x129000, B `*0x252733C` stride 0x400000 |
+| 1 | vehicles | 8 | 0x20 | 1 | A `*0x2527324` 0x400000, B `*0x2527328` 0x300000 |
+| 2 | characters (no buffer) | 2 | 2 | 1 | none |
+| 3 | characters (no buffer) | 10 | 10 | 1 | none |
+| 4 | animations | 1 | 0x80 | 1 | A `*0x2527340` 0x400 |
+| 5 | vehicle | 1 | 1 | 1 | A `*0x252732C` 0xC8000 |
+
+The callbacks per kind (`0x22248F8 + kind*0x10`):
+
+| Off | Callback |
+|---|---|
+| +0x0 | (cfg+0x20) |
+| +0x4 | slot became unused (`rsched_slot_make_idle`) |
+| +0x8 | loaded (used by the job finish) |
+| +0xC | unload (`rsched_slot_evict`) |
+
+| Off | Scheduler (0xD4) |
+|---|---|
+| +0x00 | slot count |
+| +0x04 | group count |
+| +0x08 | slots (0x3C each) |
+| +0x0C | idle-loaded slot list |
+| +0x10 | loading slot list |
+| +0x14 | slot being loaded by the current job |
+| +0x18 | in-use slot list |
+| +0x1C | free slot list |
+| +0x20..+0x2C | buffers from the config |
+| +0x30 | request count |
+| +0x34 | requests (0x48 each) |
+| +0x38 | active request list |
+| +0x3C | free request list |
+| +0x40 | per-group slot queues (0x18-byte `streamman_queue`, compare `rsched_slot_compare`) |
+| +0x44 | per-group request queues (compare `rsched_request_compare`) |
+| +0x48, +0x4C.. | deferred releases (count, 0x10-byte {id, level, all, group}) |
+| +0xCC | per-group slot quota |
+| +0xD0 | flags: 1 disabled, 2 dirty, 4 config flag, 8 updating |
+
+| Off | Slot (0x3C) |
+|---|---|
+| +0x00 | bound request |
+| +0x04 | id (-1 none) |
+| +0x14 | float time |
+| +0x18 | object using it |
+| +0x1C | job index (-1) |
+| +0x20 | queue node |
+| +0x24 | group |
+| +0x28 | state: 0 loaded/idle, 1 loading, 4 free |
+| +0x2C, +0x30 | links |
+
+| Off | Request (0x48) |
+|---|---|
+| +0x00 | bound slot |
+| +0x04 | id |
+| +0x08 | group count |
+| +0x0C | object |
+| +0x10 | queue node |
+| +0x14 | per-group counts |
+| +0x18 | u8 flags (1 evaluated, 2 load now) |
+| +0x1C, +0x20 | links |
+| +0x24, +0x28 | temp links |
+| +0x2C..+0x44 | counts per level 0..6 (best level = highest non-zero) |
+
+**Flow:**
+1. **Request.** Game code calls `rsched_add_ref(EAX = sched; id, level, group, load_now)` and `rsched_release(EAX = sched, EDX = id; level, group, all)`. Both mark the scheduler dirty.
+2. **Update.** Every frame `rsched_update_all` (0xA79080) runs `rsched_update` on each scheduler: `rsched_assign_group_quotas`, then `rsched_update_group` per group. That pairs the best requests with the worst slots, evicting through `rsched_slot_evict`. Each slot it starts loading becomes a **job**: `rsched_job_add(id, A + i*strideA, strideA, B + i*strideB, strideB, level)`.
+3. **Jobs.** Jobs are 0x20 bytes {id, dest, size, dest2, size2, level, links}, at most 50, in the `streamman_queue` at `0x2F9B2D0`. Only one is current at a time (`0x2529E58`, streamer handle `0xEB80F8`).
+   - `rsched_job_start_next` requests it from the streamer by kind: character (type 3), vehicle (type 2, `streamman_request_vehicle` 0xA87F80) or animation (type 6, `streamman_request_animation` 0xA88240).
+   - `rsched_job_pump` waits for the streamer slot to go idle, then calls `0xA78950` if it is loaded (state 4) or `0xA789B0` if not, frees the job and starts the next.
+
+**Resource registry** (`resource_registry_init` 0xA774E0): the id's low 24 bits index `0x2529E3C`, which holds up to 1000 entries of 0xC bytes:
+
+| Off | Registry entry |
+|---|---|
+| +0x00 | flags (bit 3: skip in `rsched_update_group`; bits 4-23 name count) |
+| +0x04 | name list |
+| +0x08 | extra (the animation size) |
+
+The entry count is at `0x2529E38`. Names live in a pool at `0x2529E44` (used count `0x2529E40`), and a name hash table is at `0x2F9B260`/`0x2F9B2BC`.
+
+For a port of the streamer core, none of this needs to move. It only calls `streamman_queue_*`, `streamman_request_character/vehicle/animation`, `streamman_is_idle` and the slot arrays at `0x2225B3C`.
