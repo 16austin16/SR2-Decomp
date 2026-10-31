@@ -830,6 +830,7 @@ const L_MAX: u32 = 3000;
 
 /// How a handler records its arguments.
 #[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)] // Clip waits for an in-game check
 enum Rec {
     /// Nothing.
     None,
@@ -839,6 +840,11 @@ enum Rec {
     Float,
     /// n dwords copied from the pointer argument, written only if all fit.
     Block(usize),
+    /// A dword (the plane), then four doubles stored as floats (the clip plane).
+    Clip,
+    /// Vertex space: count, byte size, then the space (padded to 4), whose address
+    /// goes back into the caller's {dst, bytes}; the caller fills it.
+    Vtx,
 }
 
 /// The ported handler types: how they record, and the API function they replay.
@@ -856,16 +862,20 @@ fn spec(kind: u32) -> Option<(Rec, usize)> {
         0x09 => (Rec::None, 0x00D2_3200),
         0x0A => (Rec::Float, 0x00D2_3120),
         0x0B => (Rec::None, 0x00D2_3060),
+        // 0x0C (clip plane, Rec::Clip) is written but stays original: never seen in play.
         0x0D => (Rec::Float, 0x00D2_3000),
         0x0E => (Rec::Float, 0x00D2_2F90),
         0x0F => (Rec::Block(3), 0x00D0_9E20),
         0x10 => (Rec::Dwords(4), 0x00D1_4B20),
         0x11 => (Rec::Dwords(1), 0x00D1_4AD0),
         0x18 => (Rec::Block(2), 0x00D0_A580),
+        0x19 => (Rec::Vtx, 0x00D0_A4F0),
         0x1A => (Rec::None, 0x00D0_A4B0),
         0x1B => (Rec::Block(2), 0x00D0_A440),
+        0x1C => (Rec::Vtx, 0x00D0_A380),
         0x1D => (Rec::None, 0x00D0_A330),
         0x1E => (Rec::Block(2), 0x00D0_A2C0),
+        0x1F => (Rec::Vtx, 0x00D0_A1F0),
         0x20 => (Rec::None, 0x00D0_A190),
         0x27 => (Rec::None, 0x00D1_EF40),
         0x2A => (Rec::Dwords(2), 0),
@@ -891,6 +901,8 @@ fn replay(kind: u32, target: usize, v: &[u32]) {
             0x10 => call_regs(target, 0, v[3], v[2], 0, 0, &[v[0], v[1]]),
             0x11 => call_regs(target, 0, v[0], 0, 0, 0, &[]),
             0x2A => call_regs(v[0] as usize, 0, 0, 0, 0, 0, &[v[1]]),
+            0x0C => call_regs(target, 0, v[0], 0, 0, 0, &[v[1], v[2], v[3], v[4]]),
+            0x19 | 0x1C | 0x1F => call_regs(target, 0, 0, 0, v[0], 0, &[v[2]]),
             _ => call_regs(target, 0, 0, 0, 0, 0, &[]),
         };
     }
@@ -901,6 +913,8 @@ fn rec_size(r: Rec) -> u32 {
         Rec::None => 0,
         Rec::Dwords(n) | Rec::Block(n) => n as u32 * 4,
         Rec::Float => 4,
+        Rec::Clip => 20,
+        Rec::Vtx => 0, // variable: handled in `handler`
     }
 }
 
@@ -935,6 +949,42 @@ fn handler(m: &mut Mem, kind: u32, mode: u32, ctx: usize, args: usize) -> bool {
                 let v = (d as f32).to_bits();
                 put(m, v)
             }
+            Rec::Clip => {
+                let v = m.rd(args);
+                if !put(m, v) {
+                    return false;
+                }
+                for i in 0..4 {
+                    let a = args + 4 + i * 8;
+                    let d = f64::from_bits(m.rd(a) as u64 | (m.rd(a + 4) as u64) << 32);
+                    let f = (d as f32).to_bits();
+                    if !put(m, f) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Rec::Vtx => {
+                let count = m.rd(args);
+                let out = m.rd(args + 4) as usize;
+                if !put(m, count) {
+                    m.wr(out, 0);
+                    return false;
+                }
+                let bytes = m.rd(out + 4);
+                let rem = (bytes as i32) % 4;
+                let pad = if rem == 0 { 0 } else { (4 - rem) as u32 };
+                let used = m.rd(ctx + 4);
+                if used.wrapping_add(bytes).wrapping_add(pad).wrapping_add(4) > m.rd(ctx + 8) {
+                    m.wr(out, 0);
+                    return false;
+                }
+                m.wr(data + used as usize, bytes);
+                let used = used + 4;
+                m.wr(out, (data + used as usize) as u32);
+                m.wr(ctx + 4, used.wrapping_add(bytes).wrapping_add(pad));
+                true
+            }
             Rec::Block(n) => {
                 let p = m.rd(args) as usize;
                 let v: Vec<u32> = (0..n).map(|i| m.rd(p + i * 4)).collect();
@@ -951,6 +1001,22 @@ fn handler(m: &mut Mem, kind: u32, mode: u32, ctx: usize, args: usize) -> bool {
         };
     }
     let used = m.rd(ctx + 4) as usize;
+    if rec == Rec::Vtx {
+        let (count, bytes) = (m.rd(data + used), m.rd(data + used + 4));
+        let rem = (bytes as i32) % 4;
+        let pad = if rem == 0 { 0 } else { (4 - rem) as u32 };
+        let ptr = (data + used + 8) as u32;
+        m.wr(ctx + 4, (used as u32 + 8).wrapping_add(bytes).wrapping_add(pad));
+        if mode == 1 && count as i32 <= 0x40 {
+            let v = [count, bytes, ptr];
+            if m.dry {
+                m.tape.push(expected_call(kind, &v));
+            } else {
+                replay(kind, target, &v);
+            }
+        }
+        return true;
+    }
     let n = rec_size(rec) as usize / 4;
     let v: Vec<u32> = (0..n).map(|i| m.rd(data + used + i * 4)).collect();
     m.wr(ctx + 4, (used + n * 4) as u32);
@@ -1079,6 +1145,11 @@ fn expected_call(kind: u32, v: &[u32]) -> Vec<u32> {
         0x1E => (LIST_BEGIN, vec![(T_BLOCK, v[0]), (T_BLOCK + 1, v[1])]),
         0x20 => (LIST_END, vec![]),
         0x27 => (RESTORE_TARGETS, vec![]),
+        0x0C => {
+            (CLIP_PLANE, vec![(T_ECX, v[0]), (T_ARG, v[1]), (T_ARG + 1, v[2]), (T_ARG + 2, v[3]), (T_ARG + 3, v[4])])
+        }
+        0x1C => (STRIP_ADD, vec![(T_ESI, v[0]), (T_ARG, v[2])]),
+        0x1F => (LIST_ADD, vec![(T_ESI, v[0]), (T_ARG, v[2])]),
         _ => return vec![3, kind],
     };
     let mut e = vec![2, port as u32];
@@ -1257,13 +1328,7 @@ extern "C" fn queue_hook(kind: u32, args: u32) -> u32 {
             if IN_SHADOW.with(|f| f.replace(true)) {
                 return original();
             }
-            let r = shadow(
-                QUEUE,
-                |m| {
-                    deferred_queue(m, kind, args as usize);
-                },
-                original,
-            );
+            let r = shadow(QUEUE, |m| deferred_queue(m, kind, args as usize) as u32, original);
             IN_SHADOW.with(|f| f.set(false));
             r
         }
@@ -1311,6 +1376,182 @@ extern "C" fn execute_hook() {
 }
 
 static REPLAYS: AtomicU32 = AtomicU32::new(0);
+
+// --- 2D vertex space, tint color, clip planes -------------------------------------------------
+
+const SHADER_PAIRS: usize = 0x00E8_4AF0; // 0x1C-byte entries {+0 VS, +4 PS, +0xC declaration}
+const PS_C4_COPY: usize = 0x0230_4D9C; // the last tint constant, kept for a device reset
+const CLIP_PLANE_MASK: usize = 0x0252_A314;
+const CLIP_PLANE_CACHE: usize = 0x022F_5A50; // RENDER_STATE_CACHE[0x98]
+
+/// `gfx_bind_shader_pair` (0xD19070; EAX = pair index): its vertex and pixel shader
+/// (NULL = the defaults) through the shader caches.
+fn bind_shader_pair(m: &mut Mem, idx: u32) {
+    let e = SHADER_PAIRS + idx as usize * 0x1C;
+    let vs = match m.rd(e) {
+        0 => m.rd(DEFAULT_VS),
+        v => v,
+    };
+    if m.rd(VS_CACHE) != vs {
+        m.put(&[4, vs]);
+        m.wr(VS_CACHE, vs);
+    }
+    let ps = match m.rd(e + 4) {
+        0 => m.rd(DEFAULT_PS),
+        v => v,
+    };
+    if m.rd(PS_CACHE) != ps {
+        m.put(&[3, ps]);
+        m.wr(PS_CACHE, ps);
+    }
+}
+
+/// `gfx_2d_alloc` (0xD1E070; cdecl (vertex count) -> the 2D vertex buffer, or NULL
+/// while a batch is pending): linear filtering on sampler 0, and the 2D shader pair
+/// (5 without a bitmap on stage 0, else 4) with its declaration.
+fn alloc_2d(m: &mut Mem, count: u32) -> u32 {
+    if m.rd(VERTS_PENDING) != 0 {
+        return 0;
+    }
+    m.wr(VERTS_PENDING, 1);
+    m.wr(VERTS_COUNT, count);
+    sampler0_state(m, 7, 2);
+    sampler0_state(m, 5, 2);
+    let idx = 4 + ((m.rd(BITMAP_CACHE) as i32) < 0) as u32;
+    let decl = m.rd(SHADER_PAIRS + idx as usize * 0x1C + 0xC);
+    if decl != m.rd(DECL_CACHE) {
+        m.put(&[5, decl]);
+        m.wr(DECL_CACHE, decl);
+    }
+    bind_shader_pair(m, idx);
+    VERTS as u32
+}
+
+/// `im2d_strip_add` / `im2d_list_add` (0xD0A380 / 0xD0A1F0; ESI = vertex count, cdecl
+/// (vertices or NULL) -> where the vertices go): flush what the batch holds, take the
+/// vertex space and copy the vertices in. Deferred, the space is in the list record
+/// (type 0x1C / 0x1F) and the caller fills it.
+fn batch_add(m: &mut Mem, list: bool, count: u32, src: u32) -> u32 {
+    if defers() {
+        let mut out = [0u32, count.wrapping_mul(0x1C)];
+        let p = out.as_mut_ptr() as usize;
+        m.wr(p, 0);
+        m.wr(p + 4, count.wrapping_mul(0x1C));
+        m.queue(if list { 0x1F } else { 0x1C }, &[count, p as u32]);
+        if m.dry
+            && let Some(e) = m.tape.last_mut()
+        {
+            e.truncate(3); // the {dst, bytes} pointer is each caller's own stack: not compared
+        }
+        let dst = m.rd(p);
+        // Our own scratch: the original's is on its own stack.
+        m.overlay.remove(&p);
+        m.overlay.remove(&(p + 4));
+        return dst;
+    }
+    let var = if list { LIST_COUNT } else { STRIP_COUNT };
+    let n = m.rd(var) as i32;
+    if list {
+        if n >= 3 {
+            flush_2d(m, 4, (n / 3) as u32);
+        }
+    } else if n >= 0 {
+        flush_2d(m, 5, n.wrapping_sub(2) as u32);
+    }
+    m.wr(var, count);
+    let dst = alloc_2d(m, count);
+    if dst != 0 && src != 0 {
+        let n = count.wrapping_mul(0x1C) as usize;
+        if m.dry {
+            for i in (0..n).step_by(4) {
+                let v = m.rd(src as usize + i);
+                m.wr(dst as usize + i, v);
+            }
+        } else {
+            unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, n) };
+        }
+    }
+    dst
+}
+
+/// `gfx_cmd_set_ps_c4` (0xD18DE0; EAX = &float4): pixel shader constant c4, also
+/// kept at 0x2304D9C for a device reset. No cache.
+fn set_ps_c4(m: &mut Mem, p: u32) {
+    let v: Vec<u32> = (0..4).map(|i| m.rd(p as usize + i * 4)).collect();
+    for (i, &x) in v.iter().enumerate() {
+        m.wr(PS_C4_COPY + i * 4, x);
+    }
+    m.put(&[7, 4, 1, v[0], v[1], v[2], v[3]]);
+}
+
+/// `gfx_set_tint_color` (0xD14700; ESI = &{r, g, b}): the context's +0x70 = (r, g, b,
+/// 1.0), then pixel constant c4 from it.
+fn set_tint_color(m: &mut Mem, p: u32) {
+    let ctx = thread_context() as usize;
+    for i in 0..3 {
+        let v = m.rd(p as usize + i * 4);
+        m.wr(ctx + 0x70 + i * 4, v);
+    }
+    m.wr(ctx + 0x7C, 1.0f32.to_bits());
+    if defers() {
+        m.queue(7, &[p]);
+    } else {
+        set_ps_c4(m, ctx as u32 + 0x70);
+    }
+}
+
+/// `gfx_set_user_clip_plane` (0xD18BD0; ECX = plane 0-5, cdecl (a, b, c, d)): a plane
+/// with a = b = c = 0 is switched off, otherwise on and set on the device directly
+/// (SetClipPlane, not through the ring); CLIPPLANEENABLE through the cache.
+fn set_user_clip_plane(m: &mut Mem, idx: u32, plane: [u32; 4]) {
+    if idx > 5 {
+        return;
+    }
+    let off = (0..3).all(|i| f32::from_bits(plane[i]) == 0.0);
+    let mask = if off { m.rd(CLIP_PLANE_MASK) & !(1 << idx) } else { m.rd(CLIP_PLANE_MASK) | 1 << idx };
+    m.wr(CLIP_PLANE_MASK, mask);
+    if m.rd(CLIP_PLANE_CACHE) != mask && mask != 0xBAAD_F00D {
+        m.wr(CLIP_PLANE_CACHE, mask);
+        m.put(&[15, 0x98, mask]);
+    }
+    if off || m.dry {
+        return; // (the device call cannot be predicted: not compared)
+    }
+    unsafe {
+        let dev = rd(0x0252_A2D0);
+        let f: extern "system" fn(u32, u32, *const [u32; 4]) -> i32 =
+            std::mem::transmute(rd(rd(dev as usize) as usize + 0xDC) as usize);
+        f(dev, idx, &plane);
+    }
+}
+
+/// `gfx_set_clip_plane` (0xD22090; ECX = plane, cdecl (a, b, c, d)).
+fn set_clip_plane(m: &mut Mem, idx: u32, plane: [u32; 4]) {
+    if defers() {
+        let mut a = vec![idx];
+        for v in plane {
+            a.extend_from_slice(&f64_args(f32::from_bits(v)));
+        }
+        m.queue(0xC, &a);
+    } else {
+        set_user_clip_plane(m, idx, plane);
+    }
+}
+
+/// What a hook's Rust body returns to the caller in EAX.
+trait Ret {
+    fn ret(self) -> u32;
+}
+impl Ret for () {
+    fn ret(self) -> u32 {
+        0
+    }
+}
+impl Ret for u32 {
+    fn ret(self) -> u32 {
+        self
+    }
+}
 
 // --- Calling the originals ------------------------------------------------------------------
 
@@ -1407,7 +1648,7 @@ static CALLS: [AtomicU32; COUNT] = [const { AtomicU32::new(0) }; COUNT];
 static MISMATCHES: [AtomicU32; COUNT] = [const { AtomicU32::new(0) }; COUNT];
 static LOGGED: AtomicU32 = AtomicU32::new(0);
 
-fn shadow(i: usize, rust: impl FnOnce(&mut Mem), original: impl FnOnce() -> u32) -> u32 {
+fn shadow(i: usize, rust: impl FnOnce(&mut Mem) -> u32, original: impl FnOnce() -> u32) -> u32 {
     let watch = watched();
     let before: Vec<u32> = watch.iter().map(|&p| unsafe { rd(p) }).collect();
     let mut m = Mem { dry: true, ..Mem::live() };
@@ -1450,7 +1691,7 @@ fn shadow(i: usize, rust: impl FnOnce(&mut Mem), original: impl FnOnce() -> u32)
 /// One hook body: count, then original / shadow / Rust. A hook reached while a check
 /// runs on this thread (one ported function calling another) runs the original: the
 /// outer check predicted it already.
-fn run(i: usize, rust: impl FnOnce(&mut Mem), original: impl FnOnce() -> u32) -> u32 {
+fn run(i: usize, rust: impl FnOnce(&mut Mem) -> u32, original: impl FnOnce() -> u32) -> u32 {
     CALLS[i].fetch_add(1, Ordering::Relaxed);
     if exec_taping() {
         return original(); // a handler's call during the replay check: taped by the hook
@@ -1465,10 +1706,7 @@ fn run(i: usize, rust: impl FnOnce(&mut Mem), original: impl FnOnce() -> u32) ->
             IN_SHADOW.with(|f| f.set(false));
             r
         }
-        Mode::Rust => {
-            rust(&mut Mem::live());
-            0
-        }
+        Mode::Rust => rust(&mut Mem::live()),
     }
 }
 
@@ -1515,7 +1753,7 @@ macro_rules! hook {
         extern "C" fn $hook($eax: u32, $ecx: u32, $edx: u32, $esi: u32, $edi: u32, $a: *const u32) -> u32 {
             let r = ($eax, $ecx, $edx, $esi, $edi, $a);
             let t = tape_exec_call($idx, &r);
-            let res = run($idx, |$m: &mut Mem| $body, original($idx, r, $nargs));
+            let res = run($idx, |$m: &mut Mem| Ret::ret($body), original($idx, r, $nargs));
             end_exec_call(t);
             res
         }
@@ -1674,6 +1912,39 @@ hook!(e_list_end, h_list_end, LIST_END, 0, |m, eax, ecx, edx, esi, edi, a| {
     batch_end(m, true)
 });
 
+hook!(e_bind_pair, h_bind_pair, BIND_SHADER_PAIR, 0, |m, eax, ecx, edx, esi, edi, a| {
+    let _ = (eax, ecx, edx, esi, edi, a);
+    bind_shader_pair(m, eax)
+});
+hook!(e_alloc_2d, h_alloc_2d, ALLOC_2D, 1, |m, eax, ecx, edx, esi, edi, a| {
+    let _ = (eax, ecx, edx, esi, edi, a);
+    alloc_2d(m, arg(a, 0))
+});
+hook!(e_strip_add, h_strip_add, STRIP_ADD, 1, |m, eax, ecx, edx, esi, edi, a| {
+    let _ = (eax, ecx, edx, esi, edi, a);
+    batch_add(m, false, esi, arg(a, 0))
+});
+hook!(e_list_add, h_list_add, LIST_ADD, 1, |m, eax, ecx, edx, esi, edi, a| {
+    let _ = (eax, ecx, edx, esi, edi, a);
+    batch_add(m, true, esi, arg(a, 0))
+});
+hook!(e_ps_c4, h_ps_c4, PS_C4, 0, |m, eax, ecx, edx, esi, edi, a| {
+    let _ = (eax, ecx, edx, esi, edi, a);
+    set_ps_c4(m, eax)
+});
+hook!(e_tint, h_tint, TINT, 0, |m, eax, ecx, edx, esi, edi, a| {
+    let _ = (eax, ecx, edx, esi, edi, a);
+    set_tint_color(m, esi)
+});
+hook!(e_user_clip, h_user_clip, USER_CLIP_PLANE, 4, |m, eax, ecx, edx, esi, edi, a| {
+    let _ = (eax, ecx, edx, esi, edi, a);
+    set_user_clip_plane(m, ecx, [arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3)])
+});
+hook!(e_clip, h_clip, CLIP_PLANE, 4, |m, eax, ecx, edx, esi, edi, a| {
+    let _ = (eax, ecx, edx, esi, edi, a);
+    set_clip_plane(m, ecx, [arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3)])
+});
+
 const STREAM: usize = 0;
 const INDICES: usize = 1;
 const DECL: usize = 2;
@@ -1719,7 +1990,15 @@ const LIST_BEGIN: usize = 41;
 const LIST_END: usize = 42;
 const QUEUE: usize = 43;
 const EXECUTE_LIST: usize = 44;
-const COUNT: usize = 45;
+const BIND_SHADER_PAIR: usize = 45;
+const ALLOC_2D: usize = 46;
+const STRIP_ADD: usize = 47;
+const LIST_ADD: usize = 48;
+const PS_C4: usize = 49;
+const TINT: usize = 50;
+const USER_CLIP_PLANE: usize = 51;
+const CLIP_PLANE: usize = 52;
+const COUNT: usize = 53;
 
 /// (name, address, the bytes the detour steals (whole instructions, no relative branches)).
 const PORTS: [(&str, usize, &[u8]); COUNT] = [
@@ -1768,6 +2047,14 @@ const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("im2d_list_end", 0x00D0A190, &[0x80, 0x3D, 0xDB, 0x49, 0xE8, 0x00, 0x00]),
     ("render_deferred_queue", 0x00CF_8EA0, &[0xA1, 0x7C, 0x59, 0x30, 0x02]),
     ("render_deferred_execute", 0x00CF_8FA0, &[0xA1, 0x78, 0x59, 0x30, 0x02]),
+    ("gfx_bind_shader_pair", 0x00D19070, &[0x8D, 0x0C, 0xC5, 0x00, 0x00, 0x00, 0x00]),
+    ("gfx_2d_alloc", 0x00D1E070, &[0x33, 0xD2, 0x39, 0x15, 0xFC, 0xA2, 0x52, 0x02]),
+    ("im2d_strip_add", 0x00D0A380, &[0x83, 0xEC, 0x08, 0x80, 0x3D, 0xDB, 0x49, 0xE8, 0x00, 0x00]),
+    ("im2d_list_add", 0x00D0A1F0, &[0x83, 0xEC, 0x08, 0x80, 0x3D, 0xDB, 0x49, 0xE8, 0x00, 0x00]),
+    ("gfx_cmd_set_ps_c4", 0x00D18DE0, &[0xD9, 0x00, 0xD9, 0x1D, 0x9C, 0x4D, 0x30, 0x02]),
+    ("gfx_set_tint_color", 0x00D14700, &[0x64, 0xA1, 0x2C, 0x00, 0x00, 0x00]),
+    ("gfx_set_user_clip_plane", 0x00D18BD0, &[0x83, 0xEC, 0x10, 0x83, 0xF9, 0x05]),
+    ("gfx_set_clip_plane", 0x00D22090, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xC0]),
 ];
 
 /// Whole bodies of the writers whose first five bytes hold a short branch: these are
@@ -1800,7 +2087,8 @@ const RELOCATED_CALLS: [(usize, &[usize]); 4] =
 
 /// Never called in the shadow-checked play run (the game writes these commands
 /// inline elsewhere), so not verified: left original in the Rust build.
-const NOT_SEEN_IN_GAME: [usize; 5] = [DECL, PS_CONSTANTS_UNCHECKED, PS_CONSTANTS, VS_CONSTANTS, DRAW];
+const NOT_SEEN_IN_GAME: [usize; 7] =
+    [DECL, PS_CONSTANTS_UNCHECKED, PS_CONSTANTS, VS_CONSTANTS, DRAW, USER_CLIP_PLANE, CLIP_PLANE];
 
 static ORIG: [AtomicUsize; COUNT] = [const { AtomicUsize::new(0) }; COUNT];
 
@@ -1850,6 +2138,14 @@ fn entry_address(i: usize) -> usize {
         LIST_BEGIN => e_list_begin,
         LIST_END => e_list_end,
         QUEUE => queue_entry,
+        BIND_SHADER_PAIR => e_bind_pair,
+        ALLOC_2D => e_alloc_2d,
+        STRIP_ADD => e_strip_add,
+        LIST_ADD => e_list_add,
+        PS_C4 => e_ps_c4,
+        TINT => e_tint,
+        USER_CLIP_PLANE => e_user_clip,
+        CLIP_PLANE => e_clip,
         EXECUTE_LIST => execute_hook,
         _ => unreachable!(),
     };

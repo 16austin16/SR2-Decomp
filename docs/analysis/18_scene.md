@@ -444,6 +444,16 @@ hooked tape only their type). Over a play run: 1,264,367 queued calls and 3,599 
 0 differences; then the Rust lists drew the game. Tapes are per thread (the game and render
 threads check at the same time).
 
+
+**2D vertex space, tint (third batch).** Also Rust: `gfx_bind_shader_pair`, `gfx_2d_alloc`,
+`im2d_strip_add` / `im2d_list_add`, `gfx_cmd_set_ps_c4`, `gfx_set_tint_color`, and the handlers of
+types 19, 1C and 1F (vertex space: the record's space address goes back into the caller's
+{dst, bytes}; replay skips counts over 64). Checked with 1,285,885 queued calls and every replay,
+0 differences; live, the HUD text and minimap draw through it. The clip plane
+(`gfx_set_clip_plane`, `gfx_set_user_clip_plane`, type 0C) is written but never ran in play, so it
+stays original. In the check, the {dst, bytes} pointer an add passes to the queue is each caller's
+own stack and is not compared (its contents are).
+
 Details:
 - `gfx_apply_render_state_block`: blend modes 0-12 (0 off; 1 one/one add; 2 srcalpha/one add;
   4 destalpha/one add; 5 srcalpha/invsrcalpha; 6 destalpha/invdestalpha; 7 invdestalpha/

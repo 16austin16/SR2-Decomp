@@ -73,4 +73,5 @@ original. The standalone build can move to 64-bit later.
 35. ✅ The D3D command executor (gfx_execute_commands) and the ring rewind in Rust: 186 million Direct3D calls compared with the original (dry run against a recording proxy), 0 differences; the game renders with it.
 36. ✅ The ring writers and the first 22 graphics API functions in Rust (38 functions in one batch): predicted by Rust, compared with the original live, about 30 million calls, 0 differences; the game renders with them.
 37. ✅ The deferred command lists in Rust: queue, execute and 25 handler types (27 functions); 1.26 million queued calls and 3,599 replayed lists compared, 0 differences; the game draws with them.
-38. Next: the rest of the gfx_* layer (2D add and its handlers, tint color, clip plane, gamma, text) (18_scene.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).
+38. ✅ The 2D vertex space (alloc, strip / list add, shader pairs, their handlers) and the tint constant in Rust (9 functions); checked with the graphics layer, 0 differences.
+39. Next: text (font_draw_string_2d and friends), the 2D shapes, then vint rendering (06_vint.md), render_frame's batch passes (18_scene.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).
