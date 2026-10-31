@@ -65,4 +65,6 @@ original. The standalone build can move to 64-bit later.
 27. ✅ Request side, part 1, in Rust: step_init, the typed requests (animation, character, vehicle, chunk geom, chunk peg) and the unload helpers. 646 geom and 23 peg requests identical to the original in the teleport test. A chunk-extras difference seen in 2 of 3 Rust runs turned out to be ordering variance that the original shows too (05_streamer.md).
 28. ✅ Request side, part 2: request_chunk and the chunk-extras request in Rust; 655 chunk and 20 extras requests identical to the original in the teleport test.
 29. ✅ Streamer step/completion callbacks in Rust (23): the whole streamer runs in Rust; teleport test event logs identical to the original.
-30. Next: rsched and the io scheduler; then input (14_input.md), the render executor (07_render.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).
+30. ✅ The file-read (hdd) scheduler in Rust: hdd_service and the request functions; I/O events identical to the original for all 1,241 distinct world-chunk reads in the teleport test.
+31. ✅ rsched job layer in Rust: job_add/cancel/start_next/pump and rsched_update_all; job events match the original in the teleport test.
+32. Next: the rest of rsched (slot add_ref/release/update, group quotas, slot binding and eviction); then input (14_input.md), the render executor (07_render.md), the vint UI (06_vint.md), Lua (09_script.md) and audio (10_audio.md).

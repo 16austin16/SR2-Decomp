@@ -40,6 +40,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
         log(&crate::mempool::summary());
         log(&crate::streamman::summary());
         log(&crate::hddio::summary());
+        log(&crate::rsched::summary());
         if SURVEY {
             crate::survey::report(&format!("frame {n}"));
         }
@@ -2101,6 +2102,7 @@ pub fn install_all() {
         crate::mempool::install();
         crate::streamman::install();
         crate::hddio::install();
+        crate::rsched::install();
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }

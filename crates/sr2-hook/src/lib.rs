@@ -24,6 +24,7 @@ mod detour;
 mod hddio;
 mod hooks;
 mod mempool;
+mod rsched;
 mod streamman;
 mod teleport;
 #[allow(dead_code)] // enabled by hand when surveying a class family
