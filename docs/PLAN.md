@@ -51,4 +51,5 @@ original. The standalone build can move to 64-bit later.
 13. ✅ `file_read` @0xBFE170 → Rust. All 2,170,333 distinct reads in a boot plus save load are identical to the original, including a hash of the bytes. The EOF and compressed paths have not been exercised yet.
 14. ✅ Save tested: a new save slot written through the Rust `file_open` loads back fine, so writes are on Rust too. Menu input: Esc opens the pause menu, Ctrl/Shift switch tabs, arrow keys are extended scancodes.
 15. ✅ Temp unmount (`0xC0B8E0` plus record unregister `0xC0B2A0`) → Rust. All three unmounts in a save load leave the same state as the original's (`golden/temp_unmounts.txt`).
-16. Next: the file write path (whatever writes the `.bbsave` after `file_open`), file close (`0xBFDF30`), and the stream readers (`0xC18450`, `0xC18500`).
+16. ✅ `file_write` @0xBFE360 and `file_close` @0xBFDF30 → Rust. A save written and closed by Rust loads back, and 9,770 distinct closes match the original. The whole file API (open/resolve/read/write/close) is now Rust.
+17. Next: the stream layer underneath (`0xC18450` packfile read, `0xC18500` OS read, `0xC18300`/`0xC181C0` source open), or move on to the RTTI class list to pick the next subsystem.

@@ -300,6 +300,35 @@ It does not close the handle; the `mount_temp` caller owns it.
 - Each call is logged with the temp count and names, the record count, an address-independent hash of the slots (as record indices), and a hash of the temp array (`golden/temp_unmounts.txt`).
 - The Rust run's "after" states are identical. The "before" temp-array hash varies between runs because it covers heap pointers set by the mount.
 
+## 5g. `file_write` (0xBFE360) and `file_close` (0xBFDF30)
+
+Hand-decoded with capstone (Observed). Saving calls `file_open(path, "wb")`, then `file_write(h, 0x3AB58, buf)` (the whole 240,472-byte save in one call), then `file_close(h)`, all from 0x695245.
+
+`file_write`: ESI = handle, EDI = n, EDX = src; returns the number of bytes written in EAX and preserves ESI/EDI. 102 call sites. State 2 means a write error.
+1. Return 0 if `n == 0` or state != 0. If access != 2: state = 2, return 0.
+2. Memory (type 2): if `pos + n > capacity (+0x164)`, state = 2. If state is still 0, `memcpy(stream + pos, src, n)` and the result is n; otherwise the result is 0.
+3. Otherwise `0xC18570(ECX=n, EDX=src, stream)`, which is `WriteFile`. A short write sets state 2.
+4. `pos += got`, and size (+0x160) = max(size, pos).
+
+The prologue has a relative branch, so the function is replaced outright. For the observe run, the original is relocated: `detour::relocate` copies the 0x9F-byte body and re-aims its two `call rel32`s.
+
+`file_close`: cdecl(handle) returns AL. 121 call sites. It has a C++ EH frame and runs under critical section `0x33DA2F0`.
+1. By type:
+   - **0, OS file:** fails if arg != 0; otherwise `0xC184C0(ESI=os_file)` (CloseHandle plus releasing the os_file).
+   - **1, packfile entry:** `0xC18400(EAX=arg, EDI=stream)`.
+   - **2, memory:** `free(stream)` if it is a write handle that owns its buffer (flag 0x10 clear); the result is 1.
+   - **Any other type:** unlock and return 0, leaving the handle allocated.
+2. Reset the handle fields: names cleared; kind, arg, capacity and type set to -1; everything else 0.
+3. `pool_free(h)` (0xBFFEB0), unlock, return the result.
+
+**Ported (hooks.rs), 2026-10-31.** Both are Rust; the OS/packfile write and close helpers go through shims, and the lock uses the game's own IAT entries.
+- **Save test** (folder backed up first): one write with the original and one with Rust, both 0x3AB58 bytes ending in state 0. The saves differ in 40 bytes of session data. The Rust-written save (written and closed by Rust) loads back into the game.
+- **Close test:** per-call close logs over boot, load and save. All 9,770 distinct closes seen in both runs gave identical results, covering OS files, packfile entries, the memory file and the save's write handle.
+- The per-call logs are behind `LOG_WRITE_CLOSE_CALLS` (off).
+- **Not exercised:** memory-file writes, write errors, and closes of unknown types.
+
+**Steam Cloud note:** saves in `%LOCALAPPDATA%\THQ\Saints Row 2` are synced with Auto-Cloud. A file deleted while the game is closed is restored on the next launch, so test saves have to be deleted while the game is running.
+
 ## 6. Open questions
 
 - `packfile_mount_temp` callers: 0x69d250 mounts `city_load.vpp_pc` and 0xc0b6f0 mounts `hmaps.vpp_pc` on a save load. 0xc0b640 has not been seen yet. The temp unmount (it should rewind the record count to the mark) is not traced yet.

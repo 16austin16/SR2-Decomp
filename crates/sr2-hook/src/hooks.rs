@@ -1,6 +1,6 @@
-//! Detours into the original game, installed once `.text` is decrypted.
+﻿//! Detours into the original game, installed once `.text` is decrypted.
 //!
-//! Addresses are for SR2_pc.exe sha256 e20156a0…cfe8 (Steam, AppID 9480);
+//! Addresses are for SR2_pc.exe sha256 e20156a0â€¦cfe8 (Steam, AppID 9480);
 //! see docs/functions.csv.
 
 use std::arch::{asm, naked_asm};
@@ -37,6 +37,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     }
     if n.is_multiple_of(60) {
         file_read_log_flush();
+        call_logs_flush();
     }
     if n.is_multiple_of(3600) && FIND_ENTRY_SHADOW {
         log(&format!(
@@ -138,7 +139,7 @@ const PACKFILE_FIND_RECORD_BODY: [u8; 254] = [
     0x10, 0xC3, 0x8B, 0x44, 0x24, 0x14, 0x5F, 0x5E, 0x5D, 0x5B, 0x83, 0xC4, 0x10, 0xC3,
 ];
 
-/// Globals (docs/analysis/01_packfile.md §4).
+/// Globals (docs/analysis/01_packfile.md Â§4).
 const G_HASH_SLOTS: usize = 0x0234_8948; // *const *const FileRecord
 const G_HASH_SLOT_COUNT: usize = 0x0234_894C; // i32
 const G_FILE_RECORDS: usize = 0x0234_8958; // *const FileRecord
@@ -166,7 +167,7 @@ static FIND_RECORD_FALLBACK: AtomicBool = AtomicBool::new(false);
 
 /// `_stricmp(query, entry_full_name) == 0`, where the full name is `"name.ext"`,
 /// or just `name` when ext is NULL or empty. `_stricmp` in the "C" locale folds
-/// only ASCII A–Z, as here.
+/// only ASCII Aâ€“Z, as here.
 unsafe fn query_matches_entry(query: *const u8, e: &VppEntry) -> bool {
     let name = unsafe { std::ffi::CStr::from_ptr(e.name.cast()) }.to_bytes();
     let ext: &[u8] = if e.ext.is_null() { b"" } else { unsafe { std::ffi::CStr::from_ptr(e.ext.cast()) }.to_bytes() };
@@ -377,7 +378,7 @@ unsafe fn packfile_load(slot: *mut u8, h: *mut u8, permanent: bool, register: bo
     r as u8 != 0
 }
 
-/// Rust port of `packfile_mount` (0xC0B410), docs/analysis/01_packfile.md §5a.
+/// Rust port of `packfile_mount` (0xC0B410), docs/analysis/01_packfile.md Â§5a.
 extern "C" fn packfile_mount_rust(path: *const u8) -> u32 {
     unsafe {
         // 0xC0B120: rejects only NULL (its basename length check cannot fail).
@@ -1199,7 +1200,7 @@ unsafe fn file_source_open(loc: *mut u8, mode: *const u8, h: *mut u8) -> bool {
     r as u8 != 0
 }
 
-/// Rust port of `file_open` (0xBFDC20), docs/analysis/01_packfile.md §5d.
+/// Rust port of `file_open` (0xBFDC20), docs/analysis/01_packfile.md Â§5d.
 ///
 /// `file_handle` (0x16C bytes, pooled): name `char[0x41]` +0, path +0x41,
 /// location kind +0x144, type +0x148 (0 OS file, 1 packfile, -1 dead),
@@ -1447,7 +1448,7 @@ unsafe fn packfile_stream_read(stream: *mut u8, arg: u32, dst: *mut u8, n: u32, 
     r
 }
 
-/// Rust port of `file_read` (0xBFE170), docs/analysis/01_packfile.md §5e.
+/// Rust port of `file_read` (0xBFE170), docs/analysis/01_packfile.md Â§5e.
 /// State +0x158: 0 ok, 1 EOF/short read, 3 one-shot read done (flag bit 8).
 extern "C" fn file_read_rust(n: u32, dst: *mut u8, h: *mut u8) -> u32 {
     unsafe {
@@ -1603,6 +1604,331 @@ extern "C" fn file_read_log(h: *const u8, dst: *const u8, n: u32, pos: u32, got:
 fn file_read_log_flush() {
     use std::io::Write as _;
     if let Some(f) = FILE_READ_LOG.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        let _ = f.flush();
+    }
+}
+
+// --- 0xBFE360 file_write and 0xBFDF30 file_close --------------------------
+
+/// LTCG: ESI = handle, EDI = n, EDX = src, returns bytes written; ESI/EDI
+/// preserved. Prologue `test edi,edi; jne +3; xor eax,eax; ret`: the jne is
+/// relative, so this one is replaced outright (body pinned below).
+const FILE_WRITE: usize = 0x00BF_E360;
+const FILE_WRITE_BODY: [u8; 0x9F] = [
+    0x85, 0xFF, 0x75, 0x03, 0x33, 0xC0, 0xC3, 0x83, 0xBE, 0x58, 0x01, 0x00, 0x00, 0x00, 0x75, 0xF4, 0x53, 0xBB, 0x02,
+    0x00, 0x00, 0x00, 0x33, 0xC0, 0x39, 0x9E, 0x54, 0x01, 0x00, 0x00, 0x74, 0x08, 0x89, 0x9E, 0x58, 0x01, 0x00, 0x00,
+    0x5B, 0xC3, 0x39, 0x9E, 0x48, 0x01, 0x00, 0x00, 0x75, 0x38, 0x8B, 0x8E, 0x5C, 0x01, 0x00, 0x00, 0x55, 0x8D, 0x2C,
+    0x39, 0x3B, 0xAE, 0x64, 0x01, 0x00, 0x00, 0x5D, 0x76, 0x06, 0x89, 0x9E, 0x58, 0x01, 0x00, 0x00, 0x39, 0x86, 0x58,
+    0x01, 0x00, 0x00, 0x75, 0x28, 0x8B, 0x86, 0x4C, 0x01, 0x00, 0x00, 0x57, 0x52, 0x03, 0xC1, 0x50, 0xE8, 0x8F, 0x24,
+    0x0A, 0x00, 0x83, 0xC4, 0x0C, 0x8B, 0xC7, 0xEB, 0x1B, 0x8B, 0x8E, 0x4C, 0x01, 0x00, 0x00, 0x51, 0x8B, 0xCF, 0xE8,
+    0x9A, 0xA1, 0x01, 0x00, 0x83, 0xC4, 0x04, 0x3B, 0xC7, 0x74, 0x06, 0x89, 0x9E, 0x58, 0x01, 0x00, 0x00, 0x01, 0x86,
+    0x5C, 0x01, 0x00, 0x00, 0x8B, 0x8E, 0x5C, 0x01, 0x00, 0x00, 0x39, 0x8E, 0x60, 0x01, 0x00, 0x00, 0x73, 0x06, 0x89,
+    0x8E, 0x60, 0x01, 0x00, 0x00, 0x5B, 0xC3,
+];
+const OS_FILE_WRITE: usize = 0x00C1_8570; // ECX = n, EDX = src, stack os_file*, caller-clean -> bytes (WriteFile)
+/// Offsets of the body's two `call rel32` (memcpy, os_file_write), fixed up
+/// when the original is relocated for the observe run.
+const FILE_WRITE_CALLS: [usize; 2] = [0x5C, 0x71];
+/// The relocated original (see [`detour::relocate`]).
+static FILE_WRITE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+const FILE_WRITE_USE_RUST: bool = true;
+
+/// Call the original's convention: ESI = h, EDI = n, EDX = src.
+unsafe fn call_file_write(f: usize, h: *mut u8, n: u32, src: *const u8) -> u32 {
+    let r: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "mov esi, {h}",
+            "mov edi, {n}",
+            "call {f}",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) f,
+            h = in(reg) h,
+            n = in(reg) n,
+            in("edx") src,
+            lateout("eax") r,
+            clobber_abi("C"),
+        );
+    }
+    r
+}
+
+/// cdecl `(file_handle*) -> bool`. Prologue `push -1; push <SEH handler>;
+/// mov eax,fs:[0]`: 13 bytes, absolute operands only.
+const FILE_CLOSE_PROLOGUE: [u8; 13] = [0x6A, 0xFF, 0x68, 0x08, 0x3A, 0xDA, 0x00, 0x64, 0xA1, 0x00, 0x00, 0x00, 0x00];
+const FILE_CLOSE_LOCK: usize = 0x033D_A2F0; // CRITICAL_SECTION
+const IAT_ENTER_CRITICAL_SECTION: usize = 0x00DB_80CC;
+const IAT_LEAVE_CRITICAL_SECTION: usize = 0x00DB_80D0;
+const PACKFILE_STREAM_CLOSE: usize = 0x00C1_8400; // EAX = arg, EDI = stream -> AL
+const OS_FILE_CLOSE: usize = 0x00C1_84C0; // ESI = os_file -> AL
+const CRT_FREE: usize = 0x00C9_6BAD;
+
+static FILE_CLOSE_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static FILE_CLOSE_IMPL: AtomicUsize = AtomicUsize::new(0);
+const FILE_CLOSE_USE_RUST: bool = true;
+
+/// Log every file_write / file_close to sr2-filewrite.log / sr2-fileclose.log
+/// (a save load is ~20k closes, a save a handful of writes). Off once verified.
+const LOG_WRITE_CLOSE_CALLS: bool = false;
+
+unsafe fn os_file_write(stream: *mut u8, src: *const u8, n: u32) -> u32 {
+    let r: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "push {stream}",
+            "call {f}",
+            "add esp, 4",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) OS_FILE_WRITE,
+            stream = in(reg) stream,
+            in("ecx") n,
+            in("edx") src,
+            lateout("eax") r,
+            clobber_abi("C"),
+        );
+    }
+    r
+}
+
+/// Rust port of `file_write` (0xBFE360), docs/analysis/01_packfile.md Â§5g.
+/// State +0x158 = 2 marks a write error; memory files have a capacity at +0x164.
+extern "C" fn file_write_rust(h: *mut u8, n: u32, src: *const u8) -> u32 {
+    unsafe {
+        let field = |o: usize| h.add(o) as *mut u32;
+        if n == 0 || *field(0x158) != 0 {
+            return 0;
+        }
+        if *field(0x154) != 2 {
+            *field(0x158) = 2;
+            return 0;
+        }
+        let pos = *field(0x15C);
+        let got = if *field(0x148) == 2 {
+            if pos.wrapping_add(n) > *field(0x164) {
+                *field(0x158) = 2;
+            }
+            if *field(0x158) == 0 {
+                let memcpy: extern "C" fn(*mut u8, *const u8, u32) -> *mut u8 = std::mem::transmute(CRT_MEMCPY);
+                memcpy((*field(0x14C) as *mut u8).add(pos as usize), src, n);
+                n
+            } else {
+                0
+            }
+        } else {
+            let got = os_file_write(*field(0x14C) as *mut u8, src, n);
+            if got != n {
+                *field(0x158) = 2;
+            }
+            got
+        };
+        *field(0x15C) = pos.wrapping_add(got);
+        if *field(0x160) < *field(0x15C) {
+            *field(0x160) = *field(0x15C);
+        }
+        got
+    }
+}
+
+#[unsafe(naked)]
+extern "C" fn file_write_thunk() {
+    naked_asm!(
+        "push edx", // src
+        "push edi", // n
+        "push esi", // h
+        "call {f}",
+        "add esp, 12",
+        "ret",
+        f = sym file_write_hook,
+    )
+}
+
+extern "C" fn file_write_hook(h: *mut u8, n: u32, src: *const u8) -> u32 {
+    let pos = unsafe { *(h.add(0x15C) as *const u32) };
+    let got = if FILE_WRITE_USE_RUST {
+        file_write_rust(h, n, src)
+    } else {
+        unsafe { call_file_write(FILE_WRITE_ORIGINAL.load(Ordering::Relaxed), h, n, src) }
+    };
+    if LOG_WRITE_CLOSE_CALLS {
+        unsafe {
+            let rd = |o: usize| *(h.add(o) as *const u32);
+            let data = std::slice::from_raw_parts(src, if src.is_null() { 0 } else { got as usize });
+            let mut x = 0x811C_9DC5u32;
+            fnv(&mut x, data);
+            call_log(
+                1,
+                &format!(
+                    "{:?} type {} n {n:#x} pos {pos:#x} -> {got:#x} state {} pos {:#x} size {:#x} data {x:08x}",
+                    String::from_utf8_lossy(cstr(h)),
+                    rd(0x148) as i32,
+                    rd(0x158),
+                    rd(0x15C),
+                    rd(0x160)
+                ),
+            );
+        }
+    }
+    got
+}
+
+unsafe fn packfile_stream_close(arg: u32, stream: *mut u8) -> bool {
+    let r: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "mov edi, {stream}",
+            "call {f}",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) PACKFILE_STREAM_CLOSE,
+            stream = in(reg) stream,
+            inout("eax") arg => r,
+            clobber_abi("C"),
+        );
+    }
+    r as u8 != 0
+}
+
+unsafe fn os_file_close(stream: *mut u8) -> bool {
+    let r: u32;
+    unsafe {
+        asm!(
+            "push ebx",
+            "push esi",
+            "push edi",
+            "push ebp",
+            "mov esi, {stream}",
+            "call {f}",
+            "pop ebp",
+            "pop edi",
+            "pop esi",
+            "pop ebx",
+            f = in(reg) OS_FILE_CLOSE,
+            stream = in(reg) stream,
+            lateout("eax") r,
+            clobber_abi("C"),
+        );
+    }
+    r as u8 != 0
+}
+
+/// Rust port of `file_close` (0xBFDF30): close the source by type, reset the
+/// handle and return it to the pool, all under the close lock. An unknown type
+/// returns false and leaves the handle allocated, as in the original.
+extern "C" fn file_close_rust(h: *mut u8) -> u32 {
+    unsafe {
+        let enter: extern "system" fn(usize) = std::mem::transmute(*(IAT_ENTER_CRITICAL_SECTION as *const usize));
+        let leave: extern "system" fn(usize) = std::mem::transmute(*(IAT_LEAVE_CRITICAL_SECTION as *const usize));
+        let field = move |o: usize| h.add(o) as *mut u32;
+        enter(FILE_CLOSE_LOCK);
+        let stream = *field(0x14C) as *mut u8;
+        let ok = match *field(0x148) {
+            0 => *field(0x150) == 0 && os_file_close(stream),
+            1 => packfile_stream_close(*field(0x150), stream),
+            2 => {
+                // Memory files opened for writing own their buffer, unless flag 0x10.
+                if *field(0x154) == 2 && !stream.is_null() && *field(0x168) & 0x10 == 0 {
+                    let free: extern "C" fn(*mut u8) = std::mem::transmute(CRT_FREE);
+                    free(stream);
+                    *field(0x14C) = 0;
+                }
+                true
+            }
+            _ => {
+                leave(FILE_CLOSE_LOCK);
+                return 0;
+            }
+        };
+        *h = 0;
+        *h.add(0x41) = 0;
+        for (o, v) in [
+            (0x144, u32::MAX),
+            (0x150, u32::MAX),
+            (0x154, 0),
+            (0x158, 0),
+            (0x15C, 0),
+            (0x160, 0),
+            (0x164, u32::MAX),
+            (0x168, 0),
+            (0x14C, 0),
+            (0x148, u32::MAX),
+        ] {
+            *field(o) = v;
+        }
+        file_handle_free(h);
+        leave(FILE_CLOSE_LOCK);
+        ok as u32
+    }
+}
+
+extern "C" fn file_close_hook(h: *mut u8) -> u32 {
+    let before = if LOG_WRITE_CLOSE_CALLS {
+        unsafe {
+            let rd = |o: usize| *(h.add(o) as *const u32);
+            format!(
+                "{:?} type {} access {} arg {} flag {:#x} size {:#x}",
+                String::from_utf8_lossy(cstr(h)),
+                rd(0x148) as i32,
+                rd(0x154),
+                rd(0x150) as i32,
+                rd(0x168),
+                rd(0x160)
+            )
+        }
+    } else {
+        String::new()
+    };
+    let imp: extern "C" fn(*mut u8) -> u32 = unsafe { std::mem::transmute(FILE_CLOSE_IMPL.load(Ordering::Relaxed)) };
+    let r = imp(h) as u8;
+    if LOG_WRITE_CLOSE_CALLS {
+        call_log(2, &format!("{before} -> {r}"));
+    }
+    r as u32
+}
+
+static CALL_LOGS: std::sync::Mutex<[Option<std::io::BufWriter<std::fs::File>>; 3]> =
+    std::sync::Mutex::new([None, None, None]);
+const CALL_LOG_NAMES: [&str; 3] = ["sr2-unused.log", "sr2-filewrite.log", "sr2-fileclose.log"];
+
+fn call_log(which: usize, line: &str) {
+    use std::io::Write as _;
+    let mut logs = CALL_LOGS.lock().unwrap_or_else(|e| e.into_inner());
+    let slot = &mut logs[which];
+    if slot.is_none() {
+        *slot = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(CALL_LOG_NAMES[which])
+            .ok()
+            .map(std::io::BufWriter::new);
+    }
+    if let Some(f) = slot.as_mut() {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn call_logs_flush() {
+    use std::io::Write as _;
+    for f in CALL_LOGS.lock().unwrap_or_else(|e| e.into_inner()).iter_mut().flatten() {
         let _ = f.flush();
     }
 }
@@ -1846,6 +2172,40 @@ pub fn install_early() {
             log(&format!("hooked packfile_unmount_temp_all @ 0xc0b8e0 ({which})"));
         }
         Err(e) => log(&format!("hook packfile_unmount_temp_all failed: {e:?}")),
+    }
+
+    // file_write: relocate the original first (the hook may call it), then replace.
+    match unsafe { detour::relocate(FILE_WRITE, &FILE_WRITE_BODY, &FILE_WRITE_CALLS) } {
+        Ok(copy) => {
+            FILE_WRITE_ORIGINAL.store(copy, Ordering::Relaxed);
+            match unsafe { detour::replace(FILE_WRITE, &FILE_WRITE_BODY, file_write_thunk as extern "C" fn() as usize) } {
+                Ok(()) => log(&format!(
+                    "hooked file_write @ 0xbfe360 ({})",
+                    if FILE_WRITE_USE_RUST { "Rust" } else { "original, relocated, observed" }
+                )),
+                Err(e) => log(&format!("hook file_write failed: {e:?}")),
+            }
+        }
+        Err(e) => log(&format!("relocate file_write failed: {e:?}")),
+    }
+
+    if FILE_CLOSE_USE_RUST {
+        FILE_CLOSE_IMPL.store(file_close_rust as extern "C" fn(*mut u8) -> u32 as usize, Ordering::Relaxed);
+    }
+    match unsafe {
+        detour::install(FILE_CLOSE, &FILE_CLOSE_PROLOGUE, file_close_hook as extern "C" fn(*mut u8) -> u32 as usize)
+    } {
+        Ok(tramp) => {
+            FILE_CLOSE_ORIGINAL.store(tramp, Ordering::Relaxed);
+            let which = if FILE_CLOSE_USE_RUST {
+                "Rust"
+            } else {
+                FILE_CLOSE_IMPL.store(tramp, Ordering::Relaxed);
+                "original, observed"
+            };
+            log(&format!("hooked file_close @ 0xbfdf30 ({which})"));
+        }
+        Err(e) => log(&format!("hook file_close failed: {e:?}")),
     }
 
     // Every file_open at boot goes through here, so hook it before the mounts.

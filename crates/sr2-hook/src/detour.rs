@@ -55,6 +55,38 @@ pub unsafe fn replace(target: usize, expected: &[u8], replacement: usize) -> Res
     Ok(())
 }
 
+/// Copy a whole function body (`expected`, pinned like [`replace`]) to new
+/// executable memory, re-aiming the `call rel32` instructions at the given
+/// offsets, and return the copy's address. For functions whose prologue holds
+/// a relative branch: the copy keeps the original callable after [`replace`].
+/// Every other branch in the body must stay inside it.
+///
+/// # Safety
+/// `call_offsets` must be exactly the body's `E8` instructions with targets outside it.
+pub unsafe fn relocate(target: usize, expected: &[u8], call_offsets: &[usize]) -> Result<usize, DetourError> {
+    let current = unsafe { std::slice::from_raw_parts(target as *const u8, expected.len()) };
+    if current != expected {
+        return Err(DetourError::PrologueMismatch { found: current.to_vec() });
+    }
+    let n = expected.len();
+    let copy =
+        unsafe { VirtualAlloc(std::ptr::null(), n, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as *mut u8;
+    if copy.is_null() {
+        return Err(DetourError::Alloc);
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(expected.as_ptr(), copy, n);
+        for &o in call_offsets {
+            debug_assert_eq!(expected[o], 0xE8);
+            let rel = i32::from_le_bytes(expected[o + 1..o + 5].try_into().unwrap());
+            let dest = (target + o + 5).wrapping_add(rel as usize);
+            let fixed = jmp_rel32(copy as usize + o, dest);
+            std::ptr::copy_nonoverlapping(fixed[1..].as_ptr(), copy.add(o + 1), 4);
+        }
+    }
+    Ok(copy as usize)
+}
+
 /// Redirect `target` to `replacement`. Returns a trampoline that runs the
 /// original function (stolen prologue + jump back).
 ///
