@@ -62,4 +62,5 @@ original. The standalone build can move to 64-bit later.
 24. ✅ Teleport test harness (`teleport.rs`, `tools/ingame/run_teleport.ps1`): 8 jumps across the city exercise chunk streaming and the abort path (27 aborts on Rust, the same kind as the original).
 25. ✅ `start_load` and `check_batch` in Rust: original and Rust event logs match for every deterministic load, completion and abort in the teleport test.
 26. ✅ The rest of the per-resource streamer in Rust: finish_current, the chunk-extras start and poll, process_sequential (not exercised yet). Teleport test: original and Rust event logs match.
-27. Next: the request functions and completion callbacks (mapped in 05_streamer.md "Request side, step by step"), then the resource slot scheduler (rsched) and the io scheduler; then the vint UI and the D3D wrappers.
+27. ✅ Request side, part 1, in Rust: step_init, the typed requests (animation, character, vehicle, chunk geom, chunk peg) and the unload helpers. 646 geom and 23 peg requests identical to the original in the teleport test. Open: a chunk-extras ordering difference seen in 2 of 3 Rust runs (05_streamer.md).
+28. Next: request_chunk and request_chunk_extras, the completion/step callbacks, then rsched and the io scheduler; then the vint UI (mapped in 06_vint.md) and the D3D wrappers.

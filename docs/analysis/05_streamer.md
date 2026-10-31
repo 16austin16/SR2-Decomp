@@ -1236,3 +1236,35 @@ Unlike in `poll_chunk_extras`, the g_peg call here passes the data and size swap
 - No code builds a kind-4 id from a constant. The registry id builder (`0xA77540`, kind << 24 | index) is only reached from `0xA798C0`, which nothing calls or references.
 
 So the kind-4 ids must come from data tables. A runtime log is the practical way to find a trigger: log `rsched_add_ref` when EAX = 0x2F9B638, or calls to 0xA88240, while playing missions and activities. Cutscene and activity scripts are the likely users.
+
+### Request side in Rust (part 1)
+
+In Rust behind `PUMP_RUST`, with the same request event in both modes:
+- `step_init` (`0xA7F770`) and `file_exists` (Rust-internal; the original is not detoured).
+- The unload helpers `0xA80A40`, `0xA80BC0` and `0xA80CC0`. `any_chunk_busy` (`0xA80B40`) is a pure
+  query and is shadow-checked.
+- The typed requests: animation `0xA88240`, character `0xA7FC30`, vehicle `0xA87F80`, chunk geom
+  `0xA85140` and chunk peg `0xA85890`. Register arguments come in through a naked entry thunk
+  that passes EAX/ECX/EDX and a pointer to the stack arguments.
+
+Each request logs its handle, slot state and, for every step, the file name, alignment, the
++0x21C flags and which callbacks are set. Teleport test, original vs Rust:
+- All 646 geom and 23 peg requests are identical.
+- Character/vehicle requests are ambient (42 appeared identically in both runs, the rest
+  differ by spawn).
+- No animation request happened in either run.
+- 0 mismatches.
+
+Still original: `request_chunk` (`0xA80360`), `request_chunk_extras` (`0xA84510` / `_impl`
+`0xA82EA0`), `step_init_multipart` and all the completion and step callbacks.
+
+**Open item.** In 2 of 3 Rust runs since `poll_chunk_extras` was ported, the same two chunk-extras
+starts differ from the original, with identical numbers both times:
+- one chunk: 0 mesh parts and anims of 227,720 bytes, vs 8 parts and 189,368 bytes;
+- the other: 16 parts, vs 8.
+
+Three original runs never showed this. The part totals agree (16), which fits two neighbouring
+chunks sharing objects being started in the opposite order, so their shared mesh cache records
+are loaded by the other chunk. That may be a timing effect of the hook, but it reproduces too
+exactly to dismiss. Next step: log the order of extras starts and polls, and the record states.
+

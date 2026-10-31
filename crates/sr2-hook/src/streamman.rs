@@ -85,7 +85,17 @@ const FINISH: usize = 16;
 const START_EXTRAS: usize = 17;
 const PROCESS_SEQ: usize = 18;
 const POLL_EXTRAS: usize = 19;
-const COUNT: usize = 20;
+const STEP_INIT: usize = 20;
+const UNLOAD_CHUNK_PEGS_EXTRAS: usize = 21;
+const ANY_CHUNK_BUSY: usize = 22;
+const CANCEL_CHUNK_LOADS: usize = 23;
+const UNLOAD_FLAGGED_GEOM: usize = 24;
+const REQUEST_ANIMATION: usize = 25;
+const REQUEST_CHARACTER: usize = 26;
+const REQUEST_VEHICLE: usize = 27;
+const REQUEST_GEOM: usize = 28;
+const REQUEST_PEG: usize = 29;
+const COUNT: usize = 30;
 
 /// (name, address, stolen prologue): whole, position-independent instructions.
 const PORTS: [(&str, usize, &[u8]); COUNT] = [
@@ -109,6 +119,16 @@ const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("start_chunk_extras", 0x00A7_E100, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
     ("process_sequential", 0x00A7_D0C0, &[0x83, 0xEC, 0x0C, 0x8B, 0x15, 0xF0, 0x9F, 0x52, 0x02]),
     ("poll_chunk_extras", 0x00A7_E900, &[0x83, 0xEC, 0x58, 0xA1, 0x50, 0x0B, 0xE8, 0x00]),
+    ("step_init", 0x00A7_F770, &[0x8B, 0x54, 0x24, 0x04, 0x83, 0xA6, 0x1C, 0x02, 0x00, 0x00, 0xFE]),
+    ("unload_chunk_pegs_extras", 0x00A8_0A40, &[0x51, 0x53, 0x66, 0x8B, 0x5C, 0x24, 0x0C]),
+    ("any_chunk_busy", 0x00A8_0B40, &[0x53, 0x56, 0x57, 0xBF, 0x84, 0x7B, 0xE8, 0x00]),
+    ("cancel_chunk_loads", 0x00A8_0BC0, &[0x83, 0xEC, 0x0C, 0x53, 0x55, 0x56]),
+    ("unload_flagged_geom", 0x00A8_0CC0, &[0x56, 0x33, 0xF6, 0x39, 0x35, 0xB0, 0x7B, 0xE8, 0x00]),
+    ("request_animation", 0x00A8_8240, &[0x53, 0x8B, 0x5C, 0x24, 0x08]),
+    ("request_character", 0x00A7_FC30, &[0x8B, 0x4C, 0x24, 0x24, 0x53]),
+    ("request_vehicle", 0x00A8_7F80, &[0x8B, 0x44, 0x24, 0x0C, 0x53]),
+    ("request_chunk_geom", 0x00A8_5140, &[0x83, 0xEC, 0x08, 0x53, 0x56]),
+    ("request_chunk_peg", 0x00A8_5890, &[0x83, 0xEC, 0x08, 0x53, 0x56]),
 ];
 
 /// Trampolines to the originals.
@@ -282,7 +302,8 @@ unsafe fn capture(q: usize) -> QueueState {
         let mut header = [0u8; Q_HEADER];
         std::ptr::copy_nonoverlapping(q as *const u8, header.as_mut_ptr(), Q_HEADER);
         let (cap, nodes) = (rd(q + 4) as usize, rd(q + 8) as usize);
-        let nodes = if nodes == 0 { Vec::new() } else { std::slice::from_raw_parts(nodes as *const u8, cap * NODE).to_vec() };
+        let nodes =
+            if nodes == 0 { Vec::new() } else { std::slice::from_raw_parts(nodes as *const u8, cap * NODE).to_vec() };
         QueueState { header, nodes }
     }
 }
@@ -324,7 +345,14 @@ unsafe fn shadow<R: PartialEq + Copy + std::fmt::Debug>(
         let rr = rust();
         let after_r = capture(q);
         if rr != ro || !after_r.same(&after_o) {
-            mismatch(i, format!("queue {q:#x} count {}: original {ro:?}, rust {rr:?}, state equal {}", rd(q), after_r.same(&after_o)));
+            mismatch(
+                i,
+                format!(
+                    "queue {q:#x} count {}: original {ro:?}, rust {rr:?}, state equal {}",
+                    rd(q),
+                    after_r.same(&after_o)
+                ),
+            );
             restore(q, &after_o);
             return ro;
         }
@@ -460,7 +488,9 @@ extern "C" fn q_node_index_entry() {
 
 /// Slot record of a handle (`type << 16 | index`), as the originals compute it.
 unsafe fn slot(handle: u32) -> usize {
-    unsafe { (rd(SLOT_ARRAYS + (handle >> 16) as usize * 4) as usize).wrapping_add((handle & 0xFFFF) as usize * SLOT_SIZE) }
+    unsafe {
+        (rd(SLOT_ARRAYS + (handle >> 16) as usize * 4) as usize).wrapping_add((handle & 0xFFFF) as usize * SLOT_SIZE)
+    }
 }
 
 fn query(i: usize, handle: u32, rust: impl Fn() -> u32) -> u32 {
@@ -872,7 +902,8 @@ unsafe fn start_load(s: usize) {
             let head = rd(batch + 0x0C) as usize;
             let mut n = head;
             while n != 0 {
-                let desc = [rd(n + 8), rd(n + 0x0C), 0, rd(n + 0x24), rd(n + 0x20), *((n + 0x28) as *const u8) as u32, 0, 0];
+                let desc =
+                    [rd(n + 8), rd(n + 0x0C), 0, rd(n + 0x24), rd(n + 0x20), *((n + 0x28) as *const u8) as u32, 0, 0];
                 let (lo, hi) = io_submit(&desc);
                 wr(n + 0x10, lo);
                 wr(n + 0x14, hi);
@@ -1285,7 +1316,9 @@ unsafe fn start_extras(s: usize) {
                         for j in 0..(rd(step + 0x208) as i32).max(0) as usize {
                             let name = rd(step + 8 + j * 4);
                             let buf = with_ext(name, ANIM_EXT as u32);
-                            let Some(size) = resolve_size(buf.as_ptr()).filter(|&s| s != 0) else { continue };
+                            let Some(size) = resolve_size(buf.as_ptr()).filter(|&s| s != 0) else {
+                                continue;
+                            };
                             let pool = rd(step + 0x220) as usize;
                             if size > thiscall(vslot(pool, 3), pool, [0; 3]) {
                                 continue;
@@ -1329,7 +1362,8 @@ unsafe fn start_extras(s: usize) {
             let head = rd(batch + 0x0C) as usize;
             let mut n = head;
             while n != 0 {
-                let desc = [rd(n + 8), rd(n + 0x0C), 0, rd(n + 0x24), rd(n + 0x20), *((n + 0x28) as *const u8) as u32, 0, 0];
+                let desc =
+                    [rd(n + 8), rd(n + 0x0C), 0, rd(n + 0x24), rd(n + 0x20), *((n + 0x28) as *const u8) as u32, 0, 0];
                 let (lo, hi) = io_submit(&desc);
                 wr(n + 0x10, lo);
                 wr(n + 0x14, hi);
@@ -1412,7 +1446,14 @@ unsafe fn poll_extras(batch: usize) {
                         0 => extras_part_done(node),
                         1 => {
                             let index = game_call(CHUNK_POOL_INDEX, 0, 0, rd(info + 0x778), 0, [0; 3]);
-                            game_call(OBJECT_ANIM_ADD_LOADED, 0, 0, rd(node + 8), 0, [rd(node + 0x20), rd(node + 0x24), index]);
+                            game_call(
+                                OBJECT_ANIM_ADD_LOADED,
+                                0,
+                                0,
+                                rd(node + 8),
+                                0,
+                                [rd(node + 0x20), rd(node + 0x24), index],
+                            );
                         }
                         2 => {
                             call(CHUNK_EXTRAS_PARSE_NODES, &[node as u32, *((info + 0x772) as *const u16) as u32]);
@@ -1482,9 +1523,24 @@ unsafe fn extras_part_done(node: usize) {
         if raw_next != 0 && rd(raw_next + 0x30) == rd(node + 0x30) {
             return;
         }
-        game_call_edx(SMESH_TABLE_ADD_STREAMED, 0, rd(node + 0x30), (rec + 8) as u32, 0, 0, [rd(rec + 0x124), rd(rec + 0x128), 0]);
+        game_call_edx(
+            SMESH_TABLE_ADD_STREAMED,
+            0,
+            rd(node + 0x30),
+            (rec + 8) as u32,
+            0,
+            0,
+            [rd(rec + 0x124), rd(rec + 0x128), 0],
+        );
         if rd(rec + 0x134) != 0 {
-            game_call(PEG_REGISTER_LOADED, 0, (rec + 0x8A) as u32, rd(rec + 0x12C), 0, [rd(rec + 0x130), rd(rec + 0x134), 0]);
+            game_call(
+                PEG_REGISTER_LOADED,
+                0,
+                (rec + 0x8A) as u32,
+                rd(rec + 0x12C),
+                0,
+                [rd(rec + 0x130), rd(rec + 0x134), 0],
+            );
         }
         *((rec + 0x122) as *mut u8) = 1;
     }
@@ -1580,7 +1636,15 @@ unsafe fn process_sequential() {
                     wr(info + 0x0C, rd(info + 0x0C).wrapping_sub(pad));
                     wr(step + 0x218, rd(info + 8));
                 }
-                let (lo, hi) = game_call_edx(SUBMIT_SINGLE_READ, rd(step), rd(info + 8), 0, 0, rd(info + 4), [rd(info + 0x0C), 0, 0]);
+                let (lo, hi) = game_call_edx(
+                    SUBMIT_SINGLE_READ,
+                    rd(step),
+                    rd(info + 8),
+                    0,
+                    0,
+                    rd(info + 4),
+                    [rd(info + 0x0C), 0, 0],
+                );
                 wr(cur + 0x18, lo);
                 wr(cur + 0x1C, hi);
                 let issue = rd(step + 0x234) as usize;
@@ -1657,7 +1721,12 @@ extern "C" fn process_sequential_hook() {
         }
         if rd(cur + 4) != state {
             let info = rd(cur + 0x10) as usize;
-            event(format!("{e} -> s{} step {} current {}", rd(cur + 4), rd(info + 0x20) & 0x3FF, (rd(CURRENT) as usize == cur) as u8));
+            event(format!(
+                "{e} -> s{} step {} current {}",
+                rd(cur + 4),
+                rd(info + 0x20) & 0x3FF,
+                (rd(CURRENT) as usize == cur) as u8
+            ));
         }
     }
 }
@@ -1837,6 +1906,712 @@ fn write_events() {
     let _ = std::fs::write("sr2-streamman.log", text);
 }
 
+// --- Request side -----------------------------------------------------------------
+//
+// The typed requests fill a slot's loading info and read steps, set the slot to
+// requested (state 1) and (re)queue it. In `PUMP_RUST` mode they run in Rust;
+// otherwise the originals run. Either way the hooks log the same request events.
+
+const PACKFILE_FIND_ENTRY: usize = 0x00C0_AD80; // ECX = name -> entry
+const INDEXED_FILE_LOOKUP: usize = 0x00C1_DA80; // ECX = name, cdecl (0, 0, u32 *size) -> AL
+const DISABLE_INDEXED_LOOKUP: usize = 0x0252_72DC; // u8
+const CRT_STRNCPY: usize = 0x00C9_90F0;
+const EXT_G_PEG: usize = 0x00DD_A764; // ".g_peg_pc"
+const EXT_G_MORPH: usize = 0x00E0_DA70; // ".g_morph_pc"
+const CHARACTER_MODE_CHECK: usize = 0x006C_9090; // ECX = name -> AL
+const VEHICLE_REQUESTED: usize = 0x0048_40A0; // EDI = *(object + 4)
+const WORLD_CHUNKS: usize = 0x00F7_AAE8; // [0x866] chunk entry*
+const WORLD_CHUNK_RELEASE: usize = 0x004A_9DA0; // cdecl (entry, -1)
+const CHUNK_TYPES: usize = 0x00E8_7B84; // [3] the chunk slot types (0, 1, 4)
+const SLOT_COUNTS: usize = 0x00E8_7BB0; // [10] slots per type
+const UNLOAD_FLAGGED_GEOM_FLAG: usize = 0x00E8_7B4F; // u8
+
+/// Call a game function with EAX/ECX/EDX/ESI set and any number of stack
+/// arguments (cdecl or callee-clean alike: ESP is restored from EBP).
+unsafe fn game_call_n(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, args: &[u32]) -> (u32, u32) {
+    let block: [u32; 7] = [f as u32, eax, ecx, edx, esi, args.as_ptr() as u32, args.len() as u32];
+    let (lo, hi): (u32, u32);
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "mov ebp, esp",
+            "mov ebx, edx",
+            "mov ecx, [ebx + 24]",
+            "mov esi, [ebx + 20]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "mov eax, [ebx + 4]", "mov ecx, [ebx + 8]", "mov edx, [ebx + 12]", "mov esi, [ebx + 16]",
+            "call dword ptr [ebx]",
+            "mov esp, ebp",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("edx") block.as_ptr() => hi, lateout("eax") lo, lateout("ecx") _,
+            clobber_abi("C"),
+        );
+    }
+    (lo, hi)
+}
+
+unsafe fn rb(p: usize) -> u8 {
+    unsafe { *(p as *const u8) }
+}
+
+unsafe fn wb(p: usize, v: u8) {
+    unsafe { *(p as *mut u8) = v }
+}
+
+/// "No handle": the originals store 0 and 0xFFFF as two words.
+unsafe fn out_none(out: usize) {
+    unsafe {
+        *(out as *mut u16) = 0;
+        *((out + 2) as *mut u16) = 0xFFFF;
+    }
+}
+
+/// Remove the slot from the request queue if it is queued, then push it (again).
+unsafe fn requeue(s: usize) {
+    unsafe {
+        if rd(s + 0x14) != u32::MAX {
+            q_remove(REQUEST_QUEUE, rd(s + 0x14));
+        }
+        wr(s + 0x14, q_push(REQUEST_QUEUE, s as u32) as u32);
+    }
+}
+
+/// `file_exists` (0xA7D750, ESI = name -> AL): in a mounted packfile, or (unless
+/// disabled) found with a non-zero size by the indexed lookup. Returns the raw AL.
+unsafe fn file_exists(name: u32) -> u8 {
+    unsafe {
+        if game_call(PACKFILE_FIND_ENTRY, 0, name, 0, 0, [0; 3]) != 0 {
+            return 1;
+        }
+        if rb(DISABLE_INDEXED_LOOKUP) != 0 {
+            return 0;
+        }
+        let mut size = 0u32;
+        let r = game_call(INDEXED_FILE_LOOKUP, 0, name, 0, 0, [0, 0, &mut size as *mut u32 as u32]) as u8;
+        if size != 0 { r } else { 0 }
+    }
+}
+
+/// `streamman_step_init` (0xA7F770; ESI = step, EAX = file, CX = alignment;
+/// stdcall (begin, issue, progress, after)): set up one read step.
+unsafe fn step_init(step: usize, file: u32, align: u16, begin: u32, issue: u32, progress: u32, after: u32) {
+    unsafe {
+        wr(step + 0x21C, rd(step + 0x21C) & !1);
+        wr(step, file);
+        wr(step + 0x230, progress);
+        *((step + 0x214) as *mut u16) = align;
+        wr(step + 0x22C, begin);
+        wr(step + 0x210, 0);
+        wr(step + 0x218, 0);
+        wr(step + 0x234, issue);
+        wr(step + 0x238, after);
+        wb(step + 4, 0);
+        wr(step + 0x208, 0);
+        wr(step + 0x20C, 0);
+        std::ptr::write_bytes((step + 8) as *mut u8, 0, 0x200);
+        wr(step + 0x21C, rd(step + 0x21C) & !2);
+        wr(step + 0x240, 0);
+        wr(step + 0x23C, 0);
+    }
+}
+
+unsafe fn step_empty(step: usize, align: u16) {
+    unsafe { step_init(step, 0, align, 0, 0, 0, 0) }
+}
+
+/// `path_change_extension(src, out, 0x41, ext)`.
+unsafe fn change_extension(src: u32, out: usize, ext: usize) {
+    unsafe {
+        game_call(PATH_CHANGE_EXTENSION, 0, src, 0, 0, [out as u32, 0x41, ext as u32]);
+    }
+}
+
+/// A single-slot type's slot, or None (after writing "no handle") if it is busy.
+unsafe fn single_slot(t: usize, out: usize) -> Option<usize> {
+    unsafe {
+        let s = rd(SLOT_ARRAYS + t * 4) as usize;
+        if rd(s + 4) != 0 {
+            out_none(out);
+            return None;
+        }
+        Some(s)
+    }
+}
+
+/// Mark a slot requested: state 1, +8/+0xC cleared; then the info's current step
+/// and bits 20-22 are cleared (the step count is preset by the info).
+unsafe fn claim(s: usize) -> usize {
+    unsafe {
+        wr(s + 8, 0);
+        wr(s + 0x0C, 0);
+        wr(s + 4, 1);
+        let info = rd(s + 0x10) as usize;
+        wr(info + 0x20, rd(info + 0x20) & 0xFF8F_FC00);
+        info
+    }
+}
+
+/// `streamman_request_animation` (0xA88240; EDX = dest; cdecl (out, name, size,
+/// object) -> out): type 6, one step, completion 0xA87C50.
+unsafe fn request_animation(dest: u32, out: usize, name: u32, size: u32, object: u32) {
+    unsafe {
+        let Some(s) = single_slot(6, out) else { return };
+        let info = claim(s);
+        wr(info + 8, dest);
+        wr(info + 0x0C, size);
+        wr(info + 4, 0);
+        wr(info + 0x10, 0);
+        wr(info + 0x18, object);
+        wr(info + 0x1C, 0x00A8_7C50);
+        step_init(info + 0x24, name, 1, 0, 0, 0, 0);
+        requeue(s);
+        wr(out, 0x6_0000);
+    }
+}
+
+/// `streamman_request_character` (0xA7FC30; EAX = dest A, EDX = size A; cdecl
+/// (out, a1..a10) -> out): type 3, 10 steps into buffers A and B (bit 0 of +0x21C
+/// selects B), completion `character_on_loaded`.
+unsafe fn request_character(dest_a: u32, size_a: u32, a: &[u32; 11]) {
+    unsafe {
+        let out = a[0] as usize;
+        let Some(s) = single_slot(3, out) else { return };
+        let info = claim(s);
+        wr(info + 0x0C, size_a);
+        wr(info + 0x1758, size_a);
+        wr(info + 4, 0);
+        wr(info + 8, dest_a);
+        wr(info + 0x10, 0);
+        wr(info + 0x18, a[10]);
+        wr(info + 0x1C, 0x00A7_FA40);
+        wr(info + 0x1750, dest_a);
+        wr(info + 0x1754, a[8]);
+        wr(info + 0x175C, a[9]);
+        wr(info + 0x1760, dest_a);
+        wr(info + 0x1764, a[8]);
+        let cond = (rb(0x0252_7D14) != 0 && rb(0x0252_7CF7) != 0) || rb(0x0252_7D15) != 0;
+        let mode = cond && game_call(CHARACTER_MODE_CHECK, 0, a[1], 0, 0, [0; 3]) as u8 != 0;
+        wb(info + 0x1768, mode as u8);
+        let (begin, after) = (0x00A7_F840, 0x00A7_F9C0);
+        let step = |k: usize| info + 0x24 + k * 0x244;
+        let full = |k: usize, file: u32, align: u16| step_init(step(k), file, align, begin, 0, 0, after);
+        let optional = |k: usize, file: u32, align: u16| {
+            if file_exists(file) == 1 {
+                full(k, file, align);
+                wr(step(k) + 0x21C, rd(step(k) + 0x21C) | 1);
+            } else {
+                step_empty(step(k), 0);
+            }
+        };
+        full(0, a[1], 0x40);
+        optional(1, a[2], 0x1000);
+        full(2, a[4], 0x10);
+        if a[4] != 0 {
+            file_get_size(a[4], &mut *((step(2) + 0x210) as *mut u32));
+        }
+        change_extension(a[3], info + 0x170D, EXT_G_MORPH);
+        optional(3, (info + 0x170D) as u32, 0x10);
+        full(4, a[3], 4);
+        change_extension(a[3], info + 0x16CC, EXT_G_PEG);
+        optional(5, (info + 0x16CC) as u32, 0x40);
+        full(6, a[5], 0x10);
+        full(7, a[7], 4);
+        full(8, a[6], 4);
+        step_empty(step(9), 0);
+        requeue(s);
+        wr(out, 0x3_0000);
+    }
+}
+
+/// `streamman_request_vehicle` (0xA87F80; EDX = size A, ECX = dest B; cdecl (out,
+/// files[11], dest A, value, object) -> out): type 2, 11 steps, filter 0xA87AF0,
+/// completion `vehicle_on_loaded`. Steps 4, 6, 8 and 10 only if the file exists.
+unsafe fn request_vehicle(size_a: u32, dest_b: u32, a: &[u32; 5]) {
+    unsafe {
+        let (out, files, dest_a, value, object) = (a[0] as usize, a[1] as usize, a[2], a[3], a[4] as usize);
+        let Some(s) = single_slot(2, out) else { return };
+        let info = claim(s);
+        wr(info + 4, 0);
+        wr(info + 0x0C, size_a);
+        wr(info + 0x1918, size_a);
+        wr(info + 8, dest_a);
+        wr(info + 0x18, object as u32);
+        wr(info + 0x1910, dest_a);
+        wr(info + 0x1914, dest_b);
+        wr(info + 0x1920, dest_a);
+        wr(info + 0x1924, dest_b);
+        wr(info + 0x10, 0x00A8_7AF0);
+        wr(info + 0x1C, 0x00A8_7BF0);
+        wr(info + 0x191C, value);
+        let (begin, after) = (0x00A8_7B10, 0x00A8_7BB0);
+        let f = |i: usize| rd(files + i * 4);
+        let step = |k: usize| info + 0x24 + k * 0x244;
+        let full = |k: usize, align: u16| step_init(step(k), f(k), align, begin, 0, 0, after);
+        let optional = |k: usize, align: u16| -> bool {
+            if file_exists(f(k)) != 0 {
+                full(k, align);
+                true
+            } else {
+                step_empty(step(k), align);
+                false
+            }
+        };
+        full(0, 0x40);
+        full(1, 0x1000);
+        full(9, 4);
+        full(2, 4);
+        full(3, 0x20);
+        optional(4, 0x20);
+        full(5, 0x20);
+        optional(6, 0x20);
+        full(7, 0x20);
+        optional(8, 0x20);
+        if optional(10, 0x40) {
+            let bit = !(rd(rd(object + 8) as usize + 0x5B0) >> 14) & 1;
+            wr(step(10) + 0x21C, (rd(step(10) + 0x21C) & !1) | bit);
+        }
+        requeue(s);
+        game_call(VEHICLE_REQUESTED, 0, 0, 0, rd(object + 4), [0; 3]);
+        wr(out, 0x2_0000);
+    }
+}
+
+/// `streamman_request_chunk_geom` (0xA85140; EAX = request; cdecl (out) -> out):
+/// always slot 0 of type 0, state not checked. 2 steps (chunk_pc and, if it
+/// exists, g_chunk_pc), no destination accounting; completion
+/// `chunk_geom_on_loaded`. A reservation of -1 resets the pool's GPU part.
+unsafe fn request_geom(req: usize, out: usize) {
+    unsafe {
+        if file_exists(rd(req)) == 0 {
+            out_none(out);
+            return;
+        }
+        let s = rd(SLOT_ARRAYS) as usize;
+        let info = rd(s + 0x10) as usize;
+        wr(info + 0x20, (rd(info + 0x20) & 0xFF90_0800) | 0x10_0800);
+        *((info + 0x52E) as *mut u16) = *((req + 0x0C) as *const u16);
+        wb(info + 0x541, rb(req + 0x14));
+        wb(info + 0x540, rb(req + 0x15));
+        let (pool, reservation) = (rd(req + 0x10) as usize, rd(req + 0x18));
+        for o in [4, 8, 0x0C, 0x10, 0x18] {
+            wr(info + o, 0);
+        }
+        wr(info + 0x1C, 0x00A8_4FF0);
+        wr(info + 0x534, pool as u32);
+        wr(info + 0x53C, reservation);
+        wr(info + 0x530, 0);
+        wb(info + 0x542, rb(req + 0x16));
+        wb(info + 0x543, rb(req + 0x1C));
+        if reservation == u32::MAX {
+            wr(pool + 0x48, rd(pool + 0x44));
+            let gpu = rd(rd(info + 0x534) as usize + 0x54) as usize;
+            thiscall(vslot(gpu, 12), gpu, [0; 3]);
+        }
+        call(CRT_STRNCPY, &[(info + 0x4AC) as u32, rd(req), 0x41]);
+        wb(info + 0x4EC, 0);
+        call(CRT_STRNCPY, &[(info + 0x4ED) as u32, rd(req + 4), 0x41]);
+        wb(info + 0x52D, 0);
+        let steps = rd(info + 0x14) as usize;
+        step_init(steps, (info + 0x4AC) as u32, 0x10, 0x00A8_4E60, 0x00A8_4F80, 0, 0x00A8_4F90);
+        if file_exists((info + 0x4ED) as u32) != 0 {
+            step_init(steps + 0x244, (info + 0x4ED) as u32, 0x10, 0x00A8_4F00, 0, 0, 0x00A8_4FC0);
+        } else {
+            wr(info + 0x20, (rd(info + 0x20) & 0xFFF0_07FF) | 0x400);
+            wr(steps + 0x454, 0);
+            wr(steps + 0x45C, 0);
+        }
+        if rb(info + 0x540) != 0 {
+            wr(steps + 0x21C, rd(steps + 0x21C) | 2);
+            wr(steps + 0x460, rd(steps + 0x460) | 2);
+        }
+        wr(s + 4, 1);
+        wr(s + 8, 0);
+        wr(s + 0x0C, 0);
+        requeue(s);
+        wr(out, 0);
+    }
+}
+
+/// `streamman_request_chunk_peg` (0xA85890; cdecl (out, req {name, u16 id, pool,
+/// value, u8 wait}) -> out): the first idle type-1 slot; steps .peg_pc and
+/// .g_peg_pc (both with the retry callback), completion `chunk_peg_on_loaded`.
+unsafe fn request_peg(out: usize, req: usize) {
+    unsafe {
+        let name = rd(req);
+        if file_exists(name) == 0 {
+            out_none(out);
+            return;
+        }
+        let Some(i) = (0..rd(SLOT_COUNTS + 4)).find(|&i| {
+            let s = slot(0x1_0000 | i);
+            s == 0 || matches!(rd(s + 4), 0 | 3 | 4)
+        }) else {
+            out_none(out);
+            return;
+        };
+        let s = rd(SLOT_ARRAYS + 4) as usize + i as usize * SLOT_SIZE;
+        let info = rd(s + 0x10) as usize;
+        for o in [4, 8, 0x0C, 0x10, 0x18] {
+            wr(info + o, 0);
+        }
+        wr(info + 0x1C, 0x00A8_57A0);
+        wr(info + 0x20, (rd(info + 0x20) & 0xFF9F_FC00) | 0x10_0000);
+        wr(info + 0x53C, rd(req + 8));
+        wr(info + 0x534, 0);
+        wr(info + 0x538, 0);
+        wr(info + 0x530, 0);
+        *((info + 0x52E) as *mut u16) = *((req + 4) as *const u16);
+        wb(info + 0x540, rb(req + 0x10));
+        call(CRT_STRNCPY, &[(info + 0x4AC) as u32, name, 0x41]);
+        wb(info + 0x4EC, 0);
+        let steps = rd(info + 0x14) as usize;
+        step_init(steps, (info + 0x4AC) as u32, 4, 0x00A8_5450, 0x00A8_5660, 0, 0x00A8_56B0);
+        wr(info + 4, rd(req + 0x0C));
+        wr(steps + 0x240, 0x00A8_56E0);
+        change_extension((info + 0x4AC) as u32, info + 0x4ED, EXT_G_PEG);
+        step_init(steps + 0x244, (info + 0x4ED) as u32, 0x40, 0x00A8_5510, 0, 0x00A8_5600, 0);
+        wr(steps + 0x244 + 0x240, 0x00A8_56E0);
+        wr(steps + 0x21C, rd(steps + 0x21C) | 2);
+        wr(steps + 0x460, rd(steps + 0x460) | 2);
+        wr(s + 4, 1);
+        wr(s + 8, 0);
+        wr(s + 0x0C, 0);
+        requeue(s);
+        wr(out, 0x1_0000 | i);
+    }
+}
+
+/// Busy chunk slots of the three chunk types, as handles.
+unsafe fn busy_chunk_slots() -> Vec<u32> {
+    unsafe {
+        let mut v = Vec::new();
+        for k in 0..3 {
+            let t = rd(CHUNK_TYPES + k * 4);
+            for i in 0..rd(SLOT_COUNTS + t as usize * 4) {
+                let h = t << 16 | (i & 0xFFFF);
+                let s = slot(h);
+                if s != 0 && !matches!(rd(s + 4), 0 | 3 | 4) {
+                    v.push(h);
+                }
+            }
+        }
+        v
+    }
+}
+
+/// `streamman_unload_chunk_pegs_extras` (0xA80A40, cdecl (u16 chunk id)): unload
+/// the busy peg and extras slots loading that chunk.
+unsafe fn unload_chunk_pegs_extras(id: u16) {
+    unsafe {
+        for (t, field) in [(1u32, 0x52E), (4u32, 0x772)] {
+            for i in 0..rd(SLOT_COUNTS + t as usize * 4) {
+                let info = rd(rd(SLOT_ARRAYS + t as usize * 4) as usize + i as usize * SLOT_SIZE + 0x10) as usize;
+                if *((info + field) as *const u16) != id {
+                    continue;
+                }
+                let h = t << 16 | (i & 0xFFFF);
+                let s = slot(h);
+                if s != 0 && !matches!(rd(s + 4), 0 | 3 | 4) {
+                    unload_hook(h);
+                }
+            }
+        }
+    }
+}
+
+/// `streamman_cancel_chunk_loads` (0xA80BC0): busy geom slots are unloaded; busy
+/// peg/extras slots release their world chunk entry instead.
+unsafe fn cancel_chunk_loads() {
+    unsafe {
+        for k in 0..3 {
+            let t = rd(CHUNK_TYPES + k * 4);
+            for i in 0..rd(SLOT_COUNTS + t as usize * 4) as usize {
+                let h = t << 16 | (i as u32 & 0xFFFF);
+                let s = slot(h);
+                if s == 0 || matches!(rd(s + 4), 0 | 3 | 4) {
+                    continue;
+                }
+                if t == 0 {
+                    unload_hook(h);
+                    continue;
+                }
+                let id = match t {
+                    1 => *((0x02FA_45C6 + i * 0x544) as *const u16) as u32,
+                    4 => *((0x02FA_5D1A + i * 0x77C) as *const u16) as u32,
+                    _ => 0xFFFF,
+                };
+                if id != 0xFFFF && id < 0x866 {
+                    let e = rd(WORLD_CHUNKS + id as usize * 4);
+                    if e != 0 {
+                        call(WORLD_CHUNK_RELEASE, &[e, u32::MAX]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `streamman_unload_flagged_geom` (0xA80CC0, AL = flag): store the flag, unload
+/// every geom slot whose info has +0x542 set (state not checked).
+unsafe fn unload_flagged_geom(flag: u8) {
+    unsafe {
+        wb(UNLOAD_FLAGGED_GEOM_FLAG, flag);
+        for i in 0..rd(SLOT_COUNTS) {
+            let info = rd(rd(SLOT_ARRAYS) as usize + i as usize * SLOT_SIZE + 0x10) as usize;
+            if rb(info + 0x542) != 0 {
+                unload_hook(i & 0xFFFF);
+            }
+        }
+    }
+}
+
+/// A C string for the event log (at most 64 bytes), or "-".
+unsafe fn cstr_lossy(p: u32) -> String {
+    unsafe {
+        if p == 0 {
+            return "-".into();
+        }
+        let bytes = std::slice::from_raw_parts(p as *const u8, 64);
+        let n = bytes.iter().position(|&b| b == 0).unwrap_or(64);
+        String::from_utf8_lossy(&bytes[..n]).into_owned()
+    }
+}
+
+/// A request's outcome for the event log: the handle, slot state and every step
+/// (file, alignment, +0x21C flags, which callbacks are set).
+unsafe fn describe_request(kind: &str, out: usize) -> String {
+    unsafe {
+        let h = rd(out);
+        if h >> 16 == 0xFFFF {
+            return format!("req_{kind} -> none");
+        }
+        let s = slot(h);
+        let info = rd(s + 0x10) as usize;
+        let flags = rd(info + 0x20);
+        let mut steps = String::new();
+        for k in 0..((flags >> 10) & 0x3FF) as usize {
+            let st = rd(info + 0x14) as usize + k * 0x244;
+            let cbs: u32 = [0x22C, 0x234, 0x230, 0x238, 0x240]
+                .iter()
+                .enumerate()
+                .map(|(b, &o)| ((rd(st + o) != 0) as u32) << b)
+                .sum();
+            steps += &format!(
+                " [{} a{:x} f{} cb{:x}]",
+                cstr_lossy(rd(st)),
+                *((st + 0x214) as *const u16),
+                rd(st + 0x21C) & 3,
+                cbs
+            );
+        }
+        format!("req_{kind} -> {h:#x} s{} flags {:#x}{steps}", rd(s + 4), flags & 0xFFFF_FC00)
+    }
+}
+
+/// Entry for functions with register arguments: hands the hook EAX/ECX/EDX and a
+/// pointer to the caller's stack arguments; returns EAX. Caller-clean.
+macro_rules! regs_entry {
+    ($entry:ident, $hook:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $entry() {
+            std::arch::naked_asm!(
+                "push edx",
+                "push ecx",
+                "push eax",
+                "lea eax, [esp + 16]",
+                "push eax",
+                "lea eax, [esp + 4]",
+                "push eax",
+                "call {h}",
+                "add esp, 20",
+                "ret",
+                h = sym $hook,
+            )
+        }
+    };
+}
+
+regs_entry!(request_animation_entry, request_animation_hook);
+regs_entry!(request_character_entry, request_character_hook);
+regs_entry!(request_vehicle_entry, request_vehicle_hook);
+regs_entry!(request_geom_entry, request_geom_hook);
+
+/// Read `N` stack arguments.
+unsafe fn stack_args<const N: usize>(p: *const u32) -> [u32; N] {
+    unsafe { std::array::from_fn(|i| *p.add(i)) }
+}
+
+/// regs = [EAX, ECX, EDX].
+extern "C" fn request_animation_hook(regs: *const [u32; 3], args: *const u32) -> u32 {
+    CALLS[REQUEST_ANIMATION].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let r = *regs;
+        let a: [u32; 4] = stack_args(args);
+        if PUMP_RUST {
+            request_animation(r[2], a[0] as usize, a[1], a[2], a[3]);
+        } else {
+            game_call_n(orig(REQUEST_ANIMATION), r[0], r[1], r[2], 0, &a);
+        }
+        event(describe_request("animation", a[0] as usize));
+        a[0]
+    }
+}
+
+extern "C" fn request_character_hook(regs: *const [u32; 3], args: *const u32) -> u32 {
+    CALLS[REQUEST_CHARACTER].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let r = *regs;
+        let a: [u32; 11] = stack_args(args);
+        if PUMP_RUST {
+            request_character(r[0], r[2], &a);
+        } else {
+            game_call_n(orig(REQUEST_CHARACTER), r[0], r[1], r[2], 0, &a);
+        }
+        event(describe_request("character", a[0] as usize));
+        a[0]
+    }
+}
+
+extern "C" fn request_vehicle_hook(regs: *const [u32; 3], args: *const u32) -> u32 {
+    CALLS[REQUEST_VEHICLE].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let r = *regs;
+        let a: [u32; 5] = stack_args(args);
+        if PUMP_RUST {
+            request_vehicle(r[2], r[1], &a);
+        } else {
+            game_call_n(orig(REQUEST_VEHICLE), r[0], r[1], r[2], 0, &a);
+        }
+        event(describe_request("vehicle", a[0] as usize));
+        a[0]
+    }
+}
+
+extern "C" fn request_geom_hook(regs: *const [u32; 3], args: *const u32) -> u32 {
+    CALLS[REQUEST_GEOM].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let r = *regs;
+        let a: [u32; 1] = stack_args(args);
+        if PUMP_RUST {
+            request_geom(r[0] as usize, a[0] as usize);
+        } else {
+            game_call_n(orig(REQUEST_GEOM), r[0], r[1], r[2], 0, &a);
+        }
+        event(describe_request("geom", a[0] as usize));
+        a[0]
+    }
+}
+
+extern "C" fn request_peg_hook(out: u32, req: u32) -> u32 {
+    CALLS[REQUEST_PEG].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        if PUMP_RUST {
+            request_peg(out as usize, req as usize);
+        } else {
+            let f: extern "C" fn(u32, u32) -> u32 = std::mem::transmute(orig(REQUEST_PEG));
+            f(out, req);
+        }
+        event(describe_request("peg", out as usize));
+        out
+    }
+}
+
+/// `step_init`: ESI = step, EAX = file, CX = alignment, stdcall 4 arguments; ESI kept.
+#[unsafe(naked)]
+extern "C" fn step_init_entry() {
+    std::arch::naked_asm!(
+        "push esi",
+        "push ecx",
+        "push eax",
+        "push esi",
+        "lea eax, [esp + 20]",
+        "push eax",
+        "call {h}",
+        "add esp, 16",
+        "pop esi",
+        "ret 16",
+        h = sym step_init_hook,
+    )
+}
+
+/// (args, step, file, align): args = [begin, issue, progress, after].
+extern "C" fn step_init_hook(args: *const u32, step: u32, file: u32, align: u32) {
+    CALLS[STEP_INIT].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let a: [u32; 4] = stack_args(args);
+        if PUMP_RUST {
+            step_init(step as usize, file, align as u16, a[0], a[1], a[2], a[3]);
+        } else {
+            game_call_n(orig(STEP_INIT), file, align, 0, step, &a);
+        }
+    }
+}
+
+extern "C" fn unload_chunk_pegs_extras_hook(id: u32) {
+    CALLS[UNLOAD_CHUNK_PEGS_EXTRAS].fetch_add(1, Ordering::Relaxed);
+    event("unload_chunk_pegs_extras".into());
+    unsafe {
+        if PUMP_RUST {
+            unload_chunk_pegs_extras(id as u16);
+        } else {
+            let f: extern "C" fn(u32) = std::mem::transmute(orig(UNLOAD_CHUNK_PEGS_EXTRAS));
+            f(id);
+        }
+    }
+}
+
+/// `streamman_any_chunk_busy` (0xA80B40) is a pure query: shadow-checked.
+extern "C" fn any_chunk_busy_hook() -> u32 {
+    CALLS[ANY_CHUNK_BUSY].fetch_add(1, Ordering::Relaxed);
+    let rust = unsafe { !busy_chunk_slots().is_empty() } as u32;
+    let tramp = orig(ANY_CHUNK_BUSY);
+    if tramp != 0 {
+        let f: extern "C" fn() -> u32 = unsafe { std::mem::transmute(tramp) };
+        let o = f() & 0xFF;
+        if o != rust && o != unsafe { !busy_chunk_slots().is_empty() } as u32 {
+            mismatch(ANY_CHUNK_BUSY, format!("original {o}, rust {rust}"));
+            return o;
+        }
+    }
+    rust
+}
+
+extern "C" fn cancel_chunk_loads_hook() {
+    CALLS[CANCEL_CHUNK_LOADS].fetch_add(1, Ordering::Relaxed);
+    event("cancel_chunk_loads".into());
+    unsafe {
+        if PUMP_RUST {
+            cancel_chunk_loads();
+        } else {
+            let f: extern "C" fn() = std::mem::transmute(orig(CANCEL_CHUNK_LOADS));
+            f();
+        }
+    }
+}
+
+#[unsafe(naked)]
+extern "C" fn unload_flagged_geom_entry() {
+    std::arch::naked_asm!("push eax", "call {h}", "add esp, 4", "ret", h = sym unload_flagged_geom_hook)
+}
+
+extern "C" fn unload_flagged_geom_hook(flag: u32) {
+    CALLS[UNLOAD_FLAGGED_GEOM].fetch_add(1, Ordering::Relaxed);
+    event(format!("unload_flagged_geom {}", flag as u8));
+    unsafe {
+        if PUMP_RUST {
+            unload_flagged_geom(flag as u8);
+        } else {
+            game_call_n(orig(UNLOAD_FLAGGED_GEOM), flag, 0, 0, 0, &[]);
+        }
+    }
+}
+
 // --- Install and report ---------------------------------------------------------------
 
 fn hook_address(i: usize) -> usize {
@@ -1861,6 +2636,16 @@ fn hook_address(i: usize) -> usize {
         START_EXTRAS => start_extras_hook as extern "C" fn(u32) as usize,
         PROCESS_SEQ => process_sequential_hook as extern "C" fn() as usize,
         POLL_EXTRAS => poll_extras_hook as extern "C" fn(u32) as usize,
+        STEP_INIT => step_init_entry as extern "C" fn() as usize,
+        UNLOAD_CHUNK_PEGS_EXTRAS => unload_chunk_pegs_extras_hook as extern "C" fn(u32) as usize,
+        ANY_CHUNK_BUSY => any_chunk_busy_hook as extern "C" fn() -> u32 as usize,
+        CANCEL_CHUNK_LOADS => cancel_chunk_loads_hook as extern "C" fn() as usize,
+        UNLOAD_FLAGGED_GEOM => unload_flagged_geom_entry as extern "C" fn() as usize,
+        REQUEST_ANIMATION => request_animation_entry as extern "C" fn() as usize,
+        REQUEST_CHARACTER => request_character_entry as extern "C" fn() as usize,
+        REQUEST_VEHICLE => request_vehicle_entry as extern "C" fn() as usize,
+        REQUEST_GEOM => request_geom_entry as extern "C" fn() as usize,
+        REQUEST_PEG => request_peg_hook as extern "C" fn(u32, u32) -> u32 as usize,
         _ => unreachable!(),
     }
 }
