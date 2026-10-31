@@ -496,9 +496,9 @@ Node kinds for status 3:
   | .peg_pc | +0x12C (data) / +0x130 (size) |
   | .g_peg_pc | +0x134 / +0x138 |
 
-  When the next node is absent or belongs to another object (node+0x30 differs), the object is complete:
+  The object is complete when the node's raw next link (+4) is 0, or the node it points to has a different object (+0x30). The link is not the next-or-0 value used for the walk, so in a one-node circular list (+4 points to itself) the object never completes (corrected from the main session's port):
   1. `smesh_table_add_streamed(+0x124, +0x128)`.
-  2. If there is a g_peg, call `0xC08B80` with ESI = +0x134 and stack +0x130, which registers the loaded peg.
+  2. If there is a g_peg (+0x134 non-zero), call `0xC08B80` with ESI = rec+0x12C (peg data), ECX = rec+0x8A (peg name) and stack (rec+0x130, rec+0x134), caller-clean; it registers the loaded peg. (`smesh_table_add_streamed` in step 1 gets ECX = node+0x30 and EDX = rec+8, stack (+0x124, +0x128).)
   3. Set the record's loaded flag (+0x122 = 1).
 - **1, anim.** Call `object_anim_add_loaded(data, size, chunk_pool_index(pool))`.
 - **2, text node file.** Call `streamman_chunk_extras_parse_nodes(node, chunk id)`.
@@ -637,8 +637,8 @@ The callbacks per kind (`0x22248F8 + kind*0x10`):
 | Off | Callback |
 |---|---|
 | +0x0 | (cfg+0x20) |
-| +0x4 | slot became unused (`rsched_slot_make_idle`) |
-| +0x8 | loaded (used by the job finish) |
+| +0x4 | available: a slot became loaded (`rsched_job_finish_loaded`) or idle (`rsched_slot_make_idle`) |
+| +0x8 | load failed (`rsched_job_finish_failed`) |
 | +0xC | unload (`rsched_slot_evict`) |
 
 | Off | Scheduler (0xD4) |
@@ -656,8 +656,8 @@ The callbacks per kind (`0x22248F8 + kind*0x10`):
 | +0x34 | requests (0x48 each) |
 | +0x38 | active request list |
 | +0x3C | free request list |
-| +0x40 | per-group slot queues (0x18-byte `streamman_queue`, compare `rsched_slot_compare`) |
-| +0x44 | per-group request queues (compare `rsched_request_compare`) |
+| +0x40 | per-group request queues (0x18-byte `streamman_queue`, sized by the request count, compare `rsched_request_compare` 0xA752A0) |
+| +0x44 | per-group slot queues (sized by the slot count, compare `rsched_slot_compare` 0xA751E0) |
 | +0x48, +0x4C.. | deferred releases (count, 0x10-byte {id, level, all, group}) |
 | +0xCC | per-group slot quota |
 | +0xD0 | flags: 1 disabled, 2 dirty, 4 config flag, 8 updating |
@@ -698,10 +698,454 @@ The callbacks per kind (`0x22248F8 + kind*0x10`):
 
 | Off | Registry entry |
 |---|---|
-| +0x00 | flags (bit 3: skip in `rsched_update_group`; bits 4-23 name count) |
+| +0x00 | flags (bit 3: load failed, set by `rsched_job_finish_failed`, skipped by `rsched_update_group`; bits 4-23 name count) |
 | +0x04 | name list |
 | +0x08 | extra (the animation size) |
 
 The entry count is at `0x2529E38`. Names live in a pool at `0x2529E44` (used count `0x2529E40`), and a name hash table is at `0x2F9B260`/`0x2F9B2BC`.
 
 For a port of the streamer core, none of this needs to move. It only calls `streamman_queue_*`, `streamman_request_character/vehicle/animation`, `streamman_is_idle` and the slot arrays at `0x2225B3C`.
+
+## Request side, step by step (for porting)
+
+Corrections to earlier notes:
+- `file_exists` (0xA7D750) takes the name in **ESI**, not ECX.
+- `streamman_step_init` (0xA7F770) is **stdcall `ret 0x10`**: ESI = step, EAX = file, CX = alignment, stack (begin → +0x22C, issue → +0x234, progress → +0x230, after → +0x238). It also clears +0x4, +0x208, +0x20C, +0x210, +0x218, the 0x200 buffer, +0x21C bits 0-1, +0x23C and +0x240.
+- The multi-part variant is `streamman_step_init_multipart` (0xA80EE0), stdcall `ret 0x18`:
+  - Registers: EAX = step, ECX = part count.
+  - Stack: (list*, file, u16 align, extra → +0x220, begin, after).
+  - It sets +4 = 1 and +0x208 = count, copies the list into the step buffer (+8), and clears +0x20C, +0x228, issue, progress, +0x23C and retry.
+
+The steps of a loading info are at info+0x24 + k*0x244. Step k's fields are therefore info+0x24 + k*0x244 + off. Below, "step k" means that block.
+
+### Pattern shared by every typed request
+
+Character, vehicle and animation are single-slot types:
+1. `slot = *(0x2225B3C[type])`. If slot+4 (state) != 0 → `*out = {lo 0, hi 0xFFFF}` (none) and return.
+2. Set slot +4 = 1 and clear slot +8 / +0xC. `info = slot+0x10`.
+3. `info+0x20 &= 0xFF8FFC00`: clears the current step and bits 20-22. The step count (bits 10-19) is preset by the info's constructor and is **not** set here.
+4. Fill the info fields and steps (below).
+5. If slot+0x14 != -1, `streamman_queue_remove(EAX = slot+0x14, EDX = 0x2F9B88C)`. Then `slot+0x14 = streamman_queue_push(ECX = 0x2F9B88C, slot)`.
+6. `*out = type << 16 | index`.
+
+The chunk types (0, 1, 4) search their slot array for the first slot in state 0, 3 or 4 instead (peg: `0xE87BB4` slots; extras: `0xE87BC0`). Geom (type 0) always uses slot 0 and does not check its state.
+
+### streamman_request_character (0xA7FC30)
+
+Type 3, slot `*0x2225B48`, returns 0x30000.
+- **Registers:** EAX = dest A, EDX = size A.
+- **Stack:** (out, f0, f1, base, f2, f6, f8, f7, dest B, size B, object), i.e. arg0 = out ... arg10 = object.
+- `rsched_job_request_character` passes f0/f1/base as the registry entry's first three names, then the .morph_pc, .pcm_pc, .sim_pc and .cvtf names it finds in the list.
+
+Info fields:
+
+| Off | Value |
+|---|---|
+| +4 | 0 |
+| +8 | dest A |
+| +0xC | size A |
+| +0x10 | 0 (no filter) |
+| +0x18 | object (arg10) |
+| +0x1C | `character_on_loaded` (0xA7FA40) |
+| +0x1750, +0x1760 | dest A (base, cursor) |
+| +0x1754, +0x1764 | dest B (arg8) |
+| +0x1758 | size A |
+| +0x175C | size B (arg9) |
+| +0x1768 | u8: (`0x2527D14` && `0x2527CF7`) or `0x2527D15`, and `0x6C9090(ECX = arg1)` |
+
+Steps (all with begin `character_before_read_began_cb` 0xA7F840, after `character_after_read_cb` 0xA7F9C0, no issue or progress):
+
+| Step | File | Align | Notes |
+|---|---|---|---|
+| 0 | arg1 | 0x40 | |
+| 1 | arg2 | 0x1000 | only if `file_exists(arg2)`, then +0x21C bit 0; else an empty step (all 0) |
+| 2 | arg4 | 0x10 | then `file_get_size(ESI = &step2+0x210, arg4)` if arg4 != 0 |
+| 3 | info+0x170D = `path_change_extension(arg3, ".g_morph_pc")` | 0x10 | only if it exists (bit 0); else empty |
+| 4 | arg3 | 4 | |
+| 5 | info+0x16CC = `path_change_extension(arg3, ".g_peg_pc")` | 0x40 | only if it exists (bit 0); else empty |
+| 6 | arg5 | 0x10 | |
+| 7 | arg7 | 4 | |
+| 8 | arg6 | 4 | |
+| 9 | 0 | 0 | empty, no callbacks |
+
+Quirk: the begin and after callbacks return **false for step 3**. If a `.g_morph_pc` exists, the load aborts at that step.
+
+### streamman_request_vehicle (0xA87F80)
+
+Type 2, slot `*0x2225B44`, returns 0x20000.
+- **Registers:** EDX = size A, ECX = dest B.
+- **Stack:** (out, files[11]*, dest A, value → +0x191C, object).
+
+Info fields:
+
+| Off | Value |
+|---|---|
+| +4 | 0 |
+| +8, +0x1910, +0x1920 | dest A |
+| +0xC, +0x1918 | size A |
+| +0x1914, +0x1924 | dest B |
+| +0x191C | arg3 |
+| +0x18 | object |
+| +0x10 | filter `vehicle_step_filter` (0xA87AF0): file non-NULL and not starting with '!' |
+| +0x1C | `vehicle_on_loaded` (0xA87BF0) |
+
+Steps (begin `vehicle_before_read_began_cb` 0xA87B10, after `vehicle_after_read_cb` 0xA87BB0), in the order they are set up:
+
+| Step | File | Align | Notes |
+|---|---|---|---|
+| 0 | files[0] | 0x40 | |
+| 1 | files[1] | 0x1000 | |
+| 9 | files[9] | 4 | set up third |
+| 2 | files[2] | 4 | |
+| 3 | files[3] | 0x20 | |
+| 4 | files[4] | 0x20 | only if `file_exists(ESI = files[4])`, else empty with CX = 0x20 |
+| 5 | files[5] | 0x20 | |
+| 6 | files[6] | 0x20 | only if it exists |
+| 7 | files[7] | 0x20 | |
+| 8 | files[8] | 0x20 | only if it exists |
+| 10 (+0x16CC) | files[10] | 0x40 | only if it exists, then +0x21C bit 0 = NOT bit 14 of `object->+8->+0x5B0` (bit 0 selects buffer B) |
+
+Then the queue push, then `0x4840A0(EDI = object+4)`. `rsched_job_request_vehicle` fills files[] with the registry entry's names ("Empty" for id -1).
+
+### streamman_request_animation (0xA88240)
+
+Type 6, slot `*0x2225B54`, returns 0x60000 (EAX = out as well).
+- **Registers:** EDX = dest.
+- **Stack:** (out, name, size, object).
+
+Info: +8 = dest, +0xC = size, +4 = 0, +0x10 = 0, +0x18 = object, +0x1C = `animation_on_loaded` (0xA87C50, **always returns false**, so the slot ends in state 3 although the data was read).
+
+Step 0: file = name, align 1, no callbacks.
+
+### streamman_request_chunk_geom (0xA85140)
+
+Type 0, slot 0 of `*0x2225B3C`, `*out = 0` (handle 0x00000).
+- **Registers:** EAX = request struct.
+- **Stack:** (out).
+
+| Off | Request struct field |
+|---|---|
+| +0 | chunk_pc name |
+| +4 | g_chunk_pc name |
+| +8 | .pvs_pc name |
+| +0xC | u16 chunk id |
+| +0x10 | pool |
+| +0x14 | u8 wait |
+| +0x15 | u8 req+0x19 |
+| +0x16 | u8 req+0x1A |
+| +0x18 | pool reservation index |
+| +0x1C | u8 no-peg |
+
+1. Unless `packfile_find_entry(ECX = name)`, or `indexed_file_lookup` with a non-zero size (and `0x25272DC` clear), finds the file: `*out = {0, 0xFFFF}` and return.
+2. Set info fields:
+
+   | Off | Value |
+   |---|---|
+   | +0x20 | `(old & 0xFF900800) \| 0x100800`: step count 2, no destination accounting |
+   | +0x52E | chunk id |
+   | +0x541 | wait |
+   | +0x540 | req+0x19 |
+   | +0x542 | req+0x1A |
+   | +0x543 | no-peg |
+   | +4, +8, +0xC, +0x10, +0x18 | 0 |
+   | +0x1C | `chunk_geom_on_loaded` |
+   | +0x534 | pool |
+   | +0x53C | reservation |
+   | +0x530 | 0 |
+
+   If reservation == -1: `pool+0x48 = pool+0x44` and call `pool->+0x54->vtable[+0x30]()`, which resets the GPU pool.
+3. Copy the names with strncpy, 0x41 each: +0x4AC = name, +0x4ED = g_chunk_pc name.
+4. Step 0: file = info+0x4AC, align 0x10, begin `chunk_geom_before_read_began_cb` 0xA84E60, issue 0xA84F80 (an empty `ret`), after `chunk_geom_after_read_cb` 0xA84F90.
+5. Step 1, if `file_exists(ESI = g_chunk_pc name)`: file = g_chunk_pc name, align 0x10, begin `chunk_geom_before_read_began_gpu_cb` 0xA84F00, after 0xA84FC0. The after callback calls `pool+0x54` vtable +0x38 with (+0x538 - step1 size).
+
+   Otherwise the step count becomes 1 (`(+0x20 & 0xFFF007FF) | 0x400`) and step1 file / dest are cleared.
+6. If +0x540 is set: steps 0 and 1 get +0x21C |= 2.
+7. Set slot state 1, push it on the queue, `*out = 0`.
+
+### streamman_request_chunk_peg (0xA85890)
+
+Type 1, `*out = 0x10000 | index`.
+- **Stack:** (out, req*) with req = {name (.peg_pc), u16 chunk id, pool, +4 value, u8 wait}.
+
+1. The same file-exists check as geom.
+2. Take the first type-1 slot in state 0, 3 or 4 (`0xE87BB4` slots).
+3. Set info fields:
+
+   | Off | Value |
+   |---|---|
+   | +4, +8, +0xC, +0x10, +0x18 | 0 |
+   | +0x1C | `chunk_peg_on_loaded` (0xA857A0) |
+   | +0x20 | `(old & 0xFF9FFC00) \| 0x100000` |
+   | +0x53C | pool |
+   | +0x534, +0x538, +0x530 | 0 |
+   | +0x52E | chunk id |
+   | +0x540 | wait |
+   | +0x4AC | name (strncpy 0x41) |
+
+4. Step 0: file = +0x4AC, align 4, begin `chunk_peg_before_read_began_cb` 0xA85450, issue `chunk_peg_read_issued_cb` 0xA85660, after 0xA856B0. The after callback calls `0xC08DE0(EAX = step file)` if the step size > 0.
+5. Then info+4 = req[3], and step 0 retry = `chunk_peg_retry_cb` 0xA856E0.
+6. +0x4ED = `path_change_extension(name, ".g_peg_pc")`.
+7. Step 1: file = +0x4ED, align 0x40, begin `streamman_chunk_peg_before_read_began_peg_gpu_cb` 0xA85510, progress `chunk_peg_progress_cb` 0xA85600, retry 0xA856E0.
+8. Both steps get +0x21C |= 2. Set state 1 and push on the queue.
+
+### streamman_request_chunk_extras (0xA84510) and _impl (0xA82EA0)
+
+`0xA84510`:
+- **Registers:** ECX = chunk pool.
+- **Stack:** (out, chunk id, name, u16 old chunk id).
+
+1. If streaming is off (`0x2528B48` == 1 and `0x2528B49` == 0) → none.
+2. If no type-4 slot is free → none.
+3. Pool index = (ECX - 0x2771894) / 0x58 must be 0..2, else none.
+4. **Network-client path.** Taken when `0x2528C14` is set, (`0x2528B56` == 0 or `0x2528B2B` != 0) does not hold, or `+0x3F8` is 0. It:
+   - drops any matching entries from the list `0xEB8148` (count `0xEB8150`, capacity `0xEB814C`) via `0xA84DD0`;
+   - appends {chunk id, sequence `0x252A02C`++};
+   - sends message 0x7E with {chunk id, sequence, pool index} through `0x814740`;
+   - returns none.
+5. **Local path.**
+   1. If the old id != 0xFFFF: `chunk_extras_list_release(DI = old id, DL = 1)`.
+   2. `chunk_extras_list_get(EAX = &count, DX = chunk id, list buf)`.
+   3. `chunk_extras_list_store(EAX = count, list, chunk id, 1)`.
+   4. `streamman_request_chunk_extras_impl(out, chunk id, name, pool index, list, count)`.
+   5. Return EAX = out.
+
+`_impl`:
+1. Streaming off → none.
+2. Take the first free type-4 slot. `info+0x20 = (old & 0xFF9FFC00) | 0x100000`, clear +4 / +8 / +0xC / +0x10 / +0x18, +0x1C = `chunk_extras_on_loaded` 0xA81620, +0x778 = 0x2771894 + idx*0x58, +0x772 = chunk id. Step 0's +0x208 and file are cleared.
+3. If chunk id == 0xFFFF → none (the slot is left at state 0, info half set).
+4. `chunk_extras_collect_parts` splits the object list into mesh objects and animations.
+5. **Meshes.** `n = smesh_cache_filter_requests(out list, mesh list, count, chunk id)`. If n > 0: step 0 = `step_init_multipart(EAX = step0, ECX = n, list, object_template_find(first name)->+8, *(u16*)0xE8355C, 0, begin 0xA81160, after 0xA81200)`, and step 0 retry = `streamman_retry_never` 0xA81610.
+6. Step 1's +0x208 and file are cleared.
+7. **Animations.** If the animation count > 0: step 1 = multipart(EAX = step1, ECX = count, anim list, list[0], 0x10, extra 0x2771AA0 + idx*0x54, begin 0xA80FA0, after 0xA81040), retry 0xA81610.
+8. +0x6F0 = name (strncpy 0x41, +0x730 = 0).
+9. Step 2: file = name if it exists (packfile or indexed lookup), else 0; align 0x40, begin 0xA814D0, after 0xA81530, retry 0xA81610.
+10. If the file exists or any parts were added: state 1, queue push, out = 0x40000 | index. Otherwise none.
+
+### streamman_request_chunk (0xA80360)
+
+Cdecl (out, req*).
+
+| Off | Chunk request (req) |
+|---|---|
+| +0 | name used for the world chunk id |
+| +8 | name used to match a pool reservation |
+| +0xC | count |
+| +0x10 | u16 list of chunk ids allowed to stay |
+| +0x14 | pool, or 0 to pick one |
+| +0x18 | u8 wait |
+| +0x19 | u8 no-history |
+| +0x1A | u8 special |
+| +0x1B | u8 force-geom-without-peg |
+
+1. Unless `0xE87B4F` is set: if req+0x1A is set → none.
+2. `id = world_chunk_find_id(ECX = req+0)`. If id < 0x866 and the world chunk table `0xF7AAE8[id]` is non-zero (already loaded) → none.
+3. **History.** Unless req+0x19 is set:
+   - If the id is not in the history (`chunk_request_history_find(DX = id)`), add it (`chunk_request_history_add(id)`).
+   - Otherwise, if entry+0xC == frame-1, set it to the current frame `0x252A3C0`.
+   - Otherwise remove the entry and add it again.
+4. If geom slot 0 is not idle and its chunk id (+0x52E) is not in req's list → `streamman_unload(0)`.
+5. If req+0x1A is clear and the current slot is geom (type 0) with +0x542 set → `abort_current(0)`.
+6. Continue only if geom slot 0 is NULL, or in state 0, 3 or 4. Otherwise → none.
+7. If the current slot is type 4 → `abort_current(1)`.
+8. If req+0x1A is set and any peg slot is busy → none.
+9. Look through the reservations `0xF6FBD8[]` (count `0xF6FBC4`) from the newest down:
+   - one in state 3 → none;
+   - stop at the first with flag +0x1C bit 0.
+10. Find the reservation whose name (+0x14) matches req+8 by stricmp, skipping flagged ones (bit 0). Call its index r.
+11. If none matched, or req+0x18 / req+0x1A is set, go to step 13.
+12. If a reservation matched, by its state (+0x20):
+    - 7 or 8 → set state 9, +0x24 = -1, then `streamman_unload_chunk_pegs_extras(its chunk id)`;
+    - 9 → continue to step 13;
+    - anything else → none.
+13. Need a free peg slot and a free extras slot, else → none.
+14. **Pool:** req+0x14, else (no reservation) `chunk_pool_pick(*0x27718D0)` or, for req+0x1A, `0x27732AC` if it has room; else the reservation's pool (+0x10).
+15. **Names.** Each is `path_change_extension` of the request name into a local:
+    - chunk_pc → `"chunk_pc"`;
+    - g_chunk_pc → `"g_chunk_pc"`;
+    - pvs → `".pvs_pc"`;
+    - extras → `".cts"`;
+    - peg → `".peg_pc"`.
+16. **Sub-requests** (only if there is a pool):
+    1. Unless req+0x1A: `extras = request_chunk_extras(ECX = pool; out, id, cts name, reservation chunk id or 0xFFFF)`.
+    2. `peg = request_chunk_peg(out, {peg name, id, pool, 0, wait})`.
+    3. `geom = request_chunk_geom(EAX = {chunk_pc, g_chunk_pc, pvs, id, pool, wait, req+0x19, req+0x1A, r, no-peg})`, where no-peg = (peg is none) or req+0x1B.
+17. If geom is none: unload peg and extras if they were made, then return none.
+18. If wait (req+0x18): `streamman_wait(geom)` and clear the geom slot +4 / +8 / +0xC.
+    - If that returned false → `*out = {0, 0xFFFF}` (lo 0, hi 0xFFFF).
+    - If it returned true:
+      - wait for and clear the peg slot;
+      - wait for and clear the extras slot, but only when `0x2527D14` is 0 or `*0x2527D10 + 0xAFF` is set;
+      - then `*out = geom`.
+19. Without wait, `*out = geom`.
+
+### Unload helpers
+
+| Function | Behaviour |
+|---|---|
+| `streamman_unload_chunk_pegs_extras` 0xA80A40 | cdecl (u16 id): `streamman_unload` on busy type-1 slots with +0x52E == id and busy type-4 slots with +0x772 == id |
+| `streamman_any_chunk_busy` 0xA80B40 | any slot of types 0, 1, 4 in state 1 or 2 |
+| `streamman_cancel_chunk_loads` 0xA80BC0 | every busy chunk slot: type 0 → `streamman_unload`; types 1 and 4 → `0x4A9DA0(world chunk entry, -1)` for the chunk id stored in the info (peg +0x52E at `0x2FA45C6` + i*0x544, extras +0x772 at `0x2FA5D1A` + i*0x77C) |
+| `streamman_unload_flagged_geom` 0xA80CC0 | AL = flag → `0xE87B4F`; `streamman_unload` of every geom slot with info +0x542 set |
+| `streamman_release_chunk_extras` 0xA84410 | see the mesh cache section |
+
+## Completion and step callbacks
+
+All callbacks are cdecl (info*), except progress, which is (info*, node*). Each returns a bool in AL.
+
+| Type | Begin | Issue | Progress | After | Retry | Completion (+0x1C) |
+|---|---|---|---|---|---|---|
+| 0 geom, step 0 | 0xA84E60 | 0xA84F80 (`ret`) | - | 0xA84F90 | - | 0xA84FF0 |
+| 0 geom, step 1 | 0xA84F00 | - | - | 0xA84FC0 | - | |
+| 1 peg, step 0 | 0xA85450 | 0xA85660 | - | 0xA856B0 | 0xA856E0 | 0xA857A0 |
+| 1 peg, step 1 | 0xA85510 | - | 0xA85600 | - | 0xA856E0 | |
+| 2 vehicle | 0xA87B10 | - | - | 0xA87BB0 | - | 0xA87BF0 (filter 0xA87AF0) |
+| 3 character | 0xA7F840 | - | - | 0xA7F9C0 | - | 0xA7FA40 |
+| 4 extras, steps 0/1/2 | 0xA81160 / 0xA80FA0 / 0xA814D0 | - | - | 0xA81200 / 0xA81040 / 0xA81530 | 0xA81610 (false) | 0xA81620 |
+| 6 animation | - | - | - | - | - | 0xA87C50 (false) |
+
+The geom and peg begin callbacks allocate from the chunk pool:
+- free = `pool->vtable[+0xC]()` minus the step alignment; if > 0, `dest = pool->vtable[+0x1C](free, align)` → step+0x218, info+8 = dest, info+0xC = free; false if it cannot allocate.
+- The after or issue callback gives the unused tail back: `vtable[+0x38](allocated - size)` for geom, `+0x34` with pool+0x48 kept for peg.
+
+**chunk_geom_on_loaded (0xA84FF0):**
+1. Compute the chunk:
+   - if step0 has a file: `0x4AF280(step0 file, step0 dest, step0 size, +0x540, +0x542, +0x541)`, which is `chunk_load_from_memory`; store the result at +0x530;
+   - otherwise use 0.
+2. If the chunk is 0: clear the world chunk table entry for `world_chunk_find_id`, call `streamman_unload_chunk_pegs_extras(+0x52E)` and return false.
+3. If no-peg (+0x543) is set:
+   - `0x4A8BC0(chunk)`;
+   - if chunk+0x180 is set, append it to `0xF70BA8[*0xF71B58++]`;
+   - `0x4C6C30`, then `0x4AB660`.
+4. Otherwise:
+   - if wait (+0x541) is set: `0x4AB660`;
+   - if not: chunk+0x20 = 4 and then 0. These are two stores to the same field; the result is 0.
+5. If chunk+0x1C bit 0 or wait is set: chunk+0x18 = 3, `0x4AA840`, `0x562100`.
+6. Return true.
+
+**chunk_peg_on_loaded (0xA857A0):**
+1. `e = 0xC086E0(step1 file)`. If e is 0 → false.
+2. `0xC08EB0(step1 size)` and e[0] = 0.
+3. If step0 has a file and a size:
+   - if +0x538 is set, give back the unused GPU tail and set +0x538 = 0;
+   - for the world chunk entry (+0x52E): `0x4AA8D0`;
+   - if +0x540 is clear and `0xF6FBC0` is set: entry state = 6, +0x24 = -1;
+   - otherwise `0x4AB660`.
+4. Return true.
+
+**character_on_loaded (0xA7FA40):**
+1. `0x6E8A50(EAX = &loader)` finds a free character loader (0x28C-byte records). If there is none → false.
+2. Otherwise it builds a descriptor and returns `loader->vtable[+8](&descriptor)`. The descriptor is { object (+0x18), step0 file, step0 dest, step1 dest, step4 file, step4 dest, step4 size, step5 dest, step5 size, step2 file, step2 dest, step3 dest, step6 file, step6 dest, step7 file, step7 dest, step8 file, step8 dest }.
+
+**vehicle_on_loaded (0xA87BF0):** builds 11 x {file, size (+0x210), dest (+0x218)} and returns `0xADB530(EAX = info+0x18; &array)`.
+
+**chunk_extras_on_loaded (0xA81620):**
+1. World chunk entry (+0x772): flags |= 0x80.
+2. If its state is 7: `0x4AB660(EAX = 8)`.
+3. `0x914460(entry chunk id)`, then return true.
+
+## Resource slot scheduler, step by step
+
+Slot states (+0x28):
+
+| State | Meaning | List |
+|---|---|---|
+| 0 | loaded and idle | +0xC |
+| 1 | queued for loading | +0x10 |
+| 2 | loading | current, sched+0x14 |
+| 3 | in use (bound to a request) | +0x18 |
+| 4 | free | +0x1C |
+
+Registry entry +0 bit 3 = **load failed**.
+
+Correction to the scheduler table above: +0x40 holds the per-group **request** queues and +0x44 the per-group **slot** queues. The two compare functions were swapped in the first notes: requests use 0xA752A0 and slots use 0xA751E0.
+
+The callbacks per kind (`0x22248F8 + kind*0x10`) are:
+- **+4 available:** called on load success and when a slot goes idle.
+- **+8 failed.**
+- **+0xC unload.**
+- **+0:** not called by this code.
+
+**rsched_add_ref** (0xA757F0): EAX = sched, stack (id, level, group, load_now).
+1. Find the request with this id on the active list (+0x38).
+   - **Found:** remember its best level (the highest non-zero of +0x2C..+0x44) and best group (the highest index with a non-zero count). Increment level and group, compute both again.
+     - If the best level changed, set dirty.
+     - If the best group changed, set dirty, re-queue the request with a new +0x10 and update the bound slot's group (+0x24) / requeue it unless it is current.
+     - If the request has no slot: `rsched_bind_loaded_slot`.
+   - **Not found:** pop the free list (+0x3C); if it is empty, return.
+     1. Clear the request, set the id, flag bit 1 = load_now, increment level and group.
+     2. Append it to the active list and push it on the request queue.
+     3. Call `rsched_bind_loaded_slot` and set dirty.
+
+**rsched_release** (0xA75A60): EAX = sched, EDX = id, stack (level, group, all).
+1. If +0xD0 bit 3 (updating) is set: append {id, level, all, group} to the deferred list (+0x48 count, 0x10-byte records at +0x4C) and return.
+2. Find the request. If it is absent and streaming is on, `0x347B088` = registry name (debug) and return.
+3. Take its best group. Then either:
+   - `all`: clear the level counts and the group counts;
+   - otherwise: decrement level[level] and group[group].
+4. If any level is non-zero: `rsched_request_requeue(old best group, new best group)`, then `rsched_bind_loaded_slot` if it has no slot.
+5. If every level is zero:
+   1. Unbind from its slot.
+   2. If the request has an object (+0xC): `rsched_slot_make_idle`.
+   3. Unlink from the active list, remove it from its queue, clear it (`0xA75030`) and append it to the free list.
+   4. Set dirty.
+
+**rsched_update** (0xA75730): EAX = sched. Runs only if +0xD0 bit 0 is clear and bit 1 is set.
+1. Clear bit 1 and set bit 3.
+2. `rsched_bind_loaded_slot` for every active request with no slot.
+3. `rsched_assign_group_quotas`.
+4. `rsched_update_group` for each group.
+5. Clear request flag bit 0 on all of them, then clear bit 3.
+6. Replay the deferred releases and zero the count.
+
+**rsched_assign_group_quotas** (0xA76220): for each group g:
+1. Pop every slot from the group's slot queue (sched+0x44 + g*0x18) into a temp list with +0x20 = -1. Count them, counting the current slot if its group is g.
+2. If the count exceeds the quota (+0xCC[g]), move the excess (taken from the front) to a spare list.
+3. Push the rest back.
+
+Then for each group short of its quota, move spare slots into it: set the request's bit 0 and unbind it, push the slot on the group's queue, set slot +0x24 = g.
+
+**rsched_update_group** (0xA764D0): EAX = group, stack (sched).
+1. Pop every slot from the group's slot queue (+0x44 + g*0x18) into list S (slot +0x20 = -1, temp links +0x34/+0x38).
+2. If S is not empty, pop up to |S| requests from the request queue (+0x40 + g*0x18) into list R (request +0x10 = -1, temp links +0x24/+0x28).
+3. **Pass 1.** Re-push any request whose registry id has the failed bit.
+4. **Pass 2.** For each request, find a slot in S with the same id. If found:
+   - take both out of their lists;
+   - if the request's best level > 4 and the slot has an object: `rsched_slot_make_idle`;
+   - re-push both.
+   - Also re-push the request if it is the current job's slot id.
+5. **Pass 3.** Re-push any request whose id is already in a slot whose group (`0xA750A0`) differs.
+6. **Pass 4.** Pair the remaining requests (best first) with the remaining slots (worst first):
+   - if the request's best level > 4, or the slot is not loaded (+0x10 == 0):
+     1. `rsched_slot_evict`, then put the slot on the queued list (+0x10) with state 1.
+     2. Set slot fields: id = request id, +0x14 = 0, +8 / +0xC / +0x10 = 0; bind both.
+     3. If request bit 1 (load_now) is set: job = `rsched_job_add(id, A + i*strideA, strideA, B + i*strideB, strideB, best level)`, where i = slot index. Otherwise job = -1.
+     4. If the request has an object, `rsched_slot_make_idle`.
+   - else, if the request has no object and the slot has none: `rsched_slot_use`.
+7. Push back everything left in R and S.
+
+**Jobs:**
+- `rsched_job_add` (0xA77DD0): cdecl (id, dest, size, dest2, size2, level) → queue index, or -1 when 50 (0x32) jobs are queued. It takes a job from the free list `0x2529E54`, appends it to `0x2529E50`, count++, and pushes it on the queue `0x2F9B2D0`.
+- `rsched_job_start_next` (0xA77B90): if the queue is not empty:
+  1. Pop the best job and unlink it.
+  2. Make it current (`0x2529E58`).
+  3. `rsched_job_begin_slot(EAX = id, ECX = scheduler of kind)`.
+  4. By kind:
+     - 0, 2, 3 → `rsched_job_request_character(out, id, dest, dest2, size, size2)`;
+     - 1, 5 → `rsched_job_request_vehicle(out, dest, dest2, size, size2)` with EAX = id;
+     - 4 → `streamman_request_animation(out, name, dest2, registry +8)` with EDX = size. The name is "Empty" for id -1.
+  5. Store the handle at `0xEB80F8`.
+- `rsched_job_pump` (0xA77F10): if a handle is set (not `{0xFFFF hi, 0 lo}`):
+  1. If `streamman_is_idle(handle)` is false, return.
+  2. If the streamer slot state is 4: `rsched_job_finish_loaded(id, slot+8, 1)` with EDX = slot+0xC.
+     Otherwise: `rsched_job_finish_failed(id, 1)`.
+  3. Clear the streamer slot (+4, +8, +0xC).
+  4. Reset the job (id -1), append it to the free list, count--, current = 0, handle = 0xFFFF0000.
+  5. Call `rsched_job_start_next`.
+
+  Because `animation_on_loaded` returns false, kind 4 (animations) always takes the failed path.
+- `rsched_job_cancel` (0xA77E90): removes a queued job from the queue and the active list and frees it.
+
+**Every frame**, `rsched_update_all` (0xA79080):
+1. `rsched_update` on the six schedulers.
+2. `rsched_job_pump`.
+3. `0xA78AC0` when streaming is on, `0x2528C14` is set, (`0x2528B56` == 0 or `0x2528B2B` != 0), `*0x2528C14 + 0x3F8` is set and `0x2528BB4` < 1.
