@@ -87,14 +87,14 @@ Handlers are named `render_deferred_h<type>_<api>`. "Record" is what the handler
 | 04 | 0xCF95A0 | `gfx_set_color` 0xD14840 | cdecl (r, g, b, a) ints, pops 16 | ctx+0x28..+0x34 = v / 255 |
 | 05 | 0xCF9540 | `gfx_set_alpha` 0xD147E0 | cdecl (a), pops 4 | ctx+0x34 = a / 255 |
 | 06 | 0xCF9140 | `gfx_set_bitmap` 0x56C2B0 | ESI = bitmap handle | ctx+0x38 |
-| 07 | 0xCF94A0 | `gfx_set_ps_params3` 0xD14700 | ESI = &{3 dwords} | pixel shader constants (ring 7) via 0xD18DE0, then 0xD1D840 |
+| 07 | 0xCF94A0 | `gfx_set_tint_color` 0xD14700 | ESI = &{f32 r, g, b} | ctx+0x70..+0x7C = (r, g, b, 1.0), then tail-jump `gfx_cmd_set_ps_c4` (pixel shader constant c4). Not the gamma ramp: that is `gfx_apply_gamma` 0xD14770 |
 | 08 / 09 | 0xCFB100 / 0xCFB0F0 | `gfx_push_depth_bias` 0xD232C0 / `gfx_pop_depth_bias` 0xD23200 | cdecl (float), pops 4 / - | 16-deep stack; `D3DRS_DEPTHBIAS` (0xC3) = sum |
 | 0A / 0B | 0xCFB080 / 0xCFB070 | `gfx_push_slope_depth_bias` 0xD23120 / `gfx_pop_slope_depth_bias` 0xD23060 | cdecl (float) / - | `D3DRS_SLOPESCALEDEPTHBIAS` (0xAF) |
-| 0C | 0xCF9350 | `gfx_set_clip_plane` 0xD22090 | cdecl 4 floats, pops 16 | 0xD18BD0: ring 7 plus `CLIPPLANEENABLE` (0x98) |
+| 0C | 0xCF9350 | `gfx_set_clip_plane` 0xD22090 | index + cdecl 4 floats | `gfx_set_user_clip_plane` 0xD18BD0: `CLIPPLANEENABLE` (0x98) through the cache, and **SetClipPlane called directly on the device** (not the ring) |
 | 0D / 0E | 0xCFB000 / 0xCFAF90 | `gfx_set_state_float_110` 0xD23000 / `gfx_set_state_float_0e` 0xD22F90 | cdecl (float) | thread state floats (role open) |
 | 0F | 0xCF92B0 | `gfx_set_shader_state3` 0xD09E20 | EAX = &{3 dwords} | 0xD18E50 (ring 7) and 0xD1CCF0 (render states + vertex declaration) |
 | 10 | 0xCF91E0 | `gfx_clear_region` 0xD14B20 | registers + cdecl 2, pops 8 | `gfx_cmd_clear`, re-applies the state block |
-| 11 | 0xCF9190 | `gfx_clear` 0xD14AD0 | ECX = value | `gfx_cmd_clear` |
+| 11 | 0xCF9190 | `gfx_clear` 0xD14AD0 | ECX = stencil value | `gfx_cmd_clear` of the **stencil** only (flags 4) |
 | 12 | 0xCFB740 | `gfx_draw_bitmap` 0xD11240 | EAX + cdecl 10, pops 0x2C | bitmap, state block, 0xD1F0D0 (2D quad) |
 | 13 / 15 | 0xCFAD50 / 0xCFA8C0 | `gfx_draw_text_13` 0xD15C60 / `gfx_draw_text_15` 0xCF5D90 | ESI, EDI + cdecl (3 floats, 1), pops 16; the record also holds the string | font layer 0xBD68E0 / 0xBDB5C0 |
 | 14 / 16 | 0xCFAB00 / 0xCFA670 | `gfx_draw_text_14` 0xD15BD0 | ESI, EAX + cdecl 4, pops 16 | font layer 0xBD6E60 |
@@ -105,7 +105,7 @@ Handlers are named `render_deferred_h<type>_<api>`. "Record" is what the handler
 | 21 | 0xCF9E60 | `im2d_draw_quad` 0xD0A130 | ESI, EDI + cdecl (ptr), pops 4 | state block, 0xD1E330 |
 | 22 / 23 / 24 | 0xCF9D00 / 0xCF9AD0 / 0xCF9910 | `im2d_draw_22` 0xD0B980 / `_23` 0xD0B7D0 / `_24` 0xD0A5E0 | cdecl 5 / EDI + 6 / 4 floats + 1 | 2D shapes over the strip / list batches (role open) |
 | 25 | 0xCFBA10 | `gfx_draw_25` 0xD13A60 | EAX + cdecl (float, ptr), pops 8 | role open |
-| 26 / 27 | 0xCF9810 / 0xCF9800 | `gfx_restore_default_targets_clear` 0xD1EF80 / `gfx_restore_default_targets` 0xD1EF40 | cdecl (3 bools) / - | default render target, depth target and viewport (0x22F63F8 / 0x22F63FC), optional clear |
+| 26 / 27 | 0xCF9810 / 0xCF9800 | `gfx_set_render_target_level` 0xD1EF80 / `gfx_restore_default_targets` 0xD1EF40 | ESI = target index, EDX = level + cdecl (3 bools) / - | 26: render target `0x22FDC28[index]` level `level` (GetSurfaceLevel), then optional clears; 27: the default render target, depth target and viewport (0x22F63F8 / 0x22F63FC) |
 | 28 | 0xCFB240 | queued by `gfx_queue_28` 0xD09D90 (16 dwords from 0x25282F4…) | - | calls 0x7715E0 with 8 floats (the pause map) |
 | 29 | 0xCFB450 | `gfx_draw_29` 0xD15E80 | EDI, EAX + cdecl 6, pops 0x18 | role open |
 | 2A | 0xCF9060 | `render_deferred_h_call_fn` | record {fn, arg} | `fn(arg)` on the render thread. `gfx_queue_call_79edf0` (0xCF90E0) uses it |
@@ -151,6 +151,100 @@ A shadow check must compare the ring bytes *after* these caches. The same call c
 | 7 | the font (`gfx_draw_text_*` → 0xBD6xxx) and "role open" types | 5 |
 
 Each API function's deferred path and immediate path can be ported together: the deferred path is only the `render_deferred_queue` call.
+
+### Remaining leaves, step by step
+
+**`gfx_bind_shader_pair`** (0xD19070; `EAX` = pair index; no stack arguments; called by 0xD1CCF0, 0xD1DEB0 and 0xD1E070):
+1. `entry = 0xE84AF0 + index × 0x38`. `vs = entry[+0]`, or the default `0xE84B98` when 0.
+2. If `vs != 0x22F2AEC` (vertex shader cache): write ring `{4, vs}` (SetVertexShader, 8 bytes) and update the cache.
+3. `ps = entry[+4]`, or the default `0xE84B9C` when 0.
+4. If `ps != 0x22F2AE8` (pixel shader cache): write ring `{3, ps}` (SetPixelShader) and update the cache.
+
+The 0x38-byte entries are filled at shader load. The default pair is entry 3 (0xE84B98 = 0xE84AF0 + 3 × 0x38).
+
+**`gfx_set_tint_color`** (0xD14700; `ESI` = &{f32 r, g, b}):
+1. `ctx+0x70..+0x7C` = (r, g, b, 1.0). This is done on every call, before the defer test.
+2. Defer as type 0x07 (record = the 3 floats), or tail-jump `gfx_cmd_set_ps_c4(EAX = ctx+0x70)`.
+
+**`gfx_cmd_set_ps_c4`** (0xD18DE0; `EAX` = &float4):
+1. Copy the 4 floats to `0x2304D9C..0x2304DA8` (a copy kept for the device-reset restore).
+2. Write ring `{7, 4, 1, f0, f1, f2, f3}` (SetPixelShaderConstantF(4, data, 1), 0x1C bytes). There is no cache test.
+
+**`gfx_apply_gamma`** (0xD14770; no arguments; reached by fall-through after `gfx_set_tint_color`'s body, with its own entry at 0xD14770):
+1. Pick the context as usual (0xEC26A0 → 0xEC2610).
+2. If `ctx+0x5C` (byte, gamma dirty) is 1, call `gfx_set_gamma_ramp(lo = ctx+0x64, hi = ctx+0x68, gamma = ctx+0x60)`.
+3. Keep copies: `0xE84A28` = gamma, `0x252A320` = lo, `0xE84A2C` = hi.
+4. Clear `ctx+0x5C`.
+
+**`gfx_set_gamma_ramp`** (0xD1D840; cdecl `(f32 lo, f32 hi, f32 gamma)`, caller pops 12):
+1. `dev->GetDeviceCaps(&caps)` (slot 7). Unless `caps.Caps2 & D3DCAPS2_FULLSCREENGAMMA (0x20000)`, return.
+2. For i = 0..255:
+   1. `v = pow(i / 255.0, gamma) × (hi − lo) + lo` (pow is the CRT x87 helper 0xCA05D0).
+   2. Clamp `v` to [0, 1].
+   3. `w = (int)(v × 1024) << 6`, clamped to 0xFFFF.
+   4. Store `w` into red[i], green[i] and blue[i] of a `D3DGAMMARAMP` on the stack.
+3. `dev->SetGammaRamp(0, 0, &ramp)` (slot 21).
+
+**Device thread.** This calls the device **directly**, not through the ring. It runs on whichever thread applies the context: the render thread, or the game thread while `0xE849DB` is set. Keep that in mind for the device-thread-only rule of the ring executor.
+
+**`gfx_set_user_clip_plane`** (0xD18BD0; `ECX` = plane index, cdecl `(f32 a, b, c, d)`; returns with `ret`, caller pops 16; called only by `gfx_set_clip_plane`):
+1. If index > 5, return.
+2. If a, b and c are all 0.0 (the `fucom` tests), the plane is off:
+   1. `mask = 0x252A314 & ~(1 << index)`.
+   2. If `mask` differs from the render-state cache `0x22F5A50` (`D3DRS_CLIPPLANEENABLE`, 0x98) and isn't `0xBAADF00D`, write ring `{15, 0x98, mask}` and update the cache.
+   3. Return.
+3. Otherwise:
+   1. `mask = 0x252A314 | (1 << index)`, with the same cached SetRenderState(0x98).
+   2. Then `dev->SetClipPlane(index, {a, b, c, d})` (slot 55) **directly on the device**, not through the ring.
+
+`0x252A314` is the enabled-plane mask, and it is kept even when the cache already matches.
+
+### Deferred record layouts
+
+What each handler stores in mode 0. Fields are 4 bytes in order; `f32` arguments arrive in the varargs as doubles and are stored as floats. Mode 1 reads the same fields back and calls the API with the convention in the handler table.
+
+**Shared pieces:**
+
+| Piece | Meaning |
+|---|---|
+| `pair8` | the `{u32, u32}` render-state pair (`gfx_set_render_state_block`'s argument), passed by pointer and copied by value; it always comes last |
+| `STR` | `u32 len`, then `len` bytes padded to 4 |
+| `VTX` | `u32 count`, `u32 bytes`, then `bytes` of vertices padded to 4. In mode 0 the handler writes the address of that space back into the caller's `{dst*, bytes}` struct, so **the caller fills the vertices after `render_deferred_queue` returns**. Execute skips the call when count > 64 |
+
+**Records by type:**
+
+| Type | API | Record |
+|---|---|---|
+| 00 | `gfx_set_viewport_rect` | y, x, w, h, no_clamp |
+| 01 | `gfx_set_scissor_rect` | 4 × u32 (2 registers + 2 stack) |
+| 02, 09, 0B, 1A, 1D, 20, 27 | (no arguments) | empty |
+| 03 | `gfx_set_render_state_block` | pair8 |
+| 04 | `gfx_set_color` | r, g, b, a |
+| 05 | `gfx_set_alpha` | a |
+| 06 | `gfx_set_bitmap` | handle |
+| 07 | `gfx_set_tint_color` | f32 r, g, b |
+| 08, 0A, 0D, 0E | the float setters | f32 |
+| 0C | `gfx_set_clip_plane` | u32 index, f32 a, b, c, d |
+| 0F | `gfx_set_shader_state3` | 3 × u32 (12 bytes copied) |
+| 10 | `gfx_clear_region` | 4 × u32 |
+| 11 | `gfx_clear` | u32 stencil |
+| 12 | `gfx_draw_bitmap` | 11 × u32 (EAX + 10 stack), pair8 |
+| 13, 15 | `gfx_draw_text_13` / `_15` | f32 x, f32 y, STR text, u32, f32 scale, u32, pair8 |
+| 14, 16 | `gfx_draw_text_14` | 12 bytes (vec3 position), 36 bytes (3 × 3 orientation), f32, STR text, u32, u32, pair8 (3D text) |
+| 17 | `im2d_draw_17` | f32 × 4, pair8 |
+| 18, 1B, 1E | `im2d_*_begin` | pair8 |
+| 19, 1C, 1F | `im2d_*_add` | VTX |
+| 21 | `im2d_draw_quad` | 12 bytes (from ESI), 12 bytes (from EDI), pair8 |
+| 22 | `im2d_draw_22` | 4 × u32, pair8 |
+| 23 | `im2d_draw_23` | 8 × u32, pair8 |
+| 24 | `im2d_draw_24` | u32, f32 × 4, pair8 |
+| 25 | `gfx_draw_25` | 12 bytes, f32, pair8 |
+| 26 | `gfx_set_render_target_level` | index, level, 3 × bool |
+| 28 | (pause map draw 0x7715E0) | f32 × 8 |
+| 29 | `gfx_draw_29` | f32, f32, STR, u32, 12 bytes, 12 bytes, u32, u32, pair8 |
+| 2A | callback | fn, arg |
+
+Each handler checks `used + size <= space` before every field. When a field doesn't fit, it returns 0 and `render_deferred_queue` marks the list overflowed (0x16801). The VTX check happens before the space is handed out.
 
 ### In Rust (gfx_cmd.rs)
 
