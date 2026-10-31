@@ -421,3 +421,93 @@ There are two pools. Pool 0 uses free list 0x15125A0, active list 0x151259C and 
 - **Request:** `smesh_cache_filter_requests` (0x6E6B80) drops objects whose mesh is already resident and adds the chunk to existing records.
 - **Start:** `start_chunk_extras` calls `smesh_cache_add_ref` (0x6E63F0). If the pool is full, it evicts an unreferenced record (`smesh_cache_find_unreferenced` + `smesh_cache_free`). For a record already loaded, it only adds the chunk id (`smesh_cache_record_add_chunk` 0x6E6B30).
 - **Unload:** `streamman_release_chunk_extras` (0xA84410, chunk id) calls `smesh_cache_release_chunk` (0x6E6720) for each object of the chunk. The last reference to an unloaded record frees it.
+
+## process_sequential and poll_chunk_extras, in detail
+
+### Read request state names
+
+The table at `0xE87BEC` names every read request state (+0x2C), so `async_io_error_code` returns either a state or 10/11. The names are:
+
+| Value | Name |
+|---|---|
+| 0 | UNKNOWN |
+| 1 | UNUSED |
+| 2 | PENDING |
+| 3 | ACTIVE |
+| 4 | CANCEL_PENDING |
+| 5 | CANCELED |
+| 6 | DONE_SUCCESS |
+| 7 | CANNOT_OPEN |
+| 8 | VDIR MISMATCH |
+| 9 | ERROR_UNKNOWN |
+| 10 | NOT_ENOUGH_MEMORY |
+| 11 | INVALID_HANDLE |
+
+State 8 was the one left unexplained in the read scheduler table above.
+
+### streamman_process_sequential (0xA7D0C0)
+
+Called by the pump for type 6 (animation). It takes no arguments and works on the current slot `*0x2529FF0`, with info = slot+0x10. There is no batch: one read is in flight at a time, kept at slot +0x18/+0x1C.
+
+**Slot state 1.** Starting at the current step (flags bits 0-9), it looks for a runnable step, then stops at the step count (bits 10-19):
+- If the info has a filter (+0x10), it runs it on the step's file and stops at a step where it returns 1.
+- Without a filter, it stops at a step whose file is non-zero.
+
+If no step is runnable, it calls `streamman_finish_current` and returns.
+
+Otherwise:
+1. Store the step index in bits 0-9 and call `streamman_nop(step file)`.
+2. Run the begin callback (+0x22C). If it returns false, call `abort_current(0)`.
+3. Unless flag 0x100000 is set, round info+8 up to the step's alignment (+0x214), take the same amount off info+0xC, and store info+8 in step +0x218.
+4. Call `streamman_submit_single_read` (0xA7CF50) with EAX = step file, ECX = info+8, EDI = info+4 and stack info+0xC. Store the returned (request, sequence) in slot +0x18/+0x1C.
+5. Run the issue callback (+0x234) if set, and set slot state 2.
+
+**Slot state 2.** Take the step at bits 0-9 and call `streamman_nop(file)`, then poll `async_io_status(slot+0x18, slot+0x1C)`. Note that `file_get_size(file)` is called here and its result ignored.
+- **Status not 3, 4 or 5 (still running).** If the progress callback (+0x230) is set, call it with `(info, 0)`; false aborts. With no callback it just returns.
+- **Status 4 or 5, or 3 followed by a re-poll that is not 3.** Run the retry callback (+0x240). Unless it returns 1, call `streamman_nop(file, name)` and `abort_current(0)`. The name comes from the table above via `async_io_error_code`, or is "No servicing request" when there is no current slot.
+- **Done.** Run the after callback (+0x238); false aborts. Then:
+  1. Call `async_io_release(request, sequence, 0)` and clear slot +0x18/+0x1C.
+  2. Unless flag 0x100000 is set, add step +0x210 (read size) to info+8 and take it off info+0xC.
+  3. Advance the step:
+     - If step +4 (u8 multi-part) is 0, go to the next step.
+     - If it is set, advance only once +0x208 <= +0x20C. Then keep skipping following steps that are themselves multi-part with +0x208 <= 0.
+     - If the step is still the same afterwards, the step is re-issued (state 1); this is how a multi-part step reads its parts one at a time.
+  4. If the new step index differs from the step count captured at entry, set slot state 1 (the next pump issues the next read). Otherwise call `streamman_finish_current`.
+
+### streamman_poll_chunk_extras (0xA7E900)
+
+Takes `(batch*)`. info = batch+0x14 and slot info = info+0x10, holding chunk id +0x772 and chunk pool +0x778. It walks the pending nodes (batch+0xC) in order and checks `async_io_status`:
+
+| Status | Action |
+|---|---|
+| 1 (queued) | stop |
+| 2 (being read) | `streamman_nop(name)`, where name is `path_change_extension(file, suffix)` if node+0xC is set, else the file; then stop |
+| 3 (done) | by node kind (+0x2C), see below; then move the node to the finished list (+0x10) |
+| 5 (failed) | move the node to the finished list, nothing else |
+| 4 or other | leave it and go on to the next node (no move) |
+
+Node kinds for status 3:
+- **0, mesh/peg part.** Look up the record with `object_template_find(name)` then `smesh_cache_find`. If the record is not loaded yet (+0x122), store the data by suffix (stricmp against the table `0xE87B90`):
+
+  | Suffix | Stored at |
+  |---|---|
+  | .smesh_pc | +0x124 |
+  | .g_smesh_pc | +0x128 |
+  | .peg_pc | +0x12C (data) / +0x130 (size) |
+  | .g_peg_pc | +0x134 / +0x138 |
+
+  When the next node is absent or belongs to another object (node+0x30 differs), the object is complete:
+  1. `smesh_table_add_streamed(+0x124, +0x128)`.
+  2. If there is a g_peg, call `0xC08B80` with ESI = +0x134 and stack +0x130, which registers the loaded peg.
+  3. Set the record's loaded flag (+0x122 = 1).
+- **1, anim.** Call `object_anim_add_loaded(data, size, chunk_pool_index(pool))`.
+- **2, text node file.** Call `streamman_chunk_extras_parse_nodes(node, chunk id)`.
+
+When the pending list is empty:
+1. Call `streamman_nop()`.
+2. Free every finished node: `async_io_free(mgr, request, sequence, 0)`, clear +0x10/+0x14, back to the pool 0x252A020.
+3. Clear info+0x20 (the active batch).
+4. Unlink the batch from the active list `0x252A01C` and put it on the free list `0x252A018`.
+5. Call `streamman_finish_current`.
+
+Unlike `check_batch` there is no progress, after or retry callback, and a failed part is only dropped.
