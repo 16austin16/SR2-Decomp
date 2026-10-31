@@ -601,6 +601,111 @@ extern "C" fn packfile_mount_temp_log(
     }
 }
 
+// --- 0xC0B8E0 packfile_unmount_temp_all (every call logged) ----------------
+
+/// cdecl, no args, no result. Prologue `mov eax,[temp_count]; test eax,eax`:
+/// 7 bytes, absolute operand only.
+const PACKFILE_UNMOUNT_TEMP_ALL: usize = 0x00C0_B8E0;
+const PACKFILE_UNMOUNT_TEMP_ALL_PROLOGUE: [u8; 7] = [0xA1, 0x60, 0x89, 0x34, 0x02, 0x85, 0xC0];
+
+/// The "temp packfile" allocator object (`0xEC5E58`): vtable +0x34 is
+/// `bool(int)`, +0x58 `void(int)`, both thiscall; `0xEC5E94` is the mark
+/// passed to +0x58.
+const TEMP_PACKFILE_ALLOCATOR: usize = 0x00EC_5E58;
+const TEMP_PACKFILE_ALLOCATOR_MARK: usize = 0x00EC_5E94;
+
+static UNMOUNT_TEMP_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+static UNMOUNT_TEMP_IMPL: AtomicUsize = AtomicUsize::new(0);
+const UNMOUNT_TEMP_USE_RUST: bool = true;
+
+/// `0xC0B2A0`: drop a packfile's records from the hash. Its `n` records are
+/// the last `n` in the table (temp packfiles are unmounted newest first), and
+/// for each one the first slot from its bucket that points at it is cleared.
+/// The scan does not stop at empty slots and the table is not compacted, so
+/// probe chains through a cleared slot are cut, as in the original.
+unsafe fn packfile_unregister_records(pf: *const u8) {
+    unsafe {
+        let n = *(pf.add(0x154) as *const u32);
+        let records = *(G_FILE_RECORDS as *const *const FileRecord);
+        let count = *(G_FILE_RECORD_COUNT as *const i32) as usize;
+        let slot_count = *(G_HASH_SLOT_COUNT as *const u32);
+        let slots = *(G_HASH_SLOTS as *const *mut *const FileRecord);
+        for k in 0..n as usize {
+            let rec = records.add(count - 1 - k);
+            let bucket = (*rec).hash % slot_count.wrapping_sub(0x67);
+            for i in 0..(slot_count - bucket) as usize {
+                let s = slots.add(bucket as usize + i);
+                if *s == rec {
+                    *s = std::ptr::null();
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Rust port of `0xC0B8E0`: unmount every temp packfile, then reset the temp
+/// allocator and clear the temp array. Handles are not closed here (the
+/// mount_temp caller owns them).
+extern "C" fn packfile_unmount_temp_all_rust() {
+    unsafe {
+        let count = G_TEMP_PACKFILE_COUNT as *mut i32;
+        let base = *(G_TEMP_PACKFILES as *const *mut u8);
+        for i in (0..*count).rev() {
+            let pf = base.add(i as usize * PACKFILE_SIZE);
+            packfile_unregister_records(pf);
+            *(G_FILE_RECORD_COUNT as *mut u32) -= *(pf.add(0x154) as *const u32);
+        }
+        *count = 0;
+        let vtable = *(TEMP_PACKFILE_ALLOCATOR as *const *const usize);
+        let check: extern "thiscall" fn(usize, u32) -> u8 = std::mem::transmute(*vtable.add(0x34 / 4));
+        if check(TEMP_PACKFILE_ALLOCATOR, 0) != 0 {
+            let vtable = *(TEMP_PACKFILE_ALLOCATOR as *const *const usize);
+            let reset: extern "thiscall" fn(usize, u32) = std::mem::transmute(*vtable.add(0x58 / 4));
+            reset(TEMP_PACKFILE_ALLOCATOR, *(TEMP_PACKFILE_ALLOCATOR_MARK as *const u32));
+        }
+        let max = *(G_TEMP_PACKFILE_MAX as *const i32);
+        std::ptr::write_bytes(*(G_TEMP_PACKFILES as *const *mut u8), 0, max as usize * PACKFILE_SIZE);
+    }
+}
+
+extern "C" fn packfile_unmount_temp_all_hook() {
+    let before = unsafe { temp_state() };
+    let imp: extern "C" fn() = unsafe { std::mem::transmute(UNMOUNT_TEMP_IMPL.load(Ordering::Relaxed)) };
+    imp();
+    let after = unsafe { temp_state() };
+    log(&format!("unmount_temp_all: before {before} | after {after}"));
+}
+
+/// Temp count and names, record count, and an address-independent hash of the
+/// hash slots (record index or empty) and of the temp array bytes.
+unsafe fn temp_state() -> String {
+    unsafe {
+        let count = *(G_TEMP_PACKFILE_COUNT as *const i32);
+        let base = *(G_TEMP_PACKFILES as *const *const u8);
+        let names: Vec<String> = (0..count.max(0) as usize)
+            .map(|i| String::from_utf8_lossy(cstr(base.add(i * PACKFILE_SIZE + 8))).into_owned())
+            .collect();
+        let records = *(G_FILE_RECORDS as *const *const FileRecord) as usize;
+        let slots = *(G_HASH_SLOTS as *const *const usize);
+        let mut sh = 0x811C_9DC5u32;
+        let mut used = 0u32;
+        for i in 0..*(G_HASH_SLOT_COUNT as *const u32) as usize {
+            let s = *slots.add(i);
+            let idx = if s == 0 { u32::MAX } else { ((s - records) / 8) as u32 };
+            used += (s != 0) as u32;
+            fnv(&mut sh, &idx.to_le_bytes());
+        }
+        let max = (*(G_TEMP_PACKFILE_MAX as *const i32)).max(0) as usize;
+        let mut th = 0x811C_9DC5u32;
+        fnv(&mut th, std::slice::from_raw_parts(base, max * PACKFILE_SIZE));
+        format!(
+            "temp {count} {names:?} records {} slots used {used} #{sh:08x} temp array #{th:08x}",
+            *(G_FILE_RECORD_COUNT as *const i32)
+        )
+    }
+}
+
 // --- 0xC0AD80 packfile_find_entry (replaced, original shadow-checked) ------
 
 /// LTCG: ECX = `const char* path`, returns `vpp_entry*` in EAX, no stack args.
@@ -1713,6 +1818,34 @@ pub fn install_early() {
             log(&format!("hooked packfile_mount_temp @ 0xc0a970 ({which})"));
         }
         Err(e) => log(&format!("hook packfile_mount_temp failed: {e:?}")),
+    }
+
+    UNMOUNT_TEMP_IMPL.store(
+        if UNMOUNT_TEMP_USE_RUST {
+            packfile_unmount_temp_all_rust as extern "C" fn() as usize
+        } else {
+            0
+        },
+        Ordering::Relaxed,
+    );
+    match unsafe {
+        detour::install(
+            PACKFILE_UNMOUNT_TEMP_ALL,
+            &PACKFILE_UNMOUNT_TEMP_ALL_PROLOGUE,
+            packfile_unmount_temp_all_hook as extern "C" fn() as usize,
+        )
+    } {
+        Ok(tramp) => {
+            UNMOUNT_TEMP_ORIGINAL.store(tramp, Ordering::Relaxed);
+            let which = if UNMOUNT_TEMP_USE_RUST {
+                "Rust"
+            } else {
+                UNMOUNT_TEMP_IMPL.store(tramp, Ordering::Relaxed);
+                "original, observed"
+            };
+            log(&format!("hooked packfile_unmount_temp_all @ 0xc0b8e0 ({which})"));
+        }
+        Err(e) => log(&format!("hook packfile_unmount_temp_all failed: {e:?}")),
     }
 
     // Every file_open at boot goes through here, so hook it before the mounts.

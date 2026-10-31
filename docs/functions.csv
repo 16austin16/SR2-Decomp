@@ -53,3 +53,6 @@ address,name,subsystem,status,notes
 0x00c18500,os_file_read,file,documented,"ESI=os_file, ECX=dst, EDI=n, stack (arg, pos) caller-clean; ReadFile, OVERLAPPED if os_file flag 1 (01 §5e)"
 0x00c18450,packfile_stream_read,packfile,documented,"EAX=stream, ECX=arg (0/1), stack (dst, len, pos) caller-clean; compressed via 0xC17EF0, plain via 0xC17E00 (01 §5e)"
 0x00bfdb20,file_clear_oneshot,file,documented,"EAX=handle; clears flag bit 8 on the handle and its stream (01 §5e)"
+0x00c0b8e0,packfile_unmount_temp_all,packfile,rust,"cdecl(); unregister + record_count -= n per temp packfile (newest first), temp_count = 0, reset temp allocator, zero temp array (01 §5f). Replaced by Rust; 3 save-load unmounts identical to golden/temp_unmounts.txt"
+0x00c0b2a0,packfile_unregister_records,packfile,rust,"cdecl(pf) -> 1; clears the hash slot of each of the pf's (last n) records; no compaction (01 §5f). Ported with 0xC0B8E0"
+0x00c0b7b0,packfile_find_in_temp,packfile,documented,"(name, out_size*, out_offset*) -> AL; last temp packfile with a matching entry; offset uses the last-iterated pf's +0x17C base (01 §5f)"

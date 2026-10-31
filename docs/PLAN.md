@@ -50,4 +50,5 @@ original. The standalone build can move to 64-bit later.
 12. ✅ `file_open` @0xBFDC20 → Rust for reads. 9,843 distinct calls over a boot plus save load gave the same results as the original. Writes and appends stay on the original until a save is tested.
 13. ✅ `file_read` @0xBFE170 → Rust. All 2,170,333 distinct reads in a boot plus save load are identical to the original, including a hash of the bytes. The EOF and compressed paths have not been exercised yet.
 14. ✅ Save tested: a new save slot written through the Rust `file_open` loads back fine, so writes are on Rust too. Menu input: Esc opens the pause menu, Ctrl/Shift switch tabs, arrow keys are extended scancodes.
-15. Next: the temp unmount, the file write path (whatever writes the `.bbsave` after `file_open`), and the stream readers (`0xC18450`, `0xC18500`).
+15. ✅ Temp unmount (`0xC0B8E0` plus record unregister `0xC0B2A0`) → Rust. All three unmounts in a save load leave the same state as the original's (`golden/temp_unmounts.txt`).
+16. Next: the file write path (whatever writes the `.bbsave` after `file_open`), file close (`0xBFDF30`), and the stream readers (`0xC18450`, `0xC18500`).

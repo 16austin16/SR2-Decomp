@@ -277,6 +277,29 @@ Hand-decoded with capstone (Observed). It takes EAX = size and stack `(void* dst
 - **Not exercised:** EOF/clamp, short reads, compressed packfiles and flag bit 8. Every read in the run ended in state 0.
 - The per-call logs (`LOG_FILE_CALLS`) are off by default, since a run writes about 200 MB.
 
+## 5f. Temp unmount `0xC0B8E0` and `0xC0B2A0`
+
+Hand-decoded with capstone (Observed).
+
+`packfile_unmount_temp_all` (0xC0B8E0, cdecl, no args; callers 0x4B2F91, 0x69C8C2, 0xA83E74):
+1. For each temp packfile, newest first: `0xC0B2A0(pf)`, then `record_count -= pf.n` (+0x154).
+2. `temp_count = 0`.
+3. On the "temp packfile" allocator `0xEC5E58` (thiscall vtable): if `+0x34(0)` returns true, call `+0x58([0xEC5E94])`.
+4. `memset(temp_array, 0, temp_max * 0x180)`.
+
+It does not close the handle; the `mount_temp` caller owns it.
+
+`packfile_unregister_records` (0xC0B2A0, cdecl `(pf)`, returns 1):
+- The packfile's `n` records are the last `n` in the record table, which is why unmounting goes newest first.
+- For each record, walking backwards from `record_count - 1`: take the bucket `hash % (slots - 0x67)`, then scan forward to the end of the slot array (not stopping at empty slots) and clear the first slot that points at the record.
+- The table is not compacted, so a probe chain that ran through a cleared slot is cut. Records added after the packfile, from other mounts, could become unreachable that way. This doesn't happen in practice, because only one temp packfile is mounted at a time.
+
+**Seen on a save load:** three calls. The first unmounts `hmaps.vpp_pc` (53,761 → 53,031 records). The second has nothing to unmount. The third unmounts `city_load.vpp_pc` at the end of the load (53,655 → 53,031). Each leaves the hash table exactly as it was after boot.
+
+**Ported (hooks.rs), 2026-10-31.** Both functions are Rust; the allocator calls go through the vtable as `extern "thiscall"`.
+- Each call is logged with the temp count and names, the record count, an address-independent hash of the slots (as record indices), and a hash of the temp array (`golden/temp_unmounts.txt`).
+- The Rust run's "after" states are identical. The "before" temp-array hash varies between runs because it covers heap pointers set by the mount.
+
 ## 6. Open questions
 
 - `packfile_mount_temp` callers: 0x69d250 mounts `city_load.vpp_pc` and 0xc0b6f0 mounts `hmaps.vpp_pc` on a save load. 0xc0b640 has not been seen yet. The temp unmount (it should rewind the record count to the mark) is not traced yet.
