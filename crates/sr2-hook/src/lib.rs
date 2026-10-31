@@ -23,6 +23,7 @@ mod callers;
 mod detour;
 mod hddio;
 mod hooks;
+mod input;
 mod mempool;
 mod rsched;
 mod streamman;

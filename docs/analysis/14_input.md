@@ -68,13 +68,13 @@ Names are in `docs/functions.csv` (subsystem `input`).
 | +0x00 | value (float, 0..1) |
 | +0x04 | previous value |
 | +0x08 | press threshold |
-| +0x0C | repeat delay (ms) |
-| +0x10 | repeat interval (ms) |
+| +0x0C | repeat interval (ms) |
+| +0x10 | first repeat delay (ms) |
 | +0x14 | press time |
 | +0x18 | last repeat time |
-| +0x1C | u8 repeat pulse |
-| +0x1D | u8 just pressed |
-| +0x1E | u8 just released |
+| +0x1C | u8 pressed this frame |
+| +0x1D | u8 pressed or repeated this frame |
+| +0x1E | u8 released (set by input_do_frame, never cleared there; input_pad_reset_buttons clears it) |
 | +0x1F | u8 held |
 | +0x20 | u8 **eaten** (`0x23478D8`; set by vint, see 06_vint.md) |
 
@@ -190,6 +190,41 @@ Mouse look in **gameplay** goes through the look stick (`0x2348534` / `0x2348538
 | `mouse_update` 0xC1F320 | none (critical section `0x234F9E0`) | mouse deltas, wheel delta |
 
 The pad record base is `0x23478A8` (stride 0x104C). Its 87 button records start at +0x10 (`0x23478B8`) and its 8 sticks at +0xC4C (`0x23484F4`).
+
+## In Rust (input.rs)
+
+`input_do_frame` and its tree run in Rust: keyboard events, key events, the keyboard/mouse
+mapping, the repeat timers, button and stick state, idle time; also the window procedure's
+key callback, the key queue, `input_keyboard_reset`, `input_key_down`, `input_button_analog` and
+`input_pad_reset_buttons`. Still original: the XInput / DirectInput polls (called from the Rust
+`input_poll_devices`), the dead zone, the rebind captures and `mouse_update`.
+
+**How it was checked.** In shadow mode each hooked call runs the original on a snapshot of the
+input state, records every `QueryPerformanceCounter` read (the pointer at `0xDB8114` is wrapped),
+restores the snapshot, runs the Rust with the same clock readings replayed, and compares the
+two results byte for byte. `tools/ingame/run_input.ps1` drives a scripted stretch of play (walk,
+sprint, jump, mouse look, wheel, clicks, the pause menu, Ctrl and H / J). Result: 8,902 frames,
+272 window messages, ~850,000 key queries, 0 differences, the clock replay exact.
+
+Corrections and details found on the way:
+- **Key events arrive on another thread** (the window procedure). `input_wndproc_keys` writes
+  key-ups straight into the key-up ring (0xC10D2F), not through `input_key_queue_push`. The
+  shadow check holds a lock that the key callbacks take; without it an event landing mid-check
+  was lost.
+- The button record's +0x0C is the repeat interval and +0x10 the first delay (the table above
+  had them swapped), and +0x1C / +0x1D are "pressed this frame" / "pressed or repeated".
+- `input_key_down`: key 0x101 reads `0x234F483` and 0x102 reads `0x234F47B`. For keys >= 0x100
+  EAX keeps the key's upper bits (callers test AL).
+- `input_map_keyboard_mouse` also fills: stick 2 from the mouse direction (|delta| > 5),
+  stick 5 x from H / J (keys 0x23 / 0x24), stick 6 from the raw mouse delta (dx / 10,
+  -dy / 30), stick 7 as a copy of the look stick, button 19 (left and right mouse together),
+  and buttons 33 / 34 (wheel up / down). The move stick is y = bindings[0] / [1] and
+  x = bindings[3] / [2].
+- The stick values that `input_do_frame` derives (eaten / inverted) only drive the repeat timers
+  and "any input"; they are not written back.
+- The x87 precision control during the game is 53-bit (precision field 2), so unstored x87
+  intermediates are doubles.
+- A left Ctrl key-down is dropped while `GetAsyncKeyState(VK_RMENU)` is negative (AltGr).
 
 ## Consumers and "eating"
 
