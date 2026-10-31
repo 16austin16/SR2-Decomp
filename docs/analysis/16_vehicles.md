@@ -25,7 +25,7 @@ All three lists link through vehicle +0x84DC.
 | +0x84D8 | u8: 1 = full physics vehicle |
 | +0x84DC | list link |
 | +0x84E4 | **vehicle info** (from the vehicle xtbls). +0x9C is the vehicle class: 0 / 1 / 2 / 5 land vehicles (car, bike, …), 3 boat, 4 aircraft |
-| +0x8554 | effects (fire / explosion) |
+| +0x8554 | the **vehicle AI record** (`vehicle_ai`): the AI orders and `vehicle_ai_drive` use it, and it is cleaned up on destroy (0xB25D60). It was earlier read as effects (fire / explosion); see 25_network.md, "Receivers" |
 | +0x8F48 / +0x8F4C / +0x8F50 | flags (+0x8F50: 0x10 / 0x100 networked delete, 0x40 do not count, 0x10000000) |
 | +0x9058 | drown / destroy timer (game time; -1 = off) |
 | +0x905C | multiplayer flag |

@@ -27,6 +27,8 @@ This block has no strings. It holds the vehicle AI's orders: go to, follow, chas
 
 Most orders replicate themselves to the co-op partner with a `veh_pkt` sub-command. The senders are named in 27_packet_senders.md (`veh_pkt_send_00`, `_08`, `_09`, `_0d`, …), and the order bodies call them. A port should name these once the `veh_pkt` sub-commands are decoded. The receiving side has the same numbers (`veh_pkt_sub_*`).
 
+Twelve of the orders are now paired with their `veh_pkt` sub-command and named `vehicle_ai_order_<sub>` (0xB42A70, 0xB487A0, 0xB4AAF0, 0xB4AF80, 0xB4BFC0, 0xB4C940, 0xB55950, 0xB55BE0, 0xB5C2E0, 0xB5C7B0, 0xB5FB30, 0xB61180, and 0xB42D20 as a second sender of 0x00). The receiver runs each one on `vehicle+0x8554`, the vehicle AI record (25_network.md, "Receivers").
+
 ## Road network and vehicle data
 
 - `traffic_spline_validate` (0xB318F0): checks that each road spline links to a next and a previous spline. Traffic follows splines from the chunks' road data plus `traffic_lanes.xtbl` (21_ai.md).

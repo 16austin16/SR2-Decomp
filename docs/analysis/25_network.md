@@ -159,9 +159,36 @@ The force-flag setters (31_traffic_vehicle_ai.md, 32_animation.md, 33_effects_we
 - `veh_pkt` orders mostly start with the vehicle's handle, then a target handle or a position.
 - `braveheart_packet` (Strong Arm) starts with an activity id byte (`u8=6` / `u8=7` …) followed by a per-activity message.
 
+## Receivers
+
+`docs/net_subcommands.csv` now has five receiver columns:
+
+| Column | What |
+|---|---|
+| `recv_object` | object type the receiver checks (`+0x4C`: human, vehicle, …) |
+| `recv_subobject` | the offset it passes on instead of the object (for example `+0x8554`) |
+| `recv_main_calls` | what it calls |
+| `recv_reads` | the payload offsets and sizes it reads |
+| `recv_reruns_sender` | set when it calls its own sender |
+
+**Shape.** A receiver for an object command does four things:
+1. Read the u16 network handle from the payload; `0xFFFF` means none.
+2. Hash it and look it up in the remote-handle table `0x212E258` (buckets at +0x5C, count at +0x60, key at node +0xC). That gives the local handle, then the object through `0x2149C64`.
+3. Check the object type (+0x4C) and that it isn't being destroyed (`+0x80 & 0xB`).
+4. Call one function with the object (or a sub-object) and the remaining fields.
+
+**Do-or-send pairs.** 72 receivers call their own sender. The sender is the real game function: on the machine that owns the object it does the work, otherwise it sends the packet, and the owner's receiver calls it again. So the receivers add no logic, and porting one means porting the sender. Examples:
+- `human_take_damage`, `object_teleport`, `player_teleport`;
+- most `human_pkt` 0x00-0x4D actions;
+- the vehicle AI orders.
+
+**Vehicle AI orders.** 12 `veh_pkt` receivers (0x00, 0x01, 0x03-0x06, 0x08-0x0B, 0x0D, 0x0E) apply their sender to `vehicle+0x8554`. That is the vehicle AI record: `vehicle_ai_drive` uses it, and the destroy path cleans it up (16_vehicles.md listed it as "effects"). The pairs are named `vehicle_ai_order_<sub>` (sender) and `veh_pkt_vehicle_ai_order_<sub>` (receiver). What each order does (go to, chase, follow, flee, …) is still open; the payloads and callers in the CSV are the leads.
+
+The other ~195 receivers have no object check: `hud_pkt`, `scrpt_pkt`, `act_packet` and `misc_packet` mostly act on the activity, mission or HUD state, or on Lua objects found by name.
+
 ## Open
 
-- The ~270 sub-commands still named by number. Their payloads are now known; naming them needs each receiver's use of the fields.
+- The ~260 sub-commands still named by number. Their payloads and receiver calls are in the CSV; most of the human actions and vehicle orders need an in-game trace (a co-op session, or forcing the "not owner" branch) to tell apart.
 - Payloads of receivers whose senders weren't found (the header pattern misses senders that build the buffer in a caller). The CSV lists who uses each; the payload layouts would name the rest.
 - Who sends each packet type, beyond the senders found by the header pattern.
 - The transport below `net_send_packet` (0x7FA400 / 0x7FA390), and the GameSpy gt2 / NAT layer under it.
