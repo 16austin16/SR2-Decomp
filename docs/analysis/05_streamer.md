@@ -373,3 +373,23 @@ Decoded from the data (2026-10-30; numbers from sr2_chunk161 and sr2_chunk060, r
 - 0x23/0x24: zero-filled per-object storage.
 - Undecided: 0x09 (224 entries with position, orientation, two 30° angles and distances 5.05/3.0: cones of some kind), 0x0A (78 local transforms with ids 43xx, grouped by offset lists: attachment points?), 0x10 (19 hashed placements with orientation), 0x14, 0x1B, 0x1F, 0x20, 0x21, 0x22.
 
+### check_batch
+
+`streamman_check_batch` (`0xA7ED40`) is in Rust as well, detoured so that the original run logs
+the same events. It polls the pending read nodes in order with `async_io_status`:
+- 1 (queued): stop.
+- 2 (reading): the step's progress callback (+0x230, `(info, node)`; false aborts), then stop.
+- 3 (done): for chunk pegs, the after callback (+0x238; false aborts); then the node moves to
+  the done list (+0x10).
+- 5 (failed): the retry callback (+0x240) must return 1, otherwise the slot is aborted.
+
+With nothing pending, it runs `finish_current` (`0xA7CFC0`, the completion, still original)
+and frees each request with `async_io_free` (`0xA73650`, stdcall, mode 0). When a request's
+sequence no longer matches, it first copies `*0x2529E24` to `0x2529E28` (a debug last-error
+value). The nodes go back to the pool `0x252A020` (count `0x252A024`) and the batch to the free
+list. Both `async_io_submit` and `async_io_free` are stdcall, not cdecl.
+
+Teleport test, original vs Rust: identical completions (647 chunk geom, 23 peg, 16 type 5 and
+2 type 7 slots, each from reading to loaded) and identical aborts (32 each). Outside the
+random ambient vehicle/character loads, the two event logs are the same.
+

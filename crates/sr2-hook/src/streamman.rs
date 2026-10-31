@@ -44,7 +44,6 @@ const BATCH_CANCEL_READS: usize = 0x00A7_D9C0; // (batch)
 const BATCH_RELEASE_A: usize = 0x00A7_DA30; // (batch, mode)
 const BATCH_RELEASE_B: usize = 0x00A7_DB30; // (batch, mode)
 const START_LOAD_EXTRAS: usize = 0x00A7_E100; // (slot), type 4
-const POLL_BATCH: usize = 0x00A7_ED40; // (batch)
 const POLL_BATCH_EXTRAS: usize = 0x00A7_E900; // (batch), type 4
 const PROCESS_ANIMATION: usize = 0x00A7_D0C0; // (), type 6
 const STREAMMAN_NOP: usize = 0x00A7_D810;
@@ -54,6 +53,14 @@ const READ_NODE_ALLOC: usize = 0x00A7_D930; // () -> node, from the pool 0x252A0
 const BATCH_FREE_NODES: usize = 0x00A7_DC30; // (batch)
 const ASYNC_IO_SUBMIT: usize = 0x00A7_3290; // stdcall (io manager, desc[8], bool) -> u64 request id
 const IO_MANAGER: usize = 0x00EB_80E0; // -> io manager*
+const IO_STATUS: usize = 0x00A7_41A0; // cdecl (request, sequence) -> 1 queued, 2 reading, 3 done, 4 cancelled, 5 failed
+const IO_FREE: usize = 0x00A7_3650; // stdcall (mgr, request, sequence, mode)
+const FINISH_CURRENT: usize = 0x00A7_CFC0; // () -> bool: completion callback, state 4 or abort
+const READ_NODE_POOL: usize = 0x0252_A020;
+const READ_NODE_POOL_COUNT: usize = 0x0252_A024;
+/// Written by check_batch when a finished request's sequence no longer matches (a debug "last error" copy).
+const IO_LAST_ERROR_SRC: usize = 0x0252_9E24;
+const IO_LAST_ERROR: usize = 0x0252_9E28;
 
 /// Run the control flow in Rust (false: the originals, with the same event log).
 const PUMP_RUST: bool = true;
@@ -76,7 +83,8 @@ const UNLOAD: usize = 11;
 const PROCESS: usize = 12;
 const WAIT: usize = 13;
 const START_LOAD_I: usize = 14;
-const COUNT: usize = 15;
+const CHECK_BATCH: usize = 15;
+const COUNT: usize = 16;
 
 /// (name, address, stolen prologue): whole, position-independent instructions.
 const PORTS: [(&str, usize, &[u8]); COUNT] = [
@@ -95,6 +103,7 @@ const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("process", 0x00A7_D6D0, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
     ("wait", 0x00A7_D600, &[0x56, 0x8B, 0x74, 0x24, 0x08]),
     ("start_load", 0x00A7_DDE0, &[0x83, 0xEC, 0x30, 0x53, 0x8B, 0x1D, 0x18, 0xA0, 0x52, 0x02]),
+    ("check_batch", 0x00A7_ED40, &[0x83, 0xEC, 0x50, 0xA1, 0x50, 0x0B, 0xE8, 0x00]),
 ];
 
 /// Trampolines to the originals.
@@ -668,8 +677,11 @@ unsafe fn poll_active() {
         while b != 0 {
             let next = rd(b + 4) as usize;
             let next = if next != rd(BATCHES_ACTIVE) as usize { next } else { 0 };
-            let poll = if rd(rd(b + 0x14) as usize) == 4 { POLL_BATCH_EXTRAS } else { POLL_BATCH };
-            call(poll, &[b as u32]);
+            if rd(rd(b + 0x14) as usize) == 4 {
+                call(POLL_BATCH_EXTRAS, &[b as u32]);
+            } else {
+                check_batch_hook(b as u32); // through the hook, for the event log
+            }
             b = next;
         }
     }
@@ -871,6 +883,131 @@ unsafe fn start_load(s: usize) {
     }
 }
 
+/// Remove `n` from the circular `{prev, next}` list whose head pointer is at
+/// `head` (moving the head on if it was `n`) and clear its links.
+unsafe fn list_remove(head: usize, n: usize) {
+    unsafe {
+        if rd(head) as usize == n && rd(n + 4) as usize == n {
+            wr(head, 0);
+        } else {
+            if rd(head) as usize == n {
+                wr(head, rd(n + 4));
+            }
+            let (prev, next) = (rd(n), rd(n + 4));
+            if prev != 0 {
+                wr(prev as usize + 4, next);
+            }
+            if next != 0 {
+                wr(next as usize, prev);
+            }
+        }
+        wr(n, 0);
+        wr(n + 4, 0);
+    }
+}
+
+/// `streamman_check_batch` (0xA7ED40): poll a batch's pending reads (+0x0C) in
+/// order. Queued: stop. Being read: the step's progress callback (+0x230, `(info,
+/// node)`; false aborts), then stop. Done: for chunk pegs the step's after callback
+/// (+0x238; false aborts), then the node moves to the done list (+0x10). Failed:
+/// the step's retry callback (+0x240) must return 1, else the slot is aborted.
+/// With nothing left pending, `finish_current` runs the completion, every request
+/// is freed (`async_io_free`, mode 0), the nodes go back to the pool and the batch
+/// to the free list.
+///
+/// Left out: two debug-only calls into the empty `streamman_nop` (0xA7D810) with
+/// a formatted file name or error name, which have no effect.
+unsafe fn check_batch(batch: usize) {
+    unsafe {
+        let s = rd(batch + 0x14) as usize;
+        let info = rd(s + 0x10) as usize;
+        let ok = |r: u32| r as u8 != 0;
+        let mut node = rd(batch + 0x0C) as usize;
+        while node != 0 {
+            let next = rd(node + 4) as usize;
+            let next = if next != rd(batch + 0x0C) as usize { next } else { 0 };
+            let step = rd(info + 0x14) as usize + rd(node + 0x2C) as usize * 0x244;
+            match call(IO_STATUS, &[rd(node + 0x10), rd(node + 0x14)]) {
+                1 => break,
+                2 => {
+                    let progress = rd(step + 0x230) as usize;
+                    if progress != 0 && !ok(call(progress, &[info as u32, node as u32])) {
+                        abort_current_hook(0);
+                        return;
+                    }
+                    break;
+                }
+                3 => {
+                    let after = rd(step + 0x238) as usize;
+                    if rd(s) == 1 && after != 0 && !ok(call(after, &[info as u32])) {
+                        abort_current_hook(0);
+                        return;
+                    }
+                    list_remove(batch + 0x0C, node);
+                    list_append(batch + 0x10, node);
+                    node = next;
+                }
+                5 => {
+                    let retry = rd(step + 0x240) as usize;
+                    if retry == 0 || call(retry, &[info as u32]) as u8 != 1 {
+                        abort_current_hook(0);
+                        return;
+                    }
+                    node = next;
+                }
+                _ => node = next,
+            }
+        }
+        if rd(batch + 0x0C) != 0 {
+            return;
+        }
+        wr(s + 0x20, 0);
+        call(FINISH_CURRENT, &[]);
+        let mut node = rd(batch + 0x10) as usize;
+        while node != 0 {
+            let next = rd(node + 4) as usize;
+            let next = if next != rd(batch + 0x10) as usize { next } else { 0 };
+            let (req, seq) = (rd(node + 0x10) as usize, rd(node + 0x14));
+            if req == 0 || seq != rd(req) {
+                wr(IO_LAST_ERROR, rd(rd(IO_LAST_ERROR_SRC) as usize));
+            }
+            std::arch::asm!(
+                "push ebx", "push esi", "push edi", "push ebp",
+                "push 0", "push {q}", "push {r}", "push dword ptr [{r} + 0x3C]", "call {f}",
+                "pop ebp", "pop edi", "pop esi", "pop ebx",
+                r = in(reg) req, q = in(reg) seq, f = in(reg) IO_FREE, clobber_abi("C"),
+            );
+            list_remove(batch + 0x10, node);
+            wr(node + 0x10, 0);
+            wr(node + 0x14, 0);
+            wr(READ_NODE_POOL_COUNT, rd(READ_NODE_POOL_COUNT).wrapping_add(1));
+            list_append(READ_NODE_POOL, node);
+            node = next;
+        }
+        list_remove(BATCHES_ACTIVE, batch);
+        list_append(BATCHES_FREE, batch);
+    }
+}
+
+extern "C" fn check_batch_hook(batch: u32) {
+    CALLS[CHECK_BATCH].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let s = rd(batch as usize + 0x14) as usize;
+        let e = format!("check {}", describe(s));
+        let state = rd(s + 4);
+        if PUMP_RUST {
+            check_batch(batch as usize);
+        } else {
+            let f: extern "C" fn(u32) = std::mem::transmute(orig(CHECK_BATCH));
+            f(batch);
+        }
+        // Only state changes (completions, aborts): how many polls a read takes varies.
+        if rd(s + 4) != state {
+            event(format!("{e} -> s{} current {}", rd(s + 4), (rd(CURRENT) as usize == s) as u8));
+        }
+    }
+}
+
 extern "C" fn start_load_hook(s: u32) {
     CALLS[START_LOAD_I].fetch_add(1, Ordering::Relaxed);
     unsafe {
@@ -1065,6 +1202,7 @@ fn hook_address(i: usize) -> usize {
         PROCESS => process_hook as extern "C" fn() as usize,
         WAIT => wait_hook as extern "C" fn(u32) -> u32 as usize,
         START_LOAD_I => start_load_hook as extern "C" fn(u32) as usize,
+        CHECK_BATCH => check_batch_hook as extern "C" fn(u32) as usize,
         _ => unreachable!(),
     }
 }
