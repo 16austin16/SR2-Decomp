@@ -334,9 +334,14 @@ switches between the port and the originals, and both modes write the same disti
   (types 2 and 3), which vary between runs.
 - 36,000 frames walking out of the crib into Copperton on the Rust pump: no problems, and
   the queue checks stayed at 0 mismatches (559k calls).
-- Not exercised yet: `unload`, `abort_current` and `batch_release`. Nothing was unloaded or
-  aborted in these runs. A scripted teleport (`luafn_teleport`, `0xA47310`) across districts
-  should trigger them.
+- Teleport test (`TELEPORT_TEST` in hooks.rs, `crates/sr2-hook/src/teleport.rs`,
+  `tools/ingame/run_teleport.ps1`): after the save loads, the hook teleports the player 600 m at
+  a time around a square loop (8 jumps, every 1200 frames), the way `luafn_teleport` does. On
+  the Rust pump: 27 aborts (chunk extras, slots 4:0 and 4:1, cancelled with their batch, so
+  `batch_release` runs too), 0 queue mismatches over 668k calls, and the game kept running.
+  The original gives the same kinds of events (32 aborts; counts depend on how far reads got
+  before each jump).
+- Still not exercised: `unload` (`0xA7D4F0`). No calls in any run, including the teleports.
 
 `abort_current` cancels a reading slot in mode 1 when its info's destination offset (+8) is
 above 2 GB, else mode 2. It cancels the 64-bit read id at +0x18/+0x1C if set (`0xA74150`, then

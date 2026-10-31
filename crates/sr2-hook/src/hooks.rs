@@ -25,6 +25,9 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     let original: extern "C" fn() -> i32 =
         unsafe { std::mem::transmute(FRAME_TICK_ORIGINAL.load(Ordering::Relaxed)) };
     let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if TELEPORT_TEST {
+        crate::teleport::tick(n);
+    }
     if n == 1 || n.is_multiple_of(3600) {
         log(&format!("game_frame_tick: frame {n}"));
     }
@@ -166,6 +169,9 @@ struct VppEntry {
 /// Count calls per memory-pool vtable slot (crate::survey) and log them with
 /// the frame summaries. For finding which methods matter; off normally.
 const SURVEY: bool = false;
+/// Teleport the player around a loop after a save loads (teleport.rs), to exercise
+/// streaming. Test runs only (tools/ingame/run_teleport.ps1): it moves the player.
+const TELEPORT_TEST: bool = false;
 
 /// Run the verify pass once the main menu is up (packfiles mounted at boot).
 const FIND_RECORD_VERIFY_FRAME: u32 = 300;

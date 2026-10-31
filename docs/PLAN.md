@@ -59,4 +59,5 @@ original. The standalone build can move to 64-bit later.
 21. ✅ Streamer core mapped (`docs/analysis/05_streamer.md`): resource types and slots, request queue, the pump, loading infos, the chunk loader.
 22. ✅ First streamer code in Rust: the request queue (init/push/remove/pop_best/node_index) and the slot queries, shadow-checked on every call (76,687 calls over a boot plus save load, 0 mismatches).
 23. ✅ Streamer control flow in Rust: the pump, process_generic, poll_active, wait, unload, abort_current, batch_release. Event log identical to the original over a boot plus save load (apart from ambient spawns), and 36,000 frames walking in the city. unload/abort are not exercised yet.
-24. Next: a scripted teleport test to exercise unload/abort; then start_load (`0xA7DDE0`), the batch polls and the read scheduler at `0xA75900`–`0xA77E90`; then the vint UI and the D3D wrappers.
+24. ✅ Teleport test harness (`teleport.rs`, `tools/ingame/run_teleport.ps1`): 8 jumps across the city exercise chunk streaming and the abort path (27 aborts on Rust, the same kind as the original).
+25. Next: start_load (`0xA7DDE0`), the batch polls and the read scheduler at `0xA75900`–`0xA77E90`; then the vint UI and the D3D wrappers.

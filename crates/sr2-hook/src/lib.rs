@@ -20,6 +20,7 @@ mod detour;
 mod hooks;
 mod mempool;
 mod streamman;
+mod teleport;
 #[allow(dead_code)] // enabled by hand when surveying a class family
 mod survey;
 
