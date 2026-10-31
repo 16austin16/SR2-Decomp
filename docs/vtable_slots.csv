@@ -231,3 +231,5 @@ thin_control,0,render,"draws the control: box outline from the rect (+4..+0x10) 
 thin_control,2,set_position,"(int x, int y) moves the rect (+4..+0x10) keeping its size"
 thin_control,3,layout,"measures the text (0xBD7730) and sets the rect's right/bottom edges (+0xC/+0x10)"
 thin_control,4,release,"base ret; groups release their children (their slot 4) and go back on the free list 0x1F7A428"
+menu_widget,1,get_height,"(scale) font height (0xC15D60) x scale x line count (+0x18); dividers a fixed fraction"
+menu_widget,2,render,"draws the widget's text/lines at the given position (text measured with 0xBDC630)"
