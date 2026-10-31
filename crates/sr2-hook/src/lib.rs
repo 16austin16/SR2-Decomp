@@ -19,6 +19,7 @@ use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 mod detour;
 mod hooks;
 mod mempool;
+mod streamman;
 #[allow(dead_code)] // enabled by hand when surveying a class family
 mod survey;
 

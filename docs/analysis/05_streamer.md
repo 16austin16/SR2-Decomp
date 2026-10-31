@@ -1,6 +1,7 @@
 # 05 — World streamer (`streamman`)
 
-Status: core mapped 2026-10-30 (see the sections below). Nothing ported yet.
+Status: core mapped 2026-10-30 (see the sections below). The request queue and the slot
+queries are in Rust (see "Ported" at the end).
 
 The streamer sits on top of the file API (all Rust now). It decides which world chunks,
 pegs (textures), meshes, characters, vehicles and animations are resident, and loads them
@@ -126,3 +127,26 @@ Per type, after the steps:
 5. Adds the record to the loaded-chunk lists (`0xF6FBD8`, count `0xF6FBC4`, and per-feature lists from `0xF70B88` to `0xF77994`), then calls `0xA8F7C0`, `0x4AB7D0` and `0xA132E0` and finishes with `0x4AFC70` or marks it pending.
 
 The chunk pools are set up inside `game_init_allocators_and_packfiles` (`0x51D800`, called from `game_main_thread_proc` at `0x52079F`). The `chunk0/1/2 cpu`/`gpu`, `chunk always loaded`, `chunk_anim0..2`, `interiors` and `mp_*_chunk` pools are created there. The three chunk pools are 0x58-byte objects at `0x2771894` (`0x27718EC`, `0x2771944`); `streamman_request_chunk_extras` gets one in ECX.
+
+## Ported
+
+`crates/sr2-hook/src/streamman.rs`, inline detours, shadow-checked on every call (the queue
+methods snapshot the whole queue, run the original, rewind, run Rust and compare):
+
+| Function | Address | Calls in a boot plus save load |
+|---|---|---|
+| `streamman_queue_init` (ECX = queue, kept) | `0xA72E20` | 86 |
+| `streamman_queue_push` (thiscall-like, `ret 4`) | `0xA72C70` | 10,864 |
+| `streamman_queue_remove` (EAX = index, EDX = queue kept, leaves ECX = node) | `0xA72D10` | 10,783 |
+| `streamman_queue_pop_best` (stdcall) | `0xA72DA0` | 33,882 |
+| `streamman_queue_node_index` (EAX = node, ECX = queue) | `0xA72E80` | 0 |
+| `streamman_is_idle` / `_is_loaded` / `_is_unused` | `0xA7D560` / `0xA7D5A0` / `0xA7D5D0` | 21,070 / 0 / 0 |
+| `streamman_get_slot_info` / `_clear_slot` | `0xA7D670` / `0xA7D6A0` | 0 / 2 |
+
+76,687 calls, 0 mismatches. The queue is generic: besides the request queue `0x2F9B88C` it is
+used by about 20 other call sites in `0xA75900`–`0xA77E90` (the read scheduler), and there are
+59 queues at boot.
+
+`pop_best` details: the compare callback gets `(best, candidate)` values. A result of 1 takes the
+candidate unless `best < candidate`, so ties go to the later node. 2 always takes the
+candidate, and anything else keeps the current best.

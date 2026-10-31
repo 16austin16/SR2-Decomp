@@ -56,4 +56,6 @@ original. The standalone build can move to 64-bit later.
 18. ✅ Memory pools started (`docs/analysis/04_mempool.md`): vtables, layout, and a runtime survey of method calls and pool objects. `static_mempool_base::alloc` → Rust by vtable-slot swap in 4 pool classes, shadow-checked on every call (428k allocations, 0 mismatches).
 19. ✅ `virtual_mempool::alloc` → Rust (page commits through the page tracker included), shadow-checked under the pool and tracker locks: 1.26M allocations and 18,574 commits, 0 mismatches.
 20. ✅ Memory pools done for everything the game calls: 25 methods → Rust as inline detours, covering direct calls as well as virtual ones, with register-exact thunks for leaf methods. Shadow-checked on every call: 20.5M calls over boot plus save load, 0 mismatches. Untouched: the pool types never used in single player, and the page tracker internals.
-21. Next: the streamer (`streamman_*`, mapped in `docs/analysis/05_streamer.md`), the vint UI, and the D3D wrappers.
+21. ✅ Streamer core mapped (`docs/analysis/05_streamer.md`): resource types and slots, request queue, the pump, loading infos, the chunk loader.
+22. ✅ First streamer code in Rust: the request queue (init/push/remove/pop_best/node_index) and the slot queries, shadow-checked on every call (76,687 calls over a boot plus save load, 0 mismatches).
+23. Next: the rest of the streamer (unload/abort, the pump, start_load, poll_active, the read scheduler at `0xA75900`–`0xA77E90`), then the vint UI and the D3D wrappers.

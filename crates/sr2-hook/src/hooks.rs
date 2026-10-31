@@ -35,6 +35,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if n == 1 || n == FIND_RECORD_VERIFY_FRAME || n.is_multiple_of(3600) {
         log(&file_resolve_summary());
         log(&crate::mempool::summary());
+        log(&crate::streamman::summary());
         if SURVEY {
             crate::survey::report(&format!("frame {n}"));
         }
@@ -2091,6 +2092,7 @@ pub fn install_all() {
         }
 
         crate::mempool::install();
+        crate::streamman::install();
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }
