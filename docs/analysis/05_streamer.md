@@ -321,3 +321,24 @@ Sections present in every chunk: 0x00, 0x05, 0x22, 0x25. Never seen in these arc
 
 Still unidentified by data (no strings): 0x01, 0x04, 0x06, 0x09, 0x0A, 0x0B/0x0C (they share data; 0x0C is a tree over 0x0B), 0x10, 0x11, 0x14, 0x1A, 0x1B, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24.
 
+### Control flow (PUMP_RUST)
+
+The pump (`0xA7D6D0`), `process_generic` (`0xA7F100`), `poll_active` (`0xA7F0C0`), `wait`
+(`0xA7D600`), `unload` (`0xA7D4F0`), `abort_current` (`0xA7CE70`) and `batch_release` (`0xA7DCD0`)
+are in Rust too. They call I/O and virtual functions, so they can't be rewound. `PUMP_RUST`
+switches between the port and the originals, and both modes write the same distinct events
+(pump transitions, waits, unloads, aborts) to `sr2-streamman.log` in the game folder.
+
+- Boot plus save load, original vs Rust: identical event sets (624 chunk-geom loads, peg and
+  extras loads, 639 waits all loaded), except the counts of ambient vehicle/character loads
+  (types 2 and 3), which vary between runs.
+- 36,000 frames walking out of the crib into Copperton on the Rust pump: no problems, and
+  the queue checks stayed at 0 mismatches (559k calls).
+- Not exercised yet: `unload`, `abort_current` and `batch_release`. Nothing was unloaded or
+  aborted in these runs. A scripted teleport (`luafn_teleport`, `0xA47310`) across districts
+  should trigger them.
+
+`abort_current` cancels a reading slot in mode 1 when its info's destination offset (+8) is
+above 2 GB, else mode 2. It cancels the 64-bit read id at +0x18/+0x1C if set (`0xA74150`, then
+`0xA74270` with the mode), otherwise the batch at +0x20.
+

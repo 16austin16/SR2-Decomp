@@ -1,19 +1,28 @@
 //! World streamer (`streamman`), docs/analysis/05_streamer.md.
 //!
 //! Ported so far: the request queue the streamer uses for its requests and
-//! read batches (a fixed-capacity, priority-picked list), and the slot-state
-//! queries behind resource handles. Each is an inline detour that runs the
-//! port and shadow-checks it against the original on every call:
+//! read batches (a fixed-capacity, priority-picked list), the slot-state
+//! queries behind resource handles, and the control flow on top of them: the
+//! per-frame pump, unload, abort and wait. The queue and the queries are inline
+//! detours that run the port and shadow-check it against the original on every
+//! call:
 //! - queries: both run, results compared (re-reading once on a difference);
 //! - queue methods: snapshot the queue, run the original, rewind, run the port,
 //!   compare the whole queue and the result, and keep the original's outcome on
 //!   a mismatch.
+//!
+//! The control flow calls I/O and virtual functions, so it can't be rewound.
+//! `PUMP_RUST` switches it between the port and the originals; both modes
+//! record the same distinct events in `sr2-streamman.log`, so an original run
+//! and a Rust run can be compared.
 //!
 //! Queue layout (0x18 bytes): +0x00 count, +0x04 capacity, +0x08 node array,
 //! +0x0C used list, +0x10 free list, +0x14 compare callback
 //! `int(*)(u32 best, u32 candidate)`. Nodes are 12 bytes `{value, next, prev}`
 //! on circular doubly linked lists; a node's index is its position in the array.
 
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::{detour, log};
@@ -21,6 +30,29 @@ use crate::{detour, log};
 /// `0x2225B3C[type]`: that type's array of 0x28-byte slot records.
 const SLOT_ARRAYS: usize = 0x0222_5B3C;
 const SLOT_SIZE: usize = 0x28;
+
+/// The slot being processed (NULL when none), the request queue, and the batch lists.
+const CURRENT: usize = 0x0252_9FF0;
+const REQUEST_QUEUE: usize = 0x02F9_B88C;
+const BATCHES_FREE: usize = 0x0252_A018;
+const BATCHES_ACTIVE: usize = 0x0252_A01C;
+
+/// Game functions the control flow calls (all cdecl).
+const READ_CANCEL: usize = 0x00A7_4150; // (id lo, id hi)
+const READ_RELEASE: usize = 0x00A7_4270; // (id lo, id hi, mode)
+const BATCH_CANCEL_READS: usize = 0x00A7_D9C0; // (batch)
+const BATCH_RELEASE_A: usize = 0x00A7_DA30; // (batch, mode)
+const BATCH_RELEASE_B: usize = 0x00A7_DB30; // (batch, mode)
+const START_LOAD: usize = 0x00A7_DDE0; // (slot)
+const START_LOAD_EXTRAS: usize = 0x00A7_E100; // (slot), type 4
+const POLL_BATCH: usize = 0x00A7_ED40; // (batch)
+const POLL_BATCH_EXTRAS: usize = 0x00A7_E900; // (batch), type 4
+const PROCESS_ANIMATION: usize = 0x00A7_D0C0; // (), type 6
+const STREAMMAN_NOP: usize = 0x00A7_D810;
+const IAT_SLEEP: usize = 0x00DB_80B8;
+
+/// Run the control flow in Rust (false: the originals, with the same event log).
+const PUMP_RUST: bool = true;
 
 const Q_HEADER: usize = 0x18;
 const NODE: usize = 12;
@@ -35,7 +67,11 @@ const IS_LOADED: usize = 6;
 const IS_UNUSED: usize = 7;
 const GET_SLOT_INFO: usize = 8;
 const CLEAR_SLOT: usize = 9;
-const COUNT: usize = 10;
+const ABORT_CURRENT: usize = 10;
+const UNLOAD: usize = 11;
+const PROCESS: usize = 12;
+const WAIT: usize = 13;
+const COUNT: usize = 14;
 
 /// (name, address, stolen prologue): whole, position-independent instructions.
 const PORTS: [(&str, usize, &[u8]); COUNT] = [
@@ -49,6 +85,10 @@ const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("is_unused", 0x00A7_D5D0, &[0x8B, 0x44, 0x24, 0x04, 0x8B, 0xC8]),
     ("get_slot_info", 0x00A7_D670, &[0x8B, 0x44, 0x24, 0x0C, 0x8B, 0xC8]),
     ("clear_slot", 0x00A7_D6A0, &[0x8B, 0x44, 0x24, 0x04, 0x8B, 0xC8]),
+    ("abort_current", 0x00A7_CE70, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
+    ("unload", 0x00A7_D4F0, &[0x8B, 0x44, 0x24, 0x04, 0x8B, 0xC8]),
+    ("process", 0x00A7_D6D0, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
+    ("wait", 0x00A7_D600, &[0x56, 0x8B, 0x74, 0x24, 0x08]),
 ];
 
 /// Trampolines to the originals.
@@ -476,6 +516,308 @@ extern "C" fn clear_slot_hook(handle: u32) {
     }
 }
 
+// --- Control flow: abort, unload, the pump, wait -------------------------------
+
+/// Call a cdecl game function with up to three arguments, saving EBX/ESI/EDI/EBP
+/// around it (LTCG callees may not).
+unsafe fn call(f: usize, args: &[u32]) -> u32 {
+    let mut a = [0u32; 3];
+    a[..args.len()].copy_from_slice(args);
+    let r: u32;
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "mov ebp, esp",
+            "push dword ptr [{a} + 8]",
+            "push dword ptr [{a} + 4]",
+            "push dword ptr [{a}]",
+            "call {f}",
+            "mov esp, ebp",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            f = in(reg) f, a = in(reg) a.as_ptr(),
+            lateout("eax") r, clobber_abi("C"),
+        );
+    }
+    r
+}
+
+/// Call loading-info vtable slot `i` (thiscall, no arguments).
+unsafe fn info_vcall(info: usize, i: usize) {
+    unsafe {
+        let f = rd(rd(info) as usize + i * 4) as usize;
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "call {f}",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            f = in(reg) f, in("ecx") info, clobber_abi("C"),
+        );
+    }
+}
+
+/// `streamman_batch_release` (0xA7DCD0, ESI = batch, EDI = mode; only called by
+/// abort_current, so not detoured): cancel and release the batch's reads, then
+/// move it from the active list to the free list's tail. Batches start with
+/// `{prev, next}`.
+unsafe fn batch_release(batch: usize, mode: u32) {
+    unsafe {
+        call(BATCH_CANCEL_READS, &[batch as u32]);
+        call(BATCH_RELEASE_A, &[batch as u32, mode]);
+        call(BATCH_RELEASE_B, &[batch as u32, mode]);
+        if rd(BATCHES_ACTIVE) as usize == batch && rd(batch + 4) as usize == batch {
+            wr(BATCHES_ACTIVE, 0);
+        } else {
+            if rd(BATCHES_ACTIVE) as usize == batch {
+                wr(BATCHES_ACTIVE, rd(batch + 4));
+            }
+            let (prev, next) = (rd(batch), rd(batch + 4));
+            if prev != 0 {
+                wr(prev as usize + 4, next);
+            }
+            if next != 0 {
+                wr(next as usize, prev);
+            }
+        }
+        wr(batch, 0);
+        wr(batch + 4, 0);
+        let head = rd(BATCHES_FREE) as usize;
+        if head == 0 {
+            wr(batch, batch as u32);
+            wr(batch + 4, batch as u32);
+            wr(BATCHES_FREE, batch as u32);
+        } else {
+            let tail = rd(head) as usize;
+            wr(batch, tail as u32);
+            wr(batch + 4, head as u32);
+            wr(tail + 4, batch as u32);
+            wr(head, batch as u32);
+        }
+    }
+}
+
+/// Take a slot off the request queue if it is still queued.
+unsafe fn dequeue(s: usize) {
+    unsafe {
+        if rd(s + 0x14) != u32::MAX {
+            q_remove(REQUEST_QUEUE, rd(s + 0x14));
+            wr(s + 0x14, u32::MAX);
+        }
+    }
+}
+
+/// `streamman_abort_current` (0xA7CE70): stop the current slot. A slot past the
+/// request stage (state > 1) has its read (+0x18/+0x1C, a 64-bit id) or else its
+/// batch (+0x20) cancelled, in mode 1 when the info's destination offset is above
+/// 2 GB, else 2. Then loading-info slot 1 (abort) if `use_abort`, else slot 0
+/// (unload); state 3, off the queue, no current slot.
+unsafe fn abort_current(use_abort: bool) {
+    unsafe {
+        let cur = rd(CURRENT) as usize;
+        if rd(cur + 4) as i32 > 1 {
+            let mode = if rd(rd(cur + 0x10) as usize + 8) > 0x7FFF_FFFF { 1 } else { 2 };
+            let (lo, hi) = (rd(cur + 0x18), rd(cur + 0x1C));
+            if lo | hi != 0 {
+                call(READ_CANCEL, &[lo, hi]);
+                let cur = rd(CURRENT) as usize;
+                call(READ_RELEASE, &[rd(cur + 0x18), rd(cur + 0x1C), mode]);
+                let cur = rd(CURRENT) as usize;
+                wr(cur + 0x18, 0);
+                wr(cur + 0x1C, 0);
+            } else if rd(cur + 0x20) != 0 {
+                batch_release(rd(cur + 0x20) as usize, mode);
+            }
+        }
+        info_vcall(rd(rd(CURRENT) as usize + 0x10) as usize, use_abort as usize);
+        let cur = rd(CURRENT) as usize;
+        wr(cur + 4, 3);
+        dequeue(cur);
+        wr(CURRENT, 0);
+    }
+}
+
+/// `streamman_unload` (0xA7D4F0): the current slot is aborted through its
+/// unload; any other gets loading-info slot 0 directly. Then off the queue,
+/// state 0. Returns 1 only for a NULL slot.
+unsafe fn unload(handle: u32) -> u32 {
+    unsafe {
+        let s = slot(handle);
+        if s == 0 {
+            return 1;
+        }
+        if rd(CURRENT) as usize == s {
+            abort_current(false);
+        } else {
+            info_vcall(rd(s + 0x10) as usize, 0);
+        }
+        dequeue(s);
+        wr(s + 4, 0);
+        0
+    }
+}
+
+/// `streamman_poll_active` (0xA7F0C0, only called by process_generic): poll every
+/// active batch. A poll may unlink its batch, so the next one is read first.
+unsafe fn poll_active() {
+    unsafe {
+        let mut b = rd(BATCHES_ACTIVE) as usize;
+        while b != 0 {
+            let next = rd(b + 4) as usize;
+            let next = if next != rd(BATCHES_ACTIVE) as usize { next } else { 0 };
+            let poll = if rd(rd(b + 0x14) as usize) == 4 { POLL_BATCH_EXTRAS } else { POLL_BATCH };
+            call(poll, &[b as u32]);
+            b = next;
+        }
+    }
+}
+
+/// `streamman_process_generic` (0xA7F100, only called by the pump): start the
+/// current slot if it is requested (state 1), then poll the active batches.
+unsafe fn process_generic() {
+    unsafe {
+        let cur = rd(CURRENT) as usize;
+        if rd(cur + 4) == 1 {
+            call(if rd(cur) == 4 { START_LOAD_EXTRAS } else { START_LOAD }, &[cur as u32]);
+        }
+        poll_active();
+    }
+}
+
+/// `streamman_process` (0xA7D6D0), the pump: with no current slot, make the best
+/// request current (nothing queued: return). Animations (type 6, and any type
+/// above 9) have their own path.
+unsafe fn process() {
+    unsafe {
+        let mut cur = rd(CURRENT) as usize;
+        if cur == 0 {
+            if rd(REQUEST_QUEUE) == 0 {
+                call(STREAMMAN_NOP, &[]);
+                return;
+            }
+            cur = q_pop_best(REQUEST_QUEUE) as usize;
+            wr(CURRENT, cur as u32);
+            wr(cur + 0x14, u32::MAX);
+        }
+        match rd(cur) {
+            0..=5 | 7..=9 => process_generic(),
+            _ => {
+                call(PROCESS_ANIMATION, &[]);
+            }
+        }
+    }
+}
+
+/// `streamman_wait` (0xA7D600): pump, with Sleep(1), until the slot is idle;
+/// returns whether it ended up loaded.
+unsafe fn wait(handle: u32) -> u32 {
+    unsafe {
+        let sleep: extern "system" fn(u32) = std::mem::transmute(rd(IAT_SLEEP) as usize);
+        let idle = || {
+            let s = slot(handle);
+            s == 0 || matches!(rd(s + 4), 0 | 3 | 4)
+        };
+        while !idle() {
+            process_hook(); // through the hook, so the event log matches the original's
+            sleep(1);
+        }
+        let s = slot(handle);
+        (s != 0 && rd(s + 4) == 4) as u32
+    }
+}
+
+/// Distinct control-flow events with their counts, written to `sr2-streamman.log`.
+static EVENTS: Mutex<BTreeMap<String, u32>> = Mutex::new(BTreeMap::new());
+
+fn event(e: String) {
+    *EVENTS.lock().unwrap_or_else(|p| p.into_inner()).entry(e).or_insert(0) += 1;
+}
+
+/// A slot as "type:index sState", or "-" for none.
+unsafe fn describe(s: usize) -> String {
+    unsafe {
+        if s == 0 {
+            return "-".into();
+        }
+        let t = rd(s) as usize;
+        let base = if t < 10 { rd(SLOT_ARRAYS + t * 4) as usize } else { 0 };
+        format!("{t}:{} s{}", s.wrapping_sub(base) / SLOT_SIZE, rd(s + 4))
+    }
+}
+
+extern "C" fn abort_current_hook(use_abort: u32) {
+    CALLS[ABORT_CURRENT].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let cur = rd(CURRENT) as usize;
+        let e = format!(
+            "abort {} use_abort {} reads {} batch {}",
+            describe(cur),
+            use_abort as u8,
+            (rd(cur + 0x18) | rd(cur + 0x1C) != 0) as u8,
+            (rd(cur + 0x20) != 0) as u8
+        );
+        if PUMP_RUST {
+            abort_current(use_abort as u8 != 0);
+        } else {
+            let f: extern "C" fn(u32) = std::mem::transmute(orig(ABORT_CURRENT));
+            f(use_abort);
+        }
+        event(format!("{e} -> s{} queued {}", rd(cur + 4), rd(cur + 0x14) as i32));
+    }
+}
+
+extern "C" fn unload_hook(handle: u32) -> u32 {
+    CALLS[UNLOAD].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let s = slot(handle);
+        let e = format!("unload {} current {}", describe(s), (s != 0 && rd(CURRENT) as usize == s) as u8);
+        let r = if PUMP_RUST {
+            unload(handle)
+        } else {
+            let f: extern "C" fn(u32) -> u32 = std::mem::transmute(orig(UNLOAD));
+            f(handle) & 0xFF
+        };
+        event(format!("{e} -> {r}"));
+        r
+    }
+}
+
+extern "C" fn process_hook() {
+    CALLS[PROCESS].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let before = rd(CURRENT) as usize;
+        let e = format!("process {} queued {}", describe(before), rd(REQUEST_QUEUE));
+        if PUMP_RUST {
+            process();
+        } else {
+            let f: extern "C" fn() = std::mem::transmute(orig(PROCESS));
+            f();
+        }
+        let after = rd(CURRENT) as usize;
+        if after != before {
+            event(format!("{e} -> {}", describe(after)));
+        }
+    }
+}
+
+extern "C" fn wait_hook(handle: u32) -> u32 {
+    CALLS[WAIT].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let e = format!("wait {}", describe(slot(handle)));
+        let r = if PUMP_RUST {
+            wait(handle)
+        } else {
+            let f: extern "C" fn(u32) -> u32 = std::mem::transmute(orig(WAIT));
+            f(handle) & 0xFF
+        };
+        event(format!("{e} -> {r}"));
+        r
+    }
+}
+
+fn write_events() {
+    let events = EVENTS.lock().unwrap_or_else(|p| p.into_inner());
+    let text: String = events.iter().map(|(e, n)| format!("{e}\t{n}\n")).collect();
+    let _ = std::fs::write("sr2-streamman.log", text);
+}
+
 // --- Install and report ---------------------------------------------------------------
 
 fn hook_address(i: usize) -> usize {
@@ -490,6 +832,10 @@ fn hook_address(i: usize) -> usize {
         IS_UNUSED => is_unused_hook as extern "C" fn(u32) -> u32 as usize,
         GET_SLOT_INFO => get_slot_info_hook as extern "C" fn(*mut u32, *mut u32, u32) as usize,
         CLEAR_SLOT => clear_slot_hook as extern "C" fn(u32) as usize,
+        ABORT_CURRENT => abort_current_hook as extern "C" fn(u32) as usize,
+        UNLOAD => unload_hook as extern "C" fn(u32) -> u32 as usize,
+        PROCESS => process_hook as extern "C" fn() as usize,
+        WAIT => wait_hook as extern "C" fn(u32) -> u32 as usize,
         _ => unreachable!(),
     }
 }
@@ -507,10 +853,14 @@ pub fn install() {
             Err(e) => log(&format!("streamman: hooking {name} @ {addr:#x} failed: {e:?}")),
         }
     }
-    log(&format!("replaced {ok}/{COUNT} streamman functions with Rust (inline detours, shadow-checked)"));
+    let pump = if PUMP_RUST { "Rust" } else { "original, observed" };
+    log(&format!(
+        "replaced {ok}/{COUNT} streamman functions (inline detours; queue and queries Rust, shadow-checked; pump/unload/abort/wait: {pump})"
+    ));
 }
 
 pub fn summary() -> String {
+    write_events();
     let mut parts = Vec::new();
     let mut total = (0u64, 0u64);
     for (i, &(name, ..)) in PORTS.iter().enumerate() {
