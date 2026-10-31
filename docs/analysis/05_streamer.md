@@ -1342,3 +1342,26 @@ Details checked against the disassembly:
 - The character and vehicle begin callbacks write the step's dest as info + k*0x244 + 0x23C,
   which works because their steps are inline at info+0x24.
 
+### Read scheduler in Rust
+
+`crates/sr2-hook/src/hddio.rs` ports the read scheduler's request lifecycle, behind `IO_RUST`:
+- submit, set_state, hdd_finish_current, cancel / cancel_impl, free / release, bytes_read;
+- `hdd_service`, the loop the hdd thread runs;
+- status and error_code, which are pure and shadow-checked on every call.
+
+Both modes log one event per finished or cancelled request to `sr2-io.log` (file + suffix,
+priority, size, final state, bytes read). `run_teleport.ps1` collects it as `bin/<label>.io.log`.
+
+Teleport test, original vs Rust:
+- 3,400-3,470 reads per run, all ending in state 6.
+- Identical events for all 1,241 distinct world-chunk reads.
+- The only differing reads are ambient vehicle/character files.
+- status: 40,727 calls, 0 mismatches.
+
+Every cancel in the run hit a request that had already finished (state 6), which is a no-op.
+
+Still original: the wait/urgent helpers (`async_io_wait*`, `hdd_make_urgent`,
+`hdd_attach_wait_event`; TLS and pooled wait events), the read cache, `hdd_scheduler_create`/init
+and the thread procedure. `async_io_bytes_read` always returns 0 on PC, so the peg progress
+callback always exits early.
+

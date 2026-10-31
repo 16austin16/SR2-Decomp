@@ -21,6 +21,7 @@ mod caller_targets;
 #[cfg(feature = "caller-survey")]
 mod callers;
 mod detour;
+mod hddio;
 mod hooks;
 mod mempool;
 mod streamman;
