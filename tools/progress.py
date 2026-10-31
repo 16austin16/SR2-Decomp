@@ -160,7 +160,8 @@ def game_virtuals(data, lo, size):
             va = int(vt.split("@")[0], 16)
             for k in range(int(r["n_virtuals"] or 0)):
                 f = struct.unpack_from("<I", data, va - BASE + 4 * k)[0]
-                if lo <= f < lo + size:
+                # Slots past a vtable's real end hold data; real targets follow padding.
+                if lo <= f < lo + size and (data[f - BASE - 1] in (0xCC, 0xC3, 0x90) or data[f - BASE - 3] == 0xC2):
                     out.add(f)
     return out
 

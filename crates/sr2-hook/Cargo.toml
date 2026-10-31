@@ -11,6 +11,10 @@ name = "dinput8"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
+[features]
+# Logs the callers of every still-unnamed virtual method (src/callers.rs).
+caller-survey = []
+
 [dependencies]
 sr2-formats = { path = "../sr2-formats" }
 windows-sys = { version = "0.59", features = [

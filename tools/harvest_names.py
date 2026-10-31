@@ -115,7 +115,9 @@ def vtable_slots(x):
             va = int(va, 16)
             for k in range(int(r["n_virtuals"] or 0)):
                 f = x.u32(va + 4 * k)
-                if x.lo <= f < x.hi:
+                # Some slot counts run past the real end of a vtable into data (UTF-16
+                # text such as 0x0041004C); only padded function starts count.
+                if x.plausible(f):
                     owners[f].append((nb, int(off, 16), nice_class(r["name"]), k))
     named = slot_names()
     out = {}

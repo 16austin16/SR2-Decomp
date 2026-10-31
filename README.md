@@ -11,6 +11,8 @@ The original functions are replaced one at a time while the game runs. Each repl
 
 The graphic also tracks virtual methods of the game's own classes separately (Havok left out), since renaming a `Class::vfN` placeholder does not change the identified count. Functions are identified mostly by `tools/harvest_names.py`: Lua script bindings, Ghidra library matches, RTTI vtable slots and constructors/destructors. Virtual methods worked out by hand are recorded per base class in `docs/vtable_slots.csv`, and the name is applied to every subclass's override (for example `fuzz_crime::get_bar_title` names that method in all 44 crime types). The game's own Direct3D 9 wrappers (`IDirect3DDevice9Lost`, `gr_vertex_buffer`, `gr_index_buffer`) are named from the COM method order in `d3d9.h`.
 
+Methods that can't be named statically can be named from their callers: `python -I tools/gen_caller_targets.py bin/SR2_pc.unpacked.exe` lists the unnamed virtual slots, and building the hook with `--features caller-survey` (after adding `mod callers; mod caller_targets;` and `crate::callers::install()` at the end of `install_all`) logs every caller to `sr2-callers.log` in the game folder. `python tools/caller_report.py bin/SR2_pc.unpacked.exe <log>` then shows each method's callers with their names and strings.
+
 Update the graphic after porting or naming something: `python -I tools/progress.py bin/SR2_pc.unpacked.exe docs/img/progress.svg`
 
 ## Layout
