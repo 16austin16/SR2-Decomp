@@ -86,6 +86,39 @@ The arguments are in ring order, after the id. "dev->X" is a call on `0x252A2D0`
 | 30 | src, dst | `dev->UpdateSurface(src, NULL, dst, NULL)` |
 | 31 | arg | 0xD1C530(arg, 0, 0): screenshot / readback |
 
+**Device vtable slots, as called by each case.** Each case loads the method from `[[0x252A2D0]] + off` and calls it stdcall with the device first. The arguments are in the order the table above lists them, so the callee pops. The slots below were read from the executor and match `d3d9.h`.
+
+| Id | Method | Offset | Slot |
+|---|---|---|---|
+| 0 | BeginScene | +0xA4 | 41 |
+| 1 | EndScene (after ID3DXFont::DrawTextA, slot 14 of the font, for the FPS overlay) | +0xA8 | 42 |
+| 2 | Clear | +0xAC | 43 |
+| 3 | SetPixelShader | +0x1AC | 107 |
+| 4 | SetVertexShader | +0x170 | 92 |
+| 5 | SetVertexDeclaration | +0x15C | 87 |
+| 6 | SetVertexShaderConstantF | +0x178 | 94 |
+| 7 | SetPixelShaderConstantF | +0x1B4 | 109 |
+| 8 | SetStreamSource | +0x190 | 100 |
+| 10 | SetIndices | +0x1A0 | 104 |
+| 11 | DrawPrimitive | +0x144 | 81 |
+| 12 | DrawIndexedPrimitive | +0x148 | 82 |
+| 13 | DrawPrimitiveUP | +0x14C | 83 |
+| 14, 23 | SetTexture | +0x104 | 65 |
+| 15 | SetRenderState | +0xE4 | 57 |
+| 16 | SetRenderTarget | +0x94 | 37 |
+| 17 | SetDepthStencilSurface | +0x9C | 39 |
+| 18 | StretchRect | +0x88 | 34 |
+| 19 | SetSamplerState | +0x114 | 69 |
+| 20 | Present | +0x44 | 17 |
+| 21 | SetRenderState, then SetScissorRect | +0xE4, +0x12C | 57, 75 |
+| 22 | IDirect3DTexture9::LockRect / UnlockRect | +0x4C / +0x50 | 19 / 20 |
+| 24 | SetViewport | +0xBC | 47 |
+| 25, 26 | IDirect3DQuery9::Issue | +0x18 | 6 |
+| 29 | GetRenderTargetData | +0x80 | 32 |
+| 30 | UpdateSurface | +0x78 | 30 |
+
+The ring readers take `EAX = &ring (0x33D62EC)` and push the output pointer. The render-side layer that writes these commands (the deferred lists, state caches and 2D batches) is in 18_scene.md, "The deferred command lists, step by step, for porting".
+
 The executor keeps no state of its own besides the vb, ib and texture caches above, the FPS font and the timers.
 
 ### Frame limiter (inside command 20)

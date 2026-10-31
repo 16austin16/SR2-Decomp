@@ -22,9 +22,32 @@ What fills the D3D command ring each frame. The executor side is in 07_render.md
 7. 0xD14700 (2D flush), then **`render_deferred_execute`** (0xCF8FA0), with `0x252A2A2` set while it runs.
 8. **Publish** the ring (`InterlockedExchangeAdd(0x33D62F4, …)`, 07_render.md), then set `0x27741AC` = 1 (frame done) and run 0x522D00.
 
-## The deferred command lists (0x2305978 / 0x230597C)
+## The deferred command lists, step by step, for porting
 
-These are **not mesh lists**. They are a double-buffered queue of *render-state commands* that the game thread records and the render thread executes. `frame_end_handoff` swaps the two pointers.
+The game has two command layers. Don't confuse them:
+
+| Layer | Who writes | Who executes | Contents |
+|---|---|---|---|
+| **Deferred lists** (this section) | game thread (and the main menu / loading loops) | render thread, in `render_deferred_execute` | calls to the *graphics API* (`gfx_set_*`, `im2d_*`, …) recorded with their arguments |
+| **D3D ring** (07_render.md) | render thread (and the game thread while `0xE849DB` is set) | device thread, in `gfx_execute_commands` | D3D9 calls (32 ids) |
+
+A deferred command is a recorded call to a graphics API function. When replayed on the render thread, that function runs immediately and writes ring commands. So **no deferred handler calls D3D itself**. Every D3D call goes through the ring, and its device vtable slot is in the ring table in 07_render.md.
+
+### How an API function decides to defer
+
+Every function in the table below starts the same way:
+1. Read the thread's graphics context: `ctx = *(*(fs:[0x2C]) + 0x60)`. TLS slot 0 → +0x60. The byte at +0x5C marks the render thread.
+2. If it's the game thread's context `0xEC26A0`, the fields it writes go to the render context `0xEC2610` instead.
+3. If `0xE849DB` (force immediate) is clear and the caller is the game thread (or `ctx` is `0xEC2610`), call `render_deferred_queue(type, args…)` and return.
+4. Otherwise run immediately and write ring commands.
+
+`0xE849DB` is set by `frame_end_handoff` (and the gamewide / loading code at 0x69AB80, 0x69AED0, 0x73CCF0) while the render thread is parked. It is cleared by `startup_loading_render_loop` and 0xD14BF0. While it is set, the game thread writes the ring directly.
+
+There is a second per-thread structure: `gfx_get_thread_state` (0xD22790) returns `*(*(fs:[0x2C]) + 0x74)`, or `0x31BF4B0` on the device-owner thread (`0x252A3EC`). It holds the depth-bias stacks (+0x1688 / count +0x16C8, and the slope-scale stack with count +0x170C) and the float at +0x110.
+
+### The list
+
+There are two lists of 0x1C5C8 bytes, `0x2305980` and `0x2321F48`. The pointers are `0x230597C` (game side, written) and `0x2305978` (render side, executed). `frame_end_handoff` swaps them. `rl_mesh_inst::render` and 0xBDB2A0 temporarily repoint `0x230597C` to record into another list.
 
 | Off | Field |
 |---|---|
@@ -33,9 +56,101 @@ These are **not mesh lists**. They are a double-buffered queue of *render-state 
 | +0x5DC4 | data area (0x16800 bytes) |
 | +0x1C5C4 | data used (0x16801 marks overflow) |
 
-- **`render_deferred_queue`** (0xCF8EA0, (type, args…)) writes into the *game-side* list `0x230597C`. It calls `handler[type](0 = record, &dst, &args)`, which serialises the arguments into the data area.
-- **`render_deferred_execute`** (0xCF8FA0) runs on the render thread after `render_frame`. It walks the *render-side* list `0x2305978` and calls `handler[type](1 = execute, &data, 0)`, then invalidates the 16 cached texture stages (`0xE84AA8…`).
-- The handler table is `0xE847E0`: 24 types, functions 0xCF9xxx / 0xCFAxxx / 0xCFBxxx.
+**`render_deferred_queue`** (0xCF8EA0): cdecl varargs `bool (int type, …)`, caller pops.
+1. Refuse (return 0) when data used > 0x16800 or the count is 3000. Mark overflow by setting data used to 0x16801.
+2. `ctx = {data + used, 0, 0x16800 - used}`.
+3. Call `handler[type](0, &ctx, &va)`. The handler copies its arguments into `ctx.data` and adds their size to `ctx.used`. It returns 0 when they don't fit in `ctx.space`.
+4. On success, append the record `{type, used}`, then `used += ctx.used` and `count += 1`.
+5. The type is not range-checked.
+
+**`render_deferred_execute`** (0xCF8FA0), on the render thread after `render_frame` (`0x252A2A2` is set around it):
+1. For each record `i < count`: `ctx = {data + record.offset, 0, …}`, then `handler[record.type](1, &ctx, NULL)`.
+2. Fill `0xE84AA8[0..15]` with -1. This is the per-stage bitmap handle cache of `gfx_set_texture_cached`.
+3. It does **not** reset the count. The list is reset when it is swapped back in.
+
+**Handler convention.** Every handler is `bool __cdecl h(int mode, ctx *c, va_list *args)`, and the caller pops 12.
+- In mode 0 it reads from `*args` and writes to `c->data + c->used`.
+- In mode 1 it reads the same fields back, advancing `c->used`, and calls the API function with the same registers and stack the original caller used.
+
+Float arguments arrive in the varargs as doubles and are stored as 4-byte floats.
+
+### Handler table (0xE847E0, 43 entries, types 0x00-0x2A)
+
+Handlers are named `render_deferred_h<type>_<api>`. "Record" is what the handler stores, in order.
+
+| Type | Handler | Replays | Convention of the API function (= record) | What it does |
+|---|---|---|---|---|
+| 00 | 0xCF9710 | `gfx_set_viewport_rect` 0xD149B0 | EDI = y; cdecl (x, w, h, no_clamp), pops 16 | ctx+8..+0x1C = x0, x1, y0, y1, w, h, clamped to the target size |
+| 01 | 0xCFB170 | `gfx_set_scissor_rect` 0xD14D20 | ESI, EDI; cdecl (a, b), pops 8 | ctx+0x44..+0x50; `gfx_cmd_set_scissor` |
+| 02 | 0xCF9700 | `gfx_invalidate_render_state_block` 0xD14950 | - | ctx+0x20 / +0x24 = -1 |
+| 03 | 0xCF9670 | `gfx_set_render_state_block` 0xD148D0 | ECX = &{u32 a, u32 b} | if different from ctx+0x20 / +0x24: store, then `gfx_apply_render_state_block` |
+| 04 | 0xCF95A0 | `gfx_set_color` 0xD14840 | cdecl (r, g, b, a) ints, pops 16 | ctx+0x28..+0x34 = v / 255 |
+| 05 | 0xCF9540 | `gfx_set_alpha` 0xD147E0 | cdecl (a), pops 4 | ctx+0x34 = a / 255 |
+| 06 | 0xCF9140 | `gfx_set_bitmap` 0x56C2B0 | ESI = bitmap handle | ctx+0x38 |
+| 07 | 0xCF94A0 | `gfx_set_ps_params3` 0xD14700 | ESI = &{3 dwords} | pixel shader constants (ring 7) via 0xD18DE0, then 0xD1D840 |
+| 08 / 09 | 0xCFB100 / 0xCFB0F0 | `gfx_push_depth_bias` 0xD232C0 / `gfx_pop_depth_bias` 0xD23200 | cdecl (float), pops 4 / - | 16-deep stack; `D3DRS_DEPTHBIAS` (0xC3) = sum |
+| 0A / 0B | 0xCFB080 / 0xCFB070 | `gfx_push_slope_depth_bias` 0xD23120 / `gfx_pop_slope_depth_bias` 0xD23060 | cdecl (float) / - | `D3DRS_SLOPESCALEDEPTHBIAS` (0xAF) |
+| 0C | 0xCF9350 | `gfx_set_clip_plane` 0xD22090 | cdecl 4 floats, pops 16 | 0xD18BD0: ring 7 plus `CLIPPLANEENABLE` (0x98) |
+| 0D / 0E | 0xCFB000 / 0xCFAF90 | `gfx_set_state_float_110` 0xD23000 / `gfx_set_state_float_0e` 0xD22F90 | cdecl (float) | thread state floats (role open) |
+| 0F | 0xCF92B0 | `gfx_set_shader_state3` 0xD09E20 | EAX = &{3 dwords} | 0xD18E50 (ring 7) and 0xD1CCF0 (render states + vertex declaration) |
+| 10 | 0xCF91E0 | `gfx_clear_region` 0xD14B20 | registers + cdecl 2, pops 8 | `gfx_cmd_clear`, re-applies the state block |
+| 11 | 0xCF9190 | `gfx_clear` 0xD14AD0 | ECX = value | `gfx_cmd_clear` |
+| 12 | 0xCFB740 | `gfx_draw_bitmap` 0xD11240 | EAX + cdecl 10, pops 0x2C | bitmap, state block, 0xD1F0D0 (2D quad) |
+| 13 / 15 | 0xCFAD50 / 0xCFA8C0 | `gfx_draw_text_13` 0xD15C60 / `gfx_draw_text_15` 0xCF5D90 | ESI, EDI + cdecl (3 floats, 1), pops 16; the record also holds the string | font layer 0xBD68E0 / 0xBDB5C0 |
+| 14 / 16 | 0xCFAB00 / 0xCFA670 | `gfx_draw_text_14` 0xD15BD0 | ESI, EAX + cdecl 4, pops 16 | font layer 0xBD6E60 |
+| 17 | 0xCFA4E0 | `im2d_draw_17` 0xD0B020 | ECX + cdecl 4 floats, pops 16 | 2D shape (role open) |
+| 18 / 19 / 1A | 0xCFA450 / 0xCFA340 / 0xCFA330 | `im2d_c_begin` 0xD0A580 / `_add` 0xD0A4F0 / `_end` 0xD0A4B0 | ESI = &{state pair} / ESI = count + cdecl (data) / - | batch at 0x22F6430 with its own vertex declaration |
+| 1B / 1C / 1D | 0xCFA2A0 / 0xCFA190 / 0xCFA180 | `im2d_strip_begin` 0xD0A440 / `_add` 0xD0A380 / `_end` 0xD0A330 | ECX = &{state pair} / ESI = count ≤ 64 + cdecl (vertices) / - | strip; end = `gfx_2d_flush(TRIANGLESTRIP, n - 2)` |
+| 1E / 1F / 20 | 0xCFA0F0 / 0xCF9FE0 / 0xCF9FD0 | `im2d_list_begin` 0xD0A2C0 / `_add` 0xD0A1F0 / `_end` 0xD0A190 | same | list; end = `gfx_2d_flush(TRIANGLELIST, n / 3)` |
+| 21 | 0xCF9E60 | `im2d_draw_quad` 0xD0A130 | ESI, EDI + cdecl (ptr), pops 4 | state block, 0xD1E330 |
+| 22 / 23 / 24 | 0xCF9D00 / 0xCF9AD0 / 0xCF9910 | `im2d_draw_22` 0xD0B980 / `_23` 0xD0B7D0 / `_24` 0xD0A5E0 | cdecl 5 / EDI + 6 / 4 floats + 1 | 2D shapes over the strip / list batches (role open) |
+| 25 | 0xCFBA10 | `gfx_draw_25` 0xD13A60 | EAX + cdecl (float, ptr), pops 8 | role open |
+| 26 / 27 | 0xCF9810 / 0xCF9800 | `gfx_restore_default_targets_clear` 0xD1EF80 / `gfx_restore_default_targets` 0xD1EF40 | cdecl (3 bools) / - | default render target, depth target and viewport (0x22F63F8 / 0x22F63FC), optional clear |
+| 28 | 0xCFB240 | queued by `gfx_queue_28` 0xD09D90 (16 dwords from 0x25282F4…) | - | calls 0x7715E0 with 8 floats (the pause map) |
+| 29 | 0xCFB450 | `gfx_draw_29` 0xD15E80 | EDI, EAX + cdecl 6, pops 0x18 | role open |
+| 2A | 0xCF9060 | `render_deferred_h_call_fn` | record {fn, arg} | `fn(arg)` on the render thread. `gfx_queue_call_79edf0` (0xCF90E0) uses it |
+
+"Role open" rows are named from their shape. Port them by copying the record layout, and name them once traced in-game.
+
+### State caches checked before writing the ring
+
+| Cache | Indexed by | Written by | Dirty test |
+|---|---|---|---|
+| `0x22F57F0` u32[] | `D3DRENDERSTATETYPE` (e.g. +0x6C = `ALPHABLENDENABLE`, +0x2AC = `BLENDOP`, +0x30C = `DEPTHBIAS`) | `gfx_apply_render_state_block`, the depth-bias pushes, `gfx_set_clip_plane` | `cache[state] != value` → write ring 15 and update. `0xBAADF00D` means "never set" for depth bias |
+| `0x22F52F0` u32[] | sampler state for stage 0 (+0x14 MAGFILTER, +0x1C MIPFILTER) | `gfx_2d_flush`, 0xD1E070 | same; writes ring 19 |
+| `0x22F2AF0` [16] | stage → D3D texture | `gfx_set_texture_cached`, `gfx_cmd_set_texture` | texture differs → ring 14 |
+| `0xE84AA8` [16] | stage → bitmap handle | `gfx_set_texture_cached` | handle differs. Reset to -1 by `render_deferred_execute` and each frame |
+| ctx+0x20 / +0x24 | the last state block | `gfx_set_render_state_block` | pair differs. `gfx_invalidate_render_state_block` forces a re-apply |
+| `0x22F5BF0` [16], `0x22F63F4`, `0x22F63F0` | executor side: texture, vb, ib | `gfx_execute_commands` | no test; kept for device reset |
+
+A shadow check must compare the ring bytes *after* these caches. The same call can emit nothing when the cache already holds the value.
+
+### Shared globals (locking for a shadow check)
+
+| Global | Writers | Readers | Synchronisation |
+|---|---|---|---|
+| `0x230597C` / `0x2305978` list pointers | game thread (`frame_end_handoff` swaps them) | render thread | swapped only while the render thread waits on the hand-off job `0x2774198`. The flags `0x277419C` (picked up) and `0x27741AC` (frame done) are in 11_frame.md |
+| `0xE849DB` force immediate | game thread, around the hand-off and loading | every API function | plain byte, no lock. Only changed while the render thread is parked |
+| ring write `0x33D62F8`, last published `0x33D62FC` | the thread that owns writing (the render thread; the game thread while `0xE849DB` is set) | - | single writer by protocol |
+| ring published end `0x33D62F4` | `InterlockedExchangeAdd` in `gfx_end_frame` | device thread | interlocked |
+| ring read `0x33D6300` | device thread | `gfx_command_buffer_wait` (spins with `Sleep(1)`) | interlocked rewind |
+| deferred-release list `0x252A2BC` | any thread | device thread at EndScene | critical section `0x2301CCC` |
+| `0x252A2A2` "executing deferred" | render thread | `gfx_2d_flush`, `gfx_cmd_set_scissor` (coordinate scaling) | plain byte |
+| `0x252A3EC` device-owner thread id | device creation | `gfx_get_thread_state` and about 30 others | written once |
+
+### Porting order (leaves first)
+
+| Step | Functions | Depends on |
+|---|---|---|
+| 1 | the ring writers `gfx_cmd_*` (07_render.md) | the ring |
+| 2 | the caches above, `gfx_set_texture_cached` 0x4D0D70, `gfx_apply_render_state_block` 0xD1CDB0 | 1, bitmap lookup 0xC094E0 |
+| 3 | `gfx_get_thread_state` 0xD22790 and the TLS context accessor (inline in each function) | - |
+| 4 | the plain setters: viewport, scissor, state block, color, alpha, bitmap, depth bias push / pop, clear | 1-3 |
+| 5 | `gfx_2d_flush` 0xD1DF50 and the 2D batches (`im2d_*_begin / _add / _end`, `im2d_draw_quad`, `gfx_draw_bitmap`) | 1-4 |
+| 6 | `render_deferred_queue`, the 43 handlers, `render_deferred_execute` | 4-5. The handlers only copy arguments, so port them per type alongside their API function |
+| 7 | the font (`gfx_draw_text_*` → 0xBD6xxx) and "role open" types | 5 |
+
+Each API function's deferred path and immediate path can be ported together: the deferred path is only the `render_deferred_queue` call.
 
 ## render_frame (0x52A710), by profiler stage
 
@@ -91,6 +206,6 @@ Then `gfx_cmd_set_stream_source` and `gfx_cmd_draw_indexed`. `gfx_cmd_draw_index
 
 ## Open
 
-- The meaning of each deferred handler type (0xE847E0).
+- The deferred types marked "role open" in the handler table.
 - What render passes 7 and the generic pass are (forward lighting variants).
 - The shadow technique: "lispsm" / "uniform" strings in 0x5380A0, and shadow-map sizes.
