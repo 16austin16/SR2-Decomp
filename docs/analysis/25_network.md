@@ -88,7 +88,7 @@ A sub-command is renamed from `<packet>_sub_<nn>` only when the evidence says wh
 
 | Packet | Sub | Receiver | Evidence |
 |---|---|---|---|
-| human_pkt | 0x06 | `human_pkt_on_death` 0x9B0030 | sender called by `human_on_death` and the remote do_frame updates |
+| human_pkt | 0x06 | `human_pkt_revive` 0x9B0030 | the sender's local branch clears invulnerability and restores max hit points; payload {handle, u8} |
 | human_pkt | 0x0E | `human_pkt_human_take_damage` 0x9844D0 | calls `human_take_damage` |
 | human_pkt | 0x12 | `human_pkt_deactivate` 0x97E920 | senders called by `human::deactivate` |
 | human_pkt | 0x16 | `human_pkt_reset` 0x4181D0 | sender called by `objects_reset` |
@@ -120,8 +120,48 @@ A sub-command is renamed from `<packet>_sub_<nn>` only when the evidence says wh
 - **`veh_pkt`**: the vehicle AI orders (31_traffic_vehicle_ai.md) from the convoy / heli objectives, road rage, chop shop, pimping and the notoriety spawn groups. 0x08 / 0x09 / 0x1D are a related set.
 - **`scrpt_pkt`**: the Lua binding wrappers in 0xA20000-0xA70000. Several receivers there are large blocks shared by many bindings, so their callee lists in the CSV are only hints.
 
+## Payloads
+
+`docs/net_payloads.csv` gives the payload of every sender found (261), field by field after the header (and after the sub-command byte for sub-command packets). The `payload` column of `docs/net_subcommands.csv` repeats it per sub-command.
+
+**How the layouts were read.** Every sender builds its packet the same way in a stack buffer:
+1. `buf[0]` = type, then a cursor register = 3 or 4 (`0xE8BC14` and the per-packet ordered flag decide whether a sequence byte is reserved).
+2. `buf[cursor]` = the sub-command (sub-command packets only), then `cursor += 1`.
+3. Each field: `mov size [esp + cursor + base], value`, then `cursor += size`.
+4. `*(u16 *)&buf[1] = cursor - 3`, and the send.
+
+The extractor follows the cursor and records each field's size.
+
+| Notation | Meaning |
+|---|---|
+| `u8` / `u16` / `u32` | integer of that size |
+| `f32` | float (`fstp`) |
+| `handle` | 16-bit **network handle**: the object's handle `+0x44` looked up in the handle table `0x2149C64`, then the multiplayer record `[obj+0xB0]+2`, or `0xFFFF` when the object has none |
+| `u8=N` | a constant |
+| `a\|b` | branches write different sizes there |
+| `blob` | a `memcpy` / string copy |
+
+Floats stored through integer registers show as `u32`, so a run of 3 or 12 `u32`s after a handle is usually a position or a position plus a 3×3 orientation (the teleports, `human_pkt` 0x1B / 0x1C).
+
+**Properties: `memb_pkt` (0x6E).** It carries `{u32 hash(class name), u32 hash(member name), handle, value}` (hash 0xBDCA30). The receiver `net_recv_memb_pkt` sets the member on the object. The senders, named `net_send_prop_<class>_<member>`:
+
+| Class | Members |
+|---|---|
+| `human` | `hit_points`, `max_hit_points`, `adjust_hp`, `cash_adjust`, `override_emotion`, `anim_state_override`, `priority_target_params` |
+| `human_ai_data` | `leash_params`, `wander_params`, `sidewalk_leash_params`, `worried_walk` |
+| `player` | `player_last_vehicle_handle`, `script_mode_params` |
+| `vehicle` | `hit_points`, `max_hit_points`, `adjustment`, `m_force_flagsengine_disabled` |
+
+The force-flag setters (31_traffic_vehicle_ai.md, 32_animation.md, 33_effects_weather.md) use the same `class` + `member` string pairs: `human` / `human_force_flags*`, `vehicle` / `m_force_flags*`, `vehicle_ai` / `vai_force_flags*`. They send the same property packet when this machine doesn't own the object. `human_set_hit_points` and friends (20_weapons.md) are the `human/hit_points` senders.
+
+**Other patterns:**
+- Most `human_pkt` senders whose sub-command comes from a register (no fixed sub in the CSV) send `{handle actor, handle target, u8=0}`: the crime events and activity humans (`fuzz_crime_*`) ordering an NPC against a target.
+- `veh_pkt` orders mostly start with the vehicle's handle, then a target handle or a position.
+- `braveheart_packet` (Strong Arm) starts with an activity id byte (`u8=6` / `u8=7` …) followed by a per-activity message.
+
 ## Open
 
-- The ~275 sub-commands still named by number. The CSV lists who uses each; the payload layouts would name the rest.
+- The ~270 sub-commands still named by number. Their payloads are now known; naming them needs each receiver's use of the fields.
+- Payloads of receivers whose senders weren't found (the header pattern misses senders that build the buffer in a caller). The CSV lists who uses each; the payload layouts would name the rest.
 - Who sends each packet type, beyond the senders found by the header pattern.
 - The transport below `net_send_packet` (0x7FA400 / 0x7FA390), and the GameSpy gt2 / NAT layer under it.
