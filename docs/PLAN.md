@@ -61,4 +61,5 @@ original. The standalone build can move to 64-bit later.
 23. ✅ Streamer control flow in Rust: the pump, process_generic, poll_active, wait, unload, abort_current, batch_release. Event log identical to the original over a boot plus save load (apart from ambient spawns), and 36,000 frames walking in the city. unload/abort are not exercised yet.
 24. ✅ Teleport test harness (`teleport.rs`, `tools/ingame/run_teleport.ps1`): 8 jumps across the city exercise chunk streaming and the abort path (27 aborts on Rust, the same kind as the original).
 25. ✅ `start_load` and `check_batch` in Rust: original and Rust event logs match for every deterministic load, completion and abort in the teleport test.
-26. Next: the chunk-extras path (`0xA7E100` start, `0xA7E900` poll), `finish_current` (`0xA7CFC0`), the read scheduler at `0xA75900`–`0xA77E90`; then the vint UI and the D3D wrappers.
+26. ✅ The rest of the per-resource streamer in Rust: finish_current, the chunk-extras start and poll, process_sequential (not exercised yet). Teleport test: original and Rust event logs match.
+27. Next: the request functions and completion callbacks (mapped in 05_streamer.md "Request side, step by step"), then the resource slot scheduler (rsched) and the io scheduler; then the vint UI and the D3D wrappers.

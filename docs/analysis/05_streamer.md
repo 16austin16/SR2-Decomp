@@ -1149,3 +1149,23 @@ Then for each group short of its quota, move spare slots into it: set the reques
 1. `rsched_update` on the six schedulers.
 2. `rsched_job_pump`.
 3. `0xA78AC0` when streaming is on, `0x2528C14` is set, (`0x2528B56` == 0 or `0x2528B2B` != 0), `*0x2528C14 + 0x3F8` is set and `0x2528BB4` < 1.
+
+### poll_chunk_extras and process_sequential in Rust
+
+`streamman_poll_chunk_extras` (`0xA7E900`) and `streamman_process_sequential` (`0xA7D0C0`) are in
+Rust too, both detoured so that the original run logs the same events. With these, everything
+the pump does per resource runs in Rust; the io scheduler and the request functions are still
+the original.
+
+- Teleport test, poll: 108-111 polls and 17 extras completions per run. The first of two Rust
+  runs had 2 chunk-extras starts with different mesh-part/anim counts. Two original runs and the
+  second Rust run all matched exactly (659 distinct non-ambient events). The difference came from
+  which mesh records and anims were already resident, and was not reproduced.
+- process_sequential is not exercised by any test so far (no type-6 slot is processed), so it
+  is checked against the disassembly only. Details the port keeps: an already past-the-end step
+  is still issued; `file_get_size` in state 2 refreshes step +0x210, which the cursor advance
+  then uses; "done" is re-polled before the retry callback; and multi-part steps advance only
+  once +0x20C >= +0x208.
+- Calls that need EDX as an input (or return EDX:EAX) go through `game_call_edx`. `async_io_free`
+  takes four arguments, so it has its own helper (`io_free`).
+

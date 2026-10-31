@@ -44,8 +44,6 @@ const BATCH_CANCEL_READS: usize = 0x00A7_D9C0; // (batch)
 const BATCH_RELEASE_A: usize = 0x00A7_DA30; // (batch, mode)
 const BATCH_RELEASE_B: usize = 0x00A7_DB30; // (batch, mode)
 
-const POLL_BATCH_EXTRAS: usize = 0x00A7_E900; // (batch), type 4
-const PROCESS_ANIMATION: usize = 0x00A7_D0C0; // (), type 6
 const STREAMMAN_NOP: usize = 0x00A7_D810;
 const IAT_SLEEP: usize = 0x00DB_80B8;
 const FILE_GET_SIZE: usize = 0x00BF_E0E0; // ESI = u32 *out, cdecl (name) -> AL
@@ -85,7 +83,9 @@ const START_LOAD_I: usize = 14;
 const CHECK_BATCH: usize = 15;
 const FINISH: usize = 16;
 const START_EXTRAS: usize = 17;
-const COUNT: usize = 18;
+const PROCESS_SEQ: usize = 18;
+const POLL_EXTRAS: usize = 19;
+const COUNT: usize = 20;
 
 /// (name, address, stolen prologue): whole, position-independent instructions.
 const PORTS: [(&str, usize, &[u8]); COUNT] = [
@@ -107,6 +107,8 @@ const PORTS: [(&str, usize, &[u8]); COUNT] = [
     ("check_batch", 0x00A7_ED40, &[0x83, 0xEC, 0x50, 0xA1, 0x50, 0x0B, 0xE8, 0x00]),
     ("finish_current", 0x00A7_CFC0, &[0x83, 0xEC, 0x08, 0x53, 0x55, 0x56]),
     ("start_chunk_extras", 0x00A7_E100, &[0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8]),
+    ("process_sequential", 0x00A7_D0C0, &[0x83, 0xEC, 0x0C, 0x8B, 0x15, 0xF0, 0x9F, 0x52, 0x02]),
+    ("poll_chunk_extras", 0x00A7_E900, &[0x83, 0xEC, 0x58, 0xA1, 0x50, 0x0B, 0xE8, 0x00]),
 ];
 
 /// Trampolines to the originals.
@@ -681,7 +683,7 @@ unsafe fn poll_active() {
             let next = rd(b + 4) as usize;
             let next = if next != rd(BATCHES_ACTIVE) as usize { next } else { 0 };
             if rd(rd(b + 0x14) as usize) == 4 {
-                call(POLL_BATCH_EXTRAS, &[b as u32]);
+                poll_extras_hook(b as u32); // through the hook, for the event log
             } else {
                 check_batch_hook(b as u32); // through the hook, for the event log
             }
@@ -886,6 +888,18 @@ unsafe fn start_load(s: usize) {
     }
 }
 
+/// `async_io_free(request->manager, request, sequence, 0)` (stdcall, 4 arguments).
+unsafe fn io_free(req: usize, seq: u32) {
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "push 0", "push {q}", "push {r}", "push dword ptr [{r} + 0x3C]", "call {f}",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            r = in(reg) req, q = in(reg) seq, f = in(reg) IO_FREE, clobber_abi("C"),
+        );
+    }
+}
+
 /// Remove `n` from the circular `{prev, next}` list whose head pointer is at
 /// `head` (moving the head on if it was `n`) and clear its links.
 unsafe fn list_remove(head: usize, n: usize) {
@@ -974,12 +988,7 @@ unsafe fn check_batch(batch: usize) {
             if req == 0 || seq != rd(req) {
                 wr(IO_LAST_ERROR, rd(rd(IO_LAST_ERROR_SRC) as usize));
             }
-            std::arch::asm!(
-                "push ebx", "push esi", "push edi", "push ebp",
-                "push 0", "push {q}", "push {r}", "push dword ptr [{r} + 0x3C]", "call {f}",
-                "pop ebp", "pop edi", "pop esi", "pop ebx",
-                r = in(reg) req, q = in(reg) seq, f = in(reg) IO_FREE, clobber_abi("C"),
-            );
+            io_free(req, seq);
             list_remove(batch + 0x10, node);
             wr(node + 0x10, 0);
             wr(node + 0x14, 0);
@@ -1083,22 +1092,27 @@ const VIRTUAL_MEMPOOL_ALLOC: usize = 0x00BF_CA60;
 /// (the extra pushes are ignored). Everything goes through one block in EDX so
 /// no operand can sit in a register the sequence overwrites.
 unsafe fn game_call(f: usize, eax: u32, ecx: u32, esi: u32, edi: u32, args: [u32; 3]) -> u32 {
-    let block: [u32; 6] = [f as u32, esi, edi, args[0], args[1], args[2]];
-    let r: u32;
+    unsafe { game_call_edx(f, eax, ecx, 0, esi, edi, args).0 }
+}
+
+/// [`game_call`] with EDX as an input too; returns EDX:EAX as (EAX, EDX).
+unsafe fn game_call_edx(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: [u32; 3]) -> (u32, u32) {
+    let block: [u32; 7] = [f as u32, esi, edi, edx, args[0], args[1], args[2]];
+    let (lo, hi): (u32, u32);
     unsafe {
         std::arch::asm!(
             "push ebx", "push esi", "push edi", "push ebp",
             "mov ebp, esp",
-            "push dword ptr [edx + 20]", "push dword ptr [edx + 16]", "push dword ptr [edx + 12]",
-            "mov esi, [edx + 4]", "mov edi, [edx + 8]",
-            "call dword ptr [edx]",
+            "push dword ptr [edx + 24]", "push dword ptr [edx + 20]", "push dword ptr [edx + 16]",
+            "mov esi, [edx + 4]", "mov edi, [edx + 8]", "mov ebx, [edx]", "mov edx, [edx + 12]",
+            "call ebx",
             "mov esp, ebp",
             "pop ebp", "pop edi", "pop esi", "pop ebx",
-            inout("edx") block.as_ptr() => _, inout("eax") eax => r, inout("ecx") ecx => _,
+            inout("edx") block.as_ptr() => hi, inout("eax") eax => lo, inout("ecx") ecx => _,
             clobber_abi("C"),
         );
     }
-    r
+    (lo, hi)
 }
 
 unsafe fn thiscall(f: usize, this: usize, args: [u32; 3]) -> u32 {
@@ -1361,6 +1375,293 @@ extern "C" fn start_extras_hook(s: u32) {
     }
 }
 
+// --- Chunk extras poll ----------------------------------------------------------
+
+const CHUNK_POOL_INDEX: usize = 0x004A_A9F0; // ESI = chunk pool -> index (pools at 0x2771894, stride 0x58)
+const OBJECT_ANIM_ADD_LOADED: usize = 0x006E_9BD0; // ESI = name, cdecl (data, size, pool index)
+const CHUNK_EXTRAS_PARSE_NODES: usize = 0x00A7_E7A0; // cdecl (node, chunk id)
+const OBJECT_TEMPLATE_FIND: usize = 0x0093_1060; // ECX = name -> template
+const SMESH_CACHE_FIND: usize = 0x006E_6310; // EDX = template -> record
+const CRT_STRICMP: usize = 0x00C9_9030; // cdecl (a, b)
+const SMESH_TABLE_ADD_STREAMED: usize = 0x006E_5960; // ECX = name, EDX = record names (+8), cdecl (smesh, g_smesh)
+const PEG_REGISTER_LOADED: usize = 0x00C0_8B80; // ESI = peg data, ECX = name, cdecl (peg size, g_peg data)
+
+/// `streamman_poll_chunk_extras` (0xA7E900): check_batch for type 4, with no
+/// callbacks. Per pending node: queued stops; being read stops (after a debug-only
+/// name format, left out); done is handled by kind (+0x2C) and the node moves to
+/// the finished list; failed just moves; anything else (cancelling) is skipped in
+/// place. Kinds: 0 a mesh/peg part, stored on its mesh cache record (unless the
+/// record is already loaded) by extension; when the raw next node belongs to
+/// another object the record's mesh is registered (`smesh_table_add_streamed`),
+/// then its g_peg if there is one, and it is marked loaded. 1 an anim
+/// (`object_anim_add_loaded`). 2 the node file (`parse_nodes`). With nothing
+/// pending: free the finished nodes, clear the slot's batch, batch to the free
+/// list, then `finish_current`.
+unsafe fn poll_extras(batch: usize) {
+    unsafe {
+        let s = rd(batch + 0x14) as usize;
+        let info = rd(s + 0x10) as usize;
+        let mut node = rd(batch + 0x0C) as usize;
+        while node != 0 {
+            let next = rd(node + 4) as usize;
+            let next = if next != rd(batch + 0x0C) as usize { next } else { 0 };
+            match call(IO_STATUS, &[rd(node + 0x10), rd(node + 0x14)]) {
+                1 | 2 => break,
+                3 => {
+                    match rd(node + 0x2C) {
+                        0 => extras_part_done(node),
+                        1 => {
+                            let index = game_call(CHUNK_POOL_INDEX, 0, 0, rd(info + 0x778), 0, [0; 3]);
+                            game_call(OBJECT_ANIM_ADD_LOADED, 0, 0, rd(node + 8), 0, [rd(node + 0x20), rd(node + 0x24), index]);
+                        }
+                        2 => {
+                            call(CHUNK_EXTRAS_PARSE_NODES, &[node as u32, *((info + 0x772) as *const u16) as u32]);
+                        }
+                        _ => {}
+                    }
+                    list_remove(batch + 0x0C, node);
+                    list_append(batch + 0x10, node);
+                }
+                5 => {
+                    list_remove(batch + 0x0C, node);
+                    list_append(batch + 0x10, node);
+                }
+                _ => {}
+            }
+            node = next;
+        }
+        if rd(batch + 0x0C) != 0 {
+            return;
+        }
+        let mut node = rd(batch + 0x10) as usize;
+        while node != 0 {
+            let next = rd(node + 4) as usize;
+            let next = if next != rd(batch + 0x10) as usize { next } else { 0 };
+            let (req, seq) = (rd(node + 0x10) as usize, rd(node + 0x14));
+            if req == 0 || seq != rd(req) {
+                wr(IO_LAST_ERROR, rd(rd(IO_LAST_ERROR_SRC) as usize));
+            }
+            io_free(req, seq);
+            list_remove(batch + 0x10, node);
+            wr(node + 0x10, 0);
+            wr(node + 0x14, 0);
+            wr(READ_NODE_POOL_COUNT, rd(READ_NODE_POOL_COUNT).wrapping_add(1));
+            list_append(READ_NODE_POOL, node);
+            node = next;
+        }
+        wr(s + 0x20, 0);
+        list_remove(BATCHES_ACTIVE, batch);
+        list_append(BATCHES_FREE, batch);
+        finish_current_hook(); // through the hook, for the event log
+    }
+}
+
+/// A finished mesh/peg part (kind 0): see `poll_extras`.
+unsafe fn extras_part_done(node: usize) {
+    unsafe {
+        let template = game_call(OBJECT_TEMPLATE_FIND, 0, rd(node + 0x30), 0, 0, [0; 3]);
+        let rec = game_call_edx(SMESH_CACHE_FIND, 0, 0, template, 0, 0, [0; 3]).0 as usize;
+        if *((rec + 0x122) as *const u8) != 0 {
+            return;
+        }
+        let ext = rd(node + 0x0C);
+        let (data, size) = (rd(node + 0x20), rd(node + 0x24));
+        let is = |k: usize| call(CRT_STRICMP, &[ext, rd(PART_EXTS + k * 4)]) == 0;
+        if is(0) {
+            wr(rec + 0x124, data);
+        } else if is(1) {
+            wr(rec + 0x128, data);
+        } else if is(2) {
+            wr(rec + 0x12C, data);
+            wr(rec + 0x130, size);
+        } else if is(3) {
+            wr(rec + 0x134, data);
+            wr(rec + 0x138, size);
+        }
+        let raw_next = rd(node + 4) as usize;
+        if raw_next != 0 && rd(raw_next + 0x30) == rd(node + 0x30) {
+            return;
+        }
+        game_call_edx(SMESH_TABLE_ADD_STREAMED, 0, rd(node + 0x30), (rec + 8) as u32, 0, 0, [rd(rec + 0x124), rd(rec + 0x128), 0]);
+        if rd(rec + 0x134) != 0 {
+            game_call(PEG_REGISTER_LOADED, 0, (rec + 0x8A) as u32, rd(rec + 0x12C), 0, [rd(rec + 0x130), rd(rec + 0x134), 0]);
+        }
+        *((rec + 0x122) as *mut u8) = 1;
+    }
+}
+
+extern "C" fn poll_extras_hook(batch: u32) {
+    CALLS[POLL_EXTRAS].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let s = rd(batch as usize + 0x14) as usize;
+        let e = format!("poll_extras {}", describe(s));
+        let state = rd(s + 4);
+        if PUMP_RUST {
+            poll_extras(batch as usize);
+        } else {
+            let f: extern "C" fn(u32) = std::mem::transmute(orig(POLL_EXTRAS));
+            f(batch);
+        }
+        if rd(s + 4) != state {
+            event(format!("{e} -> s{} current {}", rd(s + 4), (rd(CURRENT) as usize == s) as u8));
+        }
+    }
+}
+
+// --- Sequential (animation) path ---------------------------------------------------
+
+const SUBMIT_SINGLE_READ: usize = 0x00A7_CF50; // EAX = file, ECX = dest, EDI = info+4, cdecl (space left) -> EDX:EAX
+
+/// Advance the info's current step (bits 0-9) by one; returns whether it reached
+/// the step count (bits 10-19).
+unsafe fn next_step(info: usize) -> bool {
+    unsafe {
+        let f = rd(info + 0x20);
+        let n = (f & !0x3FF) | (f.wrapping_add(1) & 0x3FF);
+        wr(info + 0x20, n);
+        (n ^ (n >> 10)) & 0x3FF == 0
+    }
+}
+
+/// `streamman_process_sequential` (0xA7D0C0), the pump's path for type 6
+/// (animations): one read at a time, kept at slot +0x18/+0x1C, no batch.
+///
+/// State 1: find the next step from the current one that passes the filter (a
+/// filter must return exactly 1). None left: `finish_current`. Otherwise make it
+/// current, run its begin callback (false aborts), align the cursor as start_load
+/// does, submit the read (priority 0x70, `submit_single_read`), run the issue
+/// callback and go to state 2. A current step already past the count is issued
+/// anyway, as in the original.
+///
+/// State 2: poll the read (`file_get_size` refreshes the step's size at +0x210 on
+/// the way). Still running: the progress callback `(info, 0)` (false aborts). Done,
+/// cancelled or failed: poll again; unless that says done, the retry callback must
+/// return 1, else abort. Then the after callback (false aborts), release the read,
+/// advance the cursor, and advance the step: plain steps by one; a multi-part step
+/// (u8 +4) only once its part counter +0x20C reaches +0x208, then past following
+/// multi-part steps with nothing to read (+0x208 <= 0). Back to state 1 while
+/// steps remain (counted against the step count read on entry), else
+/// `finish_current`. Two debug-only `streamman_nop` calls are left out.
+unsafe fn process_sequential() {
+    unsafe {
+        let cur = rd(CURRENT) as usize;
+        let info = rd(cur + 0x10) as usize;
+        let steps = |i: u32| rd(info + 0x14) as usize + i as usize * 0x244;
+        let ok = |r: u32| r as u8 != 0;
+        match rd(cur + 4) {
+            1 => {
+                let flags = rd(info + 0x20);
+                let (mut i, n) = (flags & 0x3FF, (flags >> 10) & 0x3FF);
+                while i < n {
+                    let file = rd(steps(i));
+                    let filter = rd(info + 0x10);
+                    let runnable = if filter != 0 { call(filter as usize, &[file]) as u8 == 1 } else { file != 0 };
+                    if runnable {
+                        break;
+                    }
+                    i += 1;
+                }
+                if i == n {
+                    finish_current_hook();
+                    return;
+                }
+                wr(info + 0x20, (rd(info + 0x20) & !0x3FF) | (i & 0x3FF));
+                let step = steps(i);
+                let begin = rd(step + 0x22C) as usize;
+                if begin != 0 && !ok(call(begin, &[info as u32])) {
+                    abort_current_hook(0);
+                    return;
+                }
+                if rd(info + 0x20) & 0x10_0000 == 0 {
+                    let align = *((step + 0x214) as *const u16) as u32;
+                    let r = rd(info + 8) % align;
+                    let pad = if r == 0 { 0 } else { align - r };
+                    wr(info + 8, rd(info + 8).wrapping_add(pad));
+                    wr(info + 0x0C, rd(info + 0x0C).wrapping_sub(pad));
+                    wr(step + 0x218, rd(info + 8));
+                }
+                let (lo, hi) = game_call_edx(SUBMIT_SINGLE_READ, rd(step), rd(info + 8), 0, 0, rd(info + 4), [rd(info + 0x0C), 0, 0]);
+                wr(cur + 0x18, lo);
+                wr(cur + 0x1C, hi);
+                let issue = rd(step + 0x234) as usize;
+                if issue != 0 {
+                    call(issue, &[info as u32]);
+                }
+                wr(cur + 4, 2);
+            }
+            2 => {
+                let flags = rd(info + 0x20);
+                let n = (flags >> 10) & 0x3FF;
+                let step = steps(flags & 0x3FF);
+                let status = call(IO_STATUS, &[rd(cur + 0x18), rd(cur + 0x1C)]);
+                file_get_size(rd(step), &mut *((step + 0x210) as *mut u32));
+                if !matches!(status, 3..=5) {
+                    let progress = rd(step + 0x230) as usize;
+                    if progress != 0 && !ok(call(progress, &[info as u32, 0])) {
+                        abort_current_hook(0);
+                    }
+                    return;
+                }
+                if call(IO_STATUS, &[rd(cur + 0x18), rd(cur + 0x1C)]) != 3 {
+                    let retry = rd(step + 0x240) as usize;
+                    if retry == 0 || call(retry, &[info as u32]) as u8 != 1 {
+                        abort_current_hook(0);
+                        return;
+                    }
+                }
+                let after = rd(step + 0x238) as usize;
+                if after != 0 && !ok(call(after, &[info as u32])) {
+                    abort_current_hook(0);
+                    return;
+                }
+                call(READ_RELEASE, &[rd(cur + 0x18), rd(cur + 0x1C), 0]);
+                wr(cur + 0x18, 0);
+                wr(cur + 0x1C, 0);
+                if rd(info + 0x20) & 0x10_0000 == 0 {
+                    let size = rd(step + 0x210);
+                    wr(info + 8, rd(info + 8).wrapping_add(size));
+                    wr(info + 0x0C, rd(info + 0x0C).wrapping_sub(size));
+                }
+                if *((step + 4) as *const u8) == 0 {
+                    next_step(info);
+                } else if rd(step + 0x20C) as i32 >= rd(step + 0x208) as i32 && !next_step(info) {
+                    loop {
+                        let s2 = steps(rd(info + 0x20) & 0x3FF);
+                        if *((s2 + 4) as *const u8) == 0 || rd(s2 + 0x208) as i32 > 0 || next_step(info) {
+                            break;
+                        }
+                    }
+                }
+                if rd(info + 0x20) & 0x3FF == n {
+                    finish_current_hook();
+                } else {
+                    wr(cur + 4, 1);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+extern "C" fn process_sequential_hook() {
+    CALLS[PROCESS_SEQ].fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let cur = rd(CURRENT) as usize;
+        let e = format!("sequential {}", describe(cur));
+        let state = rd(cur + 4);
+        if PUMP_RUST {
+            process_sequential();
+        } else {
+            let f: extern "C" fn() = std::mem::transmute(orig(PROCESS_SEQ));
+            f();
+        }
+        if rd(cur + 4) != state {
+            let info = rd(cur + 0x10) as usize;
+            event(format!("{e} -> s{} step {} current {}", rd(cur + 4), rd(info + 0x20) & 0x3FF, (rd(CURRENT) as usize == cur) as u8));
+        }
+    }
+}
+
 extern "C" fn start_load_hook(s: u32) {
     CALLS[START_LOAD_I].fetch_add(1, Ordering::Relaxed);
     unsafe {
@@ -1417,7 +1718,7 @@ unsafe fn process() {
         match rd(cur) {
             0..=5 | 7..=9 => process_generic(),
             _ => {
-                call(PROCESS_ANIMATION, &[]);
+                process_sequential_hook(); // through the hook, for the event log
             }
         }
     }
@@ -1558,6 +1859,8 @@ fn hook_address(i: usize) -> usize {
         CHECK_BATCH => check_batch_hook as extern "C" fn(u32) as usize,
         FINISH => finish_current_hook as extern "C" fn() -> u32 as usize,
         START_EXTRAS => start_extras_hook as extern "C" fn(u32) as usize,
+        PROCESS_SEQ => process_sequential_hook as extern "C" fn() as usize,
+        POLL_EXTRAS => poll_extras_hook as extern "C" fn(u32) as usize,
         _ => unreachable!(),
     }
 }
