@@ -54,4 +54,5 @@ original. The standalone build can move to 64-bit later.
 16. ✅ `file_write` @0xBFE360 and `file_close` @0xBFDF30 → Rust. A save written and closed by Rust loads back, and 9,770 distinct closes match the original. The whole file API (open/resolve/read/write/close) is now Rust.
 17. ✅ RTTI class map (`docs/analysis/03_rtti_classes.md`): 517 game classes across objects, memory pools, streaming, renderer, D3D wrappers, vint UI, scripting, activities, multiplayer; about 305 Havok.
 18. ✅ Memory pools started (`docs/analysis/04_mempool.md`): vtables, layout, and a runtime survey of method calls and pool objects. `static_mempool_base::alloc` → Rust by vtable-slot swap in 4 pool classes, shadow-checked on every call (428k allocations, 0 mismatches).
-19. Next: the rest of the pools (`can_alloc`, `virtual_mempool::alloc` with commit, tracked/page pools, the reset paths), then the streamer (`streamman_*`), the vint UI, and the D3D wrappers.
+19. ✅ `virtual_mempool::alloc` → Rust (page commits through the page tracker included), shadow-checked under the pool and tracker locks: 1.26M allocations and 18,574 commits, 0 mismatches.
+20. Next: the rest of the pools (`can_alloc`, tracked/page/split/async pools, the reset paths, the page tracker), then the streamer (`streamman_*`), the vint UI, and the D3D wrappers.
