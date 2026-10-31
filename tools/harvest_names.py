@@ -15,6 +15,8 @@ changed; new rows get status `named` and a note saying where the name came from:
   several classes is named after the class with the fewest bases (where it was
   introduced). Scalar deleting destructors are recognised by their
   `test byte [esp+4], 1` prologue.
+- ctor/dtor: constructors (write a vtable, return this) and destructors (write a
+  vtable first, or called first by a scalar deleting destructor).
 - string: an error/log string that starts with a function name ("foo_bar: ...",
   "foo_bar()", "foo::bar: ...") and is referenced from exactly one function.
 """
@@ -112,6 +114,93 @@ def vtable_slots(x):
     return out
 
 
+MOV_EAX_THIS = {b"\x8B\xC6", b"\x89\xF0", b"\x8B\xC1", b"\x89\xC8", b"\x8B\xC7", b"\x89\xF8", b"\x8B\xC3", b"\x89\xD8"}
+POPS = {0x5B, 0x5D, 0x5E, 0x5F}
+
+
+def returns_this(x, f, end):
+    """The function ends `mov eax, <esi|ecx|edi|ebx>; pop*; ret[ n]` (MSVC constructors return this)."""
+    d = x.d
+    e = end
+    while e > f and d[e - 1 - BASE] == 0xCC:
+        e -= 1
+    if e - f >= 1 and d[e - 1 - BASE] == 0xC3:
+        e -= 1
+    elif e - f >= 3 and d[e - 3 - BASE] == 0xC2:
+        e -= 3
+    else:
+        return False
+    for _ in range(4):
+        if d[e - 2 - BASE:e - BASE] in MOV_EAX_THIS:
+            return True
+        if d[e - 1 - BASE] not in POPS:
+            return False
+        e -= 1
+    return False
+
+
+def ctors_dtors(x, starts, names):
+    """Constructors and destructors, from the vtable stores in their bodies.
+
+    - A function that writes a vtable and returns `this` is a constructor of the
+      last (most derived) class it writes at offset 0.
+    - One that writes a vtable within its first 12 bytes (no call before it) and
+      doesn't return `this` is a destructor of the first class it writes.
+    - A scalar deleting destructor that calls a function before its
+      `test byte [esp+n], 1` names that function the destructor.
+    """
+    import bisect
+    vts = {}
+    for r in csv.DictReader(open(ROOT / "docs/rtti_classes.csv", encoding="utf-8")):
+        for v in filter(None, r["vtables"].split(" ")):
+            va, off = v.split("@")
+            vts[int(va, 16)] = (nice_class(r["name"]), int(off, 16))
+    t = x.d[x.lo - BASE:x.hi - BASE]
+    by_fn = defaultdict(list)
+    # mov dword [reg (+disp8/32)], imm32, reg != esp/ebp
+    for m in re.finditer(rb"\xC7[\x00-\x03\x06\x07\x40-\x43\x46\x47\x80-\x83\x86\x87]", t):
+        i = m.start()
+        mod = t[i + 1] >> 6
+        imm = struct.unpack_from("<I", t, i + {0: 2, 1: 3, 2: 6}[mod])[0]
+        disp = 0 if mod == 0 else (t[i + 2] if mod == 1 else 1)
+        if imm in vts and disp == 0 and vts[imm][1] == 0:
+            site = x.lo + i
+            j = bisect.bisect_right(starts, site) - 1
+            if j >= 0:
+                by_fn[starts[j]].append((site, vts[imm][0]))
+    out = {}
+    for f, stores in by_fn.items():
+        j = bisect.bisect_right(starts, f)
+        end = starts[j] if j < len(starts) else x.hi
+        # Many functions are only reached through pointers, so the next known start
+        # can be far away; MSVC pads only between functions, so a ret followed by
+        # int3 ends this one.
+        pad = re.search(rb"(\xC3|\xC2..)\xCC", x.d[f - BASE:end - BASE], re.S)
+        if pad:
+            end = f + pad.start() + len(pad.group(1))
+        stores = [s for s in stores if s[0] < end]
+        if not stores:
+            continue
+        if returns_this(x, f, end):
+            cls = stores[-1][1]
+            out[f] = (f"{cls}::ctor", f"writes the {cls} vtable and returns this")
+        elif stores[0][0] - f <= 12 and b"\xE8" not in x.d[f - BASE:stores[0][0] - BASE]:
+            cls = stores[0][1]
+            out[f] = (f"{cls}::dtor", f"writes the {cls} vtable first and doesn't return this")
+    for f, name in names.items():
+        if not name.endswith("::scalar_deleting_dtor"):
+            continue
+        cls = name[:-len("::scalar_deleting_dtor")]
+        body = x.d[f - BASE:f - BASE + 32]
+        test = re.search(rb"\xF6\x44\x24[\x04\x08]\x01", body)
+        call = body.find(b"\xE8")
+        if test and 0 <= call < test.start():
+            tgt = f + call + 5 + struct.unpack_from("<i", body, call + 1)[0]
+            if x.lo <= tgt < x.hi:
+                out[tgt] = (f"{cls}::dtor", f"called first by {cls}::scalar_deleting_dtor")
+    return out
+
+
 def string_names(x, starts):
     pat = re.compile(rb"([A-Za-z_][A-Za-z0-9_]*(?:::~?[A-Za-z_][A-Za-z0-9_]*)?)(?:\(\))?(?::\s|\(\))")
     refs = defaultdict(set)
@@ -187,6 +276,8 @@ def main(argv):
         return "havok" if name.startswith(("hk", "Hk", "?$hk")) else "class"
     add("vtable", vtable_slots(x), class_area)
     starts = sorted(set(function_starts(x.d, x.lo, x.hi - x.lo)) | known | set(new))
+    names = {int(r["address"], 16): r["name"] for r in rows} | {f: r["name"] for f, r in new.items()}
+    add("ctor/dtor", ctors_dtors(x, starts, names), class_area)
     add("string", string_names(x, starts), lambda f, n: "named")
 
     print(f"total new rows: {len(new)} (csv had {len(rows)})")
