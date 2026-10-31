@@ -155,12 +155,12 @@ Each API function's deferred path and immediate path can be ported together: the
 ### Remaining leaves, step by step
 
 **`gfx_bind_shader_pair`** (0xD19070; `EAX` = pair index; no stack arguments; called by 0xD1CCF0, 0xD1DEB0 and 0xD1E070):
-1. `entry = 0xE84AF0 + index × 0x38`. `vs = entry[+0]`, or the default `0xE84B98` when 0.
+1. `entry = 0xE84AF0 + index × 0x1C`: +0 vertex shader, +4 pixel shader, +0xC vertex declaration (used by the 2D allocator). `vs = entry[+0]`, or the default `0xE84B98` when 0.
 2. If `vs != 0x22F2AEC` (vertex shader cache): write ring `{4, vs}` (SetVertexShader, 8 bytes) and update the cache.
 3. `ps = entry[+4]`, or the default `0xE84B9C` when 0.
 4. If `ps != 0x22F2AE8` (pixel shader cache): write ring `{3, ps}` (SetPixelShader) and update the cache.
 
-The 0x38-byte entries are filled at shader load. The default pair is entry 3 (0xE84B98 = 0xE84AF0 + 3 × 0x38).
+The 0x1C-byte entries are filled at shader load. The default pair is entry 6 (0xE84B98 = 0xE84AF0 + 6 × 0x1C). Corrected from 0x38 by the main session's port.
 
 **`gfx_set_tint_color`** (0xD14700; `ESI` = &{f32 r, g, b}):
 1. `ctx+0x70..+0x7C` = (r, g, b, 1.0). This is done on every call, before the defer test.
@@ -231,10 +231,16 @@ Four deferred types carry text. The API functions are thin wrappers; the drawing
 
 | Off | Field |
 |---|---|
+| +0x08 | glyph count |
+| +0x0C | first character code |
+| +0x10 | default advance (characters outside the font) |
 | +0x14 | s16 line height |
 | +0x16 | s16 used for the inverse scale |
+| +0x1C | letter spacing added to every advance |
+| +0x20 | kerning pair count |
 | +0x24 / +0x26 | s16 baseline y / x offsets |
-| +0xA8 / +0xAC | kerning / glyph tables used by the glyph lookup |
+| +0xA8 | kerning pairs, 4 bytes `{u8 left, u8 right, s8 adjust, pad}`, grouped by left glyph |
+| +0xAC | glyph table, 16 bytes per glyph: +0 advance, +4 width, +0xC s16 index of the glyph's first kerning pair (−1 = none) |
 | +0xB0 | the font's bitmap handle |
 | +0xB4 / +0xB8 | per-glyph u / v pixel tables (i32) |
 
@@ -251,7 +257,7 @@ Four deferred types carry text. The API functions are thin wrappers; the drawing
    - **`\n`**: `pen_y += round(f.line_height(+0x14) × sx)`, then reset `pen_x` (centring again on the rest of the string when the sentinel was given).
    - **Other characters below 0x20**: skipped.
    - **Printable characters**:
-     1. `font_glyph_metrics` (0xBD7D70; `ESI` = &out; `(state, prev char, char, &kern)`) gives the glyph index, width and advance (with kerning against the previous character).
+     1. `font_glyph_metrics` (0xBD7D70) gives the glyph index, width and advance, with kerning against the *next* character (described below).
      2. `u0 = f.u[g] / w + 0.5 / w`, `v0 = f.v[g] / h + 0.5 / h`, and u1 / v1 from the glyph size.
      3. Get space for 4 vertices of 0x1C bytes:
         - **deferring**: `render_deferred_queue(0x1C, 4, &{dst = 0, bytes = 0x70})`, then write the vertices to the `dst` it returns (the VTX write-back);
@@ -261,6 +267,21 @@ Four deferred types carry text. The API functions are thin wrappers; the drawing
 10. Tail-jump `im2d_strip_end`.
 
 So **each glyph is its own 4-vertex strip and its own draw** in immediate mode.
+
+**`font_glyph_metrics`** (0xBD7D70; `ECX` = font id, `ESI` = &advance; cdecl `(u8 c, u8 next, int *width)`; returns the glyph index or −1):
+1. `f = font_lookup(id)`. `k` = the alias scale (1.0 unless the id is an alias).
+2. `g = c − f.first_char`. If `g` is outside `[0, f.count)`:
+   1. `*width = 0`.
+   2. `*advance = trunc((f.default_advance + f.spacing) × k)`.
+   3. Return −1.
+3. Otherwise, with `e = f.glyphs[g]` (16-byte entries): `*width = e.width` and `adv = e.advance + f.spacing`.
+4. **Kerning.** Only when `e.kern_start > −1` and `next` isn't 0 or `
+`, and `next` is inside the font:
+   1. Scan the pairs from `kern_start` while the left glyph is `g` and the right glyph is below `next − first`.
+   2. On an exact `(g, next)` match, add the pair's signed adjust to `adv`.
+5. `*width = trunc(*width × k)`, `*advance = trunc(adv × k)`. Return `g`.
+
+There's no cache: every glyph is looked up again on every draw.
 
 **`font_draw_string_2d_wide`** (0xBDB5C0) is the same with `u16` characters, `text_center_x_wide` (0xCF5C20) and `font_glyph_metrics_wide` (0xBDC760).
 
