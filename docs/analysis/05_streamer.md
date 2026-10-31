@@ -150,3 +150,95 @@ used by about 20 other call sites in `0xA75900`–`0xA77E90` (the read scheduler
 `pop_best` details: the compare callback gets `(best, candidate)` values. A result of 1 takes the
 candidate unless `best < candidate`, so ties go to the later node. 2 always takes the
 candidate, and anything else keeps the current best.
+
+## Batches, read nodes and completion
+
+`streamman_start_load` / `streamman_start_chunk_extras` group the reads of one slot into a **batch**:
+
+| Off | Batch field |
+|---|---|
+| +0x00, +0x04 | links (free list `0x252A018`, active list `0x252A01C`) |
+| +0x08..+0x14 | cleared on take |
+| +0x0C | pending read nodes (circular list) |
+| +0x10 | finished read nodes |
+| +0x14 | slot |
+| +0x18 | u16 chunk id (type 0 only, else 0xFFFF) |
+
+Read nodes come from a pool at `0x252A020` (free count `0x252A024`, `streamman_read_node_alloc` 0xA7D930):
+
+| Off | Read node field |
+|---|---|
+| +0x00, +0x04 | links |
+| +0x08 | file |
+| +0x0C | name suffix for error messages (e.g. ".anim_pc"), or 0 |
+| +0x10, +0x14 | io request and sequence (from `async_io_submit`) |
+| +0x20 | destination |
+| +0x24 | size |
+| +0x28 | u8 priority: 0x70 types 0/1, 0x40 other types, 0x30 chunk extras |
+| +0x2C | step index (extras: part kind 0 mesh/peg, 1 anim, 2 file) |
+| +0x30 | extras: object id |
+
+Each pump, `streamman_poll_active` runs `streamman_check_batch` (0xA7ED40) on every active batch (`streamman_poll_chunk_extras` 0xA7E900 for type 4). The status codes come from `async_io_status` (0xA741A0): 1 pending, 2 error, 3 done, 5 failed. When nothing is pending, `streamman_finish_current` (0xA7CFC0) replays the step sizes into slot +8/+0xC and calls the loading info's completion callback. It returns true for state 4, or false to abort. The read requests are then released (`async_io_release`), and the nodes and the batch go back to their pools.
+
+Completion callbacks: chunk geom `chunk_geom_on_loaded` (0xA84FF0, calls `chunk_load_from_memory` with step 0's buffer/offset/size), chunk peg `chunk_peg_on_loaded` (0xA857A0), character `character_on_loaded` (0xA7FA40), chunk extras 0xA81620.
+
+Type 6 (animation) does not use batches: `streamman_process_sequential` (0xA7D0C0) issues one read at a time and keeps the request in slot +0x18/+0x1C (which is why `streamman_abort_current` cancels those).
+
+Read failures are reported with names from the table at `0xE87BEC` ("UNKNOWN", …), indexed by `async_io_error_code` (0xA74340; 10 = "not enough memory", 0xB = no request).
+
+## Read scheduler ("hdd thread")
+
+Below the streamer, every read goes through one scheduler thread. Its manager is `*(*0xEB80E0)` (the first entry of a manager list: count `0xEB80E8`, capacity `0xEB80E4`). It is created once by `hdd_scheduler_create` (`0xA73F90`), which allocates the 0x44-byte manager from the default mempool, initialises it (`hdd_scheduler_init`, `0xA73030`) and starts the thread with `0xBFA930(hdd_thread_proc, mgr, 1)` (handle at +0x24).
+
+**Correction to the batch section above:** `async_io_status` code 2 means *being read*, not error. The step callback at +0x230 is a progress callback (false aborts). The codes are 0 none, 1 queued, 2 being read, 3 done, 4 cancelled, 5 failed.
+
+| Off | Manager field |
+|---|---|
+| +0x00 | auto-reset event (wakes the thread) |
+| +0x04 | u8 |
+| +0x08 | CRITICAL_SECTION (guards everything below) |
+| +0x20 | |
+| +0x24 | thread handle |
+| +0x28 | name "hdd thread" |
+| +0x2C | u8 stop |
+| +0x2D | u8 allow low-priority reads (priority < 0x22); 1 at init |
+| +0x2E, +0x2F | u8 flags (+0x2F pauses the service loop) |
+| +0x30 | free request list |
+| +0x34 | pending list, sorted by priority (highest first) |
+| +0x38 | finished list (cancelled requests wait here) |
+| +0x3C | request being serviced |
+| +0x40 | request array: 256 x 0x48 bytes |
+
+| Off | Request field (0x48 bytes) |
+|---|---|
+| +0x00 | sequence (bumped on every free; callers pass it back to detect reuse) |
+| +0x04 | file name |
+| +0x08 | name suffix (for messages) |
+| +0x0C | start offset in the file (0 from the streamer) |
+| +0x10 | size |
+| +0x14 | destination |
+| +0x18 | u8 priority (0x70/0x40/0x30 from the streamer; 0x75 when made urgent) |
+| +0x1C, +0x20 | 0 from the streamer |
+| +0x24 | open file while reading |
+| +0x28 | bytes read |
+| +0x2C | state: 1 free, 2 queued, 3 reading, 4 cancelling, 5 cancelled, 6 done, 7 open failed, 8, 9 read failed |
+| +0x30 | one-shot waiter event (async_io_wait_done) |
+| +0x34 | attached wait event (hdd_make_urgent / hdd_attach_wait_event) |
+| +0x38 | u8 released by the owner |
+| +0x3C | manager |
+| +0x40, +0x44 | links |
+
+`async_io_submit` (`0xA73290`, cdecl (mgr, desc[8], bool)) copies the 8-dword description into +0x04..+0x20, sets state 2, inserts it by priority and SetEvents the thread. It returns {request, sequence}.
+
+`hdd_thread_proc` (`0xA72FB0`) calls `hdd_service` (`0xA73C50`, ECX = mgr) with Sleep(5) between passes. One pass:
+1. WaitForSingleObject(event).
+2. Under the lock, takes the pending head as current, unless its priority is below 0x22 and +0x2D is clear. Sets state 3.
+3. Opens the file with `file_open` (0xBFDC20, now Rust), sets the start offset, reads with `file_read` (0xBFE170, Rust) into the destination, and closes with `file_close` (0xBFDF30, Rust). The file's error field (+0x158) picks the final state: 0 → 6, 3 → 5, else 9. An open failure gives 7.
+4. `hdd_finish_current` (`0xA73150`) sets the state through `async_io_set_state` (`0xA739A0`, which signals waiters) and recycles the record at once if the owner already released it.
+5. Repeats until the pending list is empty or the head is gated.
+
+Cancel/release: `async_io_cancel_impl` (`0xA73430`) moves a queued request to the finished list (state 5), or marks the current one cancelling (state 4) and aborts its file read (`0xBFDAF0`). `async_io_free` (`0xA73650`) waits if the request is still in flight, then bumps the sequence and returns the record to the free list.
+
+Blocking waits: `hdd_make_urgent` (`0xA73AC0`) bumps queued requests to priority 0x75 and attaches events. `async_io_wait` (`0xA738B0`) / `async_io_wait_event` (`0xA73850`) wait on them. `async_io_wait_done` (`0xA73900`) waits using the calling thread's event (TLS +0x78). Wait events come from a small pool object at `0xEB80C0` (vtable slot 1 free, slot 2 alloc).
+
+Debug: flag `0x2529DDB` makes reads of `player.cvtf` copy from memory (`0x2223CC0`); flags `0x2529DD5..DD7` force release modes; `0x2529DDA` changes how files are opened and skips `0xBFE600` after a read.
