@@ -16,6 +16,10 @@ use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryA;
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 
+#[cfg(feature = "caller-survey")]
+mod caller_targets;
+#[cfg(feature = "caller-survey")]
+mod callers;
 mod detour;
 mod hooks;
 mod mempool;

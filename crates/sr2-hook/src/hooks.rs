@@ -2102,6 +2102,9 @@ pub fn install_all() {
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }
+        // Logs the callers of unnamed virtual methods; last, so ported slots are skipped.
+        #[cfg(feature = "caller-survey")]
+        crate::callers::install();
     });
 }
 
