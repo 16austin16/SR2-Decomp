@@ -393,3 +393,31 @@ Teleport test, original vs Rust: identical completions (647 chunk geom, 23 peg, 
 2 type 7 slots, each from reading to loaded) and identical aborts (32 each). Outside the
 random ambient vehicle/character loads, the two event logs are the same.
 
+
+## Batch cleanup helpers and the streamed mesh cache
+
+Callees of the ported functions that were still unnamed:
+
+- `streamman_batch_release` (0xA7DCD0) runs `streamman_batch_cancel_pending` (0xA7D9C0), which calls `async_io_cancel_impl` on every pending node. It then runs `streamman_batch_free_pending` (0xA7DA30) and `streamman_batch_free_finished` (0xA7DB30) with the mode. Both call `async_io_free(request->mgr, request, sequence, mode)` on each node of their list (+0xC and +0x10), clear node +0x10/+0x14 and return the node to the pool 0x252A020.
+- The stores to 0x2529E28 in those loops (from `*0x2529E24` when a node's request is null or its sequence does not match) are debug checks with no effect on the logic.
+- `streamman_read_nodes_free_list` (0xA7DD50, EAX = list) returns a whole node list to the pool. `start_chunk_extras` uses it to drop its temporary list.
+- `path_change_extension` (0xBFF930, ECX = src, stack out/size/ext) is used by `start_chunk_extras` and `check_batch` to build the part file names. It returns false if the result would not fit.
+
+`start_chunk_extras` and the chunk-extras request path go through a **streamed mesh cache** (0x6E6310-0x6E6CB0). Records are keyed by the object template (`object_template_find` 0x931060: table 0x2BC5B00, 0x90 bytes each, found by name hash).
+
+| Off | Mesh cache record |
+|---|---|
+| +0x00, +0x04 | links |
+| +0x08, +0x49, +0x8A, +0xCB | file names (0x41 each): .smesh_pc, .g_smesh_pc, .peg_pc, .g_peg_pc (the g_ ones are emptied if the file does not exist) |
+| +0x10C | mesh object (vtable); its +0x54 is the peg object |
+| +0x110 | key: object template |
+| +0x114 | u8 pool (template +0xD) |
+| +0x116 | u16[6] chunk ids that reference it, 0xFFFF free |
+| +0x122 | u8 loaded |
+| +0x124.. | part data set by `streamman_poll_chunk_extras` |
+
+There are two pools. Pool 0 uses free list 0x15125A0, active list 0x151259C and free count 0x2527D64. Pool 1 uses 0x1512598, 0x147A514 and 0x2527D68. Everything is skipped when 0x2528B48 == 1 and 0x2528B49 == 0.
+
+- **Request:** `smesh_cache_filter_requests` (0x6E6B80) drops objects whose mesh is already resident and adds the chunk to existing records.
+- **Start:** `start_chunk_extras` calls `smesh_cache_add_ref` (0x6E63F0). If the pool is full, it evicts an unreferenced record (`smesh_cache_find_unreferenced` + `smesh_cache_free`). For a record already loaded, it only adds the chunk id (`smesh_cache_record_add_chunk` 0x6E6B30).
+- **Unload:** `streamman_release_chunk_extras` (0xA84410, chunk id) calls `smesh_cache_release_chunk` (0x6E6720) for each object of the chunk. The last reference to an unloaded record frees it.
