@@ -100,29 +100,104 @@ Stick 0 is the move stick; stick +0x40 (`0x2348534`) is the camera / look stick.
 
 **Mouse buttons**: `0x234F473` / `0x234F47B` / `0x234F483` (left, right, middle; 8-byte stride).
 
-## Controls (actions)
+## Bindings (input.bin)
 
-The game reads a control through `input_get_control_value` (0xC010C0; EAX = control, EDX = pad). It **sums every source bound to the control** and scales the result. The control table is `0x23476FC`, 0x1C bytes per control:
+`input.bin` is 0x2C8 bytes:
 
-| Off | Source | Read |
+| Range | Contents |
+|---|---|
+| 0x000-0x2B7 | `0x234E778`: **87 entries of 8 bytes**, one per button record, `{u32 key, u32 pad_button}` |
+| 0x2B8-0x2C7 | `0x234E768`: four u32 stick-axis indices (left x, left y, right x, right y) into the pad's raw axes |
+
+- **key** is a DirectInput scan code (`DIK_*`, 0-255), or 0x100 / 0x101 / 0x102 for the left / right / middle mouse button. -1 means unbound.
+- **pad_button** is an index into the pad's raw button bytes (pad +0xF68), or -1.
+
+**Defaults:**
+- `input_default_key_bindings` (0xC12090) copies 87 keys from `0xE829A0`: W, S, A, D, E, Space, Q, Space, Right, Up, Left, Down, Enter, Esc, … (`DIK_W` = 0x11, …). It then calls 0xBA45C0(0xBA2F60).
+- `input_default_pad_bindings` (0xC120D0) copies the 87 pad buttons and the four axis indices for the pad layout `0x23486FC`:
+
+  | Layout | Buttons | Axes |
+  |---|---|---|
+  | 0 (and 3 = XInput) | `0xE82B38` | `0xE830CC` |
+  | 1 | `0xE82CB0` | `0xE830DC` |
+  | 2 | `0xE82E10` | `0xE830EC` |
+  | 4 | `0xE82F70` | `0xE830FC` |
+
+`input_dinput8_create` runs both default functions, then overwrites the block with `input.bin` when the file exists and is the right size. Otherwise `input_save_bindings` (0xC12200) writes the defaults out.
+
+**How they are used**: `input_map_keyboard_mouse` sets button record *i* to 1.0 when `input_key_down(bindings[i].key)` is true. The XInput / DirectInput pad code sets it to `raw[bindings[i].pad_button] / 128`. The two sources fill the same 87 records, so gameplay never sees which device a press came from.
+
+## Window procedure side
+
+`input_wndproc_keys` (0xC10CD0) takes (msg, lParam) cdecl. WinMain registers it as a message callback, and it only runs while `0x252A54E` is set. The scan code is `(lParam >> 16) & 0xFF`, plus 0x80 for extended keys (lParam bit 24).
+
+| Message | Action |
+|---|---|
+| WM_KEYDOWN (0x100), WM_SYSKEYDOWN (0x104) | `input_key_queue_push`(scan, down = 1) into the event ring `0x2348A80`. A left Ctrl (0x1D) sent while right Alt is held (`GetAsyncKeyState(VK_RMENU)`) is dropped (AltGr). |
+| WM_KEYUP (0x101), WM_SYSKEYUP (0x105) | push `{scan, delay 1}` into the key-up ring `0x2348980` |
+| WM_SETFOCUS (7), WM_KILLFOCUS (8) | `input_keyboard_reset` |
+
+The mouse has its own callback, 0xC19350 (also registered from WinMain). It accumulates the wheel into `0x234F460` and sets the button bytes `0x234F473 / 0x234F47B / 0x234F483`.
+
+`input_keyboard_events` (0xC11710) then runs once per frame:
+1. Pass every queued down event to `input_key_event` (0xC10B80; cdecl (scan, down)). It sets key +0, records the press time, and pushes a typed-key code with modifier bits into the text ring `0x2349780` (32 entries, write `0x234897C`, read `0x2349800`): 0x1000 Shift, 0x2000 Alt, 0x4000 Ctrl, 0x8000 the grave key.
+2. Release keys from the key-up ring, but only after they have been down for at least one frame. The delay byte counts down.
+
+While a rebind is being captured, key events go to `0x2349848[scan]` instead.
+
+## The free-camera control table
+
+`input_get_control_value` (0xC010C0) and its table at `0x23476FC` are **not** the gameplay bindings. They are the **debug / free camera's** 15 controls:
+- `camera_controls_init` (0xC01570, from game init 0x51F700 and 0x493120) copies the table from the static data at `0xDC8308`, sets two sensitivities (`0x234789C` / `0x23478A0`), and sets `0x252A53A`.
+- The only reader is the free camera, 0xC01650 (from 0x5011A0).
+
+Each entry is 0x1C bytes:
+
+| Off | Field |
+|---|---|
+| +0x00 | pad button record index |
+| +0x04 | key |
+| +0x08 | stick direction 0-7 |
+| +0x0C | mouse direction 0-5 (X+, X-, Y+, Y-, wheel up, wheel down) |
+| +0x10 | mouse button |
+| +0x14 | scale (1.0) |
+| +0x18 | id |
+
+The defaults are W / S / A / D on the move stick, the numpad arrows on the look stick and mouse, LShift / LCtrl, Tab, Space and Q / E.
+
+Mouse look in **gameplay** goes through the look stick (`0x2348534` / `0x2348538`), which `input_map_keyboard_mouse` fills from the mouse delta: (dx / 30) × sensitivity `0x25F5C98` / `0x25F5C9C`.
+
+## Porting order (input_do_frame's tree, leaves first)
+
+| Function | Convention / registers | Output |
 |---|---|---|
-| +0x00 | pad button index | 0 when that button is eaten |
-| +0x04 | key (0-255, or a mouse button) | only when keyboard input is enabled (`0x252A545`) |
-| +0x08 | stick direction 0-7 | ±x / ±y of the move stick (0-3) or the look stick (4-7) |
-| +0x0C | mouse direction 0-5 | X+, X-, Y+, Y-, wheel up, wheel down. Only when mouse input is enabled (`0x252A546`). dx × `0xE83E1C` × 0.06; Y is inverted unless `0x252A547` is set. |
-| +0x10 | mouse button | |
-| +0x14 | scale (float) | |
+| `fabsf` 0x49EE60 | cdecl (float) | ST0 |
+| `input_key_down` 0xC111D0 | EAX = key | AL |
+| `input_repeat_timer` 0xC061C0 | ESI = 12-byte timer, XMM0 = axis value | writes the timer (+8 = pulse) |
+| `input_button_analog` 0xC06870 | EAX = button record | ST0 value |
+| `input_key_queue_push` 0xC10B10 | cdecl (scan byte), DL = down | ring write |
+| `input_key_event` 0xC10B80 | cdecl (scan, down) | key table, text ring |
+| `input_keyboard_reset` 0xC10EB0 | none | |
+| `input_keyboard_events` 0xC11710 | none | |
+| `input_stick_deadzone` 0xC13A90 | EDI = &axis, cdecl (deadzone) | axis in place |
+| `input_pad_reset_buttons` 0x75C700 | EAX = pad record | clears the 87 records |
+| `input_map_keyboard_mouse` 0xC13660 | none | button records, sticks |
+| `input_poll_xinput` 0xC13C80 | cdecl (pad record) | pad raw bytes, sticks, button records |
+| `input_poll_dinput` 0xC141D0 | cdecl (pad record); device at +0xE58: Poll (vtable +0x64), GetDeviceState | same |
+| `input_rebind_capture_keys` 0xC12910 / `input_rebind_capture_pad` 0xC12B00 | none | the bindings block |
+| `input_poll_devices` 0xC14780 | none | |
+| `input_do_frame` 0xC063D0 | none | button records, sticks, idle time |
+| `mouse_update` 0xC1F320 | none (critical section `0x234F9E0`) | mouse deltas, wheel delta |
 
-Each field is -1 when unused. The mouse camera is control → +0x0C (mouse X/Y), together with the look stick that `input_map_keyboard_mouse` fills from the same deltas.
+The pad record base is `0x23478A8` (stride 0x104C). Its 87 button records start at +0x10 (`0x23478B8`) and its 8 sticks at +0xC4C (`0x23484F4`).
 
 ## Consumers and "eating"
 
-- **vint** runs `vint_input_do_frame` after `input_do_frame`. When a Lua subscription consumes an event, `vint_input_mark_consumed` sets the eaten flags of its buttons (+0x20), sticks (+0xE/+0xF) and keys (+2). From then on `input_get_control_value` returns 0 for them that frame (06_vint.md).
-- **The game** reads controls only through `input_get_control_value` and the button records. That is why eating at the record level hides input from gameplay.
+- **vint** runs `vint_input_do_frame` after `input_do_frame`. When a Lua subscription consumes an event, `vint_input_mark_consumed` sets the eaten flags of its buttons (+0x20), sticks (+0xE/+0xF) and keys (+2). From then on the game reads them as not pressed / zero that frame (06_vint.md).
+- **The game** reads the button records and sticks directly (the free camera also goes through `input_get_control_value`). That is why eating at the record level hides input from gameplay.
 - `0x252A54F` blocks all keyboard reads (text entry).
 
 ## Open
 
-- The exact layout of the 0x2B8-byte bindings block in `input.bin`, and how it fills the control table `0x23476FC` (0xC12090 / 0xC120D0 / 0xC13500).
-- The names of the 87 buttons (the controls menu strings).
-- The window procedure itself.
+- The names of the 87 buttons (match the default keys to the controls menu strings).
+- The force-feedback setup 0xC13500 (DirectInput constant-force effect) and rumble.
