@@ -638,7 +638,7 @@ It picks the shader set from the flags with `(f >> 4 & 0x200 | f & 0x180) >> 7` 
    | +4 | &inst+0x14 (rotation) |
    | +8 / +0xC | &inst+0x50 / +0x60 (AABB) |
    | +0x10 | mesh |
-   | +0x14 | &inst+0x98 (cached light set, 0x144 bytes, valid flag +0x140) |
+   | +0x14 | &inst+0x98 (cached transform-stack entry, 0x144 bytes, valid flag +0x140) |
    | +0x18 | &inst+0x1DC (cached camera distance²) |
    | +0x1C | byte flags from inst+0x95 (1 → 2, 2 → 4, 4 → 8) |
    | +0x1D | byte inst+0x5C |
@@ -652,10 +652,11 @@ It picks the shader set from the flags with `(f >> 4 & 0x200 | f & 0x180) >> 7` 
 7. Restore the fade to 1.0.
 
 **`mesh_render_generic`** (0xD06430), step by step:
-1. **Lighting.** If the cached light set is valid and `0x252A338` is set, apply it (0xD23660) and reuse the cached distance. Otherwise:
+1. **Transform.** If the cached entry is valid and `0x252A338` is set, `gfx_transform_push_cached` it and reuse the cached distance. Otherwise:
    - compute the squared distance from the camera (`gfx_get_thread_state()`) to the AABB (SSE);
-   - copy the 0x144-byte light set for the current view (`thread_state + 0x1554` index) into the cache and mark it valid.
-2. 0xD04FC0(mesh).
+   - `gfx_transform_push` from the descriptor;
+   - copy the new top entry into the cache and mark it valid.
+2. `mesh_vertex_cache_select(mesh)` (0xD04FC0).
 3. **Index buffer:** mesh+8 → +0x10. If it differs from the cache `0x252A310`, write command 10 (SetIndices).
 4. `gfx_set_material_constants(desc+4, arg, desc+0x28)` (0xD1B100): the world transform constants.
 5. **For each submesh.** The count is the u16 at mesh+2, and each submesh is a 16-byte record from mesh+4:
@@ -673,14 +674,14 @@ It picks the shader set from the flags with `(f >> 4 & 0x200 | f & 0x180) >> 7` 
    2. `gfx_bind_vertex_stream`. If it returns 0, look up the declaration in `ctx+0x308[a × 5 + b]` and write command 5 if it changed (cache `0x252A30C`).
    3. Stream source: command 8 `{0, buffer, base × stride, stride}`, unless it matches the cache `0x2304D8C / 0x2304D6C / 0x2304D7C`.
    4. Material (`(mesh+0xC)+4 + material × 0x18`):
-      - its shader id goes through 0xD01DA0 / 0xD01D20, optionally remapped by `0x2302D0C` when `0x252A339` is set;
+      - its shader id (optionally remapped by `0x2302D0C` when `0x252A339` is set) goes to `gfx_material_vs_constants` / `gfx_material_ps_constants`;
       - its sampler states (count +0xC, 6-byte `{stage, type, value}` at +0x14) go out as command 0x13, cached in `0x22F52F0[stage × 16 + type]` (stages below 20, types below 16).
-   5. 0xD049E0 (textures and constants from the material set at desc+0x3C).
-   6. 0xD19D00(distance).
-   7. `gfx_bind_shaders(pass, 0, decl a, decl b)` (0xD1A860): the pass picks the shader variant.
+   5. `gfx_bind_material_textures` (textures from the material set at desc+0x3C).
+   6. `LOD = gfx_shader_pick_lod(distance)`.
+   7. `gfx_bind_shaders(pass, 0, decl a, decl b)` with that LOD.
    8. If there are any primitives: `gfx_cmd_draw_indexed(5 = D3DPT_TRIANGLESTRIP, start index, index count − 2)` (0xD21650).
-   9. For each bone-matrix slot of the material set below −1: 0xD19FA0. Then 0xD17D40.
-6. Decrement the thread state's nesting counter (+0x1554).
+   9. `gfx_unbind_special_texture` for each special slot, then `gfx_sampler_states_pop`.
+6. Pop the transform (`ts+0x1554 −= 1`).
 
 **Porting order:**
 1. The list adders and `render_lists_reset`: plain arrays with an atomic counter.
@@ -692,9 +693,117 @@ It picks the shader set from the flags with `(f >> 4 & 0x200 | f & 0x180) >> 7` 
 7. `mesh_render_generic`. It sits on functions that are already ported: `gfx_cmd_*`, `gfx_bind_shaders` and `gfx_set_material_constants`.
 8. `mesh_render_depth` and `mesh_render_pass7`, which follow the same shape.
 
-**Open:**
-- What each of passes 0-7 is (opaque, alpha, decal, water, sky).
-- 0xD04FC0, 0xD049E0 and the light-set layout.
+**Open:** passes 5 and 0xA (see the next section).
+
+### Mesh-path leaves, for porting
+
+Ring command numbers are from the table in 07_render.md:
+- 3 / 4: pixel / vertex shader;
+- 5: vertex declaration;
+- 6 / 7: VS / PS constants `{reg, count, vec4s}`;
+- 8: stream source;
+- 10: indices;
+- 14: texture `{stage, texture}`;
+- 15: render state `{state, value}`;
+- 0x13: sampler state `{stage, type, value}`.
+
+`ctx` is the render context (`[fs:0x2C][0]+0x58`). `ts` is `gfx_get_thread_state()`.
+
+**Render passes.** The `pass` argument of `render(pass, arg)` is not a list index. It is the technique column that `gfx_bind_shaders` looks up in each shader. Values and where they are used:
+
+| Pass | Used by | What it is |
+|---|---|---|
+| 0 | `render_env_cubemap` (each face), 0x525BB0 at the end of render3 | plain lit draw (environment map and late world) |
+| 3 | `rl_mesh_inst::render` → `mesh_render_depth` | shadow map depth |
+| 4 | 0x526C50, once per extra view in render3 (0x528A10) | extra views (views 1.. at `0x2612D18`) |
+| 5 | 0x524750 (visibility list) in render4b (0x527020) | *open* |
+| 7 | 0x5258B0 in render2:b (0x528820) → `mesh_render_pass7` | depth only: `gfx_bind_shaders` sets `D3DRS_COLORWRITEENABLE` (0xA8) to 0. It fills the depth that render3 resolves |
+| 8 | `render_stage2_a4` in render2:a3, 0x527A60 in render4 | main view: opaque world, then the pass 6 list (transparent) |
+| 0xA | 0x529EB0 in render1 (pass 4 list) | *open*: drawn before the main passes |
+
+So "opaque / transparent" is decided by which list an instance is in (2, 1 / 6), and "depth / shadow / main" by the pass.
+
+**The transform stack** (what I called the light set before). Each thread state has a stack of 0x144-byte entries at `ts + 0x114 + level × 0x144`, with the depth at `ts+0x1554`:
+
+| Off | Field |
+|---|---|
+| +0 | matrix 0 (4×4, from 0xBE62B0; probably world × view × projection) |
+| +0x40 | matrix 1 (4×4; probably world × view) |
+| +0x80 | world matrix: the 3×3 rotation rows with w = 0, then the position with w = 1 |
+| +0xC0..+0x143 | the rest of the entry, copied as a whole. +0x140 is the cache-valid byte in an instance's copy |
+
+- **`gfx_transform_push`** (0xD233B0; `EAX` = &rotation 3×3, `ECX` = &position, cdecl `(bool absolute)`):
+  1. Depth += 1.
+  2. The world matrix is the rotation and position, or, with a parent level and `absolute` = 0, combined with the parent (0xBE62B0).
+  3. Matrices 1 and 0 are rebuilt from it.
+  4. `gfx_transform_apply`.
+- **`gfx_transform_push_cached`** (0xD23660; cdecl `(entry *)`): depth += 1, copy the 0x144-byte entry in, then `gfx_transform_apply`.
+- **`gfx_transform_apply`** (0xD229B0): when deferring (`0xE849DB`) or on a context other than the main one, 0xD18EE0 uploads the matrices.
+- The pop is inline: `ts+0x1554 −= 1` at the end of each `mesh_render_*`.
+
+`rl_mesh_inst` keeps a copy of its entry at +0x98 and its camera distance² at +0x1DC. `mesh_render_generic` pushes that copy when it is valid and `0x252A338` allows the cache. Otherwise it pushes from the descriptor (`EAX` = desc+4, `ECX` = desc+0, absolute 0) and copies the new top (`ts + depth × 0x144 − 0x30`) into the instance.
+
+**`gfx_set_material_constants`** (0xD1B100; `EAX` = &position; cdecl `(&rotation, light *, &scale)`). 0xBDE500 transforms each vector after it is built:
+
+| Constant | Command | Value | Context copy |
+|---|---|---|---|
+| VS c10 | 6 | camera (`ts`+0) − position | ctx+0x650 |
+| VS c19 | 6 | scale, w = 1 | ctx+0x6B0 |
+| PS c18 | 7 | lighting camera (ctx+0x5C0) − position; w = the LOD distance ctx+0x6E4 | ctx+0x6D0 |
+| VS c2 | 6 | when a light is given: light+0x10 − position, w = 1 | ctx+0x5D0 |
+| VS c18 | 6 | when the light's type (+0) is 2: its direction (+0x1C), w = 0 | ctx+0x630 |
+
+**`gfx_set_instance_fade`** (0xD1A620; cdecl `(f32 fade)`): if fade ≠ ctx+0x6E0, store it and write command 7 (PS c4) `{ctx+0x6E8 ? 0 : 1.0, ctx+0x6EC, 0, fade}`.
+
+**`gfx_shader_pick_lod`** (0xD19D00; `EAX` = shader id, cdecl `(f32 distance²)` → LOD in `EAX`):
+1. The shader record is `ctx+0x484 → [id × 0xC + 8]`.
+2. With fewer than 2 LODs (+9 byte), return 0.
+3. Otherwise add the squares of the thresholds at +0x30 one at a time. Return the first index where the sum exceeds the distance, or the last LOD.
+
+**`gfx_bind_shaders`** (0xD1A860; `ECX` = shader id, `EAX` = LOD; cdecl `(pass, column, decl a, decl b)`):
+1. Clamp the LOD to the shader's count − 1.
+2. `technique = (s16) shader+0x2C → [pass × 8 + 4] → [column]`.
+3. Store id, LOD, technique, a, b in ctx+0x46C..+0x47C.
+4. The pair is `shader+0x28 → [LOD] + technique × 8`: {vertex shader, pixel shader}.
+5. Vertex shader (0 → default `0xE84B98`): command 4 if it differs from the cache `0x22F2AEC`.
+6. Pass 7: render state 0xA8 (color write) = 0 through the render-state cache `0x22F57F0[state]`.
+7. Pixel shader (the default `0xE84B9C` when ctx+0x480 is clear or the pair has none): command 3 if it differs from `0x22F2AE8`.
+
+**Material constants** (`EDX` = the material set desc+0x3C, `ECX` = material row; cdecl `(shader id)`):
+- `gfx_material_vs_constants` (0xD01DA0) reads entry `set+0 → [row × 8]`: {size, float offset}.
+- If the size is non-zero, it writes command 6 to register `shader+0x17`. The data is `size >> 2` vec4s from `set+0xC` + offset × 4.
+- `gfx_material_ps_constants` (0xD01D20) does the same from `set+4` with command 7.
+
+**`gfx_bind_material_textures`** (0xD049E0; `EAX` = row; cdecl `(&saved count, set, slot count)`). For each slot `v = set+0x10 → [row × 0x40 + i × 4]`:
+- If `v ≥ −1`, it is a texture: `gfx_set_texture_cached`.
+- Otherwise it is a special texture `id = v & 0x7FFFFFFF`:
+  - For ids 1 and 0x1E, first build a 3×3 product (0xD01C30, as 3 vec4s) and send it as VS c15 and PS c15 (3 registers each).
+  - Then `gfx_bind_special_texture` (0xD1ADC0; `EAX` = id, `ESI` = stage). Ids 1-4 read ctx+0x304 + id × 0x10, and ids 0x10-0x1E read ctx+0x254 + id × 0x10. The record is {texture, three sampler settings}.
+  - It writes command 14 if the texture differs from the cache `0x22F2AF0[stage]`, and pushes the settings that aren't −1 (0xD17E20). Each push adds to the saved count.
+
+After the draw, `gfx_unbind_special_texture` (0xD19FA0; `EAX` = id, `EDX` = stage) handles ids 1-4: it clears the bitmap cache `0xE84AA8[stage]` and resets sampler types 1 and 2 (address U / V) to 1 (wrap).
+
+`gfx_sampler_states_pop` (0xD17D40; `EAX` = count) pops that many saved `{stage, type, old value}` entries:
+- They live in ctx+4 (12 bytes each, count at ctx+0x304, at most 0x40).
+- Each restore is a command 0x13 through the sampler cache `0x22F52F0[stage × 16 + type]`.
+
+`mesh_render_generic` pushes one entry per material sampler state it changes and pops them all after each submesh.
+
+**`mesh_vertex_cache_select`** (0xD04FC0; cdecl `(mesh)`) only runs when `0x252A378` is set and `0xE863BC` is clear:
+1. Initialise once (0xBD9AC0).
+2. Look up the mesh's vertex buffer (+8 → +8 → +0xC) in a cache (0xBD9C80), and create the entry if it is missing (0xBD99B0, 0xD00C30, 0xD04CD0).
+3. If the entry is active (+0x108), call 0xD04CD0 and set `0x252A334` = entry. Otherwise set `0x252A334 = 0` and call 0xD01480.
+
+*Its role (per-mesh vertex lighting or instancing data) is open.* With `0x252A378` = 0 it does nothing.
+
+**Porting order:**
+1. `gfx_shader_pick_lod`, `gfx_set_instance_fade`, `gfx_sampler_states_pop`, `gfx_unbind_special_texture` (no dependencies).
+2. `gfx_bind_shaders`.
+3. The two material-constant writers.
+4. `gfx_bind_special_texture` and `gfx_bind_material_textures`.
+5. `gfx_transform_push`, `_push_cached` and `_apply` (they need 0xBE62B0 / 0xD18EE0, the matrix maths and the upload).
+6. `gfx_set_material_constants` (needs 0xBDE500).
+7. `mesh_vertex_cache_select` can stay original: it is off unless `0x252A378` is set.
 
 ## render_frame (0x52A710), by profiler stage
 
