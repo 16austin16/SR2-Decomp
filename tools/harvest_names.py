@@ -224,6 +224,12 @@ def ctors_dtors(x, starts, names):
         elif stores[0][0] - f <= 12 and b"\xE8" not in x.d[f - BASE:stores[0][0] - BASE]:
             cls = stores[0][1]
             out[f] = (f"{cls}::dtor", f"writes the {cls} vtable first and doesn't return this")
+    # A destructor shared by several scalar deleting destructors belongs to the
+    # base-most of their classes.
+    nbases = {}
+    for r in csv.DictReader(open(ROOT / "docs/rtti_classes.csv", encoding="utf-8")):
+        nbases[nice_class(r["name"])] = len([b for b in r["bases"].split(" ; ") if b])
+    callers = defaultdict(list)
     for f, name in names.items():
         if not name.endswith("::scalar_deleting_dtor"):
             continue
@@ -234,7 +240,10 @@ def ctors_dtors(x, starts, names):
         if test and 0 <= call < test.start():
             tgt = f + call + 5 + struct.unpack_from("<i", body, call + 1)[0]
             if x.lo <= tgt < x.hi and tgt not in after_alloc:
-                out[tgt] = (f"{cls}::dtor", f"called first by {cls}::scalar_deleting_dtor")
+                callers[tgt].append((nbases.get(cls, 99), cls))
+    for tgt, cs in callers.items():
+        cls = min(cs)[1]
+        out[tgt] = (f"{cls}::dtor", f"called first by {cls}::scalar_deleting_dtor")
     return out
 
 

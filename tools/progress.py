@@ -10,6 +10,7 @@ int3 padding). Inlined code, jump-table-only and pointer-only functions are
 missed, so the real total is somewhat higher; Havok and the CRT are counted.
 """
 import csv
+import re
 import struct
 import sys
 from collections import Counter, defaultdict
@@ -114,6 +115,9 @@ def render(stats, areas, out):
     parts.append(bar(pad, y, inner, s["known_n"] / s["total_n"], "Functions identified (incl. auto-named: script bindings, library matches, vtable slots)",
                      f'{s["known_n"]:,} of ~{s["total_n"]:,} ({100 * s["known_n"] / s["total_n"]:.1f}%)', "known"))
     y += 52
+    parts.append(bar(pad, y, inner, s["named_n"] / s["total_n"], "Functions with descriptive names (identified minus Class::vfN placeholders)",
+                     f'{s["named_n"]:,} of ~{s["total_n"]:,} ({100 * s["named_n"] / s["total_n"]:.1f}%)', "known"))
+    y += 52
     parts.append(bar(pad, y, inner, s["hand_n"] / s["total_n"], "Functions analysed by hand (named and documented, incl. Rust)",
                      f'{s["hand_n"]} of ~{s["total_n"]:,} ({100 * s["hand_n"] / s["total_n"]:.2f}%)', "known"))
     y += 40
@@ -158,6 +162,7 @@ def main(exe, out):
         "rust_b": sum(sz.get(a, 0) for a, *_ in rust),
         "known_n": len(funcs),
         "hand_n": sum(not f[4].startswith("auto") for f in funcs),
+        "named_n": sum(not re.search(r"::vf\d", f[1]) for f in funcs),
     }
     by_area = defaultdict(lambda: [0, 0])
     for _, _, area, status, _ in funcs:

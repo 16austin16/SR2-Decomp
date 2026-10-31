@@ -9,7 +9,9 @@ no game files; you need your own copy of the game.
 
 The original functions are replaced one at a time while the game runs. Each replacement is checked against the original in-game before it counts. The file system (archives, open/read/write/close) and the main memory-pool allocators are done; see `docs/PLAN.md` for the milestones.
 
-Update the graphic after porting something: `python -I tools/progress.py bin/SR2_pc.unpacked.exe docs/img/progress.svg`
+Functions are identified mostly by `tools/harvest_names.py`: Lua script bindings, Ghidra library matches, RTTI vtable slots and constructors/destructors. Virtual methods worked out by hand are recorded per base class in `docs/vtable_slots.csv`, and the name is applied to every subclass's override (for example `fuzz_crime::get_bar_title` names that method in all 44 crime types).
+
+Update the graphic after porting or naming something: `python -I tools/progress.py bin/SR2_pc.unpacked.exe docs/img/progress.svg`
 
 ## Layout
 - `docs/PLAN.md`: strategy and milestones
