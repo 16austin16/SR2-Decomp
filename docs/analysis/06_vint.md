@@ -1,0 +1,208 @@
+# 06: vint, the Lua-driven UI
+
+vint is Volition's UI runtime. A UI screen is a **document** (`.vint_doc`): an XML tree of **elements** (bitmaps, text, groups, …) and **animations** made of **tweens**, plus a Lua script that drives it. The game ships the documents in packages listed in `vint_file_packages.xtbl` and names them in the project `sr2.vint_proj`.
+
+Names below are in `docs/functions.csv` (subsystem `vint`) and the method names in `docs/vtable_slots.csv`. Status: mapped from the code, nothing ported yet.
+
+## Where it runs
+
+| Function | Address | When |
+|---|---|---|
+| `interface_init` | 0x7F3010 | once, from game init 0x51F600 |
+| `interface_do_frame` | 0x7F3500 | per frame: from `sim_frame` in gameplay, and from the menu game states |
+| `interface_render` | 0x7F33B0 | per frame from the menu game states (main menu, multiplayer menus, loading) |
+| `hud_document_render` | 0x799010 | renders only the HUD document (handle `0x252853C`); no direct callers or pointer references were found, so how it is reached in gameplay is still open |
+
+The path from the frame is:
+- `game_frame_tick` (0x520450) → `game_state_frame` (0x697780) → `game_state_dispatch` (0x697490).
+- The dispatch calls `overlays_update`, then a jump table over 11 game states: main menu 0x73DCB0, `gameplay_do_frame`, 0x830AB0, multiplayer menus 0x834D40, 0x82F570, 0x73B7F0, 0x688FE0. It ends with `overlays_render`.
+- The menu states call `interface_do_frame` and `interface_render` themselves. Gameplay updates through `sim_frame`.
+
+**interface_init:**
+1. Fills four platform callback tables (function pointers the vint core calls back into):
+
+   | Table | Global | Use |
+   |---|---|---|
+   | `0x1FD4FEC` | `0x252A1D4` | render |
+   | `0x1FD52B0` | `0x252A1D8` | draw: [0] begin document, [+0x18] per element, [+8] mask end |
+   | `0x1FD52E8` | `0x252A1DC` | |
+   | `0x1FD509C` | `0x252A1E0` | input / text: 0x7EDC00 virtual keyboard, 0x7ED840 |
+
+2. Creates the string pool "Vint" (`0x2528B10`).
+3. `vint_init` (0xB91EC0) registers the types and loads the project.
+4. `vint_lua_init` (0xB914F0).
+5. Screen-state table `0x252A238`, `interface_register_lua_functions` (0x7EFA10, the game-side bindings).
+6. Document-unload hook `0x252A1EC` = 0x7543E0.
+7. Localised image tags (0x7F1FB0 / 0x7F2040, `%s_TXT` / `%s_IMG`).
+8. `vint_file_packages_load` (0x7EC4E0), then sets the ready flag `0x2528AFF`.
+
+**interface_do_frame:**
+1. Return if not ready.
+2. Refresh the image tags when the player's in-vehicle state flips (`0x347AF34`).
+3. Input: 0x7EC170, 0x7F3450.
+4. 0xB95290, 0xB94560, 0xB9EA70.
+5. `vint_update_documents(*0xE87998)`, the frame time.
+
+**interface_render:**
+1. Run the screen-state callback `0xE8CF94 + state*0x10` (state `0xE8CF80` < 0x15).
+2. Reset the render params (`0x2A14B28`, `0xEB15BC` = white).
+3. `0xD148D0` / `0xD14840`, then `vint_render_documents`.
+
+## Documents
+
+Records live in a fixed table at `0x319F6B0`: 12 documents, 0x57C bytes each. The loaded ones are on a circular list headed by `0x252A1AC` (link at +0). A document **handle** is index | generation << 16, and it is valid while doc+0x4C equals the handle.
+
+| Off | Document field |
+|---|---|
+| +0x00 | list link |
+| +0x28 | name (the `<name>_init` Lua function is formed from it) |
+| +0x48 | name hash (`0xBDC9B0`) |
+| +0x4C | handle |
+| +0x458 | root element |
+| +0x45C | float time |
+| +0x460 | u8 paused |
+| +0x572 | u8 unload pending (set when the reference count drops below 1) |
+| +0x578 | reference count |
+
+**Loading** happens in `interface_document_load` (0x7F3720), the target of `vint_document_load(name)`:
+1. Find the package for the name in `vint_file_packages` (`0x2528B1C`, count `0x2528B20`, 0xC bytes {name, entries, count}). Collect it and its dependencies, up to 64.
+2. Every entry is {file, kind}:
+   - **kind 0, document:** if it is already loaded, only increment the reference count. Otherwise resolve the file through the project table `0x22EF628` (0x88 bytes each, count `0x252A244`), then `file_resolve` and allocate.
+   - **kind 1, peg:** `.peg_pc` + `.g_peg_pc` via 0x7398A0.
+   - **kind 2, Lua script:** resolve and allocate size+1.
+3. Read all files synchronously (0xA7D890).
+4. In three passes (documents, pegs, scripts), build them:
+   - document: `vint_document_alloc` (0xB8AD80), then `vint_document_create(data, allocator)` (0xB8B220), which parses the XML;
+   - peg: 0x7395B0;
+   - script: NUL-terminate and run with Lua's dobuffer (0xCDE2E0).
+5. For each new document, look up the Lua function `<name>_init` (0xCE0120). If found, create a Lua thread (0xCE01E0), set thread+0x14 = document handle, and run it (0xCE0570) unless flag 0x40 is set.
+6. Drop the load reference and add a reference to every `doc_dependency`.
+
+The .vint_doc XML tags: `vint_doc_type`, `vint_document`, `vint_doc_version`, `document_depth`, `doc_dependency`, `root_animation`, `safe_frame`, `lua_script_file`, `elements`, `animations`, `object` / `name` / `property`, `critical_resources` / `pegs` / `filename`, `metadata` / `metadata_item`. Property values are parsed by 0xB92F50: "true", `%f,%f,%f`, `%f,%f`.
+
+**Per frame:** `vint_update_documents(dt)` (0xB8BC10):
+1. Clamp dt to 0.5.
+2. For each document: unless paused, time += dt. Then `vint_object_tree_update` on its two roots, which calls vtable slot 3 `update` on every object.
+3. Then destroy the documents with unload pending: 0xB91400, the hook `0x252A1EC`, 0xB8A9F0, 0xB8ABD0.
+
+**Rendering:** `vint_render_documents` (0xB8BD40):
+1. Sort the documents by depth (0xB8A8B0).
+2. For each, `vint_document_render`:
+   1. Platform begin callback.
+   2. `vint_element_render_tree` (0xB95B10) on the root element, with a default state: white tint, alpha 1, scale 1.
+   3. The tree walk for each element:
+      - skip it if it is invisible (+0x59) or the alpha is about 0;
+      - `pre_render`, combine the state with the element's transform (0xB957B0), the per-element platform callback, then `render`;
+      - collect the element children, sort them by depth (0xB95AD0), and handle masks (+0x58) with stencil begin/end 0xB92500 / 0xB92520 (mode `0x252A1F0`);
+      - recurse into each child, then `post_render`.
+
+## Objects and the type registry
+
+Every object derives from `vint_object_base`:
+
+| Off | Object field |
+|---|---|
+| +0x00 | vtable |
+| +0x04, +0x08 | links in the name bucket `0x22EF1B8[hash & 0x3F]` |
+| +0x0C, +0x10 | links in the handle bucket `0x22EF2B8[handle & 0x3F]` |
+| +0x1C | first child |
+| +0x20 | next sibling |
+| +0x24 | parent |
+| +0x28 | handle (what Lua sees: a number) |
+| +0x2C | name hash |
+| +0x30 | document |
+
+- Lua passes objects as their numeric handle. The bindings look them up through the handle bucket.
+- `vint_object_find_by_hash` (0xB97970, EDX = hash, ESI = document) looks an object up by name.
+- **Type registry** at `0x22F2370`: 0x10 bytes per type {name, parent type, property set, factory}. The count is `0x252A270`, max 0x20.
+  - `vint_init` registers: element, group, animation, tween, bitmap, gradient, text, point, clip, bitmap_circle, sr2_map, video.
+  - Each element type is allocated from a `vint_object_factory_imp<T>` (alloc / free / index_of / get).
+  - `destroy` (slot 2) frees through the type's factory.
+
+**vint_object_base slots:**
+
+| Slot | Name | Notes |
+|---|---|---|
+| 2 | `destroy` | children first |
+| 3 | `update` | per frame |
+| 4 | `on_destroy` | |
+| 5 | `clone` | |
+| 6 | `is_type(t)` | |
+| 7 | `get_type` | |
+| 8 | returns false | |
+| 9 | empty | |
+| 10 | returns false | the earlier auto name `scalar_deleting_dtor` was wrong |
+
+Properties are 0x24-byte descriptors {name, value type, set thunk, get thunk, …, flags (0x100 = can be tweened)}. Each thunk calls one vtable slot: get = even slot, set = the next odd slot. Values are passed as a tagged union {tag, data}:
+
+| Tag | Type |
+|---|---|
+| 1 | int |
+| 2 | handle / crc |
+| 3 | float |
+| 4 | string |
+| 5 | bool |
+| 6 | color (3 floats) |
+| 7 | vec2 |
+| 8 | event |
+| 9 | bitmap |
+| 10 | font |
+| 12 | enum |
+| 13 | variant |
+
+**vint_element_base** (46 slots, table `0xEBDD50`):
+
+| Property | Type | Get / set slot | Field |
+|---|---|---|---|
+| render_mode | enum | 12 / 13 | +0x8C |
+| visible | bool | 14 / 15 | +0x59 |
+| mask | bool | 16 / 17 | +0x58 |
+| anchor | vec2 | 18 / 19 | +0x5C |
+| offset | vec2 | 20 / 21 | +0x64 |
+| tint | color | 22 / 23 | +0x7C |
+| alpha | float | 24 / 25 | +0x88 |
+| depth | int | 26 / 27 | +0x54 |
+| screen_size | vec2 | 28 / 29 | computed |
+| screen_nw | vec2 | 30 / 31 | computed (set returns false) |
+| screen_se | vec2 | 32 / 33 | computed (set returns false) |
+| rotation | float | 34 / 35 | +0x78 |
+| scale | vec2 | 36 / 37 | +0x90 |
+| auto_offset | enum | 38 / 39 | +0x6C |
+| unscaled_size | vec2 | 40 / 41 | +0x70 (set returns false) |
+
+The other element slots: 11 `build_transform`, 42 `pre_render`, 43 `render`, 44 `post_render`, 45 `apply_auto_offset`.
+
+**Subclass properties:** every type's get/set methods are named in `vtable_slots.csv`.
+
+| Class | Slots | Properties |
+|---|---|---|
+| `vint_element_bitmap` | 46-55 | image, image_crc, source_nw, source_se, custom_source_coords |
+| `vint_element_gradient` (a bitmap) | 56-71 | gradient_nw/ne/sw/se, alpha_nw/ne/sw/se |
+| `vint_element_text` | 46-75 | font, text_tag, text_tag_crc, text_scale, word_wrap, wrap_width, horz_align, vert_align, force_case, leading, line_frame_enable/w/m/e, insert_values |
+| `vint_element_clip` | | clip_size, clip_enabled |
+| `vint_element_bitmap_circle` | | image, source_nw/se, start_angle, end_angle, num_wedges |
+| `vint_element_sr2_map` | | zoom, map_mode |
+| `vint_element_video` | | vid_id_handle |
+| `vint_element_group`, `vint_element_point` | | override screen_size / nw / se / offset only |
+| `vint_object_animation` | 11-16 | start_time, is_paused, target_handle |
+| `vint_object_tween` | 11-42 | target_handle, target_name, target_property, state, start_time, duration, start_value, end_value, loop_mode, algorithm, max_loops, start_event, end_event, per_frame_event, start_value_type, end_value_type |
+
+Correction: the earlier caller-survey name `vint_object_tween::set_property` (slot 11) is really `get_target_handle`. `luafn_vint_set_property` reads it while resolving the tween's target.
+
+## Lua
+
+- `vint_lua_init` loads `vint_lib.lua` as a system lib with the `_UGGlobals` environment, then `vint_register_lua_functions` (0xB90E90) adds the 57 `vint_*` functions (`luafn_vint_*`). They cover:
+  - objects: create, clone, find, destroy, parent / child / sibling, rename;
+  - properties: get / set / set_typed;
+  - documents: find, load, unload;
+  - data groups / items: data binding;
+  - input subscriptions, sounds, time index.
+- Each document's script runs in its own Lua thread. `vint_lua_current_document` (0xB8E020) maps the running thread to its document through the context stack `0x2526360` (thread +0x14 = document handle), so bindings that take names resolve them in the calling document.
+- Callbacks into Lua (input events, data subscriptions, tween events) are `vint_callback_lua` objects. Native ones are `vint_callback_native`.
+
+## Open
+
+- How `hud_document_render` (0x799010) is reached in gameplay. No direct call and no stored pointer was found; it may be reached through a computed table.
+- The render-thread side of the platform draw callbacks (`0x1FD52B0`: 0x7F0A50 … 0x7F1C90).
+- The input path (0x7EC170, 0x7F3450, `vint_subscribe_to_input_event`).
+- The datagroup / dataitem binding system (0xB94xxx-0xB95xxx).
