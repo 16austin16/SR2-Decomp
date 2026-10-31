@@ -120,6 +120,9 @@ def render(stats, areas, out):
     y += 52
     parts.append(bar(pad, y, inner, s["hand_n"] / s["total_n"], "Functions analysed by hand (named and documented, incl. Rust)",
                      f'{s["hand_n"]} of ~{s["total_n"]:,} ({100 * s["hand_n"] / s["total_n"]:.2f}%)', "known"))
+    y += 52
+    parts.append(bar(pad, y, inner, s["vnamed_n"] / s["virt_n"], "Virtual methods of game classes with real names (excl. Havok)",
+                     f'{s["vnamed_n"]:,} of {s["virt_n"]:,} ({100 * s["vnamed_n"] / s["virt_n"]:.1f}%)', "known"))
     y += 40
     parts.append(f'<text x="{pad}" y="{y}" class="label" font-weight="600">By area (functions in Rust / identified)</text>')
     y += 10
@@ -147,11 +150,28 @@ def render(stats, areas, out):
     out.write_text("".join(body), encoding="utf-8")
 
 
+def game_virtuals(data, lo, size):
+    """Functions in the vtables of game classes (Havok's hk* classes left out)."""
+    out = set()
+    for r in csv.DictReader(open(ROOT / "docs/rtti_classes.csv", encoding="utf-8")):
+        if r["name"].startswith(("hk", "Hk", "?$hk")):
+            continue
+        for vt in filter(None, r["vtables"].split(" ")):
+            va = int(vt.split("@")[0], 16)
+            for k in range(int(r["n_virtuals"] or 0)):
+                f = struct.unpack_from("<I", data, va - BASE + 4 * k)[0]
+                if lo <= f < lo + size:
+                    out.add(f)
+    return out
+
+
 def main(exe, out):
     data = open(exe, "rb").read()
     lo, size = text_section(data)
     starts = function_starts(data, lo, size)
     funcs = load_functions()
+    virt = game_virtuals(data, lo, size)
+    name_of = {a: n for a, n, *_ in funcs}
     starts = sorted(set(starts) | {a for a, *_ in funcs if lo <= a < lo + size})
     sz = sizes(data, starts, lo + size)
     rust = [f for f in funcs if f[3] == "rust"]
@@ -163,6 +183,8 @@ def main(exe, out):
         "known_n": len(funcs),
         "hand_n": sum(not f[4].startswith("auto") for f in funcs),
         "named_n": sum(not re.search(r"::vf\d", f[1]) for f in funcs),
+        "virt_n": len(virt),
+        "vnamed_n": sum(a in name_of and not re.search(r"::vf\d", name_of[a]) for a in virt),
     }
     by_area = defaultdict(lambda: [0, 0])
     for _, _, area, status, _ in funcs:
