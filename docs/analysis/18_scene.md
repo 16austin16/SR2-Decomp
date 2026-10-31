@@ -107,7 +107,7 @@ Handlers are named `render_deferred_h<type>_<api>`. "Record" is what the handler
 | 25 | 0xCFBA10 | `gfx_draw_world_sprite` 0xD13A60 | EAX + cdecl (float, ptr), pops 8 | role open |
 | 26 / 27 | 0xCF9810 / 0xCF9800 | `gfx_set_render_target_level` 0xD1EF80 / `gfx_restore_default_targets` 0xD1EF40 | ESI = target index, EDX = level + cdecl (3 bools) / - | 26: render target `0x22FDC28[index]` level `level` (GetSurfaceLevel), then optional clears; 27: the default render target, depth target and viewport (0x22F63F8 / 0x22F63FC) |
 | 28 | 0xCFB240 | queued by `gfx_queue_28` 0xD09D90 (16 dwords from 0x25282F4…) | - | calls 0x7715E0 with 8 floats (the pause map) |
-| 29 | 0xCFB450 | `gfx_draw_text_world` 0xD15E80 | EDI, EAX + cdecl 6, pops 0x18 | role open |
+| 29 | 0xCFB450 | `gfx_draw_text_vint` 0xD15E80 | EDI, EAX + cdecl 6, pops 0x18 | role open |
 | 2A | 0xCF9060 | `render_deferred_h_call_fn` | record {fn, arg} | `fn(arg)` on the render thread. `gfx_queue_call_79edf0` (0xCF90E0) uses it |
 
 "Role open" rows are named from their shape. Port them by copying the record layout, and name them once traced in-game.
@@ -266,7 +266,7 @@ The vertices are flushed later by `gfx_2d_flush` (strip / list end, or the next 
 | 24 | `im2d_draw_rotated_bitmap` 0xD0A5E0 | `u32` + cdecl 4 floats + &pair | Uses sin / cos (0x428CD0 / 0x40B820) of an angle and the bitmap's size (0xC094E0) to rotate the quad's corners, then one strip quad. *Name from structure* |
 | 17 | `im2d_draw_17` 0xD0B020 | `ECX` + cdecl 4 floats | 400 FPU instructions, texture via `gfx_set_texture_cached`, `gfx_clip_rect_to_viewport`, 0xD1E690. Several quads (probably a stretched or framed bitmap). *Role still open* |
 | 25 | `gfx_draw_world_sprite` 0xD13A60 | `EAX` + cdecl `(f32, ptr)` | Projects a world position through the thread state's camera (0xD22CE0 reads `gfx_get_thread_state()+0x1554 / +0x1720`), sin / cos for rotation, then a screen quad. *Name from structure* |
-| 29 | `gfx_draw_text_world` 0xD15E80 | `EDI`, `EAX` + cdecl 6, pops 0x18 | UTF-16 text through 0xD156D0 (`font_lookup`, `font_glyph_metrics_wide`, `im2d_strip_begin`), positioned from two vec3s (0x729F30); sets sampler states first. *Name from structure: text placed by world position* |
+| 29 | `gfx_draw_text_vint` 0xD15E80 | `EDI`, `EAX` + cdecl 6, pops 0x18 | vint's text draw (draw slot +0x28, 06_vint.md): UTF-16 text through 0xD156D0 (`font_lookup`, `font_glyph_metrics_wide`, `im2d_strip_begin`) inside a rect, with vint's state pair 0x2A14B28; sets sampler states first |
 
 ### The text path, step by step
 
@@ -401,7 +401,7 @@ What each handler stores in mode 0. Fields are 4 bytes in order; `f32` arguments
 | 25 | `gfx_draw_world_sprite` | 12 bytes, f32, pair8 |
 | 26 | `gfx_set_render_target_level` | index, level, 3 × bool |
 | 28 | (pause map draw 0x7715E0) | f32 × 8 |
-| 29 | `gfx_draw_text_world` | f32, f32, STR, u32, 12 bytes, 12 bytes, u32, u32, pair8 |
+| 29 | `gfx_draw_text_vint` | f32, f32, STR, u32, 12 bytes, 12 bytes, u32, u32, pair8 |
 | 2A | callback | fn, arg |
 
 Each handler checks `used + size <= space` before every field. When a field doesn't fit, it returns 0 and `render_deferred_queue` marks the list overflowed (0x16801). The VTX check happens before the space is handed out.

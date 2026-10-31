@@ -266,12 +266,12 @@ vint never draws directly. Everything goes through the table at `0x1FD52B0` (glo
 | Slot | Target | Use |
 |---|---|---|
 | +0x00 | 0x7F0AB0 | begin document: resets the clip state, 0x7F0950, sets the full-screen viewport (0xD14D20) |
-| +0x04 | 0x7F0BA0 | end: 0xD14840, 0xD147E0 |
-| +0x08 | 0x7F0B00 | mask end (stencil mode) |
-| +0x0C | 0x7F0B20 | mask begin |
+| +0x04 | 0x7F0BA0 | set colour (see "Rendering, step by step") |
+| +0x08 | 0x7F0B00 | set mask mode |
+| +0x0C | 0x7F0B20 | clear the mask |
 | +0x10 | 0x7F0A70 | clip begin (viewport/scissor 0xD14D20); used by `vint_element_clip` |
 | +0x14 | 0x7F0A90 | clip end (full screen) |
-| +0x18 | 0x7F0A50 | per element (empty) |
+| +0x18 | 0x7F0A50 | set blend mode (per element) |
 | +0x1C | 0x7F1350 | bitmap quad: `vint_element_bitmap` render → 0xB9C030 |
 | +0x20 | 0x7F0D20 | bitmap circle: `vint_element_bitmap_circle` → 0xB9C190 |
 | +0x24 | 0x7F16A0 | gradient: `vint_element_gradient` → 0xB9BF80 → 0xB92420 |
@@ -284,7 +284,70 @@ The other three tables:
 - `0x1FD52E8` (global `0x252A1DC`): sound.
 - `0x1FD509C` (global `0x252A1E0`): text input.
 
+## Rendering, step by step, for porting
+
+**`vint_document_render`** (0xB8ACF0; stdcall `(doc)`, `ret 4`):
+1. Build a default **render state** of 0x70 bytes on the stack:
+
+   | Off | Default | Field |
+   |---|---|---|
+   | +0 | u32 1 | blend mode |
+   | +4 / +8 / +0xC | 1.0 | tint r, g, b |
+   | +0x10 | 1.0 | alpha |
+   | +0x14 | 0 | byte "no masks" |
+   | +0x24 / +0x28 | 1.0 | scale x, y |
+   | +0x2C / +0x30 | 0 | translation |
+   | +0x34 | 1.0 | |
+   | +0x38 / +0x3C / +0x40 / +0x48 | 0 | |
+   | +0x44 | 1.0 | |
+
+   From +0x24 on it's a 2D transform.
+2. Call draw slot +0x00 (begin).
+3. If the document has a root element (+0x458), `vint_element_render_tree(ECX = root; &state, scratch 0x22ECBB0, 256)`.
+
+**`vint_element_render_tree`** (0xB95B10; `ECX` = element, stdcall `(state *, scratch **, scratch count)`, `ret 0xC`):
+1. Return unless visible (+0x59) and `state.alpha > eps` (0xE5C1B0).
+2. `element->vf42()` (vtable +0xA8, `pre_render`).
+3. Copy the 0x70-byte state, then combine it with the element's (0xB957B0; `EDI` = &state, cdecl `(element)`): tint, alpha, transform.
+4. Draw slot +0x18 (blend mode = `state[0]`).
+5. `element->vf43(&state)` (+0xAC, `render`). The element emits its draws through the draw slots.
+6. Collect the children (first child +0x1C, next sibling +0x20) that pass `is_type(*0xEBDF6C)` (vtable +0x18, "is an element") into the scratch array.
+7. Sort them by depth (`qsort` with 0xB95AD0).
+8. If `state+0x14` is set, recurse into each child with the remaining scratch.
+9. Otherwise, handle masks with the global stencil mode `0x252A1F0`. For each child, before recursing:
+   - if the mode is 0 and the child is a mask (+0x58 == 1): draw slot +0x0C (clear mask), then slot +0x08 with mode 2, and remember that a mask was opened;
+   - if the mode is 2 and the child isn't a mask: slot +0x08 with mode 1.
+
+   After the children, if a mask was opened: slot +0x08 with 0, and the mode goes back to 0.
+10. `element->vf44()` (+0xB0, `post_render`).
+
+**Draw callbacks** (table `0x1FD52B0`, global `0x252A1D8`). These replace the table above, and give the arguments:
+
+| Slot | Function | Arguments | Does |
+|---|---|---|---|
+| +0x00 | 0x7F0AB0 | - | begin: blend `0xE8C548 = 1`, mask mode `0x2528B14 = 0`, colour cache `0xEB15BC = FFFFFFFF`, apply (0x7F0950), full-screen scissor `gfx_set_scissor_rect(ESI = w 0x22FDC1C, EDI = 0; 0, h 0x22FDC20)` |
+| +0x04 | 0x7F0BA0 | `u8 rgba *` | set colour: if different from the cache `0xEB15BC`, `gfx_set_color(r, g, b, a)` and update the cache |
+| +0x08 | 0x7F0B00 | `int mode` | set mask mode `0x2528B14` and apply (0 normal, 1 test the mask, 2 write the mask) |
+| +0x0C | 0x7F0B20 | - | clear the mask: state pair from `0xEC27B0` (flags & ~0xE \| 1), 0xA93670, colour 0, full-screen `im2d_fill_rect` |
+| +0x10 | 0x7F0A70 | `int rect[4]` (x, y, w, h) | `gfx_set_scissor_rect(ESI = rect[2], EDI = rect[0]; rect[1], rect[3])` (clip begin) |
+| +0x14 | 0x7F0A90 | - | full-screen scissor (clip end) |
+| +0x18 | 0x7F0A50 | `int blend` | if different from `0xE8C548`, store it and apply |
+| +0x1C | 0x7F1350 | element draw data | bitmap quad (`vint_element_bitmap`): `gfx_set_bitmap`, strip quad through `gfx_2d_alloc` / deferred type 0x1C |
+| +0x20 | 0x7F0D20 | | bitmap circle (sin / cos segments) |
+| +0x24 | 0x7F16A0 | | gradient quad |
+| +0x28 | 0x7F1BD0 | `u16 *text, …, rect` | text: `gfx_draw_text_vint` (0xD15E80, deferred type 0x29) with the state pair `0x2A14B28` |
+| +0x2C | 0x7F1C50 | `vec2 *pos, vec2 *size` | `im2d_draw_17(ECX = 0x2A14B28; pos.x, pos.y, size.x, size.y)` |
+| +0x30 | 0x7F1C90 | `vec2 *pos, vec2 *off, vec2 *size` | filled rectangle in ints (0xD0E7F0) |
+
+**`vint_apply_state`** (0x7F0950) turns the mask mode `0x2528B14` and blend mode `0xE8C548` into vint's render-state pair `0x2A14B28 / 0x2A14B2C`, from the table `0xEC27B0`. It also sets the colour where the mode needs it (mask write: colour 0, 0, 0, 255). Every draw passes `0x2A14B28` as its pair.
+
+**Porting order:**
+1. The draw callbacks (they only call the already ported `gfx_*` / `im2d_*`).
+2. `vint_apply_state`.
+3. `vint_element_render_tree` and `vint_document_render`.
+4. Each element type's `render` (vf43), which fills the per-slot draw data.
+5. The update walk (`vint_object_tree_update`) and input (`vint_input_do_frame`, above) can be ported independently of rendering.
+
 ## Open
 
 - The datagroup / dataitem binding system (0xB94xxx-0xB95xxx).
-- The exact argument layouts of the draw-table slots. Each wrapper in 0xB92340-0xB925D0 passes its arguments straight through.
