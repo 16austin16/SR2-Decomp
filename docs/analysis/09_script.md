@@ -108,7 +108,60 @@ The supervisor (0x68BE50) also calls `script_threads_resume_all` during loading.
 - `game_frame_tick` uses `script_thread_create` on the vint state directly for the "screen_change_failed_pc" thread of the document whose +0x48 matches, then resumes it.
 - vint and game threads share the one table and the same scheduler.
 
+## The VM interface, for porting
+
+SR2 links **Lua 5.0** with `lua_Number = double`.
+
+**Values.** A `TObject` is 16 bytes: `+0 tt`, `+8 value`.
+- Tags: 0 nil, 1 boolean (value +8 = 0 / 1), 2 light userdata, 3 number (double at +8), 4 string, 5 table, 6 function, 7 userdata, 8 thread.
+- `lua_State`: `+8 top`, `+0xC base`, `+0x10` global state (+0x20 / +0x24 the GC threshold / count checked before allocating).
+- Stack index → address: `luaA_index` (0xCDBE80; `EAX` = index, `ECX` = L). Positive indices are `base + (i − 1) × 16`. Negative ones are `top + i × 16`. −10000 (`0xFFFFD8F0`) is the registry, −10001 the globals, and lower values are upvalues.
+
+**Bindings.** Every `luafn_*` (1,128 named) is a plain `lua_CFunction`: cdecl `int (lua_State *L)`.
+- It reads its arguments with `lua_tonumber` / `lua_tostring`.
+- It writes results **inline**: `L->top->tt = 3; L->top->value = (double)x; L->top += 16`. Nil is tt 0 and booleans tt 1.
+- It returns the number of results.
+
+So a Rust binding is a C-ABI `extern "C" fn(*mut lua_State) -> i32` writing the same 16-byte values.
+
+**API functions the game calls** (outside the bindings), with their LTCG conventions:
+
+| Function | Convention | Game call sites |
+|---|---|---|
+| `lua_tostring` 0xCDCA80 | `EAX` = index, `ECX` = L → `char *` | 900 (and most bindings) |
+| `lua_tonumber` 0xCDC250 | `EAX` = index, `ECX` = L → double in st0 | 532 |
+| `lua_pushstring` 0xCDCAF0 | `ESI` = L, cdecl `(char *)`; NULL pushes nil | 229 |
+| `lua_pushcclosure` 0xCDCD30 | `ESI` = L, cdecl `(fn, n upvalues)` | 32 (the registrars) |
+| `lua_rawget` / `lua_rawset` 0xCD4FE0 / 0xCD5040 | | 25 / 14 |
+| `lua_pcall` 0xCDA480 | `ESI` = L, cdecl `(nargs, nresults, errfunc)` | 6 |
+| `luaL_argerror` / `luaL_error` / `lua_error` | | 18 / 7 / 5 |
+| `lua_newthread` 0xCDCED0, `lua_resume` 0xCDAC30, `lua_yield` 0xCDAAC0 | the script thread scheduler (above) | |
+
+**Pushing arguments into a script thread before its first resume.** These take a thread table entry (+4 = the coroutine's `lua_State`, +0x1C = the argument count):
+
+| Helper | Address | Arguments | Does |
+|---|---|---|---|
+| `script_thread_push_string` | 0xCE01B0 | `EDI` = entry, `EAX` = string | pushes a string, or nil when NULL; count += 1 (125 call sites) |
+| `script_thread_push_bool` | 0xCDFCB0 | `ECX` = entry, cdecl `(u8)`, `ret 4` | tt 1 |
+| `script_thread_push_number` | 0xCDFC60 | `ECX` = entry, cdecl `(double)`, `ret 8` | tt 3 |
+| `script_thread_resume_if_alive` | 0xCE0740 | `EAX` = &entry pointer | if the entry exists and isn't dead (flag 0x40), `script_thread_resume(0)` (this was "Open") |
+
+**Memory.** The VM allocates through `script_heap_alloc` (0xCDF2C0: `EAX` = size, under the critical section `0x347ADE4`). It frees through `script_heap_free` (0xCDE870, 260 call sites), with size-class pools at `0x25263A4`.
+
+**Registration chain:**
+1. `script_main_state_load_libs` loads the Lua base libraries (`luaB_*`, `lua_load_system_lib`).
+2. The game bindings are registered by tables of `{name, function}` pairs, harvested as `luafn_*`.
+3. On the vint state, `interface_register_lua_functions` (0x7F35A0) calls the 24 subsystem registrars (`*_lua_register`, 28_menus_hud.md), each a run of `lua_pushstring(name)` + `lua_pushcclosure(fn, 0)` + `luaV_settable`.
+
+**Per frame.** `script_do_frame` → `script_threads_resume_all` (above).
+
+**Porting order:**
+1. The value layout and the `lua_State` fields above.
+2. The five API functions the bindings use (`tostring`, `tonumber`, `pushstring`, `pushcclosure`, `luaA_index`).
+3. Bindings one by one (each is independent).
+4. The thread table and its push / resume helpers.
+5. The VM itself last: it can stay original while everything around it is Rust.
+
 ## Open
 
 - The four hook setters (`0x252A640/644/668/66C`, written by 0x51F700, 0xA244D0 and 0xCDF780).
-- What 0xCE0740 does (it has many callers in mission code; probably find or kill a thread by name).
