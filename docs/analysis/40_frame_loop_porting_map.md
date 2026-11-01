@@ -23,7 +23,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 
 | | Calls | Rust | mapped | unmapped |
 |---|---|---|---|---|
-| all four functions | 204 | 4 | 59 | 141 |
+| all four functions | 204 | 5 | 70 | 129 |
 
 - `game_frame_tick` and `game_state_frame` are almost fully mapped. They are short call sequences, so their bodies can be ported as Rust skeletons now, calling the original functions by address.
 - `frame_end_handoff` is mapped except for two groups:
@@ -31,7 +31,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
   - the render snapshot helpers (0x6255A0, 0x46CCD0, 0xD08310, 0x51A4A0, 0xBE4170).
 
   It is the next skeleton to port. `render_thread_wait_frame` and the render-list swap are the parts that need care, because both threads touch them.
-- `sim_frame` is the large one: 143 calls, 105 of them unmapped. The unmapped calls with the largest reach are the next naming targets:
+- `sim_frame` is the large one: 144 calls, 103 of them still unmapped (after the naming rounds f6f2237, 8d7d4a9 and f4c9a77). The unmapped calls with the largest reach are the next naming targets:
   - **0x5053B0** (17.4%): now `effect_objects_do_frame`. It runs `effect_objects_budget_bodies` (Havok bodies for the 50 most important effect-object parts), then `effect_object_update` on each object.
   - **0x6A5BB0** (11.1%): now `mission_fail_flow_do_frame`. It switches on the failure reason 0x1450380 (doc 22) and handles fades, revive / teleport, `cutscene_play`, `mission_end` and the stronghold cancel dialog.
   - **0x93D150** (10.9%): now `world_spawn_do_frame` (spawn regions, spawn groups, traffic). It runs every frame; only with 0x2528B48 set and 0x2528B49 clear does it wait for 0xE96C00 >= 0xB first.
