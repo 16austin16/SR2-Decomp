@@ -32,10 +32,10 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 
   It is the next skeleton to port. `render_thread_wait_frame` and the render-list swap are the parts that need care, because both threads touch them.
 - `sim_frame` is the large one: 143 calls, 105 of them unmapped. The unmapped calls with the largest reach are the next naming targets:
-  - **0x5053B0** (17.4%): walks the list 0xF9F684 (+0xB4 links) after 0x504F10.
-  - **0x6A5BB0** (11.1%): switch on 0x1450380; reaches `cutscene_play`, `mission_end` and the stronghold cancel text. Likely the mission / stronghold flow.
-  - **0x93D150** (10.9%): runs only in single player or as host (0x2528B48 / 49). Reaches the traffic spawner strings `num_cars` / `time` (0x93C690).
-  - **0x9D7F90** (10.5%): calls 0x9D6D60 for every human on the list 0x217043C (links +0x1294). 0x9D6D60 holds `COOP_REVIVAL_PENDING`.
+  - **0x5053B0** (17.4%): now `effect_objects_do_frame`. It runs `effect_objects_budget_bodies` (Havok bodies for the 50 most important effect-object parts), then `effect_object_update` on each object.
+  - **0x6A5BB0** (11.1%): now `mission_fail_flow_do_frame`. It switches on the failure reason 0x1450380 (doc 22) and handles fades, revive / teleport, `cutscene_play`, `mission_end` and the stronghold cancel dialog.
+  - **0x93D150** (10.9%): now `world_spawn_do_frame` (spawn regions, spawn groups, traffic). It runs every frame; only with 0x2528B48 set and 0x2528B49 clear does it wait for 0xE96C00 >= 0xB first.
+  - **0x9D7F90** (10.5%): now `humans_update_all`, which runs `human_update` (0x9D6D60) for every human on the list 0x217043C.
   - **0xB7CA80** (7.5%), **0x4CF840** (7.5%), **0xA6C350** (6.9%), **0x4D9F20** (6.1%), **0x9DF4C0** (6.0%), **0x437160** (5.9%, a fixed list of 17 updates in 0x408E90..0x45EBE0).
 
 ### `game_frame_tick` (0x520450), Rust (`frame.rs`)
@@ -49,7 +49,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | simfr:1,2,3,4,5,6 | `input_do_frame` 0xC063D0 | Rust | 1.1% | 9 (input) |  |
 | simfr:1,2,3,4,5,6 | `vint_input_do_frame` 0xB99550 | mapped | 0.0% | 2 (input) | 06 |
 | simfr:1,2,3,4,5,6 | `player_controls_update` 0x4FE760 | mapped | 0.0% |  | 14, 19 |
-| simfr:1,2,3,4,5,6 | — 0x500CA0 | unmapped | 1.1% |  |  |
+| simfr:1,2,3,4,5,6 | `input_direction_history_update` 0x500CA0 | mapped | 1.1% |  | 14 |
 | simfr:1,2,3,4,5,6 | `mouse_update` 0xC1F320 | Rust | 0.0% |  |  |
 | simfr:1,2,3,4,5,6 | `dialog_box_do_frame` 0x753AA0 | mapped | 0.7% |  | 40 |
 | simfr:1,2,3,4,5,6 | `game_pause_do_frame` 0x69B160 | mapped | 2.4% | 16 (gfx_cmd, render) | 40 |
@@ -84,14 +84,14 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1,2,3 | — 0xA66340 | unmapped | 1.1% |  |  |
 | sim_frame:1,2,3 | — 0x543920 | unmapped | 0.5% | 8 (gfx_cmd) |  |
 | sim_frame:1,2,3 | — 0x68F4B0 | unmapped | 2.7% | 2 (gfx_cmd) |  |
-| sim_frame:1,2,3 | — 0x93D150 | unmapped | 10.9% | 10 (rsched, streamman) |  |
+| sim_frame:1,2,3 | `world_spawn_do_frame` 0x93D150 | mapped | 10.9% | 10 (rsched, streamman) | 40 |
 | sim_frame:1,2,3 | `script_do_frame` 0xCDDE70 | mapped | 0.4% |  | 09 |
 | sim_frame:1,2,3 | — 0x6DA350 | unmapped | 0.0% |  |  |
 | sim_frame:1,2,3 | — 0x54CCA0 | unmapped | 0.7% |  |  |
 | sim_frame:1,2,3 | — 0x6B7020 | unmapped | 0.6% | 2 |  |
 | sim_frame:1,2,3 | — 0x6905E0 | unmapped | 0.1% |  |  |
 | sim_frame:1,2,3 | — 0x75A120 | unmapped | 0.9% | 10 (gfx_cmd) |  |
-| sim_frame:1,2,3 | — 0x4F5040 | unmapped | 0.0% |  |  |
+| sim_frame:1,2,3 | `input_context_do_frame` 0x4F5040 | mapped | 0.0% |  | 14 |
 | sim_frame:1,2,3 | — 0x6AB6B0 | unmapped | 0.0% |  |  |
 | sim_frame:1,2,3 | — 0x6AB240 | unmapped | 0.0% |  |  |
 | sim_frame:1,2,3 | — 0x6AB2D0 | unmapped | 0.0% |  |  |
@@ -106,7 +106,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1b | — 0xA6C350 | unmapped | 6.9% | 5 (gfx_cmd, streamman) |  |
 | sim_frame:1b | — 0xA58EE0 | unmapped | 2.0% |  |  |
 | sim_frame:1b | — 0x501FB0 | unmapped | 4.2% | 37 (gfx_cmd, hddio, streamman) |  |
-| sim_frame:1b | — 0x6A5BB0 | unmapped | 11.1% | 18 (gfx_cmd, rsched, streamman) |  |
+| sim_frame:1b | `mission_fail_flow_do_frame` 0x6A5BB0 | mapped | 11.1% | 18 (gfx_cmd, rsched, streamman) | 40 |
 | sim_frame:1b | — 0x7B02E0 | unmapped | 0.3% |  |  |
 | sim_frame:1b | `crib_stash_tutorial_nag` 0x548260 | mapped | 0.2% |  | 30 |
 | sim_frame:1b | — 0xA93FF0 | unmapped | 0.0% |  |  |
@@ -115,7 +115,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1c | — 0x6FF860 | unmapped | 0.1% |  |  |
 | sim_frame:1c | — 0xB08530 | unmapped | 4.7% | 1 (rsched) |  |
 | sim_frame:1c | — 0x6ADB10 | unmapped | 0.8% |  |  |
-| sim_frame:1c | — 0x9D7F90 | unmapped | 10.5% | 2 (gfx_cmd) |  |
+| sim_frame:1c | `humans_update_all` 0x9D7F90 | mapped | 10.5% | 2 (gfx_cmd) | 40 |
 | sim_frame:1c | `humans_update_neighborhoods` 0x9A7080 | mapped | 6.5% | 1 (gfx_cmd) | 15 |
 | sim_frame:1c | `humans_animation_jobs` 0x9A7150 | mapped | 0.6% |  | 15 |
 | sim_frame:1c | `humans_ai_update` 0x9A71B0 | mapped | 10.5% | 1 (gfx_cmd) | 15 |
@@ -183,7 +183,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:6,7 | `inventory_find_weapon` 0x55ADF0 | mapped | 0.1% |  | 38 |
 | sim_frame:6,7 | — 0x727610 | unmapped | 0.3% |  |  |
 | sim_frame:6,7 | — 0x955470 | unmapped | 2.5% |  |  |
-| sim_frame:6,7 | — 0x5053B0 | unmapped | 17.4% |  |  |
+| sim_frame:6,7 | `effect_objects_do_frame` 0x5053B0 | mapped | 17.4% |  | 40 |
 | sim_frame:6,7 | — 0x5142A0 | unmapped | 2.9% |  |  |
 | sim_frame:6,7 | `net_send_door_event` 0x91A840 | mapped | 3.6% |  | 27 |
 | sim_frame:6,7 | — 0x4525E0 | unmapped | 0.2% |  |  |
