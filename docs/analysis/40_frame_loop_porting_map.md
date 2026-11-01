@@ -23,7 +23,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 
 | | Calls | Rust | mapped | unmapped |
 |---|---|---|---|---|
-| all four functions | 204 | 5 | 192 | 7 |
+| all four functions (table rows) | 206 | 10 | 194 | 2 |
 
 - `game_frame_tick` and `game_state_frame` are almost fully mapped. They are short call sequences, so their bodies can be ported as Rust skeletons now, calling the original functions by address.
 - `frame_end_handoff` is mapped except for two groups:
@@ -31,7 +31,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
   - the render snapshot helpers (0x6255A0, 0x46CCD0, 0xD08310, 0x51A4A0, 0xBE4170).
 
   It is the next skeleton to port. `render_thread_wait_frame` and the render-list swap are the parts that need care, because both threads touch them.
-- `sim_frame` is the large one: 144 calls; 7 of the frame-loop calls are still unmapped, listed in "The last unidentified frame-loop calls". The remaining ones are small (under 0.3% reach) except 0x9A9CE0, 0x55BA40 and 0x4DA880; see "Sections :1c, :4 and :5". The unmapped calls with the largest reach are the next naming targets:
+- `sim_frame` is the large one: 144 calls; 2 of the frame-loop calls are still unmapped (0x6AB6B0, 0x55BA40), listed in "The last unidentified frame-loop calls". The remaining ones are small (under 0.3% reach) except 0x55BA40 (0x9A9CE0 is now `humans_flagged_update_all`; 0x4DA880 is mapped); see "Sections :1c, :4 and :5". The unmapped calls with the largest reach are the next naming targets:
   - **0x5053B0** (17.4%): now `effect_objects_do_frame`. It runs `effect_objects_budget_bodies` (Havok bodies for the 50 most important effect-object parts), then `effect_object_update` on each object.
   - **0x6A5BB0** (11.1%): now `mission_fail_flow_do_frame`. It switches on the failure reason 0x1450380 (doc 22) and handles fades, revive / teleport, `cutscene_play`, `mission_end` and the stronghold cancel dialog.
   - **0x93D150** (10.9%): now `world_spawn_do_frame` (spawn regions, spawn groups, traffic). It runs every frame; only with 0x2528B48 set and 0x2528B49 clear does it wait for 0xE96C00 >= 0xB first.
@@ -95,8 +95,8 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1,2,3 | `controller_disconnect_check` 0x75A120 | mapped | 0.9% | 10 (gfx_cmd) | 14, 40 |
 | sim_frame:1,2,3 | `input_context_do_frame` 0x4F5040 | mapped | 0.0% |  | 14 |
 | sim_frame:1,2,3 | — 0x6AB6B0 | unmapped | 0.0% |  |  |
-| sim_frame:1,2,3 | — 0x6AB240 | unmapped | 0.0% |  |  |
-| sim_frame:1,2,3 | — 0x6AB2D0 | unmapped | 0.0% |  |  |
+| sim_frame:1,2,3 | `record_input_step` 0x6AB240 | Rust | 0.0% |  | 40 |
+| sim_frame:1,2,3 | `state_eaaf84_check` 0x6AB2D0 | Rust | 0.0% |  | 40 |
 | sim_frame:1,2,3 | `gps_route_update` 0x765BB0 | mapped | 3.7% | 11 (gfx_cmd) | 40 |
 | sim_frame:1b | `game_clock_advance` 0x68A1E0 | mapped | 0.2% |  | 13, 40 |
 | sim_frame:1b | `net_send_periodic_status` 0x68A320 | mapped | 1.0% |  | 35, 40 |
@@ -127,7 +127,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1c | — 0x55BA40 | unmapped | 4.4% | 1 (rsched) |  |
 | sim_frame:1c | `septic_decals_update` 0x56BD60 | mapped | 3.1% | 8 (gfx_cmd) | 29, 40 |
 | sim_frame:1c | `districts_ownership_refresh` 0x4B11F0 | mapped | 0.4% | 4 (mempool) | 30, 40 |
-| sim_frame:1c | — 0x5507C0 | unmapped | 0.0% |  |  |
+| sim_frame:1c | `vehicle_groups_timed_spawn` 0x5507C0 | Rust | 0.0% |  | 40 |
 | sim_frame:1c | `shops_do_frame` 0x9F5420 | mapped | 1.6% |  | 30, 40 |
 | sim_frame:1c | `holdup_do_frame` 0x655750 | mapped | 4.8% |  | 29, 40 |
 | sim_frame:1c | `chunk_swap_sequences_update` 0x542B00 | mapped | 1.1% |  | 05, 40 |
@@ -149,7 +149,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:4 | `sim_physics_step` 0x6FA0E0 | mapped | 18.0% | 6 (gfx_cmd, mempool, render) | 11, 17 |
 | sim_frame:4 | `humans_character_step` 0x9A9B60 | mapped | 3.6% |  | 15 |
 | sim_frame:4 | `explosions_flush_queue` 0x4C2BF0 | mapped | 5.8% |  | 33, 40 |
-| sim_frame:4 | — 0x9A9CE0 | unmapped | 5.1% |  |  |
+| sim_frame:4 | `humans_flagged_update_all` 0x9A9CE0 | mapped | 5.1% |  | 40 |
 | sim_frame:4 | `havok_triggers_update` 0x71B910 | mapped | 0.4% |  | 36, 40 |
 | sim_frame:5 | `streamman_slot_entries_update` 0xA8B400 | mapped | 0.1% |  | 05, 40 |
 | sim_frame:5 | `population_update` 0x95A3D0 | mapped | 0.9% |  | 21 |
@@ -196,7 +196,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:6,7 | `glares_update` 0x4C6CD0 | mapped | 1.7% |  | 40 |
 | sim_frame:6,7 | `lighting_exposure_blend_update` 0x4C35C0 | mapped | 2.3% | 4 (gfx_cmd) | 40 |
 | sim_frame:6,7 | `mesh_decals_fade_update` 0xD07B40 | mapped | 0.0% |  | 40 |
-| sim_frame:6,7 | — 0x4DA880 | unmapped | 2.0% | 1 (mempool) |  |
+| sim_frame:6,7 | `list_f9e550_update` 0x4DA880 | Rust | 2.0% | 1 (mempool) | 40 |
 | sim_frame:6,7 | `object_effect_links_update` 0x92D620 | mapped | 1.5% |  | 33, 40 |
 | sim_frame:6,7 | `level_objects_near_camera_update` 0x9FCF90 | mapped | 4.0% | 3 | 40 |
 | sim_frame:6,7 | `iga_tick` 0xB82180 | mapped | 0.1% |  | 40 |
@@ -394,6 +394,83 @@ With shape A the body may free the node. With shape B it must not.
 `weapon_effect_free` does the same without a lock, with the head `0x22D7B58` and the free list `0x22D7B5C`.
 
 **Saved registers** (only matter for inline asm): `ambulances_update` / `meter_maids_update` / `taxis_update` save `EBX` / `ESI` / `EDI`; `weapon_effects_update` saves `ECX` / `ESI` / `EDI`; the rest save `ESI` (and `EDI` for `trigger_objects_reap`).
+
+## Six x87 frame-loop calls at instruction level
+
+How the compares decode below:
+- `fcom` / `fcomp`, then `fnstsw ax`, then `test ah, 5` with `jp`: **jumps when ST0 ≥ the operand or the compare is unordered (NaN)**. The C0 / C2 bits are 00 or 111, which is even parity.
+- `test ah, 0x41` with `jne`: jumps when ST0 ≤ the operand or NaN.
+- `test ah, 0x44` with `jnp`: jumps when the two are exactly equal, and **not** on NaN.
+- Every "→ f32" below is an `fstp dword` / `fld dword` round trip; keep these to get the same bits. Arithmetic between them is done at x87 extended precision (64-bit mantissa, the game's default control word).
+
+### `camera_pre_update` (0x493260)
+
+No arguments.
+1. dt = f32 `[0xE8437C]` (frame dt).
+2. If the camera target handle `[0x25F5BB0]` resolves, `[0x25F5BE8]` bit 2 is clear, and the target is a vehicle (+0x4C == 5) or a human (type 1) with +0x595 ≠ 0: dt = `physics_frame_time()` (ST0) instead.
+3. dt → f32.
+4. Mode `[0x25F5AE8]`: fn = dword `0xDD5254 + mode × 20`. If fn is set: `fn(cdecl f32 dt)`, called for its side effects only. The caller reloads dt from its own local afterwards, so fn must leave the x87 stack empty.
+5. `[0x25F5C00]` = dt (the camera dt that the other camera code reads).
+
+### `weapons_cooldown_update` (0xB72FD0)
+
+No arguments. List `[0x22D7B6C]`, circular, next at +4. It stops at the head or at 0.
+
+The constants are loaded once and kept on the x87 stack: dt `[0xE8437C]`, 0.0, 1.8 (`0xE5C100`, double), 0.2 (`0xE5C0F8`, double).
+
+For each weapon w:
+1. If 0 ≥ w+0x44, or the compare is NaN: skip.
+2. v = w+0x44 − (dt × 1.8) / 0.2, computed in extended precision (one `fmul`, one `fdiv`, one `fsub`), then → f32.
+3. w+0x44 = v; then, if v ≤ 0, w+0x44 = 0.0 (`test ah, 0x41`). The value is stored twice; the second store is the result.
+
+**Port:** `cd = max(f32(cd − dt·1.8/0.2), 0)`. Do not fold 1.8 / 0.2 into 9.0: that changes the rounding. A NaN cooldown is never touched.
+
+### `lighting_exposure_blend_update` (0x4C35C0)
+
+No arguments.
+1. `[0x2526D1C]` = 0.0.
+2. a = f32(`[0xE99394]` + 0.0); step = f32(`[0xE84380]` × 0.1 (double `0xDD50E8`)).
+3. The target T = 0.5 (double `0xE5BF70`):
+   - if a − step > T: `[0xE99394]` = cur − step;
+   - otherwise, if a + step < T: `[0xE99394]` = cur + step;
+   - otherwise (or NaN): `[0xE99394]` = T.
+
+   The compares use extended-precision a − step / a + step, and the new value is rounded to f32 by the store.
+4. `lighting_exposure_set(cdecl f32 a)`. **It gets the value from before this frame's step**, so exposure lags one frame. Keep that.
+
+A NaN exposure snaps to 0.5.
+
+### `camera_target_effects_update` (0x4CBFC0)
+
+No arguments.
+1. Return if `[0x2527D10]` is set and its +0x15E0 == 1 (a cutscene camera).
+2. Return unless the camera mode `[0x25F5AE8]` is 0, 7 or 5.
+3. t = camera dt `[0x25F5C00]` if it is > 1/60 (`0xE5C01C`), otherwise 1/60; NaN gives 1/60. Then t → f32.
+4. Target handle `[0x25F5BB0]`:
+   - a human (type 1): `camera_target_human_effects(cdecl t)` (0x4CBBC0);
+   - a vehicle (type 5): `camera_target_vehicle_effects(ECX = handle, cdecl t)` (0x4CBD70).
+
+   It returns early if the handle is unresolved. The type checks re-read the slot.
+
+### `player_nav_node_update` (0xA1CCC0)
+
+No arguments. Player = `[0x21703D4]`.
+1. node = `nav_closest_node_find(cdecl &p, [0x2203AC0], &player+0x14, 0, 0, 0, 0, f32 0.0)` (0xA13860), where p is a 3-float local.
+2. Then p.y = player +0x18 (the player's own height **overwrites** the found y). This happens even when no node is found.
+3. If node:
+   - `[0x2203AC0]` = 0xA05250(`ESI` = node), the node reference kept for next frame's search;
+   - `0x2E4C8D0..D8` = p;
+   - `[0x2203ABC]` = 0xA1ACC0(`EAX` = node, cdecl f32 0.85 (`0xDD04F8`)).
+
+The only x87 here is the 0.0 / 0.85 arguments and the y copy (both are plain f32 moves, so there is no rounding concern).
+
+### `humans_flagged_update_all` (0x9A9CE0), was unmapped
+
+cdecl (f32 dt), from `sim_frame` section :4.
+1. If dt == 0.0 exactly (`fcomp` with 0, `test ah, 0x44`, `jnp`): return. **A NaN dt runs.**
+2. For each human on `0x215E908` (circular, next at +0xB8): if +0xCC & 0x200, call `human_flagged_update(cdecl human)` (0x9A2B80).
+
+dt is only used as the "paused" test and is **not** passed on.
 
 ## Suggested porting order
 

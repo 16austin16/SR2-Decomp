@@ -11867,3 +11867,8 @@ address,name,subsystem,status,notes
 0x00a275f0,script_follower_index,script,documented,"EAX = name -> follower index (> 0) for #FOLLOWER#, #FOLLOWER1#..#FOLLOWER3#, else <= 0 (09)"
 0x00a27660,script_follower_get,script,documented,"cdecl (follower index) -> human or 0; role inferred (09)"
 0x00a618a0,script_object_find,script,documented,"EAX = name -> script object (vtbl +0x34 returns its human) or 0; role inferred (09)"
+0x009a9ce0,humans_flagged_update_all,humans,documented,"cdecl (f32 dt): unless dt == 0 (NaN runs), calls human_flagged_update for each human on 0x215E908 (next +0xB8) with +0xCC bit 0x200; dt itself is not passed on (40)"
+0x009a2b80,human_flagged_update,humans,documented,"cdecl (human): per-human update for humans with +0xCC bit 0x200 (vehicle entry / exit, stat awards, ...); role not pinned down (40)"
+0x004cbbc0,camera_target_human_effects,camera,documented,"cdecl (f32 dt): camera screen effects while following a human; role inferred (40)"
+0x004cbd70,camera_target_vehicle_effects,camera,documented,"ECX = vehicle handle, cdecl (f32 dt): camera motion blur while following a vehicle (xtbl_load_motion_blur data, timer_remaining); role inferred (40)"
+0x00a13860,nav_closest_node_find,nav,documented,"cdecl (&out point, current node, &position, 0, 0, 0, 0, f32 0.0) -> node: the nav node nearest the position and the closest point on it; role inferred (40)"
