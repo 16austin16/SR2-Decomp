@@ -9376,7 +9376,7 @@ address,name,subsystem,status,notes
 0x004932f0,camera_update,camera,documented,"twice per sim_frame: previous transform, dt (physics dt for vehicles), mode update from table 0xDD5250 (0x14 each), smoothing, shake, cut, desired -> current 0x25F5B14/0x25F5B38, FOV blend, view-blocker fade (19)"
 0x0049b4b0,camera_follow_update,camera,documented,"camera mode 0 update: gameplay follow camera on foot and in vehicles, ray/linear-cast collision (19)"
 0x00492df0,camera_cut,camera,documented,"camera teleport (flag 4): resets smoothing; moves over 15 m set 0x2529620 (19)"
-0x004fe760,player_controls_update,input,documented,"early in game_frame_tick: from the current pad record builds the player control block 0x2659908: 8 stick entries (0x28 each: value, previous, raw, step, taken flags) and the 87-entry button arrays down 0x2659A48 / repeat 0x2659A9F / just pressed 0x2659B4D, the availability masks 0x2659AF6 / 0x2659BA4 and press times 0x2659BFC; adaptive threshold for buttons 0x23 / 0x24 (14)"
+0x004fe760,player_controls_update,input,rust,"Rust (controls.rs), shadow-checked byte for byte: control block 0x2659908 from the pad record; trigger thresholds; keeps the x87 quirk where stick 6 y's negative-previous branch tests stick 3 y (14)"
 0x00b71200,xtbl_load_weapons,weapon,documented,"loads weapons.xtbl and weapon_categories.xtbl (20)"
 0x009847a0,human_take_damage,weapon,documented,"ECX = attacker, EDX = damage flags, (victim, amount, vehicle, weapon): network forward, difficulty/armour/multiplier scaling, invulnerability, last attacker, human_adjust_hit_points, reactions, death (20)"
 0x0096a0a0,human_adjust_hit_points,weapon,documented,"ECX = human, (delta): hit points += delta via human_set_hit_points; remote humans send ""adjust_hp"" (20)"

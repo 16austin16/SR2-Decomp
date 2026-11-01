@@ -48,7 +48,7 @@ const PRESS_TIME: usize = 0x0265_9BFC;
 
 const SHADOW_FRAMES: u32 = 20000;
 /// Off until the narrowed shadow check has been tested in game.
-const ENABLED: bool = false;
+const ENABLED: bool = true;
 
 static ORIGINAL: AtomicUsize = AtomicUsize::new(0);
 static CALLS: AtomicU32 = AtomicU32::new(0);

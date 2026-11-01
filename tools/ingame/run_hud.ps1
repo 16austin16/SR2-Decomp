@@ -27,9 +27,13 @@ if (Get-Process SR2_pc -ErrorAction SilentlyContinue) {
     k "01"; Start-Sleep 1; k "01"; Start-Sleep 2
     k "0F"; Start-Sleep 3; shot "5_map"; k "0F"; Start-Sleep 2
     & $in -Action hold -Arg "11" -HoldMs 4000 | Out-Null; Start-Sleep 2; shot "6_walked"
-    Start-Sleep 20
+    & $in -Action hold -Arg "11,2A" -HoldMs 3000 | Out-Null
+    k "39"; Start-Sleep 1; k "13"; Start-Sleep 1; k "1D"; Start-Sleep 1; k "1D"
+    & $in -Action hold -Arg "1E" -HoldMs 1500 | Out-Null; & $in -Action hold -Arg "1F" -HoldMs 1500 | Out-Null
+    Start-Sleep 1; shot "7_moved"
+    Start-Sleep 15
     Stop-Process -Name SR2_pc -ErrorAction SilentlyContinue
     Wait-Process -Name SR2_pc -Timeout 20 -ErrorAction SilentlyContinue
 }
 Copy-Item $log "$bin\hud.hook.log" -ErrorAction SilentlyContinue
-Get-Content $log | Select-String "vint_lua|CRASH|panic"
+Get-Content $log | Select-String "vint_lua|controls:|CRASH|panic"
