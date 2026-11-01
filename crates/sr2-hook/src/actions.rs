@@ -22,7 +22,9 @@
 //!   ignores it, and returns 0;
 //! - `take_pressed` always calls its stick fallback;
 //! - `press_time` with an unbound primary reads 0x2659BFC[-1], and with primary 0 returns 0;
-//! - `consume` clears only the first button.
+//! - `consume` clears only the first button;
+//! - the stick-direction leaves compare an f32 with the f64 thresholds +-0.4 (NaN is "not past"),
+//!   and a negative y step repeats +y.
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -71,7 +73,7 @@ struct Accessor {
     ret: Ret,
 }
 
-const ACCESSORS: [Accessor; 12] = [
+const ACCESSORS: [Accessor; 37] = [
     Accessor { name: "input_action_down", addr: 0x004F_F640, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
     Accessor { name: "input_action_repeat", addr: 0x004F_F6A0, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
     Accessor { name: "input_action_just_pressed", addr: 0x004F_F700, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
@@ -84,6 +86,31 @@ const ACCESSORS: [Accessor; 12] = [
     Accessor { name: "input_action_press_time", addr: 0x004F_FB80, prologue: &[0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Eax },
     Accessor { name: "input_action_consume", addr: 0x0050_01D0, prologue: &[0xC1, 0xE0, 0x04, 0x8B, 0x88, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Void },
     Accessor { name: "input_consume_all", addr: 0x0050_02B0, prologue: &[0x6A, 0x57, 0x6A, 0x00, 0x68, 0xF6, 0x9A, 0x65, 0x02], ret: Ret::Void },
+    Accessor { name: "input_action_stick_dir_down", addr: 0x004FE380, prologue: &[0x83, 0xC0, 0x01, 0x83, 0xF8, 0x0E], ret: Ret::Al },
+    Accessor { name: "input_action_stick_dir_just_pressed", addr: 0x004FE460, prologue: &[0x83, 0xC0, 0x01, 0x83, 0xF8, 0x0C], ret: Ret::Al },
+    Accessor { name: "input_action_stick_dir_take_pressed", addr: 0x004FE520, prologue: &[0x83, 0xC0, 0x01, 0x83, 0xF8, 0x0C], ret: Ret::Al },
+    Accessor { name: "input_action_stick_dir_repeat", addr: 0x004FE5E0, prologue: &[0x83, 0xC0, 0x01, 0x83, 0xF8, 0x0C], ret: Ret::Al },
+    Accessor { name: "input_action_stick_dir_take_repeat", addr: 0x004FE6A0, prologue: &[0x83, 0xC0, 0x01, 0x83, 0xF8, 0x0C], ret: Ret::Al },
+    Accessor { name: "player_stick_held_neg_x", addr: 0x004FD6D0, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x28, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_held_pos_x", addr: 0x004FD700, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x29, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_held_neg_y", addr: 0x004FD730, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2B, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_held_pos_y", addr: 0x004FD760, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2A, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_just_neg_x", addr: 0x004FD790, prologue: &[0x8D, 0x0C, 0x80, 0x80, 0x3C, 0xCD, 0x28, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_just_pos_x", addr: 0x004FD7D0, prologue: &[0x8D, 0x0C, 0x80, 0x80, 0x3C, 0xCD, 0x29, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_just_pos_y", addr: 0x004FD810, prologue: &[0x8D, 0x0C, 0x80, 0x80, 0x3C, 0xCD, 0x2A, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_just_neg_y", addr: 0x004FD850, prologue: &[0x8D, 0x0C, 0x80, 0x80, 0x3C, 0xCD, 0x2B, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_take_just_neg_x", addr: 0x004FD890, prologue: &[0x8D, 0x0C, 0x80, 0x80, 0x3C, 0xCD, 0x28, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
+    Accessor { name: "player_stick_take_just_pos_x", addr: 0x004FD8E0, prologue: &[0x8D, 0x0C, 0x80, 0x80, 0x3C, 0xCD, 0x29, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
+    Accessor { name: "player_stick_take_just_pos_y", addr: 0x004FD930, prologue: &[0x8D, 0x0C, 0x80, 0x80, 0x3C, 0xCD, 0x2A, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
+    Accessor { name: "player_stick_take_just_neg_y", addr: 0x004FD980, prologue: &[0x8D, 0x0C, 0x80, 0x80, 0x3C, 0xCD, 0x2B, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
+    Accessor { name: "player_stick_repeat_neg_x", addr: 0x004FD9D0, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x28, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_repeat_pos_x", addr: 0x004FD9F0, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x29, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_repeat_pos_y", addr: 0x004FDA10, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2A, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_repeat_neg_y", addr: 0x004FDA30, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2B, 0x99, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_take_repeat_neg_x", addr: 0x004FDA50, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x28, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
+    Accessor { name: "player_stick_take_repeat_pos_x", addr: 0x004FDA90, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x29, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
+    Accessor { name: "player_stick_take_repeat_pos_y", addr: 0x004FDAD0, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2A, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
+    Accessor { name: "player_stick_take_repeat_neg_y", addr: 0x004FDB10, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2B, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
 ];
 const COUNT: usize = ACCESSORS.len();
 
@@ -262,6 +289,86 @@ unsafe fn consume_all() {
     }
 }
 
+// --- Stick directions -----------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+enum Kind {
+    Held,
+    Just,
+    TakeJust,
+    Repeat,
+    TakeRepeat,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Dir {
+    NegX,
+    PosX,
+    PosY,
+    NegY,
+}
+
+const STICK_NEG: usize = 0x00E5_C350; // f64 -0.4
+const STICK_POS: usize = 0x00E5_C358; // f64 +0.4
+
+/// A stick-direction leaf on control-block entry `e`. Taken bytes: -x +0x20, +x +0x21,
+/// +y +0x22, -y +0x23. Held: past +-0.4 (NaN is not past). Just: past now and not last frame
+/// (+8 / +0xC). Repeat: the step value (+0x18 x, +0x1C y; +y repeats on a negative step).
+/// The take forms set the taken byte (and zero the step) on true.
+unsafe fn stick_leaf(kind: Kind, e: u32, dir: Dir) -> u32 {
+    unsafe {
+        let b = BLOCK + e as usize * 0x28;
+        let (axis, taken) = match dir {
+            Dir::NegX => (0, 0x20),
+            Dir::PosX => (0, 0x21),
+            Dir::PosY => (4, 0x22),
+            Dir::NegY => (4, 0x23),
+        };
+        if rb(b + taken) != 0 {
+            return 0;
+        }
+        let neg = matches!(dir, Dir::NegX | Dir::NegY);
+        let past = |v: f32| {
+            if neg { (v as f64) < *(STICK_NEG as *const f64) } else { (v as f64) > *(STICK_POS as *const f64) }
+        };
+        let f = |o: usize| *((b + o) as *const f32);
+        let hit = match kind {
+            Kind::Held => past(f(axis)),
+            Kind::Just | Kind::TakeJust => past(f(axis)) && !past(f(axis + 8)),
+            Kind::Repeat | Kind::TakeRepeat => {
+                let step = rd(b + 0x18 + axis) as i32;
+                if matches!(dir, Dir::NegX | Dir::PosY) { step < 0 } else { step > 0 }
+            }
+        };
+        if hit {
+            match kind {
+                Kind::TakeJust => wb(b + taken, 1),
+                Kind::TakeRepeat => {
+                    *((b + 0x18 + axis) as *mut u32) = 0;
+                    wb(b + taken, 1);
+                }
+                _ => {}
+            }
+        }
+        hit as u32
+    }
+}
+
+/// A stick-direction dispatcher: action code -> control-block entry and direction. Codes 0-11
+/// cover entries 0, 1 and 5 (+y, -y, +x, -x each); the held test also has 12 / 13 (entry 6, +-x).
+/// Anything else is 0.
+unsafe fn stick_dir(kind: Kind, code: u32) -> u32 {
+    let held = matches!(kind, Kind::Held);
+    let c = code as i32;
+    let (e, d) = match c {
+        0..=11 => ([0, 1, 5][c as usize / 4], c % 4),
+        12 | 13 if held => (6, c - 10),
+        _ => return 0,
+    };
+    let dir = [Dir::PosY, Dir::NegY, Dir::PosX, Dir::NegX][d as usize];
+    unsafe { stick_leaf(kind, e, dir) }
+}
+
 /// The Rust accessor `id`: (EAX result, f32 result).
 unsafe fn rust(id: usize, r: &Regs) -> (u32, f32) {
     unsafe {
@@ -280,10 +387,26 @@ unsafe fn rust(id: usize, r: &Regs) -> (u32, f32) {
                 consume(r.eax);
                 (0, 0.0)
             }
-            _ => {
+            11 => {
                 consume_all();
                 (0, 0.0)
             }
+            12 => (stick_dir(Kind::Held, r.eax), 0.0),
+            13 => (stick_dir(Kind::Just, r.eax), 0.0),
+            14 => (stick_dir(Kind::TakeJust, r.eax), 0.0),
+            15 => (stick_dir(Kind::Repeat, r.eax), 0.0),
+            16 => (stick_dir(Kind::TakeRepeat, r.eax), 0.0),
+            17..=36 => {
+                let k = (id - 17) / 4;
+                let kind = [Kind::Held, Kind::Just, Kind::TakeJust, Kind::Repeat, Kind::TakeRepeat][k];
+                let dirs = if k == 0 {
+                    [Dir::NegX, Dir::PosX, Dir::NegY, Dir::PosY]
+                } else {
+                    [Dir::NegX, Dir::PosX, Dir::PosY, Dir::NegY]
+                };
+                (stick_leaf(kind, r.eax, dirs[(id - 17) % 4]), 0.0)
+            }
+            _ => (0, 0.0),
         }
     }
 }
@@ -358,6 +481,76 @@ extern "C" fn dispatch(id: usize, r: &mut Regs) -> u32 {
     }
 }
 
+/// Synthetic check of the stick-direction leaves and dispatchers against the originals: every
+/// leaf / code on entries 0, 1, 5 and 6 over a grid of axis values around the thresholds (with
+/// NaN), previous values, taken flags and steps. The control block is restored afterwards. Run
+/// once on the game thread.
+pub fn stick_self_test() {
+    let vals = [-1.0f32, -0.5, -0.400_000_1, -0.4, -0.399_999_9, 0.0, 0.399_999_9, 0.4, 0.400_000_1, 0.5, f32::NAN];
+    let mut checked = 0u32;
+    let mut bad = 0u32;
+    unsafe {
+        let len = BLOCK_END - BLOCK;
+        let saved = std::slice::from_raw_parts(BLOCK as *const u8, len).to_vec();
+        let block = || std::slice::from_raw_parts(BLOCK as *const u8, len).to_vec();
+        let load = |v: &[u8]| std::ptr::copy_nonoverlapping(v.as_ptr(), BLOCK as *mut u8, len);
+        IN_SHADOW.with(|x| x.set(true));
+        for &v in &vals {
+            for &pv in &vals {
+                for taken in [0u8, 1] {
+                    for step in [-1i32, 0, 1] {
+                        for e in [0usize, 1, 5, 6] {
+                            let b = BLOCK + e * 0x28;
+                            for o in [0, 4, 8, 0xC] {
+                                *((b + o) as *mut f32) = if o < 8 { v } else { pv };
+                            }
+                            *((b + 0x18) as *mut i32) = step;
+                            *((b + 0x1C) as *mut i32) = -step;
+                            std::ptr::write_bytes((b + 0x20) as *mut u8, taken, 4);
+                        }
+                        let state = block();
+                        let mut run = |id: usize, eax: u32| {
+                            load(&state);
+                            let r = Regs { edi: 0, esi: 0, ebp: 0, st0: 0, ebx: 0, edx: 0, ecx: 0, eax };
+                            let theirs = original(id, &r);
+                            let tb = block();
+                            load(&state);
+                            let ours = rust(id, &r);
+                            let ob = block();
+                            checked += 1;
+                            if !same(ACCESSORS[id].ret, theirs, ours) || tb != ob {
+                                bad += 1;
+                                if bad <= 10 {
+                                    log(&format!(
+                                        "actions: self-test {} eax {eax:#x} v {v} prev {pv} taken {taken} step {step}: original {:#x}, Rust {:#x}{}",
+                                        ACCESSORS[id].name,
+                                        theirs.0,
+                                        ours.0,
+                                        if tb == ob { "" } else { " (block differs)" }
+                                    ));
+                                }
+                            }
+                        };
+                        for id in 17..37 {
+                            for e in [0u32, 1, 5, 6] {
+                                run(id, e);
+                            }
+                        }
+                        for id in 12..17 {
+                            for code in -2i32..16 {
+                                run(id, code as u32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        IN_SHADOW.with(|x| x.set(false));
+        load(&saved);
+    }
+    log(&format!("actions: stick self-test: {checked} cases, {bad} mismatched"));
+}
+
 macro_rules! thunk {
     ($name:ident, $id:expr) => {
         #[unsafe(naked)]
@@ -393,7 +586,34 @@ thunk!(t8, 8);
 thunk!(t9, 9);
 thunk!(t10, 10);
 thunk!(t11, 11);
-const THUNKS: [extern "C" fn(); COUNT] = [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11];
+thunk!(t12, 12);
+thunk!(t13, 13);
+thunk!(t14, 14);
+thunk!(t15, 15);
+thunk!(t16, 16);
+thunk!(t17, 17);
+thunk!(t18, 18);
+thunk!(t19, 19);
+thunk!(t20, 20);
+thunk!(t21, 21);
+thunk!(t22, 22);
+thunk!(t23, 23);
+thunk!(t24, 24);
+thunk!(t25, 25);
+thunk!(t26, 26);
+thunk!(t27, 27);
+thunk!(t28, 28);
+thunk!(t29, 29);
+thunk!(t30, 30);
+thunk!(t31, 31);
+thunk!(t32, 32);
+thunk!(t33, 33);
+thunk!(t34, 34);
+thunk!(t35, 35);
+thunk!(t36, 36);
+const THUNKS: [extern "C" fn(); COUNT] = [
+    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35, t36,
+];
 
 pub fn install() {
     let mut ok = 0;
