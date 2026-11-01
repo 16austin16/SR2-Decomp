@@ -11703,7 +11703,7 @@ address,name,subsystem,status,notes
 0x00836bb0,net_timed_callbacks_run,net,documented,"sim_frame:6,7: runs the network timed callbacks (lists 0x212FFD0..) whose time is up against the session clock, removing those that finish or time out (35, 40)"
 0x004d6850,tod_keyframes_select,render,documented,"sim_frame:6,7: from the clock (0x140E72C hours, 0x140E72D minutes, 0x140E730 day) picks the two time-of-day keyframes 0xF9E2F4 / 0xF9E2F8 and the blend t 0xF9E2F0 used by the tod_* functions; 0xF9E2EC = a random [0, 1) (40)"
 0x0073dcb0,frontend_state_frame,app,documented,"game state 2 (front end) frame, from game_state_dispatch; no args (40)"
-0x0073b7f0,loading_state_frame,app,documented,"game state 10 (loading) frame, from game_state_dispatch; no args (40)"
+0x0073b7f0,loading_state_frame,app,rust,"Rust (frame.rs): loading screen state 10: fade, loading UI, co-op join wait (30 s timer), fade to black, then replace with state 5 / 2 (40)"
 0x0073cb30,frontend_connection_lost_check,ui,documented,"front end: shows the connection-lost warning (disconnected, MULTI_CONNECTION_LOST_PS3, MENU_TITLE_WARNING) (40)"
 0x0073ccf0,frontend_render,ui,documented,"front end, with 0x252A2A2 = 1 around it: video_frame, the 2D render state, screen_fade_apply, the background fill, interface_render and overlays_render (40)"
 0x007f4e90,foreign_character_warning_update,ui,documented,"no args: once, when 0x2528B28 is set and 0x2528B29 clear, sets 0x2528B29 and shows FOREIGN_CHARACTER_DETECTED_WARNING_MESSAGE (0x753EF0) (28, 11)"
