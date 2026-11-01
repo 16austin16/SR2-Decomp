@@ -78,36 +78,36 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 
 | Profiler section | Call | Status | Reach | Rust below | Doc |
 |---|---|---|---|---|---|
-| sim_frame:1,2,3 | — 0x6C6870 | unmapped | 5.0% | 57 (gfx_cmd, hddio, rsched, streamman) |  |
+| sim_frame:1,2,3 | `cutscene_do_frame` 0x6C6870 | mapped | 5.0% | 57 (gfx_cmd, hddio, rsched, streamman) | 23, 40 |
 | sim_frame:1,2,3 | — 0x493260 | unmapped | 0.1% |  |  |
 | sim_frame:1,2,3 | `camera_update` 0x4932F0 | mapped | 8.8% | 2 (gfx_cmd) | 19 |
-| sim_frame:1,2,3 | — 0xA70B40 | unmapped | 0.4% | 1 (rsched) |  |
-| sim_frame:1,2,3 | — 0xA55310 | unmapped | 1.2% |  |  |
-| sim_frame:1,2,3 | — 0xA66340 | unmapped | 1.1% |  |  |
-| sim_frame:1,2,3 | — 0x543920 | unmapped | 0.5% | 8 (gfx_cmd) |  |
-| sim_frame:1,2,3 | — 0x68F4B0 | unmapped | 2.7% | 2 (gfx_cmd) |  |
+| sim_frame:1,2,3 | `trigger_objects_reap` 0xA70B40 | mapped | 0.4% | 1 (rsched) | 09, 40 |
+| sim_frame:1,2,3 | `script_deferred_calls_flush` 0xA55310 | mapped | 1.2% |  | 09, 40 |
+| sim_frame:1,2,3 | `cellphone_do_frame` 0xA66340 | mapped | 1.1% |  | 28, 40 |
+| sim_frame:1,2,3 | `race_hud_do_frame` 0x543920 | mapped | 0.5% | 8 (gfx_cmd) | 29, 40 |
+| sim_frame:1,2,3 | `game_mode_do_frame` 0x68F4B0 | mapped | 2.7% | 2 (gfx_cmd) | 40 |
 | sim_frame:1,2,3 | `world_spawn_do_frame` 0x93D150 | mapped | 10.9% | 10 (rsched, streamman) | 40 |
 | sim_frame:1,2,3 | `script_do_frame` 0xCDDE70 | mapped | 0.4% |  | 09 |
 | sim_frame:1,2,3 | — 0x6DA350 | unmapped | 0.0% |  |  |
-| sim_frame:1,2,3 | — 0x54CCA0 | unmapped | 0.7% |  |  |
-| sim_frame:1,2,3 | — 0x6B7020 | unmapped | 0.6% | 2 |  |
+| sim_frame:1,2,3 | `wiretap_triggers_update` 0x54CCA0 | mapped | 0.7% |  | 22, 40 |
+| sim_frame:1,2,3 | `tutorial_do_frame` 0x6B7020 | mapped | 0.6% | 2 | 30, 40 |
 | sim_frame:1,2,3 | — 0x6905E0 | unmapped | 0.1% |  |  |
-| sim_frame:1,2,3 | — 0x75A120 | unmapped | 0.9% | 10 (gfx_cmd) |  |
+| sim_frame:1,2,3 | `controller_disconnect_check` 0x75A120 | mapped | 0.9% | 10 (gfx_cmd) | 14, 40 |
 | sim_frame:1,2,3 | `input_context_do_frame` 0x4F5040 | mapped | 0.0% |  | 14 |
 | sim_frame:1,2,3 | — 0x6AB6B0 | unmapped | 0.0% |  |  |
 | sim_frame:1,2,3 | — 0x6AB240 | unmapped | 0.0% |  |  |
 | sim_frame:1,2,3 | — 0x6AB2D0 | unmapped | 0.0% |  |  |
-| sim_frame:1,2,3 | — 0x765BB0 | unmapped | 3.7% | 11 (gfx_cmd) |  |
+| sim_frame:1,2,3 | `gps_route_update` 0x765BB0 | mapped | 3.7% | 11 (gfx_cmd) | 40 |
 | sim_frame:1b | — 0x68A1E0 | unmapped | 0.2% |  |  |
-| sim_frame:1b | — 0x68A320 | unmapped | 1.0% |  |  |
+| sim_frame:1b | `net_send_periodic_status` 0x68A320 | mapped | 1.0% |  | 35, 40 |
 | sim_frame:1b | — 0x68B860 | unmapped | 0.2% | 2 (gfx_cmd) |  |
-| sim_frame:1b | — 0xA17690 | unmapped | 1.7% |  |  |
-| sim_frame:1b | — 0xA1CCC0 | unmapped | 2.4% |  |  |
-| sim_frame:1b | — 0xA0AFF0 | unmapped | 2.6% |  |  |
-| sim_frame:1b | — 0xA0BF10 | unmapped | 2.0% |  |  |
+| sim_frame:1b | `nav_timesliced_jobs_update` 0xA17690 | mapped | 1.7% |  | 21, 40 |
+| sim_frame:1b | `player_nav_node_update` 0xA1CCC0 | mapped | 2.4% |  | 21, 40 |
+| sim_frame:1b | `nav_detours_update` 0xA0AFF0 | mapped | 2.6% |  | 21, 40 |
+| sim_frame:1b | `nav_detour_hulls_update` 0xA0BF10 | mapped | 2.0% |  | 21, 40 |
 | sim_frame:1b | `triggers_do_frame` 0xA6C350 | mapped | 6.9% | 5 (gfx_cmd, streamman) | 09, 40 |
-| sim_frame:1b | — 0xA58EE0 | unmapped | 2.0% |  |  |
-| sim_frame:1b | — 0x501FB0 | unmapped | 4.2% | 37 (gfx_cmd, hddio, streamman) |  |
+| sim_frame:1b | `restricted_zones_update` 0xA58EE0 | mapped | 2.0% |  | 21, 40 |
+| sim_frame:1b | `debug_city_plane_export_update` 0x501FB0 | mapped | 4.2% | 37 (gfx_cmd, hddio, streamman) | 40 |
 | sim_frame:1b | `mission_fail_flow_do_frame` 0x6A5BB0 | mapped | 11.1% | 18 (gfx_cmd, rsched, streamman) | 40 |
 | sim_frame:1b | — 0x7B02E0 | unmapped | 0.3% |  |  |
 | sim_frame:1b | `crib_stash_tutorial_nag` 0x548260 | mapped | 0.2% |  | 30 |
@@ -174,54 +174,54 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:5 | `chunk_object_attachments_update` 0x4AB140 | mapped | 2.2% |  | 05 |
 | sim_frame:5 | `detour_hull_objects_update` 0x9193C0 | mapped | 0.3% |  | 34, 40 |
 | sim_frame:5 | `timed_object_effects_expire` 0x5585E0 | mapped | 0.3% |  | 40 |
-| sim_frame:6,7 | — 0xB6AD40 | unmapped | 4.0% | 9 (gfx_cmd) |  |
-| sim_frame:6,7 | — 0x4DE770 | unmapped | 0.9% | 1 (mempool) |  |
+| sim_frame:6,7 | `weapon_target_lock_update` 0xB6AD40 | mapped | 4.0% | 9 (gfx_cmd) | 20, 40 |
+| sim_frame:6,7 | `weather_update` 0x4DE770 | mapped | 0.9% | 1 (mempool) | 33, 38, 40 |
 | sim_frame:6,7 | — 0x4D6850 | unmapped | 0.0% |  |  |
-| sim_frame:6,7 | — 0x4E66A0 | unmapped | 5.0% |  |  |
+| sim_frame:6,7 | `shadow_cascades_update` 0x4E66A0 | mapped | 5.0% |  | 40 |
 | sim_frame:6,7 | `weather_rain_effects_update` 0x4CF840 | mapped | 7.5% | 2 | 33, 40 |
-| sim_frame:6,7 | — 0x4CA750 | unmapped | 2.9% | 8 (gfx_cmd, mempool) |  |
-| sim_frame:6,7 | — 0x503AE0 | unmapped | 1.8% |  |  |
+| sim_frame:6,7 | `light_modifiers_update` 0x4CA750 | mapped | 2.9% | 8 (gfx_cmd, mempool) | 33, 40 |
+| sim_frame:6,7 | `ambient_zone_effects_update` 0x503AE0 | mapped | 1.8% |  | 33, 40 |
 | sim_frame:6,7 | — 0x4CBFC0 | unmapped | 0.2% |  |  |
 | sim_frame:6,7 | `inventory_find_weapon` 0x55ADF0 | mapped | 0.1% |  | 38 |
 | sim_frame:6,7 | — 0x727610 | unmapped | 0.3% |  |  |
-| sim_frame:6,7 | — 0x955470 | unmapped | 2.5% |  |  |
+| sim_frame:6,7 | `searchlights_update` 0x955470 | mapped | 2.5% |  | 34, 40 |
 | sim_frame:6,7 | `effect_objects_do_frame` 0x5053B0 | mapped | 17.4% |  | 40 |
-| sim_frame:6,7 | — 0x5142A0 | unmapped | 2.9% |  |  |
+| sim_frame:6,7 | `tod_ambient_effects_update` 0x5142A0 | mapped | 2.9% |  | 33, 40 |
 | sim_frame:6,7 | `net_send_door_event` 0x91A840 | mapped | 3.6% |  | 27 |
 | sim_frame:6,7 | — 0x4525E0 | unmapped | 0.2% |  |  |
 | sim_frame:6,7 | — 0x452820 | unmapped | 0.0% |  |  |
-| sim_frame:6,7 | — 0x453120 | unmapped | 2.6% |  |  |
+| sim_frame:6,7 | `ai_scheduled_tasks_run` 0x453120 | mapped | 2.6% |  | 21, 40 |
 | sim_frame:6,7 | `world_focus_point_update` 0x9DF4C0 | mapped | 6.0% | 13 (gfx_cmd) | 19, 40 |
-| sim_frame:6,7 | — 0x926170 | unmapped | 5.0% |  |  |
-| sim_frame:6,7 | — 0x4C6CD0 | unmapped | 1.7% |  |  |
+| sim_frame:6,7 | `coop_do_frame` 0x926170 | mapped | 5.0% |  | 35, 40 |
+| sim_frame:6,7 | `glares_update` 0x4C6CD0 | mapped | 1.7% |  | 40 |
 | sim_frame:6,7 | — 0x4C35C0 | unmapped | 2.3% | 4 (gfx_cmd) |  |
 | sim_frame:6,7 | — 0xD07B40 | unmapped | 0.0% |  |  |
 | sim_frame:6,7 | — 0x4DA880 | unmapped | 2.0% | 1 (mempool) |  |
-| sim_frame:6,7 | — 0x92D620 | unmapped | 1.5% |  |  |
-| sim_frame:6,7 | — 0x9FCF90 | unmapped | 4.0% | 3 |  |
+| sim_frame:6,7 | `object_effect_links_update` 0x92D620 | mapped | 1.5% |  | 33, 40 |
+| sim_frame:6,7 | `level_objects_near_camera_update` 0x9FCF90 | mapped | 4.0% | 3 | 40 |
 | sim_frame:6,7 | — 0xB82180 | unmapped | 0.1% |  |  |
 | sim_frame:6,7 | `gfx_get_thread_state` 0xD22790 | mapped | 0.1% |  |  |
 | sim_frame:6,7 | — 0xB821E0 | unmapped | 0.1% |  |  |
-| sim_frame:6,7 | — 0x6BCC60 | unmapped | 1.3% | 1 (rsched) |  |
+| sim_frame:6,7 | `rewards_do_frame` 0x6BCC60 | mapped | 1.3% | 1 (rsched) | 30, 40 |
 | sim_frame:6,7 | `difficulty_set_message` 0x54C220 | mapped | 1.5% | 5 | 30 |
 | sim_frame:6,7 | `cheats_do_frame` 0x687B40 | mapped | 2.4% | 18 (gfx_cmd, rsched, streamman) | 38 |
 | sim_frame:6,7 | `notoriety_update` 0x55F1D0 | mapped | 0.6% | 1 | 21 |
 | sim_frame:6,7 | `coop_session_active` 0x7F7AD0 | mapped | 0.0% |  | 09 |
-| sim_frame:6,7 | — 0x7A8F70 | unmapped | 1.1% |  |  |
+| sim_frame:6,7 | `confessional_do_frame` 0x7A8F70 | mapped | 1.1% |  | 30, 40 |
 | sim_frame:6,7 | `world_teleport_load_update` 0x4BC420 | mapped | 7.7% | 21 (gfx_cmd, hddio, streamman) | 40 |
-| sim_frame:6,7 | — 0x4C4210 | unmapped | 1.1% |  |  |
-| sim_frame:6,7 | — 0x91E9F0 | unmapped | 2.4% |  |  |
+| sim_frame:6,7 | `rumble_update` 0x4C4210 | mapped | 1.1% |  | 14, 40 |
+| sim_frame:6,7 | `chunk_object_lists_update` 0x91E9F0 | mapped | 2.4% |  | 05, 40 |
 | sim_frame:6,7 | `world_lighting_update` 0x4D9F20 | mapped | 6.1% | 3 | 33, 40 |
-| sim_frame:6,7 | — 0x4C2DD0 | unmapped | 1.0% |  |  |
+| sim_frame:6,7 | `render_param_volumes_update` 0x4C2DD0 | mapped | 1.0% |  | 33, 40 |
 | sim_frame:6,7 | — 0x683E00 | unmapped | 0.0% |  |  |
 | sim_frame:6,7 | — 0x9E99F0 | unmapped | 0.0% |  |  |
 | sim_frame:6,7 | `misc_packet_send_14` 0x926860 | mapped | 0.9% |  | 27 |
 | sim_frame:6,7 | — 0x836BB0 | unmapped | 0.0% |  |  |
-| sim_frame:6,7 | — 0xD24B70 | unmapped | 2.5% |  |  |
-| sim_frame:6,7 | — 0x793A40 | unmapped | 3.6% | 12 (gfx_cmd) |  |
+| sim_frame:6,7 | `gfx_view_set_hud` 0xD24B70 | mapped | 2.5% |  | 40 |
+| sim_frame:6,7 | `hud_do_frame` 0x793A40 | mapped | 3.6% | 12 (gfx_cmd) | 28, 40 |
 | sim_frame:6,7 | `interface_do_frame` 0x7F3500 | mapped | 5.3% |  | 06 |
 | sim_frame:6,7 | `camera_get_fov` 0x494080 | mapped | 0.6% |  | 11, 19 |
-| sim_frame:6,7 | — 0xD24D80 | unmapped | 2.9% |  |  |
+| sim_frame:6,7 | `gfx_view_set_world` 0xD24D80 | mapped | 2.9% |  | 40 |
 
 ### `frame_end_handoff` (0x521A00)
 
