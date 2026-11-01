@@ -193,6 +193,145 @@ cdecl (human `H`, f32 dt), the first call of `human_update`. No security cookie.
 
 **Port:** a call skeleton of 26 steps. Steps 3-4 (time scale and clock) are the only x87-heavy parts; keep their f32 stores. The animation update (24) is where most time goes.
 
+## human_state_machine_update (0x9947F0) at instruction level
+
+State byte +0x591, sub-state byte +0x592. The previous pair is kept in +0x593 / +0x594.
+
+### `human_state_set` (0x9954C0)
+
+`ECX` = state, `EDX` = sub-state, cdecl (human).
+- **Lock:** while the human is in 7 / 0x15, only a change to 7 / 0x12 is accepted; any other call returns at once.
+- Otherwise: +0x593 = old state, +0x594 = old sub-state, +0x591 = `CL`, +0x592 = `DL`.
+- When the state really changes, it runs leave actions for the old state (for example, leaving 6 calls 0x6AEEE0(cdecl 0, 1), or (0xFA, 0) when going to 8). Those actions are not mapped here.
+
+### The dispatcher
+
+`EAX` = human; `ESI` = human throughout.
+1. +0x53E = 0.
+2. If +0x4A0 has value 4 set, +0x595 == 0, +0x591 == 0 and `timer_elapsed(&+0x4E4)`: 0xA1E5B0(`ECX` = 0, `ESI` = human).
+3. `switch` +0x591 through the table 0x9948CC (states 1-8). State 0 and anything above 8 return.
+
+| State | Call |
+|---|---|
+| 1 | tail `human_state1_update` (`ECX` = human) |
+| 2 | Only if `human_owned_locally` (0x806720, `EAX` = human). Then +0x470 bit 0x40 set: `human_anim_set_update(cdecl human, 0, 1, 1, 0)`; clear: tail `human_state2_update` (`EAX` = human) |
+| 3 | The same owner test and the same bit 0x40 alternative; otherwise `human_state3_update(cdecl human)` |
+| 4 | tail `human_state4_update` (`EAX` = human) |
+| 5 | `human_state5_update(cdecl human)` |
+| 6 | `human_state6_update` (`ESI` = human, no stack argument) |
+| 7 | `human_state7_update(cdecl human)` |
+| 8 | tail `human_state8_update` (`EAX` = human) |
+
+Five different calling conventions in one switch: keep each one when calling the originals.
+
+**`human_owned_locally`** (0x806720, `EAX` = human → `AL`):
+- 0 when the human is null.
+- 1 when it has no net record (+0xB0), there is no session (`[0x2528C14]`), or the session has no +0x408.
+- Otherwise 1 only when the record's owner byte equals session+0x408 +0x1B0 **and** record +0x67C bit 0 is clear; 0 in every other case.
+
+### State 1 (0x998790), `ECX` = human
+
+If the human's own handle +0x44 resolves in the object table (`0x2149C64 + (h & 0xFFF) × 16`, with +0x44 matching) to an object of type 1 (+0x4C) with +0x3CC == 1: `human_pkt_send_09(ECX = human, cdecl &+0x564, 0, 0, 1)`. Nothing else.
+
+### State 2 (0x99CFF0), `EAX` = human (`EDI`)
+
+1. Return if +0x470 bit 0x40.
+2. m = +0x474. If m ≠ 2 and +0x498 == 0 and +0x49C == 0: **tail 0x99CC30** (`EAX` = human).
+3. f = bit 5 of +0x80.
+4. m == 0: +0x514 = −1, +0x474 = 1, then as m == 1.
+5. m == 1: if `0x99C7B0(cdecl human, f)` is false, tail 0x99CC30 (`EAX` = human); otherwise return.
+6. m == 2 with f clear: 0x95F090(`EAX` = human, cdecl &+0x4EC, 0, −1, 0); 0xBE49A0(`EAX` = &+0x4F8, cdecl &+0x20); 0x99CA90.
+7. m == 2 with f set (an interpolated move):
+   1. ok = 0x993CD0().
+   2. t = 1.0. If the timer +0x510 is set and not elapsed: t = f32((200 − `timer_remaining`) × `[0xE5C5D0]`), clamped to [0, 1] (≤ 0 or NaN → 0).
+   3. pos = +0x504 + (+0x4EC − +0x504) × t, per component, each step → f32.
+   4. Unless `human_entering_or_exiting_vehicle`: pos.y = +0x18 (keeps the current height).
+   5. done = (t == 1.0).
+   6. 0x95F090(`EAX` = human, cdecl &pos, 0, −1, 0).
+   7. `human_pkt_send_09(ECX = human, cdecl &(+0x4F8 + +0x14 … +0x500 + +0x1C), 0, 0, 0)`.
+   8. If ok and done: +0x510 = −1. Then if +0x4A0 has value 4 set: 0xA1E5B0(`ECX` = 0, `ESI` = human), and 0x99CA90 only when it returns false. Without that bit: 0x99CA90.
+8. Other values of m: return.
+
+### State 3 (0x99E490), cdecl (human)
+
+1. Return if +0x470 bit 0x40.
+2. 0x735C80(`ECX` = +0x570, cdecl &T), where T is a 48-byte local. Then 0x9948F0(`EAX` = &T, cdecl human, &human+0x20).
+3. r = 0xB19AE0(`EAX` = human, cdecl &T, &T+0x14). If r is 0 or −1: 0x99E650(`ESI` = human, cdecl 0); return.
+4. If +0x474 == 2: copy T to the block at +0xE40 (3 dwords, then 9 dwords to +0xE4C), then 0x99DEA0(`EDX` = +0xE40, `ECX` = +0xE64, cdecl human).
+5. `human_state2_update` (`EAX` = human): state 3 runs the state 2 move too.
+6. If +0x470 has value 4 set:
+   - d = 0xBDEA80(`EAX` = &T, `ECX` = +0xE40) (a distance).
+   - If d ≤ `[0xE99A34]` or NaN: 0x99E650(`ESI` = human, cdecl 1).
+   - Otherwise ok = (+0x474 == 2) ? 0x99E6D0(cdecl human, 0, 0) : (0x99DC70(`ECX` = 0, `EAX` = &T, cdecl human) ≠ 0).
+     - ok: `human_anim_set_update(cdecl human, −1, 1, 1, 0)`;
+     - not ok: 0x99E650(`ESI` = human, cdecl 0).
+
+### State 4 (0x999980), `EAX` = human (`ESI`)
+
+1. +0xC8 &= ~0x10. If +0x4C == 1 and +0x3CC == 1: `human_pkt_send_09(ECX = human, cdecl &+0x564, 0, 0, 1)`.
+2. rig = +0x5E0; track = rig +0x168; p = f32(0x96F280(cdecl human)), the animation progress.
+3. `switch` +0x592 (1-4, table 0x999B54):
+   - **1:** go on if `anim_track_is_playing(ECX = *rig, cdecl [0x15B8794], track)`, or else if p ≥ K, where K = `[0xDD1B58]`; otherwise return. Then +0xC8 = (+0xC8 & ~0x01000000) | 0x800000; `human_state_set(4, 2)`, then **falls into 2**.
+   - **2:** return if 0x999400() is true, or p < K (or NaN). Then 0x96F5F0(`ECX` = human, cdecl id, 0x53E, 0x10000, f32 0.0, 1.0, −1.0), where id = 0x3A if +0x61D or +0x61C is set, else 0x39. Then `human_state_set(4, 3)`.
+   - **3:** return if 0x999400() is true, or p < 1.0 (or NaN). Then 0x999190(cdecl 1, 1) and 0x96FCA0(`ECX` = human, cdecl id, 0, 1, f32 0.0, 1.0, −1.0, 0, −1), where id = 0x3E if +0x61D, 0x3D if +0x61C, else 0x3C.
+   - **4:** tail 0x999690 (`EAX` = human).
+
+### State 8 (0x9989C0), `EAX` = human
+
+If +0x592 == 0xF: `human_state_set(8, 0x10)`. Nothing else.
+
+### States 5, 6 and 7 (case-level map)
+
+These three are large (about 0x600 to 0x700 bytes each). Below are their sub-state switches and the calls in each case, in order. The work inside each case is not mapped at instruction level yet.
+
+**State 5** (0x9976E0, cdecl human), sub-states 5-11 (table 0x997CE8):
+- **Prologue:**
+  - if the human is the local player: `[0xE8DD90]` = −1 and player +0x1162 &= ~7;
+  - then it needs the record behind handle +0xF68: high word below 0x866 into the table `0xF7AAE8`; entry = (low word − 1) × 0x20 + list +0x150; entry +0x18 bit 2 must be set;
+  - otherwise it goes to the tail 0x997CAA, which calls 0x997420 and 0x963090.
+
+| Sub | Calls |
+|---|---|
+| 5 | `human_state_set` |
+| 6 | 0x96FCA0, 0x735C80, 0x6FC610, 0x464D90, `audio_play`, `human_state_set`, 0x997420 |
+| 7 | 0x96F280, 0x997360, 0x96FCA0, 0x735C80, 0x6FC610, 0x464D90, `audio_play`, `human_state_set` |
+| 8 | 0x96F280, 0x95F090, 0x96FCA0, `human_state_set`, 0x96FCA0, 0x997590, 0x9974C0, 0x95F090 |
+| 9 | 0x96F280, 0x95F090, 0x997390, 0x9973C0, 0x96FCA0, 0x464D90, `audio_play`, `human_state_set` |
+| 10 | 0x96F280, 0xCECBC0, 0x997D10, 0x999190, 0x9973F0, 0x96FCA0, 0xBDDAE0, 0xBDDA80, `vec3_mul_mat33_in_place`, 0x735E70 |
+| 11 | 0x96F280 |
+
+**State 6** (0x9989E0, `ESI` = human; 16-byte aligned frame with a security cookie):
+- **Prologue:**
+  - owned = the inline `human_owned_locally` test; false when `ESI` is 0;
+  - if the +0x10CC record's +0xC4 has +0x2C ≥ 0: 0x9C5140 (`EAX` = human);
+  - then the local-player checks: 0x9D7DD0, and 0x9DA290 when +0x1161 bit 0 is set;
+  - then `human_pkt_send_09`.
+- **Switch** on +0x592:
+
+| Sub | Calls |
+|---|---|
+| 12 | 0x7F5CD0, 0x418540, 0x6FA330, 0x997E20, 0x4080B0; on later paths `timer_elapsed`, `human_apply_hit`, 0x6AE180, `human_state_set` |
+| 13 | 0x9CBC60, `human_pkt_send_17`, `human_state_set`, 0x6AE560, 0x6AEE30, `object_is_player_human`, 0x99F420 |
+| 14 | 0x998810 (`EAX` = human) |
+| other | return |
+
+**State 7** (0x99A2D0, cdecl human), sub-states 0x11-0x15 (table 0x99A9B4):
+
+| Sub | Calls |
+|---|---|
+| 0x11 | `human_owned_locally`, 0x983540, 0x6AEE30, 0x6AEEE0, 0x99A1E0, 0x9ACC30, 0x9ACC90, 0x418540, 0x735C80, 0x6FA330, `object_teleport`, 0x9ACC90, 0x4080B0 |
+| 0x12 | 0x717AC0, 0x7183D0, 0x7152A0, `human_state_set`, 0xCEC570, 0x96F280, 0x717AC0, 0x7183D0, 0x9ACB10, 0x5B65D0, `human_owned_locally`, 0x43F100, 0x96E7E0, 0x5DDA00, 0x415920 |
+| 0x13 | 0x96F280, 0x717AC0, 0x7183D0, `human_state_set`, 0x6FC610, 0x735EF0, 0x963090, `player_busted_handle`, 0x493C80 |
+| 0x14 | return |
+| 0x15 | `screen_fade_is_full`, `screen_fade_start`, 0x925460, `human_equals_local_player`, `object_teleport`, `vehicle_seat_occupant`, 0xBDE150, 0xBE49A0, `object_teleport`, 0x719310, 0x9AD780, `camera_cut`, `human_state_set`, 0x4D1270 |
+
+7 / 0x15 is the sub-state that `human_state_set` locks: only 7 / 0x12 can leave it. It fades, teleports and cuts the camera. With `player_busted_handle` in 0x13, state 7 looks like the arrest / respawn sequence (inferred).
+
+**Port order:**
+1. The dispatcher, `human_state_set`, and states 1, 4 and 8. They are small and fully mapped above.
+2. States 2 and 3. The interpolated move in state 2 needs `[0xE5C5D0]` and the f32 rounding at each step.
+3. States 5-7 last, calling the originals per case until their insides are mapped.
+
 ## Open
 
 - What 0x9C1B90 (AI think) runs per behaviour, and the human state machine values at +0x591 / +0x592.
