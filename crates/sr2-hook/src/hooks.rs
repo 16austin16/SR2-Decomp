@@ -35,6 +35,9 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if n == 1 || n.is_multiple_of(3600) {
         log(&format!("game_frame_tick: frame {n}{}", if RUST_FRAME { " (Rust body)" } else { "" }));
     }
+    if n > 3600 && n.is_multiple_of(900) {
+        log(&crate::actions::summary());
+    }
     if n == 900 || n == 4300 {
         crate::actions::stick_self_test();
     }

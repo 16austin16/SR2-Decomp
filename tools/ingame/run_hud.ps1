@@ -22,6 +22,7 @@ function shot($n) { & $in shot "$bin\hud_$n.png" | Out-Null }
 if (Get-Process SR2_pc -ErrorAction SilentlyContinue) {
     Start-Sleep 3; shot "1_hud"
     k "01"; Start-Sleep 2; shot "2_pause"
+    & $in -Action hold -Arg "E050" -HoldMs 1500 | Out-Null; Start-Sleep 1   # take_repeat: held Down in a menu
     k "E04D"; Start-Sleep 2; shot "3_pause_tab"
     k "E04D"; Start-Sleep 2; shot "4_pause_tab2"
     k "01"; Start-Sleep 1; k "01"; Start-Sleep 2
@@ -30,6 +31,7 @@ if (Get-Process SR2_pc -ErrorAction SilentlyContinue) {
     & $in -Action hold -Arg "11,2A" -HoldMs 3000 | Out-Null
     k "39"; Start-Sleep 1; k "13"; Start-Sleep 1; k "1D"; Start-Sleep 1; k "1D"
     & $in -Action hold -Arg "1E" -HoldMs 1500 | Out-Null; & $in -Action hold -Arg "1F" -HoldMs 1500 | Out-Null
+    k "2E"; Start-Sleep 1; k "2E"; Start-Sleep 1; k "12"; Start-Sleep 1   # consume: C (crouch), E (use)
     Start-Sleep 1; shot "7_moved"
     Start-Sleep 15
     Stop-Process -Name SR2_pc -ErrorAction SilentlyContinue

@@ -142,6 +142,7 @@ thread_local! {
 
 /// The `pushad` block, lowest address first. The ESP slot carries an f32 result out.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct Regs {
     edi: u32,
     esi: u32,
@@ -766,6 +767,34 @@ pub fn stick_self_test() {
                         }
                     }
                 }
+            }
+        }
+        // The accessors with no callers in the exe: previous values for every action, and
+        // player_stick_get on each entry (x through the pointer, y through ECX).
+        for action in 0..132u32 {
+            for id in [4usize, 6] {
+                let r = Regs { edi: 0, esi: 0, ebp: 0, st0: 0, ebx: 0, edx: 0, ecx: 0, eax: action };
+                let theirs = original(id, &r, std::ptr::null());
+                let ours = rust(id, &r, std::ptr::null_mut());
+                checked += 1;
+                if theirs.1.to_bits() != ours.1.to_bits() {
+                    bad += 1;
+                    log(&format!("actions: self-test {} action {action}: original {}, Rust {}", ACCESSORS[id].name, theirs.1, ours.1));
+                }
+            }
+        }
+        for e in [0u32, 1, 3, 4, 5, 6] {
+            let (mut x1, mut y1, mut x2, mut y2) = (0u32, 0u32, 0u32, 0u32);
+            let r1 = Regs { edi: 0, esi: 0, ebp: 0, st0: 0, ebx: 0, edx: 0, ecx: &mut y1 as *mut u32 as u32, eax: e };
+            let a1 = [&mut x1 as *mut u32 as u32];
+            original(47, &r1, a1.as_ptr());
+            let r2 = Regs { ecx: &mut y2 as *mut u32 as u32, ..r1 };
+            let mut a2 = [&mut x2 as *mut u32 as u32];
+            rust(47, &r2, a2.as_mut_ptr());
+            checked += 1;
+            if (x1, y1) != (x2, y2) {
+                bad += 1;
+                log(&format!("actions: self-test player_stick_get entry {e}: original {x1:#x} {y1:#x}, Rust {x2:#x} {y2:#x}"));
             }
         }
         // The response curve over a sweep of inputs.
