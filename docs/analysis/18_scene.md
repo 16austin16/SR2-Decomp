@@ -977,6 +977,38 @@ No arguments. Frame: `sub esp, 0x7C`; saves `EBX` / `EBP` / `ESI` / `EDI`. `EBX`
 - Steps 2 and 11 call the job function directly on the game thread, then arm and signal the job object. The job object is a completion fence, not the place the work runs.
 - 0x5250C0 receives a descriptor whose own function field is 0x5250C0.
 
+**The job descriptor (queue item 32).** It is a 32-byte stack struct, built twice. `E` is `ESP` after the prologue (`sub esp, 0x7C` and 4 pushes).
+
+| Off | First job (at E+0x24) | Second job (at E+0x44) | Meaning |
+|---|---|---|---|
+| +0x00 | 0x5250C0 | 0x5250D0 | the function |
+| +0x04 | 0, then the job object `[0xFA6BD8]` after the call (only when one exists) | same | the job |
+| +0x08 | **not written** (stale stack) | 0x2612D10 | argument 1 |
+| +0x0C | not written | not written | argument 2 |
+| +0x10 | 6 | 6 | the kind |
+| +0x14 | not written | not written | — |
+| +0x18 | `GetCurrentThreadId()` (`call [0xDB8080]`, kept in `EBP`) | same | the creating thread |
+| +0x1C | 0 | 0 | — |
+
+The order of the writes:
+1. +0x04 and +0x1C are zeroed **before** `GetCurrentThreadId`;
+2. then +0x18 is written;
+3. then the call's three cdecl arguments are pushed: (&descriptor, +0x08, +0x0C), with +0x08 / +0x0C pushed as they are;
+4. +0x00 and +0x10 (and +0x08 for the second job) are stored **after** the pushes, through `ESP`-relative addresses. The second job's pushed argument 2 is the constant 0x2612D10, so it is right even though the stored +0x08 comes later.
+
+The descriptor is **dead data**:
+- 0x5250C0 is `jmp 0x511050`, and 0x511050 reads none of its stack arguments: it works on globals (`[0xF9F694]`, `[0xFA20A0]`).
+- 0x5250D0 reads only its second argument and calls `0x523BD0(cdecl 0x2612D10)`.
+- The job object is then driven with `ECX` = job only: vtbl +4 (kick), then vtbl +0xC (sync), as `job_alloc` documents. The descriptor is not passed.
+- Nothing reads +0x04 after it is written.
+
+The struct is what is left of an inlined "submit job" helper that the compiler reduced to a direct call.
+
+**Port:**
+- No struct is needed. Call 0x511050 (or the port of it), then 0x523BD0(0x2612D10) when `[0xE99382]` is set.
+- Keep the two kick / sync pairs on `[0xFA6BD8]` and the step 14 wait. The render thread is synchronised through them.
+- If you call the originals, any 32 bytes of stack satisfy them.
+
 **Port:** keep the call order and the job fence. 0x523BD0 is the heavy part (the main and occlusion passes), so port this function as a skeleton calling originals.
 
 The roles of 0x523BD0, 0x4B3FF0, 0x4BA270 and 0xA02550 are not identified yet; which light source each collector in step 3 handles (other than the headlights) is not checked.
