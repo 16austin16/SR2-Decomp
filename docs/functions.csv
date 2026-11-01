@@ -11455,7 +11455,7 @@ address,name,subsystem,status,notes
 0x00a57730,group_find_by_name,script,documented,"name in a register -> script group or 0 (group_show, release_to_world) (09)"
 0x00a58070,group_set_hidden,script,documented,"group in a register, cdecl (bool hidden): group_show passes 0 (09)"
 0x00985630,human_is_dead,humans,documented,"cdecl (human) -> AL (character_is_dead) (09)"
-0x00bdc9b0,string_crc32_lower,util,documented,"ECX = string -> CRC-32 of the lowercased string (table 0xE843B8); first call of game_frame_tick (40)"
+0x00bdc9b0,string_crc32_lower,util,documented,"ECX = string -> CRC-32 of the lowercased string (table 0xE843B8), 0 for NULL; the vint name hash (vint_lua.rs calls it vint_hash_string); first call of game_frame_tick (06, 40)"
 0x00521970,temp_batching_pool_release,render,documented,"frame_end_handoff: resets the ""temp batching pool"" header at 0x2774150 and frees the source 0xFA23B4 (40)"
 0x005218d0,temp_batching_pool_create,render,documented,"frame_end_handoff: allocates the 0x60000-byte ""temp batching source"" and sets up the pool header at 0x2774150 (40)"
 0x005220b0,render_snapshot_copy_view,render,documented,"EAX = snapshot (0xE9D620): copies the view block 0xE9D6D0.. into it for the render thread (40)"

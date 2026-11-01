@@ -216,7 +216,7 @@ So a Rust binding is a C-ABI `extern "C" fn(*mut lua_State) -> i32` writing the 
 
 | Helper | Address | Convention |
 |---|---|---|
-| `vint_hash_string` | 0xBDC9B0 | `ECX` = string → hash (0 for NULL) |
+| `string_crc32_lower` (called `vint_hash_string` in vint_lua.rs) | 0xBDC9B0 | `ECX` = string → CRC-32 of the lowercased string (0 for NULL) |
 | `vint_object_find_child_by_hash` | 0xB98340 | `ECX` = parent, (hash), `ret 4` |
 | `vint_object_find_property` | 0xB978A0 | `ESI` = object, `ECX` = name → descriptor (value type at +4) |
 | `vint_object_get_property_by_hash` | 0xB97680 | `ESI` = object, `EDI` = &value, (hash), `ret 4` → al |
