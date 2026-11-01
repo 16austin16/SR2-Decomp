@@ -190,7 +190,7 @@ const COUNT: usize = 16;
 static PORTS: [Port; COUNT] = [
     port("human_equals_local_player", 0x0092_6650, ECX | EDX | SAVED),
     port("human_is_dead_or_invalid", 0x0098_55F0, EDX | SAVED),
-    port("human_from_handle_non_scripted", 0x009D_06A0, EDX | SAVED),
+    port("human_from_handle_kind2", 0x009D_06A0, EDX | SAVED),
     port("human_from_handle_active", 0x0043_8710, SAVED),
     port("vehicle_interaction_rider_find", 0x00B0_7A30, SAVED),
     port("human_vehicle_interaction_entering", 0x009B_9320, SAVED),
@@ -337,7 +337,7 @@ extern "C" fn dead_or_invalid_entry(r: &mut Pushad, _: *const u32) {
 }
 regs_thunk!(dead_or_invalid_thunk, dead_or_invalid_entry);
 
-// --- 0x9D06A0 human_from_handle_non_scripted (ECX = handle -> EAX) -------------------------------
+// --- 0x9D06A0 human_from_handle_kind2 (ECX = handle -> EAX) -------------------------------
 
 /// The live human of the handle only when its kind byte +0x3CC is 2 (`setne cl; sub ecx, 1;
 /// and eax, ecx` keeps EAX for 2 and clears it otherwise).

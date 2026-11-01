@@ -69,7 +69,7 @@ Every name below is missing from `functions.csv`. `timer_elapsed_ms` (0xBDD2A0) 
 | 0x9B9320 | `human_vehicle_interaction_entering` | cdecl (human) -> AL | vehicle_interaction_rider_find(ESI = +0x44) slot state +4 == 1 (a null slot gives 0); 91 callers. The existing human_entering_vehicle (0x9B9030) instead tests state 3 with +0xD78 == 0 | confirmed |
 | 0x9B9350 | `human_vehicle_interaction_exiting` | cdecl (human) -> AL | same, state +4 == 2; 46 callers (human_entering_or_exiting_vehicle tests 1 or 2). The existing human_exiting_vehicle (0x9B9070) tests state 3 with +0xD78 != 0 | confirmed |
 | 0x9855F0 | `human_is_dead_or_invalid` | EDX = human -> AL | 0 only when the handle +0x44 resolves to this object and hit points +0x1124 > 0; 200 callers | confirmed |
-| 0x9D06A0 | `human_from_handle_non_scripted` | ECX = handle -> EAX human or 0 | live type-1 object whose +0x3CC kind **is** 2 (the name is inverted; corrected later); 88 callers (vehicles_update pair events, human code) | inferred |
+| 0x9D06A0 | `human_from_handle_kind2` (was human_from_handle_non_scripted) | ECX = handle -> EAX human or 0 | live type-1 object whose +0x3CC kind **is** 2 (the name is inverted; corrected later); 88 callers (vehicles_update pair events, human code) | inferred |
 | 0x926650 | `human_equals_local_player` | EAX = human -> AL | EAX != 0 and EAX == [0x21703D4]; 86 callers. The existing human_is_local_player (0x926600, ECX) only tests +0x4C == 1 and +0x3CC == 1 (any player human) | confirmed |
 | 0x9B5C00 | `human_set_look_at_point` | cdecl (human, f32 weight), EDX = &point, ESI = duration ms, EAX = flag | +0x730..0x738 = point, bit 0 of +0x760 = EAX bit 0, +0x74C = weight when > 0, clears +0x75C bit 0, timer +0x748 = now + ESI or -1; the look-target step of human_update | confirmed |
 | 0x98E2A0 | `human_knockdown_default_force` | no args -> ST0 (f32) | [0x279749C] in single player (0x2528B48 == 1, 0x2528B49 == 0), else [0x279748C]; the same constants as the explosion knockdown (doc 33); human_update_core step 6 | confirmed |
@@ -162,9 +162,9 @@ These are 15 small functions from the list above. Each is a leaf or a fixed call
    - o = `resolve([EDX+0x44])` (0 when the handle is 0). If o != EDX: return 1.
    - Return 0 if `0.0 < f32 [EDX+0x1124]`, else 1. A NaN gives 1.
 
-3. **0x9D06A0 `human_from_handle_non_scripted`** (ECX = handle → EAX).
+3. **0x9D06A0 `human_from_handle_kind2` (was human_from_handle_non_scripted)** (ECX = handle → EAX).
    - o = `resolve(ECX)`. Return 0 unless o is valid and o+0x4C == 1.
-   - Return o if byte o+0x3CC == 2, else 0. **Correction:** this line said the opposite. `setne cl` gives 0 when the kind is 2; `sub ecx, 1` turns that into −1 (all bits set), so `and eax, ecx` keeps o. Any other kind gives `ecx` = 0 and returns 0. The name `human_from_handle_non_scripted` is therefore inverted; the row is a ported (rust) row, so the rename is left to the porting session.
+   - Return o if byte o+0x3CC == 2, else 0. **Correction:** this line said the opposite. `setne cl` gives 0 when the kind is 2; `sub ecx, 1` turns that into −1 (all bits set), so `and eax, ecx` keeps o. Any other kind gives `ecx` = 0 and returns 0. The name `human_from_handle_kind2` (was human_from_handle_non_scripted) is therefore inverted; the row is a ported (rust) row, so the rename is left to the porting session.
    - Branch-free in the original (`setne` / `sub 1` / `and`); a plain `if` gives the same value.
 
 4. **0x438710 `human_from_handle_active`** (EAX = handle, cdecl (u8 require_alive) → EAX; the caller cleans 4).
