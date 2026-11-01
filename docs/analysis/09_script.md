@@ -200,7 +200,7 @@ So a Rust binding is a C-ABI `extern "C" fn(*mut lua_State) -> i32` writing the 
 | 15 | `group_show` 0xA2D7E0 | 253 | (group name) → 0 | `group_find_by_name` (0xA57730), `group_set_hidden(0)` (0xA58070) |
 | 16 | `character_is_dead` 0xA35700 | 251 | (name) → boolean | name lookup (0xA52BB0, 0xA275F0 / 0xA27660, else the object's virtual +0x34), then `human_is_dead` (0x985630) |
 | 17 | `audio_play` 0x7ECDF0 | 243 | (cue name, [type string], [volume], …) up to 3 → handle number | 0x7ECCA0 picks the cue, then the audio play path 0x465AB0 / 0x464920 / 0x465B90 (10_audio.md) |
-| 18 | `vint_object_destroy` 0xB8F310 | 225 | (handle, [delay]) → 0 | finds the object; destroys it now, or queues it with the delay (0xB97A20) |
+| 18 | `vint_object_destroy` 0xB8F310 | 225 | (handle, [delay]) → 0 | finds the object; unlinks it from its parent (`vint_object_unlink_from_parent` 0xB97A20, skipped for an element of a document with no root) and destroys it (slot 2). The delay is converted and ignored |
 | 19 | `objective_text` 0xA47050 | 179 | (tag, text id, [arg], [arg], [index]) up to 5 → 0 | formats the localized text into a 258-char buffer (0x7F4BC0), then the HUD objective (0x78E250) |
 | 20 | `door_lock` 0xA2DED0 | 178 | (door name, [locked = true]) → 0 | the object lookup (0xA5B6E0), then 0x91B690 (sets the lock) |
 
@@ -209,3 +209,24 @@ So a Rust binding is a C-ABI `extern "C" fn(*mut lua_State) -> i32` writing the 
 2. The name-lookup ones that set a flag or callback: `trigger_enable`, `on_trigger`, `on_death`, `group_show`, `door_lock`, `character_is_dead`.
 3. The vint four (`vint_set_property`, `vint_get_property`, `vint_object_find`, `vint_object_destroy`). Together they are 64% of all binding call sites, and they run every frame in the HUD scripts, so they are where a port saves the most. They need the vint property table (06_vint.md) first.
 4. `thread_new`, `audio_play`, `objective_text` and `release_to_world`, which reach into larger systems.
+
+## Ported: the vint four
+
+`crates/sr2-hook/src/vint_lua.rs` replaces `vint_set_property`, `vint_object_find`, `vint_get_property` and `vint_object_destroy`, plus `vint_lua_current_document` (0xB8E020) and `vint_object_unlink_from_parent` (0xB97A20). The Lua API and the vint value / property helpers stay the game's:
+
+| Helper | Address | Convention |
+|---|---|---|
+| `vint_hash_string` | 0xBDC9B0 | `ECX` = string → hash (0 for NULL) |
+| `vint_object_find_child_by_hash` | 0xB98340 | `ECX` = parent, (hash), `ret 4` |
+| `vint_object_find_property` | 0xB978A0 | `ESI` = object, `ECX` = name → descriptor (value type at +4) |
+| `vint_object_get_property_by_hash` | 0xB97680 | `ESI` = object, `EDI` = &value, (hash), `ret 4` → al |
+| `vint_object_set_property_by_name` | 0xB97810 | `ESI` = object, `ECX` = name, (&value, extra), `ret 8` |
+| `vint_value_init` / `_free` / `_assign` | 0xB93A10 / 0xB93790 / 0xB93620 | `EAX` = &value, `ECX` = type / `EAX` = &value / `ESI` = dst, `EDI` = src |
+| `vint_value_from_lua` | 0xB8D200 | `EAX` = &typed value, cdecl (&scratch, L, &args left, 0) → &value read |
+| `vint_value_push_lua` | 0xB8D8F0 | `EAX` = L, `EDX` = &value → results pushed |
+| `vint_value_to_handle` | 0x634BA0 | `ECX` = &value |
+| `lua_opt_int_arg` | 0x5575E0 | `EDI` = &args left, cdecl (L, 0, &default) |
+
+`vint_set_property`, step by step: the handle is read only if argument 1 is a number. The property's value type comes from its descriptor. A tween's `start_value` / `end_value` (type 0xD) instead takes the type of the property it animates (the tween's target handle, slot 11, and its `target_property` string). The value is initialised to that type (types up to 0xB), read from the remaining arguments, and set with an optional trailing int.
+
+Tested in game: HUD, pause menu and map, 727 / 532 / 110 / 77 calls in about 2 minutes; `vint_object_find` and `vint_get_property` matched the originals on every shadowed call.

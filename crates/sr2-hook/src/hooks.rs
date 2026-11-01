@@ -47,6 +47,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
         log(&crate::render::summary());
         log(&crate::gfx_cmd::summary());
         log(&crate::texguard::summary());
+        log(&crate::vint_lua::summary());
         if SURVEY {
             crate::survey::report(&format!("frame {n}"));
         }
@@ -2114,6 +2115,7 @@ pub fn install_all() {
         crate::render::install();
         crate::gfx_cmd::install();
         crate::texguard::install();
+        crate::vint_lua::install();
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }
