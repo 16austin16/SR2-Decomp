@@ -37,6 +37,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     }
     if n > 3600 && n.is_multiple_of(900) {
         log(&crate::actions::summary());
+        log(&crate::lua_bindings::summary());
     }
     if n == 900 || n == 4300 {
         crate::actions::stick_self_test();
@@ -2129,6 +2130,7 @@ pub fn install_all() {
         crate::frame::install();
         crate::controls::install();
         crate::actions::install();
+        crate::lua_bindings::install();
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }

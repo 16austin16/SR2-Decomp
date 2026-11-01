@@ -30,6 +30,7 @@ mod gfx_cmd;
 mod hddio;
 mod hooks;
 mod input;
+mod lua_bindings;
 mod mempool;
 mod menu;
 mod missionlog;
