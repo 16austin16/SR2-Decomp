@@ -11325,7 +11325,7 @@ address,name,subsystem,status,notes
 0x00ce01b0,script_thread_push_string,lua,documented,"EDI = thread entry, EAX = string: pushes it (or nil when NULL) on the coroutine (+4), entry+0x1C += 1 (09)"
 0x00cdfcb0,script_thread_push_bool,lua,documented,"ECX = thread entry, cdecl (u8), ret 4: tt 1 (09)"
 0x00cdfc60,script_thread_push_number,lua,documented,"ECX = thread entry, cdecl (double), ret 8: tt 3 (09)"
-0x00ce0740,script_thread_resume_if_alive,lua,documented,"EAX = &entry pointer: resumes the thread unless it is missing or dead (flag 0x40) (09)"
+0x00ce0740,script_thread_resume_once,script,documented,"EAX = &entry pointer: resumes it once (script_thread_resume, no error out) unless flag 0x40 is set; used after thread creation (09)"
 0x00cdf2c0,script_heap_alloc,lua,documented,"EAX = size: allocation for the VM under the critical section 0x347ADE4 (09)"
 0x00cde870,script_heap_free,lua,documented,"EAX = block: frees into the size-class pools 0x25263A4 (260 call sites) (09)"
 0x00cdced0,lua_newthread,lua,documented,"Lua 5.0 lua_newthread (used by script_thread_create) (09)"
@@ -11828,3 +11828,4 @@ address,name,subsystem,status,notes
 0x006ab2d0,state_eaaf84_check,app,rust,"Rust (frame.rs, sim_frame batch): resets the state 0xEAAF84 when its record 0xEAAF90 is gone or done; an idle non-1 state goes to 0x6AB380; role unknown (40)"
 0x005507c0,vehicle_groups_timed_spawn,ai,rust,"Rust (frame.rs, sim_frame batch 2): groups 1-3, every 20 min of game time (0x2797BD0[i]) spawn with 0x55BD10(EDI = group) while the group has fewer than 5 (0x1409AA8[i]); role inferred (40)"
 0x006ab240,record_input_step,app,rust,"Rust (frame.rs, sim_frame batch 3): with record 0xEAAF90 in state 3 / screen 0, take-repeat actions 0x10 / 0xF step it (0x6AB000 / 0x6AB090); active -> 0x6AB3F0 unless state 0xEAAF84 is 2, else the state resets; role unknown (40)"
+0x00427600,floorf_wrapper,math,documented,"cdecl (f32) -> ST0: widens to double and calls 0xDA0C50 (floor), result rounded to f32; role inferred (17)"

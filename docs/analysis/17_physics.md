@@ -108,6 +108,24 @@ Humans are character proxies, not bodies (15_humans.md). A vehicle is one body (
 
 **Actions** (`hkpUnaryAction`): `multi_game_havok_corrector` (multiplayer position correction) and `MyAction` (0x6F53F0).
 
+## physics_frame_time (0x6FF860) at instruction level
+
+No arguments; returns **ST0**. Frame `sub esp, 0x18`; saves `ESI`.
+
+1. If the physics frame did not change (`[0x252A3C0]` == `[0xE8ECBC]`): return `[0x2527DCC]` (the time stepped this frame, already computed).
+2. Otherwise:
+   1. step = f32(`[0x2527DA4]` / `[0xE8ECAC]`);
+   2. x = f32(carry `[0x2527DC8]` + frame dt `[0xE8437C]`);
+   3. y = f32(x / step);
+   4. `floorf_wrapper(cdecl y)` (0x427600, floor through a double) → ST0.
+3. Convert with the **control word set to truncate**: save it with `fnstcw`, OR it with 0xC00, `fldcw`, `fistp qword`, restore. n = the low dword.
+4. If n ≥ `physics_max_substeps()` (an **unsigned** compare, `jb`): n = `physics_max_substeps()`, called a second time.
+5. Result = f32(n as float × step). `fild` treats n as signed; a negative n gets +4294967296.0 (0xE5BFD8), so it is used as unsigned.
+
+**Port:**
+- `floor`, then truncate, then the unsigned clamp. A negative x (impossible with a positive dt) would wrap to a huge n and then be clamped.
+- Keep the f32 roundings at each `fstp` / `fld` pair.
+
 ## Open
 
 - What each step phase in `havok_step_job` maps to in Havok.

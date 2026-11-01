@@ -162,6 +162,73 @@ So a Rust binding is a C-ABI `extern "C" fn(*mut lua_State) -> i32` writing the 
 4. The thread table and its push / resume helpers.
 5. The VM itself last: it can stay original while everything around it is Rust.
 
+## script_do_frame and the thread scheduler at instruction level (for the port)
+
+### `script_do_frame` (0xCDDE70)
+
+No arguments; aligned frame (`and esp, −8`); saves `ESI`.
+
+1. used = `[0x252A66C]` ? `call [0x252A66C]` : −1 → `fild` → f32 A.
+2. budget = `[0x252A668]` ? `call [0x252A668]` : −1 → `fild`, × 0.85 (double at 0xE5C0E8) → f32 B.
+3. **If B ≤ 0** (`fcom` with 0, `test ah, 0x41` / `jnp`): **return at once, without resuming any thread.**
+   - So with no budget callback installed (B = −0.85), no script thread ever runs.
+   - An unordered compare (NaN) continues.
+4. If A > B: for each script state `0x25268D8[i × 8]` (i < `[0x252A664]`):
+   1. set `G = state +0x10`; `G+0x20` (GC threshold) = 0;
+   2. if `G+0x24` (blocks) ≥ `G+0x20`: `luaC_collectgarbage(cdecl state)`.
+
+   The threshold was just set to 0, so the test is always true: a full collection on every state.
+5. `script_threads_resume_all()`.
+
+### `script_threads_resume_all` (0xCE06D0)
+
+Saves `EBX` / `ESI` / `EDI`; `[esp+0xF]` is an error byte.
+
+- The thread records live at `0x2524360`, **32 bytes each**, with count `[0x252A638]` re-read every step:
+
+  | Offset | Field |
+  |---|---|
+  | +4 | `lua_State` |
+  | +8 | owner / state id |
+  | +0xC | u8 first run |
+  | +0x10 | function name |
+  | +0x18 | u16 flags |
+  | +0x1C | argument count |
+
+For i = 0 while i < count:
+1. Flags &= ~1.
+2. If the owner +8 is in the paused list (4 dwords `0x2526848..0x2526854`): skip this record.
+3. Otherwise `ok = script_thread_resume(EDI = &(record pointer on the stack), cdecl &error byte)`.
+4. If it returns 0 (the record was killed): **i − 1 and the pointer − 0x20**, so the same index runs again, because the kill compacts the array.
+
+### `script_thread_resume` (0xCE0570)
+
+`EDI` = **pointer to** the record pointer, cdecl (u8 *error or 0); returns `AL`: 1 = keep, 0 = removed. Aligned frame; saves `EBX` / `ESI`; `BL` = error.
+
+1. Flags & 0x40 → **return 0 without killing** (already dying).
+2. Flags & 4 (kill requested) → kill.
+3. If the pre-check hook `[0x252A640](cdecl record)` exists and returns 1 → kill.
+4. Flags & 3 (paused / waiting) → return 1.
+5. If the skip hook `[0x252A644](cdecl record)` exists and returns 1 → return 1.
+6. **First run** (byte +0xC):
+   1. `lua_pushstring(ESI = L, cdecl name +0x10)`;
+   2. `luaV_gettable(cdecl L, L+0x40 (globals), top − 0x10, 0)`, and copy the result over the top slot (16 bytes);
+   3. if the argument count +0x1C > 0: 0xCDC530(`ESI` = L, `EAX` = −1 − nargs), which moves the function below its arguments;
+   4. clear +0xC.
+7. Flags |= 1; 0xCDFD20 (current thread on).
+8. `BL` = `lua_resume(ESI = L, cdecl nargs +0x1C)` ≠ 0. The count is **passed on every resume**, not only the first.
+9. 0xCDFD00 (current thread off), 0xCDD100. If the error pointer is set: `*error = BL`.
+10. If `script_thread_is_suspended(cdecl record)` (it yielded):
+    - an error goes to the error path;
+    - otherwise, if `[0x252A613]`: 0xCDDBD0(cdecl L, 0);
+    - **return 1**.
+11. Finished or error. On error, with a live L: the owner's error callback `script_state_get_callback(EDX = owner +8)` → `cb(cdecl record)`.
+12. **Kill:** `script_thread_kill(cdecl EDI)`; return 0.
+
+**Port:**
+- The order of the checks and the two hooks (`0x252A640` / `0x252A644`) matter for missions that pause threads.
+- Keep the "repeat the index after a kill" step: `script_thread_kill` compacts the array, so the next thread moves into the current slot.
+
 ## Open
 
 - The four hook setters (`0x252A640/644/668/66C`, written by 0x51F700, 0xA244D0 and 0xCDF780).
