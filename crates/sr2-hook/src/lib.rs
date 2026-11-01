@@ -20,6 +20,7 @@ use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 mod caller_targets;
 #[cfg(feature = "caller-survey")]
 mod callers;
+mod controls;
 mod crash;
 mod detour;
 mod display;
