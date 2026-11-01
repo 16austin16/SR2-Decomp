@@ -4,6 +4,8 @@
 //! of each port a relocated copy of the original runs on the same registers and its EAX is
 //! compared with the Rust version's; on a mismatch the original's is kept.
 //!
+//! Also: nav_cell_scratch_record, vehicle_nav_query_mask, road_lane_by_index / _index / _filter_bit19_clear, nav_route_total_length (ST0 + EAX shadow).
+//!
 //! Not ported: `nav_cell_walkable` and `nav_cell_to_node_ref` (they call other functions) and
 //! `nav_cell_has_link_flag2` (a loop whose leftover EAX upper bits are not worth reproducing).
 
@@ -142,7 +144,13 @@ const CELL_CHUNK_RECORD: usize = 1;
 const LINK_FLAGS_TO_MASK: usize = 2;
 const ROUTE_CURRENT_ENTRY: usize = 3;
 const ORDER_IN_0_1_3: usize = 4;
-const COUNT: usize = 5;
+const SCRATCH_RECORD: usize = 5;
+const QUERY_MASK: usize = 6;
+const LANE_BY_INDEX: usize = 7;
+const LANE_INDEX: usize = 8;
+const LANE_FILTER: usize = 9;
+const ROUTE_TOTAL_LENGTH: usize = 10;
+const COUNT: usize = 11;
 
 static PORTS: [Port; COUNT] = [
     port("nav_node_ref_to_cell", 0x00A0_51D0, SAVED),
@@ -150,6 +158,12 @@ static PORTS: [Port; COUNT] = [
     port("nav_link_flags_to_mask", 0x00A0_4A10, EDX | SAVED),
     port("nav_route_current_entry", 0x00A1_F610, ECX | SAVED),
     port("vehicle_ai_order_in_0_1_3", 0x00B2_DC20, ECX | EDX | SAVED),
+    port("nav_cell_scratch_record", 0x00A0_2A90, EDX | SAVED),
+    port("vehicle_nav_query_mask", 0x00B2_6530, ECX | EDX | SAVED),
+    port("road_lane_by_index", 0x00A8_ABE0, SAVED),
+    port("road_lane_index", 0x00A8_ABA0, ECX | SAVED),
+    port("road_lane_filter_bit19_clear", 0x00A8_AB80, ECX | EDX | SAVED),
+    port("nav_route_total_length", 0x00A1_9460, ECX | EDX | SAVED),
 ];
 
 fn shadowing(id: usize) -> Option<(u32, usize)> {
@@ -320,6 +334,156 @@ extern "C" fn order_in_0_1_3_entry(r: &mut Pushad, _: *const u32) {
 }
 regs_thunk!(order_in_0_1_3_thunk, order_in_0_1_3_entry);
 
+// --- 0xA02A90 nav_cell_scratch_record (EAX = cell* -> EAX = record or 0) ---------------------------
+
+/// `[cell + 0x20]` must equal the generation word 0x2E160BC (else 0); the record is
+/// `0x2E160C4 + u16[cell + 0x1E] * 24`.
+unsafe fn cell_scratch_record(cell: u32) -> u32 {
+    unsafe {
+        let c = cell as usize;
+        if rd(c + 0x20) != rd(0x02E1_60BC) {
+            return 0;
+        }
+        let i = rb(c + 0x1E) as u32 | (rb(c + 0x1F) as u32) << 8;
+        0x02E1_60C4u32.wrapping_add(i * 24)
+    }
+}
+
+extern "C" fn cell_scratch_record_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(SCRATCH_RECORD, &p, unsafe { cell_scratch_record(p.eax) });
+}
+regs_thunk!(cell_scratch_record_thunk, cell_scratch_record_entry);
+
+// --- 0xB26530 vehicle_nav_query_mask (EAX = vehicle or 0 -> EAX = mask) ----------------------------
+
+/// Null vehicle: t = -1, else `t = [[v + 0x84E4] + 0x9C]` (no null check). t == 2 -> 0x200000,
+/// t == 4 -> 0x40000, anything else 0x400.
+unsafe fn query_mask(v: u32) -> u32 {
+    unsafe {
+        let t = if v == 0 { 0xFFFF_FFFF } else { rd(rd(v as usize + 0x84E4) as usize + 0x9C) };
+        match t {
+            2 => 0x20_0000,
+            4 => 0x4_0000,
+            _ => 0x400,
+        }
+    }
+}
+
+extern "C" fn query_mask_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(QUERY_MASK, &p, unsafe { query_mask(p.eax) });
+}
+regs_thunk!(query_mask_thunk, query_mask_entry);
+
+// --- 0xA8ABE0 road_lane_by_index (EAX = index -> EAX = lane* or 0) ---------------------------------
+
+/// Signed index < 0 or >= `[net]` gives 0 (net = [0x2225B64], not null-checked); else
+/// `[net + 4] + index * 0x3C`.
+unsafe fn lane_by_index(i: u32) -> u32 {
+    unsafe {
+        if (i as i32) < 0 {
+            return 0;
+        }
+        let net = rd(0x0222_5B64) as usize;
+        if (i as i32) >= rd(net) as i32 {
+            return 0;
+        }
+        rd(net + 4).wrapping_add(i.wrapping_mul(0x3C))
+    }
+}
+
+extern "C" fn lane_by_index_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(LANE_BY_INDEX, &p, unsafe { lane_by_index(p.eax) });
+}
+regs_thunk!(lane_by_index_thunk, lane_by_index_entry);
+
+// --- 0xA8ABA0 road_lane_index (EAX = lane* -> EAX = index or -1) -----------------------------------
+
+/// Null lane, `[lane + 0x10]` bit 19 set, or no network (0x2225B64 == 0): -1. Else the signed
+/// division of `lane - [net + 4]` by 0x3C as `hi32(d * 0x88888889) + d`, sar 5, plus the sign bit.
+unsafe fn lane_index(lane: u32) -> u32 {
+    unsafe {
+        if lane == 0 || (rd(lane as usize + 0x10) >> 0x13) & 1 != 0 {
+            return 0xFFFF_FFFF;
+        }
+        let net = rd(0x0222_5B64) as usize;
+        if net == 0 {
+            return 0xFFFF_FFFF;
+        }
+        let d = lane.wrapping_sub(rd(net + 4)) as i32;
+        let hi = ((0x8888_8889u32 as i32 as i64 * d as i64) >> 32) as i32;
+        let e = hi.wrapping_add(d) >> 5;
+        ((e as u32) >> 31).wrapping_add(e as u32)
+    }
+}
+
+extern "C" fn lane_index_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(LANE_INDEX, &p, unsafe { lane_index(p.eax) });
+}
+regs_thunk!(lane_index_thunk, lane_index_entry);
+
+// --- 0xA8AB80 road_lane_filter_bit19_clear (EAX = lane* -> EAX unchanged or 0) ---------------------
+
+/// Null gives 0; bit 19 of `[rec + 0x10]` set gives 0; otherwise EAX is kept.
+unsafe fn lane_filter(rec: u32) -> u32 {
+    unsafe {
+        if rec == 0 || (rd(rec as usize + 0x10) >> 0x13) & 1 != 0 { 0 } else { rec }
+    }
+}
+
+extern "C" fn lane_filter_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(LANE_FILTER, &p, unsafe { lane_filter(p.eax) });
+}
+regs_thunk!(lane_filter_thunk, lane_filter_entry);
+
+// --- 0xA19460 nav_route_total_length (ECX = head -> ST0, EAX = last link read) ---------------------
+
+/// `sum = 0; p = head; loop { sum = f32(sum + f32 [p + 0x14]); next = [p + 0x1C]; stop when next ==
+/// head or next == 0 }`. The sum goes through `fstp dword` every step (f64 add, then `as f32`);
+/// the loads are `fld dword`, so a signalling NaN is quieted. Returns the sum and the final EAX.
+unsafe fn route_total_length(head: u32) -> (f32, u32) {
+    unsafe {
+        let mut sum = 0.0f32;
+        if head == 0 {
+            return (sum, 0);
+        }
+        let mut p = head;
+        loop {
+            let bits = rd(p as usize + 0x14);
+            let quiet = if bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x7F_FFFF != 0 { 0x40_0000 } else { 0 };
+            let x = f32::from_bits(bits | quiet);
+            let next = rd(p as usize + 0x1C);
+            sum = (x as f64 + sum as f64) as f32;
+            if next == head || next == 0 {
+                return (sum, next);
+            }
+            p = next;
+        }
+    }
+}
+
+extern "C" fn route_total_length_entry(r: &mut Pushad, _: *const u32) -> f32 {
+    let p = *r;
+    let (mut ours, eax) = unsafe { route_total_length(p.ecx) };
+    r.eax = eax;
+    let Some((n, orig)) = shadowing(ROUTE_TOTAL_LENGTH) else { return ours };
+    let inp = Regs::of(&p);
+    let mut out = inp;
+    let theirs = unsafe { call_full(orig, &mut out, 0, true) } as f32;
+    check_preserved(ROUTE_TOTAL_LENGTH, &inp, &out);
+    if theirs.to_bits() != ours.to_bits() || out.eax != eax {
+        mismatch(ROUTE_TOTAL_LENGTH, n, format!("in {inp:x?}: original {:#x} eax {:#x}, Rust {:#x} eax {eax:#x}", theirs.to_bits(), out.eax, ours.to_bits()));
+        r.eax = out.eax;
+        ours = theirs;
+    }
+    ours
+}
+regs_thunk!(route_total_length_thunk, route_total_length_entry);
+
 // --- install ---------------------------------------------------------------------------------------
 
 pub fn install() {
@@ -329,6 +493,12 @@ pub fn install() {
         (LINK_FLAGS_TO_MASK, &LINK_FLAGS_TO_MASK_BODY, &[], link_flags_to_mask_thunk),
         (ROUTE_CURRENT_ENTRY, &ROUTE_CURRENT_ENTRY_BODY, &[], route_current_entry_thunk),
         (ORDER_IN_0_1_3, &ORDER_IN_0_1_3_BODY, &[], order_in_0_1_3_thunk),
+        (SCRATCH_RECORD, &SCRATCH_RECORD_BODY, &[], cell_scratch_record_thunk),
+        (QUERY_MASK, &QUERY_MASK_BODY, &[], query_mask_thunk),
+        (LANE_BY_INDEX, &LANE_BY_INDEX_BODY, &[], lane_by_index_thunk),
+        (LANE_INDEX, &LANE_INDEX_BODY, &[], lane_index_thunk),
+        (LANE_FILTER, &LANE_FILTER_BODY, &[], lane_filter_thunk),
+        (ROUTE_TOTAL_LENGTH, &ROUTE_TOTAL_LENGTH_BODY, &[], route_total_length_thunk),
     ];
     let mut ok = 0;
     for (id, body, call_offsets, thunk) in list {
@@ -383,4 +553,33 @@ const ROUTE_CURRENT_ENTRY_BODY: [u8; 27] = [
 const ORDER_IN_0_1_3_BODY: [u8; 26] = [
     0x8B, 0x80, 0x54, 0x85, 0x00, 0x00, 0x85, 0xC0, 0x7C, 0x0D, 0x83, 0xF8, 0x01, 0x7E, 0x05, 0x83,
     0xF8, 0x03, 0x75, 0x03, 0xB0, 0x01, 0xC3, 0x32, 0xC0, 0xC3,
+];
+const SCRATCH_RECORD_BODY: [u8; 29] = [
+    0x8B, 0x48, 0x20, 0x3B, 0x0D, 0xBC, 0x60, 0xE1, 0x02, 0x75, 0x0F, 0x0F, 0xB7, 0x40, 0x1E, 0x8D,
+    0x04, 0x40, 0x8D, 0x04, 0xC5, 0xC4, 0x60, 0xE1, 0x02, 0xC3, 0x33, 0xC0, 0xC3,
+];
+const QUERY_MASK_BODY: [u8; 49] = [
+    0x85, 0xC0, 0x75, 0x05, 0x83, 0xC8, 0xFF, 0xEB, 0x0C, 0x8B, 0x80, 0xE4, 0x84, 0x00, 0x00, 0x8B,
+    0x80, 0x9C, 0x00, 0x00, 0x00, 0x83, 0xE8, 0x02, 0x74, 0x11, 0x83, 0xE8, 0x02, 0x74, 0x06, 0xB8,
+    0x00, 0x04, 0x00, 0x00, 0xC3, 0xB8, 0x00, 0x00, 0x04, 0x00, 0xC3, 0xB8, 0x00, 0x00, 0x20, 0x00,
+    0xC3,
+];
+const LANE_BY_INDEX_BODY: [u8; 31] = [
+    0x85, 0xC0, 0x7C, 0x18, 0x8B, 0x0D, 0x64, 0x5B, 0x22, 0x02, 0x3B, 0x01, 0x7D, 0x0E, 0x8B, 0xD0,
+    0xC1, 0xE2, 0x04, 0x2B, 0xD0, 0x8B, 0x41, 0x04, 0x8D, 0x04, 0x90, 0xC3, 0x33, 0xC0, 0xC3,
+];
+const LANE_INDEX_BODY: [u8; 59] = [
+    0x51, 0x85, 0xC0, 0x75, 0x05, 0x83, 0xC8, 0xFF, 0x59, 0xC3, 0x8B, 0x48, 0x10, 0xC1, 0xE9, 0x13,
+    0xF6, 0xD1, 0x80, 0xE1, 0x01, 0x74, 0xEE, 0x8B, 0x0D, 0x64, 0x5B, 0x22, 0x02, 0x85, 0xC9, 0x74,
+    0xE4, 0x2B, 0x41, 0x04, 0x8B, 0xC8, 0xB8, 0x89, 0x88, 0x88, 0x88, 0xF7, 0xE9, 0x03, 0xD1, 0xC1,
+    0xFA, 0x05, 0x8B, 0xC2, 0xC1, 0xE8, 0x1F, 0x03, 0xC2, 0x59, 0xC3,
+];
+const LANE_FILTER_BODY: [u8; 22] = [
+    0x51, 0x85, 0xC0, 0x74, 0x0D, 0x8B, 0x48, 0x10, 0xC1, 0xE9, 0x13, 0xF6, 0xD1, 0x80, 0xE1, 0x01,
+    0x75, 0x02, 0x33, 0xC0, 0x59, 0xC3,
+];
+const ROUTE_TOTAL_LENGTH_BODY: [u8; 41] = [
+    0x51, 0x85, 0xC9, 0xD9, 0xEE, 0xD9, 0x1C, 0x24, 0x8B, 0xC1, 0x74, 0x18, 0x8D, 0x64, 0x24, 0x00,
+    0xD9, 0x40, 0x14, 0x8B, 0x40, 0x1C, 0x3B, 0xC1, 0xD8, 0x04, 0x24, 0xD9, 0x1C, 0x24, 0x74, 0x04,
+    0x85, 0xC0, 0x75, 0xEC, 0xD9, 0x04, 0x24, 0x59, 0xC3,
 ];
