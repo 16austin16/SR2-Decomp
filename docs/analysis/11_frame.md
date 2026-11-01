@@ -451,6 +451,128 @@ A port of either side must keep this order:
 
 The render thread re-arms the next job before the game thread can signal again, because the game thread is still waiting for the acknowledgement.
 
+## Enter and exit of states 2, 5 and 10 (porting maps)
+
+The dispatchers are `game_state_enter` (0x697330) and `game_state_exit` (0x6973E0). Both index a jump table by `EAX` = state − 1.
+- **Enter:** saves `EDI`. States 2, 5 and 10 then **tail-jump** to their function after `pop edi`.
+- **Exit:** saves `ECX` (a local) and `ESI`, and calls the function. State 5's exit gets one cdecl argument: the next state, read from `[esp+0xC]`, the dispatcher's own argument.
+
+| State | Enter | Exit |
+|---|---|---|
+| 2 front end | `frontend_enter` 0x73D900 | `frontend_exit` 0x73DB40 |
+| 5 gameplay | `gameplay_enter` 0x68DE50 | `gameplay_exit` 0x68E560 (cdecl next state) |
+| 10 loading | `loading_enter` 0x73B430 | `loading_exit` 0x73B520 |
+
+### `frontend_enter` (0x73D900)
+
+Call order:
+1. 0x68BE20 (`ESI` = 1), 0x831300, 0x73E110.
+2. `options_display_mode_failed_dialog` (a pending display-mode error).
+3. 0x7F7830.
+4. 0x47C740 (`EDX` = 1500), then a sound by hash (`string_hash_lower(ECX = 0xE1996C)`, 0x47A2B0).
+5. 0x7EAE00 (`EAX` = 0x1FD5028), 0x6AA570, 0x76DE70, 0x73C2F0, 0x835A20, 0x7F7830.
+6. 0x4D1270(cdecl 1000): fade in.
+7. 0xB91790, 0xB91B70 (`ECX` = 0xE1993C): load the main-menu vint document.
+8. 0x830F70 (`ESI` = 0xEB22E8).
+
+### `frontend_exit` (0x73DB40)
+
+1. If `0x2527ECC`: free it (0xC15720) and clear `0x2527ECC` / `0x2527ED0`.
+2. `_stricmp(0x1F73870, "sr2_city")`: on a match, `[0xE8DD26]` = 0.
+3. `streamman_process`.
+4. If `0x2527EA0`:
+   1. 0x6888D0, 0x47F170, `[0xE94D3E]` = 1;
+   2. if `0x2527B76`: `render_thread_wait_frame(0)`, `streamman_unload_flagged_geom`, clear the flag;
+   3. clear `0x2527EA0`.
+5. `[0xE94D3E]` = 1; 0x7799D0; 0x73D210; count `0x2528B24` down to 0; `0x2527EE5` = 0.
+6. If the pad is −1 and `0x212E2B0` ≠ 0: both become 0.
+7. 0x754020.
+8. If `0x2527EBC` == 1: 0x813040. Clear it.
+9. **Unload the main-menu document** (handle `0x2527EAC`): `vint_document_run_unload_script`, the callback `[0x252A1EC]`, `vint_document_release_pending`, `vint_document_unlink`. This is the same sequence as the unload pass in `vint_update_documents`, done at once here.
+10. Clear `0x2527EAC` / `0x2527EBC` / `0x2527EBD`; `0x2527EA3` = 1.
+11. Run the Lua function `Main_menu_controller_selected` (0xCDD610, with `0x252A1B8`).
+
+### `gameplay_enter` (0x68DE50)
+
+Call order:
+1. 0x792B10.
+2. 0x739930(cdecl 0x21, `ECX` = 0xDFFB48).
+3. 0x4D1270(250): fade.
+4. `net_send_gameplay_changed`.
+5. 0x7F8BA0 (`ECX` = 11).
+6. Two rounds of HUD message strings (0x7F49E0 ×3 with `ESI` = 0xDFFAE0 / 0xDFFAF4 / 0xDFFB10, then 0x753F40).
+7. 0x4D1900 / 0x4D1270, 0x80FCF0, 0x6C8020.
+8. `_stricmp` against the level name, then 0x68DC80 / 0x68DC50.
+9. 0x7C0C30, 0x7CE320(−1), 0x8CB040(−1).
+10. `weather_set`.
+11. `overlay_show(1, EDI = 0xEAC488)`.
+12. 0x80B8D0, 0x80B960, 0xB874E0.
+13. 0x699840(cdecl 1, `EDI` = 13).
+14. 0x8D0CB0.
+
+### `gameplay_exit` (0x68E560), cdecl (next state)
+
+This tears the world down. The order matters.
+1. **Flags.** `0x2527C0F` = 1 (`time_scale_restore_check` uses it); `0x2527BA2` / `0x2527B9E..A1` = 0.
+2. **Audio and render sync.** 0x47F200, 0x47F080, `render_thread_wait_frame(0)`.
+3. **Pause and HUD.**
+   1. Unless online-host (0x2528B48 set and 0x2528B49 clear): 0x739B70.
+   2. 0x754270 (`dialog_pause_hide`), 0x754320, 0x6B7870.
+   3. Reset the screen state `0xE8CF7C` unless it is 11 or 13 (or `0x2528ADF`).
+   4. 0x755F70; `0x2527FF4` = 0; `0xE8E780` = −1.
+   5. `interface_screen_state_frame`, `hud_player_reset_complete`.
+4. **Cutscene.** If a cutscene is active: release the device (inline), 0x6C44C0, `gfx_device_acquire`, `player_outfit_stream_update`.
+5. **Overlays and device.** `overlays_hide_all`; `gfx_device_acquire`; `[0xE98974]` = 2; device release (inline); `gamewide_func(1)`.
+6. **Player.**
+   1. If the player is dead-flagged (+0x1161 bit 0): 0x9DA290(0).
+   2. If its vehicle is present and 0xAB4960 says so: 0xAB4720(0, 0).
+   3. 0x9DED00(player, 0); 0x68F420; 0x6A4230.
+7. **Network.** With the session flags set and next ≠ 10: 0x7F7830. In single player: 0xB710C0(1) and `0x2526E14` = 0 (normal weather).
+8. **World teardown:**
+   1. 0x9F2100, 0x550A00 twice; clear `0x279930C..0x279932C`.
+   2. 0xB80020, 0xB7CA10 (distant vehicles and peds), 0x4A8230.
+   3. `objects_reset` inside a device acquire / release pair.
+   4. 0xA24750, 0xA7D480, 0x514260, 0x5039F0; `0x2527294` = 0; 0xA93FC0, 0x9347B0.
+   5. `objects_deactivate_all`, 0x9FD3F0, 0x9EA0E0, 0x9ECD50, 0xAC5D40.
+   6. The Havok / physics resets 0x6E7690, 0x6E33B0, 0x6F8E50, 0x6E8560, 0x6E5BB0, 0x6E0A20.
+   7. Clear `0xF8478C..94`; 0x4DA850, 0x7938A0.
+9. **Saves and HUD.**
+   1. Unless one of `0x2527C01..04` is set: 0x6B56A0.
+   2. `0xE8DD23` = 1; 0x766320(1, 1) and (0, 1); 0x5480C0.
+   3. Clear `0x2526D67`, `0xFA2228` / `0xFA222C`, `0x276CFD0` / `D4`.
+   4. 0x747C40, 0x7483E0, 0x7434D0 ×2; clear `0x2527F27` / `0x2527F48`; 0x747930, 0x747680.
+10. **Pauses.** While `0x2527C08` > 0: 0x699910 (pops pause levels).
+11. **Clocks.**
+    1. 0xA79030; `0x2526D2A` / `0x2526D24` = 0; 0xC14930(0, 0).
+    2. Pending online stats: 0x835A20, 0x824F30.
+    3. 0x793D60(0).
+    4. `0xE84390` = 1/120 (0x3C088889); `0xE84394` = 0.2.
+12. **Co-op to loading.** In co-op with next == 10: `0x2527C00` = 1 around 0x7F8BA0.
+13. **End.** `0x2527C0F` = 0. If the pending state is 2: 0x73E110. Then 0x69AED0, 0x465470, 0x47F170.
+
+### `loading_enter` (0x73B430)
+
+1. `[0xE94D3E]` = 0 (world not visible); 0x7F8BA0.
+2. `0xE8EB88` = 0 (load result: 0 running, 1 done, −1 failed); `0x2527E81` / `0x2527E80` = 0.
+3. Set both job workers to kind 4 (`0x33D6430`, `0x33D6500`) and `job_worker_wake` each.
+4. If `0x2527E84` == 0: 0x739340. Then 0x6981E0.
+5. `gfx_set_color(0, 0, 0, 0xFF)`; `screen_fade_start(0, 0, 1.0)`: black at once. Then 0x4D1270(250, 0).
+6. If loading is the top state and `0xE96C04` < 11: 0x73B650.
+7. **`0xE8EB8C` = `thread_create(loading_thread_proc 0x73B320, 0, 0)`**: the load runs on its own thread.
+8. `0x2527E8C` = 0; `0x2527E83` = 0.
+
+### `loading_exit` (0x73B520)
+
+1. `CloseHandle` on the loading thread's handle (`0x2347144 + (0xE8EB8C & 0xFFFF) × 20`).
+2. If the co-op wait did not finish (`0x2527E8C` == 0) and `0x2527BA0` is set: set `0x2528989` when `0xE8D6BF`, then 0x7F8BA0.
+3. On failure or a non-gameplay next state: 0x698700. Here a failure is `0x2527E80` set or `0xE8EB88` == −1; a non-gameplay next state is a pending state other than 5 whose top is not 8 / 9.
+4. If the loading music `0xEAC094` is still valid and not handed over (0x698FF0 false): stop it (0x47C740, `EDX` = 500).
+5. `[0xE94D3E]` = 1.
+
+**Port note:**
+- `loading_enter` / `loading_exit` and `frontend_exit` are short, call-order-only functions, so they can be ported as they are.
+- `gameplay_exit` is long but has no branches that depend on its own results. A port can keep it as one block of calls in this order. Keep the device acquire / release pairs: there are three, and `objects_reset` must run inside one.
+
 ## Open
 
 - The exact identity of most unnamed sim_frame calls (the lists above give the order).
