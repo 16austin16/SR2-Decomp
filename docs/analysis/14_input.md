@@ -495,6 +495,91 @@ The code is the action's +8 field; −1 means none. Each dispatcher does `EAX + 
 - **Codes 12 / 13 exist only for the held test.** The other four dispatchers stop at 11, and anything outside their range returns 0 (`xor al, al`).
 - **Leaf return types differ.** The held / just / repeat leaves return `EAX` = 0 / 1. The take leaves return only `AL`, and their false path leaves `AH` as it was.
 
+### Reaching the accessors in a scripted run (keyboard)
+
+**Which keys.**
+- Keys below are the **shipped defaults**: the record → key table `0xE829A0` (`input_default_key_bindings`) plus the scheme tables of `input_actions_load_defaults`.
+- An `input.bin` in the game folder overrides the record → key part, so check it first.
+- Records are button-record indexes (`r`).
+
+**Keyboard on-foot scheme** (table `0xDD44A8`, scheme 0):
+
+| Action | Name | Key (record) |
+|---|---|---|
+| 0 | weapon menu | Q (r6) |
+| 2 | reload | R (r14) |
+| 3 | shoulder camera | V (r16) |
+| 4 / 5 | zoom in / out | H (r66) / N (r67) |
+| 6 | attack primary | LMB (r35) |
+| 7 | attack secondary | RMB (r36) |
+| 8 | jump / climb | Space (r5) |
+| 9 | pratfall | LMB + RMB (r35 / r36) |
+| 0xB | multi pratfall | LCtrl (r17) |
+| 0xC | sprint | LShift (r18) |
+| 0xD | walk | Caps (r63) |
+| 0x11 | crouch | C (r15) |
+| 0x12 | pick up Havok object | LCtrl (r17) |
+| 0xE-0x10 | taunts | Up / Left / Right (r52 / r54 / r55) |
+
+**Default-table actions:**
+
+| Action | Name | Key (record) |
+|---|---|---|
+| 0x2D | action / use | E (r4) |
+| 0x2E | recruit | Up (r52) |
+| 0x2F | cancel | Down (r53) |
+| 0x30 | pause | Esc (r21) |
+| 0x31 | pause map | Tab (r20) |
+| 0x32 / 0x33 | weapon cycle | records 33 / 34, which are unbound by default |
+| 0x36 / 0x37 | menu up / down | W / S (r70 / r71), or Up / Down (r9 / r11) |
+| 0x48 | select | Enter (r12) |
+| 0x49 | abort | Esc (r13) |
+| 0x59 | skip | Esc (r21) |
+
+**Vehicle scheme** (`0xDD4BA8`, from 0x500630):
+
+| Action | Name | Key (record) |
+|---|---|---|
+| 0x1E | firearm | LMB (r35) |
+| 0x1F | secondary firearm | RMB (r36) |
+| 0x18 | accelerate | LShift (r50) |
+| 0x19 | brake | Space (r51) |
+| 0x24 | look behind | X (r49) |
+| 0x15 | weapon menu | Q (r6) |
+
+Steering and throttle also come from the move stick (stick 0 = W / A / S / D through `input_map_keyboard_mouse`).
+
+| Path | How to reach it |
+|---|---|
+| `input_action_take_repeat` 0x4FFA30 | Any menu list. Open the pause menu (Esc, action 0x30), then **hold** W / S or Up / Down (actions 0x36 / 0x37). The first take happens on press, then one every auto-repeat pulse (first after 500 ms, then every 150 ms). The "held but no pulse → 0 and the stick fallback is still called" quirk shows on the frames between pulses. |
+| `input_action_press_time` 0x4FFB80 | Only call site: 0x4F91E4 in `player_controls_attack`, with action 7. On foot with a weapon, **press and release RMB** (secondary attack). |
+| `input_action_consume` 0x5001D0 | **E** near a vehicle, pick-up or diversion (`player_controls_interact`, actions 0x2D / 2); **C** on foot (`player_controls_on_foot`, action 0x11); **LMB / RMB in a vehicle** (`player_controls_vehicle`, actions 0x1E / 0x20). |
+| `input_consume_all` 0x5002B0 | Any menu or overlay opening: **Esc** (pause, through `game_pause_do_frame`), **Tab** (map), or a change of input context (`input_context_enter_consume`, e.g. a phone call or a cutscene start). |
+| `player_stick_get` 0x4FF5F0, `input_action_prev_value` 0x4FF7C0, `input_action_alt_prev_value` 0x4FF860 | **No callers in the exe**: no direct or tail call and no stored pointer. They cannot be reached from gameplay; test them with a direct call in a harness. (`player_stick_get_raw` 0x4FF5A0 does have 15 callers.) |
+
+### Reaching the death / respawn path
+
+`gameplay_do_frame` runs `player_death_respawn_update` for the local player once its death timer (+0x122C) has run out, no death script thread (+0x1290) is running, and +0xFA4 bit 0x10 is set.
+
+Any real death sets these. Ways to die from a script, untested:
+1. With the F7 menu, turn god mode off and lower health, then take normal damage: jump off a building roof, or stand next to a car and shoot it until it explodes. The F7 vehicle drop (`cheat_vehicle_drop`, doc 38) places a car next to the player.
+2. Drown: deep water kills on foot.
+3. Get run over: drive a dropped car into the player from a co-op partner (two players needed).
+
+No shipped cheat kills the player directly.
+
+### Getting into a vehicle
+
+1. Stand next to the driver door and press **E** (action 0x2D, "action", record 4). `player_controls_interact` starts the entry; the human goes through `vehicle_interactions_update` (vi_enter.xtbl animations).
+2. Conditions:
+   - on foot, not in a cutscene or menu;
+   - the vehicle not locked or reserved (`vehicle_seat_reservations_expire` handles reservations);
+   - the player not ragdolled.
+3. The F7 vehicle drop puts a car next to the player for this.
+4. Then drive with the vehicle scheme above. The driver throttle, steering and brake come from `vehicle_player_input` (actions 0x24 / 0x27 / 0x28) and the move stick.
+
+The exact key that accelerates on PC (W through the stick or LShift through action 0x18) is not confirmed statically. Try both.
+
 ### Porting notes
 
 - `player_controls_update` reads only the pad record, the pad index and the frame time, and writes only the block. That makes it a self-contained next step after `input_do_frame`. It can be checked with a compare-against-original run, as `input.rs` does for the input tree.
