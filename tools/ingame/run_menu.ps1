@@ -2,7 +2,9 @@
 # options (god mode, cash, respect), then Mission logging (on, two F8 marks, off).
 # -Options: infinite ammo, clear wanted level, time +2 h / -1 h instead.
 # Screenshots to bin/menu_*.png.
-param([switch]$Options)
+# -World: weather (two picks, then normal), the game cheats list (first cheat on, off),
+# then infinite ammo. -Cheats: just the cheats list.
+param([switch]$Options, [switch]$World, [switch]$Cheats)
 $g = "E:\SteamGames\steamapps\common\Saints Row 2"
 $bin = "F:\Saints Row 2 Decomp\bin"
 $in = "$PSScriptRoot\sr2input.ps1"
@@ -22,7 +24,24 @@ while ((Get-Date) -lt $deadline -and -not (Select-String -Path $log -Pattern "fr
 function k($s) { & $in key $s | Out-Null; Start-Sleep -Milliseconds 400 }
 function shot($n) { & $in shot "$bin\menu_$n.png" | Out-Null }
 if (Get-Process SR2_pc -ErrorAction SilentlyContinue) {
-    if ($Options) {
+    if ($Cheats) {
+        k "41"; k "E050"; k "1C"; k "E050"; k "1C"; Start-Sleep 1; shot "c1_cheats"
+        foreach ($i in 1..10) { k "E050" }; shot "c2_cheats_more"
+        k "41"; Start-Sleep 2
+        Stop-Process -Name SR2_pc -ErrorAction SilentlyContinue
+        Wait-Process -Name SR2_pc -Timeout 20 -ErrorAction SilentlyContinue
+    } elseif ($World) {
+        k "41"; k "E050"; k "1C"; shot "w1_world"
+        k "E04D"; k "1C"; Start-Sleep 3; shot "w2_weather1"
+        k "E04D"; k "E04D"; k "1C"; Start-Sleep 3; shot "w3_weather3"
+        k "E04B"; k "E04B"; k "E04B"; k "1C"; Start-Sleep 2
+        k "E050"; k "1C"; Start-Sleep 1; shot "w4_cheats"
+        k "1C"; Start-Sleep 2; shot "w5_cheat_on"; k "1C"; Start-Sleep 2; shot "w6_cheat_off"
+        k "0E"; k "1C"; k "E050"; k "1C"; shot "w7_ammo"
+        k "41"; Start-Sleep 2
+        Stop-Process -Name SR2_pc -ErrorAction SilentlyContinue
+        Wait-Process -Name SR2_pc -Timeout 20 -ErrorAction SilentlyContinue
+    } elseif ($Options) {
         k "41"; k "1C"; k "E050"; k "1C"; k "E050"; k "E050"; k "E050"; k "E050"; k "1C"; shot "6_ammo_wanted"
         k "E050"; k "E050"; shot "7_time_before"; k "E04D"; Start-Sleep 1; k "E04D"; Start-Sleep 1; shot "8_time_plus2"; k "E04B"; Start-Sleep 1; shot "9_time_minus1"
         k "41"; Start-Sleep 2

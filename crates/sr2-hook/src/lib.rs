@@ -34,6 +34,7 @@ mod render;
 mod rsched;
 mod streamman;
 mod teleport;
+mod texguard;
 #[allow(dead_code)] // enabled by hand when surveying a class family
 mod survey;
 

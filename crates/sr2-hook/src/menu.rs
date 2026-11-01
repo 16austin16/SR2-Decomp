@@ -62,7 +62,9 @@ const GPS_TARGET: usize = 0x029B_A748;
 // Game flags and cheats (docs/analysis/38_cheats_and_menu_hooks.md).
 const CHEAT_FLAGS: usize = 0x027A_6A40; // u32: 0x40 infinite ammo, 0x1000 unlimited clip
 const AMMO_FLAGS: u32 = 0x40 | 0x1000;
-const CHEATS: usize = 0x027A_6A68; // 0x68-byte records: +1 active, +0x10 char *name
+// 0x68-byte records: +0 stays on (else one-shot), +1 active, +0xC u16 *display name
+// (localized), +0x10 char *phone number.
+const CHEATS: usize = 0x027A_6A68;
 const CHEAT_COUNT: usize = 0x0252_7B5C;
 const CHEAT_ON: usize = 0x0068_62F0; // ESI = record, (1), callee pops
 const CHEAT_OFF: usize = 0x0068_63C0; // ESI = record, (1, 0), callee pops
@@ -148,7 +150,16 @@ fn items(s: &State) -> Vec<String> {
         ],
         Page::Cheats => {
             let mut v: Vec<String> = (0..cheat_count())
-                .map(|i| format!("{}{}", cheat_name(i), if cheat_active(i) { "   [ON]" } else { "" }))
+                .map(|i| {
+                    let tag = if !cheat_toggles(i) {
+                        "   (once)"
+                    } else if cheat_active(i) {
+                        "   [ON]"
+                    } else {
+                        ""
+                    };
+                    format!("{}{tag}", cheat_name(i))
+                })
                 .collect();
             v.push("Back".into());
             v
@@ -378,7 +389,7 @@ pub fn tick() {
                         } else {
                             call_regs(CHEAT_OFF, 0, 0, 0, rec, 0, &[1, 0]);
                         }
-                        let state = if cheat_active(i) { "on" } else { "off" };
+                        let state = if !cheat_toggles(i) { "done" } else if cheat_active(i) { "on" } else { "off" };
                         msg = Some(format!("cheat {}: {state}", cheat_name(i)));
                     }
                 }
@@ -447,7 +458,28 @@ fn cheat_count() -> usize {
 }
 
 fn cheat_name(i: usize) -> String {
-    cstr(unsafe { rd(CHEATS + i * 0x68 + 0x10) } as usize)
+    let r = CHEATS + i * 0x68;
+    let name = wstr(unsafe { rd(r + 0xC) } as usize);
+    if name.is_empty() || name == "?" { cstr(unsafe { rd(r + 0x10) } as usize) } else { name }
+}
+
+fn cheat_toggles(i: usize) -> bool {
+    unsafe { *((CHEATS + i * 0x68) as *const u8) != 0 }
+}
+
+/// A NUL-terminated UTF-16 string at `p` (read safely; the menu font is ASCII), or "?".
+fn wstr(p: usize) -> String {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut b = [0u16; 40];
+    let mut n = 0usize;
+    let ok = p != 0
+        && unsafe { ReadProcessMemory(GetCurrentProcess(), p as *const _, b.as_mut_ptr().cast(), 80, &mut n) } != 0;
+    if !ok {
+        return "?".into();
+    }
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf16_lossy(&b[..end])
 }
 
 fn cheat_active(i: usize) -> bool {
