@@ -355,6 +355,102 @@ Called from `game_state_stack_stream_frame` for a state-5 level, from `frame_end
 
 **Thread note.** This runs inside `frame_end_handoff` after `render_thread_wait_frame` and the device acquire, so the render thread is idle or done with its frame. The view it reads is the game thread's own `gfx_get_thread_state`.
 
+## frame_present and the render thread at instruction level
+
+### `frame_present` (0x5217E0), game thread
+
+No arguments; `push ecx` reserves one temporary.
+
+1. If `[0xE94D3F]` (a one-shot clear request):
+   1. `gfx_cmd_clear(cdecl 7, 0xFF000000, f32 1.0, 0)`. The 1.0 is written into the slot a `push ecx` reserved, through `fld1` / `fstp [esp]`.
+   2. `gfx_invalidate_render_state_block()`; `gfx_set_render_state_block(ECX = 0xEC2748)`.
+   3. `[0xE94D3F]` = 0.
+2. `gfx_present()` (0xD15110): ends this thread's command list.
+3. Screenshot mode:
+   1. wanted = `[0x2527392]` ? `[0x2527391]` : `0xE98970[[0xE98974]]`;
+   2. store it as 0 / 1 into `[0xE98978]` when it changed.
+4. **`screenshot_save()` is called on every path, every frame.** It returns early unless the screenshot keys / flags (`0x2349415`, `0x2348EED`, `0x2527C05`, …) ask for one, so keep the call.
+
+### `game_render_thread_frame` (0x522640), render thread
+
+This is the whole render thread body: it loops until stopped.
+- **Frame:** `push ebp / mov ebp, esp / and esp, -8 / sub esp, 0x20`; saves `EBX` / `EBP` / `ESI` / `EDI`. Then `EBP` is reused as the `GetCurrentThreadId` import pointer, and `EBX` = 0. Profile markers live at `[esp+0x14]` / `[esp+0x18]` / `[esp+0x1C]`.
+- **Returns** `EAX` = 0 when stopped.
+
+Rows marked **S** touch state shared with the game thread.
+
+**Setup:**
+1. **S** `[0x252A3EC]` = render thread id; `render_thread_wait_frame` tests it.
+2. `gfx_device_acquire()`.
+3. **S** `[0x2774198]` = `job_alloc(cdecl 0x9C, 0xDE1BEC)`, then `job->vtbl[+4]()` (arm).
+4. **S** `render_thread_frame_boundary` (0x522D00): `[0x277419D]` = 1, time → `0x27741A0`, `SetEvent([0x27741A4])`.
+5. **S** `[0x277419D]` = 1 again, the time again (QPC / ms divisor, 0 when the timer is off); `[0x2774194]` = 1.
+6. `render_thread_init_pools()` (0xD14CB0).
+
+**Loop:**
+1. `pump_window_messages()`. If the window is inactive (`[0x252A406]` == 0): `Sleep(50)` and `SetPriorityClass(GetCurrentProcess(), 0x20)`. On both paths `[0xED4718]` = 0x20.
+2. `profile_start(ECX = 0xDE1C0C, &[esp+0x14])`.
+3. **Device release** (inline): unless the caller is thread `[0x252A370]`, decrement `[0x252A368]`; at 0, set `[0x252A374]` = 0 and `LeaveCriticalSection(0x33D62D0)`.
+4. **S Wait for the game thread.** With `ESI` = `[0x2774198]` (if non-zero):
+   1. `[esi+0x34]` = 0x33D6328; `esi->vtbl[+0x10]()` blocks until `frame_end_handoff` step 16 calls vtbl +0xC.
+   2. Clear +4, +8 (byte), +0x34, +9 (byte), +0x3C, +0x40, +0x44.
+   3. Free it: `pool 0xEC5B98 ->vtbl[+4](esi − 8)` (thiscall).
+5. **S Next job.**
+   1. `EDI` = frame number `[0x252A3C4]`; job = `pool->vtbl[+8]()`; `ESI` = job ? job + 8 : 0.
+   2. `[0x27741B0]` = `EDI`; `render_thread_wait_frame` compares it.
+   3. Set the job fields: +9 = 1, +0x3C = 0xDE1BEC, +0x40 = 0xD0, +0x44 = `EDI`; `ResetEvent([esi+0x2C])`; +0x38 = 0, +0x34 = 0, +0x28 = 0.
+   4. `[0x2774198]` = `ESI`; `esi->vtbl[+4]()` (arm).
+6. **Device acquire** (inline): unless the caller is `[0x252A370]` or already `[0x252A374]`, `EnterCriticalSection(0x33D62D0)` and set `[0x252A374]` = thread id; then increment `[0x252A368]`.
+7. `profile_stop`.
+8. **S** If `[0x2774195]` (stop, set by `render_thread_stop`): release the device, set `[0x2774196]` = 1, return 0.
+9. `profile_start(ECX = 0xDE1C18, &[esp+0x1C])`.
+10. **S Acknowledge:** `[0x277419C]` = 1 (`frame_end_handoff` step 17 waits for it); `[0x2527363]` = 0.
+11. `gfx_cmd_clear(cdecl 7, 0xFF000000, f32 1.0, 0)`.
+12. **Render target.** Take the render context from TLS (`fs:[0x2C]` → [0]).
+    1. target = (ctx +0x5C == 0 and ctx +0x60 == 0xEC26A0) ? 0xEC2610 : ctx +0x60.
+    2. target +0x20 = target +0x24 = −1.
+    3. **S** If `[0xE849DB]` == 0 (the game thread is outside its 2D bracket) and target is a default one: `render_deferred_queue(cdecl 2)`.
+13. `gfx_set_render_state_block(ECX = 0xEC2748)`.
+14. `profile_start(ECX = 0xDE1C24)`.
+15. **S** If the snapshot is valid and the world is visible (`[0xE9D68C]` and `[0xE9D68D]`, written by the game thread):
+    1. `render_viewport_setup` (0x52A3B0), `city_build_render_batches` (0x4B7CC0);
+    2. `level_objects_render_collect(EDI = 0xE9D620)`;
+    3. 0x533910, 0x533A70, 0x533CD0;
+    4. `city_instance_batch_begin(cdecl city_instances_job_a)`, `city_instances_pass_a`, then `city_instance_batch_flush` if `[0xF83AF4]` ≠ 0;
+    5. the same with `city_instances_job_b` / `city_instances_pass_b`;
+    6. `city_batch_job_release`.
+16. `profile_stop`. **S** `[0x27741AD]` = 1: batches built; the game thread clears it in `frame_end_handoff` step 8.
+17. If `[0xE9D68D]`: `render_frame` (0x52A710). Otherwise `gfx_command_buffer_wait` (Rust).
+18. **S** `gfx_set_tint_color(ESI = 0xE9D670)`, the snapshot tint.
+19. `[0x252A2A2]` = 1; **S** `render_deferred_execute` (Rust) runs the list in `[0x2305978]` that the game thread just swapped in; `[0x252A2A2]` = 0.
+20. Statistics: zero `0x2304D6C..0x2304D78` and `0x2304D8C..0x2304D98`; `InterlockedExchangeAdd(0x33D62F4, [0x33D62F8] − [0x33D62FC])`; `[0x33D62FC]` = `[0x33D62F8]`.
+21. `profile_stop`. **S** `[0x27741AC]` = 1: frame done (`frame_end_handoff` steps 2 / 18).
+22. **S** `render_thread_frame_boundary`, then back to step 1.
+
+### Shared state between the two threads
+
+| Global | Written by | Read by | Meaning |
+|---|---|---|---|
+| `[0x2774198]` job | render (setup, step 5) | game (`frame_end_handoff` step 16 signals it) | the hand-off |
+| `0x277419C` | render step 10 (1); game clears | game step 17 | acknowledgement |
+| `0x27741AC` | render step 21 (1); game clears | game steps 2 / 18 | frame finished |
+| `0x27741AD` | render step 16 (1); game step 8 (0) | either | batches built |
+| `0x277419D`, `0x27741A0`, event `0x27741A4` | render (boundary) | `render_thread_wait_frame` | frame boundary and time |
+| `0x27741B0` | render step 5 | `render_thread_wait_frame` | frame number of the armed job |
+| `0x252A3EC` | render setup | game | render thread id |
+| `0x2774195` / `0x2774196` | game (`render_thread_stop`) / render | the other | stop and stopped |
+| `0xE9D620..0xE9D6D0` snapshot | game (`frame_end_handoff` steps 8-10) | render steps 15 / 18 | view, lights, tint, valid / visible |
+| `0x2305978` / `0x230597C` | game (swap, step 11) | render step 19 / game | deferred state lists |
+| `0xE849DB` | game (1 / 0 around its 2D work) | render step 12 | game 2D bracket |
+| `0x2527363` | game (1) / render step 10 (0) | `render_thread_wait_frame` | "game wrote the frame" |
+| device CS `0x33D62D0`, `0x252A368` / `0x252A374` | both | both | recursive device lock |
+
+A port of either side must keep this order:
+- **Game thread:** write the snapshot → release the device → signal → wait for `0x277419C`.
+- **Render thread:** wait → re-arm → re-acquire the device → acknowledge → read the snapshot.
+
+The render thread re-arms the next job before the game thread can signal again, because the game thread is still waiting for the acknowledgement.
+
 ## Open
 
 - The exact identity of most unnamed sim_frame calls (the lists above give the order).

@@ -11732,3 +11732,8 @@ address,name,subsystem,status,notes
 0x006e79d0,mempool_compact_step,mempool,documented,"gameplay_streaming_frame: one step of the compacting mempools (compacting_mempool_compact); role inferred (04, 11)"
 0x00b7c210,distant_peds_stream_update,humans,documented,"gameplay_streaming_frame, when distant peds are enabled (0x2529E20 and the six flags 0x215DA04); role inferred (11)"
 0x00a54870,script_streamed_assets_release,script,documented,"gameplay_streaming_frame tail jump: releases script-requested smesh / anim assets (0xA54580, virtual_mempool::release_to); role inferred (09, 11)"
+0x00d14cb0,render_thread_init_pools,render,documented,"render thread, once before its loop: sets up its CPU virtual pool (0xBF40A0); role inferred (11)"
+0x0052a3b0,render_viewport_setup,render,documented,"render thread, before the batch build: viewport and scissor for the frame (gfx_cmd_set_viewport, gfx_set_viewport_rect, 0x524C30); role inferred (11, 18)"
+0x009fa9e0,level_objects_render_collect,render,documented,"render thread, EDI = 0xE9D620 (snapshot): adds the flagged level objects (objects_collect_render_flagged list 0x21F2BB0) to the render lists; role inferred (11)"
+0x004b6e10,city_instances_pass_a,render,documented,"render thread: first city instance pass, feeding accumulator B with city_instances_job_a; role inferred (11, 18)"
+0x004b7070,city_instances_pass_b,render,documented,"render thread: second city instance pass with frustum_test_aabb, accumulator B with city_instances_job_b; role inferred (11, 18)"
