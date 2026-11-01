@@ -309,13 +309,81 @@ The heavy ones are `object_items_update`, `object_props_update`, `vehicle_intera
    - With no join pending and `0x2527EB0` set: 0x8318E0(1) / 0x830990(10), then `main_menu_force_close` (0x73C5B0).
 8. **Network state scripts.**
    - When `0x2529334` ≠ 4 and `0x2527EBF` is set: start the Lua thread `main_menu_ethernet_disconnected` (`script_thread_create`), with the argument `0x2527EAC`.
-   - When it is 4: set `0x2527EBF` / `0x2527EC0`. When it is ≠ 4 and `0x2527EC0` is set: start `main_menu_internet_disconnected`.
+   - When it is 4: set `0x2527EBF` / `0x2527EC0`. The `main_menu_internet_disconnected` start is effectively dead code (see the instruction-level section below).
 9. If `0x2527EBC`: 0x812F80. Then 0x884A10 (multiplayer HUD and vint cleanup).
 
 **Port:**
 - Steps 1-6 and 9 are plain calls.
 - The join flow (step 7) and the disconnect scripts (step 8) touch the multiplayer session code; keep them as one original call each.
 - The `0x252A2A2` bracket around `frontend_render` must stay; the render code checks it.
+
+#### `frontend_state_frame` at instruction level: the join flow and its stack objects (queue item 33)
+
+**Frame.** `sub esp, 0x1D0`; cookie = `[0xE80B50]` ^ `ESP`, stored at `[esp+0x1C8]`; then `push ebx, esi, edi`. Below, E is `ESP` after those pushes. The cookie is at E+0x1D4 and is checked by `__security_check_cookie` before `ret`. There is no SEH frame: the destructors are inlined and cannot throw.
+
+| Local | Type | Notes |
+|---|---|---|
+| E+0x13 | byte `have` | 1 when the join payload parsed |
+| E+0x14 | dword | the parse cursor for 0x830E80; later the Lua thread pointer |
+| E+0x18 | **A**, an invite record (at least 0x9C bytes) | built by **0x73E070** (`ESI` = this). The embedded `pc_multi_session_info` at A+0xC (E+0x24) gets vptr 0xDFFD88; A+0x98 (E+0xB0) holds the flags |
+| E+0xC8 | **B**, a `pc_multi_session_info` (0x82 bytes used) | built by **0x810DA0** (`ESI` = this, vptr 0xDFFD88) |
+| E+0x150 | char[0x80] | the copied join payload |
+
+**Constructors.** 0x73E070 and 0x810DA0 are the same constructor; 0x73E070 is applied at offset +0xC. Each:
+- writes the vptr 0xDFFD88;
+- sets +0x30 = 0, byte +0x34 = 0, +0x38 = 0, +0x3C = 1;
+- clears the bytes +0x41..+0x44 and +0x46..+0x49;
+- runs `memset(+0x59, 0, 0x29)`, then clears byte +0x59 once more;
+- returns `this` in `EAX`.
+
+**Destructors** are inlined as one store: the vptr is set to the **base vtable 0xDFFD54**, which `EDI` holds. Its slot 0 is 0x68F070, while the derived vtable's slot 0 is `pc_multi_session_info::scalar_deleting_dtor` 0x68F020. There is no other cleanup. A port can drop both objects' destructors. It needs the constructors only for the fields that 0x830E80 / 0x810EE0 read.
+
+**Steps:**
+1. `frontend_connection_lost_check`. If `[0x2A1890F]`: 0x81EDF0; `memset(0x2A187D0, 0, 0x144)`.
+2. `[0x252A2A2]` = 1; `frontend_render`; `[0x252A2A2]` = 0. `streamman_process`.
+3. If `[0x2528C34]` == 12 and `[0x2527EC1]` == 1: 0x81EBD0, `[0x2527EC1]` = 0. Otherwise 0x81EC70(cdecl 1).
+4. `foreign_character_warning_update`.
+5. **Join pending** (`[0x2A1890E]`). The online state is `[0x2529334]`; 4 means logged in.
+   1. If `[0x2527EC3]` == 1 (a login already started): when the state is 4, go to step 7; otherwise as in 5.2.
+   2. State ≠ 4: `[0x2527EC3]` = 1; `mp_login_update`; go to step 7. The join stays pending until the login finishes.
+   3. State 4:
+      1. n = min(`[0x2A18908]`, 0x80); flag = byte `[0x2A18884]`; `memcpy(E+0x150, 0x2A18885, n)`.
+      2. Clear `[0x2A1890E]` and `[0x2527C02]`.
+      3. Construct A. Cursor = 0.
+      4. n == 0: `have` = 0. Otherwise 0x830E80(`ESI` = &cursor, `EDI` = &A, cdecl &payload, flag ? 6 : 2), which parses the payload into A: the inner vf +0x24 reads the session info, then +0x98 (dword), +0xA4 (int8), +0xA0, +0xA8 (int8), +0xA1. Then `have` = 1.
+   4. `ok` = 1 and `EDI` = 0xDFFD54.
+   5. **PC session check**, when `[0x2528D20]` is set:
+      - `have` == 0: destroy A; go to step 7.
+      - Construct B. If 0x831040() is true and `pc_multi_session_info::vf3(ECX = &B, stdcall &A.session)` (0x810EE0) returns 0: `ok` = 0. In every other case: 0x832AD0().
+      - Destroy B. If `ok` == 0: destroy A; go to step 7.
+   6. `have` == 1:
+      - `coop_wait_text(EAX = &A)` (0x8309F0).
+      - If A+0x98 bit 0: `coop_load_old_text_text` (0x832A00), then destroy A.
+      - Otherwise, if `[0x144E75C]` == 0, `[0x140BBCA]` == 0 and `[0x140BBC9]` == 0: `[0x144E757]` &= ~3; **`[0x144E75C]` = 7** (the pending game state: join); clear both bytes. Then destroy A.
+   7. `have` == 0 (without `[0x2528D20]`): 0x81EDF0, `memset(0x2A187D0, 0, 0x144)`, destroy A.
+6. **No join pending.** If `[0x2527EB0]`:
+   1. clear it;
+   2. if `[0xEB2230]` == 0: 0x8318E0(cdecl 1), then 0x830990(`CL` = 3, cdecl 10);
+   3. `_strncpy(0x1F73870, 0x1F73870, 0x80)`. **Quirk:** the source and the destination are the same buffer (the level name), so only the next store matters;
+   4. `[0x1F738EF]` = 0;
+   5. `main_menu_force_close`.
+7. **Disconnect scripts.**
+   - State == 4: `[0x2527EBF]` = 1 and `[0x2527EC0]` = 1.
+   - State ≠ 4 with `[0x2527EBF]`: if `0xCE0120(EAX = L, cdecl "main_menu_ethernet_disconnected")` (the function exists):
+     1. th = `script_thread_create(EAX = L, cdecl name, 0, 0, 0)`;
+     2. th +0x14 = `[0x2527EAC]`;
+     3. push one argument onto the thread stack (slot +0 = 1, +8 = 1), stack top += 0x10, th +0x1C += 1;
+     4. `script_thread_resume_once(EAX = &th)`.
+
+     Then `[0x2527EBF]` = 0. `L` = `[0x252A1B8]`.
+   - **Correction:** the `main_menu_internet_disconnected` branch (0x73DF52) runs only when `[0x2529334]` reads 4 and then, read again one instruction later, is not 4. Single-threaded, it **never runs**; only a race with another thread could reach it. Doc 40's step 8 above described it as the "≠ 4" case.
+8. If `[0x2527EBC]`: 0x812F80. Then 0x884A10. Cookie check; `ret`.
+
+**Port:**
+- Keep the order: copy the payload, then clear `0x2A1890E`, then parse.
+- The pending state 7 is set only when no other state change is pending.
+- A and B need their constructor fields only. Their destructors are vptr resets.
+- The security cookie belongs to the original frame and has no meaning in Rust.
 
 ### `loading_state_frame` (0x73B7F0), state 10
 
