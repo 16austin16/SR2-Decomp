@@ -6,8 +6,10 @@
 //!
 //! Also: nav_cell_scratch_record, vehicle_nav_query_mask, road_lane_by_index / _index / _filter_bit19_clear, nav_route_total_length (ST0 + EAX shadow).
 //!
-//! Not ported: `nav_cell_walkable` and `nav_cell_to_node_ref` (they call other functions) and
-//! `nav_cell_has_link_flag2` (a loop whose leftover EAX upper bits are not worth reproducing).
+//! Also (callees called by address through `call_regs`): nav_cell_has_link_flag2 (exact leftover EAX),
+//! nav_cell_walkable, nav_cell_to_node_ref (-> 0xA02C10), vehicle_ai_set_speed_override /
+//! vehicle_ai_clear_speed_override (-> 0xB2B8A0, shadowed up to the call) and nav_route_clear
+//! (-> 0xA18500, no shadow: the list free writes too much to snapshot).
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
@@ -150,7 +152,17 @@ const LANE_BY_INDEX: usize = 7;
 const LANE_INDEX: usize = 8;
 const LANE_FILTER: usize = 9;
 const ROUTE_TOTAL_LENGTH: usize = 10;
-const COUNT: usize = 11;
+const HAS_LINK_FLAG2: usize = 11;
+const CELL_WALKABLE: usize = 12;
+const CELL_TO_NODE_REF: usize = 13;
+const SET_SPEED_OVERRIDE: usize = 14;
+const CLEAR_SPEED_OVERRIDE: usize = 15;
+const ROUTE_CLEAR: usize = 16;
+const COUNT: usize = 17;
+
+const NAV_CELL_LOCATE: usize = 0x00A0_2C10;
+const NAV_ROUTE_LIST_FREE: usize = 0x00A1_8500;
+const AI_SET_FORCE_FLAG: usize = 0x00B2_B8A0;
 
 static PORTS: [Port; COUNT] = [
     port("nav_node_ref_to_cell", 0x00A0_51D0, SAVED),
@@ -164,6 +176,12 @@ static PORTS: [Port; COUNT] = [
     port("road_lane_index", 0x00A8_ABA0, ECX | SAVED),
     port("road_lane_filter_bit19_clear", 0x00A8_AB80, ECX | EDX | SAVED),
     port("nav_route_total_length", 0x00A1_9460, ECX | EDX | SAVED),
+    port("nav_cell_has_link_flag2", 0x00A0_5460, SAVED),
+    port("nav_cell_walkable", 0x00A0_49F0, SAVED),
+    port("nav_cell_to_node_ref", 0x00A0_5250, SAVED),
+    port("vehicle_ai_set_speed_override", 0x00B2_74F0, ECX | EDX | SAVED),
+    port("vehicle_ai_clear_speed_override", 0x00B2_7530, ECX | EDX | SAVED),
+    port("nav_route_clear", 0x00A1_F730, 0),
 ];
 
 fn shadowing(id: usize) -> Option<(u32, usize)> {
@@ -484,6 +502,214 @@ extern "C" fn route_total_length_entry(r: &mut Pushad, _: *const u32) -> f32 {
 }
 regs_thunk!(route_total_length_thunk, route_total_length_entry);
 
+// --- 0xA05460 nav_cell_has_link_flag2 (EAX = cell* -> AL, upper EAX = loop leftover) ----------------
+
+/// `n = u8[cell + 0x1C]` link refs at `[cell + 0x18]`. Ref 0, chunk 0xFFFF / >= 0x866 (unsigned) or a
+/// null record skip; else `link = (((ref & 0xFFFF) - 1) << 5) + [rec + 0x150]` (a zero sum skips) and
+/// `u8[link + 0x18] & 2` gives 1. Upper EAX: 0 / the ref / lo - 1 / the link sum from the last step.
+unsafe fn cell_has_link_flag2(cell: u32) -> u32 {
+    unsafe {
+        let n = rb(cell as usize + 0x1C) as u32;
+        if n == 0 {
+            return cell & !0xFF;
+        }
+        let mut p = rd(cell as usize + 0x18) as usize;
+        let mut eax = cell;
+        for _ in 0..n {
+            let r = rd(p);
+            p += 4;
+            eax = r;
+            if r == 0 {
+                continue;
+            }
+            let hi = r >> 16;
+            eax = (r & 0xFFFF).wrapping_sub(1);
+            if hi == 0xFFFF || hi >= 0x866 {
+                continue;
+            }
+            let rec = rd(CHUNKS + hi as usize * 4);
+            if rec == 0 {
+                continue;
+            }
+            eax = eax.wrapping_shl(5).wrapping_add(rd(rec as usize + 0x150));
+            if eax == 0 {
+                continue;
+            }
+            if rb(eax as usize + 0x18) & 2 != 0 {
+                return (eax & !0xFF) | 1;
+            }
+        }
+        eax & !0xFF
+    }
+}
+
+extern "C" fn has_link_flag2_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(HAS_LINK_FLAG2, &p, unsafe { cell_has_link_flag2(p.eax) });
+}
+regs_thunk!(has_link_flag2_thunk, has_link_flag2_entry);
+
+// --- 0xA049F0 nav_cell_walkable (EAX = cell* -> AL, upper EAX as the callee left it) ----------------
+
+/// Byte +0x1D: bit 0x10 -> 0; bit 2 clear -> 1; else the result of nav_cell_has_link_flag2 (our
+/// Rust version, which reproduces its EAX). Only AL is set; the rest of EAX is the input's or the callee's.
+unsafe fn cell_walkable(cell: u32) -> u32 {
+    unsafe {
+        let f = rb(cell as usize + 0x1D);
+        if f & 0x10 != 0 {
+            return cell & !0xFF;
+        }
+        if f & 2 != 0 {
+            let e = cell_has_link_flag2(cell);
+            return if e & 0xFF == 0 { e } else { (e & !0xFF) | 1 };
+        }
+        (cell & !0xFF) | 1
+    }
+}
+
+extern "C" fn cell_walkable_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(CELL_WALKABLE, &p, unsafe { cell_walkable(p.eax) });
+}
+regs_thunk!(cell_walkable_thunk, cell_walkable_entry);
+
+// --- 0xA05250 nav_cell_to_node_ref (EAX = cell* -> EAX = ref or -1) ---------------------------------
+
+/// Null cell or `u16[cell + 0x2C] == 0xFFFF`: -1. Else nav_cell_locate (0xA02C10) with EAX = cell,
+/// ECX = &kind, EDX = &chunk, EDI = &idx and stack (&chunk, &kind), locals preset to 0xFFF / 1 / 0x7FFFF;
+/// AL == 0 gives -1, else `chunk << 20 | (kind & 1) << 19 | idx & 0x7FFFF`.
+unsafe fn cell_to_node_ref(cell: u32) -> u32 {
+    unsafe {
+        if cell == 0 || (rd(cell as usize + 0x2C) & 0xFFFF) == 0xFFFF {
+            return 0xFFFF_FFFF;
+        }
+        let mut t = [0xFFFu32, 1, 0x7FFFF]; // chunk, kind, idx
+        let b = t.as_mut_ptr();
+        let (pc, pk, pi) = (b as u32, b.add(1) as u32, b.add(2) as u32);
+        let al = call_regs(NAV_CELL_LOCATE, cell, pk, pc, 0, pi, &[pc, pk]) & 0xFF;
+        if al == 0 {
+            return 0xFFFF_FFFF;
+        }
+        let chunk = std::ptr::read_volatile(b);
+        let kind = std::ptr::read_volatile(b.add(1));
+        let idx = std::ptr::read_volatile(b.add(2));
+        (chunk << 0x14) | ((kind & 1) << 0x13) | (idx & 0x7FFFF)
+    }
+}
+
+extern "C" fn cell_to_node_ref_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(CELL_TO_NODE_REF, &p, unsafe { cell_to_node_ref(p.eax) });
+}
+regs_thunk!(cell_to_node_ref_thunk, cell_to_node_ref_entry);
+
+// --- 0xB274F0 / 0xB27530 vehicle_ai_set / clear_speed_override (EAX = ai block) -----------------------
+
+const F32_1000: u32 = 0x447A_0000;
+
+/// The part before the call: speed < 1000.0 is kept, anything else (>= 1000, NaN) becomes 1000.0;
+/// `[ai + 0x88] = speed` and bit 4 of byte `[ai + 0x16]` = CL bit 0.
+unsafe fn speed_override_set(ai: u32, cl: u32, arg: u32) {
+    unsafe {
+        let s = if f32::from_bits(arg) < 1000.0 { arg } else { F32_1000 };
+        wd(ai as usize + 0x88, s);
+        let b = rb(ai as usize + 0x16);
+        wb(ai as usize + 0x16, b ^ ((((cl as u8) << 4) ^ b) & 0x10));
+    }
+}
+
+unsafe fn speed_override_clear(ai: u32) {
+    unsafe {
+        wd(ai as usize + 0x88, 0);
+        wb(ai as usize + 0x16, rb(ai as usize + 0x16) & 0xEF);
+    }
+}
+
+/// Run the shadow copy (the original cut before its call), put the memory back, run `ours`; on a
+/// mismatch the original's two stores are kept. The caller makes the real call afterwards.
+unsafe fn shadow_ai_stores(id: usize, p: &Pushad, arg: u32, ours: impl FnOnce()) {
+    unsafe {
+        let Some((n, orig)) = shadowing(id) else {
+            ours();
+            return;
+        };
+        let a = p.eax as usize;
+        let (o88, o16) = (rd(a + 0x88), rb(a + 0x16));
+        let inp = Regs::of(p);
+        let mut out = inp;
+        call_full(orig, &mut out, arg, false);
+        check_preserved(id, &inp, &out);
+        let (s88, s16) = (rd(a + 0x88), rb(a + 0x16));
+        wd(a + 0x88, o88);
+        wb(a + 0x16, o16);
+        ours();
+        let (r88, r16) = (rd(a + 0x88), rb(a + 0x16));
+        if (r88, r16) != (s88, s16) {
+            mismatch(id, n, format!("in {inp:x?} arg {arg:#x}: original {s88:#x}/{s16:#x}, Rust {r88:#x}/{r16:#x}"));
+            wd(a + 0x88, s88);
+            wb(a + 0x16, s16);
+        }
+    }
+}
+
+extern "C" fn set_speed_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let arg = *args;
+        shadow_ai_stores(SET_SPEED_OVERRIDE, &p, arg, || speed_override_set(p.eax, p.ecx, arg));
+        r.eax = call_regs(AI_SET_FORCE_FLAG, 0, 0, 0, 0, p.eax, &[1]);
+    }
+}
+regs_thunk!(set_speed_thunk, set_speed_entry);
+
+extern "C" fn clear_speed_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    unsafe {
+        shadow_ai_stores(CLEAR_SPEED_OVERRIDE, &p, 0, || speed_override_clear(p.eax));
+        r.eax = call_regs(AI_SET_FORCE_FLAG, 0, 0, 0, 0, p.eax, &[0]);
+    }
+}
+regs_thunk!(clear_speed_thunk, clear_speed_entry);
+
+// --- 0xA1F730 nav_route_clear (ESI = route or 0) ----------------------------------------------------
+
+/// For each of the `u8[route + 0x3C]` entries (count re-read every step, signed compare) with bit 2 of
+/// `[entry + 4]` set, nav_route_list_free(EAX = &entry) (entry = route + 4 + 12 * i); then the bytes
+/// +0x3C, +0x24, +0x30 = 0. EAX leaves as the last count read (unchanged if there was none).
+/// No shadow: the list free writes too much to snapshot.
+extern "C" fn route_clear_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    PORTS[ROUTE_CLEAR].calls.fetch_add(1, Ordering::Relaxed);
+    let route = p.esi as usize;
+    if route == 0 {
+        return;
+    }
+    unsafe {
+        let mut eax = p.eax;
+        if rb(route + 0x3C) != 0 {
+            let mut i = 0u32;
+            let mut e = route + 4;
+            loop {
+                if rb(e + 4) & 4 != 0 {
+                    call_regs(NAV_ROUTE_LIST_FREE, e as u32, 0, 0, p.esi, i, &[]);
+                }
+                let n = rb(route + 0x3C) as u32;
+                eax = n;
+                i += 1;
+                e += 12;
+                if (i as i32) >= n as i32 {
+                    break;
+                }
+            }
+        }
+        wb(route + 0x3C, 0);
+        wb(route + 0x24, 0);
+        wb(route + 0x30, 0);
+        r.eax = eax;
+    }
+}
+regs_thunk!(route_clear_thunk, route_clear_entry);
+
 // --- install ---------------------------------------------------------------------------------------
 
 pub fn install() {
@@ -499,12 +725,27 @@ pub fn install() {
         (LANE_INDEX, &LANE_INDEX_BODY, &[], lane_index_thunk),
         (LANE_FILTER, &LANE_FILTER_BODY, &[], lane_filter_thunk),
         (ROUTE_TOTAL_LENGTH, &ROUTE_TOTAL_LENGTH_BODY, &[], route_total_length_thunk),
+        (HAS_LINK_FLAG2, &HAS_LINK_FLAG2_BODY, &[], has_link_flag2_thunk),
+        (CELL_WALKABLE, &CELL_WALKABLE_BODY, &[0x10], cell_walkable_thunk),
+        (CELL_TO_NODE_REF, &CELL_TO_NODE_REF_BODY, &[0x3C], cell_to_node_ref_thunk),
+        (SET_SPEED_OVERRIDE, &SET_SPEED_BODY, &[0x37], set_speed_thunk),
+        (CLEAR_SPEED_OVERRIDE, &CLEAR_SPEED_BODY, &[0x11], clear_speed_thunk),
+        (ROUTE_CLEAR, &ROUTE_CLEAR_BODY, &[0x19], route_clear_thunk),
     ];
     let mut ok = 0;
     for (id, body, call_offsets, thunk) in list {
         let port = &PORTS[id];
         match unsafe { detour::relocate(port.addr, body, call_offsets) } {
-            Ok(copy) => port.original.store(copy, Ordering::Relaxed),
+            // nav_route_clear has no shadow. The two speed-override shadows stop before their call:
+            // `add esp, 4` (undoing the push) replaces `call 0xB2B8A0`.
+            Ok(_) if id == ROUTE_CLEAR => {}
+            Ok(copy) => {
+                if id == SET_SPEED_OVERRIDE || id == CLEAR_SPEED_OVERRIDE {
+                    let o = if id == SET_SPEED_OVERRIDE { 0x37 } else { 0x11 };
+                    unsafe { std::ptr::copy_nonoverlapping([0x83u8, 0xC4, 0x04, 0x90, 0x90].as_ptr(), (copy + o) as *mut u8, 5) };
+                }
+                port.original.store(copy, Ordering::Relaxed)
+            }
             Err(e) => log(&format!("port_nav: {}: no shadow copy: {e:?}", port.name)),
         }
         if replace_pinned(port.name, port.addr, body, thunk as usize) {
@@ -582,4 +823,42 @@ const ROUTE_TOTAL_LENGTH_BODY: [u8; 41] = [
     0x51, 0x85, 0xC9, 0xD9, 0xEE, 0xD9, 0x1C, 0x24, 0x8B, 0xC1, 0x74, 0x18, 0x8D, 0x64, 0x24, 0x00,
     0xD9, 0x40, 0x14, 0x8B, 0x40, 0x1C, 0x3B, 0xC1, 0xD8, 0x04, 0x24, 0xD9, 0x1C, 0x24, 0x74, 0x04,
     0x85, 0xC0, 0x75, 0xEC, 0xD9, 0x04, 0x24, 0x59, 0xC3,
+];
+const HAS_LINK_FLAG2_BODY: [u8; 97] = [
+    0x56, 0x57, 0x0F, 0xB6, 0x78, 0x1C, 0x33, 0xD2, 0x85, 0xFF, 0x7E, 0x4B, 0x8B, 0x70, 0x18, 0x90,
+    0x8B, 0x06, 0x85, 0xC0, 0x74, 0x37, 0x8B, 0xC8, 0x0F, 0xB7, 0xC0, 0xC1, 0xE9, 0x10, 0x83, 0xE8,
+    0x01, 0x81, 0xF9, 0xFF, 0xFF, 0x00, 0x00, 0x74, 0x24, 0x81, 0xF9, 0x66, 0x08, 0x00, 0x00, 0x73,
+    0x1C, 0x8B, 0x0C, 0x8D, 0xE8, 0xAA, 0xF7, 0x00, 0x85, 0xC9, 0x74, 0x11, 0xC1, 0xE0, 0x05, 0x03,
+    0x81, 0x50, 0x01, 0x00, 0x00, 0x74, 0x06, 0xF6, 0x40, 0x18, 0x02, 0x75, 0x0F, 0x83, 0xC2, 0x01,
+    0x83, 0xC6, 0x04, 0x3B, 0xD7, 0x7C, 0xB9, 0x5F, 0x32, 0xC0, 0x5E, 0xC3, 0x5F, 0xB0, 0x01, 0x5E,
+    0xC3,
+];
+const CELL_WALKABLE_BODY: [u8; 28] = [
+    0x8A, 0x48, 0x1D, 0xF6, 0xC1, 0x10, 0x74, 0x03, 0x32, 0xC0, 0xC3, 0xF6, 0xC1, 0x02, 0x74, 0x09,
+    0xE8, 0x5B, 0x0A, 0x00, 0x00, 0x84, 0xC0, 0x74, 0xEF, 0xB0, 0x01, 0xC3,
+];
+const CELL_TO_NODE_REF_BODY: [u8; 106] = [
+    0x83, 0xEC, 0x0C, 0x85, 0xC0, 0x75, 0x07, 0x83, 0xC8, 0xFF, 0x83, 0xC4, 0x0C, 0xC3, 0x66, 0x81,
+    0x78, 0x2C, 0xFF, 0xFF, 0xC7, 0x04, 0x24, 0xFF, 0x0F, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x04, 0x01,
+    0x00, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x08, 0xFF, 0xFF, 0x07, 0x00, 0x74, 0xDA, 0x57, 0x8D, 0x4C,
+    0x24, 0x08, 0x51, 0x8D, 0x54, 0x24, 0x08, 0x52, 0x8D, 0x7C, 0x24, 0x14, 0xE8, 0x7F, 0xD9, 0xFF,
+    0xFF, 0x83, 0xC4, 0x08, 0x84, 0xC0, 0x5F, 0x74, 0xBE, 0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x44, 0x24,
+    0x08, 0x8B, 0x14, 0x24, 0x83, 0xE1, 0x01, 0xC1, 0xE1, 0x13, 0x25, 0xFF, 0xFF, 0x07, 0x00, 0xC1,
+    0xE2, 0x14, 0x0B, 0xC1, 0x0B, 0xC2, 0x83, 0xC4, 0x0C, 0xC3,
+];
+const SET_SPEED_BODY: [u8; 63] = [
+    0x51, 0xD9, 0x44, 0x24, 0x08, 0x57, 0xDC, 0x1D, 0xD8, 0xC0, 0xE5, 0x00, 0x8B, 0xF8, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x05, 0x7B, 0x0A, 0xD9, 0x05, 0x30, 0x80, 0xE9, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9,
+    0x44, 0x24, 0x0C, 0xC0, 0xE1, 0x04, 0x32, 0x4F, 0x16, 0xD9, 0x9F, 0x88, 0x00, 0x00, 0x00, 0x6A,
+    0x01, 0x80, 0xE1, 0x10, 0x30, 0x4F, 0x16, 0xE8, 0x74, 0x43, 0x00, 0x00, 0x5F, 0x59, 0xC3,
+];
+const CLEAR_SPEED_BODY: [u8; 24] = [
+    0xD9, 0xEE, 0x57, 0x8B, 0xF8, 0xD9, 0x9F, 0x88, 0x00, 0x00, 0x00, 0x80, 0x67, 0x16, 0xEF, 0x6A,
+    0x00, 0xE8, 0x5A, 0x43, 0x00, 0x00, 0x5F, 0xC3,
+];
+const ROUTE_CLEAR_BODY: [u8; 59] = [
+    0x85, 0xF6, 0x74, 0x36, 0x57, 0x33, 0xFF, 0x80, 0x7E, 0x3C, 0x00, 0x76, 0x20, 0x55, 0x8D, 0x6E,
+    0x04, 0xF6, 0x45, 0x04, 0x04, 0x74, 0x07, 0x8B, 0xC5, 0xE8, 0xB2, 0x8D, 0xFF, 0xFF, 0x0F, 0xB6,
+    0x46, 0x3C, 0x83, 0xC7, 0x01, 0x83, 0xC5, 0x0C, 0x3B, 0xF8, 0x7C, 0xE5, 0x5D, 0xC6, 0x46, 0x3C,
+    0x00, 0xC6, 0x46, 0x24, 0x00, 0xC6, 0x46, 0x30, 0x00, 0x5F, 0xC3,
 ];
