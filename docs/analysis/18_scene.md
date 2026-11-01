@@ -823,6 +823,69 @@ After the draw, `gfx_unbind_special_texture` (0xD19FA0; `EAX` = id, `EDX` = stag
 
 The camera position used for lighting comes from the snapshot `0x277C9D0` (written by `frame_end_handoff`) into the render context +0x5C0, together with the LOD distance `0xE9896C` → +0x6E4.
 
+## render_frame (0x52A710) porting map, with its shared-state reads
+
+Render thread, no arguments; called from `game_render_thread_frame` when the world is visible (`[0xE9D68D]`). The frame is `sub esp, 0x24` with a security cookie; it saves `EBX` / `EBP` / `ESI` / `EDI`. Each stage is wrapped in `profile_start` / `profile_stop` with the names from the table above. `render_deferred_execute` (0xCF8FA0) is already in Rust; it runs after this function and only reads the deferred list (see "The deferred command lists").
+
+### Steps
+
+1. **Render targets.** Save `[0x22FDC9C]` / `[0x22FDCA0]` into `0x22FDCB0` / `0x22FDCB4`; `[0x22FDCAC]` = 0x22FD8E4. Then 0x529EB0.
+2. **Shadow flag.** `BL` = (`[0x2526CCC]` ≠ 0) and bit 0x2000 of view 0's flags `[0x2612D18]`. It is used in steps 6 and 8.
+3. **Screenshot.** If `[0x2975A5C]` & 2: `[0x2975914]` = 0xD1C530(cdecl ([0x2975940] + 1) % 3 + 0xC, 0x297591C, 0).
+4. **render1:** 0x728C40; `render_stage1` (0x52A4F0).
+5. **render-shadow-jobs:** `render_shadows` (0x5285F0), then 0xD1CB00(cdecl ([0x2975940] + 1) % 3 + 0xC).
+6. **render-flush:** `gfx_command_buffer_wait`.
+7. **render2:a:** 0xD00F20; `[0x25295F0]` += 1; 0x5380A0 **only if `BL`**; 0xD1A070(`ECX` = 0x25273C4); 0x9F0BA0.
+8. **render2:a3:**
+   1. `render_stage2_a2_a3`.
+   2. If `[0x25273F3]`: 0x531840, then `[0x25273F2]` = 0. **The render thread writes a game-side byte here.** The game thread copies 0x25273F2 → 0x25273F3 in `frame_end_handoff`.
+   3. 0x9EF600, 0xB782B0, 0xD1AFA0, 0xD1A280.
+   4. **Lighting centre:** render context (`fs:[0x2C]` → [0] = `EBP`) +0x58 → ctx; ctx +0x5C0..+0x5C8 = `0x277C9D0..D8`; +0x5CC = 0.0; +0x6E4 = `[0xE9896C]`.
+   5. If `[0x27948A8]`: 0xB78150(cdecl f32 `[0x27948B0]`). Then `tod_light_shader_constants` (0xB78190):
+      - with `BL`: (`EAX` = 0xE9D690, `EDI` = 0xE9D6C0, cdecl 0xE9D69C, 0xE9D6B0), the snapshot sun;
+      - otherwise: the defaults (`EAX` = 0xEC5ACC, `EDI` = 0x252A6F0, cdecl 0xEC5ACC, 0x252A6F0).
+9. **render2:b:** `[0x252A338]` = 1; 0x528820; `[0x252A338]` = 0.
+10. **render3:**
+    1. The screen size comes from the context (`EBP` +0x5C byte, +0x60 pointer; when the byte is 0 and the pointer is 0xEC26A0, use 0xEC2610). Then `gfx_set_scissor_rect(cdecl 0, size[1])` and 0xD1A400(cdecl f32 size[0], f32 size[1]), both converted with `fild`; size = the two dwords at the chosen pointer.
+    2. `[0x252A338]` = 1; 0x528A10 (depth resolve, extra views); `[0x252A338]` = 0.
+11. **render4:** 0xAE1090. **render4a:** 0x527A60.
+12. **render4b:** `[0xE98D74]` = `[0xE5C340]`. If `[0x25273E4]` and `[0xE94D37]`: 0x518810. Then `[0xE94D37]` = 1; 0x527020.
+13. If `[0x27A3F18]` (tagging): 0x625620. Then 0x738E80, 0x5293D0.
+14. **render4d:** `gfx_set_tint_color(ESI = 0xE9D670)`; 0xA8B440, 0x4C7290, 0x4C32F0, 0x4CFC60, 0x8AB9E0, 0xD1A4D0(cdecl 0).
+15. **render5:**
+    - If `[0x25273B4]` is set: 0x51CF40(cdecl 0), 0xD1E140; restore `0x22FDCB0 / B4` from `0x22FDCA4 / A8`.
+    - Otherwise: build {`[0xFA2228]`, `[0xFA222C]`, 0} on the stack; 0x51CF40(cdecl 0), `0x517BB0(ESI = &it)`, 0xD1E140, 0x518CA0(cdecl &it); then the same restore.
+    - Then `[0x22FDCAC]` = 0x22FDC1C; 0x517D40.
+16. 0x5211F0(cdecl &profile block); check the cookie; return.
+
+### What reads the snapshot (0xE9D620..0xE9D6D0)
+
+Found by scanning render_frame and 197 callees, three calls deep.
+
+| Snapshot field | Written by (game thread, doc 11) | Read in render_frame by |
+|---|---|---|
+| `0xE9D620..28` camera position | `render_snapshot_copy_view` | `render_stage1` (view setup through `gfx_view_set_world`), 0x536CB0 (under 0x5380A0, shadows), `render_stage2_a2_a3` / `render_env_cubemap`, `render_viewport_setup` (0x52A3B0, through 0x531840), 0x526070 / 0x526410 (under 0x528A10) |
+| `0xE9D62C..4C` camera matrix (9 dwords) | the same | `render_stage1` (`gfx_view_set_world(&0xE9D62C, …)`), 0x536CB0, `render_viewport_setup`, 0x526070 / 0x526410 |
+| `0xE9D650` FOV | the same (`camera_get_fov`) | `render_stage1`, `render_viewport_setup`, 0x526070 / 0x526410 |
+| `0xE9D664..6C`, `0xE9D670..78` (tint), `0xE9D67C..84` | `frame_end_handoff` step 9 | 0x518CA0 (render5 post, all nine dwords); `gfx_set_tint_color` (render4d, 0xE9D670) |
+| `0xE9D690` / `0xE9D69C` / `0xE9D6B0` / `0xE9D6C0` sun direction / colour | `sky_light_snapshot` | `tod_light_shader_constants`, only with the shadow flag `BL` |
+| `0x277C9D0..D8` LOD / lighting centre | `frame_end_handoff` step 12 | render_frame itself → ctx +0x5C0 |
+
+**Not snapshotted but read on the render thread.** Every one of these is written by the game thread. Today they are safe only because the game thread waits for the acknowledgement (doc 11, "Snapshot window"):
+- `[0xE9896C]` (LOD distance);
+- the view count `[0x2526CCC]` and view flags `[0x2612D18]` (written by `game_render_func`);
+- `[0x25273F3]`, `[0x27948A8]` / `[0x27948B0]`, `[0x25273E4]`, `[0x27A3F18]`, `[0x25273B4]`;
+- the screenshot ring `[0x2975A5C]` / `[0x2975940]`.
+
+**Render-thread-only state** (no sharing):
+- the scratch allocator `0x2774180` (base) / `0x2774184` (end) / `0x2774188` (size) / `0x277418C` (cursor, `InterlockedExchangeAdd` in 0x528210, reset in `render_stage1`);
+- the profiler blocks `0x277C9DC` / `0x277D178` (`render_shadows`);
+- `0x27741D0` (0xA8EAB0);
+- the flags `0x252A338`, `0xE94D37`, `0xE98D74`;
+- the render-target save slots `0x22FDCA4..0x22FDCB4`.
+
+**Port order.** Keep render_frame a call skeleton with the 16 steps above. Port the leaves stage by stage, render5 and render4d first: they are short and read only the tint fields. When the stage functions are ported, give them the snapshot as a struct pointer, not the raw globals. That is the one place where a later double-buffered snapshot would plug in.
+
 ## Mesh submission
 
 Renderable instances are `rl_*` / `r_*` classes (for example `rl_mesh_inst`, `r_dynamic_water_detailed_inst`, `r_dynamic_license_plate_inst`). Their `render(pass, …)` virtual writes the commands.
