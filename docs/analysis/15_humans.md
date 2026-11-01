@@ -140,6 +140,59 @@ The others:
 
 **Port:** keep this as a call skeleton. The AI branch returns early, so the local-player part (step 3.3 onward) never runs for NPCs. Several bit tests of +0x1161..+0x1164 decide the branches; copy them as they are.
 
+## human_update_core (0x9A7DF0) porting map
+
+cdecl (human `H`, f32 dt), the first call of `human_update`. No security cookie.
+
+1. **Return** if H is 0 or H+0x80 & 0xB. Clear H+0xCC bits 0x3000 and H+0xC08 bit 0x80. Previous position +0x50..0x58 = +0x14..0x1C.
+2. **Passenger test.** A is set when all of these hold:
+   - the handle is live and not the cutscene actor `[0xEBCE9C]` (unless `[0xEBCEA0]` is 7 or 8);
+   - not `human_entering_or_exiting_vehicle`;
+   - `vehicle_from_handle` gives a vehicle;
+   - not a player driver;
+   - 0x9A62D0 is false.
+3. **Time scale H+0xD64** (per-human slow motion), with the minimum M = `[0x2529718]`:
+   - H+0xC8 bit 0x400: ramp up, r = `timer_remaining` / H+0xD6C; the bit clears at the end;
+   - bit 0x800: ramp down, 1 − r; at the end, M and the bit clears;
+   - when `[0xE8825F]`: humans listed in `0xF53908` (3 slots) fall at dt × 1.3333 (f32 constant); humans in `0xF53914` (3 slots) rise at that rate and call 0x492D00 above 1.0;
+   - otherwise: if 0x9A62D0 was true in step 2 (in a vehicle), the scale falls by 2·dt down to M; if A, it rises by 2·dt up to 1.0; else it is 1.0;
+   - the result is clamped to [M, 1.0]; the compares are written to keep NaN out.
+4. **Animation clock** H+0x5B0 +=:
+   - dt normally;
+   - the **real** frame time `[0xE84380]` while a cutscene plays (`[0x2527D14]`, cutscene +0xAFF clear, real time ≤ 0.5) for script-controlled players (+0x4C == 1 and +0x3CC == 1) or when 0x6C6E80 is true;
+   - otherwise dt.
+5. Alive with a hold H+0xC20: release it, `human_take_damage(H)`, clear +0xC20 / +0xC28.
+6. Pending knockdown (H+0xC24 == 1 and +0xC0 bit 0x400 clear): `human_knockdown(H, 0x98E2A0(0, 0, 0))`. Then +0xC24 = 0.
+7. **Collision-ignore window:** +0xC8 bit 0x40 (and not 0x200000): 0x7190C0(0), clear the bit, timer +0xF94 = now + 100 ms; when it passes: 0x7190C0(1), +0xF94 = −1.
+8. 0x96E400(H).
+9. **Reload:** when 0x9C81E0, for the held weapon (+0x10CC → +0xC4) of a firearm type: `weapon_reload_step` once, or (clip size − ammo) times when the reload animation (+0xD0C, `anim_track_is_playing`) finished.
+10. Grab release: +0xD0C ≠ −1 with no live weapon → +0xD0C = −1, and 0x960A80(1, 0) when `human_owned_locally` and not the player (or +0x1164 bit 4).
+11. **Cutscene LOD** (+0x3CC == 2, while no blocking cutscene or +0x1074 is set, and the rig flag +0x26C == 1):
+    - distance to the camera `0x25F5B14`: ≥ 20 m clears +0x1074;
+    - otherwise the weight w = 1 − (d − 15) × 0.2 above 15 m, then 0x95BE10(...), and +0x1074 = 1.
+12. 0x989630, 0x9B6C70(H), 0x9B0F10(H), 0x9A4CB0.
+13. **Anim override clear:** for a local or unflagged human with +0xC0 bit 0x400000 and no rig action (+0x164 == −1): `net_send_prop_human_anim_state_override(&−NaN)`; clear +0xC0 bits 0xC00000.
+14. 0x9C9F80(H) when +0xC0 bit 0x40000 and handle +0x374 is live.
+15. Rig action 0x1AD / 0x1AE with the anim finished and +0xEF8 ≠ −1: 0x91AF30(H, action == 0x1AD).
+16. 0x96F3A0(H) action with table `0xE90E48` bit 0x400 and its anim playing: +0x101C = −1, +0x1024 = 0, +0x1020 = −1.
+17. Not a passenger (the inverse of step 2's handle / vehicle part): 0x9947F0.
+18. **Not ragdolled** (+0x595 == 0): an animation-driven hit (anim `0x15B87C4` playing, local or flagged +0xCC bit 0x10000000):
+    - `0x9AC180(H, ...)`;
+    - `human_take_damage(H, amount, 0, weapon)` when the hit has damage;
+    - 0x6AE560(H, 0x714, 0) for the flag.
+
+    **Ragdolled:** 0x710DB0 / 0x7152E0 (impulse), then 0x718260 speed → +0xC0 bit 0x80000 = speed² ≥ 64 (or ≥ 9 with bit 0x10000000).
+19. The local player with +0xC0 bit 0x400 and not 0x7C5770: 0x6AE180(0x1E2, −1.0, 0xFFFF, 1).
+20. 0x4372E0. **Auto-fire** (+0xC8 bit 0x10, not +0x10C8, `human_has_firearm`, 0x994BC0, 0x9C2FD0): `weapon_fire(H, ...)`.
+21. **Combat timer** +0xF78: in state 3 (+0x590), now + 5000 ms. Otherwise, once elapsed and not in a vehicle transition: firing / reload checks (`weapon_clip_size`, `weapon_reserve_ammo`, 0x9C53C0) may clear it (−1), or it is re-armed for 5 s.
+22. **Nearby-threat scan** (0x98E8A0, 0x98E710): over the human list 0x215E908 (next +0xB8), find a live, active (+0x80 bit 0x20), non-dead human within 1 m on the ground plane (0x412080). The result bit drives 0x735EF0(1) when it disagrees with the move state (index 5 in the 28-entry table at +0x570).
+23. 0x96CB70(H, −1, 1, 1, 0) for weapon type 10 with +0xC0 bit 0x40.
+24. **Animation:** `anim_rig_prepare(rig, 1)` unless hidden (+0x80 bit 4, or a model flag); then **`anim_rig_update(rig, dt)`**.
+25. 0x9A68D0 (the large post-update: visibility, LOD, attachments).
+26. In a network session (gate as in doc 22): clear +0xC0 bit 0x400 unless 0x98E270.
+
+**Port:** a call skeleton of 26 steps. Steps 3-4 (time scale and clock) are the only x87-heavy parts; keep their f32 stores. The animation update (24) is where most time goes.
+
 ## Open
 
 - What 0x9C1B90 (AI think) runs per behaviour, and the human state machine values at +0x591 / +0x592.
