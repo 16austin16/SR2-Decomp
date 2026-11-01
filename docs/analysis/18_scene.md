@@ -954,7 +954,7 @@ No arguments. Frame: `sub esp, 0x7C`; saves `EBX` / `EBP` / `ESI` / `EDI`. `EBX`
    2. Two floats: the partner's +0x12D0 / +0x12D4, or, when the partner is the local player, the thread view's +0x1710 / +0x1714.
    3. 0x523EB0(cdecl &a, &b, f32, f32). The floats are written after `sub esp, 8`.
 6. `[0xFA6BDC]` = `[0xE98980]` if `0x2527393`, else 1.0; `[0x2526CCC]` = 0.
-7. 0x523BD0(cdecl 0): the main pass; it can raise `0x2526CCC`.
+7. 0x523BD0(cdecl 0): selects the occluders for view 0 (see the port map below; corrected: it does not write `0x2526CCC`).
 8. 0x4B3FF0(`EAX` = 0x25F5B14 camera position, cdecl 1).
 9. **Occlusion flag** `[0xE99382]`:
    - 0 if `0xE996E4` is 0 or `0x25273B4` is set;
@@ -1011,7 +1011,83 @@ The struct is what is left of an inlined "submit job" helper that the compiler r
 
 **Port:** keep the call order and the job fence. 0x523BD0 is the heavy part (the main and occlusion passes), so port this function as a skeleton calling originals.
 
-The roles of 0x523BD0, 0x4B3FF0, 0x4BA270 and 0xA02550 are not identified yet; which light source each collector in step 3 handles (other than the headlights) is not checked.
+The roles of 0x523BD0, 0x4B3FF0, 0x4BA270 and 0xA02550 are given in the port map below (queue item 35).
+
+#### `game_render_func` step-by-step port map (queue item 35)
+
+All of it runs on the **game thread** (inside `frame_end_handoff`). Nothing here runs on the render thread. The render thread reads what this function leaves behind: the view list at 0x2612D10, the occluder sets, the light list and the time-of-day snapshot. `E` = `ESP` after the prologue (`sub esp, 0x7C` + 4 pushes). The locals are E+0x10 .. E+0x8C. `EBX` = 0 and `EBP` = the `GetCurrentThreadId` import throughout. The function takes no arguments and returns nothing.
+
+**Corrections to the step list above:**
+- Step 7: 0x523BD0 does **not** write `0x2526CCC`. It writes the occluder counts `0x2527398` / `0x252739C`. The view count is rebuilt by 0x4BA270 (step 10).
+- Step 3: 0x4C85D0 is not only a light collector. Its tail (0x4C8770 → 0x4C8100 / 0x4C83D0) writes `0x2527393` and `0xE98980`, which step 6 reads in the same frame.
+- Step 14: +8 and +9 are **bytes**; +4, +0x34, +0x3C, +0x40 and +0x44 are dwords.
+
+| # | Step | Callees (registers / convention) | Reads | Writes | Port status |
+|---|---|---|---|---|---|
+| 1 | Job | `job_alloc` 0xBF3F50 (cdecl 0xDE2374 file, 0x7AE line) → EAX | `0x252A3E8` | `0xFA6BD8` (only when jobs are on) | portable (call the original) |
+| 2 | Effect release | 0x511050 `effects_release_dead_particles` (through `jmp` at 0x5250C0; no arguments used) → `effect_list_reclaim_dead` 0x50F190; then job vtbl +4 / +0xC (`ECX` = job) | `0xF9F694`, `0xFA20A0`, `0xFA2098/9C`, `0xFA6BD8` | `0xF9F694`, `0xFA20A0`, `0xFA2098/9C`, `0x2527298`, `0x25272A0` | call the original; the descriptor is dead (above) |
+| 3a | Sky | 0x4D7160 `sky_update` (no args) → 0x4D6330 (sky preset by name hash, then `skybox_parse_colors` / `sky_sun_moon_setup`), 0x4D63E0, 0x4D9C40 | camera `0x25F5B14..1C`, `0x25F5B50..58`, `0x2526DAC..DC6`, `0xF9E2E8..F8`, `0xF9E5D8`, `0xE8437C` | sky state `0x2658CE4..0x2658DAC`, `0xE9D3BC..C4` | not ported; 3.2 KB with x87 maths; call the original |
+| 3b | Light count | — | — | `0x252A364` = 0 | trivial |
+| 3c | Light collectors | `vehicles_lights_collect` 0xAE0FD0 (**rust**), `effect_objects_lights_collect` 0x505350 (**rust**), `projectiles_lights_collect` 0x94DFA0, 0x4C85D0 `level_lights_collect`, `searchlights_lights_collect` 0x9556A0 (**rust**), `humans_weapon_lights_collect` 0x963750; all take no arguments | the object lists; 0x4C85D0 reads `0x2526D44` (group count), `0x26521A0` (groups, stride 0x10), `0x2527D10` (cutscene), `0x27E66FC`, `0x27E670C`, `0x33D6308` | the light list through `render_light_add_point` 0xCFDE50 / `render_light_add_spot` 0xCFDD80 (`0x252A364` and its array); 0x4C85D0's tail also writes `0x2527393`, `0xE98980`, `0x2526BCA/CB`, `0x2658C64..CE0`, `0xE9A764..778` | 3 of 6 ported; keep the order, since it decides the order of the light array |
+| 3d | Constants | `render_global_constants_update` 0x524060 (**rust**) | time, time of day | `0x25273C4..`, shader constants | ported |
+| 4 | Viewport + view copy | `render_viewport_setup` 0x52A3B0 (no args); then `rep movsd` 0x84 dwords from TLS context (`fs:[0x2C]` → [0] +0x58 → +0x740) | the thread view | `0x277CBF0` (0x210 bytes) | portable; the TLS context is the game thread's |
+| 5 | Co-op view | `coop_partner_human` 0x9D7BD0 → EAX; 0x9DFA00 `human_camera_get` (`ECX` = human, `EAX` = &pos E+0x18 (12 bytes), cdecl &mat E+0x64 (3×3, 0x24 bytes); for the local player `[0x21703D4]` it copies the camera globals `0x25F5B14` / `0x25F5B38`, else human +0x12A0 / +0x12AC); `gfx_get_thread_state` 0xD22790 (only when the partner is the local player); 0x523EB0 `coop_view_clip_build` (cdecl &pos, &mat, f32 a, f32 b) | `0x2528B48`, `0x2528B49`, `0x21603CC`, `0x21703D4`, partner +0x12D0 / +0x12D4 (or the thread state's +0x1710 / +0x1714) | `0x277CE00` (clip-plane set: +0 count, planes from +0x10) | 0x9DFA00 is a 0x70-byte leaf: port it. 0x523EB0 calls 0xD24260 (plane builder, 1.1 KB) and 0xA01AD0; call the original |
+| 6 | Light scale | — | `0x2527393`, `0xE98980` (both from step 3c) | `0xFA6BDC` (f32, else 1.0), `0x2526CCC` = 0 | trivial |
+| 7 | Main occluders | 0x523BD0 `occluders_select(cdecl view)` with view 0 | see below | `0x2527398`, `0x27741D0` | call the original |
+| 8 | Lighting zones | 0x4B3FF0 `tod_zone_update` (`EAX` = &camera pos 0x25F5B14, cdecl u8 1); also called from 0x6C11F8 and 0x6C8A58 | `0x2527D14/15`, `0x2527CF7`, `0xE996E6`, `0x2526CBC`, `0x2526CE7`, `0xEB7A80`, the zone table `0x26128F8..0x2612AF8` | the zone table (active bytes at +0xC of each entry), `0x261290C`, `0x215D9FE`, `0x215DA06`, `0x215DA1E`, `0x215DA26`, `0xEB7A80` | 1.1 KB; call the original |
+| 9 | Occlusion flag | 0x4B4A60 `tod_occlusion_allowed` (no args → AL) | `0xE996E4`, `0x25273B4`, `0x2526CC3`, `0x2526CC4`, `0x26128F8..908` | `0xE99382` | 0x4B4A60 is an 85-byte leaf: port it (below) |
+| 10 | Extra views | 0x4BA270 `render_views_build` (`ECX` = 0x25F5B38 camera matrix, cdecl &0x25F5B14) → 0x4D8B60 (builds view 0; reads the sky state `0x2658C64..`), 0x4B9B80, 0x4B9D60, 0x4BA990, 0xD246D0, 0xA01AD0, 0xA02550 | `0xE98948`, `0xE99382`, `0x2527390`, `0x2526CE7`, `0x252A3EC` (device-owner thread id), the per-thread contexts `0x33D6330` (stride 0xD0, to `0x33D6400`), the zone table | the view list `0x2612D10` (stride 0x280), `0x2526CCC`, `0x2612D20..D50`, `0x2612D68..D72`, `0x2615750` (a copy of the 0x2000-flag view), `0x2526CE7`, `0x2527390` | 1.7 KB with a stack cookie; call the original |
+| 11 | Second occluders | 0x5250D0 → 0x523BD0(cdecl 0x2612D10); then job vtbl +4 / +0xC | `0xE99382`, `0xFA6BD8` | `0x252739C`, `0x27785D0`; or `0x252739C` = 0 | call the original |
+| 12 | Frame counters + snapshot | — | `0x26128F8` (0x81 dwords) | `0x2526CD0` (word += 1), `0x25273A4` = 1.0, `0x2612B00` | trivial |
+| 13 | View-0 clip set | 0xA02550 `view_clip_planes_build` (`EAX` = 0x277C9E0 out, `ECX` = 0x25F5B14 eye, cdecl (0x2615510, 0x2612D20, f32 `[0x2612D58]`)) → 0xA01B90, 0xBDECB0, `vec3_normalize_in_place`, 0xA01AD0 | `0x2526CCC`, `0x2612D18` bit 0x2000 | `0x277C9E0` (plane set) | 1.2 KB, SSE; call the original |
+| 14 | Job wait + free | job vtbl +0x10 (`ECX` = job, +0x34 = 0x33D6328 first); pool `0xEC5B98` vtbl +4 (`ECX` = 0xEC5B98, stdcall job − 8) | `0x252A3E8`, `0xFA6BD8` | job +4, +8 (byte), +9 (byte), +0x34, +0x3C, +0x40, +0x44 | portable |
+
+**0x523BD0 `occluders_select(cdecl view)`, 0x2D2 bytes (EBP frame, stack cookie, `_alloca`):**
+1. view == 0 → `[0x2527398]` = 0, else `[0x252739C]` = 0.
+2. Stop unless `[0xE94CF2]` (occlusion culling on). Total = Σ chunk+0x5C over the `[0xF77990]` chunks at `0xF769E0[]`. Stop when 0. `_alloca(total × 4)` → array P.
+3. n = `chunk_render_items_collect_visible(cdecl view ? view+0x70 : thread view (ctx+0x58 → +0x740), P)`.
+4. Sort P with 0x52B120(cdecl P, P+n, n, cmp 0x523B10). The comparator puts nulls last and is otherwise nearest-first by `vec3_distance_sq` from the thread view's eye (ctx+0x58 → +0x710) to item+4.
+5. n = min(n, 3 × `[0xE98998]`). For each item, null it and count a drop when any of these holds:
+   - 0xC1A180(`ECX` = eye, cdecl item) is true (the eye is inside the occluder; shape table 0xE82680, stride 0x80);
+   - not ((0x4B45F0() and item+0xC4 bit 0) or (0x4B4610() and item+0xC4 bit 1));
+   - 0x4B4470() and item+0xC4 bit 2.
+
+   The three predicates read the current zone record `[0x2612D00]` +0x20: bit 3, NOT bit 2 (1 when there is no record), and bit 8.
+6. If anything dropped: compact with 0x523B80 (`ESI` = n, `EDX` = P: stable, moves the non-null entries to the front); n −= dropped.
+7. n = min(n, `[0xE98998]`). The target set S is 0x27741D0 (view 0) or 0x27785D0 (other views); the frustum F is ctx+0x710 (view 0) or 0x2612D20.
+8. For each i: 0xA01F20(cdecl S+0x10+i×0x220, F, P[i]) builds the occluder volume.
+9. For each surviving i and j > i: if 0xA024C0(`ECX` = volume i, cdecl P[j]) is true, null P[j] and count it. Compact again.
+10. Rebuild: S+i×0x220 = P[i], then 0xA01F20 into S+0x10+i×0x220.
+11. Count → `[0x2527398]` (view 0) or `[0x252739C]`.
+
+**Quirk (step 5):** one item can be counted as dropped more than once, by the eye test and again by a flag test, since every test runs on every item. Step 6 then subtracts the inflated count. So n ends up **smaller** than the number of surviving entries, and the farthest survivors are lost. A port must count drops the same way (do not de-duplicate) to select the same occluders.
+
+**0x4B4A60 `tod_occlusion_allowed`, for porting (no arguments, returns AL; the x87 compare is `test ah, 0x41`):**
+```
+v1 = lerp(b = [0x26128FC], a = [0x26128F8], t = [0x2612900])   // b + (a − b)·t, rounded to f32
+v  = 1 + (v1 − 1)·[0x2612908]                                  // rounded to f32
+return v > 0.0 (constant 0xDD32C0) || byte [0x2612904] == 0
+```
+A NaN makes the compare fail, so the result is then decided by the byte.
+
+**0x9DFA00 `human_camera_get`, for porting:** if `ECX` == `[0x21703D4]`, src = (0x25F5B14, 0x25F5B38); else src = (`ECX`+0x12A0, `ECX`+0x12AC). If `EAX` ≠ 0: copy 3 dwords from the position. If the stack argument ≠ 0: copy 9 dwords from the matrix. `ESI` / `EDI` are saved; `ECX` is clobbered only on the matrix copy.
+
+**0xA01AD0 `clip_planes_set_plane`** (`ECX` = &plane (vec4), `EDX` = index, stdcall &set, ret 4; aligned frame):
+- set+0x10+i×16 = the plane;
+- the sign mask of the plane's xyz (`cmpleps` against 0, 3 bits) indexes 0xE3E288 (pairs);
+- the pair is stored at set+0xC4+i×4 / set+0xA0+i×4;
+- the 16-byte masks 0xEDBD00[pair] are copied to set+0x180+i×16 and set+0xF0+i×16.
+
+**What cannot be ported yet:**
+- 0x4D7160 (sky), 0x4B3FF0 (zones), 0x4BA270 (views), 0x523BD0 (occluders), 0xA02550 / 0xD24260 / 0xD246D0 (plane builders), 0x511050 (effects) and 0x4C85D0 (level lights) have no Rust port. A whole-function port is a skeleton that calls them in order.
+- The job object (vtbl +4 / +0xC / +0x10 and the pool at 0xEC5B98) belongs to the original job system. Keep it as calls through the vtable.
+- `[0xFA6BD8]` is **not cleared** after step 14 frees the job, and step 1 writes it only when jobs are on. If `0x252A3E8` changes from 1 to 0 between frames, steps 2 and 11 kick a freed job. Jobs are always on in practice; a port can keep the same behaviour or clear the global (a harmless difference).
+
+**Skeleton order for the port:**
+1, 2, 3a, 3b, 3c, 3d, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14.
+- 3b runs after 3a: the sky first, then the light count reset.
+- Steps 6 and 9 read globals written by 3c and 8, so keep them after those steps.
+- Port as Rust now: 9 (0x4B4A60), 0x9DFA00, and the trivial steps 3b, 6 and 12.
 
 ## Open
 
