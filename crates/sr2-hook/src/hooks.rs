@@ -38,7 +38,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if n > 3600 && n.is_multiple_of(900) {
         log(&crate::actions::summary());
         log(&crate::lua_bindings::summary());
-        for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary()] {
+        for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary(), crate::port_sim_leaves::summary()] {
             if !s.is_empty() {
                 log(&s);
             }
@@ -2142,6 +2142,7 @@ pub fn install_all() {
         crate::port_vehicles::install();
         crate::port_humans2::install();
         crate::port_render::install();
+        crate::port_sim_leaves::install();
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }
