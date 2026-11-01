@@ -343,6 +343,7 @@ fn full_magazines(p: usize, on: bool) {
         seen.clear();
         return;
     }
+    let mut current = Vec::new();
     unsafe {
         let head = rd(p + INVENTORY) as usize;
         let mut item = head;
@@ -353,6 +354,7 @@ fn full_magazines(p: usize, on: bool) {
             let w = rd(item + 0xC4) as usize;
             if w != 0 {
                 let key = (w, rd(w + WEAPON_INFO) as usize);
+                current.push(key);
                 let clip = (w + WEAPON_CLIP) as *mut i32;
                 let most = seen.entry(key).or_insert(*clip);
                 if *clip > *most {
@@ -367,6 +369,8 @@ fn full_magazines(p: usize, on: bool) {
             }
         }
     }
+    // Forget weapons no longer carried (their instances are freed and reused).
+    seen.retain(|k, _| current.contains(k));
 }
 
 static MEMORY_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -382,10 +386,33 @@ fn memory() -> (u64, u64) {
     ((m.ullTotalVirtual - m.ullAvailVirtual) >> 20, m.ullTotalVirtual >> 20)
 }
 
+/// The largest free run of address space, MB: low means fragmented (a big texture
+/// create can fail with plenty free in total).
+fn largest_free_mb() -> usize {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let (mut addr, mut best) = (0usize, 0usize);
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
+    while unsafe { VirtualQuery(addr as *const _, &mut mbi, size) } == size {
+        if mbi.State == MEM_FREE {
+            best = best.max(mbi.RegionSize);
+        }
+        let next = mbi.BaseAddress as usize + mbi.RegionSize;
+        if next <= addr {
+            break;
+        }
+        addr = next;
+    }
+    best >> 20
+}
+
 fn log_memory() {
     if MEMORY_FRAMES.fetch_add(1, Ordering::Relaxed) % 3600 == 0 {
         let (used, total) = memory();
-        crate::log(&format!("memory: {used} of {total} MB of address space in use"));
+        crate::log(&format!(
+            "memory: {used} of {total} MB of address space in use, largest free block {} MB",
+            largest_free_mb()
+        ));
     }
 }
 
