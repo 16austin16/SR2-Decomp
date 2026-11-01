@@ -11,6 +11,7 @@
 //!
 //! F8 marks a point in the mission log without opening the menu.
 
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -46,8 +47,14 @@ const LOCAL_PLAYER: usize = 0x0217_03D4;
 const SET_INVULNERABLE: usize = 0x0096_5F40; // cdecl (human, bool)
 const SET_HIT_POINTS: usize = 0x0096_9C90; // ECX = human, (&f32)
 const ADJUST_CASH: usize = 0x0096_A430; // ECX = human, (&cents delta)
-const NOTORIETY_SET: usize = 0x0055_FA40; // cdecl (team, -1, 0)
-const NOTORIETY_SPAWNS: usize = 0x0055_FB90; // EDX = -1, cdecl (team)
+/// `notoriety_set` as the `notoriety_set` script call uses it: cdecl (team 0-3, f32 level).
+const NOTORIETY_SET: usize = 0x0055_F870;
+/// Advances the clock (what `set_time_of_day` calls): cdecl (f32 seconds, 1, 0, 1).
+const ADVANCE_TIME: usize = 0x0068_A1E0;
+const CLOCK_HOUR: usize = 0x0140_E72C; // u8, then u8 minute
+const INVENTORY: usize = 0x10C4; // -> circular list: item +0xB4 next, +0xC4 weapon instance
+const WEAPON_INFO: usize = 0x08; // in the weapon instance
+const WEAPON_CLIP: usize = 0x10; // i32 rounds in the magazine
 const FORCE_FLAGS: usize = 0x110C; // bit 0x40 = invulnerable
 const MAX_HP: usize = 0x1120; // i32
 const HP: usize = 0x1124; // f32
@@ -71,6 +78,8 @@ enum Action {
     ClearWanted,
     God(bool),
     TeleportWaypoint,
+    /// Hours forward (1..23).
+    Time(u32),
 }
 
 struct State {
@@ -78,6 +87,7 @@ struct State {
     page: Page,
     cursor: usize,
     god: bool,
+    ammo: bool,
     pending: Vec<Action>,
     /// The last thing done, shown at the bottom.
     status: String,
@@ -88,6 +98,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     page: Page::Main,
     cursor: 0,
     god: false,
+    ammo: false,
     pending: Vec::new(),
     status: String::new(),
 });
@@ -110,11 +121,13 @@ fn items(s: &State) -> Vec<String> {
         Page::Main => vec!["Player options".into(), "Mission logging".into(), "Close".into()],
         Page::Player => vec![
             format!("God mode: {}", if s.god { "ON" } else { "off" }),
+            format!("Infinite ammo: {}", if s.ammo { "ON" } else { "off" }),
             "Refill health".into(),
             "Add $10,000".into(),
             "Add 5,000 respect".into(),
             "Clear wanted level".into(),
             "Teleport to waypoint".into(),
+            format!("Time: < {} >", clock()),
             "Back".into(),
         ],
         Page::Logging => {
@@ -174,17 +187,25 @@ fn keys() {
             1 => (s.page, s.cursor) = (Page::Logging, 0),
             _ => s.open = false,
         },
+        Page::Player if s.cursor == 7 && (left || right || enter) => {
+            s.pending.push(Action::Time(if left { 23 } else { 1 }));
+        }
         Page::Player if enter => {
             let a = match s.cursor {
                 0 => {
                     s.god = !s.god;
                     Some(Action::God(s.god))
                 }
-                1 => Some(Action::Heal),
-                2 => Some(Action::Cash),
-                3 => Some(Action::Respect),
-                4 => Some(Action::ClearWanted),
-                5 => Some(Action::TeleportWaypoint),
+                1 => {
+                    s.ammo = !s.ammo;
+                    s.status = format!("infinite ammo {}", if s.ammo { "on" } else { "off" });
+                    None
+                }
+                2 => Some(Action::Heal),
+                3 => Some(Action::Cash),
+                4 => Some(Action::Respect),
+                5 => Some(Action::ClearWanted),
+                6 => Some(Action::TeleportWaypoint),
                 _ => {
                     (s.page, s.cursor) = (Page::Main, 0);
                     None
@@ -230,10 +251,11 @@ fn block_game_input() {
 
 /// Called on the game thread before each `game_frame_tick`.
 pub fn tick() {
-    let (actions, god) = {
+    let (actions, god, ammo) = {
         let mut s = lock();
-        (std::mem::take(&mut s.pending), s.god)
+        (std::mem::take(&mut s.pending), s.god, s.ammo)
     };
+    log_memory();
     let p = unsafe { rd(LOCAL_PLAYER) } as usize;
     if p == 0 {
         return;
@@ -262,8 +284,7 @@ pub fn tick() {
                 }
                 Action::ClearWanted => {
                     for team in 0..4u32 {
-                        call_regs(NOTORIETY_SET, 0, 0, 0, 0, 0, &[team, u32::MAX, 0]);
-                        call_regs(NOTORIETY_SPAWNS, 0, 0, u32::MAX, 0, 0, &[team]);
+                        call_regs(NOTORIETY_SET, 0, 0, 0, 0, 0, &[team, 0.0f32.to_bits()]);
                     }
                     msg = Some("wanted level cleared".into());
                 }
@@ -277,6 +298,11 @@ pub fn tick() {
                         let how = crate::teleport::teleport(p, &to);
                         format!("teleported to {:.0}, {:.0}, {:.0} ({how})", t[0], t[1], t[2])
                     });
+                }
+                Action::Time(hours) => {
+                    let secs = hours as f32 * 3600.0;
+                    call_regs(ADVANCE_TIME, 0, 0, 0, 0, 0, &[secs.to_bits(), 1, 0, 1]);
+                    msg = Some(format!("time now {}", clock()));
                 }
             }
         }
@@ -292,9 +318,71 @@ pub fn tick() {
             }
         }
     }
+    full_magazines(p, ammo);
     if let Some(m) = msg {
         crate::log(&format!("menu: {m}"));
         lock().status = m;
+    }
+}
+
+fn clock() -> String {
+    let (h, m) = unsafe { (*(CLOCK_HOUR as *const u8), *((CLOCK_HOUR + 1) as *const u8)) };
+    format!("{h:02}:{m:02}")
+}
+
+/// The most each weapon's magazine has held, by (weapon instance, weapon info).
+static MAGAZINES: Mutex<BTreeMap<(usize, usize), i32>> = Mutex::new(BTreeMap::new());
+
+/// Infinite ammo: no weapon's magazine goes below the most it has held, so it
+/// never runs out or needs reloading.
+fn full_magazines(p: usize, on: bool) {
+    let mut seen = MAGAZINES.lock().unwrap_or_else(|e| e.into_inner());
+    if !on {
+        seen.clear();
+        return;
+    }
+    unsafe {
+        let head = rd(p + INVENTORY) as usize;
+        let mut item = head;
+        for _ in 0..64 {
+            if item == 0 {
+                break;
+            }
+            let w = rd(item + 0xC4) as usize;
+            if w != 0 {
+                let key = (w, rd(w + WEAPON_INFO) as usize);
+                let clip = (w + WEAPON_CLIP) as *mut i32;
+                let most = seen.entry(key).or_insert(*clip);
+                if *clip > *most {
+                    *most = *clip;
+                } else if *clip < *most {
+                    *clip = *most;
+                }
+            }
+            item = rd(item + 0xB4) as usize;
+            if item == head {
+                break;
+            }
+        }
+    }
+}
+
+static MEMORY_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Address space in use, MB: the game is not large-address-aware, so it has 2 GB.
+fn memory_mb() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return 0;
+    }
+    (m.ullTotalVirtual - m.ullAvailVirtual) >> 20
+}
+
+fn log_memory() {
+    if MEMORY_FRAMES.fetch_add(1, Ordering::Relaxed) % 3600 == 0 {
+        crate::log(&format!("memory: {} MB of address space in use", memory_mb()));
     }
 }
 
@@ -402,7 +490,7 @@ fn draw() {
         color(150, 150, 150, 255);
         text(tx, ty, ts * 0.8, &format!("log: {} | point {} | {}", l.mission_label, l.point, l.samples_text));
         ty += lh * 0.8;
-        text(tx, ty, ts * 0.8, &status);
+        text(tx, ty, ts * 0.8, &format!("{status}   [mem {} MB]", memory_mb()));
         color(255, 255, 255, 255);
         let [x0, _x1, y0, _y1, vw, vh, l, rr, t, b] = saved;
         call_regs(SET_VIEWPORT, 0, 0, 0, 0, y0 as u32, &[x0 as u32, vw as u32, vh as u32, 1]);
