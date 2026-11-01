@@ -489,7 +489,7 @@ The other three tables:
 **`vint_element_render_tree`** (0xB95B10; `ECX` = element, stdcall `(state *, scratch **, scratch count)`, `ret 0xC`):
 1. Return unless visible (+0x59) and `state.alpha > eps` (0xE5C1B0).
 2. `element->vf42()` (vtable +0xA8, `pre_render`).
-3. Copy the 0x70-byte state, then combine it with the element's (0xB957B0; `EDI` = &state, cdecl `(element)`): tint, alpha, transform.
+3. Copy the 0x70-byte state, then combine it with the element's (`vint_state_combine` 0xB957B0; `EDI` = &state, **stdcall** `(element)`, `ret 4`): tint, alpha, transform. See "The vint render path at instruction level".
 4. Draw slot +0x18 (blend mode = `state[0]`).
 5. `element->vf43(&state)` (+0xAC, `render`). The element emits its draws through the draw slots.
 6. Collect the children (first child +0x1C, next sibling +0x20) that pass `is_type(*0xEBDF6C)` (vtable +0x18, "is an element") into the scratch array.
@@ -528,6 +528,100 @@ The other three tables:
 3. `vint_element_render_tree` and `vint_document_render`.
 4. Each element type's `render` (vf43), which fills the per-slot draw data.
 5. The update walk (`vint_object_tree_update`) and input (`vint_input_do_frame`, above) can be ported independently of rendering.
+
+## The vint render path at instruction level (for the port)
+
+`vint_render_documents` → `vint_document_render` → `vint_element_render_tree` are already described above, step by step. This section adds the math they rely on: the state combine, the colour conversion, and the bitmap and text `render` slots.
+
+### Render state layout (0x70 bytes)
+
+| Off | Field |
+|---|---|
+| +0 | blend mode |
+| +4 / +8 / +0xC | tint r, g, b |
+| +0x10 | alpha |
+| +0x14 | byte: inside a mask (set once any ancestor is a mask) |
+| +0x24 / +0x28 | accumulated scale x, y |
+| +0x2C / +0x30 | accumulated translation |
+| +0x34..+0x48 | 2x3 matrix {m0 m1 m2; m3 m4 m5}, row-major, translation in m2 / m5 |
+| +0x4C / +0x50 | draw position of this element |
+
+Element fields used:
+- +0x58 mask;
+- +0x5C / +0x60 position;
+- +0x64 / +0x68 anchor;
+- +0x78 rotation (radians);
+- +0x7C..+0x88 tint r, g, b, alpha;
+- +0x8C blend (0 = inherit);
+- +0x90 / +0x94 scale.
+
+### `vint_state_combine` (0xB957B0)
+
+`EDI` = &state (the copy), stdcall (element), `ret 4`.
+
+1. If element +0x8C ≠ 0: state+0 = it.
+2. state+0x14 = state+0x14 || element+0x58.
+3. Tint: state +4, +8, +0xC, +0x10 each × element +0x7C, +0x80, +0x84, +0x88, each → f32.
+4. θ = element+0x78 → f32. s = `sinf_wrapper(θ)`, c = `cosf_wrapper(θ)`. Both go through the CRT. **When `[0x34A5368]` is set (SSE2 present), the CRT uses its SSE2 code, not `fsin` / `fcos`**, and the two give slightly different values. A bit-exact port must call the same CRT functions or reproduce the SSE2 path.
+5. Locals: R = {c, −s, 0; s, c, 0}; S = {sx, 0, 0; 0, sy, 0} with sx, sy = element +0x90 / +0x94.
+6. Translation, with the matrix **before** this element's rotation and scale:
+   - tx = (m1 · py + m0 · px) + m2;
+   - ty = (m4 · py + m3 · px) + m5;
+   - each sum in x87, then → f32;
+   - state+0x2C += tx, state+0x30 += ty (each → f32).
+7. matrix = `matrix2x3_mul(out, R, matrix)`, then `matrix2x3_mul(out, S, matrix)`. Each is out = b × a (b = the current matrix), so the final matrix is **old × R × S**. Every element is rounded to f32 on store; the product terms are summed in x87 in the order `(a0·b0 + a3·b1)`, and for the translation column `+ b2` last.
+8. Anchor with the **new** matrix: ax = (m1 · ay' + m0 · ax') + m2 and ay = (m4 · ay' + m3 · ax') + m5, with (ax', ay') = element +0x64 / +0x68.
+   - state+0x4C = f32(state+0x2C + ax);
+   - state+0x50 = f32(state+0x30 + ay).
+9. state+0x24 ×= sx; state+0x28 ×= sy (each → f32).
+
+### Colour: two different conversions
+
+- **`vint_set_color_from_state`** (0xB922C0; `ECX` = &tint, cdecl f32 alpha), used by the bitmap and text elements:
+  - each of r, g, b × 255.0 (double `0xE5C038`) and alpha × 255.0, converted with the control word set to **truncate** (0xC00);
+  - only the **low byte** is kept, with **no clamp**: a tint slightly above 1.0 stays 255, but 257 / 255 gives 1;
+  - then draw slot +0x04 with &rgba.
+- **Text colour commands** (opcode 4, below) convert with `fistp` under the default control word: **round to nearest**.
+
+So the same colour can differ by 1 between the two paths. Keep both.
+
+### `vint_element_bitmap::render` (0xBA0DD0)
+
+`ECX` = element, stdcall (&state), `ret 4`.
+1. Only if the image kind +0x98 == 9 and the handle +0x9C is valid in the bitmap table: slot `0x31BC518 + (h & 0xFFFF) × 0x24`, which must be below 0xF0 with the stored handle at +0x14 matching.
+2. `vint_set_color_from_state(ECX = state +4, cdecl f32 state.alpha)`.
+3. `vint_draw_bitmap(EAX = state +0x34, EDX = element +0xA8 (int offset), cdecl (record, state +0x4C, element +0xB0 (int size)))`.
+
+**`vint_draw_bitmap`** (0xB9C030). Returns if record+4 (texture) is −1. It copies the matrix, position, offset and size. Then, for an **atlas sub-image** (record +0xC == 1, with index record +8 below `[0x252A1A4]`), it uses the entry `0x22DBFB0 + i × 0x20`:
+- offset += entry +8 / +0xC;
+- m0 and m4 ×= k (entry +0x18);
+- position += (entry size as **unsigned** → float) × ((1 − k) × 0.5), which keeps it centred;
+- if byte entry +0x1C == 0: size = entry +0x10 / +0x14.
+
+Then draw slot +0x1C(cdecl texture, &matrix, &position, &offset, &size).
+
+### `vint_element_text::render` (0xBA2C60)
+
+`ECX` = element, stdcall (&state), `ret 4`.
+1. If the command buffer +0xDC exists: `vint_set_color_from_state(state +4, alpha)`.
+2. `vint_text_draw_commands(ESI = state +0x34, cdecl (+0xDC, size +0xE0, state +0x4C, state +4, f32 alpha))`.
+
+**`vint_text_draw_commands`** (0xBA8A90) walks the pre-laid-out buffer as dword opcodes. Every read is bounds-checked against the size; a short buffer ends the walk, and so does an unknown opcode.
+
+| Op | Bytes | Does |
+|---|---|---|
+| 1 | 12 | pen = matrix × (x, y): `x' = (y·m1 + x·m0) + m2`, `y' = (y·m4 + x·m3) + m5`, each → f32 |
+| 2 | 4 + 2·len | glyph run: 0xBA9190 reads the run header (font, length, pen); pen transformed as in op 1; `matrix2x3_mul` with a scale matrix from the run; position = state position + pen; draw slot +0x28(font, &chars, 0, length, &matrix, &position). Advances by 4 + length × 2 (UTF-16) |
+| 3 | 24 | inline image: {index, x, y, sx, sy}. The atlas entry `0x22DBFB0 + index × 0x20` (index below `[0x252A1A4]`) gives offset (+8 / +0xC) and size (+0x10 / +0x14). matrix = `matrix2x3_mul`({sx, 0, 0; 0, sy, 0}, state matrix); position = state position + matrix × (x, y) as in op 1; texture = `0x22EB9B4[(entry +4) × 3]`, or −1 when entry +4 ≥ `[0x252A1A0]`; draw slot +0x1C(texture, &matrix, &position, &offset, &size) |
+| 4 | 20 | colour: r, g, b, a floats; **−1.0 (`[0xE87998]`) means "use the state's tint / alpha"**; each × 255.0 **rounded to nearest**; draw slot +0x04 |
+
+**Port order** for this path:
+1. `matrix2x3_mul` and `vint_state_combine`. They are pure math: test them against the original on recorded states.
+2. The two colour conversions.
+3. `vint_draw_bitmap` and the bitmap render.
+4. The text command walker, last (op 2 needs 0xBA9190 mapped first).
+
+The draw slots (table `0x1FD52B0`) are listed above.
 
 ## interface_do_frame and vint_update_documents at instruction level (for the port)
 
