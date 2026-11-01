@@ -260,7 +260,126 @@ Corrections and details found on the way:
 - **The game** reads the button records and sticks directly (the free camera also goes through `input_get_control_value`). That is why eating at the record level hides input from gameplay.
 - `0x252A54F` blocks all keyboard reads (text entry).
 
+## Game actions and the player control block
+
+Gameplay and menus do not read the button records directly. They go through **game actions**, which `player_controls_update` (0x4FE760) prepares once per frame from the pad record, and a set of small accessors.
+
+### The action table `0xF9EA38`
+
+- **132 entries of 16 bytes** (0x840 bytes):
+  - +0: primary button record (0-86, or −1 = unbound);
+  - +4: secondary button record;
+  - +8: stick direction code (−1..13), checked by the `input_action_stick_dir_*` fallbacks 0x4FE380..0x4FE6A0;
+  - +0xC: flags.
+- `input_actions_reset` (0x500170, from game init 0x51F600) sets every entry to −1 / −1 / −1 / 0 and calls `input_actions_load_defaults` (0x4FF3F0).
+- `input_actions_load_defaults` copies the 87 defaults from `0xDD3B98` (20-byte records `{action, primary, secondary, dir, flags}`) and 23 stick actions from `0xDD42A0` into `0xF9F278`. Then it applies the control scheme (0x500340, 0x500630; also run by the pause menu's change-scheme / restore-defaults / revert bindings).
+- Setters: `input_action_set` (0x4FF4B0, ECX = record), `input_actions_set_many` (0x4FF4E0, ECX = records, EDX = count), and `input_stick_action_set` / `_set_many` (0x4FF520 / 0x4FF550).
+- `input_action_table` (0x4FF590) returns the table.
+- The stick-action table `0xF9F278` has 16-byte entries `{u32 kind, u8, u32, u8}`. `input_stick_action_consume` (0x500230) sets the eaten flags of the move or look stick by kind 0-3.
+
+### The control block `0x2659908`, written by `player_controls_update`
+
+The pad is `0xE98DB0` (−1 → pad 0). The control block is cleared or rebuilt every frame.
+
+**Sticks: 8 entries of 0x28 bytes from `0x2659908`.**
+
+Entries are filled for pad sticks 0, 1, 3, 4, 5, 6 and 7. Stick 2 is not copied, and stick 7 only gets its raw copy.
+
+| Off | Field |
+|---|---|
+| +0x00 / +0x04 | x / y: eaten → 0, inverted → negated. If the sign flipped since last frame, the value is 0 for this frame. |
+| +0x08 / +0x0C | last frame's x / y |
+| +0x10 / +0x14 | x / y without the sign-flip filter |
+| +0x18 / +0x1C | step x / y (sticks 0 and 1): −1 / +1 from the stick's four auto-repeat timers (pulses at stick +0x18 / +0x24 / +0x30 / +0x3C), else 0 |
+| +0x20..+0x23 | u8 per-direction "taken" flags, cleared every frame |
+| +0x24 / +0x25 | u8 x / y taken, cleared every frame; `player_stick_get` / `player_stick_get_raw` return 0 while set |
+
+- `player_stick_get` (0x4FF5F0): EAX = entry, ECX = &x, cdecl (&y); returns +0 / +4.
+- `player_stick_get_raw` (0x4FF5A0): same, returns +0x10 / +0x14. It has 15 callers, among them the vehicle customisation lights, tagging and the minigames.
+
+**Buttons: six arrays of 87 entries (0x57), one per button record.**
+
+| Address | Contents |
+|---|---|
+| `0x2659A48` | down: value > threshold (+8) and not eaten |
+| `0x2659A9F` | pressed or repeated this frame (+0x1D), not eaten |
+| `0x2659AF6` | "available" mask for down / repeat: set to 0xFF; a *take* clears it |
+| `0x2659B4D` | just pressed (+0x1C), not eaten |
+| `0x2659BA4` | "available" mask for just-pressed: set to 0xFF |
+| `0x2659BFC` | u32 per button: the frame time `0x252A3C8` of the last press |
+
+- Buttons 0x23 and 0x24 (the analog triggers) have an adaptive threshold. While a trigger is up, its threshold drops to at most value + 0.1; while it is down, it rises to at least value − 0.1. So a half-held trigger can be pressed again without fully releasing it.
+
+### The accessors
+
+All of them map the action through the table. A button counts if either the primary or the secondary record matches. When neither does, the stick-direction fallback decides.
+
+| Function | Args | Returns |
+|---|---|---|
+| `input_action_value` 0x4FF770 | EAX = action | ST0 primary value (0 if eaten) |
+| `input_action_alt_value` 0x4FF810 | EAX | ST0 secondary value |
+| `input_action_prev_value` 0x4FF7C0 | EAX | ST0 previous primary value. No direct callers. |
+| `input_action_crossed` 0x4FF8B0 | EDX = action, cdecl (threshold) | 1 when the primary went from below the threshold to at or above it this frame |
+| `input_action_released_below` 0x4FF930 | cdecl (action, threshold) | 1 when either button went from at or above the threshold to below it |
+| `input_action_down` 0x4FF640 | ECX | AL: down & available |
+| `input_action_repeat` 0x4FF6A0 | ECX | AL: pressed-or-repeated & available |
+| `input_action_just_pressed` 0x4FF700 | ECX | AL: just pressed & available |
+| `input_action_take_repeat` 0x4FFA30 | EAX | like `_repeat`, and clears both availability masks when true |
+| `input_action_take_pressed` 0x4FFAF0 | EAX | like `_just_pressed`, and clears both masks when true |
+| `input_action_press_time` 0x4FFB80 | EAX | time of the last press |
+| `input_action_button_name` 0x4FFBB0 | EAX | wide string of the bound button (0x7F36D0), or "Button String Unbound" |
+| `input_action_consume` 0x5001D0 | EAX | clears both masks for the action's button |
+| `input_consume_all` 0x5002B0 | none | clears all masks and sets the move / look stick taken flags; menus call it when they open |
+
+The *take* forms let one consumer per frame have a press, for example a menu over gameplay. The non-take forms only check the masks, so an earlier take hides the press from them.
+
+### Who reads which action
+
+Found from the immediate action ids at the call sites of the accessors (`item11b.py`, about 520 sites; some pass the action in a variable). Action names are not known yet.
+
+| Actions | Readers |
+|---|---|
+| 2, 0x2D, 0x2E | `player_controls_interact` (0x4F82C0, diversions and pick-ups), diversion instances |
+| 3, 6, 7, 9, 0xB, 0xC, 0x11, 0x12 | `player_controls_on_foot` (0x4F9380), `player_controls_attack` (0x4F8CA0). 6 / 7 are analog (value, crossed, released); 0x12 is used by both. |
+| 4, 5 | crossed in 0x4F9380, 0x4F9C80, 0x9DA290 |
+| 0x18-0x20, 0x2A | `player_controls_vehicle` (0x4F9C80). 0x18 / 0x19 are read as values. |
+| 0x24, 0x27, 0x28 | `vehicle_player_input` (0xAA6540): 0x24 primary and secondary values, so the analog pedal pair |
+| 0x22, 0x23, 0x2B, 0x2C | 0xAA55E0 (vehicle) and 0x498770 |
+| 0x2E, 0x2F, 0x32, 0x33 | `player_controls_weapon_select` (0x4F7E90), weapon slots through `inventory_find_weapon`, and the number keys through `input_key_down` |
+| 0x36-0x52 | menus: options, pause, garage, the overlay screens, multiplayer lobby. 0x36 / 0x37, 0x38 / 0x39 and 0x3A / 0x3B are taken with repeat, so they are likely the navigation directions. 0x48 / 0x49 are the most-used takes, likely select / back. |
+| 0x59 | in `player_controls_do_frame` while the cellphone or map is up |
+| 0x5E-0x63 | diversions and minigames (0x560300, 0x560360, 0x5E1D30, tagging) |
+| 0x71-0x77 | 0x62DCA0, 0x6321A0, 0x62E0B0, 0x426CC0 |
+
+### The player's per-frame path
+
+- `game_frame_tick`:
+  1. `input_do_frame` (Rust).
+  2. `vint_input_do_frame`: UI subscriptions eat records.
+  3. **`player_controls_update`**: builds the block above.
+  4. `input_direction_history_update` (0x500CA0): two channels with 20-entry rings at `0xF9F4C0`. Each pushes the current code from 0x5008D0 when it changes, then runs the matcher 0x500AF0. Inferred to be a stick-gesture / sequence detector.
+- `sim_frame:1,2,3` → **`input_context_do_frame`** (0x4F5040): a small state machine over the input context table `0xE98E50` (16 bytes per context: enter, exit, update, …).
+  - The wanted context is the override `0xE9D47C` (when `0xE9D480` is set), else the top of the context stack `0x26598B4` (count `0x26598BC`, 8 bytes per entry), else 2.
+  - The current context is `0xF9EA00`; the previous one is `0xF9E9FC`.
+  - Contexts 0 and 1 enter through 0x4F4F70 (`input_consume_all`, then one `player_controls_do_frame`) and update with 0x4FAB20.
+  - Context 2 (gameplay) updates with **`player_controls_do_frame`** (0x4FB160).
+- `player_controls_do_frame`:
+  - Does nothing while `0x2527C08` > 0 or `0x2528989` is set.
+  - Otherwise works on the local player `0x21703D4`:
+    1. clears its control block at human +0x139C..+0x13AC;
+    2. handles death (0x9DA290) and the vehicle it is in;
+    3. takes action 0x59 while the phone / map UI is up;
+    4. runs **`player_controls_dispatch`** (0x4FAA90): `player_controls_weapon_select` → `player_controls_on_foot` → `player_controls_vehicle` → 0x9F1D00 → `player_controls_interact`;
+    5. runs 0x4FAE90.
+- `player_controls_vehicle` → `vehicle_player_input` (0xAA6540) stores throttle, steering and brake in the vehicle; `vehicle_drive_update` applies them (16_vehicles.md).
+
+### Porting notes
+
+- `player_controls_update` reads only the pad record, the pad index and the frame time, and writes only the block. That makes it a self-contained next step after `input_do_frame`. It can be checked with a compare-against-original run, as `input.rs` does for the input tree.
+- Port the accessors, setters and `input_consume_all` as one group, since they share the action table and the masks. They are leaves; only the stick-direction fallbacks 0x4FE380..0x4FE6A0 call further (0x4FD6D0..0x4FD760).
+- The player handlers (0x4F7E90, 0x4F82C0, 0x4F8CA0, 0x4F9380, 0x4F9C80) reach into humans, weapons, vehicles and networking. They are better left as original calls behind a Rust `player_controls_do_frame` for now.
+
 ## Open
 
-- The names of the 87 buttons (match the default keys to the controls menu strings).
+- The names of the 87 buttons and the 132 game actions (match the defaults at `0xDD3B98` to the controls menu strings).
 - The force-feedback setup 0xC13500 (DirectInput constant-force effect) and rumble.
