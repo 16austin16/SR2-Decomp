@@ -299,6 +299,62 @@ cdecl (u8 reset); `ret`. Everything runs under CS `0x27741B4`:
 - **Wait loops.** The two `Sleep(1)` waits (steps 17 / 18) and the busy-spins (step 2 and `render_thread_wait_frame`) are the only waits. There is no event wait on the game-thread side.
 - **Device critical section.** The device CS `0x33D62D0` is recursive per thread (count `0x252A368`, owner `0x252A374`). Both threads release it around the hand-off, so it must be released before step 16 or the render thread blocks.
 
+## gameplay_do_frame and gameplay_streaming_frame at instruction level
+
+### `gameplay_do_frame` (0x68E1B0)
+
+The state 5 (gameplay) frame function, from `game_state_dispatch`.
+- **Signature:** no arguments, returns nothing.
+- **Frame:** `sub esp, 0xC`; saves `EBX` / `EBP` / `ESI` / `EDI`. `[esp+0x18]` is the profile marker slot. `[esp+0x13]` holds the byte "this human is the local player".
+
+1. `profile_start(ECX = 0xDFFB6C, &marker)`; `[0x2527BA2]` = 1; `foreign_character_warning_update()` (no arguments: it shows the warning once when `0x2528B28` is set and `0x2528B29` is clear).
+2. **Corrupt stats.** When no cutscene blocks it (`0x2527D14` == 0 → test `0x2527D15`; when `0x2527D14` ≠ 0 the `0x2527CF7` byte is loaded but **not tested**, and the call is skipped): `stats_corrupt_check()` (0x6B5810).
+3. **Death callbacks.** For each human on `0x217043C` (`EBP`; links +0x1294; stop at the head or 0) whose timer +0x122C (ms, ≥ 0) has expired:
+   1. `bl` = 0; `[esp+0x13]` = (human == local player `0x21703D4`).
+   2. If +0xC0 bit 0 is clear:
+      1. set it;
+      2. `EDI` = `human_callback_thread_begin(ECX = human+0x1234, EDX = &[esp+0x14] (zeroed first))`;
+      3. if a thread was made:
+         - push argument 1: `script_object_name(EDX = human)` (`lua_pushstring`, or nil with the `[edi+4]`+8 stack-top bump);
+         - push argument 2: the killer +0xC0C's name if it is a live human (handle type 1), else nil (`script_thread_push_string`, EDI = thread, EAX = string).
+
+      The thread's argument count +0x1C is bumped by one for each push.
+   3. `script_thread_find(cdecl word +0x1290)`. When no thread is running:
+      1. +0x1290 = 0xFFFF;
+      2. if it is the local player and +0xFA4 bit 0x10 is set: `render_thread_wait_frame(cdecl 0)`, then `player_death_respawn_update(cdecl human)` (0x68D570).
+4. If `0x2A1890F`: 0x81EDF0, then `memset(0x2A187D0, 0, 0x144)`.
+5. **`sim_frame`** (Rust now).
+6. `profile_stop(&marker)`; `profile_start(ECX = 0xDFFB80, &marker)`.
+7. If `0x279C0C0`: 0x68C770 (navpoint markers, debug). Then `gameplay_ui_frame` (0x68D2F0).
+8. If `0x252976C`: `gfx_set_color(0, 0, 0xFF, 0xFF)` (cdecl, 4 dwords), then `gfx_draw_world_sprite(EAX = 0x2CE30D0 (the focus point), cdecl (f32 [0xDD1C8C], 0xEC2748))`. The f32 is moved through `fld` / `fstp [esp]` after a `push ecx` placeholder.
+9. `[0xE9D73D]` = 1; `profile_stop`.
+
+**Quirks:**
+- In step 2 the cutscene test is incomplete: whenever `0x2527D14` is set, the corrupt-stats check is skipped, whatever `0x2527CF7` holds.
+- The loop re-reads the list head each step (`cmp ebp, [0x217043C]`), so a callback that removes the head ends the walk.
+
+### `gameplay_streaming_frame` (0x68E410)
+
+Called from `game_state_stack_stream_frame` for a state-5 level, from `frame_end_handoff`. It runs on the game thread before `frame_present`.
+- **Signature:** no arguments.
+- **Frame:** `sub esp, 0x34`; saves `ESI` / `EDI`. It ends with a **tail jump** to 0xA54870.
+
+1. `streaming_chunk_requests_update()` (0xA7B880).
+2. Copy the render view of this thread (`gfx_get_thread_state`) to the stack: 9 floats of the matrix from +0xC into `[esp+0x18..0x38]`, then the position from +0 into `[esp+0xC..0x14]`. The last `fstp` happens after a `push`, so it targets `[esp+0x18]` relative to the moved ESP, which is position z.
+3. `city_streaming_set_view(cdecl &position, &matrix)` (0x4B39A0).
+4. **Chunk states.** For i < `[0xF6FBD4]`, chunk = `0xF70B98[i]`:
+   - state +0x18 == 1: `chunk_activate(cdecl chunk)`;
+   - state 2: set it to 3, then `chunk_ready_notify(EAX = chunk)` and 0x562100.
+5. Streaming and characters:
+   - `world_streaming_do_frame` (0x68ED30), `streaming_debug_overlay` (0x68C950), `pcr_morph_handshake` (0x7D6760);
+   - `character_textures_stream_update` (0x9E8400), `character_morph_mesh_update` (0x9ECEA0), 0x9EF5C0;
+   - clear byte +0x15 of every entry on `0x217068C` (links +0x1C);
+   - `vehicle_dirt_update` (0xAC5FB0), `player_outfit_stream_update` (0x6C6C60), `mempool_compact_step` (0x6E79D0).
+6. If distant peds are on (`0x2529E20` and all six bytes `0x215DA04`): `distant_peds_stream_update` (0xB7C210).
+7. 0x7BFC90; then `jmp script_streamed_assets_release` (0xA54870).
+
+**Thread note.** This runs inside `frame_end_handoff` after `render_thread_wait_frame` and the device acquire, so the render thread is idle or done with its frame. The view it reads is the game thread's own `gfx_get_thread_state`.
+
 ## Open
 
 - The exact identity of most unnamed sim_frame calls (the lists above give the order).
