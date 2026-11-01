@@ -384,7 +384,7 @@ With shape A the body may free the node. With shape B it must not.
 | `trigger_objects_reap` 0xA70B40 | `[0x2F9B18C]` | A, +0xBC | if `n->vtbl[+0x34]()` (thiscall) returns `EAX` == 0: `trigger_object_remove(cdecl n)` |
 | `object_props_post_update` 0x935B80 | `[0x215D798]` | B, +0xB4 | if byte `[n+0x120]` & 0x20 is clear: `object_prop_post_update(n)`, **stdcall (`ret 4`)**: the caller does not pop |
 | `detour_hull_objects_update` 0x9193C0 | `[0x2143ED4]` | B, +4 | `detour_hull_object_update(cdecl n)` |
-| `vehicle_interaction_riders_update` 0xB095D0 | array `0x31492B8`, 32 records of 0xC84 (end 0x3162338) | not a list | for each record with dword +0 ≠ 0, for rider i = 0..7: handle = `[rec + 0x34C + i × 0xA8]`. If it resolves to a live human (handle table `0x2149C64[(h & 0xFFF) × 4]`, object +0x44 == h, type +0x4C == 1): `vehicle_interaction_rider_update(ECX = rec, cdecl i)` (caller cleans 4) |
+| `vehicle_interaction_riders_update` 0xB095D0 | array `0x31492B8`, 32 records of 0xC84 (end 0x3162338) | not a list | for each record with dword +0 ≠ 0, for rider i = 0..7: handle = `[rec + 0x34C + i × 0xA8]`. If it resolves to a live human (handle table: the object pointer is the dword at `0x2149C64 + (h & 0xFFF) × 16` (16-byte slots), object +0x44 == h, type +0x4C == 1): `vehicle_interaction_rider_update(ECX = rec, cdecl i)` (caller cleans 4) |
 
 **Pool free functions** (`ambulance_pool_free` and the other two `*_pool_free`, `EDI` = pool):
 1. Return if `ESI` == 0, or if pool+0x20 is set while pool+0x14 is 0.
