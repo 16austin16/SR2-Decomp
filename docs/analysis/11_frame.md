@@ -573,6 +573,73 @@ This tears the world down. The order matters.
 - `loading_enter` / `loading_exit` and `frontend_exit` are short, call-order-only functions, so they can be ported as they are.
 - `gameplay_exit` is long but has no branches that depend on its own results. A port can keep it as one block of calls in this order. Keep the device acquire / release pairs: there are three, and `objects_reset` must run inside one.
 
+## game_state_dispatch, overlays and the gameplay UI at instruction level
+
+### `game_state_dispatch` (0x697490)
+
+**`ESI` = the state (register argument)**; `push ecx` reserves a temporary.
+
+1. Unless state == 4: `overlays_update()`.
+2. Jump table at 0x6974EC on `ESI` − 1, for states 1-11 (others do nothing):
+
+   | State | Frame function |
+   |---|---|
+   | 2 | `frontend_state_frame` |
+   | 5 | `gameplay_do_frame` |
+   | 7 | `mp_lobby_state_frame` 0x830AB0 |
+   | 8 | `mp_game_setup_state_frame` 0x834D40 |
+   | 9 | `mp_results_state_frame` 0x82F570 |
+   | 10 | `loading_state_frame` |
+   | 11 | `video_frame` |
+   | 1, 3, 4, 6 | nothing |
+
+3. Unless state is 2 or 6: `overlays_render()`. The front end renders its overlays itself, in `frontend_render`.
+
+### `overlays_update` (0x75B220)
+
+The overlay stack is the array `[0xEAC4E0]`, with count `[0xEAC4E8]`. Byte +4 of an overlay means "the overlay below keeps running".
+
+For i = count − 1 down to 0:
+1. `ovl->vtbl[+8]()` (update, thiscall). If it returns 0: `overlay_hide(ESI = ovl)` (0x75B1B0).
+2. **Re-read slot i**: a hide can change the array. If that overlay's +4 is 0, stop.
+
+### `overlays_render` (0x75B270)
+
+Frame `sub esp, 0x20`; returns at once with an empty stack.
+
+1. **Start index.** From i = count − 1 down while i > 0 and `[ovl+4]` ≠ 0: i − 1. The result is the lowest overlay that is visible.
+2. For j = i .. count − 1: if `ovl->vtbl[+0x10]()` (is "on top") returns 0, call `ovl->vtbl[+0xC]()` (render). The count is re-read each step.
+3. Save the render target's tint (+0x70 / +0x74 / +0x78 of the current TLS target, with the 0xEC26A0 → 0xEC2610 swap); `gfx_set_tint_color(ESI = &{1, 1, 1})`.
+4. For **j = 0** .. count − 1: if vtbl +0x10 returns exactly 1, call vtbl +0xC.
+   - **Quirk:** this loop starts at 0, not i. On-top overlays below the start index are drawn too, with the tint at 1.
+5. Restore the saved tint (`gfx_set_tint_color(ESI = &saved)`).
+
+### `gameplay_ui_frame` (0x68D2F0)
+
+Frame `sub esp, 0x3C`; saves `ESI` / `EDI`. It ends with a **tail jump** to `hud_render`.
+
+1. **Debug marker**, only when `0x2527B9D` is set and a local player exists:
+   1. The point = 0x9DF410(`ESI` = &tmp) + 0.05 × −(player +0x2C..+0x34).
+   2. Two points at ± 0.5 × the camera row `0x25F5B38` around it, each through `gfx_world_to_screen` (0xD22B10, `EAX` = &in, `ESI` = &out).
+   3. The rectangle is built from their spread (× 0.5, × 1.2; constants are doubles at 0xE5C368 / 0xE5BF70 / 0xE5C5A0).
+   4. `gfx_set_color(cdecl 0, 0, 0, 0xFF)`; `im2d_fill_rect(cdecl _ftol2(x0), _ftol2(y0), _ftol2(x1), _ftol2(y1), 0xEC2740)`. The four `_ftol2_sse` conversions are pushed in reverse order.
+
+   Debug only; a port can drop it or keep it behind the flag.
+2. `sun_flare_render` (0x4D6BF0), `screen_flash_render` (0x4D0E80), `screen_fade_apply` (0x4D1790), `world_text_render` (0x92D7B0), `hud_pre_render` (0x793BB0).
+3. `jmp hud_render`.
+
+### `hud_render` (0x75A230)
+
+Saves `ESI`. It ends with a **tail jump** to `interface_render`.
+
+1. For i < `[0x2527FF4]`: idx = `0x1F768E4[i]`; cb = `[0xE8E730 + idx × 0x14 + 0xC]`; call it with no arguments if set. These are the active HUD overlay render callbacks.
+2. `letterbox_render` (0x755B80), `player_hud_extras_render` (0x6C6BE0), `dialog_boxes_render(cdecl 0xEAC208)` (0x7552D0).
+3. `jmp interface_render` (0x7F33B0).
+
+**Port:** all four functions are short call sequences over global arrays. Two things must stay:
+- The re-reads of the overlay count and slots, because an overlay can hide itself during update or render.
+- `overlays_render`'s second loop starting at 0.
+
 ## Open
 
 - The exact identity of most unnamed sim_frame calls (the lists above give the order).
