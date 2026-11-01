@@ -19,6 +19,8 @@ const GAME_FRAME_TICK: usize = 0x0052_0450;
 const GAME_FRAME_TICK_PROLOGUE: [u8; 9] = [0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x10];
 
 static FRAME_TICK_ORIGINAL: AtomicUsize = AtomicUsize::new(0);
+/// Run the frame body in Rust (`frame.rs`) instead of the original.
+const RUST_FRAME: bool = true;
 static FRAMES: AtomicU32 = AtomicU32::new(0);
 
 extern "C" fn game_frame_tick_hook() -> i32 {
@@ -31,7 +33,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     crate::missionlog::tick();
     crate::menu::tick();
     if n == 1 || n.is_multiple_of(3600) {
-        log(&format!("game_frame_tick: frame {n}"));
+        log(&format!("game_frame_tick: frame {n}{}", if RUST_FRAME { " (Rust body)" } else { "" }));
     }
     if n == FIND_RECORD_VERIFY_FRAME {
         find_record_verify();
@@ -63,7 +65,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
             FIND_ENTRY_MISMATCHES.load(Ordering::Relaxed)
         ));
     }
-    original()
+    if RUST_FRAME { crate::frame::game_frame_tick() } else { original() }
 }
 
 // --- 0xBF2BD0 hash_filename_ci (replaced) ----------------------------------

@@ -5,7 +5,7 @@ address,name,subsystem,status,notes
 0x00520910,accessibility_keys_disable_or_restore,app,documented,"SPI sticky/toggle/filter keys; arg0=disable, !=0 restore (00)"
 0x00520a30,app_supervisor_thread_proc,app,documented,"creates game thread, runs loading loop, ExitProcess on shutdown (00)"
 0x00520790,game_main_thread_proc,app,documented,"game init calls then loop on game_frame_tick (00)"
-0x00520450,game_frame_tick,app,documented,"per-frame update, returns 1 to quit. Hooked live: called repeatedly (frame 3600 reached at ~18 FPS at the main menu) (00)"
+0x00520450,game_frame_tick,app,rust,"Rust (frame.rs): the frame body as a call sequence, callees by address; returns 1 to quit (11, 40)"
 0x00520630,startup_loading_render_loop,render,documented,"inferred: clear/present loop until DAT_02527e94==3 (00)"
 0x00bfa570,pump_window_messages,platform,documented,"PeekMessageW/Translate/Dispatch + IME reset (00)"
 0x00bfa620,single_instance_check_and_create_window,platform,documented,"CreateMutexA, FindWindowA 'Saints Row 2', calls create_game_window (00)"

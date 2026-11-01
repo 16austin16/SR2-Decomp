@@ -27,7 +27,7 @@ Names are in `docs/functions.csv` (subsystem `app`). Threads are described in 07
 
 ## Timing
 
-`frame_timer_update` (0xBF0710) is called as (fixed, ?, step).
+`frame_timer_update` (0xBF0710) is called as (fixed, step, extra): `extra` is `0xE98AF0` when `0x2527321` is set, else 0. (Earlier this read (fixed, ?, step); the code at 0x520569 stores the step in the second argument.)
 
 1. Real dt = QPC time since the last frame, in microseconds / 1e6 → `0xE84380`.
 2. A non-zero `step` overrides dt with 1/step.

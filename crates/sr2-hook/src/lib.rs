@@ -23,6 +23,7 @@ mod callers;
 mod crash;
 mod detour;
 mod display;
+mod frame;
 mod gfx_cmd;
 mod hddio;
 mod hooks;
