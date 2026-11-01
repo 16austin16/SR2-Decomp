@@ -529,6 +529,48 @@ The other three tables:
 4. Each element type's `render` (vf43), which fills the per-slot draw data.
 5. The update walk (`vint_object_tree_update`) and input (`vint_input_do_frame`, above) can be ported independently of rendering.
 
+## interface_do_frame and vint_update_documents at instruction level (for the port)
+
+### `interface_do_frame` (0x7F3500)
+
+No arguments; saves `ESI`.
+
+1. Return at once unless the interface is ready (`[0x2528AFF]`).
+2. **Vehicle hint change.** With `ESI` = local player `[0x21703D4]` (skipped when 0):
+   1. state = `human_entering_vehicle(cdecl player)` || `human_exiting_vehicle(cdecl player)`. The second call only runs when the first is false. `AL` = 1 on either.
+   2. If state ≠ `[0x347AF34]`: store it and call `hud_control_hints_rebuild()` (0x7F2040).
+3. Then, in this order:
+   - `interface_screen_state_frame` (0x7EC170)
+   - `interface_vkeyboard_poll` (0x7F3450)
+   - `vint_dataitems_notify_all` (0xB95290)
+   - `vint_datagroups_deliver_all` (0xB94560)
+   - `vint_tweens_do_frame` (0xB9EA70)
+4. `vint_update_documents(cdecl f32 [0xE87998])`. **That constant is −1.0**, which means "use the frame dt" (see below). The float is pushed with `push ecx` / `fld` / `fstp [esp]`.
+
+### `vint_update_documents` (0xB8BC10)
+
+cdecl (f32 dt); saves `ESI` / `EDI`; plain `ret`. **The dt argument slot is reused** as the working dt.
+
+1. If `[0x252A17D]` (aspect changed): `vint_aspect_change_reload()` (0xB8A6F0). `[0x252A1B0]` = 0.
+2. **dt rules**, all x87; the result is rounded to f32 through the argument slot:
+   1. If dt < 0 (unordered → not taken): dt = frame dt `[0xE84380]`.
+   2. If dt ≥ 0.5 (`[0xDD1C8C]`; also when unordered): dt = 0.5, and **step 3's test is skipped**.
+   3. Otherwise, if dt ≤ 0.001 (`[0xDD5984]`; also when unordered): **skip the time step** and go to the unload pass.
+3. **Time step.** For each document on `0x252A1AC` (links +0; stop at the head or 0):
+   1. Unless paused (byte +0x460 ≠ 0):
+      - if dt > 0: +0x45C (document time) += dt;
+      - else: +0x45C += the frame dt `[0xE84380]`. This branch is unreachable from `interface_do_frame`, which always arrives with dt > 0.001.
+   2. `vint_object_tree_update(EAX = +0x454)` and `vint_object_tree_update(EAX = +0x458)`. These run for paused documents too; every update slot is an empty `ret`, so only the walk happens.
+4. **Unload pass.** For each document, with next computed first (`next = (next == head) ? 0 : next`), when byte +0x572 == 1:
+   1. `vint_document_run_unload_script(cdecl doc)`;
+   2. the callback `[0x252A1EC](cdecl doc)` if it is set;
+   3. `vint_document_release_pending()`;
+   4. `vint_document_unlink(EAX = doc)`.
+
+**Port note:**
+- Since the four vint bindings and the tree walk are effectively no-ops, a Rust `vint_update_documents` is: the dt rules, the per-document time add, and the unload pass calling the four originals.
+- The clamp order matters: a dt of exactly 0.5 takes the clamp path, so it is never tested against 0.001.
+
 ## Open
 
 - The data item / group layouts beyond the delivery side.
