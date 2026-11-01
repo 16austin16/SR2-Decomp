@@ -23,7 +23,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 
 | | Calls | Rust | mapped | unmapped |
 |---|---|---|---|---|
-| all four functions | 204 | 5 | 70 | 129 |
+| all four functions | 204 | 5 | 176 | 23 |
 
 - `game_frame_tick` and `game_state_frame` are almost fully mapped. They are short call sequences, so their bodies can be ported as Rust skeletons now, calling the original functions by address.
 - `frame_end_handoff` is mapped except for two groups:
@@ -31,7 +31,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
   - the render snapshot helpers (0x6255A0, 0x46CCD0, 0xD08310, 0x51A4A0, 0xBE4170).
 
   It is the next skeleton to port. `render_thread_wait_frame` and the render-list swap are the parts that need care, because both threads touch them.
-- `sim_frame` is the large one: 144 calls, 103 of them still unmapped (after the naming rounds f6f2237, 8d7d4a9 and f4c9a77). The unmapped calls with the largest reach are the next naming targets:
+- `sim_frame` is the large one: 144 calls, 16 of them still unmapped (after the naming rounds up to the item-4 commits). The remaining ones are small (under 0.3% reach) except 0x9A9CE0 and 0x55BA40; see "Sections :1c, :4 and :5". The unmapped calls with the largest reach are the next naming targets:
   - **0x5053B0** (17.4%): now `effect_objects_do_frame`. It runs `effect_objects_budget_bodies` (Havok bodies for the 50 most important effect-object parts), then `effect_object_update` on each object.
   - **0x6A5BB0** (11.1%): now `mission_fail_flow_do_frame`. It switches on the failure reason 0x1450380 (doc 22) and handles fades, revive / teleport, `cutscene_play`, `mission_end` and the stronghold cancel dialog.
   - **0x93D150** (10.9%): now `world_spawn_do_frame` (spawn regions, spawn groups, traffic). It runs every frame; only with 0x2528B48 set and 0x2528B49 clear does it wait for 0xE96C00 >= 0xB first.
@@ -79,7 +79,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | Profiler section | Call | Status | Reach | Rust below | Doc |
 |---|---|---|---|---|---|
 | sim_frame:1,2,3 | `cutscene_do_frame` 0x6C6870 | mapped | 5.0% | 57 (gfx_cmd, hddio, rsched, streamman) | 23, 40 |
-| sim_frame:1,2,3 | — 0x493260 | unmapped | 0.1% |  |  |
+| sim_frame:1,2,3 | `camera_pre_update` 0x493260 | mapped | 0.1% |  | 19, 40 |
 | sim_frame:1,2,3 | `camera_update` 0x4932F0 | mapped | 8.8% | 2 (gfx_cmd) | 19 |
 | sim_frame:1,2,3 | `trigger_objects_reap` 0xA70B40 | mapped | 0.4% | 1 (rsched) | 09, 40 |
 | sim_frame:1,2,3 | `script_deferred_calls_flush` 0xA55310 | mapped | 1.2% |  | 09, 40 |
@@ -98,7 +98,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1,2,3 | — 0x6AB240 | unmapped | 0.0% |  |  |
 | sim_frame:1,2,3 | — 0x6AB2D0 | unmapped | 0.0% |  |  |
 | sim_frame:1,2,3 | `gps_route_update` 0x765BB0 | mapped | 3.7% | 11 (gfx_cmd) | 40 |
-| sim_frame:1b | — 0x68A1E0 | unmapped | 0.2% |  |  |
+| sim_frame:1b | `game_clock_advance` 0x68A1E0 | mapped | 0.2% |  | 13, 40 |
 | sim_frame:1b | `net_send_periodic_status` 0x68A320 | mapped | 1.0% |  | 35, 40 |
 | sim_frame:1b | — 0x68B860 | unmapped | 0.2% | 2 (gfx_cmd) |  |
 | sim_frame:1b | `nav_timesliced_jobs_update` 0xA17690 | mapped | 1.7% |  | 21, 40 |
@@ -176,26 +176,26 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:5 | `timed_object_effects_expire` 0x5585E0 | mapped | 0.3% |  | 40 |
 | sim_frame:6,7 | `weapon_target_lock_update` 0xB6AD40 | mapped | 4.0% | 9 (gfx_cmd) | 20, 40 |
 | sim_frame:6,7 | `weather_update` 0x4DE770 | mapped | 0.9% | 1 (mempool) | 33, 38, 40 |
-| sim_frame:6,7 | — 0x4D6850 | unmapped | 0.0% |  |  |
+| sim_frame:6,7 | `tod_keyframes_select` 0x4D6850 | mapped | 0.0% |  | 40 |
 | sim_frame:6,7 | `shadow_cascades_update` 0x4E66A0 | mapped | 5.0% |  | 40 |
 | sim_frame:6,7 | `weather_rain_effects_update` 0x4CF840 | mapped | 7.5% | 2 | 33, 40 |
 | sim_frame:6,7 | `light_modifiers_update` 0x4CA750 | mapped | 2.9% | 8 (gfx_cmd, mempool) | 33, 40 |
 | sim_frame:6,7 | `ambient_zone_effects_update` 0x503AE0 | mapped | 1.8% |  | 33, 40 |
-| sim_frame:6,7 | — 0x4CBFC0 | unmapped | 0.2% |  |  |
+| sim_frame:6,7 | `camera_target_effects_update` 0x4CBFC0 | mapped | 0.2% |  | 19, 40 |
 | sim_frame:6,7 | `inventory_find_weapon` 0x55ADF0 | mapped | 0.1% |  | 38 |
-| sim_frame:6,7 | — 0x727610 | unmapped | 0.3% |  |  |
+| sim_frame:6,7 | `water_waves_update` 0x727610 | mapped | 0.3% |  | 40 |
 | sim_frame:6,7 | `searchlights_update` 0x955470 | mapped | 2.5% |  | 34, 40 |
 | sim_frame:6,7 | `effect_objects_do_frame` 0x5053B0 | mapped | 17.4% |  | 40 |
 | sim_frame:6,7 | `tod_ambient_effects_update` 0x5142A0 | mapped | 2.9% |  | 33, 40 |
 | sim_frame:6,7 | `net_send_door_event` 0x91A840 | mapped | 3.6% |  | 27 |
-| sim_frame:6,7 | — 0x4525E0 | unmapped | 0.2% |  |  |
-| sim_frame:6,7 | — 0x452820 | unmapped | 0.0% |  |  |
+| sim_frame:6,7 | `ai_scheduled_tasks_expire` 0x4525E0 | mapped | 0.2% |  | 21, 40 |
+| sim_frame:6,7 | `ai_scheduled_tasks_tick` 0x452820 | mapped | 0.0% |  | 21, 40 |
 | sim_frame:6,7 | `ai_scheduled_tasks_run` 0x453120 | mapped | 2.6% |  | 21, 40 |
 | sim_frame:6,7 | `world_focus_point_update` 0x9DF4C0 | mapped | 6.0% | 13 (gfx_cmd) | 19, 40 |
 | sim_frame:6,7 | `coop_do_frame` 0x926170 | mapped | 5.0% |  | 35, 40 |
 | sim_frame:6,7 | `glares_update` 0x4C6CD0 | mapped | 1.7% |  | 40 |
-| sim_frame:6,7 | — 0x4C35C0 | unmapped | 2.3% | 4 (gfx_cmd) |  |
-| sim_frame:6,7 | — 0xD07B40 | unmapped | 0.0% |  |  |
+| sim_frame:6,7 | `lighting_exposure_blend_update` 0x4C35C0 | mapped | 2.3% | 4 (gfx_cmd) | 40 |
+| sim_frame:6,7 | `mesh_decals_fade_update` 0xD07B40 | mapped | 0.0% |  | 40 |
 | sim_frame:6,7 | — 0x4DA880 | unmapped | 2.0% | 1 (mempool) |  |
 | sim_frame:6,7 | `object_effect_links_update` 0x92D620 | mapped | 1.5% |  | 33, 40 |
 | sim_frame:6,7 | `level_objects_near_camera_update` 0x9FCF90 | mapped | 4.0% | 3 | 40 |
@@ -216,7 +216,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:6,7 | — 0x683E00 | unmapped | 0.0% |  |  |
 | sim_frame:6,7 | — 0x9E99F0 | unmapped | 0.0% |  |  |
 | sim_frame:6,7 | `misc_packet_send_14` 0x926860 | mapped | 0.9% |  | 27 |
-| sim_frame:6,7 | — 0x836BB0 | unmapped | 0.0% |  |  |
+| sim_frame:6,7 | `net_timed_callbacks_run` 0x836BB0 | mapped | 0.0% |  | 35, 40 |
 | sim_frame:6,7 | `gfx_view_set_hud` 0xD24B70 | mapped | 2.5% |  | 40 |
 | sim_frame:6,7 | `hud_do_frame` 0x793A40 | mapped | 3.6% | 12 (gfx_cmd) | 28, 40 |
 | sim_frame:6,7 | `interface_do_frame` 0x7F3500 | mapped | 5.3% |  | 06 |
