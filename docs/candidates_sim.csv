@@ -71,7 +71,6 @@ address,name,subsystem,status,notes
 0x00bdce30,rng_float01,math,documented,"EAX = rng (index +0x9C4, 2048-entry table +0x9C8) -> ST0; next u32 * 2^-32 as f32, index wraps at 0x800; 393 callers; missing from functions.csv; role confirmed (41)"
 0x00bdcf50,rand_int_range,math,documented,"ESI = min, ECX = max -> EAX; min + table[0xEC3ABC] % (max - min + 1), global table 0xEC3AC0; 209 callers; missing from functions.csv; role confirmed (41)"
 0x00bdd1b0,timer_set_random,util,documented,"EDI = &timestamp, EAX = max ms, stack min ms (ret 4); ts = now [0xE843AC] + min + rand % (max - min + 1) from the 2048-entry table 0xEC3AC0 (index 0xEC3ABC), wrapped like timer_set; 193 callers; missing from functions.csv; role confirmed (41)"
-0x00bdd2a0,timer_elapsed_ms,util,documented,"EAX = &timestamp -> EAX; now - ts with the 900,000,000 ms wrap window; unset (< 0) -> -1,800,000,000; 165 callers; missing from functions.csv; role confirmed (41)"
 0x00bddff0,vec3_normalize_in_place,math,documented,"ESI = &v; v *= 1 / sqrtf_wrapper(|v|^2), no zero check; 212 callers; missing from functions.csv; role confirmed (41)"
 0x00bde570,vec3_mul_mat33_in_place,math,documented,"ECX = &v, EAX = &m (3x3 rows at +0 / +0xC / +0x18); v = x*row0 + y*row1 + z*row2; 171 callers; missing from functions.csv; role confirmed (41)"
 0x00bde980,vec3_distance,math,documented,"cdecl (&a, &b) -> ST0; sqrtf_wrapper of the squared difference; 100 callers; missing from functions.csv; role confirmed (41)"
