@@ -64,6 +64,8 @@ enum Ret {
     St0,
     /// Nothing (EAX is whatever the original left).
     Void,
+    /// `player_stick_get(_raw)`: x through the argument pointer, y through ECX.
+    StickGet,
 }
 
 struct Accessor {
@@ -73,7 +75,7 @@ struct Accessor {
     ret: Ret,
 }
 
-const ACCESSORS: [Accessor; 37] = [
+const ACCESSORS: [Accessor; 49] = [
     Accessor { name: "input_action_down", addr: 0x004F_F640, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
     Accessor { name: "input_action_repeat", addr: 0x004F_F6A0, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
     Accessor { name: "input_action_just_pressed", addr: 0x004F_F700, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
@@ -111,6 +113,18 @@ const ACCESSORS: [Accessor; 37] = [
     Accessor { name: "player_stick_take_repeat_pos_x", addr: 0x004FDA90, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x29, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
     Accessor { name: "player_stick_take_repeat_pos_y", addr: 0x004FDAD0, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2A, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
     Accessor { name: "player_stick_take_repeat_neg_y", addr: 0x004FDB10, prologue: &[0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2B, 0x99, 0x65, 0x02, 0x00], ret: Ret::Al },
+    Accessor { name: "player_stick_x", addr: 0x004FD510, prologue: &[0x51, 0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2C, 0x99, 0x65, 0x02, 0x00], ret: Ret::St0 },
+    Accessor { name: "player_stick_y", addr: 0x004FD540, prologue: &[0x51, 0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2D, 0x99, 0x65, 0x02, 0x00], ret: Ret::St0 },
+    Accessor { name: "player_stick_raw_x", addr: 0x004FD570, prologue: &[0x51, 0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2C, 0x99, 0x65, 0x02, 0x00], ret: Ret::St0 },
+    Accessor { name: "player_stick_raw_y", addr: 0x004FD5A0, prologue: &[0x51, 0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2D, 0x99, 0x65, 0x02, 0x00], ret: Ret::St0 },
+    Accessor { name: "stick_response_curve", addr: 0x004FD5D0, prologue: &[0xD9, 0x44, 0x24, 0x04, 0xD9, 0xC0], ret: Ret::St0 },
+    Accessor { name: "player_stick_x_curved", addr: 0x004FD630, prologue: &[0x51, 0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2C, 0x99, 0x65, 0x02, 0x00], ret: Ret::St0 },
+    Accessor { name: "player_stick_y_curved", addr: 0x004FD660, prologue: &[0x51, 0x8D, 0x04, 0x80, 0x80, 0x3C, 0xC5, 0x2D, 0x99, 0x65, 0x02, 0x00], ret: Ret::St0 },
+    Accessor { name: "input_just_pressed_count", addr: 0x004FD690, prologue: &[0x33, 0xC0, 0x33, 0xC9, 0x80, 0xB9, 0x4D, 0x9B, 0x65, 0x02, 0x00], ret: Ret::Eax },
+    Accessor { name: "input_action_table", addr: 0x004FF590, prologue: &[0xB8, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Eax },
+    Accessor { name: "player_stick_get_raw", addr: 0x004FF5A0, prologue: &[0x51, 0xD9, 0xEE, 0x8D, 0x04, 0x80], ret: Ret::StickGet },
+    Accessor { name: "player_stick_get", addr: 0x004FF5F0, prologue: &[0x51, 0xD9, 0xEE, 0x8D, 0x04, 0x80], ret: Ret::StickGet },
+    Accessor { name: "input_stick_action_consume", addr: 0x00500230, prologue: &[0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x78, 0xF2, 0xF9, 0x00], ret: Ret::Void },
 ];
 const COUNT: usize = ACCESSORS.len();
 
@@ -369,8 +383,80 @@ unsafe fn stick_dir(kind: Kind, code: u32) -> u32 {
     unsafe { stick_leaf(kind, e, dir) }
 }
 
+// --- Stick readers ---------------------------------------------------------------------------
+
+const CURVE_K3: usize = 0x00E5_C210; // f64 0.9
+const CURVE_K: usize = 0x00DD_50E8; // f64 0.1
+const STICK_ACTIONS: usize = 0x00F9_F278; // 16-byte entries, +0 kind
+
+/// Arguments each accessor takes on the stack (the rest take registers only).
+fn nargs(id: usize) -> usize {
+    if matches!(id, 41 | 46 | 47) { 1 } else { 0 }
+}
+
+/// An axis of control-block entry `e`: 0 while its taken byte is set.
+unsafe fn axis(e: u32, taken: usize, off: usize) -> f32 {
+    unsafe {
+        let b = BLOCK + e as usize * 0x28;
+        if rb(b + taken) != 0 { 0.0 } else { *((b + off) as *const f32) }
+    }
+}
+
+/// `stick_response_curve`: f32(0.9 v^3), then +-0.1 away from 0 (x87 at 53 bits: f64 steps).
+unsafe fn curve(v: f32) -> f32 {
+    unsafe {
+        let v = v as f64;
+        let mut c = (v * v * *(CURVE_K3 as *const f64) * v) as f32;
+        let k = *(CURVE_K as *const f64);
+        if c > 0.0 {
+            c = (c as f64 + k) as f32;
+        }
+        if c < 0.0 {
+            c = (c as f64 - k) as f32;
+        }
+        c
+    }
+}
+
+unsafe fn curved(e: u32, taken: usize, off: usize) -> f32 {
+    unsafe {
+        let b = BLOCK + e as usize * 0x28;
+        if rb(b + taken) != 0 { 0.0 } else { curve(*((b + off) as *const f32)) }
+    }
+}
+
+/// `player_stick_get(_raw)`: x through the argument pointer, then y over the argument slot itself
+/// and through ECX.
+unsafe fn stick_get(e: u32, py: u32, args: *mut u32, raw: bool) {
+    unsafe {
+        let o = if raw { 0x10 } else { 0 };
+        let x = axis(e, 0x24, o);
+        let y = axis(e, 0x25, o + 4);
+        *(*args as *mut f32) = x;
+        *args = y.to_bits();
+        *(py as *mut f32) = y;
+    }
+}
+
+unsafe fn stick_action_consume(i: u32) {
+    unsafe {
+        let a = match rd(STICK_ACTIONS + i as usize * 16) {
+            0 => BLOCK + 0x28 + 0x24,
+            1 => BLOCK + 0x28 + 0x25,
+            2 => BLOCK + 0x24,
+            3 => BLOCK + 0x25,
+            _ => return,
+        };
+        wb(a, 1);
+    }
+}
+
+unsafe fn just_pressed_count() -> u32 {
+    unsafe { (0..87).filter(|&b| rb(PRESSED + b) != 0).count() as u32 }
+}
+
 /// The Rust accessor `id`: (EAX result, f32 result).
-unsafe fn rust(id: usize, r: &Regs) -> (u32, f32) {
+unsafe fn rust(id: usize, r: &Regs, args: *mut u32) -> (u32, f32) {
     unsafe {
         match id {
             0 => (query(r.ecx, DOWN, AVAIL, STICK_DIR_DOWN), 0.0),
@@ -406,16 +492,34 @@ unsafe fn rust(id: usize, r: &Regs) -> (u32, f32) {
                 };
                 (stick_leaf(kind, r.eax, dirs[(id - 17) % 4]), 0.0)
             }
+            37 => (0, axis(r.eax, 0x24, 0)),
+            38 => (0, axis(r.eax, 0x25, 4)),
+            39 => (0, axis(r.eax, 0x24, 0x10)),
+            40 => (0, axis(r.eax, 0x25, 0x14)),
+            41 => (0, curve(f32::from_bits(*args))),
+            42 => (0, curved(r.eax, 0x24, 0)),
+            43 => (0, curved(r.eax, 0x25, 4)),
+            44 => (just_pressed_count(), 0.0),
+            45 => (ACTIONS as u32, 0.0),
+            46 | 47 => {
+                stick_get(r.eax, r.ecx, args, id == 46);
+                (0, 0.0)
+            }
+            48 => {
+                stick_action_consume(r.eax);
+                (0, 0.0)
+            }
             _ => (0, 0.0),
         }
     }
 }
 
 /// Call the original through its trampoline with the same registers.
-unsafe fn original(id: usize, r: &Regs) -> (u32, f32) {
+unsafe fn original(id: usize, r: &Regs, args: *const u32) -> (u32, f32) {
     let f = ORIGINAL[id].load(Ordering::Relaxed);
     unsafe {
-        let eax = call_regs(f, r.eax, r.ecx, r.edx, r.esi, r.edi, &[]);
+        let a = if nargs(id) > 0 { std::slice::from_raw_parts(args, nargs(id)) } else { &[] };
+        let eax = call_regs(f, r.eax, r.ecx, r.edx, r.esi, r.edi, a);
         let mut v = 0f32;
         if ACCESSORS[id].ret == Ret::St0 {
             std::arch::asm!("fstp dword ptr [{p}]", p = in(reg) &mut v as *mut f32, options(nostack));
@@ -429,11 +533,19 @@ fn same(ret: Ret, a: (u32, f32), b: (u32, f32)) -> bool {
         Ret::Al => a.0 as u8 == b.0 as u8,
         Ret::Eax => a.0 == b.0,
         Ret::St0 => a.1.to_bits() == b.1.to_bits(),
-        Ret::Void => true,
+        Ret::Void | Ret::StickGet => true,
     }
 }
 
-extern "C" fn dispatch(id: usize, r: &mut Regs) -> u32 {
+/// What `player_stick_get(_raw)` wrote through its pointers (x, y), for the shadow compare.
+/// `px` is the x pointer read before the call (the Rust version overwrites the argument slot).
+unsafe fn stick_outputs(id: usize, r: &Regs, px: u32) -> (u32, u32) {
+    unsafe {
+        if ACCESSORS[id].ret == Ret::StickGet { (rd(px as usize), rd(r.ecx as usize)) } else { (0, 0) }
+    }
+}
+
+extern "C" fn dispatch(id: usize, r: &mut Regs, args: *mut u32) -> u32 {
     let n = CALLS[id].fetch_add(1, Ordering::Relaxed);
     let shadow = n < SHADOW_CALLS && !IN_SHADOW.with(|s| s.get());
     let out = unsafe {
@@ -442,13 +554,16 @@ extern "C" fn dispatch(id: usize, r: &mut Regs) -> u32 {
             let block = || std::slice::from_raw_parts(BLOCK as *const u8, BLOCK_END - BLOCK).to_vec();
             let load = |v: &[u8]| std::ptr::copy_nonoverlapping(v.as_ptr(), BLOCK as *mut u8, v.len());
             let before = block();
-            let theirs = original(id, r);
+            let px = if ACCESSORS[id].ret == Ret::StickGet { *args } else { 0 };
+            let theirs = original(id, r, args);
+            let theirs_out = stick_outputs(id, r, px);
             let theirs_block = block();
             load(&before);
-            let ours = rust(id, r);
+            let ours = rust(id, r, args);
+            let ours_out = stick_outputs(id, r, px);
             let ours_block = block();
             IN_SHADOW.with(|s| s.set(false));
-            if !same(ACCESSORS[id].ret, theirs, ours) || theirs_block != ours_block {
+            if !same(ACCESSORS[id].ret, theirs, ours) || theirs_block != ours_block || theirs_out != ours_out {
                 let m = MISMATCHES[id].fetch_add(1, Ordering::Relaxed) + 1;
                 if m <= 10 {
                     log(&format!(
@@ -469,7 +584,7 @@ extern "C" fn dispatch(id: usize, r: &mut Regs) -> u32 {
                 ours
             }
         } else {
-            rust(id, r)
+            rust(id, r, args)
         }
     };
     r.eax = out.0;
@@ -512,10 +627,10 @@ pub fn stick_self_test() {
                         let mut run = |id: usize, eax: u32| {
                             load(&state);
                             let r = Regs { edi: 0, esi: 0, ebp: 0, st0: 0, ebx: 0, edx: 0, ecx: 0, eax };
-                            let theirs = original(id, &r);
+                            let theirs = original(id, &r, std::ptr::null());
                             let tb = block();
                             load(&state);
-                            let ours = rust(id, &r);
+                            let ours = rust(id, &r, std::ptr::null_mut());
                             let ob = block();
                             checked += 1;
                             if !same(ACCESSORS[id].ret, theirs, ours) || tb != ob {
@@ -541,6 +656,27 @@ pub fn stick_self_test() {
                                 run(id, code as u32);
                             }
                         }
+                        for id in [37, 38, 39, 40, 42, 43] {
+                            for e in [0u32, 1, 5, 6] {
+                                run(id, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The response curve over a sweep of inputs.
+        for k in -2000i32..=2000 {
+            for v in [k as f32 / 1000.0, k as f32 / 1000.0 + 1e-4, f32::from_bits(0x3E80_0000u32.wrapping_add(k as u32))] {
+                let mut a = [v.to_bits()];
+                let r = Regs { edi: 0, esi: 0, ebp: 0, st0: 0, ebx: 0, edx: 0, ecx: 0, eax: 0 };
+                let theirs = original(41, &r, a.as_ptr());
+                let ours = rust(41, &r, a.as_mut_ptr());
+                checked += 1;
+                if theirs.1.to_bits() != ours.1.to_bits() {
+                    bad += 1;
+                    if bad <= 10 {
+                        log(&format!("actions: self-test stick_response_curve({v}): original {}, Rust {}", theirs.1, ours.1));
                     }
                 }
             }
@@ -553,21 +689,26 @@ pub fn stick_self_test() {
 
 macro_rules! thunk {
     ($name:ident, $id:expr) => {
+        thunk!($name, $id, "ret");
+    };
+    ($name:ident, $id:expr, $ret:literal) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
                 "mov eax, esp",
+                "lea ecx, [esp + 36]",
+                "push ecx",
                 "push eax",
                 "push {id}",
                 "call {d}",
-                "add esp, 8",
+                "add esp, 12",
                 "test eax, eax",
                 "jz 2f",
                 "fld dword ptr [esp + 12]",
                 "2:",
                 "popad",
-                "ret",
+                $ret,
                 id = const $id,
                 d = sym dispatch,
             )
@@ -611,8 +752,20 @@ thunk!(t33, 33);
 thunk!(t34, 34);
 thunk!(t35, 35);
 thunk!(t36, 36);
+thunk!(t37, 37);
+thunk!(t38, 38);
+thunk!(t39, 39);
+thunk!(t40, 40);
+thunk!(t41, 41, "ret 4");
+thunk!(t42, 42);
+thunk!(t43, 43);
+thunk!(t44, 44);
+thunk!(t45, 45);
+thunk!(t46, 46);
+thunk!(t47, 47);
+thunk!(t48, 48);
 const THUNKS: [extern "C" fn(); COUNT] = [
-    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35, t36,
+    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35, t36, t37, t38, t39, t40, t41, t42, t43, t44, t45, t46, t47, t48,
 ];
 
 pub fn install() {
