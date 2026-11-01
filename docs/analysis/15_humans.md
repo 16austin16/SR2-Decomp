@@ -94,6 +94,52 @@ All of this runs on the game thread from `sim_frame`. The animation work also ru
 - **Animation**: each human's rig is a 0x5E8-byte record in `0x340D240`. It is updated on the job workers (0xCEDFF0 / 0xCED090), feeds movement through +0x1CC, and is posed for rendering in `humans_post_update` (0x6DACC0).
 - **Physics**: humans are **Havok character proxies** (+0x570), not rigid bodies. They are stepped by the human code inside `sim_physics_step`, using `havok_custom_character_collector` for contacts. Ragdolls (death state) use 0x735FE0.
 
+## human_update (0x9D6D60) porting map
+
+cdecl (human, f32 dt), from `humans_update_all`. Frame about 0x314 bytes with a security cookie.
+
+1. +0x1160 byte &= ~4; `human_update_core(cdecl human, dt)`.
+2. **Co-op revive.** If +0x1161 bit 4 is set and +0x129D == 1 and `human_assets_loaded` (`EDI` = human): when no session player is below state 13, or the session flag `0x2528B56` is set with bit 4:
+   1. clear bit 4; call vtbl +0x1C(1, 1);
+   2. clear bit 1 of +0x570 → +0x130;
+   3. if `ui_blocks_player()`: +0x80 |= 0x14.
+3. Unless +0x18E8 bit 1 is set:
+   1. **Look target.** Unless +0x1162 bit 1 is set: unless +0xC0 bit 6 is set, when there is no grab (+0x100C == 0) and not `cutscene_blocking()`: aim point = camera (player) or +0x4A0 (others) + `human_view_offset_point` × 1000; 0x960C30(100.0). Then 0x9B5C00(cdecl human, value).
+      - With +0x1162 bit 1 set instead: a bone transform (`rig_bone_transform`, `ECX` = rig +0xCE4) of the player position into +0x730..0x738.
+   2. **AI or player.** If the human is not the local player's object (+0x44 handle check): `human_ai_think(human)`.
+      - In single player or as host, when it has a firearm or melee weapon, is not dead and no cutscene holds the game: +0x11C8 = `human_find_aim_target(human, &+0x11CC)`.
+      - Return early, skipping steps 4-6.
+   3. **Local player:**
+      1. Vehicle push-out: when the timer +0x14DC is set and has elapsed, and the vehicle is not a slow type 0x11, `vehicle_interaction_query`.
+      2. Ragdoll / held object (+0x1163 bits 8 / 0x10, 0x9D6CF0, 0x9DA130, 0x9D6BF0, velocity × 20).
+      3. Zoom FOV `0x25F5D38`, clamped to [0.1, 179.9] (+0x1161 bit 0, timers +0x11EC).
+      4. 0x9D5A60.
+      5. For the local player: time counters, timed stat awards (`stat_award_check` when `stats_can_award`), the HUD timer text (0x690710, `wsprintf_1024`).
+      6. 0x9D53F0, 0x930F30, `human_pickup_scan`, 0x491AA0.
+      7. Lock-on: `player_lockon_update` / `player_lockon_target_find` when it has a weapon.
+      8. Low-health heartbeat: `audio_play_params_init` / `audio_play` with timer `0xEB7E14`, tint (0xD14700); stop it with `audio_voice_stop`.
+      9. The vehicle-damage timer +0x14E0 and the hit flash +0x1560 (tint, `timer_remaining`).
+      10. +0x1163 bit 0x40 (an enemy is targeting the player).
+4. **Not alive branch** (+0x18E8 bit 1, +0x18D4 == 1): an effect (0xBDCA30, 0xA5EB50), then 0x99DD20(human, 1, −1, 0) when not dying.
+5. **Local player HUD:**
+   - `hud_vehicle_meters_update`, 0x796AB0, `hud_weapon_update`;
+   - 0x797CD0 (not online host only);
+   - 0x798770, 0x798AF0, 0x78E490, 0x9F1950.
+6. +0x1164 bit 1 = 0x9D6C60 (both zone tests 0x4AB430 true).
+
+**Helpers named here.** The four timers are used all over the game; each takes a pointer to a ms timestamp where −1 means unset:
+- `timer_elapsed` 0xBDD230 (`EAX` = &ts → `AL`);
+- `timer_remaining` 0xBDD260 (`EAX` = &ts → `EAX`);
+- `timer_set` 0xBDD100 (`EAX` = ms, `ECX` = &ts);
+- `timer_just_elapsed` 0xBDD390.
+
+The others:
+- `cutscene_blocking` 0x6C6D20;
+- `audio_play_params_init` (`ESI` = params, cdecl cue, a, b) / `audio_play` (`EAX` = params, `ECX` = &handle) / `audio_voice_stop` (`ECX` = &handle);
+- `human_has_firearm` / `weapon_info_is_firearm`, `ui_blocks_player`, `stats_can_award` / `stat_award_check`.
+
+**Port:** keep this as a call skeleton. The AI branch returns early, so the local-player part (step 3.3 onward) never runs for NPCs. Several bit tests of +0x1161..+0x1164 decide the branches; copy them as they are.
+
 ## Open
 
 - What 0x9C1B90 (AI think) runs per behaviour, and the human state machine values at +0x591 / +0x592.
