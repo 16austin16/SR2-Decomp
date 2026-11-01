@@ -72,7 +72,7 @@ unsafe fn call_eax(f: usize, obj: usize, a: u32, b: u32) -> u32 {
 }
 
 /// Returns which path was taken.
-unsafe fn teleport(obj: usize, pos: &[f32; 3]) -> &'static str {
+pub(crate) unsafe fn teleport(obj: usize, pos: &[f32; 3]) -> &'static str {
     unsafe {
         let orient: [f32; 9] = *((obj + 0x20) as *const [f32; 9]);
         let flag = call_eax(TELEPORT_FLAG, obj, 4, 0) & 0xFFFF;

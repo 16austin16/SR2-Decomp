@@ -11,7 +11,7 @@
 ## In-game menu (F7) and mission logger
 
 The hook DLL has a menu (crates/sr2-hook/src/menu.rs) in the bottom-right corner. F7 opens it; Up / Down move, Enter selects, Left / Right change a value, Backspace goes back. While it is open the game gets no buttons or sticks.
-- **Player options**: god mode (invulnerable flag plus full health, re-set if a script clears it), refill health, add $10,000, add 5,000 respect (the spendable respect at player +0x1200), clear the wanted level (all 4 notoriety teams).
+- **Player options**: god mode (invulnerable flag plus full health, re-set if a script clears it), refill health, add $10,000, add 5,000 respect (the spendable respect at player +0x1200), clear the wanted level (all 4 notoriety teams), teleport to the waypoint set on the pause map (the GPS destination at 0x29BA748; not yet tested in a scripted run).
 - **Mission logging**: logging on / off, the mission number you are on (Left / Right), and Mark point. **F8 marks a point without opening the menu.**
 
 While logging is on, a thread samples where the game and render threads are about once a millisecond (crates/sr2-hook/src/missionlog.rs). A new section starts at every marked point, mission number change, and change of the game's own active mission. Sections are appended to `sr2-mission.log` in the game folder. `python tools/mission_report.py <log>` lists the busiest functions per section, and names the unnamed ones by the nearest named function below them.

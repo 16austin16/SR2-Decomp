@@ -52,6 +52,9 @@ const FORCE_FLAGS: usize = 0x110C; // bit 0x40 = invulnerable
 const MAX_HP: usize = 0x1120; // i32
 const HP: usize = 0x1124; // f32
 const RESPECT: usize = 0x1200; // i32
+/// The GPS route's destination (vec3): the waypoint set on the pause map. Written by
+/// the route function 0x765E40 from its target argument.
+const GPS_TARGET: usize = 0x029B_A748;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -67,6 +70,7 @@ enum Action {
     Respect,
     ClearWanted,
     God(bool),
+    TeleportWaypoint,
 }
 
 struct State {
@@ -110,6 +114,7 @@ fn items(s: &State) -> Vec<String> {
             "Add $10,000".into(),
             "Add 5,000 respect".into(),
             "Clear wanted level".into(),
+            "Teleport to waypoint".into(),
             "Back".into(),
         ],
         Page::Logging => {
@@ -179,6 +184,7 @@ fn keys() {
                 2 => Some(Action::Cash),
                 3 => Some(Action::Respect),
                 4 => Some(Action::ClearWanted),
+                5 => Some(Action::TeleportWaypoint),
                 _ => {
                     (s.page, s.cursor) = (Page::Main, 0);
                     None
@@ -260,6 +266,17 @@ pub fn tick() {
                         call_regs(NOTORIETY_SPAWNS, 0, 0, u32::MAX, 0, 0, &[team]);
                     }
                     msg = Some("wanted level cleared".into());
+                }
+                Action::TeleportWaypoint => {
+                    let t = *(GPS_TARGET as *const [f32; 3]);
+                    msg = Some(if t == [0.0; 3] {
+                        "no waypoint set".into()
+                    } else {
+                        // A little above it: the teleport puts the player down on the ground.
+                        let to = [t[0], t[1] + 2.0, t[2]];
+                        let how = crate::teleport::teleport(p, &to);
+                        format!("teleported to {:.0}, {:.0}, {:.0} ({how})", t[0], t[1], t[2])
+                    });
                 }
             }
         }
