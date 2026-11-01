@@ -8674,7 +8674,7 @@ address,name,subsystem,status,notes
 0x00bfe0e0,file_get_size,file,documented,"ESI = u32 *out, cdecl (name) -> AL: file_resolve, then *out = the size; out untouched on failure. 37 callers incl. streamman_start_load"
 0x00c0be10,profile_start,app,documented,"ECX = label, stack (u32 *id): under the lock 0x340CBCC finds or creates the named 0x118-byte timer record (list 0x252A56C) and stores QueryPerformanceCounter into it"
 0x00c0c210,profile_reset,app,documented,"ECX = u32 *id, EDX = label: finds or creates the named timer record and zeroes its accumulators"
-0x0068ca70,sim_frame,app,documented,"the simulation frame; profiler labels sim_frame:1b, 1c, 4, 5, 6,7; called from game_frame_tick"
+0x0068ca70,sim_frame,app,rust,"Rust (frame.rs): the gameplay simulation step as a call sequence under its six profiler sections; callees by address (0x55ADF0 ESI = slot, 0x9E99F0 EDI, job_worker_wake ESI) (40)"
 0x0068e1b0,gameplay_do_frame,app,documented,"profiler labels gameplay_do_frame:1 / :2"
 0x006fa0e0,sim_physics_step,physics,documented,"fixed-step accumulator 0x2527DC8, step 0x2527DA4/0xE8ECAC, up to 3 (MP 30) substeps: havok_step_job + humans_character_step; post-step transform write-back; memory pressure callbacks (11, 17)"
 0x0052a710,render_frame,render,documented,"the render frame: profiler stages render1, render-shadow-jobs, render-flush, render2, render2:a/a3/b, render3, render4, render4a"

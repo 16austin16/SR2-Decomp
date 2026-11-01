@@ -24,7 +24,8 @@
 //! states. Each state's enter / exit / frame functions stay the game's. So is
 //! `frame_end_handoff` (0x521A00, 11_frame.md "frame_end_handoff at instruction level"):
 //! the render snapshots, the render-list swap and the sync with the render thread; its
-//! callees stay the game's.
+//! callees stay the game's. And `sim_frame` (0x68CA70), the gameplay simulation step, as
+//! a call sequence under its profiler sections.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -591,7 +592,345 @@ fn frame_end_handoff() {
     }
 }
 
+// --- sim_frame (0x68CA70) ---------------------------------------------------------------------
+
+// The gameplay simulation step, called by `gameplay_do_frame` (docs/analysis/40, "sim_frame").
+// A call sequence under the game's profiler sections; the callees stay the game's. Names for
+// the calls are in docs/functions.csv and doc 40.
+const SIM_FRAME: usize = 0x0068_CA70;
+const SIM_FRAME_PROLOGUE: [u8; 9] = [0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x4C];
+/// Run sim_frame's body in Rust instead of the original.
+const RUST_SIM: bool = true;
+
+const LABEL_SIM_A: u32 = 0x00DF_FA88;
+const LABEL_SIM_B: u32 = 0x00DF_FA98;
+const LABEL_SIM_C: u32 = 0x00DF_FAA8;
+const LABEL_SIM_D: u32 = 0x00DF_FAB8;
+const LABEL_SIM_E: u32 = 0x00DF_FAC4;
+const LABEL_SIM_F: u32 = 0x00DF_FAD0;
+const SIM_PAUSED: usize = 0x0252_7C08; // i32 > 0: only the always-on parts run
+const CUTSCENE_A: usize = 0x0252_7D14; // u8 (also read by the handoff)
+const CUTSCENE_B: usize = 0x0252_7CF7; // u8
+const CUTSCENE_C: usize = 0x0252_7D15; // u8
+const EXTRA_HOOK: usize = 0x0212_A634; // optional function pointer
+const PHYSICS_FRAME_TIME: usize = 0x006F_F860; // -> st0
+const IMP_QPC: usize = 0x00DB_8114;
+const QPC_ON: usize = 0x0252_A404; // u8
+const MP_ACTIVE: usize = 0x0252_8B48; // u8
+const MP_CLIENT: usize = 0x0252_8B49; // u8
+const WORKER_A: u32 = 0x033D_63F8; // job worker control blocks (+0x38 work kind)
+const WORKER_B: u32 = 0x033D_64C8;
+const JOB_WORKER_WAKE: usize = 0x00BF_3760; // ESI = worker
+
+/// Call a function that returns on the x87 stack, rounded to f32 as the callers store it.
+unsafe fn call_f32(f: usize) -> f32 {
+    let mut out = 0f32;
+    unsafe {
+        std::arch::asm!(
+            "push edi",
+            "call {f}",
+            "pop edi",
+            "fstp dword ptr [edi]",
+            f = in(reg) f,
+            in("edi") &mut out as *mut f32,
+            clobber_abi("C"),
+        );
+    }
+    out
+}
+
+unsafe fn calls(fs: &[usize]) {
+    for &f in fs {
+        unsafe { call(f) };
+    }
+}
+
+unsafe fn call_f(f: usize, v: f32) {
+    unsafe { call_regs(f, 0, 0, 0, 0, 0, &[v.to_bits()]) };
+}
+
+unsafe fn extra_hook() {
+    unsafe {
+        let f = rd(EXTRA_HOOK) as usize;
+        if f != 0 {
+            call(f);
+        }
+    }
+}
+
+unsafe fn qpc() {
+    unsafe {
+        if rb(QPC_ON) != 0 {
+            let mut t = 0u64;
+            let f: extern "system" fn(*mut u64) -> i32 = std::mem::transmute(import(IMP_QPC));
+            f(&mut t);
+        }
+    }
+}
+
+unsafe fn wake_workers(kind: u32) {
+    unsafe {
+        wd(WORKER_A as usize + 0x38, kind);
+        call_regs(JOB_WORKER_WAKE, 0, 0, 0, WORKER_A, 0, &[]);
+        wd(WORKER_B as usize + 0x38, kind);
+        call_regs(JOB_WORKER_WAKE, 0, 0, 0, WORKER_B, 0, &[]);
+    }
+}
+
+fn cutscene() -> bool {
+    unsafe { (rb(CUTSCENE_A) != 0 && rb(CUTSCENE_B) != 0) || rb(CUTSCENE_C) != 0 }
+}
+
+/// The calls run once early in the frame, and again late if the early run was skipped.
+unsafe fn cutscene_updates() {
+    unsafe {
+        calls(&[0x0049_32F0, 0x00A7_0B40, 0x00A5_5310, 0x00A6_6340]);
+        extra_hook();
+    }
+}
+
+extern "C" fn sim_frame_hook() {
+    if RUST_SIM {
+        sim_frame();
+    } else {
+        let f: extern "C" fn() = unsafe { std::mem::transmute(SIM_ORIGINAL.load(Ordering::Relaxed)) };
+        f();
+    }
+}
+
+static SIM_ORIGINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn sim_frame() {
+    unsafe {
+        let paused = rd(SIM_PAUSED) as i32 > 0;
+        let mut early_cutscene = false;
+        let (mut whole, mut section) = (0u32, 0u32);
+        profile_start(LABEL_SIM_A, &mut whole);
+        if !paused {
+            call(0x006C_6870);
+            if cutscene() {
+                early_cutscene = true;
+                call(0x0049_3260);
+                cutscene_updates();
+            }
+            calls(&[0x0054_3920, 0x0068_F4B0, 0x0093_D150]);
+        } else if rb(0x01F7_68DA) != 0 {
+            call(0x0068_F4B0);
+        }
+        call(0x00CD_DE70);
+        call_regs(0x006D_A350, 0, 0, 0, 0, 0, &[paused as u32]);
+
+        // Drop a pending item reference whose slot no longer matches.
+        let r = rd(0x00E9_DA40);
+        if r as u8 != 0xFF && r >> 8 != 0 {
+            let i = (r & 0xFF) as usize * 0x19C;
+            if rd(0x00EE_B9AC + i) != r >> 8 || rd(0x00EE_B8F8 + i) == u32::MAX {
+                wd(0x00E9_DA40, 0xFF);
+                call(0x0054_CCA0);
+            }
+        }
+        qpc();
+        calls(&[0x006B_7020, 0x0069_05E0, 0x0075_A120, 0x004F_5040, 0x006A_B6B0]);
+        match rd(0x00EA_AF84) {
+            1 => call(0x006A_B240),
+            2 => call(0x006A_B2D0),
+            _ => {}
+        }
+        qpc();
+        call(0x0076_5BB0);
+
+        if !paused {
+            profile_start(LABEL_SIM_B, &mut section);
+            call_regs(0x0068_A1E0, 0, 0, 0, 0, 0, &[rd(0x00E8_437C), 0, 1, 0]);
+            calls(&[
+                0x0068_A320, 0x0068_B860, 0x00A1_7690, 0x00A1_CCC0, 0x00A0_AFF0, 0x00A0_BF10, 0x00A6_C350,
+                0x00A5_8EE0, 0x0050_1FB0, 0x006A_5BB0, 0x007B_02E0, 0x0054_8260, 0x00A9_3FF0,
+            ]);
+            profile_stop(&mut section);
+            profile_start(LABEL_SIM_C, &mut section);
+            calls(&[0x0080_45F0, 0x0080_4850]);
+            if rb(0x0252_8B56) != 0 {
+                let a = rd(0x0252_A5F4);
+                wb(0x0252_8B2B, 0);
+                if a != 0 {
+                    wd(0x0252_A5EC, a);
+                }
+                calls(&[0x0080_45F0, 0x0080_4850]);
+                let a = rd(0x0252_A5F0);
+                wb(0x0252_8B2B, 1);
+                if a != 0 {
+                    wd(0x0252_A5EC, a);
+                }
+            }
+            let dt = call_f32(PHYSICS_FRAME_TIME);
+            calls(&[0x00B0_8530, 0x006A_DB10]);
+            call_f(0x009D_7F90, dt);
+            call_f(0x009A_7080, dt);
+            call(0x009A_7150);
+            wb(0x0252_9686, 0);
+            calls(&[0x009A_71B0, 0x0093_05F0, 0x0093_5820]);
+            wd(0x0252_970C, 5);
+            let host_only = rb(MP_ACTIVE) == 1 && rb(MP_CLIENT) == 0;
+            if !(host_only && rb(0x0252_9262) != 0) {
+                call(0x0043_7160);
+            }
+            if !host_only {
+                calls(&[0x0055_BA40, 0x0056_BD60, 0x004B_11F0, 0x0055_07C0, 0x009F_5420, 0x0065_5750]);
+                let o = rd(0x0140_928C);
+                if o != 0 && call_regs(vslot(o, 3), 0, o, 0, 0, 0, &[]) as u8 == 0 {
+                    let o = rd(0x0140_928C);
+                    call_regs(vslot(o, 2), 0, o, 0, 0, 0, &[]);
+                    wd(0x0140_928C, 0);
+                }
+                call(0x0054_2B00);
+            }
+            calls(&[0x0056_5DA0, 0x0060_3140, 0x00A9_5A30, 0x00AD_D120, 0x00AE_F510]);
+            // The original stops this marker twice.
+            profile_stop(&mut section);
+            profile_stop(&mut section);
+            profile_start(LABEL_SIM_D, &mut section);
+            calls(&[0x00AE_3A80, 0x0092_B3B0, 0x009F_A620, 0x0091_C6C0, 0x00B8_0070, 0x00B7_CA80, 0x009D_F820]);
+            wake_workers(4);
+            call(0x0055_4E20);
+            let dt = call_f32(PHYSICS_FRAME_TIME);
+            call_f(0x009A_9890, dt);
+            call(0x006F_A0E0);
+            call_regs(0x009A_9B60, 0, 0, 0, 0, 0, &[dt.to_bits(), 0]);
+            call(0x004C_2BF0);
+            wake_workers(3);
+            call_f(0x009A_9CE0, dt);
+            call(0x0071_B910);
+            profile_stop(&mut section);
+            profile_start(LABEL_SIM_E, &mut section);
+            calls(&[0x00A8_B400, 0x0095_A3D0, 0x00AE_3C60, 0x00B0_95D0]);
+            if rd(0x00EA_1020) == 2 {
+                call(0x0063_4350);
+            }
+            calls(&[
+                0x009A_7210, 0x0094_C0A0, 0x0068_8FE0, 0x00B7_2FD0, 0x004B_D790, 0x00B6_A4A0, 0x004D_1D50,
+                0x0093_0EC0, 0x009F_A670, 0x009F_F5A0, 0x00A5_E3E0, 0x0093_5B80, 0x0049_0940, 0x0048_9CC0,
+                0x004A_AC40, 0x004A_B140, 0x0091_93C0, 0x0055_85E0,
+            ]);
+            if !early_cutscene && !(rb(CUTSCENE_A) != 0 && rb(CUTSCENE_B) != 0) && rb(CUTSCENE_C) == 0 {
+                cutscene_updates();
+            }
+            profile_stop(&mut section);
+            profile_start(LABEL_SIM_F, &mut section);
+            calls(&[0x00B6_AD40, 0x004D_E770, 0x004D_6850, 0x004E_66A0, 0x004C_F840, 0x004C_A750, 0x0050_3AE0, 0x004C_BFC0]);
+
+            // Every ~2 s of game time (wrapping), clamp the local player's weapon ammo
+            // counters at 0 for the 9 slots.
+            let t = rd(0x00EA_ABD4) as i32;
+            let now = rd(0x00E8_43AC) as i32;
+            let recent = t >= 0
+                && if t > now { t.wrapping_sub(now) < 0x35A4_E900 } else { now.wrapping_sub(t) >= 0x35A4_E900 };
+            if !recent {
+                let mut v = now.wrapping_add(2000);
+                wd(0x00EA_ABD4, v as u32);
+                if v > 0x6B49_D200 {
+                    v -= 0x6B49_D200;
+                    wd(0x00EA_ABD4, v as u32);
+                }
+                let p = rd(LOCAL_PLAYER);
+                if p != 0 {
+                    for slot in 0..9u32 {
+                        let w = call_regs(0x0055_ADF0, p + 0x10C4, 0, 0, slot, 0, &[]) as usize;
+                        if w != 0 && rd(w + 0xC4) != 0 {
+                            for o in [0x10, 0x14, 0x18, 0x1C] {
+                                let a = rd(w + 0xC4) as usize + o;
+                                if (rd(a) as i32) < 0 {
+                                    wd(a, 0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let dt = call_f32(PHYSICS_FRAME_TIME);
+            call_f(0x0072_7610, dt);
+            calls(&[0x0095_5470, 0x0050_53B0, 0x0051_42A0, 0x0091_A840]);
+            if rb(CUTSCENE_A) == 0 || rb(rd(0x0252_7D10) as usize + 0xAFF) != 0 {
+                calls(&[0x0045_25E0, 0x0045_2820, 0x0045_3120]);
+            }
+            let mut focus = [0u32; 3];
+            let mut focus2 = [0u32; 3];
+            call_regs(0x009D_F4C0, focus.as_mut_ptr() as u32, 0, 0, 0, 0, &[focus2.as_mut_ptr() as u32]);
+            let free_camera = rd(CAMERA_MODE) == 0 && !(rb(CUTSCENE_A) != 0 && rb(CUTSCENE_B) != 0) && rb(CUTSCENE_C) == 0;
+            copy_dwords(0x02F9_B7E4, focus.as_ptr() as usize, 3);
+            copy_dwords(0x02F9_B7F0, focus2.as_ptr() as usize, 3);
+            wb(0x0213_B397, free_camera as u8);
+            calls(&[0x0092_6170, 0x004C_6CD0, 0x004C_35C0, 0x00D0_7B40, 0x004D_A880, 0x0092_D620, 0x009F_CF90, 0x00B8_2180]);
+            let a = call_regs(0x00D2_2790, 0, 0, 0, 0, 0, &[]) as usize;
+            let b = call_regs(0x00D2_2790, 0, 0, 0, 0, 0, &[]) as usize;
+            // Two 4x4 matrices by value: b + 0x44, then a + 0x84.
+            let mut m = [0u32; 32];
+            copy_dwords(m.as_mut_ptr() as usize, b + 0x44, 16);
+            copy_dwords(m.as_mut_ptr() as usize + 64, a + 0x84, 16);
+            call_regs(0x00B8_21E0, 0, 0, 0, 0, 0, &m);
+            profile_stop(&mut section);
+        }
+
+        if !(rb(MP_ACTIVE) == 1 && rb(MP_CLIENT) == 0) {
+            calls(&[0x006B_CC60, 0x0054_C220, 0x0068_7B40]);
+        }
+        call(0x0055_F1D0);
+        if rb(0x0252_863F) == 0 && rb(0x0252_8775) != 0 {
+            if call_regs(0x007F_7AD0, 0, 0, 0, 0, 0, &[]) as u8 == 0 {
+                wb(0x0252_8775, 0);
+            } else {
+                let a = rd(0x0252_8778);
+                if a == 0 {
+                    wb(0x0252_8775, 0);
+                } else {
+                    call_regs(0x007A_8F70, 0, 0, 0, 0, 0, &[a, rd(LOCAL_PLAYER)]);
+                }
+            }
+        }
+        if rd(0x0252_6CF8) != 0 {
+            call(0x004B_C420);
+        }
+        call(0x004C_4210);
+        call_regs(0x0091_E9F0, 0, 0, 0, 0, 0, &[CAMERA_POS as u32]);
+        calls(&[0x004D_9F20, 0x004C_2DD0, 0x0068_3E00]);
+        if rb(0x0252_88AE) != 0 {
+            let p = rd(LOCAL_PLAYER);
+            if call_regs(0x009E_99F0, 0, 0, 0, p, rd(p as usize + 0x13B0), &[]) as u8 != 0 {
+                call_regs(0x0092_6860, 0, p, 0, 0, 0, &[0, 1, 0]);
+                wb(0x0252_88AE, 0);
+            }
+        }
+        if rb(MP_ACTIVE) != 0 {
+            call(0x0083_6BB0);
+            let m = rd(0x0252_8C14) as usize;
+            if m != 0 {
+                let direct = rb(0x0252_8B56) != 0 && rb(0x0252_8B2B) == 0;
+                if direct || rb(m + 0x3F8) == 0 {
+                    let n = rd(m + 0x404) as usize;
+                    if n != 0 && rb(n + 0x1B8) == 0 && rb(0x01F7_68DA) != 0 {
+                        wb(0x01F7_68DA, 0);
+                    }
+                }
+            }
+        }
+        if rb(0x0252_73AC) != 0 {
+            call_regs(0x00D2_4B70, CAMERA_POS as u32, 0, 0, 0, 0, &[CAMERA_MATRIX as u32, rd(0x00DD_32B4)]);
+        } else {
+            let fov = call_f32(CAMERA_GET_FOV);
+            call_regs(0x00D2_4D80, CAMERA_POS as u32, 0, 0, 0, 0, &[CAMERA_MATRIX as u32, fov.to_bits(), 1, 0]);
+        }
+        calls(&[0x0079_3A40, 0x007F_3500]);
+        let _ = whole;
+    }
+}
+
 pub fn install() {
+    match unsafe { detour::install(SIM_FRAME, &SIM_FRAME_PROLOGUE, sim_frame_hook as extern "C" fn() as usize) } {
+        Ok(t) => {
+            SIM_ORIGINAL.store(t, Ordering::Relaxed);
+            log(&format!("frame: sim_frame @ 0x68ca70 hooked ({})", if RUST_SIM { "Rust body" } else { "original" }));
+        }
+        Err(e) => log(&format!("frame: hooking sim_frame failed: {e:?}")),
+    }
     match unsafe { detour::replace(STACK_DISPATCH, &STACK_DISPATCH_BODY, stack_dispatch as extern "C" fn(i32, u32) as usize) } {
         Ok(()) => log("frame: replaced game_state_stack_dispatch @ 0x697700 with Rust"),
         Err(e) => log(&format!("frame: replacing game_state_stack_dispatch failed: {e:?}")),
