@@ -23,7 +23,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 
 | | Calls | Rust | mapped | unmapped |
 |---|---|---|---|---|
-| all four functions | 204 | 5 | 176 | 23 |
+| all four functions | 204 | 5 | 192 | 7 |
 
 - `game_frame_tick` and `game_state_frame` are almost fully mapped. They are short call sequences, so their bodies can be ported as Rust skeletons now, calling the original functions by address.
 - `frame_end_handoff` is mapped except for two groups:
@@ -31,7 +31,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
   - the render snapshot helpers (0x6255A0, 0x46CCD0, 0xD08310, 0x51A4A0, 0xBE4170).
 
   It is the next skeleton to port. `render_thread_wait_frame` and the render-list swap are the parts that need care, because both threads touch them.
-- `sim_frame` is the large one: 144 calls, 16 of them still unmapped (after the naming rounds up to the item-4 commits). The remaining ones are small (under 0.3% reach) except 0x9A9CE0, 0x55BA40 and 0x4DA880; see "Sections :1c, :4 and :5". The unmapped calls with the largest reach are the next naming targets:
+- `sim_frame` is the large one: 144 calls; 7 of the frame-loop calls are still unmapped, listed in "The last unidentified frame-loop calls". The remaining ones are small (under 0.3% reach) except 0x9A9CE0, 0x55BA40 and 0x4DA880; see "Sections :1c, :4 and :5". The unmapped calls with the largest reach are the next naming targets:
   - **0x5053B0** (17.4%): now `effect_objects_do_frame`. It runs `effect_objects_budget_bodies` (Havok bodies for the 50 most important effect-object parts), then `effect_object_update` on each object.
   - **0x6A5BB0** (11.1%): now `mission_fail_flow_do_frame`. It switches on the failure reason 0x1450380 (doc 22) and handles fades, revive / teleport, `cutscene_play`, `mission_end` and the stronghold cancel dialog.
   - **0x93D150** (10.9%): now `world_spawn_do_frame` (spawn regions, spawn groups, traffic). It runs every frame; only with 0x2528B48 set and 0x2528B49 clear does it wait for 0xE96C00 >= 0xB first.
@@ -47,7 +47,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | simfr:1,2,3,4,5,6 | `string_crc32_lower` 0xBDC9B0 | mapped | 0.1% |  | 40 |
 | simfr:1,2,3,4,5,6 | `script_thread_create` 0xCE01E0 | mapped | 1.2% |  | 09 |
 | simfr:1,2,3,4,5,6 | `script_thread_resume` 0xCE0570 | mapped | 1.2% |  | 09 |
-| simfr:1,2,3,4,5,6 | — 0x699C90 | unmapped | 0.3% |  |  |
+| simfr:1,2,3,4,5,6 | `time_scale_restore_check` 0x699C90 | mapped | 0.3% |  | 40 |
 | simfr:1,2,3,4,5,6 | `input_do_frame` 0xC063D0 | Rust | 1.1% | 9 (input) |  |
 | simfr:1,2,3,4,5,6 | `vint_input_do_frame` 0xB99550 | mapped | 0.0% | 2 (input) | 06 |
 | simfr:1,2,3,4,5,6 | `player_controls_update` 0x4FE760 | mapped | 0.0% |  | 14, 19 |
@@ -56,10 +56,10 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | simfr:1,2,3,4,5,6 | `dialog_box_do_frame` 0x753AA0 | mapped | 0.7% |  | 40 |
 | simfr:1,2,3,4,5,6 | `game_pause_do_frame` 0x69B160 | mapped | 2.4% | 16 (gfx_cmd, render) | 40 |
 | simfr:1,2,3,4,5,6 | `frame_timer_update` 0xBF0710 | mapped | 0.0% |  | 11 |
-| simfr:1,2,3,4,5,6 | — 0x8217F0 | unmapped | 0.1% | 1 (mempool) |  |
-| simfr:1,2,3,4,5,6 | — 0x809640 | unmapped | 1.7% |  |  |
+| simfr:1,2,3,4,5,6 | `mp_session_heartbeat` 0x8217F0 | mapped | 0.1% | 1 (mempool) | 35, 40 |
+| simfr:1,2,3,4,5,6 | `net_do_frame` 0x809640 | mapped | 1.7% |  | 35, 40 |
 | simfr:1,2,3,4,5,6 | `profile_frame` 0x691430 | mapped | 1.0% | 2 (mempool) | 13 |
-| simfr:1,2,3,4,5,6 | — 0x69A440 | unmapped | 1.8% |  |  |
+| simfr:1,2,3,4,5,6 | `rich_presence_update` 0x69A440 | mapped | 1.8% |  | 35, 40 |
 | simfr:1,2,3,4,5,6 | **`game_state_frame`** (0x697780) | see below | | | |
 | sim-hand | **`frame_end_handoff`** (0x521A00) | see below | | | |
 
@@ -69,7 +69,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 |---|---|---|---|---|---|
 |  | `game_state_exit` 0x6973E0 | mapped | 5.3% | 35 (gfx_cmd, hddio, mempool, rsched, streamman) | 11 |
 |  | `game_state_apply` 0x697550 | mapped | 2.1% | 14 (gfx_cmd, hddio, mempool, streamman) | 11 |
-|  | — 0xB8A760 | unmapped | 0.1% |  |  |
+|  | `vint_documents_apply_aspect` 0xB8A760 | mapped | 0.1% |  | 06, 11, 40 |
 |  | `game_state_enter` 0x697330 | mapped | 0.0% |  | 11 |
 |  | `game_state_stack_dispatch` 0x697700 | Rust | 11.4% | 14 (gfx_cmd, mempool, streamman) | 40 |
 |  | `game_state_dispatch` 0x697490 | mapped | 20.8% | 50 (gfx_cmd, hddio, mempool, streamman) | 06 |
@@ -88,10 +88,10 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1,2,3 | `game_mode_do_frame` 0x68F4B0 | mapped | 2.7% | 2 (gfx_cmd) | 40 |
 | sim_frame:1,2,3 | `world_spawn_do_frame` 0x93D150 | mapped | 10.9% | 10 (rsched, streamman) | 40 |
 | sim_frame:1,2,3 | `script_do_frame` 0xCDDE70 | mapped | 0.4% |  | 09 |
-| sim_frame:1,2,3 | — 0x6DA350 | unmapped | 0.0% |  |  |
+| sim_frame:1,2,3 | `anim_rigs_release_unused` 0x6DA350 | mapped | 0.0% |  | 32, 40 |
 | sim_frame:1,2,3 | `wiretap_triggers_update` 0x54CCA0 | mapped | 0.7% |  | 22, 40 |
 | sim_frame:1,2,3 | `tutorial_do_frame` 0x6B7020 | mapped | 0.6% | 2 | 30, 40 |
-| sim_frame:1,2,3 | — 0x6905E0 | unmapped | 0.1% |  |  |
+| sim_frame:1,2,3 | `hud_notifications_update` 0x6905E0 | mapped | 0.1% |  | 28, 40 |
 | sim_frame:1,2,3 | `controller_disconnect_check` 0x75A120 | mapped | 0.9% | 10 (gfx_cmd) | 14, 40 |
 | sim_frame:1,2,3 | `input_context_do_frame` 0x4F5040 | mapped | 0.0% |  | 14 |
 | sim_frame:1,2,3 | — 0x6AB6B0 | unmapped | 0.0% |  |  |
@@ -100,7 +100,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1,2,3 | `gps_route_update` 0x765BB0 | mapped | 3.7% | 11 (gfx_cmd) | 40 |
 | sim_frame:1b | `game_clock_advance` 0x68A1E0 | mapped | 0.2% |  | 13, 40 |
 | sim_frame:1b | `net_send_periodic_status` 0x68A320 | mapped | 1.0% |  | 35, 40 |
-| sim_frame:1b | — 0x68B860 | unmapped | 0.2% | 2 (gfx_cmd) |  |
+| sim_frame:1b | `countdown_beeps_update` 0x68B860 | mapped | 0.2% | 2 (gfx_cmd) | 40 |
 | sim_frame:1b | `nav_timesliced_jobs_update` 0xA17690 | mapped | 1.7% |  | 21, 40 |
 | sim_frame:1b | `player_nav_node_update` 0xA1CCC0 | mapped | 2.4% |  | 21, 40 |
 | sim_frame:1b | `nav_detours_update` 0xA0AFF0 | mapped | 2.6% |  | 21, 40 |
@@ -109,9 +109,9 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1b | `restricted_zones_update` 0xA58EE0 | mapped | 2.0% |  | 21, 40 |
 | sim_frame:1b | `debug_city_plane_export_update` 0x501FB0 | mapped | 4.2% | 37 (gfx_cmd, hddio, streamman) | 40 |
 | sim_frame:1b | `mission_fail_flow_do_frame` 0x6A5BB0 | mapped | 11.1% | 18 (gfx_cmd, rsched, streamman) | 40 |
-| sim_frame:1b | — 0x7B02E0 | unmapped | 0.3% |  |  |
+| sim_frame:1b | `scheduled_world_events_update` 0x7B02E0 | mapped | 0.3% |  | 40 |
 | sim_frame:1b | `crib_stash_tutorial_nag` 0x548260 | mapped | 0.2% |  | 30 |
-| sim_frame:1b | — 0xA93FF0 | unmapped | 0.0% |  |  |
+| sim_frame:1b | `zone_watchers_update` 0xA93FF0 | mapped | 0.0% |  | 40 |
 | sim_frame:1c | `net_registered_objects_update` 0x8045F0 | mapped | 0.9% |  | 35, 40 |
 | sim_frame:1c | `net_remote_objects_do_frame` 0x804850 | mapped | 0.0% |  | 35, 40 |
 | sim_frame:1c | `physics_frame_time` 0x6FF860 | mapped | 0.1% |  | 17, 40 |
@@ -199,9 +199,9 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:6,7 | — 0x4DA880 | unmapped | 2.0% | 1 (mempool) |  |
 | sim_frame:6,7 | `object_effect_links_update` 0x92D620 | mapped | 1.5% |  | 33, 40 |
 | sim_frame:6,7 | `level_objects_near_camera_update` 0x9FCF90 | mapped | 4.0% | 3 | 40 |
-| sim_frame:6,7 | — 0xB82180 | unmapped | 0.1% |  |  |
+| sim_frame:6,7 | `iga_tick` 0xB82180 | mapped | 0.1% |  | 40 |
 | sim_frame:6,7 | `gfx_get_thread_state` 0xD22790 | mapped | 0.1% |  |  |
-| sim_frame:6,7 | — 0xB821E0 | unmapped | 0.1% |  |  |
+| sim_frame:6,7 | `iga_update_view` 0xB821E0 | mapped | 0.1% |  | 40 |
 | sim_frame:6,7 | `rewards_do_frame` 0x6BCC60 | mapped | 1.3% | 1 (rsched) | 30, 40 |
 | sim_frame:6,7 | `difficulty_set_message` 0x54C220 | mapped | 1.5% | 5 | 30 |
 | sim_frame:6,7 | `cheats_do_frame` 0x687B40 | mapped | 2.4% | 18 (gfx_cmd, rsched, streamman) | 38 |
@@ -213,8 +213,8 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:6,7 | `chunk_object_lists_update` 0x91E9F0 | mapped | 2.4% |  | 05, 40 |
 | sim_frame:6,7 | `world_lighting_update` 0x4D9F20 | mapped | 6.1% | 3 | 33, 40 |
 | sim_frame:6,7 | `render_param_volumes_update` 0x4C2DD0 | mapped | 1.0% |  | 33, 40 |
-| sim_frame:6,7 | — 0x683E00 | unmapped | 0.0% |  |  |
-| sim_frame:6,7 | — 0x9E99F0 | unmapped | 0.0% |  |  |
+| sim_frame:6,7 | `object_watch_list_prune` 0x683E00 | mapped | 0.0% |  | 40 |
+| sim_frame:6,7 | `human_assets_loaded` 0x9E99F0 | mapped | 0.0% |  | 15, 40 |
 | sim_frame:6,7 | `misc_packet_send_14` 0x926860 | mapped | 0.9% |  | 27 |
 | sim_frame:6,7 | `net_timed_callbacks_run` 0x836BB0 | mapped | 0.0% |  | 35, 40 |
 | sim_frame:6,7 | `gfx_view_set_hud` 0xD24B70 | mapped | 2.5% |  | 40 |
@@ -260,8 +260,8 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 |  | `matrix_orthonormalize` 0xBE4170 | mapped | 1.8% |  | 11 |
 |  | `sky_light_snapshot` 0x4D9A50 | mapped | 0.1% |  | 11 |
 |  | `world_shader_constants_update` 0xB77CA0 | mapped | 0.2% |  | 11 |
-|  | — 0x9B92E0 | unmapped | 0.1% |  |  |
-|  | — 0xAE28F0 | unmapped | 0.0% |  |  |
+|  | `human_entering_or_exiting_vehicle` 0x9B92E0 | mapped | 0.1% |  | 16, 40 |
+|  | `vehicle_from_handle` 0xAE28F0 | mapped | 0.0% |  | 16, 40 |
 |  | `vehicles_render_prepare` 0xAE1020 | mapped | 1.1% |  | 11 |
 |  | `render_lists_reset` 0x52E7C0 | mapped | 0.0% |  | 18 |
 |  | `game_render_func` 0x5250E0 | mapped | 11.0% | 5 (gfx_cmd) | 36 |
@@ -335,6 +335,22 @@ The heavy ones are `object_items_update`, `object_props_update`, `vehicle_intera
    - `0xE8EB88` == 1: replace with state 5 (gameplay), with the push / pop flags `0x140BBC9` / `0x140BBCA` = `0x2527E80`.
 
 **Port:** steps 1, 2, 4 and 5 are small and global-only, so this state can be a Rust function now. Keep the co-op wait (step 3) as calls in the same order. The device acquire / release pair there must stay balanced.
+
+## The last unidentified frame-loop calls
+
+After the naming rounds, these 7 calls are still unidentified. Each note gives what is known, for porting them as original calls:
+
+| Call | Where | What it does |
+|---|---|---|
+| 0x9A9CE0 | `sim_frame:4` | cdecl (f32 dt). When dt ≠ 0, calls 0x9A2B80 for each entry of 0x215E908 (links +0xB8) with +0xCC bit 0x200. |
+| 0x55BA40 | `sim_frame:1c` | Walks 0x2527514 indices (0x1409A08) into 0x78-byte records: a vehicle handle and a state machine. Calls `vehicle_ai_order_03`; 0x55BDB0 / 0x55BE80 send human packets 2 / 3. |
+| 0x5507C0 | `sim_frame:1c` | Three 20-minute timers (0x2797BD0[1..3]). When one fires and the count 0x1409AA8[i] < 5, calls 0x55BD10. It shares the counts with 0x55BA40, so the two are probably one spawn system. |
+| 0x4DA880 | `sim_frame:6,7` | Calls 0x4DAF70 for each entry of 0xF9E550. 0x4DAF70 checks an object's flags and distance and otherwise ends in `weather_set_stage_cmd`. |
+| 0x6AB6B0 | `sim_frame:1,2,3` | On pause (0x69B340) or a forced state (0x2527CB6 / 0xE8DD2B), counts 0xEAAF68 up or down once and dispatches on 0xEAAF84: 1 → 0x6AB240, 2 → 0x6AB2D0. |
+| 0x6AB240 | `sim_frame:1,2,3` | With a page object 0xEAAF90 in game mode 3: takes two menu actions (`input_action_take_repeat`) to step pages (0x6AB000 / 0x6AB090). |
+| 0x6AB2D0 | `sim_frame:1,2,3` | The same object's close / advance logic (0x6AB380). |
+
+The rest of the 23 are named in this round (see `functions.csv`).
 
 ## Suggested porting order
 
