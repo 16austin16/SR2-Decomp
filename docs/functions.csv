@@ -9234,7 +9234,7 @@ address,name,subsystem,status,notes
 0x00bfa930,thread_create,core,documented,"(proc, ...): CreateThread wrapper; starts the audio thread (10)"
 0x00481a00,xact_shutdown,audio,documented,"IXACT3Engine::ShutDown and Release (10)"
 0x00bf0710,frame_timer_update,app,documented,"(fixed, ?, step): QPC dt -> 0xE84380, clamped/time-scaled frame dt 0xE8437C, fixed-step sleep, 16-frame fps 0xE84388, game/real ms counters 0x252A3C8/0x252A3CC (11)"
-0x00521a00,frame_end_handoff,app,documented,"end of game_frame_tick: wait for the render thread, world streaming, gfx_present, audio job, render snapshot (camera, lighting), swap render lists 0x2305978/0x230597C, signal and wait for the render thread (11)"
+0x00521a00,frame_end_handoff,render,rust,"Rust (frame.rs): render snapshots (world or menu branch), render-list swap 0x2305978, device CS release, wake the render thread and wait for its ack / frame-done, display-change flags (11, 40)"
 0x00697550,game_state_apply,app,documented,"push / pop / replace on the state stack 0x144E760[0xE96B7C] from the pending state 0x144E75C (11)"
 0x006973e0,game_state_exit,app,documented,"EAX = state-1: exit handler (jump table 0x697458) (11)"
 0x00697330,game_state_enter,app,documented,"EAX = state-1: enter handler (jump table 0x6973A8) (11)"

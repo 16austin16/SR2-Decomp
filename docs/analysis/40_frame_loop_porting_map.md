@@ -271,7 +271,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 
 1. **Done (`crates/sr2-hook/src/frame.rs`).** **`game_frame_tick` as a Rust skeleton.** It makes 18 calls, 2 of them already Rust (`input_do_frame`, `mouse_update`). The rest are called through their addresses. This gives a Rust-owned frame without changing behaviour, and a place to add timing.
 2. **Done (`frame.rs`, with `game_state_stack_dispatch`).** **`game_state_frame`.** It makes 6 calls, all mapped (doc 11 / 06).
-3. **`frame_end_handoff`.** Port the handoff order and the snapshot copies (`render_snapshot_copy_view`, `render_snapshot_reset_scales`, `temp_batching_pool_*`). Keep the unmapped lighting block as original calls.
+3. **Done (`frame.rs`).** **`frame_end_handoff`.** Port the handoff order and the snapshot copies (`render_snapshot_copy_view`, `render_snapshot_reset_scales`, `temp_batching_pool_*`). Keep the unmapped lighting block as original calls.
 4. **`sim_frame`, by profiler section**, using the ones whose calls are best mapped:
    1. `sim_frame:4`: humans, physics, vehicles prepare;
    2. `sim_frame:5`: vehicles, humans post, projectiles;

@@ -21,7 +21,10 @@
 //!
 //! `game_state_frame` (0x697780) and `game_state_stack_dispatch` (0x697700) are Rust
 //! too (11_frame.md, "Game states"): the state stack, its transitions, and running the
-//! states. Each state's enter / exit / frame functions stay the game's.
+//! states. Each state's enter / exit / frame functions stay the game's. So is
+//! `frame_end_handoff` (0x521A00, 11_frame.md "frame_end_handoff at instruction level"):
+//! the render snapshots, the render-list swap and the sync with the render thread; its
+//! callees stay the game's.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -72,7 +75,6 @@ const SERVICES_8217F0: usize = 0x0082_17F0;
 const NETWORK_PUMP: usize = 0x0080_9640;
 const PROFILE_FRAME: usize = 0x0069_1430; // profile.dat / .bbsave saves
 const SERVICES_69A440: usize = 0x0069_A440;
-const FRAME_END_HANDOFF: usize = 0x0052_1A00;
 
 pub static FRAMES: AtomicU32 = AtomicU32::new(0);
 
@@ -166,7 +168,7 @@ pub fn game_frame_tick() -> i32 {
         // The original stops the same marker twice ("sim_frame" is never stopped).
         profile_stop(&mut sections);
         profile_start(LABEL_SIM_HAND, &mut hand);
-        call(FRAME_END_HANDOFF);
+        frame_end_handoff();
         profile_stop(&mut hand);
     }
     let _ = simfr;
@@ -243,6 +245,349 @@ extern "C" fn stack_dispatch(level: i32, _flag: u32) {
             stack_dispatch(level - 1, ((flags >> 1) & 1) as u32);
         }
         call_regs(STATE_DISPATCH, 0, 0, 0, s, 0, &[]);
+    }
+}
+
+// --- frame_end_handoff (0x521A00) ------------------------------------------------------------
+
+// The handoff to the render thread (11_frame.md, "frame_end_handoff at instruction level").
+const RENDER_THREAD_WAIT_FRAME: usize = 0x0052_2B80; // cdecl (u8 first)
+const FIRST_HANDOFF: usize = 0x00ED_4710; // u8
+const DISPLAY_CHANGE_REQUEST: usize = 0x0252_7383; // u8, compared with 0x2527382 at the end
+const RENDER_SYNC_PREV: usize = 0x0252_737E; // u8: last frame's 0x252737F
+const RENDER_SYNC: usize = 0x0252_737F; // u8: set = don't wait for the render thread's frame-done
+const RENDER_FRAME_DONE: usize = 0x0277_41AC; // u8, set by the render thread
+const RENDER_ACK: usize = 0x0277_419C; // u8, set by the render thread when it wakes
+const RENDER_BATCHES_BUILT: usize = 0x0277_41AD; // u8
+const RENDER_JOB: usize = 0x0277_4198; // -> job; vtable +0xC signals the render thread
+const HANDOFF_STARTED: usize = 0x0252_7363; // u8
+const HANDOFF_ACTIVE: usize = 0x0252_737D; // u8
+const GFX_DEVICE_ACQUIRE: usize = 0x00CF_BC00;
+const GFX_IN_HANDOFF: usize = 0x00E8_49DB; // u8
+const GFX_INVALIDATE_STATE: usize = 0x00D1_4950;
+const GFX_APPLY_GAMMA: usize = 0x00D1_4770;
+const GFX_SET_TINT: usize = 0x00D1_4700; // ESI = &rgb
+const STATE_STREAM_FRAME: usize = 0x0069_7740; // cdecl (level, flag)
+const GAMEPLAY_STREAMING_FRAME: usize = 0x0068_E410;
+const FRAME_PRESENT: usize = 0x0052_17E0;
+const AUDIO_UPDATE_VOICES: usize = 0x0046_55B0; // -> audio job or 0
+const AUDIO_JOB_TAG: u32 = 0x033D_6328;
+const AUDIO_JOB_POOL: usize = 0x00EC_5B98; // object; vtable +4 frees (job - 8)
+const TEMP_BATCHING_RELEASE: usize = 0x0052_1970;
+const TEMP_BATCHING_CREATE: usize = 0x0052_18D0;
+const SNAPSHOT_COPY_VIEW: usize = 0x0052_20B0; // EAX = view
+const SNAPSHOT_RESET_SCALES: usize = 0x0052_1870; // EAX = block
+const VIEW: usize = 0x00E9_D620; // the render snapshot of the camera
+const SCALES: usize = 0x00E9_D6D0;
+const WORLD_VISIBLE: usize = 0x00E9_4D3E; // u8
+
+const TOD_RANGE_ON: usize = 0x0252_6DC4; // u8
+const TOD_IN_RANGE: usize = 0x004D_9900; // cdecl (from, to) -> al
+const TOD_RANGE_FROM: usize = 0x0279_7784;
+const TOD_RANGE_TO: usize = 0x0279_7788;
+const TOD_RANGE_RESULT: usize = 0x00E8_49D0; // -1 / 0
+const TOD_UPDATES: [usize; 7] =
+    [0x004D_9DD0, 0x004D_4820, 0x004D_4F90, 0x004D_5470, 0x004D_5300, 0x004D_5670, 0x004E_69D0];
+const LIGHTING_SRC: usize = 0x0265_2C80; // 0x260 dwords copied for the render thread
+const LIGHTING_DST: usize = 0x0265_3600;
+const SNAPSHOT_6255A0_ON: usize = 0x027A_3F18; // u8
+const SNAPSHOTS_A: [usize; 3] = [0x0046_CCD0, 0x00D0_8310, 0x004C_7190]; // audio, decals, glares
+const GLARE_FLAG_SRC: usize = 0x0252_73F2; // u8
+const GLARE_FLAG_DST: usize = 0x0252_73F3;
+// water, render params publish / reset, 0x9FAA20
+const SNAPSHOTS_B: [usize; 4] = [0x0072_8AB0, 0x0051_A880, 0x0051_A4A0, 0x009F_AA20];
+const CAMERA_POS: usize = 0x025F_5B14; // vec3
+const CAMERA_MATRIX: usize = 0x025F_5B38; // 9 floats
+const CAMERA_GET_FOV: usize = 0x0049_4080; // -> st0
+const MATRIX_ORTHONORMALIZE: usize = 0x00BE_4170; // stdcall (&m)
+const SKY_LIGHT_SNAPSHOT: usize = 0x004D_9A50; // ESI / EDI / ECX / EDX = out
+const SNAPSHOT_B77CA0: usize = 0x00B7_7CA0;
+const CAMERA_MODE: usize = 0x025F_5AE8;
+const LOCAL_PLAYER: usize = 0x0217_03D4;
+const LISTENER_POS: usize = 0x0277_C9D0; // vec3
+const LISTENER_SCALE: usize = 0x00E9_896C; // f32
+const HUMAN_9B92E0: usize = 0x009B_92E0; // EAX = human -> al
+const OBJECT_AE28F0: usize = 0x00AE_28F0; // ECX = object -> eax
+// 0xAE1020, render_lists_reset, game_render_func, game_build_render_batches
+const AFTER_SNAPSHOTS: [usize; 4] = [0x00AE_1020, 0x0052_E7C0, 0x0052_50E0, 0x0052_2FC0];
+const MENU_CAMERA_POS: usize = 0x0252_A6D0;
+const MENU_CAMERA_MATRIX: usize = 0x00EC_5AE4;
+const MENU_COLOURS: usize = 0x0252_A6F0; // 4 floats
+const MENU_SKY: usize = 0x00EC_5ACC; // vec3
+
+const RENDER_LISTS: usize = 0x0230_5978; // two list pointers, swapped each frame
+const DEVICE_CS: u32 = 0x033D_62D0;
+const DEVICE_THREAD: usize = 0x0252_A370;
+const DEVICE_LOCKS: usize = 0x0252_A368;
+const DEVICE_OWNER: usize = 0x0252_A374;
+const IMP_GET_CURRENT_THREAD_ID: usize = 0x00DB_8080;
+const IMP_LEAVE_CRITICAL_SECTION: usize = 0x00DB_80D0;
+const IMP_SLEEP: usize = 0x00DB_80B8;
+
+unsafe fn vb(p: usize) -> u8 {
+    unsafe { std::ptr::read_volatile(p as *const u8) }
+}
+
+unsafe fn wb(p: usize, v: u8) {
+    unsafe { std::ptr::write_volatile(p as *mut u8, v) }
+}
+
+unsafe fn wd(p: usize, v: u32) {
+    unsafe { *(p as *mut u32) = v }
+}
+
+unsafe fn copy_dwords(dst: usize, src: usize, n: usize) {
+    unsafe { std::ptr::copy(src as *const u32, dst as *mut u32, n) }
+}
+
+unsafe fn import(slot: usize) -> usize {
+    unsafe { rd(slot) as usize }
+}
+
+unsafe fn vslot(obj: u32, slot: usize) -> usize {
+    unsafe { rd(rd(obj as usize) as usize + slot * 4) as usize }
+}
+
+/// `camera_get_fov`, which returns on the x87 stack.
+unsafe fn camera_fov() -> f32 {
+    let mut out = 0f32;
+    unsafe {
+        std::arch::asm!(
+            "push edi",
+            "call {f}",
+            "pop edi",
+            "fstp dword ptr [edi]",
+            f = in(reg) CAMERA_GET_FOV,
+            in("edi") &mut out as *mut f32,
+            clobber_abi("C"),
+        );
+    }
+    out
+}
+
+/// The render-snapshot fields both branches fill from the same places.
+unsafe fn snapshot_common() {
+    unsafe {
+        wd(0xE9D67C, rd(0x0252_73A0));
+        wd(0xE9D680, rd(0x00E9_8964));
+        wd(0xE9D684, rd(0x00E9_8968));
+        for (dst, src) in [
+            (0xE9D664, 0xE9D7C8),
+            (0xE9D668, 0xE9D7CC),
+            (0xE9D66C, 0xE9D7D0),
+            (0xE9D670, 0xE9D7D4),
+            (0xE9D674, 0xE9D7D8),
+            (0xE9D678, 0xE9D7DC),
+        ] {
+            wd(dst, rd(src));
+        }
+        wb(0xE9D68E, rb(0x00E9_96E5));
+        wd(0xE9D688, rd(0x0252_A3C8));
+        wb(0xE9D68C, 1);
+    }
+}
+
+/// The world is drawn: time of day, the per-system render snapshots, the camera and
+/// listener, then the render lists are built.
+unsafe fn handoff_world() {
+    unsafe {
+        if rb(TOD_RANGE_ON) != 0 {
+            let r = call_regs(TOD_IN_RANGE, 0, 0, 0, 0, 0, &[rd(TOD_RANGE_FROM), rd(TOD_RANGE_TO)]) as u8;
+            wd(TOD_RANGE_RESULT, if r != 0 { u32::MAX } else { 0 });
+        }
+        for f in TOD_UPDATES {
+            call(f);
+        }
+        copy_dwords(LIGHTING_DST, LIGHTING_SRC, 0x260);
+        if rb(SNAPSHOT_6255A0_ON) != 0 {
+            call(0x0062_55A0);
+        }
+        for f in SNAPSHOTS_A {
+            call(f);
+        }
+        wb(GLARE_FLAG_DST, rb(GLARE_FLAG_SRC));
+        for f in SNAPSHOTS_B {
+            call(f);
+        }
+        copy_dwords(VIEW, CAMERA_POS, 3);
+        copy_dwords(VIEW + 0xC, CAMERA_MATRIX, 9);
+        let fov = camera_fov();
+        // The original pushes the matrix before this store and calls after it.
+        *((VIEW + 0x30) as *mut f32) = fov;
+        call_regs(MATRIX_ORTHONORMALIZE, 0, 0, 0, 0, 0, &[(VIEW + 0xC) as u32]);
+        snapshot_common();
+        call_regs(SKY_LIGHT_SNAPSHOT, 0, 0xE9D6B0, 0xE9D6C0, 0xE9D690, 0xE9D69C, &[]);
+        call(SNAPSHOT_B77CA0);
+
+        let scale_bits;
+        if rd(CAMERA_MODE) == 1 {
+            copy_dwords(LISTENER_POS, CAMERA_POS, 3);
+            scale_bits = rd(0x00DD_0550);
+        } else {
+            let h = rd(LOCAL_PLAYER) as usize;
+            if h == 0 {
+                copy_dwords(LISTENER_POS, MENU_CAMERA_POS, 3);
+                scale_bits = 1f32.to_bits();
+            } else {
+                copy_dwords(LISTENER_POS, h + 0x14, 3);
+                let vehicle = rd(h + 0x44);
+                let mut near = false;
+                if vehicle != 0 {
+                    let c = rd(0x00EB_CE9C) as usize;
+                    let st = rd(0x00EB_CEA0);
+                    let check = c == 0 || vehicle != rd(c + 0x44) || st == 7 || st == 8;
+                    near = check
+                        && call_regs(HUMAN_9B92E0, h as u32, 0, 0, 0, 0, &[]) as u8 == 0
+                        && call_regs(OBJECT_AE28F0, 0, rd(h + 0xD74), 0, 0, 0, &[]) != 0;
+                }
+                scale_bits = rd(if near { 0x00DD_0678 } else { 0x00DD_0794 });
+            }
+        }
+        wd(LISTENER_SCALE, scale_bits);
+        for f in AFTER_SNAPSHOTS {
+            call(f);
+        }
+    }
+}
+
+/// No world (menus, loading): a fixed camera and colours.
+unsafe fn handoff_menu() {
+    unsafe {
+        copy_dwords(VIEW, MENU_CAMERA_POS, 3);
+        copy_dwords(VIEW + 0xC, MENU_CAMERA_MATRIX, 9);
+        wd(VIEW + 0x30, rd(0x00DD_3448));
+        snapshot_common();
+        copy_dwords(0xE9D6B0, MENU_COLOURS, 4);
+        copy_dwords(0xE9D6C0, MENU_COLOURS, 3);
+        wd(0xE9D6CC, rd(MENU_COLOURS + 0xC));
+        copy_dwords(0xE9D690, MENU_SKY, 3);
+        copy_dwords(0xE9D69C, MENU_SKY, 3);
+    }
+}
+
+/// `frame_end_handoff`: finish the game thread's frame and hand it to the render thread.
+fn frame_end_handoff() {
+    unsafe {
+        let first = rb(FIRST_HANDOFF);
+        wb(DISPLAY_CHANGE_REQUEST, 0);
+        call_regs(RENDER_THREAD_WAIT_FRAME, 0, 0, 0, 0, 0, &[first as u32]);
+        wb(FIRST_HANDOFF, 0);
+        if rb(RENDER_SYNC_PREV) != 0 && rb(RENDER_SYNC) == 0 {
+            // A busy spin, as in the original.
+            while vb(RENDER_FRAME_DONE) == 0 {}
+            wb(RENDER_FRAME_DONE, 0);
+        }
+        wb(HANDOFF_STARTED, 1);
+        wb(RENDER_SYNC_PREV, rb(RENDER_SYNC));
+        call(GFX_DEVICE_ACQUIRE);
+        wb(GFX_IN_HANDOFF, 1);
+        call(GFX_INVALIDATE_STATE);
+        call(GFX_APPLY_GAMMA);
+        let white = [1f32; 3];
+        call_regs(GFX_SET_TINT, 0, 0, 0, white.as_ptr() as u32, 0, &[]);
+
+        let depth = rd(STATE_DEPTH) as i32;
+        let top = stack(depth);
+        let flags = rb(STATE_FLAGS + top as usize);
+        if flags & 1 != 0 && depth > 0 {
+            call_regs(STATE_STREAM_FRAME, 0, 0, 0, 0, 0, &[(depth - 1) as u32, ((flags >> 1) & 1) as u32]);
+        }
+        if top == 5 {
+            call(GAMEPLAY_STREAMING_FRAME);
+        }
+        call(FRAME_PRESENT);
+
+        let depth = rd(STATE_DEPTH) as i32;
+        let gameplay = (if depth > -1 { stack(depth) } else { 0 }) == 5;
+        let job = if gameplay { call_regs(AUDIO_UPDATE_VOICES, 0, 0, 0, 0, 0, &[]) as usize } else { 0 };
+        wb(HANDOFF_ACTIVE, 1);
+        wb(RENDER_BATCHES_BUILT, 0);
+        call(TEMP_BATCHING_RELEASE);
+        call(TEMP_BATCHING_CREATE);
+        call_regs(SNAPSHOT_COPY_VIEW, VIEW as u32, 0, 0, 0, 0, &[]);
+        call_regs(SNAPSHOT_RESET_SCALES, SCALES as u32, 0, 0, 0, 0, &[]);
+        if rb(WORLD_VISIBLE) != 0 {
+            handoff_world();
+        } else {
+            handoff_menu();
+        }
+
+        // Swap the render lists; the render thread executes the one now in [0x2305978].
+        let skip_present = rb(0x0252_7D14);
+        let (a, b) = (rd(RENDER_LISTS), rd(RENDER_LISTS + 4));
+        wd(RENDER_LISTS + 4, a);
+        wd(RENDER_LISTS, b);
+        wd(a as usize + 0x5DC0, 0);
+        wd(a as usize + 0x1_C5C4, 0);
+        wb(HANDOFF_ACTIVE, 0);
+        let busy = (skip_present != 0 && rb(0x0252_7CF7) != 0) || rb(0x0252_7D15) != 0;
+        wb(0x00E9_4D37, (!busy) as u8);
+
+        if gameplay && job != 0 {
+            wd(job + 0x34, AUDIO_JOB_TAG);
+            call_regs(vslot(job as u32, 4), 0, job as u32, 0, 0, 0, &[]);
+            wd(job + 4, 0);
+            wb(job + 8, 0);
+            wd(job + 0x34, 0);
+            wb(job + 9, 0);
+            wd(job + 0x3C, 0);
+            wd(job + 0x40, 0);
+            wd(job + 0x44, 0);
+            call_regs(vslot(AUDIO_JOB_POOL as u32, 1), 0, AUDIO_JOB_POOL as u32, 0, 0, 0, &[(job - 8) as u32]);
+        }
+        wb(GFX_IN_HANDOFF, 0);
+        call(GFX_INVALIDATE_STATE);
+
+        // Release the device lock before waking the render thread, or it blocks on it.
+        let tid: extern "system" fn() -> u32 = std::mem::transmute(import(IMP_GET_CURRENT_THREAD_ID));
+        if tid() != rd(DEVICE_THREAD) {
+            let n = rd(DEVICE_LOCKS).wrapping_sub(1);
+            wd(DEVICE_LOCKS, n);
+            if n == 0 {
+                wd(DEVICE_OWNER, 0);
+                let leave: extern "system" fn(u32) = std::mem::transmute(import(IMP_LEAVE_CRITICAL_SECTION));
+                leave(DEVICE_CS);
+            }
+        }
+        let job = rd(RENDER_JOB);
+        call_regs(vslot(job, 3), 0, job, 0, 0, 0, &[]);
+        let sleep: extern "system" fn(u32) = std::mem::transmute(import(IMP_SLEEP));
+        while vb(RENDER_ACK) == 0 {
+            sleep(1);
+        }
+        wb(RENDER_ACK, 0);
+        if rb(RENDER_SYNC_PREV) == 0 {
+            while vb(RENDER_FRAME_DONE) == 0 {
+                sleep(1);
+            }
+            wb(RENDER_FRAME_DONE, 0);
+        }
+
+        // A display change requested this frame (0xE98948 / 0xE98994).
+        let req = vb(DISPLAY_CHANGE_REQUEST);
+        if rb(0x0252_7382) != req {
+            if req != 0 {
+                if rd(0x00E9_8948) == 2 {
+                    wb(0x0252_7381, 1);
+                    wd(0x00E9_89D8, 2);
+                    wd(0x00E9_8948, 1);
+                }
+                let e = rd(0x00E9_8994);
+                if e == 2 || e == 1 {
+                    wb(0x0252_7380, 1);
+                }
+            } else {
+                if rb(0x0252_7381) != 0 {
+                    let v = rd(0x00E9_89D8);
+                    wb(0x0252_7381, 0);
+                    wd(0x00E9_8948, v);
+                }
+                if rb(0x0252_7380) != 0 {
+                    wb(0x0252_7380, 0);
+                }
+            }
+            wb(0x0252_7382, req);
+        }
     }
 }
 
