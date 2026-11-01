@@ -27,4 +27,8 @@ resolution = desktop      # desktop, or WIDTHxHEIGHT such as 2560x1440
 
 At load the DLL makes the process DPI-aware and writes the resolution and fullscreen flag into `settings.dat` before the game reads it (backup: `settings.dat.bak`), since the game only picks its 4:3 or widescreen UI at boot. Borderless is windowed mode with the window restyled to a bare popup covering the screen. Changing the resolution in the game's own options is overridden at the next start while `display` is not `game`. Code: crates/sr2-hook/src/display.rs.
 
+## Game exe: large-address-aware (4 GB)
+
+The game folder's `SR2_pc.exe` is our DRM-stripped `bin/SR2_pc.unpacked.exe` (made by `tools/unsteamstub21.py`) with the large-address-aware flag set, so the game gets 4 GB of address space instead of 2 (it uses about 1.76 GB in the city; the hook log shows `memory: X of Y MB`). Setting the flag on the Steam exe does not work: SteamStub rejects the modified file. The original is `SR2_pc.exe.bak` next to it (sha256 e20156a0…); copy it back to undo. A Steam "verify files" also restores it.
+
 Disassembly helpers in `tools/`: `x86dis.py <hexaddr> <hexlen>`, `xrefs.py <hexaddr>...`, `check_prologues.py` (checks the mempool detour prologues), `cmp_fileopen.py` (compares per-call log results between two runs). They need `pip install --user capstone` and must run without `-I`.
