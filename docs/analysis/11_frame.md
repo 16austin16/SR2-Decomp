@@ -640,6 +640,55 @@ Saves `ESI`. It ends with a **tail jump** to `interface_render`.
 - The re-reads of the overlay count and slots, because an overlay can hide itself during update or render.
 - `overlays_render`'s second loop starting at 0.
 
+## frontend_render and interface_render at instruction level
+
+### `frontend_render` (0x73CCF0)
+
+Frame `sub esp, 8`; saves `EBX` (`EBX` = 0 from step 3 on). `frontend_state_frame` brackets the whole call with `[0x252A2A2]` = 1 / 0.
+
+1. **Video and device.** If `[0x2527EA0]` == 1:
+   1. `video_frame()`;
+   2. `[0xE849DB]` = 1 (the game thread's 2D bracket; the render thread then skips `render_deferred_queue(2)`);
+   3. `gfx_invalidate_render_state_block()`, `gfx_device_acquire()`.
+2. `screen_fade_apply()`.
+3. **Fade fill.**
+   1. alpha = `_ftol2(f32(fade [0x2526DA0] × 255.0))`. The double 255.0 is at 0xE5C038, and the product goes through `[esp+8]`, so it is rounded to f32 first.
+   2. `gfx_set_color(cdecl 0, 0, 0, alpha)`.
+   3. `im2d_fill_rect(cdecl 0, 0, width [0x22FDC1C], height [0x22FDC20], 0xEC2740)`. One `add esp, 0x24` cleans both calls.
+4. **Cached sampler states** for sampler 0, written inline into the command ring at `[0x33D62F8]` (16-byte records, opcode 0x13 = `SetSamplerState`, doc 07). Each is written only when its cache differs, then the cache is updated:
+
+   | Cache | Value | Record | Meaning |
+   |---|---|---|---|
+   | `0x22F530C` | 1 | `{0x13, 0, 7, 1}` | mip filter = point |
+   | `0x22F5304` | 2 | `{0x13, 0, 5, 2}` | mag filter = linear |
+   | `0x22F5308` | 2 | `{0x13, 0, 6, 2}` | min filter = linear |
+
+   The ring pointer advances 0x10 after each record. There is **no bounds check**, as for every ring writer.
+5. `interface_render()`.
+6. The screen-state render callback: cb = `[0xE8E8A0 + [0x2527F10] × 0x10 + 0xC]`; if set, `cb(cdecl f32 1.0)` (1.0 is pushed via `push ecx` / `fld1` / `fstp [esp]`).
+7. `overlays_render()`.
+8. If `[0x2527EA0]` == 1:
+   1. `[0xE849DB]` = 0; `gfx_invalidate_render_state_block()`;
+   2. release the device (inline): unless the caller is thread `[0x252A370]`, decrement `[0x252A368]`; at 0, set `[0x252A374]` = 0 and `LeaveCriticalSection(0x33D62D0)`.
+
+### `interface_render` (0x7F33B0)
+
+`push ecx` (temporary); no arguments.
+
+1. If the screen state `[0xE8CF80]` ≤ 0x14 and `[0xE8CF94 + state × 0x10]` is set: call it (no arguments).
+2. Copy 8 bytes `0xEC2740` → `0x2A14B28` (the 2D render-state block header).
+3. `[0xE8C548]` = 1; `[0x2528B14]` = 0; the colour bytes `0xEB15BC..BF` = 0xFF.
+4. `gfx_set_render_state_block(ECX = 0xEC2740)`.
+5. `gfx_set_color(cdecl [0xEB15BC], [0xEB15BD], [0xEB15BE], [0xEB15BF])` (zero-extended bytes, so white).
+6. `vint_render_documents()` (0xB8BD40).
+
+**Port:**
+- `interface_render` is a straight sequence.
+- In `frontend_render`, keep these:
+  - the `0xE849DB` bracket and the device acquire / release, only when `0x2527EA0` == 1;
+  - the f32 rounding of the alpha;
+  - the three cached sampler writes (or call the ring writer that produces them).
+
 ## Open
 
 - The exact identity of most unnamed sim_frame calls (the lists above give the order).
