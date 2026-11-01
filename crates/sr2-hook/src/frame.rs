@@ -1758,7 +1758,69 @@ keep_ecx_edx!(overlays_update_thunk, overlays_update);
 keep_ecx_edx!(overlays_render_thunk, overlays_render);
 keep_ecx_edx!(interface_render_thunk, interface_render);
 
+// --- gameplay_ui_frame (0x68D2F0) ----------------------------------------------------------------
+
+// 11_frame.md, "game_state_dispatch, overlays and the gameplay UI": sun flare, screen flash,
+// screen fade, world text, the HUD pre-render, then hud_render. With the debug flag 0x2527B9D set
+// (and a local player) the original first draws a debug rectangle; that case runs the original
+// through its trampoline so it stays exact.
+const GAMEPLAY_UI_FRAME: usize = 0x0068_D2F0;
+const GAMEPLAY_UI_FRAME_PROLOGUE: [u8; 10] = [0x83, 0xEC, 0x3C, 0x80, 0x3D, 0x9D, 0x7B, 0x52, 0x02, 0x00];
+static UI_FRAME_ORIGINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn gameplay_ui_frame() {
+    unsafe {
+        if rb(0x0252_7B9D) != 0 && rd(LOCAL_PLAYER) != 0 {
+            let f: extern "C" fn() = std::mem::transmute(UI_FRAME_ORIGINAL.load(Ordering::Relaxed));
+            return f();
+        }
+        // sun_flare_render, screen_flash_render, screen_fade_apply, world_text_render, hud_pre_render
+        calls(&[0x004D_6BF0, 0x004D_0E80, 0x004D_1790, 0x0092_D7B0, 0x0079_3BB0]);
+        call(HUD_RENDER);
+    }
+}
+
+fn install_ui_frame() {
+    match unsafe { detour::install(GAMEPLAY_UI_FRAME, &GAMEPLAY_UI_FRAME_PROLOGUE, gameplay_ui_frame as extern "C" fn() as usize) } {
+        Ok(t) => {
+            UI_FRAME_ORIGINAL.store(t, Ordering::Relaxed);
+            log("frame: gameplay_ui_frame @ 0x68d2f0 hooked (Rust, debug path to the original)");
+        }
+        Err(e) => log(&format!("frame: hooking gameplay_ui_frame failed: {e:?}")),
+    }
+}
+
+// --- humans_update_all (0x9D7F90) ----------------------------------------------------------------
+
+// sim_frame:1c: every human on the list 0x217043C (next at +0x1294, shape B) gets
+// human_update(cdecl human, f32 dt) (0x9D6D60).
+const HUMANS_UPDATE_ALL: usize = 0x009D_7F90;
+
+extern "C" fn humans_update_all(dt: f32) {
+    unsafe { walk_b(HUMANS, 0x1294, |h| _ = call_regs(0x009D_6D60, 0, 0, 0, 0, 0, &[h, dt.to_bits()])) };
+}
+
+#[unsafe(naked)]
+extern "C" fn humans_update_all_thunk() {
+    std::arch::naked_asm!(
+        "push ecx",
+        "push edx",
+        "push dword ptr [esp + 12]",
+        "call {f}",
+        "add esp, 4",
+        "pop edx",
+        "pop ecx",
+        "ret",
+        f = sym humans_update_all,
+    )
+}
+
 pub fn install() {
+    match unsafe { detour::replace(HUMANS_UPDATE_ALL, &HUMANS_UPDATE_ALL_BODY, humans_update_all_thunk as extern "C" fn() as usize) } {
+        Ok(()) => log("frame: replaced humans_update_all @ 0x9d7f90 with Rust"),
+        Err(e) => log(&format!("frame: replacing humans_update_all failed: {e:?}")),
+    }
+    install_ui_frame();
     match unsafe { detour::replace(INTERFACE_RENDER, &INTERFACE_RENDER_BODY, interface_render_thunk as extern "C" fn() as usize) } {
         Ok(()) => log("frame: replaced interface_render @ 0x7f33b0 with Rust"),
         Err(e) => log(&format!("frame: replacing interface_render failed: {e:?}")),
@@ -2092,4 +2154,11 @@ const INTERFACE_RENDER_BODY: [u8; 147] = [
     0xEB, 0x00, 0x0F, 0xB6, 0x0D, 0xBD, 0x15, 0xEB, 0x00, 0x52, 0x0F, 0xB6, 0x15, 0xBC, 0x15, 0xEB,
     0x00, 0x50, 0x51, 0x52, 0xE8, 0x07, 0x14, 0x52, 0x00, 0x83, 0xC4, 0x10, 0xE8, 0xFF, 0x88, 0x39,
     0x00, 0x59, 0xC3,
+];
+
+const HUMANS_UPDATE_ALL_BODY: [u8; 50] = [
+    0x51, 0x56, 0x8B, 0x35, 0x3C, 0x04, 0x17, 0x02, 0x85, 0xF6, 0x74, 0x23, 0xD9, 0x44, 0x24, 0x0C,
+    0x51, 0xD9, 0x1C, 0x24, 0x56, 0xE8, 0xB6, 0xED, 0xFF, 0xFF, 0x8B, 0xB6, 0x94, 0x12, 0x00, 0x00,
+    0x83, 0xC4, 0x08, 0x3B, 0x35, 0x3C, 0x04, 0x17, 0x02, 0x74, 0x04, 0x85, 0xF6, 0x75, 0xDD, 0x5E,
+    0x59, 0xC3,
 ];
