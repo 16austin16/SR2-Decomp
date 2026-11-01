@@ -38,7 +38,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
   - **0x9D7F90** (10.5%): calls 0x9D6D60 for every human on the list 0x217043C (links +0x1294). 0x9D6D60 holds `COOP_REVIVAL_PENDING`.
   - **0xB7CA80** (7.5%), **0x4CF840** (7.5%), **0xA6C350** (6.9%), **0x4D9F20** (6.1%), **0x9DF4C0** (6.0%), **0x437160** (5.9%, a fixed list of 17 updates in 0x408E90..0x45EBE0).
 
-### `game_frame_tick` (0x520450)
+### `game_frame_tick` (0x520450), Rust (`frame.rs`)
 
 | Profiler section | Call | Status | Reach | Rust below | Doc |
 |---|---|---|---|---|---|
@@ -61,7 +61,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | simfr:1,2,3,4,5,6 | **`game_state_frame`** (0x697780) | see below | | | |
 | sim-hand | **`frame_end_handoff`** (0x521A00) | see below | | | |
 
-### `game_state_frame` (0x697780)
+### `game_state_frame` (0x697780), Rust (`frame.rs`)
 
 | Profiler section | Call | Status | Reach | Rust below | Doc |
 |---|---|---|---|---|---|
@@ -69,7 +69,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 |  | `game_state_apply` 0x697550 | mapped | 2.1% | 14 (gfx_cmd, hddio, mempool, streamman) | 11 |
 |  | — 0xB8A760 | unmapped | 0.1% |  |  |
 |  | `game_state_enter` 0x697330 | mapped | 0.0% |  | 11 |
-|  | `game_state_stack_dispatch` 0x697700 | mapped | 11.4% | 14 (gfx_cmd, mempool, streamman) | 40 |
+|  | `game_state_stack_dispatch` 0x697700 | Rust | 11.4% | 14 (gfx_cmd, mempool, streamman) | 40 |
 |  | `game_state_dispatch` 0x697490 | mapped | 20.8% | 50 (gfx_cmd, hddio, mempool, streamman) | 06 |
 
 ### `sim_frame` (0x68CA70)
