@@ -352,6 +352,49 @@ After the naming rounds, these 7 calls are still unidentified. Each note gives w
 
 The rest of the 23 are named in this round (see `functions.csv`).
 
+## Ten list-walkers at instruction level (ready to port)
+
+None of the ten takes an argument or returns a value, and none touches the FPU. Two loop shapes recur, and each walker below uses one of them:
+
+```text
+// Shape A: next computed before the body, against the head read at that moment
+n = [HEAD]
+while n != 0:
+    link = [n + LINK]
+    next = (link != [HEAD]) ? link : 0     // sub / neg / sbb / and
+    body(n)
+    n = next
+
+// Shape B: next read after the body, compared with the live head
+n = [HEAD]
+if n != 0:
+    do { body(n); n = [n + LINK] } while n != [HEAD] && n != 0
+```
+
+With shape A the body may free the node. With shape B it must not.
+
+| Walker | Head | Shape, link | Body |
+|---|---|---|---|
+| `ambulances_update` 0xA95A30 | `[0x2FA8D3C]` (pool 0x2FA8D30 +0xC) | A, +0x14 | `ok = ambulance_update(cdecl n)` (AL); if 0: `ambulance_pool_free(ESI = n, EDI = 0x2FA8D30)` |
+| `meter_maids_update` 0xADD120 | `[0x2FACF84]` (pool 0x2FACF78 +0xC) | A, +0x14 | `meter_maid_update(cdecl n)`; if 0: `meter_maid_pool_free(ESI = n, EDI = 0x2FACF78)` |
+| `taxis_update` 0xAEF510 | `[0x3137C04]` (pool 0x3137BF8 +0xC) | A, +0x18 | `taxi_update(cdecl n)`; if 0: `taxi_pool_free(ESI = n, EDI = 0x3137BF8)` |
+| `weapon_effects_update` 0xB6A4A0 | `[0x22D7B58]` | A, +0x70 | `weapon_effect_update(cdecl n)`; if 0: `weapon_effect_free(EAX = n)` |
+| `searchlights_update` 0x955470 | `[0x215E0C0]` | A, +0xB4 | `searchlight_update(EAX = n)`: register argument, no push |
+| `debris_do_frame` 0x92B3B0 | `[0x2529604]` | A, +0xB4 | first `debris_pre_update()` once, before the loop; per node: if byte `[n+0xC0]` & 2, `n->vtbl[+0x10](0)` (thiscall, `ECX` = n, one stack argument, callee cleans) |
+| `trigger_objects_reap` 0xA70B40 | `[0x2F9B18C]` | A, +0xBC | if `n->vtbl[+0x34]()` (thiscall) returns `EAX` == 0: `trigger_object_remove(cdecl n)` |
+| `object_props_post_update` 0x935B80 | `[0x215D798]` | B, +0xB4 | if byte `[n+0x120]` & 0x20 is clear: `object_prop_post_update(n)`, **stdcall (`ret 4`)**: the caller does not pop |
+| `detour_hull_objects_update` 0x9193C0 | `[0x2143ED4]` | B, +4 | `detour_hull_object_update(cdecl n)` |
+| `vehicle_interaction_riders_update` 0xB095D0 | array `0x31492B8`, 32 records of 0xC84 (end 0x3162338) | not a list | for each record with dword +0 ≠ 0, for rider i = 0..7: handle = `[rec + 0x34C + i × 0xA8]`. If it resolves to a live human (handle table `0x2149C64[(h & 0xFFF) × 4]`, object +0x44 == h, type +0x4C == 1): `vehicle_interaction_rider_update(ECX = rec, cdecl i)` (caller cleans 4) |
+
+**Pool free functions** (`ambulance_pool_free` and the other two `*_pool_free`, `EDI` = pool):
+1. Return if `ESI` == 0, or if pool+0x20 is set while pool+0x14 is 0.
+2. Under the critical section at pool+0x30, unlink `ESI` from the used list at pool+0xC (next / prev at the walker's link offset +0 / +4).
+3. Append it to the free list at pool+0x10. An empty list makes the node point to itself; otherwise insert before the head.
+
+`weapon_effect_free` does the same without a lock, with the head `0x22D7B58` and the free list `0x22D7B5C`.
+
+**Saved registers** (only matter for inline asm): `ambulances_update` / `meter_maids_update` / `taxis_update` save `EBX` / `ESI` / `EDI`; `weapon_effects_update` saves `ECX` / `ESI` / `EDI`; the rest save `ESI` (and `EDI` for `trigger_objects_reap`).
+
 ## Suggested porting order
 
 1. **Done (`crates/sr2-hook/src/frame.rs`).** **`game_frame_tick` as a Rust skeleton.** It makes 18 calls, 2 of them already Rust (`input_do_frame`, `mouse_update`). The rest are called through their addresses. This gives a Rust-owned frame without changing behaviour, and a place to add timing.
