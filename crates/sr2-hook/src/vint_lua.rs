@@ -47,7 +47,7 @@ const CONTEXT_DEPTH: usize = 0x0252_6360; // Lua context stack: depth, then thre
 const CONTEXT_THREADS: usize = 0x0252_6364;
 const ELEMENT_TYPE: usize = 0x00EB_DF6C; // -> the element type id
 const TWEEN_TYPE: usize = 0x00EB_E2F8; // -> the tween type id
-const HASH: usize = 0x00BD_C9B0; // vint_hash_string: ECX = string (NULL -> 0)
+const HASH: usize = 0x00BD_C9B0; // string_crc32_lower: ECX = string (NULL -> 0)
 const FIND_BY_HASH: usize = 0x00B9_7970; // EDX = hash, ESI = document
 const FIND_CHILD_BY_HASH: usize = 0x00B9_8340; // ECX = parent, (hash), ret 4
 const PROPERTY_FIND: usize = 0x00B9_78A0; // ESI = object, ECX = name -> descriptor
