@@ -270,7 +270,7 @@ Gameplay and menus do not read the button records directly. They go through **ga
   - +0: primary button record (0-86, or −1 = unbound);
   - +4: secondary button record;
   - +8: stick direction code (−1..13), checked by the `input_action_stick_dir_*` fallbacks 0x4FE380..0x4FE6A0;
-  - +0xC: flags.
+  - +0xC: name pointer (see the instruction-level notes below).
 - `input_actions_reset` (0x500170, from game init 0x51F600) sets every entry to −1 / −1 / −1 / 0 and calls `input_actions_load_defaults` (0x4FF3F0).
 - `input_actions_load_defaults` copies the 87 defaults from `0xDD3B98` (20-byte records `{action, primary, secondary, dir, flags}`) and 23 stick actions from `0xDD42A0` into `0xF9F278`. Then it applies the control scheme (0x500340, 0x500630; also run by the pause menu's change-scheme / restore-defaults / revert bindings).
 - Setters: `input_action_set` (0x4FF4B0, ECX = record), `input_actions_set_many` (0x4FF4E0, ECX = records, EDX = count), and `input_stick_action_set` / `_set_many` (0x4FF520 / 0x4FF550).
@@ -294,7 +294,7 @@ Entries are filled for pad sticks 0, 1, 3, 4, 5, 6 and 7. Stick 2 is not copied,
 | +0x20..+0x23 | u8 per-direction "taken" flags, cleared every frame |
 | +0x24 / +0x25 | u8 x / y taken, cleared every frame; `player_stick_get` / `player_stick_get_raw` return 0 while set |
 
-- `player_stick_get` (0x4FF5F0): EAX = entry, ECX = &x, cdecl (&y); returns +0 / +4.
+- `player_stick_get` (0x4FF5F0): EAX = entry, ECX = &y, cdecl (&x); returns +0 / +4.
 - `player_stick_get_raw` (0x4FF5A0): same, returns +0x10 / +0x14. It has 15 callers, among them the vehicle customisation lights, tagging and the minigames.
 
 **Buttons: six arrays of 87 entries (0x57), one per button record.**
@@ -372,6 +372,128 @@ Found from the immediate action ids at the call sites of the accessors (`item11b
     4. runs **`player_controls_dispatch`** (0x4FAA90): `player_controls_weapon_select` → `player_controls_on_foot` → `player_controls_vehicle` → 0x9F1D00 → `player_controls_interact`;
     5. runs 0x4FAE90.
 - `player_controls_vehicle` → `vehicle_player_input` (0xAA6540) stores throttle, steering and brake in the vehicle; `vehicle_drive_update` applies them (16_vehicles.md).
+
+### The accessors at instruction level (for the port)
+
+**Common addressing:**
+- pad = `[0xE98DB0]`, with −1 → 0 (`sub -1 / neg / sbb / and`). Record = `0x23478B8 + pad × 0x104C + button × 0x24`.
+- action entry = `0xF9EA38 + action × 16`: +0 primary, +4 secondary, +8 stick-direction code, **+0xC name pointer**. The earlier "flags" for +0xC was wrong: `input_actions_reset` clears it, and `input_action_button_name_by_name` compares it with `_stricmp`.
+- Control-block entries are `0x2659908 + entry × 0x28`.
+
+**Float accessors.** Each pushes `ECX` as a 4-byte temporary and returns ST0 after `fstp [esp]` / `fld [esp]`, so the value is **rounded to f32**. Unbound → `fldz`, also through the f32 store.
+
+| Function | In | Reads | Eaten test |
+|---|---|---|---|
+| `input_action_value` 0x4FF770 | EAX = action | primary +0 (value) | +0x20 == 1 → 0 |
+| `input_action_prev_value` 0x4FF7C0 | EAX | primary +4 (previous) | none |
+| `input_action_alt_value` 0x4FF810 | EAX | secondary +0 | +0x20 == 1 → 0 |
+| `input_action_alt_prev_value` 0x4FF860 | EAX | secondary +4 | none |
+
+Only the value reads test eaten, with `== 1`, not `!= 0`.
+
+**`input_action_crossed` 0x4FF8B0** (`EDX` = action, cdecl (f32 t), plain `ret`):
+1. p = primary previous (f32-rounded; unbound → 0).
+2. If not t > p → 0. NaN p fails here.
+3. v = `input_action_value(EAX = EDX)`.
+4. Result 1 if v ≥ t; NaN v → 0.
+5. The result is **written into the caller's argument slot** `[esp+4]` and returned with `fild`, i.e. **0.0 / 1.0 in ST0, not AL**.
+
+**`input_action_released_below` 0x4FF930** (cdecl (action, f32 t), plain `ret`):
+1. Reads p1 = primary previous, v1 = `input_action_value`, p2 = secondary previous, v2 = `input_action_alt_value`.
+2. p1 is stored **over the action argument slot**.
+3. Result = (p1 ≥ t && v1 < t) || (p2 ≥ t && v2 < t). NaN compares count as false, but a NaN p1 still lets the secondary test run.
+4. Returned with `fild` as 0.0 / 1.0 in ST0.
+
+**Boolean accessors (`AL`).** Masks: avail A = `0x2659AF6[b]`, avail B = `0x2659BA4[b]`. All buttons are indexed by record number b.
+
+| Function | In | Button test | Takes? | Stick fallback (`EAX` = entry +8) |
+|---|---|---|---|---|
+| `input_action_down` 0x4FF640 | ECX | down `0x2659A48` & A | no | tail-jump to `_stick_dir_down` 0x4FE380, only when false |
+| `input_action_repeat` 0x4FF6A0 | ECX | repeat `0x2659A9F` & A | no | tail-jump to `_stick_dir_repeat` 0x4FE5E0, only when false |
+| `input_action_just_pressed` 0x4FF700 | ECX | just `0x2659B4D` & B | no | tail-jump to `_stick_dir_just_pressed` 0x4FE460, only when false |
+| `input_action_take_repeat` 0x4FFA30 | EAX | repeat & A, clears A and B of that button | yes | `_stick_dir_take_repeat` 0x4FE6A0, see below |
+| `input_action_take_pressed` 0x4FFAF0 | EAX | B & just, clears A and B | yes | `_stick_dir_take_pressed` 0x4FE520, **always called**; result ORed in |
+
+**Quirks to keep:**
+1. **Button selection.**
+   - The "first button" is the primary, or the secondary when the primary is −1. The second test is always the secondary. So with an unbound primary, the secondary is tested twice; harmless, because the masks are the same and a take already cleared them.
+   - The mask is read before the state, as `test byte [state], mask` → `setne`.
+2. **`input_action_take_repeat`:**
+   - Per button: if repeat & A, take it.
+   - Else, if the button is **held (down & A) but has no repeat pulse this frame**: call the stick fallback (it may take a stick pulse), **ignore its result** and return 0.
+   - Otherwise the fallback is always called, and the result is button-taken || fallback.
+   - So a held button blocks the stick for that action until its next repeat pulse.
+3. **`input_action_take_pressed`** always calls the stick fallback, even when a button already answered. It can take a stick press in the same frame as a button press.
+4. **`input_action_press_time`** 0x4FFB80 (`EAX` = action):
+   - primary == 0 → returns 0, so button record 0 is treated as "none";
+   - primary == −1 → reads `0x2659BFC[−1]` = the dword at `0x2659BF8`, which is the last three bytes of mask B plus a pad byte. That is a real out-of-bounds read of the original.
+5. **`input_action_consume`** 0x5001D0 (`EAX`) clears A and B of the **first button only** (primary, or the secondary when the primary is −1). The takes, by contrast, clear whichever button they matched.
+6. **`input_consume_all`** 0x5002B0: memsets A and B to 0 (0x57 bytes each), then sets the taken bytes +0x20..+0x25 of entries 0 and 1 to 1.
+7. **`input_actions_reset`** 0x500170: for all 0x84 entries, +0 / +4 / +8 = −1 and +0xC = 0. Then `[0xF8549B]` = (b & 0xF1) | 1, then a **tail call** to `input_actions_load_defaults`.
+8. **`input_action_button_name`** 0x4FFBB0 (`EAX`): unbound → `L"Button String Unbound"` (0xDDFE9C); otherwise cdecl `0x7F36D0(primary)`.
+9. **`input_action_button_name_by_name`** 0x4FFBD0 (cdecl (name)):
+   - finds the first entry whose +0xC name matches by `_stricmp` (0xC99030);
+   - not found → 0xDDF0B8;
+   - found → **writes the primary over its own argument and tail-jumps** to 0x7F36D0.
+10. **`input_just_pressed_count`** 0x4FD690, reached through the jump 0x4FF760: the number of non-zero bytes in the just-pressed array. It ignores the masks.
+
+### Stick accessors on the control block
+
+- **`player_stick_get` 0x4FF5F0 / `player_stick_get_raw` 0x4FF5A0:** `EAX` = entry, **cdecl (&x), `ECX` = &y**. This corrects the note above, which had the pointers swapped.
+  - x = taken byte +0x24 ? 0 : +0 (raw: +0x10); y = +0x25 ? 0 : +4 (raw: +0x14).
+  - x is written through the stack pointer. y is first stored **over that argument slot**, then written to `[ECX]`.
+- **Per-axis readers** (`EAX` = entry → ST0, 0 when the axis byte is set): x 0x4FD510 (+0x24, +0), y 0x4FD540 (+0x25, +4), raw x 0x4FD570 (+0x10), raw y 0x4FD5A0 (+0x14). The curved forms 0x4FD630 / 0x4FD660 apply `stick_response_curve`.
+- **`stick_response_curve` 0x4FD5D0** (stdcall (f32 v), `ret 4`):
+  1. c = f32(v·v·0.9·v), with 0.9 a double at 0xE5C210.
+  2. If c > 0: c = f32(c + 0.1).
+  3. Then if c < 0: c = f32(c − 0.1).
+
+  So any non-zero input jumps to at least ±0.1, and 0 stays 0.
+- **Stick actions** `0xF9F278[i]` (16 bytes): +0 primary axis kind, +4 u8 invert, +8 secondary kind (0-3), +0xC u8 invert.
+
+  | Kind | Stick and axis |
+  |---|---|
+  | 0 / 1 | entry 1 x / y |
+  | 2 / 3 | entry 0 x / y |
+  | 4 / 5 | entry 5 x / y |
+  | 6 / 7 | entry 3 / entry 4 y |
+  | 8 / 9 | entry 3 / entry 4 x |
+  | 10 / 11 | entry 6 x / y |
+
+  - `input_stick_action_value` 0x4FFE60 (`EAX` = i → ST0):
+    1. Read the primary kind's axis, f32-rounded.
+    2. If it is non-zero, negate it when +4 is set.
+    3. Otherwise read the secondary kind and negate it when +0xC is set.
+    4. A secondary kind outside 0-3 gives 0 (negated if +0xC).
+  - `input_stick_action_value_curved` 0x4FFCC0: the same, but kinds 0-5 and the secondary go through the curve. Kinds 6-11 are not curved.
+  - `input_stick_action_value_raw` 0x4FFFF0: kinds 0-3 only, with raw +0x10 / +0x14. Then `float_clamp_in_place(ECX = &v, cdecl (−1.0, 1.0))` (0x417120).
+  - `input_stick_action_consume` 0x500230: kinds 0-3 set the taken byte +0x24 / +0x25 of entry 1 / entry 0. Other kinds do nothing.
+  - 0x4FFFD0: `input_stick_action_value(13)`, then `input_stick_action_consume(13)`, returning the value in ST0. Used by `player_controls_vehicle`.
+
+### Stick-direction fallbacks (`EAX` = the action's +8 code)
+
+The code is the action's +8 field; −1 means none. Each dispatcher does `EAX + 1`, a bounds check, and a jump table. The leaf it jumps to takes `EAX` = control-block entry.
+
+| Code | Entry | Direction |
+|---|---|---|
+| 0 / 1 / 2 / 3 | 0 | +y, −y, +x, −x |
+| 4-7 | 1 | the same order |
+| 8-11 | 5 | the same order |
+| 12 / 13 | 6 | +x, −x (held test only) |
+
+| Dispatcher | Codes | Leaf test (per direction, with its taken byte +0x20 −x, +0x21 +x, +0x22 +y, +0x23 −y; a set byte → false) |
+|---|---|---|
+| `_stick_dir_down` 0x4FE380 | 0-13 | held: axis < −0.4 or > 0.4 (doubles at 0xE5C350 / 0xE5C358; NaN → false). Leaves 0x4FD6D0 −x, 0x4FD700 +x, 0x4FD730 −y, 0x4FD760 +y |
+| `_stick_dir_just_pressed` 0x4FE460 | 0-11 | just: past ±0.4 now and not past it last frame (+8 / +0xC previous). Leaves 0x4FD790 −x, 0x4FD7D0 +x, 0x4FD810 +y, 0x4FD850 −y |
+| `_stick_dir_take_pressed` 0x4FE520 | 0-11 | as just, and on true sets the taken byte to 1. Leaves 0x4FD890 −x, 0x4FD8E0 +x, 0x4FD930 +y, 0x4FD980 −y |
+| `_stick_dir_repeat` 0x4FE5E0 | 0-11 | step value: x step +0x18 < 0 → −x, > 0 → +x; y step +0x1C < 0 → **+y**, > 0 → −y. Leaves 0x4FD9D0 / 0x4FD9F0 / 0x4FDA10 / 0x4FDA30 |
+| `_stick_dir_take_repeat` 0x4FE6A0 | 0-11 | as repeat, and on true zeroes the step and sets the taken byte. Leaves 0x4FDA50 / 0x4FDA90 / 0x4FDAD0 / 0x4FDB10 |
+
+**Quirks to keep:**
+- **"Previous" in the just leaves is +8 / +0xC**: last frame's filtered +0 / +4, which `player_controls_update` copies before computing the new values.
+- **The y step sign is inverted relative to y.** +y repeats on a negative step: the step is −1 from the stick timer pulsed at stick +0x18, which `player_controls_update` copies into +0x1C.
+- **Codes 12 / 13 exist only for the held test.** The other four dispatchers stop at 11, and anything outside their range returns 0 (`xor al, al`).
+- **Leaf return types differ.** The held / just / repeat leaves return `EAX` = 0 / 1. The take leaves return only `AL`, and their false path leaves `AH` as it was.
 
 ### Porting notes
 
