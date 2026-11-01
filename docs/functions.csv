@@ -4696,7 +4696,7 @@ address,name,subsystem,status,notes
 0x00a48040,luafn_turn_invulnerable,script,rust,"Rust (lua_bindings.rs): flag nil -> false else truth; with < 2 args the first test passes the name pointer as the stack index (kept); human / object-with-human / vehicle setters (stdcall); not yet called in a test run (09)"
 0x00a48190,luafn_turn_to_do,script,named,"auto (script): script binding turn_to_do"
 0x00a48350,luafn_turn_to_check_done,script,named,"auto (script): script binding turn_to_check_done"
-0x00a483d0,luafn_turn_vulnerable,script,named,"auto (script): script binding turn_vulnerable"
+0x00a483d0,luafn_turn_vulnerable,script,rust,"Rust (lua_bindings.rs): as turn_invulnerable with flags 0; a vehicle only gets invulnerable = 0; not yet called in a test run (09)"
 0x00a48480,luafn_tutorial_completed,script,named,"auto (script): script binding tutorial_completed"
 0x00a48520,luafn_tutorial_lock,script,named,"auto (script): script binding tutorial_lock"
 0x00a48570,luafn_tutorial_start,script,named,"auto (script): script binding tutorial_start"
