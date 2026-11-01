@@ -11824,3 +11824,5 @@ address,name,subsystem,status,notes
 0x004363b0,nearest_player_view_distance,ai,documented,"cdecl (&position) -> ST0: the largest forward distance of the position in any player camera (humans on 0x217043C, view from 0x9DFA00); 1.0 when a view is degenerate; role inferred (21)"
 0x0045d740,ai_vehicle_record_update,ai,documented,"cdecl (record) -> AL: keeps an AI vehicle assignment (vehicle +8, driver +0xC, passengers +0x18 / +0x1C) alive; 0 when the vehicle or its riders are gone; reacts to distance and speed bands (400 / 900, 25 / 100); role inferred (21)"
 0x00436240,ai_human_needs_perception,ai,documented,"EAX = human -> AL: an active AI human that is not dead, not in a cutscene and in a state (+0x149) that perceives (21)"
+0x004da880,list_f9e550_update,world,rust,"Rust (frame.rs, sim_frame batch): list 0xF9E550 (link +0, shape A), 0x4DAF70(stdcall node) each; role unknown (40)"
+0x006ab2d0,state_eaaf84_check,app,rust,"Rust (frame.rs, sim_frame batch): resets the state 0xEAAF84 when its record 0xEAAF90 is gone or done; an idle non-1 state goes to 0x6AB380; role unknown (40)"
