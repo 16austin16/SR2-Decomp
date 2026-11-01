@@ -277,6 +277,40 @@ For i = 0 while i < count:
 3. The vint four (`vint_set_property`, `vint_get_property`, `vint_object_find`, `vint_object_destroy`). Together they are 64% of all binding call sites, and they run every frame in the HUD scripts, so they are where a port saves the most. They need the vint property table (06_vint.md) first.
 4. `thread_new`, `audio_play`, `objective_text` and `release_to_world`, which reach into larger systems.
 
+## Ten top bindings at instruction level (for the port)
+
+**Argument reading, exactly.**
+- `n = (L->top − L->base) >> 4`, then clamped to the most the binding reads.
+- Argument k (1-based) is read at index `k − 1 − n`, a negative, top-relative index.
+- `lua_tostring` (0xCDCA80) and the truth tests handle a **positive** index inline (base + (i − 1) × 16, nil when past top), and send **0 and negative** indexes to `luaA_index` (0xCDBE80).
+- `luaA_index` is top-relative for every index above −10000, so **index 0 is the slot at `L->top`**, one past the last argument. That slot holds whatever was left there earlier (stale data).
+- So when a binding gets fewer arguments than it reads, the missing one is **not nil**: it is the stale slot at top. Each case is listed below. A port that wants the same results reads `L->top[0]` there; a port that wants sane results treats it as nil. Pick one and note it.
+
+**Truth test** (used by `trigger_enable` and `door_lock`): a value is false when the slot is missing (NULL), nil (type 0), or boolean false (type 1, value 0). Every other value is true, **including the number 0**.
+
+**Results** are written at `L->top` and then top += 0x10:
+- boolean: type 1, value at +8;
+- number: type 3, double at +8, from `fild` of an int.
+
+| Binding | Exact behaviour |
+|---|---|
+| `trigger_enable` 0xA47BB0 | n ≤ 2. name = `lua_tostring(−n)`. **enable**: true when n ≤ 1. Otherwise arg 2 at −1: **nil also means true** (checked first), then the truth test (the same slot is fetched twice). `t = trigger_find_by_name(EAX = name)`; none → return 0. `trigger_set_enabled(ECX = t, cdecl enable)`. Enable: `trigger_activate(ESI = t)`, then **+0x11C = now** (0xE843AC), minus 1,800,000,000 if above it. Disable: `trigger_deactivate(EAX = t)`. Returns 0. With n = 0 the name is the stale top slot. |
+| `thread_new` 0xD74C70 | Saves the **unclamped** n, then clamps it to 20 for the name index: name = `lua_tostring(−min(n, 20))`. Script slot = `[0x2526360]`; a slot of 0 or above 16 gives state 0, and the next read `[0 + 8]` **crashes**. `rec = script_thread_create(EAX = state +8, cdecl name, 0, 0, 0)`. If it fails, push **65535.0** (0xE5BFA8). Otherwise: rec +0x14 = state +0x14; `lua_xmove(EDI = L, EDX = rec +4, cdecl n − 1)` **moves** the n − 1 extra arguments off the caller's stack; rec +0x1C = n − 1; `script_thread_resume(EDI = &rec, cdecl 0)` runs it at once. Push the u16 id at rec +0, or 65535.0 if the pointer was cleared. Quirks: with n = 0, xmove(−1) **raises the caller's top by one slot** and nargs is −1. With n > 20 the name comes from argument n − 19. |
+| `thread_kill` 0xD745C0 | n ≤ 1. id = `_ftol2(lua_tonumber(−n))` (truncation). `script_thread_find(cdecl id)`; if found: flags +0x18 \|= 4. The kill happens on the scheduler's next pass (`script_thread_resume` checks bit 4). Returns 0. With n = 0 the id comes from the stale slot. |
+| `on_trigger` 0xA3EBA0 | n ≤ 2. callback = `lua_tostring(−n)`, trigger name = `lua_tostring(1 − n)`. With n = 1 the name is index 0 (stale). `t = trigger_find_by_name`; none → return 0. **Only if +0x13C == 0**: `script_set_callback(ECX = t +0x150, EAX = &zero, cdecl callback)`. Then, if +0x150 ≠ −1 (a callback is set): +0x11C = now (wrapped as above). Returns 0. |
+| `on_death` 0xA3DAA0 | n ≤ 2. callback = `lua_tostring(−n)`, name = `lua_tostring(1 − n)`. `obj = script_find_object_by_name(ECX = name, EAX = &is_human byte)`. A human: `human_script_callback_set(ECX = obj +0x1234, EAX = &zero, cdecl callback)`; none → return. Not a human: `script_object_find(EAX = name)` → `object_script_callback_set(ECX = +0xBC, ...)`. Returns 0. |
+| `sizeof_table` 0xD74C00 | No argument: push −1. Otherwise `lua_table_count(cdecl L, EAX = 1)`. Index **+1 is base-relative**, so it always counts argument 1, even with extra arguments. Pushes the count as a number. |
+| `coop_is_active` 0x7EF490 | Ignores the arguments; pushes boolean `coop_session_active()` (0x7F7AD0). |
+| `group_show` 0xA2D7E0 | n ≤ 1. `group_find_by_name(EAX = lua_tostring(−n))`; if found, `group_set_hidden(EDI = group, cdecl 0)`. Returns 0. With n = 0 the name is the stale slot. |
+| `character_is_dead` 0xA35700 | n ≤ 1; name = `lua_tostring(−n)`. `obj = script_find_object_by_name(ECX = name, EAX = &is_human)`. **is_human path**: no object → **true**. Otherwise true if `human_is_dead(cdecl obj)`, **or if the dword 0xEAAF44 is ≥ 0** (a living human is then reported dead), else false. **Other path**: no name → true. `script_follower_index(EAX = name)` > 0 → `script_follower_get(cdecl index)`; otherwise `script_object_find(EAX = name)` → vtbl +0x34 (its human). No human → **true**; else `human_is_dead`. **A missing character counts as dead.** |
+| `door_lock` 0xA2DED0 | n ≤ 2; name = `lua_tostring(−n)`. **locked** = truth test of index 1 − n. With 2 arguments that is arg 2. With 1 argument it is **index 0, the stale top slot**: the default is not "locked", it depends on the leftover value (a nil leftover means unlocked). `door = script_door_find_by_name(EAX = name)`; if found, `door_set_locked(ECX = door, cdecl locked)`. As network host this also sends packet 0x62. Returns 0. |
+
+**Port notes.**
+- All ten return 0 or 1 result, as listed.
+- Port `trigger_enable` and `on_trigger` with the +0x11C game-time stamp. Trigger timing code reads it.
+- `thread_new` resumes the new thread **inside** the binding, so the child runs to its first yield before the parent continues. Keep that order.
+- `luaA_index` has been corrected in functions.csv: the old note said positive indexes are base-relative inside it. They are not; callers handle them inline.
+
 ## Ported: the vint four
 
 `crates/sr2-hook/src/vint_lua.rs` replaces `vint_set_property`, `vint_object_find`, `vint_get_property` and `vint_object_destroy`, plus `vint_lua_current_document` (0xB8E020) and `vint_object_unlink_from_parent` (0xB97A20). The Lua API and the vint value / property helpers stay the game's:
