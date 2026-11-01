@@ -75,7 +75,7 @@ struct Accessor {
     ret: Ret,
 }
 
-const ACCESSORS: [Accessor; 51] = [
+const ACCESSORS: [Accessor; 53] = [
     Accessor { name: "input_action_down", addr: 0x004F_F640, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
     Accessor { name: "input_action_repeat", addr: 0x004F_F6A0, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
     Accessor { name: "input_action_just_pressed", addr: 0x004F_F700, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
@@ -127,6 +127,8 @@ const ACCESSORS: [Accessor; 51] = [
     Accessor { name: "input_stick_action_consume", addr: 0x00500230, prologue: &[0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x78, 0xF2, 0xF9, 0x00], ret: Ret::Void },
     Accessor { name: "input_action_crossed", addr: 0x004F_F8B0, prologue: &[0x51, 0x8B, 0xC2, 0xC1, 0xE0, 0x04], ret: Ret::St0 },
     Accessor { name: "input_action_released_below", addr: 0x004F_F930, prologue: &[0x83, 0xEC, 0x0C, 0x53, 0x8B, 0x5C, 0x24, 0x14], ret: Ret::St0 },
+    Accessor { name: "input_stick_action_value", addr: 0x004F_FE60, prologue: &[0x51, 0xD9, 0xEE, 0xC1, 0xE0, 0x04], ret: Ret::St0 },
+    Accessor { name: "input_stick_action_13_take", addr: 0x004F_FFD0, prologue: &[0x51, 0xB8, 0x0D, 0x00, 0x00, 0x00], ret: Ret::St0 },
 ];
 const COUNT: usize = ACCESSORS.len();
 
@@ -486,6 +488,47 @@ unsafe fn released_below(args: *mut u32) -> f32 {
     }
 }
 
+/// One stick axis by stick-action kind: 0/1 entry 1 x/y, 2/3 entry 0 x/y, 4/5 entry 5 x/y,
+/// 6/7 entry 3/4 y, 8/9 entry 3/4 x, 10/11 entry 6 x/y.
+unsafe fn kind_axis(kind: u32) -> Option<f32> {
+    let (e, y) = match kind {
+        0 => (1, false),
+        1 => (1, true),
+        2 => (0, false),
+        3 => (0, true),
+        4 => (5, false),
+        5 => (5, true),
+        6 => (3, true),
+        7 => (4, true),
+        8 => (3, false),
+        9 => (4, false),
+        10 => (6, false),
+        11 => (6, true),
+        _ => return None,
+    };
+    unsafe { Some(if y { axis(e, 0x25, 4) } else { axis(e, 0x24, 0) }) }
+}
+
+/// `input_stick_action_value` (EAX = stick action): the primary axis, negated if +4; when it is
+/// exactly 0, the secondary (kinds 0-3 only), negated if +0xC.
+unsafe fn stick_action_value(i: u32) -> f32 {
+    unsafe {
+        let a = STICK_ACTIONS + i as usize * 16;
+        let mut v = 0.0f32;
+        if let Some(p) = kind_axis(rd(a)) {
+            v = p;
+            if v != 0.0 || v.is_nan() {
+                return if rb(a + 4) != 0 { -v } else { v };
+            }
+        }
+        let k = rd(a + 8);
+        if k <= 3 {
+            v = kind_axis(k).unwrap_or(0.0);
+        }
+        if rb(a + 0xC) != 0 { -v } else { v }
+    }
+}
+
 /// The Rust accessor `id`: (EAX result, f32 result).
 unsafe fn rust(id: usize, r: &Regs, args: *mut u32) -> (u32, f32) {
     unsafe {
@@ -542,6 +585,12 @@ unsafe fn rust(id: usize, r: &Regs, args: *mut u32) -> (u32, f32) {
             }
             49 => (0, crossed(r.edx, args)),
             50 => (0, released_below(args)),
+            51 => (0, stick_action_value(r.eax)),
+            52 => {
+                let v = stick_action_value(13);
+                stick_action_consume(13);
+                (0, v)
+            }
             _ => (0, 0.0),
         }
     }
@@ -689,6 +738,9 @@ pub fn stick_self_test() {
                                 run(id, code as u32);
                             }
                         }
+                        for i in 0..23u32 {
+                            run(51, i);
+                        }
                         for id in [37, 38, 39, 40, 42, 43] {
                             for e in [0u32, 1, 5, 6] {
                                 run(id, e);
@@ -817,8 +869,10 @@ thunk!(t47, 47);
 thunk!(t48, 48);
 thunk!(t49, 49);
 thunk!(t50, 50);
+thunk!(t51, 51);
+thunk!(t52, 52);
 const THUNKS: [extern "C" fn(); COUNT] = [
-    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35, t36, t37, t38, t39, t40, t41, t42, t43, t44, t45, t46, t47, t48, t49, t50,
+    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35, t36, t37, t38, t39, t40, t41, t42, t43, t44, t45, t46, t47, t48, t49, t50, t51, t52,
 ];
 
 pub fn install() {
