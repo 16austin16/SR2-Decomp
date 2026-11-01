@@ -143,6 +143,110 @@ Each block is a position and a previous position. The position goes to `0x256D9E
 
 Lua bindings (`audio_play`, `audio_play_for_character_do`, … in `luafn_*`) start cues.
 
+## Leaf functions at instruction level (for porting)
+
+Each function below has its exact register use, what it writes, and the edge cases a port must keep. Import slots used: `0xDB80CC` EnterCriticalSection, `0xDB80D0` LeaveCriticalSection, `0xDB8114` QueryPerformanceCounter, `0xDB8084` ReadFile.
+
+### `audio_ramp_toward` 0x46FE30
+
+`ECX` = &target, `EDX` = &value, cdecl (f32 rate per second); plain `ret`. The step is `dt × rate`, with dt the frame time `0xE99C44`.
+
+```text
+if value <= target:  value = min(value + dt*rate, target)
+else:                value = max(value - dt*rate, target)
+```
+
+- The comparisons are x87 (`fcompp` / `fcom` + `fnstsw`), and the result goes through a 32-bit store, so the value is rounded to f32 each step.
+- **NaN:**
+  - When the value is NaN, the first test takes the "≤" branch.
+  - In the "≤" branch the clamp keeps the new value (`test ah, 0x41`).
+  - In the "else" branch the clamp keeps the new value when the comparison is unordered: `test ah, 5` + `jp` takes the jump when both C0 and C2 are set.
+  - A bit-exact port has to treat an unordered comparison as "keep the new value" in both clamps.
+
+### `audio_thread_record_overrun` 0x46C7F0
+
+cdecl (start ms); returns nothing useful.
+
+1. now = 0 when the QPC timer is off (`0x252A404` == 0). Otherwise now = (QPC − base `0x2346508`) / ticks-per-ms `0x23464F8`: 64-bit, `__alldiv`, low 32 bits kept.
+2. elapsed = now − start (i32).
+3. Under CS `0x256DBC4`: if elapsed > 30, `0x2526A74` = elapsed − 30.
+   - The global is never cleared here, so it keeps the last overrun.
+   - While the timer is off, elapsed is −start, so it never writes.
+
+### `audio_set_listener` 0x47E7C0
+
+`EAX` = 3×3 orientation block (rows: right +0x0, up +0xC, forward +0x18), `ECX` = &velocity, cdecl (&position, a, b, c); plain `ret`. It only copies floats into one block of globals:
+
+| Global | From |
+|---|---|
+| `0xEEB230` | c (4th arg) |
+| `0xEEB234` | b (3rd arg) |
+| `0xEEB238` | a (2nd arg) |
+| `0xEEB23C..44` | forward (block +0x18) |
+| `0xEEB248..50` | up (block +0xC) |
+| `0xEEB254..5C` | position |
+| `0xEEB260..68` | velocity |
+
+- From `0xEEB23C` this is the `X3DAUDIO_LISTENER` layout (OrientFront, OrientTop, Position, Velocity, then pCone at `0xEEB26C`, not written here).
+- So front is the block's +0x18 row and top its +0xC row. The older note had them the other way round.
+
+### `audio_stream_issue_reads` 0x480DB0
+
+No arguments. Under CS `0x25F53D0`, it walks the circular doubly linked queue `0xEF86FC`. Nodes are `{+0 prev, +4 next, +0x10 file handle, +0x14 buffer, +0x18 size, +0x1C OVERLAPPED*}`.
+
+For each node:
+1. Note next first: it is 0 if node->next is the current head, which ends the walk.
+2. `ReadFile(handle, buffer, size, NULL, overlapped)`. The return value and `GetLastError` are ignored; completion is polled later through the OVERLAPPED.
+3. Unlink the node from the queue. If it was the head, the head becomes node->next, or 0 if the node was alone.
+4. Append it to the free list `0xEF8700`:
+   - empty list: the node points to itself and becomes the head;
+   - otherwise: insert before the head (prev = head->prev, next = head; fix both neighbours), so the head stays.
+
+The "current head" used for the end test is the head after the previous node's unlink. In practice the walk issues every node that was queued when it started.
+
+### `audio_stream_requests_update` 0x484760
+
+No arguments. Under CS `0x25F5A9C`, it walks the circular list `0xF52E50`. The next node is computed as above, but against the head re-read every step.
+
+Request node:
+
+| Off | Field |
+|---|---|
+| +0 / +4 | prev / next |
+| +8 / +0xC | async read handle (record pointer, id) |
+| +0x10 / +0x14 | arguments for a re-request |
+| +0x18 | wave bank index |
+| +0x1C | embedded stream object (vtable). +0x20 u8 ready, +0x24 dword, +0x4C value copied into +0x24 on completion. |
+| +0x70 | data size |
+
+**Handle set** (+8 | +0xC ≠ 0): `s = async_io_status(lo, hi)`.
+
+- **s = 1 or 2** (pending): skip.
+- **s = 3** (done):
+  1. obj = node+0x1C; obj.ready = 1; obj+0x24 = node+0x4C.
+  2. data = obj->vtbl[+0x2C]().
+  3. `audio_create_wavebank_from_memory(ECX = data, EDX = node+0x70, cdecl (bank))`.
+  4. On success: `async_io_release(lo, hi, 0)` and clear the handle. On failure the handle is kept, so the next frame sees status 3 again and retries the create.
+- **s ≤ 0 or s > 3** (failed, cancelled):
+  1. If bank ≤ count `0x2526B50`, then under CS `0x25F53EC` take the retry count from the bank entry `0xEF8704 + bank×32`: u16 at +0x1C, retries = w >> 2, and the field keeps only w & 3. Otherwise retries = 0.
+  2. If lo is 0, or hi ≠ *lo (stale id), refresh `0x2529E28` = `*0x2529E24`.
+     - Caution: with lo = 0 and hi ≠ 0 the original reads *lo and crashes. A port should guard this.
+  3. `async_io_free(lo->+0x3C, lo, hi, 0)`, then clear the handle.
+  4. If retries > 0: `0x483F00(EAX = retries, cdecl (node+0x10, node+0x14))` re-requests the read.
+
+**Handle clear:** if `0x481C80(EAX = bank)` says the bank is finished with:
+1. If obj->vtbl[+4]() returns true, set obj.ready = 0 and obj+0x24 = 0.
+2. Call obj->vtbl[+0x28]().
+3. Unlink the node and append it to the free list `0xF52E54` (same insertion as above).
+
+### Porting order
+
+1. `audio_ramp_toward`, `audio_set_listener` and `audio_thread_record_overrun`: pure leaves, no callees except the QPC import and the CS.
+2. `audio_stream_issue_reads`: a list walk plus ReadFile. It belongs with the other file I/O in `hddio.rs` and can share its intrusive-list helper.
+3. `audio_stream_requests_update`: needs `async_io_status` / `_release` / `_free` (Rust already), `audio_create_wavebank_from_memory` (XACT), 0x481C80 and 0x483F00 (still original), and the stream object's vtable.
+   - Port the list walk and the status switch.
+   - Keep the vtable calls, the XACT create and the re-request as calls into the original.
+
 ## Port notes
 
 - To keep the original data, a port has to read XACT 3 sound and wave banks (`.xsb` / `.xwb`) and `saintsrow.xgs`, or keep XACT itself.
