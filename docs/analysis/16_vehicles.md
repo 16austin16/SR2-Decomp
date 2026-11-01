@@ -88,6 +88,68 @@ All three lists link through vehicle +0x84DC.
 - `vehicle_sync_from_physics` (0xAB26E0) copies the body's transform and velocity back into the vehicle (0x70DED0, 0xD93F20).
 - `vehicle_drive_update` pushes forces into the body (0xD61400, 0xAD0370).
 
+## vehicles_pre_update (0xAE3A80) and vehicles_update (0xAE3C60) porting map
+
+Both are called from `sim_frame` (sections :4 and :5). Neither takes arguments.
+
+### `vehicles_pre_update` (0xAE3A80)
+
+Frame `sub esp, 0x84`.
+
+1. `humans_nav_node_refresh_all()` (0xB26340).
+2. `vehicle_obstacles_rebuild()` (0xB2E1E0).
+3. `vehicle_recent_list_prune()` (0xB2F370).
+4. `[0x252A10C]` = 0.
+5. `player_vehicle_tracking_update()` (0x9E32D0).
+6. `vehicle_deferred_calls_flush()` (0x4C2D30).
+7. Copy the vehicles of the lists 0x22A84E0 and 0x22A84D4 (circular, link +0x84DC) into a **stack array at [esp+0xC]**.
+   - The array has room for about 30 pointers. **There is no bound check**, so more than about 30 vehicles would overwrite the frame.
+   - The copy is taken first because the update can unlink vehicles.
+8. dt = `physics_frame_time()` → `fstp [esp+8]` (rounded to f32).
+9. For each copied vehicle: `vehicle_pre_update(cdecl vehicle, f32 dt)` (0xAB2AA0).
+10. Tail `jmp object_deferred_packets_flush` (0x737C10).
+
+### `vehicle_pre_update` (0xAB2AA0)
+
+cdecl (vehicle, f32 dt); frame with a security cookie.
+
+1. Return when the vehicle is 0, +0x80 & 0xB, or +0x8F50 bit 0 is set.
+2. +0x8EF8 = 0. Physics object = +0x538 for a full vehicle (+0x84D8 == 1); otherwise 0.
+3. Unless the type (+0x84E4 → +0x9C) is 3 or 4: 0xAB4720(0, 0) when 0xAFE2F0 returns 1; 0xAB4720(1, 0) when the timer +0x8FFC has elapsed.
+4. **Speed clamp.** Velocity = physics body +0x1A0..+0x1AC. Extra = 0xAFE2C0() for types 0 / 1, 0xA97A90() for type 4 (currently named `cmd_vehicle_ejection_thresholds`; that name may be wrong), else 0.
+   - Max = info +0x5B8, replaced by +0x9540 when that is > 0.
+   - Except for types 3 / 4: if the driver seat flag (+4 → +0x10C) is 1, max = info +0x5BC and the blend +0x903C = 1.0. Otherwise the blend drops by dt × 0.5, clamped to [0, 1], and max += (info +0x5BC − max) × blend.
+   - If |v| > max + extra: v is scaled to that length with `rsqrtss` and **one Newton step** (`r × 0.5 × (3 − x·r·r)`), then set through the body vtbl +0x40. Keep this SSE form to match exactly.
+5. **Fall check** (unless `[0x2528B48]` == 1 and `[0x2528B49]` == 0):
+   - when v.y < −22.352 m/s (50 mph): timer +0x91D4 = −1;
+   - otherwise start the timer at now + 500 ms when it is unset;
+   - when falling faster, or the timer is set and not yet elapsed: **`[0xE8ECAC]` = 2.0**. This is the divisor in `physics_frame_time`, so the physics step is halved while a vehicle falls fast.
+6. 0xAA0850(vehicle, dt). If +0x8F48 bit 0x100 is set and 0xA9DBE0(frame dt) returns 1: **return** (the vehicle was removed).
+7. If +0x8C38 > 0 (pending damage): 0xA9D530 / 0xA98070, then +0x8C38 = 0.
+8. **Seats.** For i = 0..7 (seat i at +0x8ABC + i × 0x24): occupant = `vehicle_seat_occupant` while i is below the seat count (+0x6CE8 for a full vehicle, 8 otherwise). Exit and passenger handling through 0xAA77C0, 0xAC0290, 0xAA7E30, 0xAA7EE0, 0xAA7FB0 and 0x96CB70 (types 0x218 / 0x21A).
+9. Driver tests: is the driver the local player (0x21703D4), is it a human (+0x4C == 1) with +0x3CC == 1. Then 0xA9F370; 0xA9F170 unless that; 0xB25170 by the driver kind (+0x8554).
+10. 0xB047D0 for type 3, else 0xA9DE30. +0x8F50 &= ~0x80. Clear the timer +0x90D0 once it has passed.
+11. 0xAD3690, 0xAC24F0, 0xAA0D10. Copy the position +0x14..+0x1C to +0x50..+0x58 and the 9 dwords +0x20.. to +0x84F8 (the previous transform); 0xAA68E0(+0x851C).
+12. +0x8F50 &= ~0x20000000. In single player (`[0x2528B48]` == 1 and `[0x2528B49]` == 0): the "stopped" check on the speeds +0x851C / +0x8528 against 2.2352 m/s (5 mph) and 4.4704 m/s, with the 250 ms timer +0x8534.
+13. +0x8F50 bit 0x40000000 = !(0xAAB5E0() or 0xAAB6B0()).
+
+### `vehicles_update` (0xAE3C60)
+
+Frame `sub esp, 0x88`.
+
+1. Collect the same two lists into a stack array at [esp+0x14]. Same **unchecked size**.
+2. For each: `vehicle_update(cdecl v)`, **skipped** when (+0x9050 is set and its +0x1C ≠ 0) or +0x80 & 0xB.
+3. For each vehicle on the light list 0x22A84DC: `vehicle_update_light(EAX = v)` unless +0x80 & 0xB.
+4. Count light vehicles without +0x8F50 bit 0x40. If more than 4: `vehicles_cull_light()`.
+5. `vehicle_collision_pairs_collect(cdecl &array, &count)` (0xAC2080). It builds unique pairs from the contact list 0x2FA8E34 (52-byte entries, count 0x252A074) into 0x223F3F0 (12 bytes each, **at most 128**: at 128 it stops early and clears the source count).
+   - A pair is {vehicle, other vehicle (from the contact's +0x14 handle) or 0, flag byte}; {A, B} and {B, A} count as the same pair.
+6. For each pair: `vehicle_collision_pair_react(cdecl &pair)` (0xAE3B30). With the flag set, it makes the drivers react to the crash (0x9DBCF0, 0x44F0A0).
+
+### Port notes
+- Keep the stack-copy-then-iterate shape: updates may unlink vehicles from the lists.
+- `[0xE8ECAC]` is written here and read by `physics_frame_time`. Port the fall check together with the physics timing, or the step count will differ.
+- The order of the ten steps above matters: the nav and obstacle data must be rebuilt before any vehicle update reads it.
+
 ## Open
 
 - The wheel / engine model (0xAD1B30 / 0xAD1F10 / 0xAD2590) in detail.
