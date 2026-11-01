@@ -430,7 +430,7 @@ const GET_THREAD_STATE: usize = 0x00D2_2790;
 const BITMAP_LOOKUP: usize = 0x00C0_94E0; // EAX = handle -> bitmap record or NULL
 
 /// The calling thread's raw context and its "render thread" byte.
-fn raw_context() -> (u32, u8) {
+pub(crate) fn raw_context() -> (u32, u8) {
     let tls: u32;
     unsafe {
         std::arch::asm!("mov {}, dword ptr fs:[0x2C]", out(reg) tls, options(nostack, readonly));
@@ -440,7 +440,7 @@ fn raw_context() -> (u32, u8) {
 }
 
 /// Whether an API call on this thread is deferred to the render thread.
-fn defers() -> bool {
+pub(crate) fn defers() -> bool {
     let (raw, flag) = raw_context();
     (unsafe { rb(FORCE_IMMEDIATE) }) == 0 && (raw == RENDER_CONTEXT || (flag == 0 && raw == GAME_CONTEXT))
 }
@@ -1373,6 +1373,7 @@ extern "C" fn execute_hook() {
         }
         Mode::Rust => deferred_execute(&mut Mem::live()),
     }
+    crate::missionlog::render_tick();
 }
 
 static REPLAYS: AtomicU32 = AtomicU32::new(0);

@@ -28,6 +28,8 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if TELEPORT_TEST {
         crate::teleport::tick(n);
     }
+    crate::missionlog::tick();
+    crate::menu::tick();
     if n == 1 || n.is_multiple_of(3600) {
         log(&format!("game_frame_tick: frame {n}"));
     }

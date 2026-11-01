@@ -27,6 +27,8 @@ mod hddio;
 mod hooks;
 mod input;
 mod mempool;
+mod menu;
+mod missionlog;
 mod render;
 mod rsched;
 mod streamman;

@@ -1334,7 +1334,8 @@ extern "C" fn do_frame_hook() {
         Mode::Original => original(),
         Mode::Shadow => shadow(DO_FRAME, &regions(), original, || unsafe { do_frame() }),
         Mode::Rust => unsafe { do_frame() },
-    })
+    });
+    crate::menu::input();
 }
 
 extern "C" fn mouse_update_hook() {
