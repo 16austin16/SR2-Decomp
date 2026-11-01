@@ -857,6 +857,68 @@ Then `gfx_cmd_set_stream_source` and `gfx_cmd_draw_indexed`. `gfx_cmd_draw_index
 - Only one debug path compiles HLSL at run time (0x517D40, `D3DXCompileShaderFromFileA`, vs_3_0 / ps_3_0).
 - The full-screen post passes bind their shaders through 0x51CA60 (commands 3, 4, 14, 16, 17).
 
+## game_build_render_batches and game_render_func (porting maps)
+
+Both run on the game thread inside `frame_end_handoff`, at the end of its world-visible branch. Their order there: `render_lists_reset`, then `game_render_func`, then `game_build_render_batches` (doc 11).
+
+### `game_build_render_batches` (0x522FC0)
+
+No arguments. It saves `EDI`, and the visible path ends with a **tail jump**.
+
+1. view = TLS render context (`fs:[0x2C]` → [0]) +0x58 → +0x740; then 0x4B7700(cdecl view).
+2. 0x530860, 0x533630, `game_build_render_batch_func` (0x522E00).
+3. **Only when the snapshot is not yet valid** (`[0xE9D68C]` == 0) and the world is visible (`[0xE9D68D]`): `render_viewport_setup`, `city_build_render_batches`, `level_objects_render_collect(EDI = 0xE9D620)`.
+   - In the normal frame, `frame_end_handoff` has already set `0xE9D68C` = 1 before this call. So this path is skipped and the render thread does the same work (doc 11, render loop step 15).
+   - The two threads share these calls; never run them on both.
+4. 0x522F10.
+5. Under the same condition as step 3: 0x533910, 0x533A70, 0x533CD0, then `pop edi` / `jmp 0x4B7EF0`. Otherwise `pop edi` / `ret`.
+
+**Port:** a call sequence with two snapshot checks. With the snapshot always valid in gameplay, only steps 1, 2 and 4 run.
+
+### `game_render_func` (0x5250E0)
+
+No arguments. Frame: `sub esp, 0x7C`; saves `EBX` / `EBP` / `ESI` / `EDI`. `EBX` = 0 throughout; `EBP` = the `GetCurrentThreadId` import.
+
+1. **Job.** If `[0x252A3E8]` (worker jobs on): `[0xFA6BD8]` = `job_alloc(cdecl 0x7AE, 0xDE2374)`.
+2. **First job.**
+   1. Build a job descriptor on the stack: `[esp+0x28]` = 0, `[esp+0x40]` = 0, then (after the 3 pushes) the function 0x5250C0, kind 6, the thread id.
+   2. Call 0x5250C0 directly with (&descriptor, two stack words). It is `jmp 0x511050`.
+   3. If the job exists: `job->vtbl[+4]()` then `job->vtbl[+0xC]()` (arm and signal).
+3. **Render list fills, in order:** 0x4D7160, `[0x252A364]` = 0, 0xAE0FD0, 0x505350, 0x94DFA0, 0x4C85D0, 0x9556A0, 0x963750, 0x524060.
+   - Inferred from their neighbours: vehicles, effect objects, projectiles, glares, searchlights and humans add their render instances here.
+4. `render_viewport_setup`; copy 0x84 dwords of the thread view (context +0x58 → +0x740) to `0x277CBF0`.
+5. **Co-op second view.** When `0x2528B48` and `0x2528B49` are both 1, the split mode `0x21603CC` == 2, and a partner exists:
+   1. 0x9DFA00(`ECX` = partner, `EAX` = &local, cdecl &local2).
+   2. Two floats: the partner's +0x12D0 / +0x12D4, or, when the partner is the local player, the thread view's +0x1710 / +0x1714.
+   3. 0x523EB0(cdecl &a, &b, f32, f32). The floats are written after `sub esp, 8`.
+6. `[0xFA6BDC]` = `[0xE98980]` if `0x2527393`, else 1.0; `[0x2526CCC]` = 0.
+7. 0x523BD0(cdecl 0): the main pass; it can raise `0x2526CCC`.
+8. 0x4B3FF0(`EAX` = 0x25F5B14 camera position, cdecl 1).
+9. **Occlusion flag** `[0xE99382]`:
+   - 0 if `0xE996E4` is 0 or `0x25273B4` is set;
+   - else `0x2526CC4` when `0x2526CC3` == 1;
+   - else 0x4B4A60().
+10. If not `0x25273B4` and render mode `0xE98948` is 1 or 2: 0x4BA270(`ECX` = 0x25F5B38 camera matrix, cdecl &0x25F5B14).
+11. **Second job.**
+    - If `[0xE99382]`: a descriptor for 0x5250D0 with 0x2612D10. 0x5250D0 is cdecl (descriptor, arg) and calls 0x523BD0(arg), so this pass runs with the occlusion data. Call it directly, then arm and signal the job as in step 2.
+    - Else: `[0x252739C]` = 0.
+12. `0x2526CD0` += 1 (word); `[0x25273A4]` = 1.0; copy 0x81 dwords `0x26128F8` → `0x2612B00` (the time-of-day snapshot).
+13. If `[0x2526CCC]` > 0 and `[0x2612D18]` & 0x2000: 0xA02550(`EAX` = 0x277C9E0, `ECX` = 0x25F5B14, cdecl (0x2615510, 0x2612D20, f32 `[0x2612D58]`)).
+14. **Job wait.** If jobs are on and `[0xFA6BD8]`:
+    1. Set +0x34 = 0x33D6328 and call vtbl +0x10 (wait).
+    2. Clear +4, +8, +0x34, +9, +0x3C, +0x40, +0x44.
+    3. `pool 0xEC5B98 ->vtbl[+4](job − 8)`.
+
+    This is the same pattern as the audio job in `frame_end_handoff`.
+
+**Quirks:**
+- Steps 2 and 11 call the job function directly on the game thread, then arm and signal the job object. The job object is a completion fence, not the place the work runs.
+- 0x5250C0 receives a descriptor whose own function field is 0x5250C0.
+
+**Port:** keep the call order and the job fence. 0x523BD0 is the heavy part (the main and occlusion passes), so port this function as a skeleton calling originals.
+
+The roles of 0x4D7160, 0x523BD0, 0x4B3FF0, 0x4BA270, 0xA02550 and the fill calls in step 3 are not identified yet.
+
 ## Open
 
 - The deferred types marked "role open" in the handler table.
