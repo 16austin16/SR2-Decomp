@@ -11,7 +11,6 @@
 //!
 //! F8 marks a point in the mission log without opening the menu.
 
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -52,9 +51,6 @@ const NOTORIETY_SET: usize = 0x0055_F870;
 /// Advances the clock (what `set_time_of_day` calls): cdecl (f32 seconds, 1, 0, 1).
 const ADVANCE_TIME: usize = 0x0068_A1E0;
 const CLOCK_HOUR: usize = 0x0140_E72C; // u8, then u8 minute
-const INVENTORY: usize = 0x10C4; // -> circular list: item +0xB4 next, +0xC4 weapon instance
-const WEAPON_INFO: usize = 0x08; // in the weapon instance
-const WEAPON_CLIP: usize = 0x10; // i32 rounds in the magazine
 const FORCE_FLAGS: usize = 0x110C; // bit 0x40 = invulnerable
 const MAX_HP: usize = 0x1120; // i32
 const HP: usize = 0x1124; // f32
@@ -63,10 +59,26 @@ const RESPECT: usize = 0x1200; // i32
 /// the route function 0x765E40 from its target argument.
 const GPS_TARGET: usize = 0x029B_A748;
 
+// Game flags and cheats (docs/analysis/38_cheats_and_menu_hooks.md).
+const CHEAT_FLAGS: usize = 0x027A_6A40; // u32: 0x40 infinite ammo, 0x1000 unlimited clip
+const AMMO_FLAGS: u32 = 0x40 | 0x1000;
+const CHEATS: usize = 0x027A_6A68; // 0x68-byte records: +1 active, +0x10 char *name
+const CHEAT_COUNT: usize = 0x0252_7B5C;
+const CHEAT_ON: usize = 0x0068_62F0; // ESI = record, (1), callee pops
+const CHEAT_OFF: usize = 0x0068_63C0; // ESI = record, (1, 0), callee pops
+const WEATHERS: usize = 0x0252_6DD0; // -> 0xD8-byte records, +0 char *name
+const WEATHER_COUNT: usize = 0x0252_6DCC;
+const WEATHER_SET: usize = 0x004D_EC00; // EAX = index, CL = 1
+const WEATHER_FORCED: usize = 0x0252_6E14; // 0 = the normal weather cycle
+/// Rows shown at once on long pages.
+const WINDOW: usize = 11;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Main,
     Player,
+    World,
+    Cheats,
     Logging,
 }
 
@@ -80,6 +92,10 @@ enum Action {
     TeleportWaypoint,
     /// Hours forward (1..23).
     Time(u32),
+    /// Weather index, or -1 for the normal cycle.
+    Weather(i32),
+    /// Cheat record index, on.
+    Cheat(usize, bool),
 }
 
 struct State {
@@ -88,6 +104,7 @@ struct State {
     cursor: usize,
     god: bool,
     ammo: bool,
+    weather: i32,
     pending: Vec<Action>,
     /// The last thing done, shown at the bottom.
     status: String,
@@ -99,6 +116,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     cursor: 0,
     god: false,
     ammo: false,
+    weather: -1,
     pending: Vec::new(),
     status: String::new(),
 });
@@ -120,7 +138,21 @@ fn pressed(scan: usize) -> bool {
 
 fn items(s: &State) -> Vec<String> {
     match s.page {
-        Page::Main => vec!["Player options".into(), "Mission logging".into(), "Close".into()],
+        Page::Main => {
+            vec!["Player options".into(), "World and cheats".into(), "Mission logging".into(), "Close".into()]
+        }
+        Page::World => vec![
+            format!("Weather: < {} >", if s.weather < 0 { "normal".into() } else { weather_name(s.weather as usize) }),
+            "Game cheats...".into(),
+            "Back".into(),
+        ],
+        Page::Cheats => {
+            let mut v: Vec<String> = (0..cheat_count())
+                .map(|i| format!("{}{}", cheat_name(i), if cheat_active(i) { "   [ON]" } else { "" }))
+                .collect();
+            v.push("Back".into());
+            v
+        }
         Page::Player => vec![
             format!("God mode: {}", if s.god { "ON" } else { "off" }),
             format!("Infinite ammo: {}", if s.ammo { "ON" } else { "off" }),
@@ -186,9 +218,32 @@ fn keys() {
     match s.page {
         Page::Main if enter => match s.cursor {
             0 => (s.page, s.cursor) = (Page::Player, 0),
-            1 => (s.page, s.cursor) = (Page::Logging, 0),
+            1 => (s.page, s.cursor) = (Page::World, 0),
+            2 => (s.page, s.cursor) = (Page::Logging, 0),
             _ => s.open = false,
         },
+        Page::World => match s.cursor {
+            0 if left || right => {
+                let n = weather_count() as i32;
+                let d = if left { -1 } else { 1 };
+                s.weather = (s.weather + 1 + d).rem_euclid(n + 1) - 1;
+            }
+            0 if enter => {
+                let w = s.weather;
+                s.pending.push(Action::Weather(w));
+            }
+            1 if enter => (s.page, s.cursor) = (Page::Cheats, 0),
+            2 if enter => (s.page, s.cursor) = (Page::Main, 0),
+            _ => {}
+        },
+        Page::Cheats if enter => {
+            let i = s.cursor;
+            if i >= cheat_count() {
+                (s.page, s.cursor) = (Page::World, 1);
+            } else {
+                s.pending.push(Action::Cheat(i, !cheat_active(i)));
+            }
+        }
         Page::Player if s.cursor == 7 && (left || right || enter) => {
             s.pending.push(Action::Time(if left { 23 } else { 1 }));
         }
@@ -306,6 +361,27 @@ pub fn tick() {
                     call_regs(ADVANCE_TIME, 0, 0, 0, 0, 0, &[secs.to_bits(), 1, 0, 1]);
                     msg = Some(format!("time now {}", clock()));
                 }
+                Action::Weather(w) => {
+                    if w < 0 {
+                        *(WEATHER_FORCED as *mut u32) = 0;
+                        msg = Some("weather back to normal".into());
+                    } else if (w as usize) < weather_count() {
+                        call_regs(WEATHER_SET, w as u32, 1, 0, 0, 0, &[]);
+                        msg = Some(format!("weather: {}", weather_name(w as usize)));
+                    }
+                }
+                Action::Cheat(i, on) => {
+                    if i < cheat_count() {
+                        let rec = (CHEATS + i * 0x68) as u32;
+                        if on {
+                            call_regs(CHEAT_ON, 0, 0, 0, rec, 0, &[1]);
+                        } else {
+                            call_regs(CHEAT_OFF, 0, 0, 0, rec, 0, &[1, 0]);
+                        }
+                        let state = if cheat_active(i) { "on" } else { "off" };
+                        msg = Some(format!("cheat {}: {state}", cheat_name(i)));
+                    }
+                }
             }
         }
     }
@@ -320,7 +396,7 @@ pub fn tick() {
             }
         }
     }
-    full_magazines(p, ammo);
+    ammo_flags(ammo);
     if let Some(m) = msg {
         crate::log(&format!("menu: {m}"));
         lock().status = m;
@@ -332,45 +408,59 @@ fn clock() -> String {
     format!("{h:02}:{m:02}")
 }
 
-/// The most each weapon's magazine has held, by (weapon instance, weapon info).
-static MAGAZINES: Mutex<BTreeMap<(usize, usize), i32>> = Mutex::new(BTreeMap::new());
+static AMMO_SET: AtomicBool = AtomicBool::new(false);
 
-/// Infinite ammo: no weapon's magazine goes below the most it has held, so it
-/// never runs out or needs reloading.
-fn full_magazines(p: usize, on: bool) {
-    let mut seen = MAGAZINES.lock().unwrap_or_else(|e| e.into_inner());
-    if !on {
-        seen.clear();
-        return;
-    }
-    let mut current = Vec::new();
+/// Infinite ammo: the game's own Infinite_Ammo (reserve and grenades) and Unlimited
+/// Clip flags, set directly so no cheat is recorded. Cleared again only if we set them.
+fn ammo_flags(on: bool) {
+    let f = CHEAT_FLAGS as *mut u32;
     unsafe {
-        let head = rd(p + INVENTORY) as usize;
-        let mut item = head;
-        for _ in 0..64 {
-            if item == 0 {
-                break;
+        if on {
+            if *f & AMMO_FLAGS != AMMO_FLAGS {
+                *f |= AMMO_FLAGS;
             }
-            let w = rd(item + 0xC4) as usize;
-            if w != 0 {
-                let key = (w, rd(w + WEAPON_INFO) as usize);
-                current.push(key);
-                let clip = (w + WEAPON_CLIP) as *mut i32;
-                let most = seen.entry(key).or_insert(*clip);
-                if *clip > *most {
-                    *most = *clip;
-                } else if *clip < *most {
-                    *clip = *most;
-                }
-            }
-            item = rd(item + 0xB4) as usize;
-            if item == head {
-                break;
-            }
+            AMMO_SET.store(true, Ordering::Relaxed);
+        } else if AMMO_SET.swap(false, Ordering::Relaxed) {
+            *f &= !AMMO_FLAGS;
         }
     }
-    // Forget weapons no longer carried (their instances are freed and reused).
-    seen.retain(|k, _| current.contains(k));
+}
+
+/// A NUL-terminated string at `p` (read safely), or "?".
+fn cstr(p: usize) -> String {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut b = [0u8; 48];
+    let mut n = 0usize;
+    let ok = p != 0
+        && unsafe { ReadProcessMemory(GetCurrentProcess(), p as *const _, b.as_mut_ptr().cast(), b.len(), &mut n) }
+            != 0;
+    if !ok {
+        return "?".into();
+    }
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    String::from_utf8_lossy(&b[..end]).into()
+}
+
+fn cheat_count() -> usize {
+    (unsafe { rd(CHEAT_COUNT) } as usize).min(256)
+}
+
+fn cheat_name(i: usize) -> String {
+    cstr(unsafe { rd(CHEATS + i * 0x68 + 0x10) } as usize)
+}
+
+fn cheat_active(i: usize) -> bool {
+    unsafe { *((CHEATS + i * 0x68 + 1) as *const u8) != 0 }
+}
+
+fn weather_count() -> usize {
+    (unsafe { rd(WEATHER_COUNT) } as usize).min(64)
+}
+
+fn weather_name(i: usize) -> String {
+    let base = unsafe { rd(WEATHERS) } as usize;
+    if base == 0 { "?".into() } else { cstr(unsafe { rd(base + i * 0xD8) } as usize) }
 }
 
 static MEMORY_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -473,6 +563,8 @@ fn draw() {
         let title = match s.page {
             Page::Main => "SR2 Decomp menu",
             Page::Player => "Player options",
+            Page::World => "World",
+            Page::Cheats => "Game cheats (may affect achievements)",
             Page::Logging => "Mission logging",
         };
         (title, items(&s), s.cursor, s.status.clone())
@@ -488,7 +580,10 @@ fn draw() {
     let lh = font_height() * ts + 2.0 * u;
     let pad = 6.0 * u;
     let w = 220.0 * u;
-    let h = lh * (list.len() as f32 + 3.4) + pad * 2.0;
+    // Long pages show a window of rows around the cursor.
+    let start = cursor.saturating_sub(WINDOW / 2).min(list.len().saturating_sub(WINDOW));
+    let shown = list.len().min(WINDOW);
+    let h = lh * (shown as f32 + 3.4) + pad * 2.0;
     let x = vw - w - 12.0 * u;
     let y = vh - h - 12.0 * u;
     let r = |x: f32, y: f32, w: f32, h: f32| rect(x as i32, y as i32, w as i32, h as i32);
@@ -509,7 +604,7 @@ fn draw() {
         color(255, 255, 255, 255);
         text(tx, ty, ts, title);
         ty += lh * 1.3;
-        for (i, item) in list.iter().enumerate() {
+        for (i, item) in list.iter().enumerate().skip(start).take(shown) {
             if i == cursor {
                 color(60, 140, 255, 140);
                 r(x + pad * 0.5, ty - u, w - pad, lh);
