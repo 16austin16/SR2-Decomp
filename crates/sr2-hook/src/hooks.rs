@@ -2118,6 +2118,7 @@ pub fn install_all() {
         crate::gfx_cmd::install();
         crate::texguard::install();
         crate::vint_lua::install();
+        crate::frame::install();
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }

@@ -43,7 +43,7 @@ Names are in `docs/functions.csv` (subsystem `app`). Threads are described in 07
 
 `game_state_frame` (0x697780) runs a stack of states. The stack is `0x144E760[depth]`, with depth in `0xE96B7C`. The pending state is `0x144E75C`; `0x140BBCA` means push and `0x140BBC9` means pop. Per-state flags are in `0x144E750[state]`.
 
-1. If a change is pending, call the current state's **exit** (`game_state_exit` 0x6973E0, table `0x697458`, index state-1). Exit is skipped when the new state is pushed on top.
+1. If a change is pending, call the current state's **exit** (`game_state_exit` 0x6973E0, table `0x697458`, index state-1). Exit is skipped when the new state is pushed on top. The exit gets `EAX` = state − 1 and one cdecl argument: the pending state, or on a pop the stack entry below the top. It is also skipped while `0x2527BF6` is set (cleared on every transition).
 2. `game_state_apply` (0x697550) pushes, pops or replaces the stack.
 3. If an aspect ratio change was flagged (`0x252A26E`), call 0xB8A760(aspect > 1.45).
 4. Call the new state's **enter** (`game_state_enter` 0x697330, table `0x6973A8`). Enter is skipped on a pop.
