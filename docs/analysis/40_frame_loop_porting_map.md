@@ -37,7 +37,8 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
   - **0x93D150** (10.9%): now `world_spawn_do_frame` (spawn regions, spawn groups, traffic). It runs every frame; only with 0x2528B48 set and 0x2528B49 clear does it wait for 0xE96C00 >= 0xB first.
   - **0x9D7F90** (10.5%): now `humans_update_all`, which runs `human_update` (0x9D6D60) for every human on the list 0x217043C.
   - Now named: **0xB7CA80** `distant_peds_update` (7.5%), **0x4CF840** `weather_rain_effects_update` (7.5%), **0xA6C350** `triggers_do_frame` (6.9%), **0x4D9F20** `world_lighting_update` (6.1%), **0x9DF4C0** `world_focus_point_update` (6.0%).
-  - **0x437160** (5.9%): a fixed list of 17 updates in 0x408E90..0x45EBE0.
+  - **0x437160** (5.9%): now `ai_global_do_frame`. It runs 14 global AI updates (not 17) in a fixed order: `ai_order_counters_rebase`, `vehicle_seat_reservations_expire`, the three `ai_spot_users_*`, `ai_pairs_expire`, `ai_groups_release_finished`, `ai_nearby_humans_scan`, `ai_round_robin_advance`, `ai_object_interaction_update`, `ai_human_list_prune`, `ai_vehicle_assignments_prune`, `ai_vehicle_records_prune` and `ai_timesliced_update` (4 AI humans per frame).
+  - Most of these roles are inferred from the lists they keep (see each row's note in `functions.csv`).
 
 ### `game_frame_tick` (0x520450), Rust (`frame.rs`)
 
@@ -122,7 +123,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1c | `humans_ai_update` 0x9A71B0 | mapped | 10.5% | 1 (gfx_cmd) | 15 |
 | sim_frame:1c | — 0x9305F0 | unmapped | 5.8% |  |  |
 | sim_frame:1c | — 0x935820 | unmapped | 5.1% | 1 (streamman) |  |
-| sim_frame:1c | — 0x437160 | unmapped | 5.9% |  |  |
+| sim_frame:1c | `ai_global_do_frame` 0x437160 | mapped | 5.9% |  | 21, 40 |
 | sim_frame:1c | — 0x55BA40 | unmapped | 4.4% | 1 (rsched) |  |
 | sim_frame:1c | — 0x56BD60 | unmapped | 3.1% | 8 (gfx_cmd) |  |
 | sim_frame:1c | — 0x4B11F0 | unmapped | 0.4% | 4 (mempool) |  |
