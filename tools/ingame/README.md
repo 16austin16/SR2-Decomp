@@ -16,4 +16,15 @@ The hook DLL has a menu (crates/sr2-hook/src/menu.rs) in the bottom-right corner
 
 While logging is on, a thread samples where the game and render threads are about once a millisecond (crates/sr2-hook/src/missionlog.rs). A new section starts at every marked point, mission number change, and change of the game's own active mission. Sections are appended to `sr2-mission.log` in the game folder. `python tools/mission_report.py <log>` lists the busiest functions per section, and names the unnamed ones by the nearest named function below them.
 
+## Display: any resolution and borderless (`sr2-hook.ini`)
+
+The hook DLL reads `sr2-hook.ini` in the game folder (written with these defaults if missing):
+
+```
+display = borderless      # borderless | fullscreen | windowed | game (leave it to the game's options)
+resolution = desktop      # desktop, or WIDTHxHEIGHT such as 2560x1440
+```
+
+At load the DLL makes the process DPI-aware and writes the resolution and fullscreen flag into `settings.dat` before the game reads it (backup: `settings.dat.bak`), since the game only picks its 4:3 or widescreen UI at boot. Borderless is windowed mode with the window restyled to a bare popup covering the screen. Changing the resolution in the game's own options is overridden at the next start while `display` is not `game`. Code: crates/sr2-hook/src/display.rs.
+
 Disassembly helpers in `tools/`: `x86dis.py <hexaddr> <hexlen>`, `xrefs.py <hexaddr>...`, `check_prologues.py` (checks the mempool detour prologues), `cmp_fileopen.py` (compares per-call log results between two runs). They need `pip install --user capstone` and must run without `-I`.

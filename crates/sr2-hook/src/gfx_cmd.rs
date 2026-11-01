@@ -1374,6 +1374,7 @@ extern "C" fn execute_hook() {
         Mode::Rust => deferred_execute(&mut Mem::live()),
     }
     crate::missionlog::render_tick();
+    crate::display::render_tick();
 }
 
 static REPLAYS: AtomicU32 = AtomicU32::new(0);

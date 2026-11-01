@@ -112,8 +112,10 @@ unsafe fn rd(p: usize) -> u32 {
     unsafe { *(p as *const u32) }
 }
 
+/// Pressed this frame (and down, so a stale flag cannot open the menu).
 fn pressed(scan: usize) -> bool {
-    unsafe { *((KEYS + scan * 12 + 1) as *const u8) != 0 }
+    let k = KEYS + scan * 12;
+    unsafe { *((k + 1) as *const u8) != 0 && *(k as *const u8) != 0 }
 }
 
 fn items(s: &State) -> Vec<String> {
@@ -417,10 +419,13 @@ const SCREEN_H: usize = 0x022F_DC20; // i32
 const RESET_VIEWPORT: usize = 0x00D1_4D90; // the viewport to the whole target
 const SET_VIEWPORT: usize = 0x00D1_49B0; // EDI = y, cdecl (x, w, h, no_clamp)
 const SET_SCISSOR: usize = 0x00D1_4D20; // EDI = left, ESI = right, cdecl (top, bottom)
-/// The 2D calls draw in a 640 x 480 space stretched over the screen, so the menu
-/// keeps its size and place at any resolution.
-const VIRTUAL_W: f32 = 640.0;
-const VIRTUAL_H: f32 = 480.0;
+/// The 2D calls draw in the HUD's design space stretched over the screen: 640 x 480
+/// at 4:3, 1280 x 720 in widescreen (the same aspect 1.45 cut the game uses to pick
+/// its UI layouts). The menu is laid out in 640 x 480 units and scaled to that space,
+/// so it keeps its size on screen at any resolution.
+fn virtual_size(sw: i32, sh: i32) -> (f32, f32) {
+    if sw as f32 / sh as f32 > 1.45 { (1280.0, 720.0) } else { (640.0, 480.0) }
+}
 const TEXT_SCALE: f32 = 0.3;
 
 fn font_height() -> f32 {
@@ -449,14 +454,15 @@ fn draw() {
     if sw <= 0 || sh <= 0 {
         return;
     }
-    let u = 1.0;
-    let ts = TEXT_SCALE;
-    let lh = font_height() * ts + 2.0;
-    let pad = 6.0;
-    let w = 220.0;
+    let (vw, vh) = virtual_size(sw, sh);
+    let u = vh / 480.0;
+    let ts = TEXT_SCALE * u;
+    let lh = font_height() * ts + 2.0 * u;
+    let pad = 6.0 * u;
+    let w = 220.0 * u;
     let h = lh * (list.len() as f32 + 3.4) + pad * 2.0;
-    let x = VIRTUAL_W - w - 12.0;
-    let y = VIRTUAL_H - h - 12.0;
+    let x = vw - w - 12.0 * u;
+    let y = vh - h - 12.0 * u;
     let r = |x: f32, y: f32, w: f32, h: f32| rect(x as i32, y as i32, w as i32, h as i32);
     let ctx = crate::gfx_cmd::thread_context() as usize;
     let saved: [i32; 10] = std::array::from_fn(|i| unsafe { rd(ctx + if i < 6 { 8 + i * 4 } else { 0x44 + (i - 6) * 4 }) } as i32);

@@ -22,6 +22,7 @@ mod caller_targets;
 mod callers;
 mod crash;
 mod detour;
+mod display;
 mod gfx_cmd;
 mod hddio;
 mod hooks;
@@ -53,6 +54,7 @@ extern "system" fn DllMain(_module: HINSTANCE, reason: u32, _reserved: *mut c_vo
         if base != SR2_IMAGE_BASE {
             log("warning: exe is not at its preferred base; hooks will be disabled");
         } else {
+            display::early();
             // Starts once the loader lock is released, racing SteamStub's decryption.
             std::thread::spawn(hooks::install_early);
         }
