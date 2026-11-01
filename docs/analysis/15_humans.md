@@ -427,7 +427,7 @@ Constants: 0.5 `[0xE5BF70]`, 1.25 `[0xE5BF48]`, 0.0 `[0xDD32C0]`, 0.25 `[0xE5BFC
    - If such a slot is found: when its index (slot − 8) is in [0, `[0x2527D6C]`), s = 0xCEC570(`EAX` = `[0x15B8800 + idx × 0x54 + 0xC]`), the animation length; then s ×= m.
    - If no slot is found, s stays 0.5 and is **not** multiplied.
 3. t = f32(+0x628 + `[0xE8437C]` / s).
-   - **Quirk:** the code computes clamp(t, 0, 1), but **stores the unclamped t** to +0x628. Keep that.
+   - **Correction:** an earlier version said the unclamped t is stored. It is not: `fst [+0x628]` at 0x99A63C writes the unclamped t, but the clamped value goes to [esp+0x14] at 0x99A662, and after `push ebp` that slot is reloaded as [esp+0x18] and stored over +0x628 at 0x99A66B. The final value is clamp(t, 0, 1).
 4. Return unless p = 0x96F280(cdecl human) ≥ 0.85 (`[0xE5C0E8]`, a double).
 5. 0x717AC0 / 0x7183D0 as in step 1; 0x9ACB10(cdecl human, 0); +0xCC |= 0x400.
 6. If +0xCC bit 0x20000000 and +0xB70 bit 0x80: 0x5B65D0(`ECX` = human). Otherwise, if owned and (+0x3CC ≠ 2 or 0x43F100() is false): 0x96E7E0(`EDI` = human).
@@ -463,7 +463,7 @@ Constants: 4.0 `[0xE5C270]`, −3.0 `[0xE5CE70]`, 5.0 `[0xE5C130]`, 0.85 `[0xE5C
 1. The dispatcher, `human_state_set`, and states 1, 4 and 8.
 2. States 2 and 3.
 3. State 6, then 5, then 7.
-4. Throughout, keep the f32 store after each arithmetic step, and the double constants (0.1, 0.85) compared against f32 values. Keep state 7 / 0x12's unclamped store.
+4. Throughout, keep the f32 store after each arithmetic step, and the double constants (0.1, 0.85) compared against f32 values. (State 7 / 0x12 ends with the clamped t in +0x628; see the correction above.)
 
 ## Open
 
