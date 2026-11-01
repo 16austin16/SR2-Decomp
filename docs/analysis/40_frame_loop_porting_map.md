@@ -31,7 +31,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
   - the render snapshot helpers (0x6255A0, 0x46CCD0, 0xD08310, 0x51A4A0, 0xBE4170).
 
   It is the next skeleton to port. `render_thread_wait_frame` and the render-list swap are the parts that need care, because both threads touch them.
-- `sim_frame` is the large one: 144 calls; 2 of the frame-loop calls are still unmapped (0x6AB6B0, 0x55BA40), listed in "The last unidentified frame-loop calls". The remaining ones are small (under 0.3% reach) except 0x55BA40 (0x9A9CE0 is now `humans_flagged_update_all`; 0x4DA880 is mapped); see "Sections :1c, :4 and :5". The unmapped calls with the largest reach are the next naming targets:
+- `sim_frame` is the large one: 144 calls; 2 of the frame-loop calls are still unmapped (0x6AB6B0, 0x55BA40), listed in "The last unidentified frame-loop calls". The remaining ones are small (under 0.3% reach) except 0x55BA40 (0x9A9CE0 is now `humans_flagged_update_all`; 0x4DA880 is in Rust); see "Sections :1c, :4 and :5". The unmapped calls with the largest reach are the next naming targets:
   - **0x5053B0** (17.4%): now `effect_objects_do_frame`. It runs `effect_objects_budget_bodies` (Havok bodies for the 50 most important effect-object parts), then `effect_object_update` on each object.
   - **0x6A5BB0** (11.1%): now `mission_fail_flow_do_frame`. It switches on the failure reason 0x1450380 (doc 22) and handles fades, revive / teleport, `cutscene_play`, `mission_end` and the stronghold cancel dialog.
   - **0x93D150** (10.9%): now `world_spawn_do_frame` (spawn regions, spawn groups, traffic). It runs every frame; only with 0x2528B48 set and 0x2528B49 clear does it wait for 0xE96C00 >= 0xB first.
