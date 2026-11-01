@@ -2690,7 +2690,92 @@ extern "C" fn nav_detour_hulls_update() {
 keep_ecx_edx!(nav_timesliced_jobs_update_thunk, nav_timesliced_jobs_update);
 keep_ecx_edx!(nav_detour_hulls_update_thunk, nav_detour_hulls_update);
 
+// --- physics_frame_time (0x6FF860) -------------------------------------------------------------------
+
+// 17_physics.md: the simulated time this frame, a whole number of physics steps. Unchanged frame
+// counter -> the cached 0x2527DCC. Else step = f32(0x2527DA4 / 0xE8ECAC); n = floor(f32(f32(carry
+// 0x2527DC8 + dt 0xE8437C) / step)) truncated to 64 bits (low 32 kept); n is clamped to
+// physics_max_substeps (0x6F5D60, called again for the clamp) with an UNSIGNED compare; result
+// f32(n as u32 * step). Returned on ST0 (a Rust extern "C" f32 return on i686).
+const PHYSICS_FRAME_TIME_FN: usize = 0x006F_F860;
+
+/// The game's floorf wrapper (cdecl f32 -> ST0), read back at full precision.
+unsafe fn game_floor(v: f32) -> f64 {
+    let mut out = 0f64;
+    unsafe {
+        std::arch::asm!(
+            "push edi",
+            "push {v}",
+            "call {f}",
+            "add esp, 4",
+            "pop edi",
+            "fstp qword ptr [edi]",
+            v = in(reg) v.to_bits(),
+            f = in(reg) 0x0042_7600usize,
+            in("edi") &mut out as *mut f64,
+            clobber_abi("C"),
+        );
+    }
+    out
+}
+
+extern "C" fn physics_frame_time() -> f32 {
+    unsafe {
+        if rd(FRAME_COUNTER) == rd(0x00E8_ECBC) {
+            return *(0x0252_7DCC as *const f32);
+        }
+        let f = |a: usize| *(a as *const f32) as f64;
+        let step = (f(PHYSICS_STEP) / f(SLOW_MOTION)) as f32;
+        let a = (f(0x0252_7DC8) + f(0x00E8_437C)) as f32;
+        let q = (a as f64 / step as f64) as f32;
+        let fl = game_floor(q);
+        let mut n = if fl.abs() < 9.2e18 { fl as i64 as u32 } else { 0 };
+        if n >= call_regs(0x006F_5D60, 0, 0, 0, 0, 0, &[]) {
+            n = call_regs(0x006F_5D60, 0, 0, 0, 0, 0, &[]);
+        }
+        (n as f64 * step as f64) as f32
+    }
+}
+
+static PFT_ORIGINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PFT_CALLS: AtomicU32 = AtomicU32::new(0);
+static PFT_MISMATCHES: AtomicU32 = AtomicU32::new(0);
+
+/// The Rust version, shadow-checked against a relocated copy of the original for the first 5000
+/// calls (it only reads state, so both can run).
+extern "C" fn physics_frame_time_checked() -> f32 {
+    let ours = physics_frame_time();
+    let n = PFT_CALLS.fetch_add(1, Ordering::Relaxed);
+    let orig = PFT_ORIGINAL.load(Ordering::Relaxed);
+    if orig != 0 && n < 5000 {
+        let theirs = unsafe { call_f32(orig) };
+        if theirs.to_bits() != ours.to_bits() {
+            let m = PFT_MISMATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+            if m <= 10 {
+                log(&format!("frame: physics_frame_time mismatch (call {n}): original {theirs}, Rust {ours}"));
+            }
+            return theirs;
+        }
+    }
+    if n == 5000 {
+        log(&format!("frame: physics_frame_time: 5000 calls shadowed, {} mismatched", PFT_MISMATCHES.load(Ordering::Relaxed)));
+    }
+    ours
+}
+
+#[unsafe(naked)]
+extern "C" fn physics_frame_time_thunk() {
+    std::arch::naked_asm!("push ecx", "push edx", "call {f}", "pop edx", "pop ecx", "ret", f = sym physics_frame_time_checked)
+}
+
 pub fn install() {
+    if let Ok(copy) = unsafe { detour::relocate(PHYSICS_FRAME_TIME_FN, &PHYSICS_FRAME_TIME_BODY, &[0x49, 0x73, 0x7C]) } {
+        PFT_ORIGINAL.store(copy, Ordering::Relaxed);
+    }
+    match unsafe { detour::replace(PHYSICS_FRAME_TIME_FN, &PHYSICS_FRAME_TIME_BODY, physics_frame_time_thunk as extern "C" fn() as usize) } {
+        Ok(()) => log("frame: replaced physics_frame_time @ 0x6ff860 with Rust"),
+        Err(e) => log(&format!("frame: replacing physics_frame_time failed: {e:?}")),
+    }
     match unsafe { detour::replace(0x00A0_BF10, &DETOUR_HULLS_BODY, nav_detour_hulls_update_thunk as extern "C" fn() as usize) } {
         Ok(()) => log("frame: replaced nav_detour_hulls_update @ 0xa0bf10 with Rust"),
         Err(e) => log(&format!("frame: replacing nav_detour_hulls_update failed: {e:?}")),
@@ -3512,4 +3597,19 @@ const DETOUR_HULLS_BODY: [u8; 167] = [
     0x83, 0xC4, 0x08, 0xC3, 0x80, 0x66, 0x08, 0xFD, 0x5F, 0x5E, 0x5B, 0x83, 0xC4, 0x08, 0xC3, 0x84,
     0xDB, 0x75, 0x09, 0xE8, 0xE8, 0xFE, 0xFF, 0xFF, 0x84, 0xC0, 0x75, 0xB6, 0x5F, 0x5E, 0x5B, 0x83,
     0xC4, 0x08, 0xE9, 0x39, 0xD9, 0xFF, 0xFF,
+];
+
+const PHYSICS_FRAME_TIME_BODY: [u8; 177] = [
+    0xA1, 0xC0, 0xA3, 0x52, 0x02, 0x83, 0xEC, 0x18, 0x3B, 0x05, 0xBC, 0xEC, 0xE8, 0x00, 0x56, 0x0F,
+    0x84, 0x91, 0x00, 0x00, 0x00, 0xD9, 0x05, 0xA4, 0x7D, 0x52, 0x02, 0x51, 0xD8, 0x35, 0xAC, 0xEC,
+    0xE8, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x05, 0xC8, 0x7D, 0x52, 0x02, 0xD8, 0x05, 0x7C, 0x43,
+    0xE8, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0x74, 0x24, 0x10, 0xD9, 0x5C,
+    0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x1C, 0x24, 0xE8, 0x52, 0x7D, 0xD2, 0xFF, 0xD9, 0x7C,
+    0x24, 0x0C, 0x83, 0xC4, 0x04, 0x0F, 0xB7, 0x44, 0x24, 0x08, 0x0D, 0x00, 0x0C, 0x00, 0x00, 0x89,
+    0x44, 0x24, 0x10, 0xD9, 0x6C, 0x24, 0x10, 0xDF, 0x7C, 0x24, 0x10, 0x8B, 0x74, 0x24, 0x10, 0xD9,
+    0x6C, 0x24, 0x08, 0xE8, 0x88, 0x64, 0xFF, 0xFF, 0x3B, 0xF0, 0x72, 0x07, 0xE8, 0x7F, 0x64, 0xFF,
+    0xFF, 0x8B, 0xF0, 0x85, 0xF6, 0x89, 0x74, 0x24, 0x10, 0xDB, 0x44, 0x24, 0x10, 0x7D, 0x06, 0xD8,
+    0x05, 0xD8, 0xBF, 0xE5, 0x00, 0xD8, 0x4C, 0x24, 0x0C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24,
+    0x10, 0x5E, 0x83, 0xC4, 0x18, 0xC3, 0xD9, 0x05, 0xCC, 0x7D, 0x52, 0x02, 0x5E, 0x83, 0xC4, 0x18,
+    0xC3,
 ];
