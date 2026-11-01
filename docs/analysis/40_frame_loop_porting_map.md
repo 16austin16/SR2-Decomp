@@ -36,7 +36,8 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
   - **0x6A5BB0** (11.1%): now `mission_fail_flow_do_frame`. It switches on the failure reason 0x1450380 (doc 22) and handles fades, revive / teleport, `cutscene_play`, `mission_end` and the stronghold cancel dialog.
   - **0x93D150** (10.9%): now `world_spawn_do_frame` (spawn regions, spawn groups, traffic). It runs every frame; only with 0x2528B48 set and 0x2528B49 clear does it wait for 0xE96C00 >= 0xB first.
   - **0x9D7F90** (10.5%): now `humans_update_all`, which runs `human_update` (0x9D6D60) for every human on the list 0x217043C.
-  - **0xB7CA80** (7.5%), **0x4CF840** (7.5%), **0xA6C350** (6.9%), **0x4D9F20** (6.1%), **0x9DF4C0** (6.0%), **0x437160** (5.9%, a fixed list of 17 updates in 0x408E90..0x45EBE0).
+  - Now named: **0xB7CA80** `distant_peds_update` (7.5%), **0x4CF840** `weather_rain_effects_update` (7.5%), **0xA6C350** `triggers_do_frame` (6.9%), **0x4D9F20** `world_lighting_update` (6.1%), **0x9DF4C0** `world_focus_point_update` (6.0%).
+  - **0x437160** (5.9%): a fixed list of 17 updates in 0x408E90..0x45EBE0.
 
 ### `game_frame_tick` (0x520450), Rust (`frame.rs`)
 
@@ -103,7 +104,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1b | — 0xA1CCC0 | unmapped | 2.4% |  |  |
 | sim_frame:1b | — 0xA0AFF0 | unmapped | 2.6% |  |  |
 | sim_frame:1b | — 0xA0BF10 | unmapped | 2.0% |  |  |
-| sim_frame:1b | — 0xA6C350 | unmapped | 6.9% | 5 (gfx_cmd, streamman) |  |
+| sim_frame:1b | `triggers_do_frame` 0xA6C350 | mapped | 6.9% | 5 (gfx_cmd, streamman) | 09, 40 |
 | sim_frame:1b | — 0xA58EE0 | unmapped | 2.0% |  |  |
 | sim_frame:1b | — 0x501FB0 | unmapped | 4.2% | 37 (gfx_cmd, hddio, streamman) |  |
 | sim_frame:1b | `mission_fail_flow_do_frame` 0x6A5BB0 | mapped | 11.1% | 18 (gfx_cmd, rsched, streamman) | 40 |
@@ -139,7 +140,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:4 | — 0x9FA620 | unmapped | 2.2% |  |  |
 | sim_frame:4 | `chunk_object_anims_update` 0x91C6C0 | mapped | 0.2% |  | 05 |
 | sim_frame:4 | — 0xB80070 | unmapped | 1.1% |  |  |
-| sim_frame:4 | — 0xB7CA80 | unmapped | 7.5% |  |  |
+| sim_frame:4 | `distant_peds_update` 0xB7CA80 | mapped | 7.5% |  | 40 |
 | sim_frame:4 | — 0x9DF820 | unmapped | 1.6% |  |  |
 | sim_frame:4 | `job_worker_wake` 0xBF3760 | mapped | 0.0% |  | 11 |
 | sim_frame:4 | `garage_exit_tutorial` 0x554E20 | mapped | 7.2% | 2 (gfx_cmd) | 30 |
@@ -176,7 +177,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:6,7 | — 0x4DE770 | unmapped | 0.9% | 1 (mempool) |  |
 | sim_frame:6,7 | — 0x4D6850 | unmapped | 0.0% |  |  |
 | sim_frame:6,7 | — 0x4E66A0 | unmapped | 5.0% |  |  |
-| sim_frame:6,7 | — 0x4CF840 | unmapped | 7.5% | 2 |  |
+| sim_frame:6,7 | `weather_rain_effects_update` 0x4CF840 | mapped | 7.5% | 2 | 33, 40 |
 | sim_frame:6,7 | — 0x4CA750 | unmapped | 2.9% | 8 (gfx_cmd, mempool) |  |
 | sim_frame:6,7 | — 0x503AE0 | unmapped | 1.8% |  |  |
 | sim_frame:6,7 | — 0x4CBFC0 | unmapped | 0.2% |  |  |
@@ -189,7 +190,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:6,7 | — 0x4525E0 | unmapped | 0.2% |  |  |
 | sim_frame:6,7 | — 0x452820 | unmapped | 0.0% |  |  |
 | sim_frame:6,7 | — 0x453120 | unmapped | 2.6% |  |  |
-| sim_frame:6,7 | — 0x9DF4C0 | unmapped | 6.0% | 13 (gfx_cmd) |  |
+| sim_frame:6,7 | `world_focus_point_update` 0x9DF4C0 | mapped | 6.0% | 13 (gfx_cmd) | 19, 40 |
 | sim_frame:6,7 | — 0x926170 | unmapped | 5.0% |  |  |
 | sim_frame:6,7 | — 0x4C6CD0 | unmapped | 1.7% |  |  |
 | sim_frame:6,7 | — 0x4C35C0 | unmapped | 2.3% | 4 (gfx_cmd) |  |
@@ -209,7 +210,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:6,7 | `world_teleport_load_update` 0x4BC420 | mapped | 7.7% | 21 (gfx_cmd, hddio, streamman) | 40 |
 | sim_frame:6,7 | — 0x4C4210 | unmapped | 1.1% |  |  |
 | sim_frame:6,7 | — 0x91E9F0 | unmapped | 2.4% |  |  |
-| sim_frame:6,7 | — 0x4D9F20 | unmapped | 6.1% | 3 |  |
+| sim_frame:6,7 | `world_lighting_update` 0x4D9F20 | mapped | 6.1% | 3 | 33, 40 |
 | sim_frame:6,7 | — 0x4C2DD0 | unmapped | 1.0% |  |  |
 | sim_frame:6,7 | — 0x683E00 | unmapped | 0.0% |  |  |
 | sim_frame:6,7 | — 0x9E99F0 | unmapped | 0.0% |  |  |
