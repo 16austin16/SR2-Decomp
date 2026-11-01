@@ -371,20 +371,21 @@ fn full_magazines(p: usize, on: bool) {
 
 static MEMORY_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// Address space in use, MB: the game is not large-address-aware, so it has 2 GB.
-fn memory_mb() -> u64 {
+/// Address space (in use, total) in MB: 2 GB total unless the exe is large-address-aware.
+fn memory() -> (u64, u64) {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
-        return 0;
+        return (0, 0);
     }
-    (m.ullTotalVirtual - m.ullAvailVirtual) >> 20
+    ((m.ullTotalVirtual - m.ullAvailVirtual) >> 20, m.ullTotalVirtual >> 20)
 }
 
 fn log_memory() {
     if MEMORY_FRAMES.fetch_add(1, Ordering::Relaxed) % 3600 == 0 {
-        crate::log(&format!("memory: {} MB of address space in use", memory_mb()));
+        let (used, total) = memory();
+        crate::log(&format!("memory: {used} of {total} MB of address space in use"));
     }
 }
 
@@ -496,7 +497,7 @@ fn draw() {
         color(150, 150, 150, 255);
         text(tx, ty, ts * 0.8, &format!("log: {} | point {} | {}", l.mission_label, l.point, l.samples_text));
         ty += lh * 0.8;
-        text(tx, ty, ts * 0.8, &format!("{status}   [mem {} MB]", memory_mb()));
+        text(tx, ty, ts * 0.8, &format!("{status}   [mem {} / {} MB]", memory().0, memory().1));
         color(255, 255, 255, 255);
         let [x0, _x1, y0, _y1, vw, vh, l, rr, t, b] = saved;
         call_regs(SET_VIEWPORT, 0, 0, 0, 0, y0 as u32, &[x0 as u32, vw as u32, vh as u32, 1]);
