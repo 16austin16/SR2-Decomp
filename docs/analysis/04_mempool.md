@@ -172,3 +172,105 @@ This is every pool method called over a boot plus save load (re-surveyed with th
 - The page tracker itself (`0xC152C0`, `0xC153A0`, `0xC15810`).
 
 These need a scenario that actually reaches them (multiplayer, other game modes) before they can be verified.
+
+## Address space: what uses it, and what can grow
+
+In the city the game uses about 1.76 GB of address space. The breakdown below is from static reading. Measuring it in-game is the next step (see "What to measure").
+
+### Fixed pools made at boot
+
+`game_init_allocators_and_packfiles` (0x51D800) `malloc`s every pool once, through the CRT heap. Each pool is `{base, size, name}` inside a static `mempool` object. None of these is freed or resized later. Sizes in MB:
+
+| MB | Pool (name string) | Notes |
+|---|---|---|
+| 282.6 | "debug_superchunk gpu" (one `malloc(0x11AA1000)`) | split by `init` (+0x44) into chunk1 gpu 64, chunk2 gpu 64, interiors gpu 10.2, chunk always loaded gpu 64, coop_player gpu 16.4. The mp_* gpu pools overlap the same block |
+| 114.0 | seven unnamed buffers, 0x2527324..0x252733C, + 1 KB at 0x2527340 | handed to `rsched_init_all` (0xA78E60) by `game_init_systems` (0x51F700): the six resource schedulers' memory (05_streamer) |
+| 98.0 | "audio - wavebank" | |
+| 52.6 | "debug_superchunk cpu" (`malloc(0x3498000)`) | split like the gpu block (mp_* cpu pools overlap it) |
+| 19.3 | "cust slots cpu" 2.2, "cust slots gpu" 16.4, "cust data" 0.7 | character customisation |
+| 16.5 | "animation" | made later, in `game_init_systems` |
+| 16.0 | unnamed `malloc(0x1000000)` | the result is discarded. Probably a deliberate gap so later heap blocks don't sit next to the pools; it is never freed |
+| 12.1 | "effects cpu" 1.1, "effects gpu" 10.9 | |
+| 11.8 | "perm mesh cpu" 1.1, "perm mesh gpu" 10.8 | |
+| 10.0 | "game_heap" | |
+| 9.0 / 9.0 | "font gpu" / "interface gpu" | |
+| 8.0 / 8.0 | "permanent" / "mp_competitive_allocators" | |
+| 6.0 / 6.0 | "perm texture gpu" / "tree gpu" | |
+| 3.5 | "vlib" | |
+| 3.0 | small / large prop pools (cpu 0.6, gpu 2.4) | 16 × 16 KB, 16 × 32 KB, 16 × 48 KB, 16 × 160 KB |
+| 1.4 | "audio - soundbank" | the only pool from `VirtualAlloc` |
+| ≤1 each | tag gpu, wieldable prop × 2, perm player cpu / gpu, vehicle, player normal map, activity asset gpu, dynamic water | |
+
+The fixed pools come to about **690 MB**. The small cpu pools ("perm texture cpu", "font cpu", "interface cpu", "anim_prop", "tree cpu", "permanent tag cpu", "activity asset cpu") are carved out of other pools with `static_mempool_base::alloc`, so they add nothing.
+
+The "gpu" pools hold the file data of textures and meshes in ordinary process memory. The GPU copy is made separately (next section).
+
+### Direct3D resources: a second copy in the process
+
+The game creates most of its textures and vertex buffers in `D3DPOOL_MANAGED` (pool argument 1). For a managed resource, the D3D9 runtime keeps its own full system-memory copy inside the game's 32-bit address space, in addition to the video memory copy. So every texture or mesh that is loaded costs its size about twice in address space: once in a "gpu" pool and once in d3d9's copy.
+
+Create calls, from a scan of every function that reads the device pointer `0x252A2D0`:
+
+| Function | Creates | Pool |
+|---|---|---|
+| `peg_texture_create` (0xD19720) | every peg bitmap: world, characters, UI | managed |
+| `gfx_create_texture_managed` (0xD195E0) | texture wrapper with the pool fixed to 1 | managed |
+| 0x492280 | L8 texture plus a `malloc`'d copy | managed |
+| 0x620BE0 | one A8 texture (W × H from a record at 0x27A3F1C) | managed |
+| 0x6E0075, 0x6E03A0, 0xD04CD0 (mesh vertex cache) | vertex buffers, usage WRITEONLY | managed |
+| 0xD02110, 0xD18810 | the 4 MB dynamic 16-bit index buffer (usage 0x208) | default |
+| 0x51CD80, 0x9EE8C0, 0x9EE950, 0x9F0CD0, 0xD1E9A0 | render targets, depth / shadow maps, cube maps | default |
+| `game_init_systems` | a 960 × 960 render target (`0x1408C78`) | default |
+
+The default-pool resources are video memory only. With WDDM drivers they may still map some address space, but they are created once.
+
+### Texture lifetime
+
+- **Create.** `bitmap_system_init` (0xC087E0) installs `peg_texture_create` / `peg_texture_release` as the bitmap callbacks `0x252A554` / `0x252A558`. The packfile and streaming code calls them as peg files load and unload.
+- **`peg_texture_create`** (0xD19720; `cdecl (peg entry *)`; the bitmap record is entry+4):
+  1. Map the format (0xD19610) and round the width up to a power of two.
+  2. If the record has no texture (+0x2C):
+     - `CreateTexture(w, h, levels, 0, format, MANAGED, &rec+0x2C, 0)`, or `CreateCubeTexture` (slot 0x64) when flag +0x12 bit 3 is set;
+     - lock each level (slot 0x4C), `memcpy` the data from the peg, unlock (0x50).
+  3. **The HRESULT is never checked.** If the create fails, +0x2C stays 0 and the first `LockRect` call goes through a null pointer. This is the crash at 0xD19922 / 0xD19936 that ended the long session with teleports.
+- **`peg_texture_release`** (0xD199B0): if +0x2C is set, `gfx_release_deferred(texture)` (0xD1FDD0), then clear +0x2C.
+- **`gfx_release_deferred`** (0xD1FDD0; also 0xD1FC90 and 0xD1FD30, identical, for other resource kinds):
+  - under CS `0x2301CCC`, push the pointer onto a vector at `0x252A2BC` (`gfx_release_queue_push`, 0xBD4A00);
+  - the vector is created on first use (0xCDF2C0).
+- **Drain.** `gfx_execute_commands` (render thread) takes the same lock, calls `Release` (vtable +8) on every queued pointer, then empties the vector (`gfx_release_queue_clear`, 0xBD4A80).
+
+So a released texture lives at most until the render thread's next pass. **There is no leak on this path.** The vector keeps its capacity, but that is a few KB.
+
+### Other allocation paths outside the pools
+
+- **CRT `malloc` (0xC96CFF)** has 96 call sites in 42 functions. 37 are the boot pools above. Most of the rest are CRT internals (locale, strdup, exceptions) or one-off init. Few run per frame: `gfx_ring_skip`, 0xD02110 / 0xD04CD0 (vertex cache), 0x492280, 0x531090, 0x7FF930, 0x821D10..0x827400 and 0xB8BDE0 are worth a hit count.
+- **`VirtualAlloc`** is called only by `virtual_mempool` (`alloc` commits inside its reserved range), the page tracker, `shadow_job_pool_init`, `allocator<>::ctor` (0x92E020), the soundbank pool, 0xC162E0 (`compacting_mempool_compact`) and the CRT small-block heap.
+- No `HeapAlloc` call outside the CRT.
+
+So the game's own memory is fixed after boot. What changes during a session is d3d9's managed copies (and the driver's own allocations) as chunks stream in and out.
+
+### Why a long session with teleports runs out
+
+1. Each teleport unloads one set of chunks and loads another, so many textures of different sizes are released and created in a burst.
+2. Each managed texture's system copy is a separate d3d9 allocation. After many bursts, the free address space is split into pieces too small for a large texture.
+3. A big `CreateTexture` then fails with out-of-memory, and `peg_texture_create` crashes on the null texture.
+
+The 4 GB large-address-aware flag roughly doubles the free space, which should push this a long way out. It does not fix the unchecked create.
+
+### What to change (for the hook)
+
+1. **Port `peg_texture_create` with the check.** It is small: format map (0xD19610), power-of-two width, create, lock / copy / unlock per level (per face for cubes). On a failed create, log it, leave +0x2C at 0 and skip the upload. A null texture binds as black instead of crashing.
+2. **Measure before going further.** Next to the existing "memory: X of Y MB" line, log:
+   - the largest free region (`VirtualQuery` walk), which shows fragmentation directly;
+   - live peg textures and their bytes (count in `peg_texture_create` / `peg_texture_release`).
+
+   If the live count stays flat across teleports while the largest free region shrinks, it is fragmentation. If the count climbs, something is creating without releasing, and the hits tell us which caller.
+3. Possibly later, for a much smaller address-space footprint: create peg textures in `D3DPOOL_DEFAULT` and upload through a temporary system-memory texture. That removes d3d9's copy but loses the automatic restore after a device reset (borderless windowed mode doesn't reset, so this may be fine).
+
+### The hook DLL
+
+Nothing in `sr2-hook` grows without bound:
+- **`missionlog`:** one `BTreeMap` per thread per section, keyed by EIP, cleared when the section is written. Its size is bounded by the number of distinct addresses hit.
+- **`gfx_cmd` shadow tapes:** filled only while a check is running, and taken right after.
+- **`menu` infinite ammo (`MAGAZINES`):** one entry per weapon instance seen while infinite ammo is on, cleared when it is turned off. Weapon instances come from a fixed pool, so this is small, but it never drops instances that were freed. Pruning keys not seen in the current inventory would keep it exact.
+- **Logs:** `sr2-hook.log` and `sr2-mission.log` are appended to and never trimmed (disk only, not memory).
