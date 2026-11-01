@@ -947,8 +947,7 @@ No arguments. Frame: `sub esp, 0x7C`; saves `EBX` / `EBP` / `ESI` / `EDI`. `EBX`
    1. Build a job descriptor on the stack: `[esp+0x28]` = 0, `[esp+0x40]` = 0, then (after the 3 pushes) the function 0x5250C0, kind 6, the thread id.
    2. Call 0x5250C0 directly with (&descriptor, two stack words). It is `jmp 0x511050`.
    3. If the job exists: `job->vtbl[+4]()` then `job->vtbl[+0xC]()` (arm and signal).
-3. **Render list fills, in order:** 0x4D7160, `[0x252A364]` = 0, 0xAE0FD0, 0x505350, 0x94DFA0, 0x4C85D0, 0x9556A0, 0x963750, 0x524060.
-   - Inferred from their neighbours: vehicles, effect objects, projectiles, glares, searchlights and humans add their render instances here.
+3. **Sky, dynamic lights, constants**, in order: 0x4D7160 (the sky), `[0x252A364]` = 0 (the light count), then the **dynamic light** collectors 0xAE0FD0 (vehicle headlights), 0x505350, 0x94DFA0, 0x4C85D0, 0x9556A0, 0x963750, each adding lights through the `render_light_add_*` helpers; then 0x524060 (sets the shader constants). (Corrected: these are not render-instance fills.)
 4. `render_viewport_setup`; copy 0x84 dwords of the thread view (context +0x58 → +0x740) to `0x277CBF0`.
 5. **Co-op second view.** When `0x2528B48` and `0x2528B49` are both 1, the split mode `0x21603CC` == 2, and a partner exists:
    1. 0x9DFA00(`ECX` = partner, `EAX` = &local, cdecl &local2).
@@ -980,7 +979,7 @@ No arguments. Frame: `sub esp, 0x7C`; saves `EBX` / `EBP` / `ESI` / `EDI`. `EBX`
 
 **Port:** keep the call order and the job fence. 0x523BD0 is the heavy part (the main and occlusion passes), so port this function as a skeleton calling originals.
 
-The roles of 0x4D7160, 0x523BD0, 0x4B3FF0, 0x4BA270, 0xA02550 and the fill calls in step 3 are not identified yet.
+The roles of 0x523BD0, 0x4B3FF0, 0x4BA270 and 0xA02550 are not identified yet; which light source each collector in step 3 handles (other than the headlights) is not checked.
 
 ## Open
 

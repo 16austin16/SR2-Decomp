@@ -103,12 +103,12 @@ cdecl (human, f32 dt), from `humans_update_all`. Frame about 0x314 bytes with a 
    1. clear bit 4; call vtbl +0x1C(1, 1);
    2. clear bit 1 of +0x570 → +0x130;
    3. if `ui_blocks_player()`: +0x80 |= 0x14.
-3. Unless +0x18E8 bit 1 is set:
-   1. **Look target.** Unless +0x1162 bit 1 is set: unless +0xC0 bit 6 is set, when there is no grab (+0x100C == 0) and not `cutscene_blocking()`: aim point = camera (player) or +0x4A0 (others) + `human_view_offset_point` × 1000; 0x960C30(100.0). Then 0x9B5C00(cdecl human, value).
+3. **+0x18E8 bit 1 test, right after the revive.** When set: step 4, then straight to the HUD (5) and the zone bit (6). Otherwise:
+   1. **Look target.** Unless +0x1162 bit 1 is set: unless +0xC0 bit 6 is set, when there is no grab (+0x100C == 0) and not `cutscene_blocking()`: aim point = camera (player) or +0x4A0 (others) + `human_view_offset_point` × 1000; 0x960C30(100.0). Then `human_set_look_at_point` (0x9B5C00; `AL` = bit 0 of 0x960C30's result, `EDX` = &point, `ESI` = 0, cdecl (human, f32)). With +0xC0 bit 0x40 set it is called with `AL` = 0, `EDX` = &human +0x564 and f32 −1.0 (`[0xE87998]`).
       - With +0x1162 bit 1 set instead: a bone transform (`rig_bone_transform`, `ECX` = rig +0xCE4) of the player position into +0x730..0x738.
    2. **AI or player.** If the human is not the local player's object (+0x44 handle check): `human_ai_think(human)`.
       - In single player or as host, when it has a firearm or melee weapon, is not dead and no cutscene holds the game: +0x11C8 = `human_find_aim_target(human, &+0x11CC)`.
-      - Return early, skipping steps 4-6.
+      - Online host: return early (after `human_ai_think`), skipping the HUD and the zone bit (5-6) too.
    3. **Local player:**
       1. Vehicle push-out: when the timer +0x14DC is set and has elapsed, and the vehicle is not a slow type 0x11, `vehicle_interaction_query`.
       2. Ragdoll / held object (+0x1163 bits 8 / 0x10, 0x9D6CF0, 0x9DA130, 0x9D6BF0, velocity × 20).
@@ -120,7 +120,7 @@ cdecl (human, f32 dt), from `humans_update_all`. Frame about 0x314 bytes with a 
       8. Low-health heartbeat: `audio_play_params_init` / `audio_play` with timer `0xEB7E14`, tint (0xD14700); stop it with `audio_voice_stop`.
       9. The vehicle-damage timer +0x14E0 and the hit flash +0x1560 (tint, `timer_remaining`).
       10. +0x1163 bit 0x40 (an enemy is targeting the player).
-4. **Not alive branch** (+0x18E8 bit 1, +0x18D4 == 1): an effect (0xBDCA30, 0xA5EB50), then 0x99DD20(human, 1, −1, 0) when not dying.
+4. **Not alive branch** (inside the bit-1 test of step 3, when +0x18D4 == 1): navpoint by hash (0xBDCA30, `navpoint_find`); if +0x591 == 0: 0x99DD20(`EDX` = 0, `EAX` = nav +0x1C, cdecl human, 1, −1, 0). Then the HUD (5).
 5. **Local player HUD:**
    - `hud_vehicle_meters_update`, 0x796AB0, `hud_weapon_update`;
    - 0x797CD0 (not online host only);

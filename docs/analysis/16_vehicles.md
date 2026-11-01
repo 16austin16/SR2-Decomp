@@ -103,7 +103,7 @@ Frame `sub esp, 0x84`.
 5. `player_vehicle_tracking_update()` (0x9E32D0).
 6. `vehicle_deferred_calls_flush()` (0x4C2D30).
 7. Copy the vehicles of the lists 0x22A84E0 and 0x22A84D4 (circular, link +0x84DC) into a **stack array at [esp+0xC]**.
-   - The array has room for about 30 pointers. **There is no bound check**, so more than about 30 vehicles would overwrite the frame.
+   - The array holds **32** pointers. **There is no bound check**, so more than 32 vehicles would overwrite the frame.
    - The copy is taken first because the update can unlink vehicles.
 8. dt = `physics_frame_time()` → `fstp [esp+8]` (rounded to f32).
 9. For each copied vehicle: `vehicle_pre_update(cdecl vehicle, f32 dt)` (0xAB2AA0).
@@ -117,12 +117,12 @@ cdecl (vehicle, f32 dt); frame with a security cookie.
 2. +0x8EF8 = 0. Physics object = +0x538 for a full vehicle (+0x84D8 == 1); otherwise 0.
 3. Unless the type (+0x84E4 → +0x9C) is 3 or 4: 0xAB4720(0, 0) when 0xAFE2F0 returns 1; 0xAB4720(1, 0) when the timer +0x8FFC has elapsed.
 4. **Speed clamp.** Velocity = physics body +0x1A0..+0x1AC. Extra = 0xAFE2C0() for types 0 / 1, 0xA97A90() for type 4 (currently named `cmd_vehicle_ejection_thresholds`; that name may be wrong), else 0.
-   - Max = info +0x5B8, replaced by +0x9540 when that is > 0.
-   - Except for types 3 / 4: if the driver seat flag (+4 → +0x10C) is 1, max = info +0x5BC and the blend +0x903C = 1.0. Otherwise the blend drops by dt × 0.5, clamped to [0, 1], and max += (info +0x5BC − max) × blend.
+   - Max = info +0x5B8, replaced by +0x9540 when that is **≥ 0**.
+   - Except for types 3 / 4: if the driver seat flag (+4 → +0x10C) is 1, max = info +0x5BC and the blend +0x903C = 1.0. Otherwise the blend drops by `[0xE8437C]` × 0.5 (not the dt argument), clamped to [0, 1], and max += (info +0x5BC − max) × blend.
    - If |v| > max + extra: v is scaled to that length with `rsqrtss` and **one Newton step** (`r × 0.5 × (3 − x·r·r)`), then set through the body vtbl +0x40. Keep this SSE form to match exactly.
-5. **Fall check** (unless `[0x2528B48]` == 1 and `[0x2528B49]` == 0):
+5. **Fall check**, skipped when online host (`[0x2528B48]` == 1 and `[0x2528B49]` == 0):
    - when v.y < −22.352 m/s (50 mph): timer +0x91D4 = −1;
-   - otherwise start the timer at now + 500 ms when it is unset;
+   - otherwise start the timer at now + 500 ms when it is unset, **and write 2.0 that frame too**;
    - when falling faster, or the timer is set and not yet elapsed: **`[0xE8ECAC]` = 2.0**. This is the divisor in `physics_frame_time`, so the physics step is halved while a vehicle falls fast.
 6. 0xAA0850(vehicle, dt). If +0x8F48 bit 0x100 is set and 0xA9DBE0(frame dt) returns 1: **return** (the vehicle was removed).
 7. If +0x8C38 > 0 (pending damage): 0xA9D530 / 0xA98070, then +0x8C38 = 0.
@@ -137,11 +137,11 @@ cdecl (vehicle, f32 dt); frame with a security cookie.
 
 Frame `sub esp, 0x88`.
 
-1. Collect the same two lists into a stack array at [esp+0x14]. Same **unchecked size**.
+1. Collect the same two lists **and the light list 0x22A84DC** into a stack array at [esp+0x14] (32 entries). Same **unchecked size**.
 2. For each: `vehicle_update(cdecl v)`, **skipped** when (+0x9050 is set and its +0x1C ≠ 0) or +0x80 & 0xB.
 3. For each vehicle on the light list 0x22A84DC: `vehicle_update_light(EAX = v)` unless +0x80 & 0xB.
 4. Count light vehicles without +0x8F50 bit 0x40. If more than 4: `vehicles_cull_light()`.
-5. `vehicle_collision_pairs_collect(cdecl &array, &count)` (0xAC2080). It builds unique pairs from the contact list 0x2FA8E34 (52-byte entries, count 0x252A074) into 0x223F3F0 (12 bytes each, **at most 128**: at 128 it stops early and clears the source count).
+5. `vehicle_collision_pairs_collect(cdecl &array, &count)` (0xAC2080). It builds unique pairs from the contact list 0x2FA8E34 (52-byte entries, count 0x252A074) into 0x223F3F0 (12 bytes each, **at most 128**, a cap inside 0xAC2080 itself: at 128 it stops early and clears the source count).
    - A pair is {vehicle, other vehicle (from the contact's +0x14 handle) or 0, flag byte}; {A, B} and {B, A} count as the same pair.
 6. For each pair: `vehicle_collision_pair_react(cdecl &pair)` (0xAE3B30). With the flag set, it makes the drivers react to the crash (0x9DBCF0, 0x44F0A0).
 
