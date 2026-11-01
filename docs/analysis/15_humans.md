@@ -280,57 +280,190 @@ If the human's own handle +0x44 resolves in the object table (`0x2149C64 + (h & 
 
 If +0x592 == 0xF: `human_state_set(8, 0x10)`. Nothing else.
 
-### States 5, 6 and 7 (case-level map)
+### State 5 (0x9976E0), cdecl (human): the climb / vault move
 
-These three are large (about 0x600 to 0x700 bytes each). Below are their sub-state switches and the calls in each case, in order. The work inside each case is not mapped at instruction level yet.
+`EBP` = human. `EBX` = −1 in every path below.
 
-**State 5** (0x9976E0, cdecl human), sub-states 5-11 (table 0x997CE8):
-- **Prologue:**
-  - if the human is the local player: `[0xE8DD90]` = −1 and player +0x1162 &= ~7;
-  - then it needs the record behind handle +0xF68: high word below 0x866 into the table `0xF7AAE8`; entry = (low word − 1) × 0x20 + list +0x150; entry +0x18 bit 2 must be set;
-  - otherwise it goes to the tail 0x997CAA, which calls 0x997420 and 0x963090.
+Animation calls in this state share one argument shape: `0x96FCA0(ECX = human, cdecl id, 0, 1, f32 0.0, 1.0, −1.0, 0, −1)` returns `AL` (started). It is written **play(id)** below. p = f32(0x96F280(cdecl human)) is the animation progress. The track is rig +0x168, with rig = +0x5E0.
 
-| Sub | Calls |
+**Prologue.**
+1. If the human's own handle +0x44 resolves to the local player `[0x21703D4]`: `[0xE8DD90]` = −1, player +0x1162 &= ~7.
+2. **Record check.** handle = +0xF68:
+   - it must be non-zero, with high word ≠ 0xFFFF and below 0x866;
+   - list = `[0xF7AAE8 + hi × 4]`, which must be non-zero;
+   - entry = `[list + 0x150]` + (lo − 1) × 0x20, which must be non-zero;
+   - entry +0x18 must have value 2 set.
+
+   If any test fails, go to the **abort tail** 0x997CAA:
+   - 0x997420(`ESI` = human, cdecl 0);
+   - if +0x570: +0x570 → +0x130 &= ~2;
+   - 0x963090(`EAX` = human, cdecl 1, 0);
+   - return.
+3. `switch` +0x592 − 5 through the table 0x997CE8 (sub-states 5-11). Any other value returns.
+
+**"Start" body**, shared by sub-states 6 and 7 after their play succeeds:
+1. 0x735C80(`ECX` = +0x570, cdecl &+0xF04).
+2. Copy 9 dwords +0x20 → +0xF1C (the start orientation).
+3. 0x6FC610(`ESI` = human, cdecl 0x17, 0): the collision filter.
+4. If +0x570: +0x570 → +0x130 |= 2.
+5. +0xC0 &= ~0x200; +0xC8 &= ~0x1000.
+6. `audio_play_params_init` (0x464D90; `ESI` = &params (local), `EDI` = &+0xF10, cdecl word `[0xE884A0]`, human, (int8) +0xF65).
+7. `audio_play(EAX = &params, ECX = &local handle)`.
+8. `human_state_set(5, next)`.
+
+**Sub-states:**
+
+| Sub | Does |
 |---|---|
-| 5 | `human_state_set` |
-| 6 | 0x96FCA0, 0x735C80, 0x6FC610, 0x464D90, `audio_play`, `human_state_set`, 0x997420 |
-| 7 | 0x96F280, 0x997360, 0x96FCA0, 0x735C80, 0x6FC610, 0x464D90, `audio_play`, `human_state_set` |
-| 8 | 0x96F280, 0x95F090, 0x96FCA0, `human_state_set`, 0x96FCA0, 0x997590, 0x9974C0, 0x95F090 |
-| 9 | 0x96F280, 0x95F090, 0x997390, 0x9973C0, 0x96FCA0, 0x464D90, `audio_play`, `human_state_set` |
-| 10 | 0x96F280, 0xCECBC0, 0x997D10, 0x999190, 0x9973F0, 0x96FCA0, 0xBDDAE0, 0xBDDA80, `vec3_mul_mat33_in_place`, 0x735E70 |
-| 11 | 0x96F280 |
+| 5 | `human_state_set(5, 7)` |
+| 6 | play(0x1A9). Fails: 0x997420(`ESI` = human, cdecl 1); return. Succeeds: the start body with next = 8 |
+| 7 | Return unless p ≥ 1.0 (NaN returns). id = 0x997360(`ECX` = human); play(id). Fails: as 6. Succeeds: the start body with next = 9 |
+| 8 | p < 1.0 (`[0xDD518C]`): the **move step**. Otherwise: 0x95F090(`EAX` = human, cdecl &+0xF10, 0, −1, 0); copy 9 dwords +0xF40 → +0x20; then if +0xD0 has value 2: play(0x1A8), success → `human_state_set(5, 0xB)`; else play(0x1A4), success → `human_state_set(5, 0xA)`. A failed play: tail 0x997D10 (`EAX` = human) |
+| 9 | p < 1.0: the move step. Otherwise: 0x95F090(`EAX` = human, cdecl &+0xF10, 0, −1, 0); copy +0xF40 → +0x20; with +0xD0 value 2: id = 0x997390(`ECX` = human), play, success → (5, 0xB); else id = 0x9973C0(`ECX` = human), play, success → `audio_play_params_init` with cue word `[0xE884A4]` (`EDI` = &+0xF10), `audio_play`, then (5, 0xA). A failed play: tail 0x997D10 |
+| 10 | Go on if p ≥ 1.0, or else if 0xCECBC0(`ECX` = *rig, cdecl `[0x15B87B8]`, track) is true; otherwise return. Then the **finish** (below) |
+| 11 | p < 1.0: return; otherwise tail 0x997D10 (`EAX` = human) |
 
-**State 6** (0x9989E0, `ESI` = human; 16-byte aligned frame with a security cookie):
-- **Prologue:**
-  - owned = the inline `human_owned_locally` test; false when `ESI` is 0;
-  - if the +0x10CC record's +0xC4 has +0x2C ≥ 0: 0x9C5140 (`EAX` = human);
-  - then the local-player checks: 0x9D7DD0, and 0x9DA290 when +0x1161 bit 0 is set;
-  - then `human_pkt_send_09`.
-- **Switch** on +0x592:
+**Move step** (8 and 9), `EAX` = human:
+1. f = 0x997590() → ST0.
+2. 0x9974C0(`EAX` = &+0xF1C, cdecl &out, &+0x20, &+0xF04, &+0xF10, &+0xF40, f32 f).
+3. 0x95F090(`EAX` = human, cdecl &out, 0, −1, 0).
 
-| Sub | Calls |
-|---|---|
-| 12 | 0x7F5CD0, 0x418540, 0x6FA330, 0x997E20, 0x4080B0; on later paths `timer_elapsed`, `human_apply_hit`, 0x6AE180, `human_state_set` |
-| 13 | 0x9CBC60, `human_pkt_send_17`, `human_state_set`, 0x6AE560, 0x6AEE30, `object_is_player_human`, 0x99F420 |
-| 14 | 0x998810 (`EAX` = human) |
-| other | return |
+The move interpolates between the start (+0xF04 / +0xF1C) and the target (+0xF10 / +0xF40).
 
-**State 7** (0x99A2D0, cdecl human), sub-states 0x11-0x15 (table 0x99A9B4):
+**Finish** (10):
+1. 0x997D10 (`EAX` = human).
+2. +0x1024 = 0.0; +0xC8 = (+0xC8 & ~0x8000) | 0x1000; +0x101C = +0x1020 = −1.
+3. 0x999190(`ESI` = human, cdecl 1, 1).
+4. play(0x9973F0(`ECX` = human)).
+5. v = (0, 0, 0). If 0xBDDAE0(`EAX` = &+0x5D4) is true and 0xBDDA80(`ECX` = &+0x5D4) is false: v = +0x5D4, then `vec3_mul_mat33_in_place(EAX = &+0x20, ECX = &v)`.
+6. 0x735E70(`ECX` = +0x570, cdecl &v): the exit velocity.
 
-| Sub | Calls |
-|---|---|
-| 0x11 | `human_owned_locally`, 0x983540, 0x6AEE30, 0x6AEEE0, 0x99A1E0, 0x9ACC30, 0x9ACC90, 0x418540, 0x735C80, 0x6FA330, `object_teleport`, 0x9ACC90, 0x4080B0 |
-| 0x12 | 0x717AC0, 0x7183D0, 0x7152A0, `human_state_set`, 0xCEC570, 0x96F280, 0x717AC0, 0x7183D0, 0x9ACB10, 0x5B65D0, `human_owned_locally`, 0x43F100, 0x96E7E0, 0x5DDA00, 0x415920 |
-| 0x13 | 0x96F280, 0x717AC0, 0x7183D0, `human_state_set`, 0x6FC610, 0x735EF0, 0x963090, `player_busted_handle`, 0x493C80 |
-| 0x14 | return |
-| 0x15 | `screen_fade_is_full`, `screen_fade_start`, 0x925460, `human_equals_local_player`, `object_teleport`, `vehicle_seat_occupant`, 0xBDE150, 0xBE49A0, `object_teleport`, 0x719310, 0x9AD780, `camera_cut`, `human_state_set`, 0x4D1270 |
+Constants: `[0xDD518C]` = 1.0, `[0xE87998]` = −1.0.
 
-7 / 0x15 is the sub-state that `human_state_set` locks: only 7 / 0x12 can leave it. It fades, teleports and cuts the camera. With `player_busted_handle` in 0x13, state 7 looks like the arrest / respawn sequence (inferred).
+### State 6 (0x9989E0), `ESI` = human: airborne
+
+16-byte aligned frame (`and esp, −16`) with a security cookie.
+
+**Prologue.**
+1. owned = the inline `human_owned_locally` test (0 when `ESI` is 0), kept at `[esp+0x17]`.
+2. If +0x10CC is non-zero, its +0xC4 is non-zero, and that record's +0x2C ≥ 0: 0x9C5140(`EAX` = human).
+3. If +0x4C == 1, +0x3CC == 1 and owned: q = 0x9D7DD0(`ECX` = +0x44); if q +0x1161 bit 0: 0x9DA290(`ECX` = q, cdecl 0).
+4. +0xC8 &= ~0x10.
+5. If the own handle resolves to a type-1 object with +0x3CC == 1:
+   - `human_pkt_send_09(ECX = human, cdecl &+0x564, 0, 0, 1)`;
+   - and when it is the local player: `[0xE8DD90]` = −1, player +0x1162 &= ~7.
+6. V = the 16 bytes at (+0x570 → +8) +0x10, copied with `movaps` (the body velocity; V.y is used below).
+7. Sub-state +0x592: 12 → A, 13 → B, 14 → 0x998810 (`EAX` = human), anything else → return.
+
+**13 (B), take-off:**
+1. If 0x9CBC60(`EAX` = human) and owned: `human_pkt_send_17(ECX = human, cdecl 0, 0)`.
+2. G = `[0x2797400]` (a global speed, written elsewhere). If V.y > −G and +0xC3 bit 0 is clear: `human_state_set(6, 12)` and 0x6AE560(cdecl human, 0, 0). Otherwise (V.y ≤ −G or NaN, or the bit set): 0x6AEE30(`EAX` = human).
+3. If `object_is_player_human(EAX = human)` and the human is the local player: 0x99F420(`EAX` = human, cdecl f32 `[0xE44850]` = 0.25).
+
+**12 (A), in the air.**
+
+*Ledge check.* It runs unless the previous state +0x593 is 5:
+1. r = 0x7F5CD0(`EDX` = human, cdecl &P, &S, &k). P (3 floats) is a ledge point. S is a buffer whose +0x18 holds the normal N. k is a dword. r = 0 skips to the fall test.
+2. dy = f32(P.y − human.y). With s = `[0xEB7C20]` (a global, 1.85 at load: the human height), go on only if 0.5·s ≤ dy ≤ 1.25·s. A NaN skips.
+3. Build a ray query object at a local Q: 0x418540 (`ECX` = &Q.ray) is the ray constructor, and the result block R (3 dwords) = {0, 0, 0x80000000}.
+4. d = human.pos − P, each component → f32. dot = f32(N.x·d.x + N.y·d.y + N.z·d.z), summed in the x87 in that order. If dot > 0.0: off = N × 0.25; otherwise off = −N × 0.25 (each → f32).
+5. Ray start = P + off (each → f32); end = start with y − 10.0. Query +0x4C = 0x4C (the mask).
+6. hit = 0x6FA330(`ECX` = &query, cdecl &R, 1).
+7. If hit and f32(P.y − R.first +4) < 0.75: no ledge. Destroy R (0x4080B0, `ECX` = &R) and go to the fall test.
+8. Otherwise (no floor within 0.75 below the ledge): 0x997E20(`EAX` = &S, `ECX` = &P, cdecl human, k, r), destroy R, **return**. 0x997E20 starts the climb, which is state 5.
+
+*Fall test* (V.y on the x87):
+1. If +0xC8 bit 0x1000 is set, or |V.y| (→ f32) ≥ 0.1 (or NaN): go to the **dive test**.
+2. Otherwise the human is stalled in the air, with timer T = +0xF6C:
+   - T unset: T = now + 750 ms, wrapped by −0x6B49D200 above 0x6B49D200; return.
+   - T set and elapsed:
+     - if owned: `human_apply_hit(cdecl human, 0, 0, 0, 0, 0, 1, 0)` and +0xC0 &= ~2;
+     - 0x6AE180(`EAX` = human, cdecl 0x1E7, f32 −1.0, 0xFFFF, 1);
+     - +0xC0 &= ~0x200; T = −1;
+     - return.
+   - T set, not elapsed: return.
+
+*Dive test:* if V.y < −G: `human_state_set(6, 13)` and +0xC8 &= ~0x1000. Otherwise return.
+
+Constants: 0.5 `[0xE5BF70]`, 1.25 `[0xE5BF48]`, 0.0 `[0xDD32C0]`, 0.25 `[0xE5BFC8]`, 10.0 `[0xE5C1B8]`, 0.1 `[0xDD50E8]` (a double, compared with the f32 |V.y|), 0.75 `[0xDD1B58]`.
+
+### State 7 (0x99A2D0), cdecl (human): knockdown / ragdoll
+
+**The role, corrected.** State 7 is the **knocked-down (ragdoll) state**, not an arrest / respawn sequence:
+- `human_apply_hit` (0x9AC180) enters it as 7 / 0x11 (three call sites).
+- Code right after it chooses 7 / 0x15 instead of 7 / 0x12 when the human is owned locally and its flag argument is non-zero.
+- Only sub-state 0x13 is an **arrest**. 0x9AD1E0 (`EDI` = human) enters it, only from a ragdolled human (+0x595 set) in 7 / 0x11:
+  - for the player it plays anim 0x286 (0x6AE180), then 0x719510, +0x628 = 0, +0x595 = 3;
+  - its one caller is 0x4058E0 (`EDI` = the player), reached from slot 23 of the vtable 0xDD5568 (class not identified);
+  - 0x13 ends in `player_busted_handle` ("You got busted.", mission failed).
+- 0x15 is a **recovery**: a fade-out, a teleport to the saved point +0x63C, then a fade back in. It is not a respawn.
+
+`EBP` = human. Sub-state +0x592 − 0x11 through the table 0x99A9B4 (0x11-0x15); anything else returns.
+
+**0x11, down:**
+1. If owned and f32(+0x654 − +0x18) > 4.0 (it fell more than 4 m):
+   - 0x983540(`ECX` = human, cdecl &W);
+   - if W.y ≥ −3.0 (or NaN): 0x6AEEE0(`ESI` = human, cdecl 0, 1); otherwise 0x6AEE30(`EAX` = human).
+2. Return unless 0x99A1E0(`EAX` = human).
+3. b = (0x9ACC30(`EDX` = human) == 0).
+4. If 0x9ACC90(cdecl human, 1): +0xAE8 = +0xAEC = −1; return.
+5. If b is false: +0xAE8 = now + 750 ms (wrapped); return.
+6. Otherwise, an **unstick** probe:
+   1. Ray query Q with the result block R = {0, 0, 0x80000000}.
+   2. pos = 0x735C80(`ECX` = +0x570). The ray goes from pos to pos + (0, 5.0, 0) (y → f32). Mask +0x4C = 0x60, +0x50 = 1.
+   3. hit = 0x6FA330(`ECX` = &Q, cdecl &R, 1).
+   4. On a hit, the last hit record is R.ptr + R.count × 0x3C − 0x30. The target is that record's x, y, z plus H × (`[0xEC5ACC]`, `[0xEC5AD0]`, `[0xEC5AD4]`) = H × (0, 1, 0), with H = `[0xEB7C20]`, each product and sum → f32. Then `object_teleport(EDX = &target, ECX = &+0x20, cdecl human, 0, 1, 1, 0)`.
+   5. Without a hit: 0x9ACC90(cdecl human, 1).
+   6. Then +0xAE8 = +0xAEC = −1; destroy R (0x4080B0); return.
+
+**0x12, get up:**
+1. **Not ragdolled** (+0x595 == 0):
+   - if 0x717AC0(`ESI` = human): 0x7183D0(`ECX` = human);
+   - 0x7152A0; +0xCC |= 0x400;
+   - `human_state_set(0, 0)`; return.
+2. **Ragdolled.** Find the duration s:
+   - default s = 0.5 (`[0xDD1C8C]`); scale m = 0.3 (`[0xE8B048]`), or 1.0 when +0xD0 bit 0x80 is set;
+   - scan the 3 rig animation slots (rig +0xD4, stride 0x34) for the first one that is active (+0x10 bit 0) and plays animation 0x54D. An inactive slot after slot 0 ends the scan.
+   - If such a slot is found: when its index (slot − 8) is in [0, `[0x2527D6C]`), s = 0xCEC570(`EAX` = `[0x15B8800 + idx × 0x54 + 0xC]`), the animation length; then s ×= m.
+   - If no slot is found, s stays 0.5 and is **not** multiplied.
+3. t = f32(+0x628 + `[0xE8437C]` / s).
+   - **Quirk:** the code computes clamp(t, 0, 1), but **stores the unclamped t** to +0x628. Keep that.
+4. Return unless p = 0x96F280(cdecl human) ≥ 0.85 (`[0xE5C0E8]`, a double).
+5. 0x717AC0 / 0x7183D0 as in step 1; 0x9ACB10(cdecl human, 0); +0xCC |= 0x400.
+6. If +0xCC bit 0x20000000 and +0xB70 bit 0x80: 0x5B65D0(`ECX` = human). Otherwise, if owned and (+0x3CC ≠ 2 or 0x43F100() is false): 0x96E7E0(`EDI` = human).
+7. If 0x5DDA00(`ESI` = +0x44): 0x415920(`ESI` = human).
+
+**0x13, arrested:**
+1. +0x628 = clamp(f32(+0x628 + `[0xE8437C]` / 1.5), 0, 1); here the **clamped** value is stored.
+2. Return unless p ≥ 0.75.
+3. 0x717AC0 / 0x7183D0.
+4. `human_state_set(7, 0x14)`.
+5. 0x6FC610(`ESI` = human, cdecl 0x15, 0); 0x735EF0(`ECX` = +0x570, `EDI` = 0x11, cdecl 1); 0x963090(`EAX` = human, cdecl 1, 0).
+6. +0xC0 &= ~0x10000000; +0x64C = 0.
+7. Only for the local player: `player_busted_handle()`, then 0x493C80(`ECX` = 7).
+
+**0x14:** return. The human stays held (busted) until something else sets its state.
+
+**0x15, recover:**
+1. If not online host and the human is the local player and the fade is not full:
+   - return if `[0x2526D9C]` == 1 (already fading out);
+   - otherwise `screen_fade_start(cdecl 250, 0, f32 1.0)` and +0xCC |= 8; return.
+2. If +0x595 (ragdolled):
+   1. If 0x925460(`EDX` = &+0x63C, `EDI` = &L): `object_teleport(EDX = &L, ECX = &+0x20, cdecl human, human_equals_local_player(EAX = human), 0, 1, 0)`.
+   2. If +0xCC bit 0x10: clear it. For each of the +0xC3C carried records (0x18 bytes, position at +0xC48 + i × 0x18):
+      - o = `vehicle_seat_occupant(EAX = record −8)`;
+      - if o: dir = (human.x − rec.x, 0, human.z − rec.z) → f32; 0xBDE150(`ESI` = &dir) (normalize); 0xBE49A0(`EAX` = &dir, cdecl &M) builds an orientation;
+      - `object_teleport(EDX = &rec pos, ECX = &M, cdecl o, 0, 1, 1, 0)`.
+   3. 0x719310(`ECX` = human, cdecl rig, &+0x14, &+0x20, &+0x14, &+0x20). +0x595 = 3. 0x9AD780(`ESI` = human). For the local player: `camera_cut`.
+3. `human_state_set(7, 0x12)`. If +0xCC bit 8: clear it and fade back in: 0x4D1270(cdecl 250, f32 0.0, `DL` = 0).
+
+Constants: 4.0 `[0xE5C270]`, −3.0 `[0xE5CE70]`, 5.0 `[0xE5C130]`, 0.85 `[0xE5C0E8]`, 1.5 `[0xE5C408]`, 0.5 `[0xDD1C8C]`, 0.3 `[0xE8B048]`, 0.75 `[0xDD1B58]`. dt = `[0xE8437C]`.
 
 **Port order:**
-1. The dispatcher, `human_state_set`, and states 1, 4 and 8. They are small and fully mapped above.
-2. States 2 and 3. The interpolated move in state 2 needs `[0xE5C5D0]` and the f32 rounding at each step.
-3. States 5-7 last, calling the originals per case until their insides are mapped.
+1. The dispatcher, `human_state_set`, and states 1, 4 and 8.
+2. States 2 and 3.
+3. State 6, then 5, then 7.
+4. Throughout, keep the f32 store after each arithmetic step, and the double constants (0.1, 0.85) compared against f32 values. Keep state 7 / 0x12's unclamped store.
 
 ## Open
 
