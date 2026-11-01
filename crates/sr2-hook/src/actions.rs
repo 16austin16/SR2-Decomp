@@ -75,7 +75,7 @@ struct Accessor {
     ret: Ret,
 }
 
-const ACCESSORS: [Accessor; 49] = [
+const ACCESSORS: [Accessor; 51] = [
     Accessor { name: "input_action_down", addr: 0x004F_F640, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
     Accessor { name: "input_action_repeat", addr: 0x004F_F6A0, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
     Accessor { name: "input_action_just_pressed", addr: 0x004F_F700, prologue: &[0xC1, 0xE1, 0x04, 0x8B, 0x91, 0x38, 0xEA, 0xF9, 0x00], ret: Ret::Al },
@@ -125,6 +125,8 @@ const ACCESSORS: [Accessor; 49] = [
     Accessor { name: "player_stick_get_raw", addr: 0x004FF5A0, prologue: &[0x51, 0xD9, 0xEE, 0x8D, 0x04, 0x80], ret: Ret::StickGet },
     Accessor { name: "player_stick_get", addr: 0x004FF5F0, prologue: &[0x51, 0xD9, 0xEE, 0x8D, 0x04, 0x80], ret: Ret::StickGet },
     Accessor { name: "input_stick_action_consume", addr: 0x00500230, prologue: &[0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x78, 0xF2, 0xF9, 0x00], ret: Ret::Void },
+    Accessor { name: "input_action_crossed", addr: 0x004F_F8B0, prologue: &[0x51, 0x8B, 0xC2, 0xC1, 0xE0, 0x04], ret: Ret::St0 },
+    Accessor { name: "input_action_released_below", addr: 0x004F_F930, prologue: &[0x83, 0xEC, 0x0C, 0x53, 0x8B, 0x5C, 0x24, 0x14], ret: Ret::St0 },
 ];
 const COUNT: usize = ACCESSORS.len();
 
@@ -391,7 +393,11 @@ const STICK_ACTIONS: usize = 0x00F9_F278; // 16-byte entries, +0 kind
 
 /// Arguments each accessor takes on the stack (the rest take registers only).
 fn nargs(id: usize) -> usize {
-    if matches!(id, 41 | 46 | 47) { 1 } else { 0 }
+    match id {
+        41 | 46 | 47 | 49 => 1,
+        50 => 2,
+        _ => 0,
+    }
 }
 
 /// An axis of control-block entry `e`: 0 while its taken byte is set.
@@ -455,6 +461,31 @@ unsafe fn just_pressed_count() -> u32 {
     unsafe { (0..87).filter(|&b| rb(PRESSED + b) != 0).count() as u32 }
 }
 
+/// `input_action_crossed` (EDX = action, cdecl f32 t): 1 when the primary went from below t to at
+/// or above it this frame. The result also replaces the argument.
+unsafe fn crossed(action: u32, args: *mut u32) -> f32 {
+    unsafe {
+        let t = f32::from_bits(*args);
+        let p = primary(action);
+        let r = t > value(p, 4, false) && value(p, 0, true) >= t;
+        *args = r as u32;
+        r as u32 as f32
+    }
+}
+
+/// `input_action_released_below` (cdecl action, f32 t): either button went from at or above t to
+/// below it. The result ends up in the action argument's slot.
+unsafe fn released_below(args: *mut u32) -> f32 {
+    unsafe {
+        let action = *args;
+        let t = f32::from_bits(*args.add(1));
+        let (p, s) = (primary(action), secondary(action));
+        let r = (value(p, 4, false) >= t && value(p, 0, true) < t) || (value(s, 4, false) >= t && value(s, 0, true) < t);
+        *args = r as u32;
+        r as u32 as f32
+    }
+}
+
 /// The Rust accessor `id`: (EAX result, f32 result).
 unsafe fn rust(id: usize, r: &Regs, args: *mut u32) -> (u32, f32) {
     unsafe {
@@ -509,6 +540,8 @@ unsafe fn rust(id: usize, r: &Regs, args: *mut u32) -> (u32, f32) {
                 stick_action_consume(r.eax);
                 (0, 0.0)
             }
+            49 => (0, crossed(r.edx, args)),
+            50 => (0, released_below(args)),
             _ => (0, 0.0),
         }
     }
@@ -665,6 +698,24 @@ pub fn stick_self_test() {
                 }
             }
         }
+        // crossed / released_below for every action on the live pad state.
+        for action in 0..132u32 {
+            for t in [-1.0f32, 0.0, 0.1, 0.5, 0.75, 1.0, 2.0] {
+                for id in [49usize, 50] {
+                    let r = Regs { edi: 0, esi: 0, ebp: 0, st0: 0, ebx: 0, edx: action, ecx: 0, eax: 0 };
+                    let mut a = if id == 49 { [t.to_bits(), 0] } else { [action, t.to_bits()] };
+                    let theirs = original(id, &r, a.as_ptr());
+                    let ours = rust(id, &r, a.as_mut_ptr());
+                    checked += 1;
+                    if theirs.1.to_bits() != ours.1.to_bits() {
+                        bad += 1;
+                        if bad <= 10 {
+                            log(&format!("actions: self-test {} action {action} t {t}: original {}, Rust {}", ACCESSORS[id].name, theirs.1, ours.1));
+                        }
+                    }
+                }
+            }
+        }
         // The response curve over a sweep of inputs.
         for k in -2000i32..=2000 {
             for v in [k as f32 / 1000.0, k as f32 / 1000.0 + 1e-4, f32::from_bits(0x3E80_0000u32.wrapping_add(k as u32))] {
@@ -764,8 +815,10 @@ thunk!(t45, 45);
 thunk!(t46, 46);
 thunk!(t47, 47);
 thunk!(t48, 48);
+thunk!(t49, 49);
+thunk!(t50, 50);
 const THUNKS: [extern "C" fn(); COUNT] = [
-    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35, t36, t37, t38, t39, t40, t41, t42, t43, t44, t45, t46, t47, t48,
+    t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27, t28, t29, t30, t31, t32, t33, t34, t35, t36, t37, t38, t39, t40, t41, t42, t43, t44, t45, t46, t47, t48, t49, t50,
 ];
 
 pub fn install() {
