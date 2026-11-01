@@ -8675,7 +8675,7 @@ address,name,subsystem,status,notes
 0x00c0be10,profile_start,app,documented,"ECX = label, stack (u32 *id): under the lock 0x340CBCC finds or creates the named 0x118-byte timer record (list 0x252A56C) and stores QueryPerformanceCounter into it"
 0x00c0c210,profile_reset,app,documented,"ECX = u32 *id, EDX = label: finds or creates the named timer record and zeroes its accumulators"
 0x0068ca70,sim_frame,app,rust,"Rust (frame.rs): the gameplay simulation step as a call sequence under its six profiler sections; callees by address (0x55ADF0 ESI = slot, 0x9E99F0 EDI, job_worker_wake ESI) (40)"
-0x0068e1b0,gameplay_do_frame,app,documented,"profiler labels gameplay_do_frame:1 / :2"
+0x0068e1b0,gameplay_do_frame,app,rust,"Rust (frame.rs): gameplay state 5: death callbacks over the human list (name + killer pushed into the script thread), local player respawn, sim_frame, gameplay UI; the death path is not yet exercised in a test (11)"
 0x006fa0e0,sim_physics_step,physics,documented,"fixed-step accumulator 0x2527DC8, step 0x2527DA4/0xE8ECAC, up to 3 (MP 30) substeps: havok_step_job + humans_character_step; post-step transform write-back; memory pressure callbacks (11, 17)"
 0x0052a710,render_frame,render,documented,"the render frame: profiler stages render1, render-shadow-jobs, render-flush, render2, render2:a/a3/b, render3, render4, render4a"
 0x0052a4f0,render_stage1,render,documented,"profiler labels render1:1 / render1:2a; runs game_render_do_pre_render_jobs"
