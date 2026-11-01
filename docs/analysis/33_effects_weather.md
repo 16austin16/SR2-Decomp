@@ -10,7 +10,7 @@ Names are in `docs/functions.csv` (subsystems `render`, `effects` and `vehicle`,
 | `tod_light_shader_constants` | 0xB78190 | sets `TOD_Light_Direction` / `_Color` (two lights) for the shaders |
 | `sky_sun_moon_setup` | 0x4D5840 | the `sun1` / `moon1` billboards and glows |
 | `skybox_parse_colors` | 0x4D5BB0 | `Skybox_Color_1..4` |
-| `light_find_by_name` | 0x91DD40 | named scene light lookup |
+| `human_inventory_restore` | 0x91DD40 | **renamed** (was `light_find_by_name`): not a light function; it rebuilds a human's weapons and ammo from saved records (see doc 44) |
 | `lighting_ambient_debug_print` | 0x4B26E0 | prints level / character / water / reflection ambient |
 | `cmd_r_force_time_of_day_lights` | 0x4B52F0 | console command |
 

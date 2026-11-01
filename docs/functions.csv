@@ -10955,7 +10955,7 @@ address,name,subsystem,status,notes
 0x00569ec0,cmd_waterspray_circles,effects,documented,"from its strings: 'Waterspray circles: %s' (33)"
 0x006d08b0,cutscene_parse_tod_lights,cutscene,documented,"from its strings: TODs, Lights, LightsEnabled, Light (33)"
 0x00727890,water_sim_shaders_init,render,documented,"from its strings: water_physics, water_physics_detail, water_normal_map_gen (33)"
-0x0091dd40,light_find_by_name,render,documented,"from its strings: 'No light found with the name %s' (33)"
+0x0091dd40,human_inventory_restore,weapon,documented,"EAX = count, cdecl (records, human): empties the inventory (human_pkt_send_3e) and ammo store, then per 0x1C-byte record adds the weapon (human_pkt_send_3c), restores clip +0x10 / +0x18 / flags and the two ammo types (ammo_store_add_type); callers pass the local player [0x21703D4]; was light_find_by_name; role inferred (44)"
 0x00951e10,searchlight_create,effects,documented,"from its strings: horizontal_sweep, 'Created searchlight: handle 0x%x.' (33)"
 0x0098d0a0,human_catch_fire,human,documented,"from its strings: SFX_FIRE_CATCH, SFX_LIGHTER_STRIKE, human_fire_leg / _torso (33)"
 0x00a97a90,cmd_vehicle_ejection_thresholds,vehicle,documented,"from its strings: vehicle-world / vehicle-vehicle / window sill ejection thresholds (33)"

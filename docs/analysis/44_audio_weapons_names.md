@@ -322,6 +322,13 @@ Next in line: `audio_voice_slot_fade_out` 0x47C740. It is x87 with an unsigned `
 ## Bugs, doc errors and surprises
 
 - **`light_find_by_name` 0x91DD40 is misnamed** (doc 33 / functions.csv). It references no light string. It sends `human_pkt_send_3e` and `human_pkt_send_3c` and calls `ammo_store_clear`, `ammo_store_find` and `ammo_store_add_type` twice. It is an ammo-store reset / restore (callers 0x693D40 / 0x693D80 / 0x694140, near the save code). It should be renamed (for example `player_ammo_store_restore`) after checking the callers.
+  - **Checked and renamed `human_inventory_restore`.** Signature: `EAX` = record count, cdecl (records, human); the caller cleans. The three callers (0x693D40, 0x693D80, 0x69414A) pass `[0x21703D4]` (the local player) and the records at save block +0xD0 with the count at +0xCC.
+    1. `human_pkt_send_3e(ECX = human+0x10C4, stdcall 0)` empties the inventory; `ammo_store_clear(EDI = [human+0x11DC])`.
+    2. For each 0x1C-byte record: find the weapon info whose name hash equals rec+0 in the table at 0x2AEFEF0 (stride 0x60, count `[0x214442C]`); skip the record when none matches.
+    3. slot = `human_pkt_send_3c(ECX = human+0x10C4, stdcall 0, rec+4, 0)` (ret 0xC); w = slot+0xC4 (skip when 0).
+    4. If the weapon info (w+8) has a primary ammo type (+0xD4): zero that store entry's count and bonus (`ammo_store_find`).
+    5. w+0x10 = rec+8 (rounds in the clip); w+0x18 = rec+0x10; w+0xD bit 0 = rec+0x18 bit 0; w+0xC bit 4 = rec+0x19 bit 0.
+    6. `ammo_store_add_type(ECX = store, EDI = primary type, cdecl rec+0xC, 0)`, then the same with the secondary type (+0xD8) and rec+0x14.
 - **`ambient_audio_sequences_update` 0x490940 probably is the radio station update.** Its records (0x48 bytes at `*0xF53094`) are the radio stations: `radio_station_find_by_name` and `luafn_radio_set_station` (via 0x48E470) use the same table.
 - **`0x2526B44` is a pause depth, not only a cutscene flag** (doc 10, per-frame step 10). `audio_pause_all` and `audio_voices_fade_out_all` increment it and `audio_resume_all` decrements it. `audio_play` / `audio_prepare` refuse cues without params flag bit 1 while it is positive.
 - `weapon_instance_has_ammo` dereferences a null info (see recipe 7).
