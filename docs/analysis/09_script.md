@@ -165,3 +165,47 @@ So a Rust binding is a C-ABI `extern "C" fn(*mut lua_State) -> i32` writing the 
 ## Open
 
 - The four hook setters (`0x252A640/644/668/66C`, written by 0x51F700, 0xA244D0 and 0xCDF780).
+
+## The 20 most-used Lua bindings, for porting
+
+**How they were ranked.** Call sites in the shipped scripts: all 177 `.lua` files in the `.vpp_pc` archives, with `patch.vpp_pc` overriding the others, and comments stripped. The mission 1 log can't rank bindings, because a binding's own code is too short for the 1 ms EIP sampler. Only 6 bindings showed up, led by `vint_set_property` (37 samples).
+
+**Binding conventions (LTCG).**
+- Every binding is cdecl `(lua_State *L)` and returns how many results it pushed.
+- Most read the argument count first: `n = (L->top − L->base) >> 4`, clamped to the most they use. Arguments are then read relative to the top, as index `i − 1 − n` (so missing trailing arguments come out as nil).
+- `lua_tostring` (0xCDCA80) and `lua_tonumber` (0xCDC250) take `ECX` = L and `EAX` = index. `lua_tonumber` returns on the FPU, and `_ftol2` converts it.
+- Optional arguments are tested with `luaA_index` (0xCDBE80): type 0 is nil, type 1 with value 0 is false.
+- Results are written straight to `L->top` (type, value), then top += 0x10:
+  - number: type 3, double at +8;
+  - boolean: type 1, value at +8.
+
+**vint handles.** The vint bindings look objects up by handle in the hash table `0x22EF2B8[handle & 0x3F]`, chained through +0xC, with the handle at +0x28.
+
+| # | Binding | Sites | Args → results | What it calls |
+|---|---|---|---|---|
+| 1 | `vint_set_property` 0xB8FAC0 | 4353 | (handle, property name, value…) up to 6 → 0 | finds the object, looks up the property (0xB978A0), type 0xD with `start_value` / `end_value` is a tween's value (rebinds the target, 0x634BA0); otherwise sets the value through the property's setter |
+| 2 | `vint_object_find` 0xB8F400 | 2449 | (name, [parent handle], [document]) → handle number | `vint_lua_current_document` or the given document, then `vint_object_find_by_hash` under the parent (0xB98340) or from the root (0xB97970) |
+| 3 | `trigger_enable` 0xA47BB0 | 856 | (trigger name, [enable = true]) → 0 | `trigger_find_by_name` (0xA6C870), `trigger_set_enabled` (0xA6D0C0); on enable 0xA6BCE0 and stamps +0x11C with the game time `0xE843AC`; on disable 0xA6BD60 |
+| 4 | `thread_new` 0xD74C70 | 773 | (function name, args…) → thread id (65535 on failure) | `script_thread_create` (0xCE01E0) in the current script slot (`0x2526364[0x2526360]`), copies the arguments (0xCDBE40), `script_thread_resume` (0xCE0570) |
+| 5 | `thread_yield` 0xD74BE0 | 670 | () → yields | `lua_yield(L, 0)` |
+| 6 | `on_trigger` 0xA3EBA0 | 609 | (callback name, trigger name) → 0 | `trigger_find_by_name`, then `script_set_callback` (0xA530F0) on the trigger's callback block (+0x150) |
+| 7 | `vint_get_property` 0xB8F570 | 394 | (handle, property name) → the value(s) | finds the object, 0xB97680 looks up the property, 0xB8D8F0 pushes it |
+| 8 | `sizeof_table` 0xD74C00 | 390 | (table) → count (−1 with no argument) | `lua_table_count` (0x7762E0) |
+| 9 | `on_death` 0xA3DAA0 | 380 | (callback name, object name) → 0 | `script_find_object_by_name`, then sets the callback on the human (+0x1234 block) or on the object's script info (+0xBC) |
+| 10 | `debug_print` 0xD74BA0 | 368 | (category, text) → 0 | reads both strings and does nothing (stripped in release) |
+| 11 | `coop_is_active` 0x7EF490 | 353 | () → boolean | `coop_session_active` (0x7F7AD0) |
+| 12 | `release_to_world` 0xA42040 | 340 | (group or object name) → 0 | group lookup (0xA57730), then each member is handed back to the world (0xA5B6E0 / 0xA70030, virtual release) |
+| 13 | `mission_debug` 0xA398C0 | 311 | (…) → 0 (number) | pushes 0; stripped |
+| 14 | `thread_kill` 0xD745C0 | 304 | (thread id) → 0 | `script_thread_find` (0xCDFEB0), sets flag 4 (kill) at +0x18; the thread table removes it on its next pass |
+| 15 | `group_show` 0xA2D7E0 | 253 | (group name) → 0 | `group_find_by_name` (0xA57730), `group_set_hidden(0)` (0xA58070) |
+| 16 | `character_is_dead` 0xA35700 | 251 | (name) → boolean | name lookup (0xA52BB0, 0xA275F0 / 0xA27660, else the object's virtual +0x34), then `human_is_dead` (0x985630) |
+| 17 | `audio_play` 0x7ECDF0 | 243 | (cue name, [type string], [volume], …) up to 3 → handle number | 0x7ECCA0 picks the cue, then the audio play path 0x465AB0 / 0x464920 / 0x465B90 (10_audio.md) |
+| 18 | `vint_object_destroy` 0xB8F310 | 225 | (handle, [delay]) → 0 | finds the object; destroys it now, or queues it with the delay (0xB97A20) |
+| 19 | `objective_text` 0xA47050 | 179 | (tag, text id, [arg], [arg], [index]) up to 5 → 0 | formats the localized text into a 258-char buffer (0x7F4BC0), then the HUD objective (0x78E250) |
+| 20 | `door_lock` 0xA2DED0 | 178 | (door name, [locked = true]) → 0 | the object lookup (0xA5B6E0), then 0x91B690 (sets the lock) |
+
+**Porting order:**
+1. The trivial ones: `thread_yield`, `debug_print`, `mission_debug`, `sizeof_table`, `coop_is_active`, `thread_kill`.
+2. The name-lookup ones that set a flag or callback: `trigger_enable`, `on_trigger`, `on_death`, `group_show`, `door_lock`, `character_is_dead`.
+3. The vint four (`vint_set_property`, `vint_get_property`, `vint_object_find`, `vint_object_destroy`). Together they are 64% of all binding call sites, and they run every frame in the HUD scripts, so they are where a port saves the most. They need the vint property table (06_vint.md) first.
+4. `thread_new`, `audio_play`, `objective_text` and `release_to_world`, which reach into larger systems.
