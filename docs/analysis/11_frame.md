@@ -159,6 +159,146 @@ The order of calls, grouped by the profiler sections. Unnamed calls are listed w
 
 The game thread is therefore at most one frame ahead of the render thread. The render thread builds frame N while the game simulates N+1.
 
+## frame_end_handoff at instruction level (for the port)
+
+`frame_end_handoff` (0x521A00):
+- **Signature:** no arguments, returns `EAX` = 0. It reserves 0x14 bytes of locals and saves `EBX` / `EBP` / `ESI` / `EDI`. `EBX` is 0 for the whole function.
+- **Locals:** `[esp+0x17]` holds "in gameplay"; `EBP` holds the audio job.
+- **Imports used:** `GetCurrentThreadId` 0xDB8080, `Sleep` 0xDB80B8, `LeaveCriticalSection` 0xDB80D0.
+
+### Order
+
+1. **Pacing.**
+   1. `al` = byte `[0xED4710]`; `[0x2527383]` = 0.
+   2. `render_thread_wait_frame` (0x522B80), cdecl (u8 `[0xED4710]` zero-extended).
+   3. `[0xED4710]` = 0.
+2. **Optional early wait.** If `[0x252737E]` ≠ 0 and `[0x252737F]` == 0: busy-spin, **without Sleep**, until `[0x27741AC]` ≠ 0 (render thread finished its frame), then clear it.
+3. **Flags.** `[0x2527363]` = 1; `[0x252737E]` = `[0x252737F]`.
+4. **Device and 2D state.**
+   1. `gfx_device_acquire` (0xCFBC00).
+   2. `[0xE849DB]` = 1.
+   3. `gfx_invalidate_render_state_block`, then `gfx_apply_gamma`.
+   4. `gfx_set_tint_color` (0xD14700), with `ESI` = &{1.0, 1.0, 1.0} on the stack.
+5. **Streaming.**
+   1. state = `0x144E760[depth 0xE96B7C]`.
+   2. If `0x144E750[state]` bit 0 is set and depth > 0: `game_state_stack_stream_frame` (0x697740), cdecl (depth − 1, (flags >> 1) & 1).
+   3. If state == 5: `gameplay_streaming_frame` (0x68E410).
+6. **Present.** `frame_present` (0x5217E0).
+7. **Audio job.**
+   1. in_game = (top state == 5; depth −1 counts as state 0), kept at `[esp+0x17]`.
+   2. If in_game: `EBP` = `audio_update_voices_on_workers()` (the queued job or 0). Otherwise `EBP` = 0.
+8. **Snapshot setup.**
+   1. `[0x252737D]` = 1 (snapshot being written); `[0x27741AD]` = 0.
+   2. `temp_batching_pool_release` (0x521970), then `temp_batching_pool_create` (0x5218D0).
+   3. `render_snapshot_copy_view` (`EAX` = 0xE9D620).
+   4. `render_snapshot_reset_scales` (`EAX` = 0xE9D6D0).
+9. **World visible (`[0xE94D3E]` ≠ 0).** All calls take no arguments unless noted.
+   1. If `[0x2526DC4]`: `[0xE849D0]` = `time_of_day_in_range([0x2797784], [0x2797788])` ? −1 : 0. The call is cdecl and the result is converted with `neg al` / `sbb`.
+   2. The time-of-day block, in order:
+      - `tod_light_value_update` 0x4D9DD0
+      - `tod_ambient_colors_update` 0x4D4820
+      - `tod_light_block_b_update` 0x4D4F90
+      - `tod_sun_update` 0x4D5470
+      - `tod_fog_color_update` 0x4D5300
+      - `tod_misc_params_update` 0x4D5670
+      - `lighting_buffers_copy_for_render` 0x4E69D0
+
+      They blend the keyframes in `0x2654210` (0x250 bytes each; keys `0xF9E2F8` / `0xF9E2F4`, t `0xF9E2F0`) into the constants `0x2658DB0..0x2658E7C`. Script overrides are at `0x2658C64..0x2658C90`.
+   3. `rep movsd` 0x260 dwords `0x2652C80` → `0x2653600`. This runs before the next test, so it is unconditional inside this branch.
+   4. If `[0x27A3F18]` (tagging active): `tagging_paint_buffer_swap` 0x6255A0.
+   5. Snapshots: `audio_frame_snapshot` 0x46CCD0 (under CS `0x256DBA8`), `mesh_decals_frame_update` 0xD08310, `glares_render_snapshot` 0x4C7190.
+   6. `[0x25273F3]` = `[0x25273F2]`.
+   7. Render parameters: `water_sim_frame_snapshot` 0x728AB0, `render_params_publish` 0x51A880, `render_params_reset` 0x51A4A0, `objects_collect_render_flagged` 0x9FAA20.
+   8. Camera:
+      1. `0x25F5B14..1C` → `0xE9D620..28`, and 9 dwords `0x25F5B38` → `0xE9D62C`.
+      2. `camera_get_fov` 0x494080 (returns in ST0) → `fstp [0xE9D650]`.
+      3. `matrix_orthonormalize` 0xBE4170, **stdcall** (`ret 4`) (&`0xE9D62C`). Its argument is pushed before the `fstp`; the caller does not pop it.
+   9. Snapshot fields:
+      - `0xE9D67C` = `[0x25273A0]`; `0xE9D680` = `[0xE98964]`; `0xE9D684` = `[0xE98968]`;
+      - `0xE9D670..78` = `0xE9D7D4..DC` (tint); `0xE9D664..6C` = `0xE9D7C8..D0`;
+      - `0xE9D68E` = byte `[0xE996E5]`; `0xE9D688` = frame time `[0x252A3C8]`; `0xE9D68C` = 1 (snapshot valid).
+   10. `sky_light_snapshot` 0x4D9A50: `ESI` = 0xE9D690 (sun direction), `ECX` = 0xE9D6B0 (sun colour + intensity), `EDI` = 0xE9D69C, `EDX` = 0xE9D6C0. It uses the sky object `0x2526DAC` or the defaults `0xEC5ACC` / `0x252A6F0`, scaled by the time-of-day intensity.
+   11. `world_shader_constants_update` 0xB77CA0 (material shader globals).
+   12. LOD / listener centre `0x277C9D0` and distance `0xE9896C`:
+       - camera mode `0x25F5AE8` == 1: camera position and `[0xDD0550]`;
+       - local player `0x21703D4` exists: its position (+0x14), and `[0xDD0678]` when it is in a vehicle, otherwise `[0xDD0794]`. "In a vehicle" means handle +0xD74 resolves through 0xAE28F0, 0x9B92E0 (EAX = player) is false, and `0xEBCE9C` / `0xEBCEA0` are not a mode-7 / 8 override;
+       - otherwise `0x252A6D0..D8` and 1.0.
+   13. `vehicles_render_prepare` 0xAE1020, `render_lists_reset` 0x52E7C0, `game_render_func` 0x5250E0, `game_build_render_batches` 0x522FC0.
+10. **World not visible.** A fixed view, with no calls:
+    - `0xE9D620` = `0x252A6D0..D8`; the matrix is 9 dwords from `0xEC5AE4`; FOV `[0xDD3448]`;
+    - the same `0xE9D664..0xE9D688` fields as above;
+    - `0xE9D6B0..BC` and `0xE9D6C0..CC` = `0x252A6F0..FC` (written with an `fxch` sequence; the end result is the same order);
+    - `0xE9D690..98` and `0xE9D69C..A4` = `0xEC5ACC..D4`;
+    - `0xE9D68C` = 1.
+11. **Render-list swap.**
+    1. Exchange `[0x2305978]` and `[0x230597C]`.
+    2. The list that is now `[0x230597C]` (the game thread's next write list) gets its counts +0x5DC0 and +0x1C5C4 zeroed.
+    3. `[0x252737D]` = 0.
+12. **Cutscene flag.** `[0xE94D37]` = !(( `[0x2527D14]` && `[0x2527CF7]` ) || `[0x2527D15]`).
+13. **Audio job.** If in_game and `EBP` ≠ 0:
+    1. Set job+0x34 = 0x33D6328, then call `job->vtbl[+0x10]()` (wait).
+    2. Clear job +4, +8 (byte), +0x34, +9 (byte), +0x3C, +0x40, +0x44.
+    3. Free it with `pool 0xEC5B98 ->vtbl[+4](job − 8)` (thiscall, `ECX` = 0xEC5B98).
+14. **End of 2D.** `[0xE849DB]` = 0; `gfx_invalidate_render_state_block`.
+15. **Device release** (inlined). If `GetCurrentThreadId()` ≠ `[0x252A370]`: decrement `[0x252A368]`. When it reaches 0, set `[0x252A374]` = 0 and `LeaveCriticalSection(0x33D62D0)`.
+16. **Hand-off.** `[0x2774198]->vtbl[+0xC]()` signals the render thread's job object.
+17. **Wait for the acknowledgement.** `Sleep(1)` until byte `[0x277419C]` ≠ 0, then clear it.
+18. **Without `[0x252737E]`:** `Sleep(1)` until `[0x27741AC]` ≠ 0, then clear it. This is the "game at most one frame ahead" wait.
+19. **Render-mode toggle** on `dl` = `[0x2527383]`. Only 0xAE0350 sets it during the frame; step 1 cleared it.
+    - If `[0x2527382]` ≠ dl and dl ≠ 0:
+      1. If `[0xE98948]` == 2: `[0x2527381]` = 1, `[0xE989D8]` = 2, `[0xE98948]` = 1.
+      2. If `[0xE98994]` is 1 or 2: `[0x2527380]` = 1.
+    - If `[0x2527382]` ≠ dl and dl == 0: restore `[0xE98948]` from `[0xE989D8]` if `[0x2527381]`, and clear `[0x2527381]` / `[0x2527380]`.
+    - In both cases `[0x2527382]` = dl.
+
+### `render_thread_wait_frame` (0x522B80)
+
+cdecl (u8 reset); `ret`. Everything runs under CS `0x27741B4`:
+
+1. If the render thread exists (`[0x252A3EC]` ≠ 0, its thread id):
+   - **New render frame number** (`[0x27741B0]` ≠ `[0x2527388]`):
+     1. Copy it into `0x2527388`.
+     2. Time-stamp with QPC (0 when the timer is off, `0x252A404`).
+     3. **Busy-spin** until byte `[0x277419D]` ≠ 0 (set by the render thread at the start of its frame, in 0x522D00).
+     4. `[0x2527384]` = elapsed ms of the spin.
+     5. `ResetEvent([0x27741A4])`; `[0x277419D]` = 0.
+   - **Same frame number and reset ≠ 0:** set `[0x27741B0]` = `[0x2527388]` = `[0x252A3C4]` − 1, then the same `ResetEvent` and clear.
+2. If `[0x252737C]` == 0 or `[0x2527363]` ≠ 0, and the caller is not thread `[0x2527E84]`: zero the counts +0x5DC0 / +0x1C5C4 of `[0x230597C]`.
+
+### The render thread's side (`game_render_thread_frame` 0x522640)
+
+**Setup:**
+1. Thread id → `0x252A3EC`.
+2. `gfx_device_acquire`.
+3. The hand-off object `[0x2774198]` = `job_alloc(…)` → vtbl +4 (arm).
+4. 0x522D00: `[0x277419D]` = 1, time → `0x27741A0`, `SetEvent([0x27741A4])`.
+
+**Loop:**
+1. `pump_window_messages`. When the window is inactive (`0x252A406` == 0): `Sleep(50)` and `SetPriorityClass(GetCurrentProcess(), 0x20)`. Both paths set `[0xED4718]` = 0x20.
+2. Release the device (the same inline code as step 15).
+3. **Wait:** `job->vtbl[+0x10]()` on `[0x2774198]` returns once the game thread's step 16 signals it. Then the job is released to the pool `0xEC5B98`.
+4. Get the next job (pool vtbl +8), `ResetEvent(job+0x2C)`, store it in `[0x2774198]` and arm it (vtbl +4). Record `[0x27741B0]` = `[0x252A3C4]`, the frame number the game thread compares in `render_thread_wait_frame`.
+5. Re-acquire the device.
+6. Unless quitting (`0x2774195`):
+   1. **`[0x277419C]` = 1** (the acknowledgement, step 17); `[0x2527363]` = 0.
+   2. Clear the target; set the default render state.
+   3. If the snapshot is valid (`0xE9D68C`) and the world is visible (`0xE9D68D`): city / instance batch building (0x52A3B0, `city_build_render_batches`, the city instance jobs).
+   4. **`[0x27741AD]` = 1.**
+   5. `render_frame` 0x52A710 (or `gfx_command_buffer_wait` when the world is not visible).
+   6. `gfx_set_tint_color(ESI = 0xE9D670)`.
+   7. `render_deferred_execute`, which runs the list the game thread just swapped into `[0x2305978]`.
+   8. Clear the stats at `0x2304D6C..98`; `InterlockedExchangeAdd(0x33D62F4, …)`.
+   9. **`[0x27741AC]` = 1** (frame finished, step 18).
+   10. 0x522D00 (frame boundary: `[0x277419D]` = 1 and `SetEvent`).
+   11. Loop.
+7. **Quit** (0x522A90, from the game thread): sets `0x2774195`, signals the job, waits with `Sleep(1)` for `0x2774196`.
+
+**What a port must keep:**
+- **Snapshot window.** The game thread may write the snapshot `0xE9D620..0xE9D6D0`, the render-parameter blocks and the deferred list only between the acknowledgement of the previous hand-off and its own step 16. While `[0x252737D]` = 1 the snapshot is being written.
+- **Lists the render thread reads after the acknowledgement:** the swapped deferred list `[0x2305978]` and the snapshot.
+- **Wait loops.** The two `Sleep(1)` waits (steps 17 / 18) and the busy-spins (step 2 and `render_thread_wait_frame`) are the only waits. There is no event wait on the game-thread side.
+- **Device critical section.** The device CS `0x33D62D0` is recursive per thread (count `0x252A368`, owner `0x252A374`). Both threads release it around the hand-off, so it must be released before step 16 or the render thread blocks.
+
 ## Open
 
 - The exact identity of most unnamed sim_frame calls (the lists above give the order).

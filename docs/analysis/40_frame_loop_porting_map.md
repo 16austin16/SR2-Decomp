@@ -220,7 +220,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:6,7 | — 0xD24B70 | unmapped | 2.5% |  |  |
 | sim_frame:6,7 | — 0x793A40 | unmapped | 3.6% | 12 (gfx_cmd) |  |
 | sim_frame:6,7 | `interface_do_frame` 0x7F3500 | mapped | 5.3% |  | 06 |
-| sim_frame:6,7 | — 0x494080 | unmapped | 0.6% |  |  |
+| sim_frame:6,7 | `camera_get_fov` 0x494080 | mapped | 0.6% |  | 11, 19 |
 | sim_frame:6,7 | — 0xD24D80 | unmapped | 2.9% |  |  |
 
 ### `frame_end_handoff` (0x521A00)
@@ -241,28 +241,28 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 |  | `render_snapshot_copy_view` 0x5220B0 | mapped | 0.0% |  | 40 |
 |  | `render_snapshot_reset_scales` 0x521870 | mapped | 0.0% |  | 40 |
 |  | `time_of_day_in_range` 0x4D9900 | mapped | 0.1% |  | 40 |
-|  | — 0x4D9DD0 | unmapped | 0.2% |  |  |
-|  | — 0x4D4820 | unmapped | 0.1% |  |  |
-|  | — 0x4D4F90 | unmapped | 0.1% |  |  |
-|  | — 0x4D5470 | unmapped | 0.1% |  |  |
-|  | — 0x4D5300 | unmapped | 0.1% |  |  |
-|  | — 0x4D5670 | unmapped | 0.1% |  |  |
-|  | — 0x4E69D0 | unmapped | 0.0% |  |  |
-|  | — 0x6255A0 | unmapped | 0.8% |  |  |
-|  | — 0x46CCD0 | unmapped | 3.8% | 1 (render) |  |
-|  | — 0xD08310 | unmapped | 2.2% |  |  |
-|  | — 0x4C7190 | unmapped | 0.1% |  |  |
-|  | — 0x728AB0 | unmapped | 0.7% |  |  |
-|  | — 0x51A880 | unmapped | 0.0% |  |  |
-|  | — 0x51A4A0 | unmapped | 5.9% | 3 |  |
-|  | — 0x9FAA20 | unmapped | 0.1% |  |  |
-|  | — 0x494080 | unmapped | 0.6% |  |  |
-|  | — 0xBE4170 | unmapped | 1.8% |  |  |
-|  | — 0x4D9A50 | unmapped | 0.1% |  |  |
-|  | — 0xB77CA0 | unmapped | 0.2% |  |  |
+|  | `tod_light_value_update` 0x4D9DD0 | mapped | 0.2% |  | 11 |
+|  | `tod_ambient_colors_update` 0x4D4820 | mapped | 0.1% |  | 11 |
+|  | `tod_light_block_b_update` 0x4D4F90 | mapped | 0.1% |  | 11 |
+|  | `tod_sun_update` 0x4D5470 | mapped | 0.1% |  | 11 |
+|  | `tod_fog_color_update` 0x4D5300 | mapped | 0.1% |  | 11 |
+|  | `tod_misc_params_update` 0x4D5670 | mapped | 0.1% |  | 11 |
+|  | `lighting_buffers_copy_for_render` 0x4E69D0 | mapped | 0.0% |  | 11 |
+|  | `tagging_paint_buffer_swap` 0x6255A0 | mapped | 0.8% |  | 11 |
+|  | `audio_frame_snapshot` 0x46CCD0 | mapped | 3.8% | 1 (render) | 10, 11 |
+|  | `mesh_decals_frame_update` 0xD08310 | mapped | 2.2% |  | 11 |
+|  | `glares_render_snapshot` 0x4C7190 | mapped | 0.1% |  | 11 |
+|  | `water_sim_frame_snapshot` 0x728AB0 | mapped | 0.7% |  | 11 |
+|  | `render_params_publish` 0x51A880 | mapped | 0.0% |  | 11 |
+|  | `render_params_reset` 0x51A4A0 | mapped | 5.9% | 3 | 11 |
+|  | `objects_collect_render_flagged` 0x9FAA20 | mapped | 0.1% |  | 11 |
+|  | `camera_get_fov` 0x494080 | mapped | 0.6% |  | 11, 19 |
+|  | `matrix_orthonormalize` 0xBE4170 | mapped | 1.8% |  | 11 |
+|  | `sky_light_snapshot` 0x4D9A50 | mapped | 0.1% |  | 11 |
+|  | `world_shader_constants_update` 0xB77CA0 | mapped | 0.2% |  | 11 |
 |  | — 0x9B92E0 | unmapped | 0.1% |  |  |
 |  | — 0xAE28F0 | unmapped | 0.0% |  |  |
-|  | — 0xAE1020 | unmapped | 1.1% |  |  |
+|  | `vehicles_render_prepare` 0xAE1020 | mapped | 1.1% |  | 11 |
 |  | `render_lists_reset` 0x52E7C0 | mapped | 0.0% |  | 18 |
 |  | `game_render_func` 0x5250E0 | mapped | 11.0% | 5 (gfx_cmd) | 36 |
 |  | `game_build_render_batches` 0x522FC0 | mapped | 19.6% | 6 (gfx_cmd) | 40 |
