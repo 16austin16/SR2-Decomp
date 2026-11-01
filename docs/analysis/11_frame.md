@@ -465,15 +465,22 @@ The dispatchers are `game_state_enter` (0x697330) and `game_state_exit` (0x6973E
 
 ### `frontend_enter` (0x73D900)
 
-Call order:
-1. 0x68BE20 (`ESI` = 1), 0x831300, 0x73E110.
-2. `options_display_mode_failed_dialog` (a pending display-mode error).
-3. 0x7F7830.
-4. 0x47C740 (`EDX` = 1500), then a sound by hash (`string_hash_lower(ECX = 0xE1996C)`, 0x47A2B0).
-5. 0x7EAE00 (`EAX` = 0x1FD5028), 0x6AA570, 0x76DE70, 0x73C2F0, 0x835A20, 0x7F7830.
-6. 0x4D1270(cdecl 1000): fade in.
-7. 0xB91790, 0xB91B70 (`ECX` = 0xE1993C): load the main-menu vint document.
-8. 0x830F70 (`ESI` = 0xEB22E8).
+Corrected from the instructions (the earlier call list was wrong in several places). `EBX` = 0, `ESI` = 1.
+1. `[0x2527F14]` = 1; 0x68BE20. `[0xE96C04]` = −1; clear `0x2527BB4`, `0x2527EC3`, `0x2527EB2`, `0x2527EB3`. 0x831300.
+2. **Main-menu document handle** `[0x2527EAC]` is live when it is non-zero, its low word is below 0xC, and the slot `0x319F6B0 + (h & 0xFFFF) × 0x57C` has the handle at +0x4C.
+   - Not live: 0x73E110.
+   - Live: only if `[0x252A263]` is set, clear it and call `options_display_mode_failed_dialog` (0x760B20).
+3. `[0xE8DD26]` = 1; 0x7F7830.
+4. **Conditional music stop:** if the sound handle `[0xEAC094]` is valid (low byte ≠ 0xFF, high bits ≠ 0 and equal to the slot's id at `0xEEB9AC + idx × 0x19C`, and the slot's +0xEEB8F8 ≠ −1): 0x47C740(`EDX` = 1500).
+5. `[0xEAC094]` = 0xFF. Hash: `string_hash_lower` (0xBDCB30), **stdcall (&out)** with `ECX` = 0xE1996C (the name), `EAX` = 0. Then 0x47A2B0(`EDX` = the hash); the word result goes to `[0xE8EAE0]`.
+6. `[0x1F6F53C]` = 0; `[0xEAC0A4]` = `[0xE843AC]`, wrapped by −0x6B49D200 when above 0x6B49D200.
+7. 0x7EAE00(`EAX` = 0x1FD5028). Clear `0xEAAF6C`; clear `[0xEAAF84]` if set. 0x6AA570, 0x76DE70. Clear `0x2527BD1`, `0xE94D3E`, `0x2528A7F`.
+8. If `[0x2527EA0]` == 0: 0x73C2F0(cdecl 0), then `[0x2527EA0]` = 1.
+9. 0x835A20. If `[0x2527C03]`: clear it, `[0x2528A7C]` = 1, and 0x7F7830 when `[0x2528B48]` is set.
+10. Only if `[0x2526D9C]` == 1: 0x4D1270(cdecl 1000, f32 0.0, `DL` = 0).
+11. `[0x2527EB4]` = 0.0; clear `0x2527C04`, `0x2528A7D`, `0x2527EBC`, `0x2527EBD`; `[0xE8EAE4]` = −1.
+12. **Main-menu Lua call record.** If `[0x2527EC4]` is a live handle (low word below 0x20, slot `0x31A4A80 + i × 0x260` with the handle at +0x210): `vint_lua_call_free` (0xB91790) with `ESI` = `EAX` = the record, `ECX` = the handle. Then `vint_lua_call_alloc` (0xB91B70, `ECX` = 0xE1993C); if it returns a record: `[0x2527EC4]` = record +0x210, record +0x25C = 0x73D350 (the callback).
+13. Only if `[0x2528CF2]`: 0x830F70(`ESI` = 0xEB22E8), then clear it.
 
 ### `frontend_exit` (0x73DB40)
 
@@ -494,21 +501,32 @@ Call order:
 
 ### `gameplay_enter` (0x68DE50)
 
-Call order:
-1. 0x792B10.
-2. 0x739930(cdecl 0x21, `ECX` = 0xDFFB48).
-3. 0x4D1270(250): fade.
-4. `net_send_gameplay_changed`.
-5. 0x7F8BA0 (`ECX` = 11).
-6. Two rounds of HUD message strings (0x7F49E0 ×3 with `ESI` = 0xDFFAE0 / 0xDFFAF4 / 0xDFFB10, then 0x753F40).
-7. 0x4D1900 / 0x4D1270, 0x80FCF0, 0x6C8020.
-8. `_stricmp` against the level name, then 0x68DC80 / 0x68DC50.
-9. 0x7C0C30, 0x7CE320(−1), 0x8CB040(−1).
-10. `weather_set`.
-11. `overlay_show(1, EDI = 0xEAC488)`.
-12. 0x80B8D0, 0x80B960, 0xB874E0.
-13. 0x699840(cdecl 1, `EDI` = 13).
-14. 0x8D0CB0.
+Corrected from the instructions (the earlier list had unconditional steps that are really gated). `EBX` = 0. "Online host" = `[0x2528B48]` == 1 and `[0x2528B49]` == 0; "co-op" = `[0x2528B49]` set. Session = `[0x2528C14]`; it "takes part" when it is non-zero, `[eax+0x3F8]` is set, and (`[0x2528B56]` == 0 or `[0x2528B2B]` set).
+1. Clear `0x2527BA0`, `0x2527BA2`. 0x792B10.
+2. **Unless online host:** 0x739930(cdecl 0x21, `ECX` = 0xDFFB48).
+3. 0x4D1270(cdecl 250, f32 0.0, `DL` = 0).
+4. If `[0xE96C04]` ≠ −1: `net_send_gameplay_changed` (0x68F0D0).
+5. Clear `0xE8E72C`, `0x2527FF8`, `0x2527FFC`. **Online host jumps to step 9.**
+6. If `[0xE8D6BF]`: `[0x2528989]` = 1. If the session takes part: 0x7F8BA0(`ECX` = 11, `ESI` = session +0x408).
+7. `CL` = 0. If the session takes part and (`[0x2527B9E]` or `[0x2527B9F]`):
+   - the HUD message: 0x753F40(`EAX` = `lstr_get(ESI = 0xDFFAE0)`, `CL` = 1, cdecl (`lstr_get(0xDFFB10)`, `lstr_get(0xDFFAF4)`, 0x68DC00, 1)), `EDI` = 0; `[0x2527BA4]` = result +0x920;
+   - B9E path: a fade 0x4D1270(cdecl 0, f32 0.0, `DL` = 1) only when `[0x2526DA0]` ≠ 0.0 (or NaN); B9F path: the same fade only when `screen_fade_is_clear` is false;
+   - `CL` = 1, `[0x2527BA1]` = `[0x2527BA0]` = 1.
+   - Then (taken or not, once the session takes part) clear `0x2527B9E` / `0x2527B9F`.
+8. If `[0x2528989]`:
+   - with `CL` = 1: go to 9;
+   - session non-zero and 0x80FCF0(cdecl session) true: if 0x6C8020 false and `_stricmp(0xE99740, 0xDFFB60)` == 0 → 0x68DC80; otherwise → 0x68DC50;
+   - session zero or 0x80FCF0 false: 0x68DC50 only when `[0x2528D21]` == 0.
+   
+   If `[0x2528989]` == 0: unless `[0x2527BD0]`: 0x7C0C30(cdecl player `[0x21703D4]`, 0), 0x7CE320(cdecl −1, 0). Then 0x8CB040.
+9. **Only online host:** `weather_set` (0x4DEC00, `EAX` = `[0x2A4D13C]`).
+10. **Only if `[0x27AC7B8]` bit 2 (value 2):** `overlay_show(cdecl 1, EDI = 0xEAC488)`.
+11. **Only co-op:** `[0x2528B89]` = 1; `[0xEB1614]` = `[0xE843AC]` + 10000 (minus 0x6B49D200 when above it); 0x80B8D0, 0x80B960.
+12. 0xB874E0.
+13. **Clock clamp.** v = f32(f32(`[0x2527DA4]` / `[0xE8ECAC]`) × 2). If v ≥ the double `[0xE5DC58]` (or NaN): `[0xE84390]` = `[0xE5D9C8]`, `[0xE84394]` = v. Otherwise `[0xE84390]` = v, `[0xE84394]` = `[0xE5D9C8]`. `[0xE98974]` = 0.
+14. If `[0x1F768DA]`: 0x699840(cdecl 1, `EDI` = 13), then `++[0x2527CC0]`.
+15. Only if `[0x2528ACE]`: 0x8D0CB0.
+16. `[0x2527C00]` = 0.
 
 ### `gameplay_exit` (0x68E560), cdecl (next state)
 
@@ -543,10 +561,10 @@ This tears the world down. The order matters.
    4. 0x747C40, 0x7483E0, 0x7434D0 ×2; clear `0x2527F27` / `0x2527F48`; 0x747930, 0x747680.
 10. **Pauses.** While `0x2527C08` > 0: 0x699910 (pops pause levels).
 11. **Clocks.**
-    1. 0xA79030; `0x2526D2A` / `0x2526D24` = 0; 0xC14930(0, 0).
+    1. 0xA79030; `0x2526D2A` / `0x2526D24` = 0; 0xC14930(`EAX` = pad or 0, `ECX` = raw pad, 0.0, 0.0).
     2. Pending online stats: 0x835A20, 0x824F30.
     3. 0x793D60(0).
-    4. `0xE84390` = 1/120 (0x3C088889); `0xE84394` = 0.2.
+    4. `0xE84390` / `0xE84394` = the clock defaults `[0xE5C018]` / `[0xE5D9C8]`.
 12. **Co-op to loading.** In co-op with next == 10: `0x2527C00` = 1 around 0x7F8BA0.
 13. **End.** `0x2527C0F` = 0. If the pending state is 2: 0x73E110. Then 0x69AED0, 0x465470, 0x47F170.
 
@@ -597,7 +615,7 @@ The game thread **enters `gameplay_exit` holding the device**: `frame_end_handof
 14. `[0xE8DD23]` = 1; 0x766320(cdecl 1, 1); 0x766320(cdecl 0, 1); 0x5480C0.
 15. Clear `0x2526D67`, `0xFA2228` / `0xFA222C`, `0x276CFD0` / `0x276CFD4`. 0x747C40; 0x7483E0; 0x7434D0(`EDI` = 0x29A6520); 0x7434D0(`EDI` = 0x29A66D8); clear `0x2527F27` / `0x2527F48`; 0x747930; 0x747680.
 16. While `[0x2527C08]` > 0: 0x699910(`ESI` = −1), which pops a pause level.
-17. 0xA79030. `[0x2526D2A]` = 0, `[0x2526D24]` = 0. 0xC14930(`ECX` = `[0xE98DB0]` or 0 when it is −1, cdecl 0.0, 0.0).
+17. 0xA79030. `[0x2526D2A]` = 0, `[0x2526D24]` = 0. 0xC14930(`EAX` = `[0xE98DB0]`, or 0 when it is −1; `ECX` = the raw `[0xE98DB0]`; cdecl 0.0, 0.0). (Fixed: the two registers were swapped here before.)
 18. If `[0x1F768DA]`: 0x835A20; if also `[0x144EA3B]`: 0x824F30 and clear it. Clear `0x1F768DA`. 0x793D60(cdecl 0).
 19. `[0xE84390]` = `[0xE5C018]`, `[0xE84394]` = `[0xE5D9C8]` (the clock defaults).
 20. Co-op with next == 10: `[0x2527C00]` = 1, then 0x7F8BA0(`ECX` = 7, `ESI` = session +0x408). Otherwise `[0x2527C00]` = 0.
@@ -612,22 +630,23 @@ The game thread **enters `gameplay_exit` holding the device**: `frame_end_handof
 
 ### `loading_enter` (0x73B430)
 
-1. `[0xE94D3E]` = 0 (world not visible); 0x7F8BA0.
+1. `[0xE94D3E]` = 0 (world not visible); 0x7F8BA0(`ECX` = 7, `ESI` = `[[0x2528C14]+0x408]`).
 2. `0xE8EB88` = 0 (load result: 0 running, 1 done, −1 failed); `0x2527E81` / `0x2527E80` = 0.
-3. Set both job workers to kind 4 (`0x33D6430`, `0x33D6500`) and `job_worker_wake` each.
+3. Both job workers to kind 4 and `job_worker_wake` each (`ESI` = worker): workers `0x33D63F8` and `0x33D64C8`, kind at worker +0x38 (`0x33D6430` / `0x33D6500`).
 4. If `0x2527E84` == 0: 0x739340. Then 0x6981E0.
-5. `gfx_set_color(0, 0, 0, 0xFF)`; `screen_fade_start(0, 0, 1.0)`: black at once. Then 0x4D1270(250, 0).
-6. If loading is the top state and `0xE96C04` < 11: 0x73B650.
+5. `gfx_set_color(0, 0, 0, 0xFF)`; `screen_fade_start(0, 0, 1.0)`: black at once. Then 0x4D1270(cdecl 250, f32 0.0, `DL` = 0).
+6. If the top state (`0x144E760[[0xE96B7C]]`) is 10 and `0xE96C04` < 11: 0x73B650.
 7. **`0xE8EB8C` = `thread_create(loading_thread_proc 0x73B320, 0, 0)`**: the load runs on its own thread.
 8. `0x2527E8C` = 0; `0x2527E83` = 0.
 
 ### `loading_exit` (0x73B520)
 
 1. `CloseHandle` on the loading thread's handle (`0x2347144 + (0xE8EB8C & 0xFFFF) × 20`).
-2. If the co-op wait did not finish (`0x2527E8C` == 0) and `0x2527BA0` is set: set `0x2528989` when `0xE8D6BF`, then 0x7F8BA0.
-3. On failure or a non-gameplay next state: 0x698700. Here a failure is `0x2527E80` set or `0xE8EB88` == −1; a non-gameplay next state is a pending state other than 5 whose top is not 8 / 9.
+2. If the co-op wait did not finish (`0x2527E8C` == 0) and `0x2527BA0` is set: set `0x2528989` when `0xE8D6BF`, then 0x7F8BA0(`ECX` = 11, `ESI` = session +0x408).
+3. On failure or a non-gameplay next state: 0x698700. Here a failure is `0x2527E80` == 1 or `0xE8EB88` == −1; a non-gameplay next state is a pending state (`0x144E75C`) other than 5 whose top is not 8 / 9.
 4. If the loading music `0xEAC094` is still valid and not handed over (0x698FF0 false): stop it (0x47C740, `EDX` = 500).
-5. `[0xE94D3E]` = 1.
+5. `[0xE94D3E]` = 1; **`[0x2527E80]` = 0**.
+6. If the top state is 10: **tail `jmp 0x73B790`**; otherwise return.
 
 **Port note:**
 - `loading_enter` / `loading_exit` and `frontend_exit` are short, call-order-only functions, so they can be ported as they are.
