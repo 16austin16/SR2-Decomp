@@ -38,6 +38,8 @@ mod port_bindings2;
 mod port_humans2;
 mod port_render;
 mod port_sim_leaves;
+mod port_weapons_audio;
+mod port_human_states;
 mod port_sim_humans;
 mod port_states;
 mod port_vehicles;
