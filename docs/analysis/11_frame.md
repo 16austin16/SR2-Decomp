@@ -550,6 +550,66 @@ This tears the world down. The order matters.
 12. **Co-op to loading.** In co-op with next == 10: `0x2527C00` = 1 around 0x7F8BA0.
 13. **End.** `0x2527C0F` = 0. If the pending state is 2: 0x73E110. Then 0x69AED0, 0x465470, 0x47F170.
 
+### gameplay_exit (0x68E560) at instruction level
+
+cdecl (next state, read at `[esp+0x14]`). Saves `EBX` (= 0 throughout), `EBP`, `ESI` (= −1 at first), `EDI`. `EBP` = the `GetCurrentThreadId` import `[0xDB8080]`.
+
+**The device lock** (critical section `0x33D62D0`; count `0x252A368`; owner `0x252A374`; the device thread id `0x252A370`):
+- **acquire** = `gfx_device_acquire` (0xCFBC00):
+  - no-op on the device thread `0x252A370`;
+  - count + 1 if the caller already owns it;
+  - otherwise `EnterCriticalSection`, owner = caller, count + 1.
+- **release** is **inlined** here:
+  - `GetCurrentThreadId`; if it equals `[0x252A370]`, skip;
+  - otherwise count − 1; at 0: owner = 0 and `LeaveCriticalSection(0x33D62D0)`.
+  - It **does not check the owner**, and a release at count 0 drives the count to −1 without leaving.
+
+The game thread **enters `gameplay_exit` holding the device**: `frame_end_handoff` took it. So the first operation can be a release.
+
+`[A]` and `[R]` below mark acquire and release.
+
+1. `0x2527C0F` = 1; `0x2527BA2` and `0x2527B9E..BA1` = 0.
+2. 0x47F200, 0x47F080, `render_thread_wait_frame(cdecl 0)`.
+3. Unless (`[0x2528B48]` == 1 and `[0x2528B49]` == 0): 0x739B70(`ECX` = 0xDFFB48).
+4. `dialog_pause_hide` (0x754270); 0x754320 (`EDI` = 3); 0x6B7870.
+5. Unless `[0x2528ADF]` == 1 or `[0xE8CF7C]` is 0xD or 0xB: `[0xE8CF7C]` = −1.
+6. 0x755F70; `[0x2527FF4]` = 0; `[0xE8E780]` = −1; `interface_screen_state_frame`; `hud_player_reset_complete`.
+7. **Cutscene** (`[0x2527D14]` set and cutscene +0xAFF == 0): **[R]** release, 0x6C44C0 (cutscene teardown, which needs the device free for the render thread), **[A]** `gfx_device_acquire`, `player_outfit_stream_update`.
+8. `overlays_hide_all`; **[A]**; `[0xE98974]` = 2; **[R]**. This is an acquire / release sync point around the render-mode write.
+9. `gamewide_func(cdecl 1)`.
+10. **Player** P = `[0x21703D4]`:
+    1. If P+0x1161 bit 0: 0x9DA290(cdecl 0).
+    2. If P's vehicle (+0xD74 handle, type 5) and 0xAB4960(`ECX` = vehicle): 0xAB4720(`EAX` = vehicle, cdecl 0, 0).
+    3. 0x9DED00(cdecl P, 0); 0x68F420; 0x6A4230.
+11. **Network / weather.** With S48 = `[0x2528B48]` and S49 = `[0x2528B49]`:
+    - S48 == 1 and S49 == 1 (co-op): 0x7F7830 unless next == 10;
+    - S48 == 1 and S49 == 0: unless next is 8, 9 or 10: 0x7F7830, `0xB710C0(EAX = 0xDFFB94, cdecl 1)`, `[0x2526E14]` = 0;
+    - otherwise nothing.
+12. **World teardown**, in this order:
+    1. 0x9F2100; 0x550A00(`ESI` = 0x279930C); 0x550A00(`ESI` = 0x2799390). Clear `0x279930C..0x279931C` and the byte `0x279932C` (floats with `fldz`).
+    2. 0xB80020 (distant vehicles), 0xB7CA10 (distant peds), 0x4A8230.
+    3. **`objects_reset`** (0x925AF0), **then [A] [R]**: a sync point after it, not around it.
+    4. 0xA24750, 0xA7D480, 0x514260, 0x5039F0; `[0x2527294]` = 0; 0xA93FC0, 0x9347B0.
+    5. `objects_deactivate_all`, 0x9FD3F0, 0x9EA0E0, 0x9ECD50, 0xAC5D40.
+    6. Physics: 0x6E7690, 0x6E33B0, 0x6F8E50, 0x6E8560, 0x6E5BB0, 0x6E0A20.
+    7. `0xF8478C..0xF84794` = 0; 0x4DA850; 0x7938A0.
+13. Unless any of `0x2527C01..C04` is set: 0x6B56A0.
+14. `[0xE8DD23]` = 1; 0x766320(cdecl 1, 1); 0x766320(cdecl 0, 1); 0x5480C0.
+15. Clear `0x2526D67`, `0xFA2228` / `0xFA222C`, `0x276CFD0` / `0x276CFD4`. 0x747C40; 0x7483E0; 0x7434D0(`EDI` = 0x29A6520); 0x7434D0(`EDI` = 0x29A66D8); clear `0x2527F27` / `0x2527F48`; 0x747930; 0x747680.
+16. While `[0x2527C08]` > 0: 0x699910(`ESI` = −1), which pops a pause level.
+17. 0xA79030. `[0x2526D2A]` = 0, `[0x2526D24]` = 0. 0xC14930(`ECX` = `[0xE98DB0]` or 0 when it is −1, cdecl 0.0, 0.0).
+18. If `[0x1F768DA]`: 0x835A20; if also `[0x144EA3B]`: 0x824F30 and clear it. Clear `0x1F768DA`. 0x793D60(cdecl 0).
+19. `[0xE84390]` = `[0xE5C018]`, `[0xE84394]` = `[0xE5D9C8]` (the clock defaults).
+20. Co-op with next == 10: `[0x2527C00]` = 1, then 0x7F8BA0(`ECX` = 7, `ESI` = session +0x408). Otherwise `[0x2527C00]` = 0.
+21. `[0x2527C0F]` = 0. If `[0x144E75C]` == 2: 0x73E110. Then 0x69AED0, 0x465470, **tail `jmp 0x47F170`**.
+
+**Lock balance.** Releases and acquires are matched within the function: 7 is −1 then +1, 8 is +1 then −1, 12.3 is +1 then −1. The thread leaves holding the device exactly as it entered.
+
+**Port:**
+- Port the inline release as a helper with the same "skip on the device thread, no owner check" rules.
+- Do not move `objects_reset` inside the pair.
+- `gameplay_enter` (0x68DE50) has no device acquire or release at all.
+
 ### `loading_enter` (0x73B430)
 
 1. `[0xE94D3E]` = 0 (world not visible); 0x7F8BA0.
@@ -571,7 +631,7 @@ This tears the world down. The order matters.
 
 **Port note:**
 - `loading_enter` / `loading_exit` and `frontend_exit` are short, call-order-only functions, so they can be ported as they are.
-- `gameplay_exit` is long but has no branches that depend on its own results. A port can keep it as one block of calls in this order. Keep the device acquire / release pairs: there are three, and `objects_reset` must run inside one.
+- `gameplay_exit` is long but has no branches that depend on its own results. A port can keep it as one block of calls in this order. Keep the device acquire / release points exactly; see "gameplay_exit at instruction level". (Correction: `objects_reset` runs **before** the third acquire, not inside a pair.)
 
 ## game_state_dispatch, overlays and the gameplay UI at instruction level
 
