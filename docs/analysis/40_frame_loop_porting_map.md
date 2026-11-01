@@ -112,68 +112,68 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 | sim_frame:1b | — 0x7B02E0 | unmapped | 0.3% |  |  |
 | sim_frame:1b | `crib_stash_tutorial_nag` 0x548260 | mapped | 0.2% |  | 30 |
 | sim_frame:1b | — 0xA93FF0 | unmapped | 0.0% |  |  |
-| sim_frame:1c | — 0x8045F0 | unmapped | 0.9% |  |  |
-| sim_frame:1c | — 0x804850 | unmapped | 0.0% |  |  |
-| sim_frame:1c | — 0x6FF860 | unmapped | 0.1% |  |  |
-| sim_frame:1c | — 0xB08530 | unmapped | 4.7% | 1 (rsched) |  |
-| sim_frame:1c | — 0x6ADB10 | unmapped | 0.8% |  |  |
+| sim_frame:1c | `net_registered_objects_update` 0x8045F0 | mapped | 0.9% |  | 35, 40 |
+| sim_frame:1c | `net_remote_objects_do_frame` 0x804850 | mapped | 0.0% |  | 35, 40 |
+| sim_frame:1c | `physics_frame_time` 0x6FF860 | mapped | 0.1% |  | 17, 40 |
+| sim_frame:1c | `vehicle_interactions_update` 0xB08530 | mapped | 4.7% | 1 (rsched) | 16, 40 |
+| sim_frame:1c | `persona_events_update` 0x6ADB10 | mapped | 0.8% |  | 40 |
 | sim_frame:1c | `humans_update_all` 0x9D7F90 | mapped | 10.5% | 2 (gfx_cmd) | 40 |
 | sim_frame:1c | `humans_update_neighborhoods` 0x9A7080 | mapped | 6.5% | 1 (gfx_cmd) | 15 |
 | sim_frame:1c | `humans_animation_jobs` 0x9A7150 | mapped | 0.6% |  | 15 |
 | sim_frame:1c | `humans_ai_update` 0x9A71B0 | mapped | 10.5% | 1 (gfx_cmd) | 15 |
-| sim_frame:1c | — 0x9305F0 | unmapped | 5.8% |  |  |
-| sim_frame:1c | — 0x935820 | unmapped | 5.1% | 1 (streamman) |  |
+| sim_frame:1c | `object_items_update` 0x9305F0 | mapped | 5.8% |  | 34, 40 |
+| sim_frame:1c | `object_props_update` 0x935820 | mapped | 5.1% | 1 (streamman) | 34, 40 |
 | sim_frame:1c | `ai_global_do_frame` 0x437160 | mapped | 5.9% |  | 21, 40 |
 | sim_frame:1c | — 0x55BA40 | unmapped | 4.4% | 1 (rsched) |  |
-| sim_frame:1c | — 0x56BD60 | unmapped | 3.1% | 8 (gfx_cmd) |  |
-| sim_frame:1c | — 0x4B11F0 | unmapped | 0.4% | 4 (mempool) |  |
+| sim_frame:1c | `septic_decals_update` 0x56BD60 | mapped | 3.1% | 8 (gfx_cmd) | 29, 40 |
+| sim_frame:1c | `districts_ownership_refresh` 0x4B11F0 | mapped | 0.4% | 4 (mempool) | 30, 40 |
 | sim_frame:1c | — 0x5507C0 | unmapped | 0.0% |  |  |
-| sim_frame:1c | — 0x9F5420 | unmapped | 1.6% |  |  |
-| sim_frame:1c | — 0x655750 | unmapped | 4.8% |  |  |
-| sim_frame:1c | — 0x542B00 | unmapped | 1.1% |  |  |
-| sim_frame:1c | — 0x565DA0 | unmapped | 0.6% | 2 (gfx_cmd) |  |
+| sim_frame:1c | `shops_do_frame` 0x9F5420 | mapped | 1.6% |  | 30, 40 |
+| sim_frame:1c | `holdup_do_frame` 0x655750 | mapped | 4.8% |  | 29, 40 |
+| sim_frame:1c | `chunk_swap_sequences_update` 0x542B00 | mapped | 1.1% |  | 05, 40 |
+| sim_frame:1c | `pushback_do_frame` 0x565DA0 | mapped | 0.6% | 2 (gfx_cmd) | 29, 40 |
 | sim_frame:1c | `diversion_mode_frame` 0x603140 | mapped | 0.1% |  |  |
-| sim_frame:1c | — 0xA95A30 | unmapped | 2.9% | 1 (gfx_cmd) |  |
-| sim_frame:1c | — 0xADD120 | unmapped | 1.5% |  |  |
-| sim_frame:1c | — 0xAEF510 | unmapped | 1.5% |  |  |
+| sim_frame:1c | `ambulances_update` 0xA95A30 | mapped | 2.9% | 1 (gfx_cmd) | 21, 40 |
+| sim_frame:1c | `meter_maids_update` 0xADD120 | mapped | 1.5% |  | 21, 40 |
+| sim_frame:1c | `taxis_update` 0xAEF510 | mapped | 1.5% |  | 21, 40 |
 | sim_frame:4 | `vehicles_pre_update` 0xAE3A80 | mapped | 8.2% |  | 40 |
-| sim_frame:4 | — 0x92B3B0 | unmapped | 0.9% |  |  |
-| sim_frame:4 | — 0x9FA620 | unmapped | 2.2% |  |  |
+| sim_frame:4 | `debris_do_frame` 0x92B3B0 | mapped | 0.9% |  | 34, 40 |
+| sim_frame:4 | `level_objects_physics_update` 0x9FA620 | mapped | 2.2% |  | 40 |
 | sim_frame:4 | `chunk_object_anims_update` 0x91C6C0 | mapped | 0.2% |  | 05 |
-| sim_frame:4 | — 0xB80070 | unmapped | 1.1% |  |  |
+| sim_frame:4 | `distant_vehicles_update` 0xB80070 | mapped | 1.1% |  | 40 |
 | sim_frame:4 | `distant_peds_update` 0xB7CA80 | mapped | 7.5% |  | 40 |
-| sim_frame:4 | — 0x9DF820 | unmapped | 1.6% |  |  |
+| sim_frame:4 | `player_vehicle_edge_check` 0x9DF820 | mapped | 1.6% |  | 16, 40 |
 | sim_frame:4 | `job_worker_wake` 0xBF3760 | mapped | 0.0% |  | 11 |
 | sim_frame:4 | `garage_exit_tutorial` 0x554E20 | mapped | 7.2% | 2 (gfx_cmd) | 30 |
 | sim_frame:4 | `humans_movement_update` 0x9A9890 | mapped | 7.8% |  | 15 |
 | sim_frame:4 | `sim_physics_step` 0x6FA0E0 | mapped | 18.0% | 6 (gfx_cmd, mempool, render) | 11, 17 |
 | sim_frame:4 | `humans_character_step` 0x9A9B60 | mapped | 3.6% |  | 15 |
-| sim_frame:4 | — 0x4C2BF0 | unmapped | 5.8% |  |  |
+| sim_frame:4 | `explosions_flush_queue` 0x4C2BF0 | mapped | 5.8% |  | 33, 40 |
 | sim_frame:4 | — 0x9A9CE0 | unmapped | 5.1% |  |  |
-| sim_frame:4 | — 0x71B910 | unmapped | 0.4% |  |  |
-| sim_frame:5 | — 0xA8B400 | unmapped | 0.1% |  |  |
+| sim_frame:4 | `havok_triggers_update` 0x71B910 | mapped | 0.4% |  | 36, 40 |
+| sim_frame:5 | `streamman_slot_entries_update` 0xA8B400 | mapped | 0.1% |  | 05, 40 |
 | sim_frame:5 | `population_update` 0x95A3D0 | mapped | 0.9% |  | 21 |
 | sim_frame:5 | `vehicles_update` 0xAE3C60 | mapped | 13.8% |  | 16 |
-| sim_frame:5 | — 0xB095D0 | unmapped | 4.9% | 3 |  |
-| sim_frame:5 | — 0x634350 | unmapped | 4.5% |  |  |
+| sim_frame:5 | `vehicle_interaction_riders_update` 0xB095D0 | mapped | 4.9% | 3 | 16, 40 |
+| sim_frame:5 | `vehicle_surfing_attach_player` 0x634350 | mapped | 4.5% |  | 29, 40 |
 | sim_frame:5 | `humans_post_update` 0x9A7210 | mapped | 13.0% | 9 (gfx_cmd, streamman) | 15 |
 | sim_frame:5 | `projectiles_update` 0x94C0A0 | mapped | 7.7% | 7 (gfx_cmd) | 20 |
 | sim_frame:5 | `video_frame` 0x688FE0 | mapped | 1.0% |  | 23 |
-| sim_frame:5 | — 0xB72FD0 | unmapped | 0.0% |  |  |
-| sim_frame:5 | — 0x4BD790 | unmapped | 1.5% |  |  |
-| sim_frame:5 | — 0xB6A4A0 | unmapped | 3.3% |  |  |
-| sim_frame:5 | — 0x4D1D50 | unmapped | 0.1% |  |  |
-| sim_frame:5 | — 0x930EC0 | unmapped | 0.2% |  |  |
-| sim_frame:5 | — 0x9FA670 | unmapped | 3.0% | 3 |  |
-| sim_frame:5 | — 0x9FF5A0 | unmapped | 2.9% |  |  |
-| sim_frame:5 | — 0xA5E3E0 | unmapped | 1.0% |  |  |
-| sim_frame:5 | — 0x935B80 | unmapped | 0.2% |  |  |
-| sim_frame:5 | — 0x490940 | unmapped | 1.0% |  |  |
-| sim_frame:5 | — 0x489CC0 | unmapped | 2.4% |  |  |
-| sim_frame:5 | — 0x4AAC40 | unmapped | 2.4% |  |  |
+| sim_frame:5 | `weapons_cooldown_update` 0xB72FD0 | mapped | 0.0% |  | 20, 40 |
+| sim_frame:5 | `brass_update` 0x4BD790 | mapped | 1.5% |  | 33, 40 |
+| sim_frame:5 | `weapon_effects_update` 0xB6A4A0 | mapped | 3.3% |  | 20, 40 |
+| sim_frame:5 | `vehicle_attached_effects_update` 0x4D1D50 | mapped | 0.1% |  | 33, 40 |
+| sim_frame:5 | `object_items_physics_sync` 0x930EC0 | mapped | 0.2% |  | 34, 40 |
+| sim_frame:5 | `level_objects_do_frame` 0x9FA670 | mapped | 3.0% | 3 | 40 |
+| sim_frame:5 | `level_objects_activate_queue` 0x9FF5A0 | mapped | 2.9% |  | 40 |
+| sim_frame:5 | `script_objects_release_pending` 0xA5E3E0 | mapped | 1.0% |  | 09, 40 |
+| sim_frame:5 | `object_props_post_update` 0x935B80 | mapped | 0.2% |  | 34, 40 |
+| sim_frame:5 | `ambient_audio_sequences_update` 0x490940 | mapped | 1.0% |  | 10, 40 |
+| sim_frame:5 | `vehicle_siren_update` 0x489CC0 | mapped | 2.4% |  | 10, 16, 40 |
+| sim_frame:5 | `chunk_effects_update` 0x4AAC40 | mapped | 2.4% |  | 05, 33, 40 |
 | sim_frame:5 | `chunk_object_attachments_update` 0x4AB140 | mapped | 2.2% |  | 05 |
-| sim_frame:5 | — 0x9193C0 | unmapped | 0.3% |  |  |
-| sim_frame:5 | — 0x5585E0 | unmapped | 0.3% |  |  |
+| sim_frame:5 | `detour_hull_objects_update` 0x9193C0 | mapped | 0.3% |  | 34, 40 |
+| sim_frame:5 | `timed_object_effects_expire` 0x5585E0 | mapped | 0.3% |  | 40 |
 | sim_frame:6,7 | — 0xB6AD40 | unmapped | 4.0% | 9 (gfx_cmd) |  |
 | sim_frame:6,7 | — 0x4DE770 | unmapped | 0.9% | 1 (mempool) |  |
 | sim_frame:6,7 | — 0x4D6850 | unmapped | 0.0% |  |  |
@@ -266,6 +266,26 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
 |  | `render_lists_reset` 0x52E7C0 | mapped | 0.0% |  | 18 |
 |  | `game_render_func` 0x5250E0 | mapped | 11.0% | 5 (gfx_cmd) | 36 |
 |  | `game_build_render_batches` 0x522FC0 | mapped | 19.6% | 6 (gfx_cmd) | 40 |
+
+## Sections :1c, :4 and :5 (porting notes)
+
+All of the calls in these sections are named except three. The `functions.csv` note of each says what list or state it walks.
+
+**Conventions:**
+- Every call in the three sections takes no arguments and returns nothing, with these exceptions:
+  - `humans_update_all` (0x9D7F90) and 0x9A9CE0 take cdecl (f32 dt), pushed from the dt local of `sim_frame`.
+  - `physics_frame_time` (0x6FF860) returns ST0.
+- `sim_frame` reads no return values in these sections. Most callees walk one global intrusive list and call a per-entry function with the entry in a register or as a cdecl argument. Those per-entry functions are still original code.
+
+**Still unidentified:**
+- **0x9A9CE0** (`:4`), cdecl (f32 dt). When dt ≠ 0, it calls 0x9A2B80 for each entry of the list 0x215E908 (links +0xB8) with +0xCC bit 0x200. The list is shared by AI, cutscene and human code; the bit's meaning is unknown.
+- **0x55BA40** (`:1c`). It walks 0x2527514 indices (0x1409A08) into 0x78-byte records with a vehicle handle and a state machine. It calls `vehicle_ai_order_03`, and 0x55BDB0 / 0x55BE80 send human packets 2 / 3.
+- **0x5507C0** (`:1c`). Three 20-minute timers (0x2797BD0[1..3]). When one fires and the count 0x1409AA8[i] < 5, it calls 0x55BD10. It shares the counts with 0x55BA40, so the two are probably one system: spawned vehicle groups, perhaps crib or gang deliveries.
+
+**Porting order inside these sections:** the list-walkers are thin, so they can be ported as Rust loops calling the original per-entry functions:
+- `ambulances_update`, `meter_maids_update`, `taxis_update`, `weapon_effects_update`, `debris_do_frame`, `brass_update`, `object_props_post_update`, `level_objects_*`, `detour_hull_objects_update`, `vehicle_interaction_riders_update`, `timed_object_effects_expire`.
+
+The heavy ones are `object_items_update`, `object_props_update`, `vehicle_interactions_update`, `havok_triggers_update`, `chunk_effects_update` and `ambient_audio_sequences_update`. They are better ported after their per-entry functions.
 
 ## Suggested porting order
 
