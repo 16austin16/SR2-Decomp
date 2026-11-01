@@ -31,7 +31,7 @@ The frame is `game_main_thread_proc` → `game_frame_tick` (0x520450), once per 
   - the render snapshot helpers (0x6255A0, 0x46CCD0, 0xD08310, 0x51A4A0, 0xBE4170).
 
   It is the next skeleton to port. `render_thread_wait_frame` and the render-list swap are the parts that need care, because both threads touch them.
-- `sim_frame` is the large one: 144 calls, 16 of them still unmapped (after the naming rounds up to the item-4 commits). The remaining ones are small (under 0.3% reach) except 0x9A9CE0 and 0x55BA40; see "Sections :1c, :4 and :5". The unmapped calls with the largest reach are the next naming targets:
+- `sim_frame` is the large one: 144 calls, 16 of them still unmapped (after the naming rounds up to the item-4 commits). The remaining ones are small (under 0.3% reach) except 0x9A9CE0, 0x55BA40 and 0x4DA880; see "Sections :1c, :4 and :5". The unmapped calls with the largest reach are the next naming targets:
   - **0x5053B0** (17.4%): now `effect_objects_do_frame`. It runs `effect_objects_budget_bodies` (Havok bodies for the 50 most important effect-object parts), then `effect_object_update` on each object.
   - **0x6A5BB0** (11.1%): now `mission_fail_flow_do_frame`. It switches on the failure reason 0x1450380 (doc 22) and handles fades, revive / teleport, `cutscene_play`, `mission_end` and the stronghold cancel dialog.
   - **0x93D150** (10.9%): now `world_spawn_do_frame` (spawn regions, spawn groups, traffic). It runs every frame; only with 0x2528B48 set and 0x2528B49 clear does it wait for 0xE96C00 >= 0xB first.
@@ -286,6 +286,55 @@ All of the calls in these sections are named except three. The `functions.csv` n
 - `ambulances_update`, `meter_maids_update`, `taxis_update`, `weapon_effects_update`, `debris_do_frame`, `brass_update`, `object_props_post_update`, `level_objects_*`, `detour_hull_objects_update`, `vehicle_interaction_riders_update`, `timed_object_effects_expire`.
 
 The heavy ones are `object_items_update`, `object_props_update`, `vehicle_interactions_update`, `havok_triggers_update`, `chunk_effects_update` and `ambient_audio_sequences_update`. They are better ported after their per-entry functions.
+
+## Other game states: front end (2) and loading (10)
+
+`game_state_dispatch` (0x697490) calls the frame function of the state on top of the stack. Two of them, as porting maps. Both take no arguments and return nothing.
+
+### `frontend_state_frame` (0x73DCB0), state 2
+
+1. `frontend_connection_lost_check` (0x73CB30).
+2. If `0x2A1890F`: 0x81EDF0, then clear the 0x144-byte pending-join block `0x2A187D0`.
+3. `[0x252A2A2]` = 1; `frontend_render` (0x73CCF0); `[0x252A2A2]` = 0. `frontend_render` runs `video_frame`, `screen_fade_apply`, `interface_render` and `overlays_render`.
+4. `streamman_process` (Rust).
+5. Invite / session state:
+   - with `0x2528C34` == 12 and `0x2527EC1`: 0x81EBD0, then clear the flag;
+   - otherwise 0x81EC70(1).
+6. `foreign_character_warning_update` (0x7F4E90).
+7. **Join flow.** When a join is pending (`0x2A1890E`) and the online state `0x2529334` == 4:
+   1. Copy the session name (up to 0x80 bytes from `0x2A18885`); 0x73E070.
+   2. `0x830E80(name, 2 or 6)`.
+   3. Either the `pc_multi_session_info` path (0x810DA0 / 0x831040 / 0x810EE0 / 0x832AD0), or 0x8309F0 and a push of state 7 (`0x144E75C` = 7).
+   - With `0x2529334` ≠ 4: `mp_login_update` (0x80A150).
+   - With no join pending and `0x2527EB0` set: 0x8318E0(1) / 0x830990(10), then `main_menu_force_close` (0x73C5B0).
+8. **Network state scripts.**
+   - When `0x2529334` ≠ 4 and `0x2527EBF` is set: start the Lua thread `main_menu_ethernet_disconnected` (`script_thread_create`), with the argument `0x2527EAC`.
+   - When it is 4: set `0x2527EBF` / `0x2527EC0`. When it is ≠ 4 and `0x2527EC0` is set: start `main_menu_internet_disconnected`.
+9. If `0x2527EBC`: 0x812F80. Then 0x884A10 (multiplayer HUD and vint cleanup).
+
+**Port:**
+- Steps 1-6 and 9 are plain calls.
+- The join flow (step 7) and the disconnect scripts (step 8) touch the multiplayer session code; keep them as one original call each.
+- The `0x252A2A2` bracket around `frontend_render` must stay; the render code checks it.
+
+### `loading_state_frame` (0x73B7F0), state 10
+
+1. `screen_fade_apply` (0x4D1790).
+2. When loading is the top state (`0x144E760[depth]` == 10): `interface_do_frame`, `interface_render`, `loading_audio_update` (0x73EDC0).
+3. **Co-op join wait.** Runs only when all of these hold: not done yet (`0x2527E83` == 0), the load finished well (`0xE8EB88` == 1), the network flags `0x2528B48` / `0x2528B49` both 1, a session exists, and 0x80FCF0(session) returns 0.
+   1. Starts a 30 s timer (`0x34A5218`) and 0x7F8BA0, the first time only.
+   2. While the partner (`coop_partner_human` 0x9D7BD0) has not arrived and the timer runs, it pumps only: `net_timed_callbacks_run`, 0xB0A7B0, 0x9114B0, 0x947570(0), `streamman_process`.
+   3. While the partner is loading (0x9E99F0), it also pumps 0x9E3AF0 / 0x9E3B10 inside a `gfx_device_acquire` / `gfx_device_release` (0xCFBBC0) pair.
+   4. While the request queue `0x2F9B88C` is not empty, it streams (0x817BA0).
+   5. Then it sets `0x2527E83` = 1.
+4. **Fade out.** On the first pass (`0x2527E81` == 0):
+   - if loading succeeded and the fade value `0x2526DA0` is still 0: set the colour to black and `screen_fade_start(250 ms, 0, 1.0)` (0 ms when `0x212FEC4` == 6);
+   - once the fade value reaches 1.0, set `0x2527E81` = 1.
+5. **Leave.** When there is no pending state change:
+   - `0xE8EB88` == −1, or `0x2527E80` set: replace with state 2 (front end);
+   - `0xE8EB88` == 1: replace with state 5 (gameplay), with the push / pop flags `0x140BBC9` / `0x140BBCA` = `0x2527E80`.
+
+**Port:** steps 1, 2, 4 and 5 are small and global-only, so this state can be a Rust function now. Keep the co-op wait (step 3) as calls in the same order. The device acquire / release pair there must stay balanced.
 
 ## Suggested porting order
 
