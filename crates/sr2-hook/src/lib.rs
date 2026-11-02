@@ -51,6 +51,7 @@ mod port_registrars;
 mod port_big;
 mod port_bindings3;
 mod port_tables;
+mod port_frame2;
 mod port_sim_humans;
 mod port_states;
 mod port_vehicles;
