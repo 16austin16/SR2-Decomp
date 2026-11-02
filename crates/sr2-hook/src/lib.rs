@@ -50,6 +50,7 @@ mod port_leaves_fp;
 mod port_registrars;
 mod port_big;
 mod port_bindings3;
+mod port_tables;
 mod port_sim_humans;
 mod port_states;
 mod port_vehicles;
