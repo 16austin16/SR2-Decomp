@@ -45,6 +45,7 @@ mod port_render_func;
 mod port_effects;
 mod port_nav;
 mod port_net;
+mod port_leaves;
 mod port_sim_humans;
 mod port_states;
 mod port_vehicles;
