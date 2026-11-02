@@ -38,7 +38,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if n > 3600 && n.is_multiple_of(900) {
         log(&crate::actions::summary());
         log(&crate::lua_bindings::summary());
-        for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary(), crate::port_sim_leaves::summary(), crate::port_weapons_audio::summary(), crate::port_human_states::summary(), crate::port_ai::summary(), crate::port_render_func::summary(), crate::port_effects::summary(), crate::port_nav::summary(), crate::port_net::summary(), crate::port_leaves::summary(), crate::port_leaves_fp::summary()] {
+        for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary(), crate::port_sim_leaves::summary(), crate::port_weapons_audio::summary(), crate::port_human_states::summary(), crate::port_ai::summary(), crate::port_render_func::summary(), crate::port_effects::summary(), crate::port_nav::summary(), crate::port_net::summary(), crate::port_leaves::summary(), crate::port_leaves_fp::summary(), crate::port_registrars::summary(), crate::port_big::summary(), crate::port_bindings3::summary()] {
             if !s.is_empty() {
                 log(&s);
             }
@@ -2152,6 +2152,9 @@ pub fn install_all() {
         crate::port_net::install();
         crate::port_leaves::install();
         crate::port_leaves_fp::install();
+        crate::port_registrars::install();
+        crate::port_big::install();
+        crate::port_bindings3::install();
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }
