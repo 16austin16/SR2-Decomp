@@ -21,6 +21,12 @@
 //!   afterwards. The original's writes always stand. A write by the audio thread between the
 //!   copy and the compare can show up as a (harmless) mismatch.
 //!
+//! Second round (37 more ports, see the section after `throttle_entry`): the voice fade / orientation /
+//! parameter wrappers, the 15 `audio_play_params_init*` variants, pause / resume / fade-out-all, the
+//! 3D-position and play-prepared writers, and the ammo store / weapon instance functions. Voice-slot
+//! writers keep the original's order of reads and writes with volatile accesses; the originals of
+//! the second round are run through `call_regs` in the shadow checks.
+//!
 //! No original here takes a lock or a critical section, and the Rust versions take none either.
 //! Read-modify-write sequences are kept in the same shape as the originals (a single `or word
 //! [m], imm` stays a single instruction; a load / test / store stays a load / test / store).
@@ -258,7 +264,44 @@ const GET_VOLUME: usize = 18;
 const STOP_CATEGORY: usize = 19;
 const MARK_DIRTY: usize = 20;
 const THROTTLE_SET: usize = 21;
-const COUNT: usize = 22;
+const SLOT_FADE_OUT: usize = 22;
+const FADE_OUT: usize = 23;
+const FADE_OUT2: usize = 24;
+const SET_ORIENT: usize = 25;
+const SET_ORIENT2: usize = 26;
+const IS_2D: usize = 27;
+const GET_P30: usize = 28;
+const SET_P28: usize = 29;
+const SET_P30: usize = 30;
+const FADE_IN: usize = 31;
+const PI_DEFAULT: usize = 32;
+const PI_BASIC: usize = 33;
+const PI_VOLUME: usize = 34;
+const PI_VARIANT: usize = 35;
+const PI_VARIANT_VOLUME: usize = 36;
+const PI_EXT: usize = 37;
+const PI_3D: usize = 38;
+const PI_3D_CHAN: usize = 39;
+const PI_3D_CHAN2: usize = 40;
+const PI_3D_CHAN_FLAG: usize = 41;
+const PI_3D_VOLUME: usize = 42;
+const PI_3D_EXT: usize = 43;
+const PI_3D_VARIANT: usize = 44;
+const PI_3D_VARIANT_VOLUME: usize = 45;
+const PI_3D_VARIANT_EXT: usize = 46;
+const PAUSE_ALL: usize = 47;
+const RESUME_ALL: usize = 48;
+const FADE_ALL: usize = 49;
+const SET_3D_POS: usize = 50;
+const PLAY_PREPARED: usize = 51;
+const ENTRY_ADD: usize = 52;
+const ADD_TYPE: usize = 53;
+const STORE_REMOVE: usize = 54;
+const WEAPON_STORE_REMOVE: usize = 55;
+const STORE_CLEAR: usize = 56;
+const IS_THROWN: usize = 57;
+const INST_ALLOC: usize = 58;
+const COUNT: usize = 59;
 
 static PORTS: [Port; COUNT] = [
     port("weapon_total_ammo", 0x00B6_9020, SAVED),
@@ -283,6 +326,43 @@ static PORTS: [Port; COUNT] = [
     port("audio_voices_stop_category", 0x0047_F200, EDX | SAVED),
     port("audio_voices_mark_dirty_all", 0x0047_F2E0, SAVED),
     port("audio_set_category_throttle", 0x0046_ED20, ECX | EDX | SAVED),
+    port("audio_voice_slot_fade_out", 0x0047_C740, EDX | SAVED),
+    port("audio_voice_fade_out", 0x0046_5F70, SAVED),
+    port("audio_voice_fade_out_2", 0x0047_FF80, SAVED),
+    port("audio_voice_set_orientation", 0x0046_5FD0, SAVED),
+    port("audio_voice_set_orientation_2", 0x0048_03B0, SAVED),
+    port("audio_voice_is_2d", 0x0046_60B0, EDX | SAVED),
+    port("audio_voice_get_param_30", 0x0046_6180, ECX | EDX | SAVED),
+    port("audio_voice_set_param_28", 0x0048_00C0, SAVED),
+    port("audio_voice_set_param_30", 0x0048_0170, SAVED),
+    port("audio_voice_slot_fade_in", 0x0047_CED0, SAVED),
+    port("audio_play_params_init_empty", 0x0046_4860, SAVED),
+    port("audio_play_params_init", 0x0046_4920, SAVED),
+    port("audio_play_params_init_volume", 0x0046_4970, SAVED),
+    port("audio_play_params_init_variant", 0x0046_49C0, SAVED),
+    port("audio_play_params_init_variant_volume", 0x0046_4A10, SAVED),
+    port("audio_play_params_init_ext", 0x0046_4A60, SAVED),
+    port("audio_play_params_init_3d", 0x0046_4AC0, SAVED),
+    port("audio_play_params_init_3d_channel", 0x0046_4B30, SAVED),
+    port("audio_play_params_init_3d_channel2", 0x0046_4BA0, SAVED),
+    port("audio_play_params_init_3d_channel_flag", 0x0046_4C10, SAVED),
+    port("audio_play_params_init_3d_volume", 0x0046_4CA0, SAVED),
+    port("audio_play_params_init_3d_ext", 0x0046_4D10, SAVED),
+    port("audio_play_params_init_3d_variant", 0x0046_4D90, SAVED),
+    port("audio_play_params_init_3d_variant_volume", 0x0046_4E00, SAVED),
+    port("audio_play_params_init_3d_variant_ext", 0x0046_4E70, SAVED),
+    port("audio_pause_all", 0x0047_F080, SAVED),
+    port("audio_resume_all", 0x0047_F170, SAVED),
+    port("audio_voices_fade_out_all", 0x0047_F020, SAVED),
+    port("audio_voice_set_3d_position", 0x0048_02D0, ECX | SAVED),
+    port("audio_voice_play_prepared", 0x0047_F800, SAVED),
+    port("ammo_store_entry_add", 0x00B6_8C20, SAVED),
+    port("ammo_store_add_type", 0x00B6_90C0, SAVED),
+    port("ammo_store_remove", 0x00B6_9190, SAVED),
+    port("weapon_ammo_store_remove", 0x00B6_9230, SAVED),
+    port("ammo_store_clear", 0x00B6_93E0, SAVED),
+    port("weapon_info_is_thrown", 0x00B7_2C40, EDX | SAVED),
+    port("weapon_instance_alloc", 0x00B7_1AC0, SAVED),
 ];
 
 /// Count a call; `Some((call number, original copy))` while it should be shadowed.
@@ -1069,6 +1149,1557 @@ extern "C" fn throttle_entry(r: &mut Pushad, args: *const u32) {
 }
 regs_thunk!(throttle_thunk, throttle_entry);
 
+// =====================================================================================================
+// Second round: voice fades and orientation wrappers, the play-params family, pause / resume.
+//
+// Voice slots are shared with the audio thread, so everything below that touches a slot keeps the
+// original's order of reads and writes, uses volatile accesses for the slot words, and keeps every
+// read-modify-write that is a single instruction in the original a single instruction (`or16`,
+// `xor16`, `add1_32`, `sub1_32`). None of these originals takes a lock or a critical section.
+// Shadow runs follow the pattern at the top of the file: the Rust version runs on a private copy of
+// what it writes, the original runs on the live state (its writes always stand), the copy is
+// compared with the live bytes afterwards. The play-params writers only touch their own 0x5C-byte
+// buffer (the caller's stack), so there the Rust version runs on a scratch buffer. The originals
+// of this round are run through `call_regs` (any number of stack arguments); only EAX is compared.
+// =====================================================================================================
+
+const MEMSET: usize = 0x00CA_0BC0; // cdecl (dest, value, count)
+const SLOT_SET_ORIENTATION: usize = 0x0047_D3A0; // ECX = transform, cdecl (slot *)
+const SLOT_UPDATE_MUTE: usize = 0x0047_D780; // ECX = slot -> AL
+const AUDIO_PAUSE_CATEGORY: usize = 0x0048_1E90; // cdecl (u8)
+const WINDOW_ACTIVE: usize = 0x0252_A406; // byte
+const MASTER_MUTED: usize = 0x0252_6AFB; // byte
+const WINDOW_PAUSED: usize = 0x0252_6AD7; // byte
+const PAUSE_DEPTH: usize = 0x0252_6B44; // i32
+const MASTER_VOICE: usize = 0x00F5_2E30; // pointer to an object whose vtable +0x28 is a SetVolume-like call
+const SLOTS_END_EAX: u32 = 0x00EE_BA90 + (SLOT_COUNT * SLOT_SIZE) as u32; // EAX at the end of the pause / resume loops
+const SLOT_WORDS: usize = SLOT_SIZE / 4;
+const ONE_BITS: u32 = 0x3F80_0000;
+
+unsafe fn vr8(p: usize) -> u8 {
+    unsafe { std::ptr::read_volatile(p as *const u8) }
+}
+unsafe fn vr16(p: usize) -> u16 {
+    unsafe { std::ptr::read_volatile(p as *const u16) }
+}
+unsafe fn vw16(p: usize, v: u16) {
+    unsafe { std::ptr::write_volatile(p as *mut u16, v) }
+}
+unsafe fn vr32(p: usize) -> u32 {
+    unsafe { std::ptr::read_volatile(p as *const u32) }
+}
+unsafe fn vw32(p: usize, v: u32) {
+    unsafe { std::ptr::write_volatile(p as *mut u32, v) }
+}
+
+/// `xor word ptr [p], v` as one instruction.
+unsafe fn xor16(p: usize, v: u16) {
+    unsafe { std::arch::asm!("xor word ptr [{p}], {v:x}", p = in(reg) p, v = in(reg) v as u32, options(nostack)) }
+}
+
+/// `add dword ptr [p], 1` as one instruction.
+unsafe fn add1_32(p: usize) {
+    unsafe { std::arch::asm!("add dword ptr [{p}], 1", p = in(reg) p, options(nostack)) }
+}
+
+/// `sub dword ptr [p], 1` as one instruction; true when the result is negative (SF).
+unsafe fn sub1_32(p: usize) -> bool {
+    let neg: u8;
+    unsafe { std::arch::asm!("sub dword ptr [{p}], 1", "sets {n}", p = in(reg) p, n = out(reg_byte) neg, options(nostack)) };
+    neg != 0
+}
+
+/// Run the original copy with the caller's registers and cdecl / stdcall stack arguments;
+/// returns its EAX.
+unsafe fn run_orig(orig: usize, p: &Pushad, args: &[u32]) -> u32 {
+    unsafe { call_regs(orig, p.eax, p.ecx, p.edx, p.esi, p.edi, args) }
+}
+
+/// What the handle check at the top of every `audio_voice_*` wrapper finds. The reads are in the
+/// original's order: the byte, the dword (generation), then the slot's +0xB4 and +0.
+enum H {
+    /// Slot byte 0xFF (AL = the byte).
+    Ff(u8),
+    /// Generation 0 (AL = the slot byte).
+    Gen0(u8),
+    /// Stale or free slot: the slot index.
+    Stale(u32),
+    /// Good: the slot index.
+    Good(u32),
+}
+
+unsafe fn hcheck(slots: usize, h: usize) -> H {
+    unsafe {
+        let al = rb(h);
+        if al == 0xFF {
+            return H::Ff(al);
+        }
+        let gen_ = rd(h) >> 8;
+        if gen_ == 0 {
+            return H::Gen0(al);
+        }
+        let s = slots.wrapping_add(al as usize * SLOT_SIZE);
+        if gen_ != vr32(s + 0xB4) || vr32(s) == 0xFFFF_FFFF {
+            return H::Stale(al as u32);
+        }
+        H::Good(al as u32)
+    }
+}
+
+/// The slot byte of a handle when it passes the first two checks (the Rust version may touch the
+/// slot then), None otherwise.
+unsafe fn handle_idx(h: usize) -> Option<usize> {
+    unsafe {
+        let al = rb(h);
+        if al == 0xFF || rd(h) >> 8 == 0 { None } else { Some(al as usize) }
+    }
+}
+
+/// A private copy of one slot, addressed as if the whole array were there.
+struct SlotCopy {
+    buf: [u32; SLOT_WORDS],
+    idx: usize,
+}
+
+impl SlotCopy {
+    unsafe fn new(idx: usize) -> SlotCopy {
+        let mut buf = [0u32; SLOT_WORDS];
+        unsafe { std::ptr::copy_nonoverlapping((VOICE_SLOTS + idx * SLOT_SIZE) as *const u32, buf.as_mut_ptr(), SLOT_WORDS) };
+        SlotCopy { buf, idx }
+    }
+    /// The array base that puts slot `idx` at the copy.
+    fn base(&self) -> usize {
+        self.slot().wrapping_sub(self.idx * SLOT_SIZE)
+    }
+    fn slot(&self) -> usize {
+        self.buf.as_ptr() as usize
+    }
+    /// The first (offset, copy dword, live dword) of the (offset, length) ranges that differ.
+    unsafe fn diff(&self, fields: &[(usize, usize)]) -> Option<(usize, u32, u32)> {
+        let live = VOICE_SLOTS + self.idx * SLOT_SIZE;
+        for &(off, len) in fields {
+            let a = unsafe { std::slice::from_raw_parts((self.slot() + off) as *const u8, len) };
+            let b = unsafe { std::slice::from_raw_parts((live + off) as *const u8, len) };
+            if a != b {
+                let (x, y) = unsafe { (std::ptr::read_unaligned((self.slot() + off) as *const u32), std::ptr::read_unaligned((live + off) as *const u32)) };
+                return Some((off, x, y));
+            }
+        }
+        None
+    }
+}
+
+/// The shadow for a voice writer: the Rust version (`ours(array base)` -> the EAX the original
+/// ends with, compared when `cmp_eax`) runs on a private copy of the slot the handle / index names,
+/// the original on the live slot, then the listed (offset, length) ranges are compared. Returns
+/// the original's EAX; its writes always stand.
+unsafe fn shadow_slot_op(
+    id: usize,
+    n: u32,
+    orig: usize,
+    p: &Pushad,
+    args: &[u32],
+    idx: Option<usize>,
+    fields: &[(usize, usize)],
+    cmp_eax: bool,
+    ours: impl FnOnce(usize) -> u32,
+) -> u32 {
+    unsafe {
+        match idx {
+            Some(i) if i < SLOT_COUNT => {
+                let sc = SlotCopy::new(i);
+                let e = ours(sc.base());
+                let t = run_orig(orig, p, args);
+                if let Some((off, a, b)) = sc.diff(fields) {
+                    mismatch(id, n, format!("in {:x?} args {args:x?} slot {i} +{off:#x}: original {b:#x}, Rust {a:#x}", Regs::of(p)));
+                } else if cmp_eax && t != e {
+                    mismatch(id, n, format!("in {:x?} args {args:x?}: original eax {t:#x}, Rust {e:#x}", Regs::of(p)));
+                }
+                t
+            }
+            Some(_) => run_orig(orig, p, args),
+            None => {
+                let e = ours(VOICE_SLOTS);
+                let t = run_orig(orig, p, args);
+                if cmp_eax && t != e {
+                    mismatch(id, n, format!("in {:x?} args {args:x?}: original eax {t:#x}, Rust {e:#x}", Regs::of(p)));
+                }
+                t
+            }
+        }
+    }
+}
+
+// --- 0x47C740 audio_voice_slot_fade_out (EAX = slot index, EDX = fade ms) -------------------------
+
+/// Clear the fade-in bit and set the fade-out bit of the flags word (+0x196); when fade-out was not
+/// already set, +0xC4 = 0.0. The rate is +0x1C x 0.5 for ms < 32, else +0x1C / (ms >> 5) (an
+/// unsigned `fild` with the 2^32 fix-up, which the shifted count never needs). It is stored to
+/// +0xA8 through an f32 round trip, only when the current +0xA8 is ordered and smaller (`fcomp`
+/// then `test ah, 5 / jp`: only C0 alone, current < new, falls through to the store). Reads and
+/// writes: flags, (+0xC4), +0x1C, flags, +0xA8, (+0xA8). The x87 status word the original leaves
+/// in AX is not reproduced.
+unsafe fn slot_fade_out_on(slots: usize, idx: u32, ms: u32) {
+    unsafe {
+        let s = slots.wrapping_add(idx.wrapping_mul(SLOT_SIZE as u32) as usize);
+        let fl = vr16(s + 0x196) as u32;
+        if fl & 0x80 == 0 {
+            vw32(s + 0xC4, 0);
+        }
+        let cur = f32::from_bits(vr32(s + 0x1C)) as f64;
+        vw16(s + 0x196, ((fl & 0xFEFF) | 0x80) as u16);
+        let v = if ms < 0x20 {
+            cur * std::ptr::read_unaligned(0x00E5_BF70 as *const f64)
+        } else {
+            let k = (ms >> 5) as i32;
+            let mut d = k as f64;
+            if k < 0 {
+                d += std::ptr::read_unaligned(0x00E5_BFD8 as *const f32) as f64;
+            }
+            cur / d
+        };
+        let new = v as f32;
+        let old = f32::from_bits(vr32(s + 0xA8));
+        if old < new {
+            vw32(s + 0xA8, new.to_bits());
+        }
+    }
+}
+
+const FADE_FIELDS: &[(usize, usize)] = &[(0xA8, 4), (0xC4, 4), (0x196, 2)];
+
+extern "C" fn slot_fade_out_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let Some((n, orig)) = shadowing(SLOT_FADE_OUT) else {
+        unsafe { slot_fade_out_on(VOICE_SLOTS, p.eax, p.edx) };
+        return;
+    };
+    unsafe {
+        let idx = Some(p.eax as usize);
+        shadow_slot_op(SLOT_FADE_OUT, n, orig, &p, &[], idx, FADE_FIELDS, false, |b| {
+            slot_fade_out_on(b, p.eax, p.edx);
+            0
+        });
+    }
+}
+regs_thunk!(slot_fade_out_thunk, slot_fade_out_entry);
+
+// --- 0x465F70 audio_voice_fade_out / 0x47FF80 audio_voice_fade_out_2 (ECX = &handle, cdecl (ms)) ---
+
+unsafe fn fade_out_on(slots: usize, h: usize, ms: u32) {
+    unsafe {
+        if let H::Good(idx) = hcheck(slots, h) {
+            slot_fade_out_on(slots, idx, ms);
+        }
+    }
+}
+
+fn fade_out_common(id: usize, r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let ms = unsafe { *args };
+    let h = p.ecx as usize;
+    let Some((n, orig)) = shadowing(id) else {
+        unsafe { fade_out_on(VOICE_SLOTS, h, ms) };
+        return;
+    };
+    unsafe {
+        let idx = handle_idx(h);
+        shadow_slot_op(id, n, orig, &p, &[ms], idx, FADE_FIELDS, false, |b| {
+            fade_out_on(b, h, ms);
+            0
+        });
+    }
+}
+
+extern "C" fn fade_out_entry(r: &mut Pushad, args: *const u32) {
+    fade_out_common(FADE_OUT, r, args);
+}
+regs_thunk!(fade_out_thunk, fade_out_entry);
+
+extern "C" fn fade_out2_entry(r: &mut Pushad, args: *const u32) {
+    fade_out_common(FADE_OUT2, r, args);
+}
+regs_thunk!(fade_out2_thunk, fade_out2_entry);
+
+// --- 0x465FD0 audio_voice_set_orientation / 0x4803B0 _2 (ECX = &handle, cdecl (transform)) --------
+
+/// The handle check, then audio_voice_slot_set_orientation (0x47D3A0, ECX = transform, the slot
+/// pointer on the stack) called by address; EAX is whatever it leaves.
+unsafe fn set_orientation_on(slots: usize, eax: u32, h: usize, transform: u32) -> u32 {
+    unsafe {
+        match hcheck(slots, h) {
+            H::Good(idx) => {
+                let s = slots.wrapping_add(idx as usize * SLOT_SIZE) as u32;
+                call_regs(SLOT_SET_ORIENTATION, s, transform, 0, 0, 0, &[s])
+            }
+            _ => eax,
+        }
+    }
+}
+
+const ORIENT_FIELDS: &[(usize, usize)] = &[(0x44, 0x18)];
+
+fn orient_common(id: usize, r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let transform = unsafe { *args };
+    let h = p.ecx as usize;
+    let Some((n, orig)) = shadowing(id) else {
+        r.eax = unsafe { set_orientation_on(VOICE_SLOTS, p.eax, h, transform) };
+        return;
+    };
+    unsafe {
+        let idx = handle_idx(h);
+        r.eax = shadow_slot_op(id, n, orig, &p, &[transform], idx, ORIENT_FIELDS, false, |b| set_orientation_on(b, p.eax, h, transform));
+    }
+}
+
+extern "C" fn orient_entry(r: &mut Pushad, args: *const u32) {
+    orient_common(SET_ORIENT, r, args);
+}
+regs_thunk!(orient_thunk, orient_entry);
+
+extern "C" fn orient2_entry(r: &mut Pushad, args: *const u32) {
+    orient_common(SET_ORIENT2, r, args);
+}
+regs_thunk!(orient2_thunk, orient2_entry);
+
+// --- 0x4660B0 audio_voice_is_2d (ECX = &handle -> AL) ------------------------------------------
+
+/// AL = 1 when the handle is good and the 0x800 (3D) bit of the flags word is clear; the rest of
+/// EAX as the original leaves it (the early failures keep the caller's EAX with AL cleared, the
+/// stale case the slot offset with AL cleared, the good case the slot offset's upper word).
+unsafe fn is_2d(eax: u32, h: usize) -> u32 {
+    unsafe {
+        match hcheck(VOICE_SLOTS, h) {
+            H::Ff(_) | H::Gen0(_) => lo(eax, false),
+            H::Stale(idx) => lo(idx * SLOT_SIZE as u32, false),
+            H::Good(idx) => {
+                let off = idx * SLOT_SIZE as u32;
+                let fl = rw(VOICE_SLOTS + off as usize + 0x196) as u32;
+                (off & 0xFFFF_0000) | (!(fl >> 11) & 1)
+            }
+        }
+    }
+}
+
+extern "C" fn is_2d_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(IS_2D, &p, 0, unsafe { is_2d(p.eax, p.ecx as usize) });
+}
+regs_thunk!(is_2d_thunk, is_2d_entry);
+
+// --- 0x466180 audio_voice_get_param_30 (ECX = &handle -> ST0) ----------------------------------
+
+/// ST0 = the slot's f32 +0x30 (quiet NaN through the `fld` / `fstp` / `fld` chain), 0.0 for a
+/// stale handle. ECX is preserved (pushed and popped). EAX as in `get_volume`.
+unsafe fn get_param_30(eax: u32, h: usize) -> (f32, u32) {
+    unsafe {
+        match hcheck(VOICE_SLOTS, h) {
+            H::Ff(al) | H::Gen0(al) => (0.0, (eax & !0xFF) | al as u32),
+            H::Stale(idx) => (0.0, idx * SLOT_SIZE as u32),
+            H::Good(idx) => {
+                let off = idx * SLOT_SIZE as u32;
+                (f32::from_bits(q32(rd(VOICE_SLOTS + off as usize + 0x30))), off)
+            }
+        }
+    }
+}
+
+extern "C" fn get_param_30_entry(r: &mut Pushad, _: *const u32) -> f32 {
+    let p = *r;
+    let (ours, eax) = unsafe { get_param_30(p.eax, p.ecx as usize) };
+    let Some((n, orig)) = shadowing(GET_P30) else {
+        r.eax = eax;
+        return ours;
+    };
+    let inp = Regs::of(&p);
+    let mut out = inp;
+    let theirs = unsafe { call_full(orig, &mut out, 0, true) } as f32;
+    check_preserved(GET_P30, &inp, &out);
+    if theirs.to_bits() != ours.to_bits() || out.eax != eax {
+        mismatch(
+            GET_P30,
+            n,
+            format!("handle {:#x}: original {:#x} eax {:#x}, Rust {:#x} eax {eax:#x}", unsafe { rd(p.ecx as usize) }, theirs.to_bits(), out.eax, ours.to_bits()),
+        );
+        r.eax = out.eax;
+        return theirs;
+    }
+    r.eax = eax;
+    ours
+}
+regs_thunk!(get_param_30_thunk, get_param_30_entry);
+
+// --- 0x4800C0 audio_voice_set_param_28 / 0x480170 audio_voice_set_param_30 (ECX = &handle, cdecl (f32) -> AL)
+
+/// `or word [+0x196], flag` (one instruction), then the f32 is stored to `field` (+0x28 / +0x30,
+/// quiet NaN), then the flags word is re-read and, when the 0x800 bit is clear and the +0x194 bit
+/// `shift` (3 / 4) is set, bit 1 is set with a separate store. AL = 1 (rest of EAX: the slot
+/// offset); a stale handle gives AL = 0 as in `set_volume_on`.
+unsafe fn set_param_on(slots: usize, eax: u32, h: usize, vbits: u32, field: usize, flag: u16, shift: u32) -> u32 {
+    unsafe {
+        let idx = match hcheck(slots, h) {
+            H::Ff(_) | H::Gen0(_) => return lo(eax, false),
+            H::Stale(idx) => return lo(idx * SLOT_SIZE as u32, false),
+            H::Good(idx) => idx,
+        };
+        let off = idx * SLOT_SIZE as u32;
+        let s = slots.wrapping_add(off as usize);
+        or16(s + 0x196, flag);
+        let b194 = vr8(s + 0x194) as u32;
+        vw32(s + field, q32(vbits));
+        let fl = vr16(s + 0x196) as u32;
+        let cl = (b194 >> shift) & 1;
+        if (!(fl >> 11) & cl) & 0xFF != 0 {
+            vw16(s + 0x196, (fl | 1) as u16);
+        }
+        lo(off, true)
+    }
+}
+
+const PARAM_FIELDS: &[(usize, usize)] = &[(0x28, 0xC), (0x196, 2)];
+
+fn set_param_common(id: usize, r: &mut Pushad, args: *const u32, field: usize, flag: u16, shift: u32) {
+    let p = *r;
+    let vbits = unsafe { *args };
+    let h = p.ecx as usize;
+    let Some((n, orig)) = shadowing(id) else {
+        r.eax = unsafe { set_param_on(VOICE_SLOTS, p.eax, h, vbits, field, flag, shift) };
+        return;
+    };
+    unsafe {
+        let idx = handle_idx(h);
+        r.eax = shadow_slot_op(id, n, orig, &p, &[vbits], idx, PARAM_FIELDS, true, |b| set_param_on(b, p.eax, h, vbits, field, flag, shift));
+    }
+}
+
+extern "C" fn set_param_28_entry(r: &mut Pushad, args: *const u32) {
+    set_param_common(SET_P28, r, args, 0x28, 2, 3);
+}
+regs_thunk!(set_param_28_thunk, set_param_28_entry);
+
+extern "C" fn set_param_30_entry(r: &mut Pushad, args: *const u32) {
+    set_param_common(SET_P30, r, args, 0x30, 4, 4);
+}
+regs_thunk!(set_param_30_thunk, set_param_30_entry);
+
+// --- 0x47CED0 audio_voice_slot_fade_in (ECX = slot index, cdecl (ms, f32 start volume)) ----------
+
+/// Unless the fade-in bit (0x100) is set: +0x1C = start (f32 round trip), the flags word with 0x80
+/// cleared and 0x100 set, +0xC4 = 0.0, +0xA8 = (1 - start) / (ms / 32) with the signed divide by 32
+/// of `cdq / and 0x1f / add / sar 5` and `fidiv` (division by zero gives the x87 result: +-inf or
+/// the default NaN, as SSE does). The writes come in that order.
+unsafe fn slot_fade_in_on(slots: usize, idx: u32, ms: u32, start: u32) {
+    unsafe {
+        let s = slots.wrapping_add(idx.wrapping_mul(SLOT_SIZE as u32) as usize);
+        let fl = vr16(s + 0x196) as u32;
+        if fl & 0x100 != 0 {
+            return;
+        }
+        let st = f32::from_bits(start) as f64;
+        vw32(s + 0x1C, q32(start));
+        vw16(s + 0x196, ((fl & 0xFF7F) | 0x100) as u16);
+        vw32(s + 0xC4, 0);
+        let m = ms as i32;
+        let k = m.wrapping_add(((m >> 31) as u32 & 0x1F) as i32) >> 5;
+        let rate = ((1.0 - st) / k as f64) as f32;
+        vw32(s + 0xA8, rate.to_bits());
+    }
+}
+
+const FADE_IN_FIELDS: &[(usize, usize)] = &[(0x1C, 4), (0xA8, 4), (0xC4, 4), (0x196, 2)];
+
+extern "C" fn slot_fade_in_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let (ms, start) = unsafe { (*args, *args.add(1)) };
+    let Some((n, orig)) = shadowing(FADE_IN) else {
+        unsafe { slot_fade_in_on(VOICE_SLOTS, p.ecx, ms, start) };
+        return;
+    };
+    unsafe {
+        let idx = Some(p.ecx as usize);
+        shadow_slot_op(FADE_IN, n, orig, &p, &[ms, start], idx, FADE_IN_FIELDS, false, |b| {
+            slot_fade_in_on(b, p.ecx, ms, start);
+            0
+        });
+    }
+}
+regs_thunk!(slot_fade_in_thunk, slot_fade_in_entry);
+
+// --- the audio_play_params_init family (ESI = params, 0x5C bytes; EDI = &position for the 3D ones) --
+// Every variant zeroes the 0x5C bytes with memset (0xCA0BC0, called by address with the same cdecl
+// arguments), then stores its fields; the f32 arguments go through `fld` / `fstp` (quiet NaN).
+// EAX = ESI at the end (the no-argument variant ends with memset's return in EAX). Only the
+// caller's buffer is written, so the shadow runs the Rust version on a scratch buffer and the
+// original on the real one, then compares the 0x5C bytes.
+
+unsafe fn pm(esi: usize) -> u32 {
+    unsafe { call_regs(MEMSET, 0, 0, 0, 0, 0, &[esi as u32, 0, 0x5C]) }
+}
+
+unsafe fn p32(esi: usize, off: usize, v: u32) {
+    unsafe { wd(esi + off, v) }
+}
+
+unsafe fn p16(esi: usize, off: usize, v: u16) {
+    unsafe { ww(esi + off, v) }
+}
+
+/// +0x1C..+0x24 = the three dwords at EDI; then `or word [+0x58], 1` (the positional flag).
+unsafe fn ppos(esi: usize, edi: usize) {
+    unsafe {
+        p32(esi, 0x1C, rd(edi));
+        p32(esi, 0x20, rd(edi + 4));
+        p32(esi, 0x24, rd(edi + 8));
+        p16(esi, 0x58, rw(esi + 0x58) | 1);
+    }
+}
+
+unsafe fn parg(a: *const u32, i: usize) -> u32 {
+    unsafe { *a.add(i) }
+}
+
+type Build = unsafe fn(usize, usize, *const u32) -> u32;
+
+/// 0x464860 (no arguments, plain ret): the "empty" params: cue 0xFFFF, type -1.
+unsafe fn build_default(esi: usize, _edi: usize, _a: *const u32) -> u32 {
+    unsafe {
+        let m = pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, 0xFFFF);
+        p32(esi, 0x18, 0xFFFF_FFFF);
+        p32(esi, 0x28, 0);
+        p16(esi, 0x30, 0xFFFF);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x4C, 0);
+        p32(esi, 0x54, 0);
+        m
+    }
+}
+
+/// 0x464920 (u16 cue, type +0x18, tag +0x4C) ret 0xC.
+unsafe fn build_basic(esi: usize, _edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p32(esi, 0x28, 0);
+        p16(esi, 0x30, 0xFFFF);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x54, 0);
+        p32(esi, 0x18, parg(a, 1));
+        p32(esi, 0x4C, parg(a, 2));
+        esi as u32
+    }
+}
+
+/// 0x464970 (u16 cue, type +0x18, tag +0x4C, f32 volume +0xC) ret 0x10.
+unsafe fn build_volume(esi: usize, _edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p32(esi, 0xC, q32(parg(a, 3)));
+        p32(esi, 0x28, 0);
+        p16(esi, 0x30, 0xFFFF);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x54, 0);
+        p32(esi, 0x18, parg(a, 1));
+        p32(esi, 0x4C, parg(a, 2));
+        esi as u32
+    }
+}
+
+/// 0x4649C0 (u16 cue, type +0x18, tag +0x4C, variant +0x28) ret 0x10.
+unsafe fn build_variant(esi: usize, _edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p32(esi, 0x28, parg(a, 3));
+        p16(esi, 0x30, 0xFFFF);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x54, 0);
+        p32(esi, 0x18, parg(a, 1));
+        p32(esi, 0x4C, parg(a, 2));
+        esi as u32
+    }
+}
+
+/// 0x464A10 (u16 cue, tag +0x4C, variant +0x28, f32 volume) ret 0x10; type 0.
+unsafe fn build_variant_volume(esi: usize, _edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p32(esi, 0xC, q32(parg(a, 3)));
+        p16(esi, 0x30, 0xFFFF);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x54, 0);
+        p32(esi, 0x18, 0);
+        p32(esi, 0x4C, parg(a, 1));
+        p32(esi, 0x28, parg(a, 2));
+        esi as u32
+    }
+}
+
+/// 0x464A60 (u16 cue, type, tag, f32 volume, u16 +2, dword +4) ret 0x18.
+unsafe fn build_ext(esi: usize, _edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0x10, ONE_BITS);
+        p32(esi, 0xC, q32(parg(a, 3)));
+        p16(esi, 0, parg(a, 0) as u16);
+        p32(esi, 0x18, parg(a, 1));
+        p16(esi, 2, parg(a, 4) as u16);
+        p32(esi, 0x28, 0);
+        p16(esi, 0x30, 0xFFFF);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x54, 0);
+        p32(esi, 0x4C, parg(a, 2));
+        p32(esi, 4, parg(a, 5));
+        esi as u32
+    }
+}
+
+/// 0x464AC0 (u16 cue, type, tag) ret 0xC; position at EDI.
+unsafe fn build_3d(esi: usize, edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x28, 0);
+        p16(esi, 0x30, 0xFFFF);
+        p32(esi, 0x54, 0);
+        p32(esi, 0x18, parg(a, 1));
+        p32(esi, 0x4C, parg(a, 2));
+        ppos(esi, edi);
+        esi as u32
+    }
+}
+
+/// 0x464B30 (u16 cue, tag, u16 +0x30) ret 0xC; type 1, position at EDI.
+unsafe fn build_3d_chan(esi: usize, edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p16(esi, 0x30, 0xFFFF);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x18, 1);
+        p32(esi, 0x4C, parg(a, 1));
+        p32(esi, 0x28, 0);
+        p32(esi, 0x54, 0);
+        ppos(esi, edi);
+        p16(esi, 0x30, parg(a, 2) as u16);
+        esi as u32
+    }
+}
+
+/// 0x464BA0 (u16 cue, tag, u16 +0x30, u16 +0x32) ret 0x10; type 1, position at EDI.
+unsafe fn build_3d_chan2(esi: usize, edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0x32, 1);
+        p16(esi, 0x30, 0xFFFF);
+        p16(esi, 0, parg(a, 0) as u16);
+        p32(esi, 0x18, 1);
+        p32(esi, 0x4C, parg(a, 1));
+        p32(esi, 0x28, 0);
+        p32(esi, 0x54, 0);
+        ppos(esi, edi);
+        p16(esi, 0x30, parg(a, 2) as u16);
+        p16(esi, 0x32, parg(a, 3) as u16);
+        esi as u32
+    }
+}
+
+/// 0x464C10 (u16 cue, tag, u16 +0x30, u16 +0x32, u8 flag -> +0x58 bit 6) ret 0x14; type 1, position
+/// at EDI. The +0x58 word: `((flag << 6) ^ lowbyte) & 0x40) ^ word) | 1`, as the setne / shl / xor /
+/// and / xor / or chain computes it.
+unsafe fn build_3d_chan_flag(esi: usize, edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p32(esi, 0x4C, parg(a, 1));
+        p16(esi, 0x32, 1);
+        p16(esi, 0x30, 0xFFFF);
+        p16(esi, 0, parg(a, 0) as u16);
+        p32(esi, 0x18, 1);
+        p32(esi, 0x28, 0);
+        p32(esi, 0x54, 0);
+        p32(esi, 0x1C, rd(edi));
+        p32(esi, 0x20, rd(edi + 4));
+        p16(esi, 0x30, parg(a, 2) as u16);
+        p32(esi, 0x24, rd(edi + 8));
+        p16(esi, 0x32, parg(a, 3) as u16);
+        let flag = (parg(a, 4) as u8 != 0) as u8;
+        let w = rw(esi + 0x58);
+        let t = (((flag << 6) ^ (w as u8)) & 0x40) as u16;
+        p16(esi, 0x58, (t ^ w) | 1);
+        esi as u32
+    }
+}
+
+/// 0x464CA0 (u16 cue, type, tag, f32 volume) ret 0x10; position at EDI.
+unsafe fn build_3d_volume(esi: usize, edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x28, 0);
+        p16(esi, 0x30, 0xFFFF);
+        p32(esi, 0x54, 0);
+        p32(esi, 0x18, parg(a, 1));
+        p32(esi, 0x4C, parg(a, 2));
+        p32(esi, 0xC, q32(parg(a, 3)));
+        ppos(esi, edi);
+        esi as u32
+    }
+}
+
+/// 0x464D10 (u16 cue, type, tag, f32 volume, u16 +2, dword +4) ret 0x18; position at EDI.
+unsafe fn build_3d_ext(esi: usize, edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x18, parg(a, 1));
+        p32(esi, 0x4C, parg(a, 2));
+        p32(esi, 0x28, 0);
+        p16(esi, 0x30, 0xFFFF);
+        p32(esi, 0x54, 0);
+        p32(esi, 0xC, q32(parg(a, 3)));
+        ppos(esi, edi);
+        p16(esi, 2, parg(a, 4) as u16);
+        p32(esi, 4, parg(a, 5));
+        esi as u32
+    }
+}
+
+/// 0x464D90 (u16 cue, tag, variant +0x28) ret 0xC; type 0, position at EDI.
+unsafe fn build_3d_variant(esi: usize, edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p32(esi, 0x28, 0);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x4C, parg(a, 1));
+        p16(esi, 0x30, 0xFFFF);
+        p32(esi, 0x54, 0);
+        p32(esi, 0x18, 0);
+        ppos(esi, edi);
+        p32(esi, 0x28, parg(a, 2));
+        esi as u32
+    }
+}
+
+/// 0x464E00 (u16 cue, tag, variant +0x28, f32 volume) ret 0x10; type 0, position at EDI.
+unsafe fn build_3d_variant_volume(esi: usize, edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p32(esi, 0x28, 0);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x4C, parg(a, 1));
+        p16(esi, 0x30, 0xFFFF);
+        p32(esi, 0x54, 0);
+        p32(esi, 0x18, 0);
+        ppos(esi, edi);
+        p32(esi, 0xC, q32(parg(a, 3)));
+        p32(esi, 0x28, parg(a, 2));
+        esi as u32
+    }
+}
+
+/// 0x464E70 (u16 cue, type +0x18, tag +0x4C, variant +0x28, f32 volume, u16 +2, dword +4) ret
+/// 0x1C; position at EDI.
+unsafe fn build_3d_variant_ext(esi: usize, edi: usize, a: *const u32) -> u32 {
+    unsafe {
+        pm(esi);
+        p32(esi, 0xC, ONE_BITS);
+        p32(esi, 0x10, ONE_BITS);
+        p16(esi, 0, parg(a, 0) as u16);
+        p32(esi, 0x4C, parg(a, 2));
+        p32(esi, 0x28, 0);
+        p16(esi, 0x32, 1);
+        p32(esi, 0x18, parg(a, 1));
+        p16(esi, 0x30, 0xFFFF);
+        p32(esi, 0x54, 0);
+        ppos(esi, edi);
+        p32(esi, 0xC, q32(parg(a, 4)));
+        p32(esi, 0x28, parg(a, 3));
+        p16(esi, 2, parg(a, 5) as u16);
+        p32(esi, 4, parg(a, 6));
+        esi as u32
+    }
+}
+
+/// Run one params variant: live, or (while shadowed) on a scratch buffer against the original on
+/// the real one. The original's bytes stand.
+unsafe fn params_run(id: usize, p: &Pushad, a: *const u32, nargs: usize, build: Build) -> u32 {
+    unsafe {
+        let Some((n, orig)) = shadowing(id) else { return build(p.esi as usize, p.edi as usize, a) };
+        let mut scratch = [0xCCCC_CCCCu32; 0x5C / 4];
+        let sp = scratch.as_mut_ptr() as usize;
+        let ours = build(sp, p.edi as usize, a);
+        let ours = if ours == sp as u32 { p.esi } else { ours };
+        let args = std::slice::from_raw_parts(a, nargs);
+        let theirs = call_regs(orig, p.eax, p.ecx, p.edx, p.esi, p.edi, args);
+        let live = std::slice::from_raw_parts(p.esi as usize as *const u32, 0x5C / 4);
+        if live != scratch || theirs != ours {
+            let i = (0..scratch.len()).find(|&i| live[i] != scratch[i]);
+            mismatch(
+                id,
+                n,
+                format!("in {:x?} args {:x?}: eax original {theirs:#x}, Rust {ours:#x}; first differing dword {:?} ({:x?} vs {:x?})", Regs::of(p), args, i, i.map(|i| live[i]), i.map(|i| scratch[i])),
+            );
+        }
+        theirs
+    }
+}
+
+macro_rules! params_port {
+    ($entry:ident, $thunk:ident, $id:expr, $build:ident, $nargs:expr, $ret:literal) => {
+        extern "C" fn $entry(r: &mut Pushad, a: *const u32) {
+            let p = *r;
+            r.eax = unsafe { params_run($id, &p, a, $nargs, $build) };
+        }
+        regs_thunk!($thunk, $entry, $ret);
+    };
+}
+
+params_port!(pi_default_entry, pi_default_thunk, PI_DEFAULT, build_default, 0, "ret");
+params_port!(pi_basic_entry, pi_basic_thunk, PI_BASIC, build_basic, 3, "ret 0xC");
+params_port!(pi_volume_entry, pi_volume_thunk, PI_VOLUME, build_volume, 4, "ret 0x10");
+params_port!(pi_variant_entry, pi_variant_thunk, PI_VARIANT, build_variant, 4, "ret 0x10");
+params_port!(pi_variant_volume_entry, pi_variant_volume_thunk, PI_VARIANT_VOLUME, build_variant_volume, 4, "ret 0x10");
+params_port!(pi_ext_entry, pi_ext_thunk, PI_EXT, build_ext, 6, "ret 0x18");
+params_port!(pi_3d_entry, pi_3d_thunk, PI_3D, build_3d, 3, "ret 0xC");
+params_port!(pi_3d_chan_entry, pi_3d_chan_thunk, PI_3D_CHAN, build_3d_chan, 3, "ret 0xC");
+params_port!(pi_3d_chan2_entry, pi_3d_chan2_thunk, PI_3D_CHAN2, build_3d_chan2, 4, "ret 0x10");
+params_port!(pi_3d_chan_flag_entry, pi_3d_chan_flag_thunk, PI_3D_CHAN_FLAG, build_3d_chan_flag, 5, "ret 0x14");
+params_port!(pi_3d_volume_entry, pi_3d_volume_thunk, PI_3D_VOLUME, build_3d_volume, 4, "ret 0x10");
+params_port!(pi_3d_ext_entry, pi_3d_ext_thunk, PI_3D_EXT, build_3d_ext, 6, "ret 0x18");
+params_port!(pi_3d_variant_entry, pi_3d_variant_thunk, PI_3D_VARIANT, build_3d_variant, 3, "ret 0xC");
+params_port!(pi_3d_variant_volume_entry, pi_3d_variant_volume_thunk, PI_3D_VARIANT_VOLUME, build_3d_variant_volume, 4, "ret 0x10");
+params_port!(pi_3d_variant_ext_entry, pi_3d_variant_ext_thunk, PI_3D_VARIANT_EXT, build_3d_variant_ext, 7, "ret 0x1C");
+
+// --- 0x47F080 audio_pause_all / 0x47F170 audio_resume_all / 0x47F020 audio_voices_fade_out_all -----
+
+/// The vtable call on the master voice object: this = [0xF52E30], ECX = its vtable, EDX = vtable
+/// +0x28, stdcall (this, f32 volume, 0). Returns the callee's EAX.
+unsafe fn master_volume_call(volume_bits: u32, set_flag: impl FnOnce(), esi: u32, edi: u32) -> u32 {
+    unsafe {
+        let e = rd(MASTER_VOICE);
+        let c = rd(e as usize);
+        let d = rd(c as usize + 0x28);
+        set_flag();
+        call_regs(d as usize, e, c, d, esi, edi, &[e, volume_bits, 0])
+    }
+}
+
+/// The pause loop over the slots: for every in-use slot the pause bit 0x2000 of +0x198 is set
+/// (after the 0x4000 bit is cleared and written back) unless +0x196 has 0x40 or the +0x194 bit 0
+/// (category -1) / bit 0 of the earlier +0x194 word (other categories) is set; a slot with +0x194
+/// bit 1 gets the stop bit 0x400 (a single `or word`) and +0x194 &= 0xFF7F instead.
+unsafe fn pause_loop(slots: usize) {
+    unsafe {
+        for k in 0..SLOT_COUNT {
+            let s = slots + k * SLOT_SIZE;
+            if !(vr32(s) != 0xFFFF_FFFF || vr16(s + 0x196) & 0x200 != 0) {
+                continue;
+            }
+            if vr32(s + 0xA4) == 0xFFFF_FFFF {
+                let cx = vr16(s + 0x198) & 0xBFFF;
+                let t = vr8(s + 0x196) & 0x40;
+                vw16(s + 0x198, cx);
+                if t != 0 {
+                    continue;
+                }
+                if vr8(s + 0x194) & 1 != 0 {
+                    continue;
+                }
+                vw16(s + 0x198, cx | 0x2000);
+            } else {
+                let dx = vr16(s + 0x194);
+                if dx & 2 != 0 {
+                    or16(s + 0x198, 0x400);
+                    vw16(s + 0x194, dx & 0xFF7F);
+                } else {
+                    let cx = vr16(s + 0x198) & 0xBFFF;
+                    let t = vr8(s + 0x196) & 0x40;
+                    vw16(s + 0x198, cx);
+                    if t != 0 {
+                        continue;
+                    }
+                    if dx & 1 != 0 {
+                        continue;
+                    }
+                    vw16(s + 0x198, cx | 0x2000);
+                }
+            }
+        }
+    }
+}
+
+/// The resume loop: every slot with 0x40 in the low byte of +0x196 gets +0x198 = (word & 0xDFFF)
+/// | 0x4000 (load, store).
+unsafe fn resume_loop(slots: usize) {
+    unsafe {
+        for k in 0..SLOT_COUNT {
+            let s = slots + k * SLOT_SIZE;
+            if vr8(s + 0x196) & 0x40 != 0 {
+                let si = (vr16(s + 0x198) & 0xDFFF) | 0x4000;
+                vw16(s + 0x198, si);
+            }
+        }
+    }
+}
+
+/// audio_pause_all with the game's state. While the window is inactive (byte 0x252A406 == 0): once
+/// (byte 0x2526AFB != 1) pause category 1 (0x481E90(1)), call the master voice's SetVolume-like
+/// method with 0.0, and set the muted byte before that call; then byte 0x2526AD7 = 1. Otherwise
+/// the pause depth 0x2526B44 += 1 (one instruction) and the loop. EAX: the vtable call's result, the
+/// caller's EAX when already muted, the loop's end value 0xEEBA90 + 128 * 0x19C.
+unsafe fn pause_all_live(eax: u32, esi: u32, edi: u32) -> u32 {
+    unsafe {
+        if rb(WINDOW_ACTIVE) == 0 {
+            let mut out = eax;
+            if rb(MASTER_MUTED) != 1 {
+                call_regs(AUDIO_PAUSE_CATEGORY, 0, 0, 0, 0, 0, &[1]);
+                out = master_volume_call(0, || wb(MASTER_MUTED, 1), esi, edi);
+            }
+            wb(WINDOW_PAUSED, 1);
+            return out;
+        }
+        add1_32(PAUSE_DEPTH);
+        pause_loop(VOICE_SLOTS);
+        SLOTS_END_EAX
+    }
+}
+
+extern "C" fn pause_all_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let Some((n, orig)) = shadowing(PAUSE_ALL) else {
+        r.eax = unsafe { pause_all_live(p.eax, p.esi, p.edi) };
+        return;
+    };
+    unsafe {
+        // Window active: the loop is shadowed on a copy of all slots (the original also bumps the
+        // pause depth). Window inactive: the original runs, then its two bytes are checked.
+        if rb(WINDOW_ACTIVE) != 0 {
+            r.eax = slots_shadow(PAUSE_ALL, n, orig, &p, |b| {
+                pause_loop(b);
+                SLOTS_END_EAX
+            });
+        } else {
+            let t = run_original(PAUSE_ALL, orig, &p, 0);
+            if rb(MASTER_MUTED) != 1 || rb(WINDOW_PAUSED) != 1 {
+                mismatch(PAUSE_ALL, n, format!("flags after: muted {} paused {}", rb(MASTER_MUTED), rb(WINDOW_PAUSED)));
+            }
+            r.eax = t.eax;
+        }
+    }
+}
+regs_thunk!(pause_all_thunk, pause_all_entry);
+
+/// audio_resume_all with the game's state. When 0x2526AD7 is set: if muted, 0x481E90(0), the master
+/// voice call with 1.0 (the muted byte cleared before it), then 0x2526AD7 = 0. Otherwise the pause
+/// depth -= 1 (one instruction): a negative result is stored as 0 and the loop runs; a positive one
+/// returns; 0 runs the loop. EAX as in pause_all.
+unsafe fn resume_all_live(eax: u32, esi: u32, edi: u32) -> u32 {
+    unsafe {
+        if rb(WINDOW_PAUSED) != 0 {
+            let mut out = eax;
+            if rb(MASTER_MUTED) != 0 {
+                call_regs(AUDIO_PAUSE_CATEGORY, 0, 0, 0, 0, 0, &[0]);
+                out = master_volume_call(ONE_BITS, || wb(MASTER_MUTED, 0), esi, edi);
+            }
+            wb(WINDOW_PAUSED, 0);
+            return out;
+        }
+        if sub1_32(PAUSE_DEPTH) {
+            wd(PAUSE_DEPTH, 0);
+        } else if rd(PAUSE_DEPTH) as i32 > 0 {
+            return eax;
+        }
+        resume_loop(VOICE_SLOTS);
+        SLOTS_END_EAX
+    }
+}
+
+extern "C" fn resume_all_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let Some((n, orig)) = shadowing(RESUME_ALL) else {
+        r.eax = unsafe { resume_all_live(p.eax, p.esi, p.edi) };
+        return;
+    };
+    unsafe {
+        if rb(WINDOW_PAUSED) != 0 {
+            let t = run_original(RESUME_ALL, orig, &p, 0);
+            if rb(MASTER_MUTED) != 0 || rb(WINDOW_PAUSED) != 0 {
+                mismatch(RESUME_ALL, n, format!("flags after: muted {} paused {}", rb(MASTER_MUTED), rb(WINDOW_PAUSED)));
+            }
+            r.eax = t.eax;
+        } else if (rd(PAUSE_DEPTH) as i32).wrapping_sub(1) <= 0 {
+            r.eax = slots_shadow(RESUME_ALL, n, orig, &p, |b| {
+                resume_loop(b);
+                SLOTS_END_EAX
+            });
+        } else {
+            let t = run_original(RESUME_ALL, orig, &p, 0);
+            if t.eax != p.eax {
+                mismatch(RESUME_ALL, n, format!("eax: original {:#x}, Rust {:#x}", t.eax, p.eax));
+            }
+            r.eax = t.eax;
+        }
+    }
+}
+regs_thunk!(resume_all_thunk, resume_all_entry);
+
+/// The fade-out-all loop: every in-use slot gets `or word [+0x194], 1` (one instruction) and
+/// audio_voice_slot_fade_out(index, ms). (The depth bump and the argument read stay with the caller.)
+unsafe fn fade_all_on(slots: usize, ms: u32) {
+    unsafe {
+        for k in 0..SLOT_COUNT {
+            let s = slots + k * SLOT_SIZE;
+            if vr32(s) != 0xFFFF_FFFF || vr16(s + 0x196) & 0x200 != 0 {
+                or16(s + 0x194, 1);
+                slot_fade_out_on(slots, k as u32, ms);
+            }
+        }
+    }
+}
+
+const FADE_ALL_FIELDS: &[(usize, usize)] = &[(0xA8, 4), (0xC4, 4), (0x194, 4)];
+
+extern "C" fn fade_all_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let Some((n, orig)) = shadowing(FADE_ALL) else {
+        unsafe {
+            add1_32(PAUSE_DEPTH);
+            let ms = *args;
+            fade_all_on(VOICE_SLOTS, ms);
+        }
+        return;
+    };
+    unsafe {
+        let ms = *args;
+        let total = SLOT_SIZE * SLOT_COUNT;
+        let mut buf = vec![0u8; total];
+        std::ptr::copy_nonoverlapping(VOICE_SLOTS as *const u8, buf.as_mut_ptr(), total);
+        let b = buf.as_ptr() as usize;
+        fade_all_on(b, ms);
+        run_orig(orig, &p, &[ms]);
+        'cmp: for k in 0..SLOT_COUNT {
+            for &(f, len) in FADE_ALL_FIELDS {
+                let x = std::slice::from_raw_parts((b + k * SLOT_SIZE + f) as *const u8, len);
+                let y = std::slice::from_raw_parts((VOICE_SLOTS + k * SLOT_SIZE + f) as *const u8, len);
+                if x != y {
+                    mismatch(FADE_ALL, n, format!("slot {k} +{f:#x}: original {y:x?}, Rust {x:x?} (ms {ms})"));
+                    break 'cmp;
+                }
+            }
+        }
+    }
+}
+regs_thunk!(fade_all_thunk, fade_all_entry);
+
+// --- 0x4802D0 audio_voice_set_3d_position (ECX = &handle, EDI = &velocity, cdecl (&position, transform) -> AL)
+
+/// Valid handle: audio_voice_slot_set_orientation(transform) by address, velocity -> +0x68..+0x70,
+/// position -> +0x5C..+0x64 (each an f32 round trip, the third position word loaded before the two
+/// `or`s and stored after them), `or word [+0x198], 1`, `or word [+0x196], 0x812` (single
+/// instructions), +0x190 = 0, then 0x47D780(slot) and `or word [+0x196], 0x20` when it returns
+/// non-zero. AL = 1 (the rest of EAX from 0x47D780's return); stale: AL = 0 as elsewhere.
+unsafe fn set_3d_position_on(slots: usize, eax: u32, h: usize, vel: usize, pos: usize, transform: u32) -> u32 {
+    unsafe {
+        let idx = match hcheck(slots, h) {
+            H::Ff(_) | H::Gen0(_) => return lo(eax, false),
+            H::Stale(idx) => return lo(idx * SLOT_SIZE as u32, false),
+            H::Good(idx) => idx,
+        };
+        let s = slots.wrapping_add(idx as usize * SLOT_SIZE);
+        call_regs(SLOT_SET_ORIENTATION, s as u32, transform, 0, 0, 0, &[s as u32]);
+        vw32(s + 0x68, q32(rd(vel)));
+        vw32(s + 0x6C, q32(rd(vel + 4)));
+        vw32(s + 0x70, q32(rd(vel + 8)));
+        vw32(s + 0x5C, q32(rd(pos)));
+        vw32(s + 0x60, q32(rd(pos + 4)));
+        let z = q32(rd(pos + 8));
+        or16(s + 0x198, 1);
+        or16(s + 0x196, 0x812);
+        vw32(s + 0x64, z);
+        vw32(s + 0x190, 0);
+        let e = call_regs(SLOT_UPDATE_MUTE, 0, s as u32, 0, 0, 0, &[]);
+        if e & 0xFF != 0 {
+            or16(s + 0x196, 0x20);
+        }
+        lo(e, true)
+    }
+}
+
+const POS_FIELDS: &[(usize, usize)] = &[(0x44, 0x30), (0x190, 2), (0x194, 2), (0x196, 2), (0x198, 2)];
+
+extern "C" fn set_3d_position_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let (pos, transform) = unsafe { (*args, *args.add(1)) };
+    let h = p.ecx as usize;
+    let Some((n, orig)) = shadowing(SET_3D_POS) else {
+        r.eax = unsafe { set_3d_position_on(VOICE_SLOTS, p.eax, h, p.edi as usize, pos as usize, transform) };
+        return;
+    };
+    unsafe {
+        let idx = handle_idx(h);
+        r.eax = shadow_slot_op(SET_3D_POS, n, orig, &p, &[pos, transform], idx, POS_FIELDS, false, |b| {
+            set_3d_position_on(b, p.eax, h, p.edi as usize, pos as usize, transform)
+        });
+    }
+}
+regs_thunk!(set_3d_position_thunk, set_3d_position_entry);
+
+// --- 0x47F800 audio_voice_play_prepared (ECX = &handle) -----------------------------------------
+
+/// A good handle whose +0x198 has no stop bit (0x400): 0x47D780(slot); when it returns non-zero and
+/// +0x196 has no 0x200, +0x196 |= 0x20 (load, store); then bit 0x200 of +0x198 is made the inverse
+/// of the same bit of +0x196 with `xor word [+0x198], ax` (one instruction, ax from the re-read
+/// flags and +0x198). EAX: the final ax (0 / 0x200); the failures keep the caller's EAX with AL =
+/// the slot byte (byte 0xFF / generation 0) or leave the slot offset (stale, stopping).
+unsafe fn play_prepared_on(slots: usize, eax: u32, h: usize) -> u32 {
+    unsafe {
+        let idx = match hcheck(slots, h) {
+            H::Ff(al) | H::Gen0(al) => return (eax & !0xFF) | al as u32,
+            H::Stale(idx) => return idx * SLOT_SIZE as u32,
+            H::Good(idx) => idx,
+        };
+        let s = slots.wrapping_add(idx as usize * SLOT_SIZE);
+        if vr16(s + 0x198) & 0x400 != 0 {
+            return idx * SLOT_SIZE as u32;
+        }
+        let e = call_regs(SLOT_UPDATE_MUTE, 0, s as u32, 0, 0, 0, &[]);
+        if e & 0xFF != 0 {
+            let fl = vr16(s + 0x196) as u32;
+            if fl & 0x200 == 0 {
+                vw16(s + 0x196, (fl | 0x20) as u16);
+            }
+        }
+        let mut ax = vr16(s + 0x196) >> 9;
+        ax = !ax;
+        ax <<= 9;
+        ax ^= vr16(s + 0x198);
+        ax &= 0x200;
+        xor16(s + 0x198, ax);
+        ax as u32
+    }
+}
+
+const PLAY_PREPARED_FIELDS: &[(usize, usize)] = &[(0x194, 2), (0x196, 2), (0x198, 2)];
+
+extern "C" fn play_prepared_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let h = p.ecx as usize;
+    let Some((n, orig)) = shadowing(PLAY_PREPARED) else {
+        r.eax = unsafe { play_prepared_on(VOICE_SLOTS, p.eax, h) };
+        return;
+    };
+    unsafe {
+        let idx = handle_idx(h);
+        r.eax = shadow_slot_op(PLAY_PREPARED, n, orig, &p, &[], idx, PLAY_PREPARED_FIELDS, true, |b| play_prepared_on(b, p.eax, h));
+    }
+}
+regs_thunk!(play_prepared_thunk, play_prepared_entry);
+
+// =====================================================================================================
+// Weapon / ammo round two. All of these run on the game thread only (the ammo stores and the weapon
+// instance lists are never read by the audio thread), so the shadow is the snapshot pattern of
+// `weapon_instance_free`: snapshot what the original can write, run the original, keep its result,
+// restore the snapshot, run the Rust version and compare; the original's writes stand on a mismatch.
+// =====================================================================================================
+
+/// Snapshot shadow: `addrs` are the dwords the original can write. Returns the EAX to give back.
+unsafe fn snap_shadow(id: usize, n: u32, orig: usize, p: &Pushad, args: &[u32], addrs: &[usize], ours: impl FnOnce() -> u32) -> u32 {
+    unsafe {
+        let before: Vec<u32> = addrs.iter().map(|&a| rd(a)).collect();
+        let theirs_eax = call_regs(orig, p.eax, p.ecx, p.edx, p.esi, p.edi, args);
+        let theirs: Vec<u32> = addrs.iter().map(|&a| rd(a)).collect();
+        for (&a, &v) in addrs.iter().zip(&before) {
+            wd(a, v);
+        }
+        let ours_eax = ours();
+        let mine: Vec<u32> = addrs.iter().map(|&a| rd(a)).collect();
+        if mine != theirs || ours_eax != theirs_eax {
+            mismatch(id, n, format!("in {:x?} args {args:x?}: original eax {theirs_eax:#x} {theirs:x?}, Rust eax {ours_eax:#x} {mine:x?}", Regs::of(p)));
+            for (&a, &v) in addrs.iter().zip(&theirs) {
+                wd(a, v);
+            }
+        }
+        theirs_eax
+    }
+}
+
+/// The three dwords of an ammo store entry (type *, count, bonus).
+fn entry_addrs(e: u32) -> Vec<usize> {
+    if e == 0 { Vec::new() } else { vec![e as usize, e as usize + 4, e as usize + 8] }
+}
+
+// --- 0xB68C20 ammo_store_entry_add (ESI = entry, EAX = amount, stdcall (u8 overflow) -> EAX added)
+
+/// room = bonus - count + limit (signed); added = amount when overflow is allowed, else min(amount,
+/// room) (signed compare); count += added; with overflow and room < amount the bonus is set to
+/// amount - room.
+unsafe fn entry_add(entry: u32, amount: u32, ovf: u32) -> u32 {
+    unsafe {
+        let e = entry as usize;
+        let ovf = ovf as u8 != 0;
+        let lim = type_limit(rd(e));
+        let count = rd(e + 4);
+        let bonus = rd(e + 8);
+        let room = bonus.wrapping_sub(count).wrapping_add(lim) as i32;
+        let amt = amount as i32;
+        let added = if ovf || amt < room { amt } else { room };
+        wd(e + 4, count.wrapping_add(added as u32));
+        if ovf && room < amt {
+            wd(e + 8, amt.wrapping_sub(room) as u32);
+        }
+        added as u32
+    }
+}
+
+extern "C" fn entry_add_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let ovf = unsafe { *args };
+    let Some((n, orig)) = shadowing(ENTRY_ADD) else {
+        r.eax = unsafe { entry_add(p.esi, p.eax, ovf) };
+        return;
+    };
+    unsafe { r.eax = snap_shadow(ENTRY_ADD, n, orig, &p, &[ovf], &entry_addrs(p.esi), || entry_add(p.esi, p.eax, ovf)) };
+}
+regs_thunk!(entry_add_thunk, entry_add_entry, "ret 4");
+
+// --- 0xB690C0 ammo_store_add_type (ECX = &store, EDI = hash, stdcall (amount, overflow) -> EAX) ---
+
+/// The entry for the hash (0 when absent or when the address is 0), then ammo_store_entry_add with
+/// EAX = amount and the overflow argument. (doc 44 had the two arguments the other way round: the
+/// first stack argument is the amount, the second the overflow flag.)
+unsafe fn add_type(store: u32, hash: u32, amount: u32, ovf: u32) -> u32 {
+    unsafe {
+        match store_scan(store, hash) {
+            Some(e) if e != 0 => entry_add(e, amount, ovf),
+            _ => 0,
+        }
+    }
+}
+
+extern "C" fn add_type_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let (amount, ovf) = unsafe { (*args, *args.add(1)) };
+    let Some((n, orig)) = shadowing(ADD_TYPE) else {
+        r.eax = unsafe { add_type(p.ecx, p.edi, amount, ovf) };
+        return;
+    };
+    unsafe {
+        let e = store_scan(p.ecx, p.edi).unwrap_or(0);
+        r.eax = snap_shadow(ADD_TYPE, n, orig, &p, &[amount, ovf], &entry_addrs(e), || add_type(p.ecx, p.edi, amount, ovf));
+    }
+}
+regs_thunk!(add_type_thunk, add_type_entry, "ret 8");
+
+// --- 0xB69190 ammo_store_remove (ECX = &store, EDI = hash, stdcall (amount) -> EAX removed) ------
+
+/// removed = min(amount, count) (signed); count -= removed; with a non-zero bonus the bonus becomes
+/// bonus - removed (through the original's `cmp / sbb / and` max, which keeps the wrapped value).
+unsafe fn store_remove(store: u32, hash: u32, amount: u32) -> u32 {
+    unsafe {
+        let e = match store_scan(store, hash) {
+            Some(e) if e != 0 => e as usize,
+            _ => return 0,
+        };
+        let count = rd(e + 4);
+        let removed = if (amount as i32) < count as i32 { amount } else { count };
+        wd(e + 4, count.wrapping_sub(removed));
+        let bonus = rd(e + 8);
+        if bonus != 0 {
+            let edx = bonus.wrapping_sub(removed);
+            let esi = if 0u32 < edx { u32::MAX } else { 0 };
+            wd(e + 8, esi & edx);
+        }
+        removed
+    }
+}
+
+extern "C" fn store_remove_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let amount = unsafe { *args };
+    let Some((n, orig)) = shadowing(STORE_REMOVE) else {
+        r.eax = unsafe { store_remove(p.ecx, p.edi, amount) };
+        return;
+    };
+    unsafe {
+        let e = store_scan(p.ecx, p.edi).unwrap_or(0);
+        r.eax = snap_shadow(STORE_REMOVE, n, orig, &p, &[amount], &entry_addrs(e), || store_remove(p.ecx, p.edi, amount));
+    }
+}
+regs_thunk!(store_remove_thunk, store_remove_entry, "ret 4");
+
+// --- 0xB69230 weapon_ammo_store_remove (ECX = instance, EAX = amount, stdcall (store) -> EAX) ------
+
+/// No instance: EAX stays the amount (the original returns without touching it). No info or no
+/// primary ammo type: 0. Else ammo_store_remove(store, the type's hash +4, amount).
+unsafe fn weapon_store_remove(inst: u32, eax: u32, store: u32) -> u32 {
+    unsafe {
+        if inst == 0 {
+            return eax;
+        }
+        let info = rd(inst as usize + 8);
+        if info == 0 {
+            return 0;
+        }
+        let ty = rd(info as usize + 0xD4);
+        if ty == 0 {
+            return 0;
+        }
+        store_remove(store, rd(ty as usize + 4), eax)
+    }
+}
+
+extern "C" fn weapon_store_remove_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let store = unsafe { *args };
+    let Some((n, orig)) = shadowing(WEAPON_STORE_REMOVE) else {
+        r.eax = unsafe { weapon_store_remove(p.ecx, p.eax, store) };
+        return;
+    };
+    unsafe {
+        let mut e = 0;
+        if p.ecx != 0 {
+            let info = rd(p.ecx as usize + 8);
+            if info != 0 {
+                let ty = rd(info as usize + 0xD4);
+                if ty != 0 {
+                    e = store_scan(store, rd(ty as usize + 4)).unwrap_or(0);
+                }
+            }
+        }
+        r.eax = snap_shadow(WEAPON_STORE_REMOVE, n, orig, &p, &[store], &entry_addrs(e), || weapon_store_remove(p.ecx, p.eax, store));
+    }
+}
+regs_thunk!(weapon_store_remove_thunk, weapon_store_remove_entry, "ret 4");
+
+// --- 0xB693E0 ammo_store_clear (EDI = &store) ----------------------------------------------------
+
+/// For i = 0.. while i < the signed count (re-read every iteration; the store base [EDI] is re-read
+/// too): count and bonus of entry i = 0. EAX ends as the last entry address (unchanged when the
+/// loop does not run).
+unsafe fn store_clear(store: u32, eax: u32) -> u32 {
+    unsafe {
+        if (rd(AMMO_TYPE_COUNT) as i32) <= 0 {
+            return eax;
+        }
+        let mut out;
+        let mut i = 0i32;
+        let mut off = 0u32;
+        loop {
+            out = rd(store as usize).wrapping_add(off);
+            i += 1;
+            wd(out as usize + 4, 0);
+            wd(out as usize + 8, 0);
+            off = off.wrapping_add(12);
+            if i >= rd(AMMO_TYPE_COUNT) as i32 {
+                break;
+            }
+        }
+        out
+    }
+}
+
+extern "C" fn store_clear_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let Some((n, orig)) = shadowing(STORE_CLEAR) else {
+        r.eax = unsafe { store_clear(p.edi, p.eax) };
+        return;
+    };
+    unsafe {
+        let mut addrs = Vec::new();
+        let cnt = rd(AMMO_TYPE_COUNT) as i32;
+        if cnt > 0 && cnt < 4096 {
+            let base = rd(p.edi as usize);
+            for i in 0..cnt as u32 {
+                addrs.push(base.wrapping_add(i * 12) as usize + 4);
+                addrs.push(base.wrapping_add(i * 12) as usize + 8);
+            }
+        }
+        r.eax = snap_shadow(STORE_CLEAR, n, orig, &p, &[], &addrs, || store_clear(p.edi, p.eax));
+    }
+}
+regs_thunk!(store_clear_thunk, store_clear_entry);
+
+// --- 0xB72C40 weapon_info_is_thrown (EAX = info -> AL) -------------------------------------------
+
+/// AL = class (+0x34) == 5; null: AL = 0. The rest of EAX stays the pointer.
+unsafe fn is_thrown(info: u32) -> u32 {
+    unsafe {
+        if info == 0 {
+            return lo(info, false);
+        }
+        lo(info, rd(info as usize + 0x34) == 5)
+    }
+}
+
+extern "C" fn is_thrown_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(IS_THROWN, &p, 0, unsafe { is_thrown(p.eax) });
+}
+regs_thunk!(is_thrown_thunk, is_thrown_entry);
+
+// --- 0xB71AC0 weapon_instance_alloc (ESI = weapon info -> EAX instance or 0) -------------------
+
+/// Take the head of the free list (circular, +0 prev / +4 next): unlink it, insert it before the
+/// head of the live list (or make it the only node), then fill in the fields, in the original's
+/// order of reads and writes.
+unsafe fn instance_alloc(info: u32) -> u32 {
+    unsafe {
+        let node = rd(INST_FREE);
+        if node == 0 {
+            return 0;
+        }
+        let n = node as usize;
+        let nx = n + 4; // &node.next
+        let next = rd(nx);
+        if next == node {
+            wd(INST_FREE, 0);
+        } else {
+            wd(INST_FREE, next);
+            let prev = rd(n);
+            if prev != 0 {
+                wd(prev as usize + 4, rd(nx));
+            }
+            let next = rd(nx);
+            if next != 0 {
+                wd(next as usize, rd(n));
+            }
+        }
+        let head = rd(INST_LIVE);
+        wd(n, 0);
+        wd(nx, 0);
+        if head == 0 {
+            wd(nx, node);
+            wd(n, node);
+            wd(INST_LIVE, node);
+        } else {
+            wd(n, rd(head as usize));
+            wd(nx, head);
+            let hp = rd(head as usize);
+            wd(hp as usize + 4, node);
+            wd(head as usize, node);
+        }
+        let i = info as usize;
+        wd(n + 8, info);
+        ww(n + 0xC, 0);
+        let x = rd(i + 0x10);
+        let cl = (((x >> 3) as u8) << 4) & 0x10;
+        wb(n + 0xC, rb(n + 0xC) ^ cl);
+        let alt = rb(i + 0x10) & 0x20 != 0;
+        let cl = rb(n + 0xC);
+        let nb: u8 = if alt { ((rd(i + 0x10) >> 4) & 1) as u8 } else { 0 };
+        wb(n + 0xC, (((nb << 5) ^ cl) & 0x20) ^ cl);
+        let mag = rw(i + 0xDC) as u32;
+        wd(n + 0x10, mag);
+        wd(n + 0x14, rw(i + 0xDC) as u32);
+        let altmag = if rb(i + 0x10) & 0x20 != 0 { rw(i + 0xDC) as u32 } else { 0 };
+        wd(n + 0x18, altmag);
+        let altmag2 = if rb(i + 0x10) & 0x20 != 0 { rw(i + 0xDC) as u32 } else { 0 };
+        wd(n + 0x40, 0);
+        wd(n + 0x1C, altmag2);
+        wd(n + 0x44, 0);
+        wd(n + 0x48, 0);
+        wd(n + 0x24, 0xFFFF_FFFF);
+        wd(n + 0x4C, q32(rd(0x00E5_C53C)));
+        wd(n + 0x28, 0xFFFF_FFFF);
+        wd(n + 0x2C, 0xFFFF_FFFF);
+        wd(n + 0x30, 0xFFFF_FFFF);
+        wd(n + 0xA8, 0xFFFF_FFFF);
+        wd(n + 0xAC, 0xFFFF_FFFF);
+        wb(n + 0x3C, 0);
+        wd(n + 0x50, 0);
+        wd(n + 0x34, 0xFFFF_FFFF);
+        for off in [0x54usize, 0x60, 0x6C, 0x78, 0x84, 0x90, 0x9C] {
+            wd(n + off, 0xFF);
+        }
+        for off in [0xB4usize, 0xB8, 0xD0, 0xCC, 0xBC, 0xC0, 0xC4, 0xC8] {
+            wd(n + off, 0);
+        }
+        if rd(i + 0x34) == 4 {
+            let mut v = rd(0x00E8_43AC);
+            wd(n + 0x30, v);
+            if v as i32 > 0x6B49_D200 {
+                v = v.wrapping_add(0x94B6_2E00);
+                wd(n + 0x30, v);
+            }
+        }
+        if rd(i + 0x34) == 5 {
+            wb(n + 0xD, rb(n + 0xD) | 4);
+        }
+        wb(n + 0xD, rb(n + 0xD) | 0x20);
+        wd(n + 0xE8, 0);
+        wd(n + 0x38, 0xFFFF_FFFF);
+        ww(n + 0xE4, 0xFFFF);
+        wd(n + 0xEC, 0xFFFF_FFFF);
+        node
+    }
+}
+
+extern "C" fn instance_alloc_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let Some((n, orig)) = shadowing(INST_ALLOC) else {
+        r.eax = unsafe { instance_alloc(p.esi) };
+        return;
+    };
+    unsafe {
+        // Everything the original can write: both heads, the free node's 0xF0 bytes, and the link
+        // words of the nodes around it and around the live head.
+        let mut addrs: Vec<usize> = vec![INST_FREE, INST_LIVE];
+        let f = rd(INST_FREE);
+        if f != 0 {
+            let fp = rd(f as usize);
+            let fnx = rd(f as usize + 4);
+            let h = rd(INST_LIVE);
+            let mut objs = vec![fp, fnx, h];
+            if h != 0 {
+                objs.push(rd(h as usize));
+            }
+            for k in 0..0xF0 / 4 {
+                addrs.push(f as usize + k * 4);
+            }
+            for o in objs {
+                if o != 0 {
+                    addrs.push(o as usize);
+                    addrs.push(o as usize + 4);
+                }
+            }
+        }
+        r.eax = snap_shadow(INST_ALLOC, n, orig, &p, &[], &addrs, || instance_alloc(p.esi));
+    }
+}
+regs_thunk!(instance_alloc_thunk, instance_alloc_entry);
+
 // --- install ------------------------------------------------------------------------------------
 
 /// Re-aim the rel32 of the `call` / `jmp` at `off` in a relocated copy.
@@ -1102,6 +2733,43 @@ pub fn install() {
         (STOP_CATEGORY, &STOP_CATEGORY_BODY, &STOP_CATEGORY_BODY_CALLS, stop_category_thunk),
         (MARK_DIRTY, &DIRTY_ALL_BODY, &DIRTY_ALL_BODY_CALLS, mark_dirty_thunk),
         (THROTTLE_SET, &THROTTLE_BODY, &THROTTLE_BODY_CALLS, throttle_thunk),
+        (SLOT_FADE_OUT, &SLOT_FADE_OUT_BODY, &SLOT_FADE_OUT_BODY_CALLS, slot_fade_out_thunk),
+        (FADE_OUT, &FADE_OUT_BODY, &FADE_OUT_BODY_CALLS, fade_out_thunk),
+        (FADE_OUT2, &FADE_OUT2_BODY, &FADE_OUT2_BODY_CALLS, fade_out2_thunk),
+        (SET_ORIENT, &ORIENT_BODY, &ORIENT_BODY_CALLS, orient_thunk),
+        (SET_ORIENT2, &ORIENT2_BODY, &ORIENT2_BODY_CALLS, orient2_thunk),
+        (IS_2D, &IS_2D_BODY, &IS_2D_BODY_CALLS, is_2d_thunk),
+        (GET_P30, &GET_P30_BODY, &GET_P30_BODY_CALLS, get_param_30_thunk),
+        (SET_P28, &SET_P28_BODY, &SET_P28_BODY_CALLS, set_param_28_thunk),
+        (SET_P30, &SET_P30_BODY, &SET_P30_BODY_CALLS, set_param_30_thunk),
+        (FADE_IN, &FADE_IN_BODY, &FADE_IN_BODY_CALLS, slot_fade_in_thunk),
+        (PI_DEFAULT, &PI_DEFAULT_BODY, &PI_DEFAULT_BODY_CALLS, pi_default_thunk),
+        (PI_BASIC, &PI_BASIC_BODY, &PI_BASIC_BODY_CALLS, pi_basic_thunk),
+        (PI_VOLUME, &PI_VOLUME_BODY, &PI_VOLUME_BODY_CALLS, pi_volume_thunk),
+        (PI_VARIANT, &PI_VARIANT_BODY, &PI_VARIANT_BODY_CALLS, pi_variant_thunk),
+        (PI_VARIANT_VOLUME, &PI_VARIANT_VOLUME_BODY, &PI_VARIANT_VOLUME_BODY_CALLS, pi_variant_volume_thunk),
+        (PI_EXT, &PI_EXT_BODY, &PI_EXT_BODY_CALLS, pi_ext_thunk),
+        (PI_3D, &PI_3D_BODY, &PI_3D_BODY_CALLS, pi_3d_thunk),
+        (PI_3D_CHAN, &PI_3D_CHAN_BODY, &PI_3D_CHAN_BODY_CALLS, pi_3d_chan_thunk),
+        (PI_3D_CHAN2, &PI_3D_CHAN2_BODY, &PI_3D_CHAN2_BODY_CALLS, pi_3d_chan2_thunk),
+        (PI_3D_CHAN_FLAG, &PI_3D_CHAN_FLAG_BODY, &PI_3D_CHAN_FLAG_BODY_CALLS, pi_3d_chan_flag_thunk),
+        (PI_3D_VOLUME, &PI_3D_VOLUME_BODY, &PI_3D_VOLUME_BODY_CALLS, pi_3d_volume_thunk),
+        (PI_3D_EXT, &PI_3D_EXT_BODY, &PI_3D_EXT_BODY_CALLS, pi_3d_ext_thunk),
+        (PI_3D_VARIANT, &PI_3D_VARIANT_BODY, &PI_3D_VARIANT_BODY_CALLS, pi_3d_variant_thunk),
+        (PI_3D_VARIANT_VOLUME, &PI_3D_VARIANT_VOLUME_BODY, &PI_3D_VARIANT_VOLUME_BODY_CALLS, pi_3d_variant_volume_thunk),
+        (PI_3D_VARIANT_EXT, &PI_3D_VARIANT_EXT_BODY, &PI_3D_VARIANT_EXT_BODY_CALLS, pi_3d_variant_ext_thunk),
+        (PAUSE_ALL, &PAUSE_ALL_BODY, &PAUSE_ALL_BODY_CALLS, pause_all_thunk),
+        (RESUME_ALL, &RESUME_ALL_BODY, &RESUME_ALL_BODY_CALLS, resume_all_thunk),
+        (FADE_ALL, &FADE_ALL_BODY, &FADE_ALL_BODY_CALLS, fade_all_thunk),
+        (SET_3D_POS, &SET_3D_POS_BODY, &SET_3D_POS_BODY_CALLS, set_3d_position_thunk),
+        (PLAY_PREPARED, &PLAY_PREPARED_BODY, &PLAY_PREPARED_BODY_CALLS, play_prepared_thunk),
+        (ENTRY_ADD, &AMMO_ENTRY_ADD_BODY, &AMMO_ENTRY_ADD_BODY_CALLS, entry_add_thunk),
+        (ADD_TYPE, &AMMO_ADD_TYPE_BODY, &AMMO_ADD_TYPE_BODY_CALLS, add_type_thunk),
+        (STORE_REMOVE, &AMMO_REMOVE_BODY, &AMMO_REMOVE_BODY_CALLS, store_remove_thunk),
+        (WEAPON_STORE_REMOVE, &WEAPON_AMMO_REMOVE_BODY, &WEAPON_AMMO_REMOVE_BODY_CALLS, weapon_store_remove_thunk),
+        (STORE_CLEAR, &AMMO_CLEAR_BODY, &AMMO_CLEAR_BODY_CALLS, store_clear_thunk),
+        (IS_THROWN, &IS_THROWN_BODY, &IS_THROWN_BODY_CALLS, is_thrown_thunk),
+        (INST_ALLOC, &INST_ALLOC_BODY, &INST_ALLOC_BODY_CALLS, instance_alloc_thunk),
     ];
     // The shadow copies first (replacing patches the entries).
     for &(id, body, call_offsets, _) in &list {
@@ -1117,6 +2785,27 @@ pub fn install() {
         unsafe { set_rel32(total, 0x37, count) };
     } else {
         PORTS[TOTAL_AMMO].original.store(0, Ordering::Relaxed);
+    }
+    // The fade-out wrappers end in `jmp audio_voice_slot_fade_out`: their copies jump to the copy of
+    // it, so a shadow run never goes through the Rust version of the slot function.
+    let slot_copy = PORTS[SLOT_FADE_OUT].original.load(Ordering::Relaxed);
+    for id in [FADE_OUT, FADE_OUT2] {
+        let c = PORTS[id].original.load(Ordering::Relaxed);
+        if c != 0 && slot_copy != 0 {
+            unsafe { set_rel32(c, 0x2D, slot_copy) };
+        } else {
+            PORTS[id].original.store(0, Ordering::Relaxed);
+        }
+    }
+    // Copies that call another ported function call that function's copy, so a shadow run of the
+    // original never goes through a Rust version.
+    for (id, off, callee) in [(FADE_ALL, 0x32usize, SLOT_FADE_OUT), (ADD_TYPE, 0x44, ENTRY_ADD), (WEAPON_STORE_REMOVE, 0x25, STORE_REMOVE)] {
+        let (c, d) = (PORTS[id].original.load(Ordering::Relaxed), PORTS[callee].original.load(Ordering::Relaxed));
+        if c != 0 && d != 0 {
+            unsafe { set_rel32(c, off, d) };
+        } else {
+            PORTS[id].original.store(0, Ordering::Relaxed);
+        }
     }
     let mut ok = 0;
     for &(id, body, _, thunk) in &list {
@@ -1315,3 +3004,365 @@ const THROTTLE_BODY: [u8; 44] = [
     0x08, 0xD9, 0x1C, 0x8D, 0xF8, 0x34, 0xEE, 0x00, 0xC3, 0xDD, 0xD8, 0xC3,
 ];
 const THROTTLE_BODY_CALLS: [usize; 0] = [];
+const FADE_OUT_BODY: [u8; 51] = [
+    0x8A, 0x01, 0x3C, 0xFF, 0x74, 0x2C, 0x8B, 0x11, 0xC1, 0xEA, 0x08, 0x74, 0x25, 0x0F, 0xB6, 0xC0,
+    0x8B, 0xC8, 0x69, 0xC9, 0x9C, 0x01, 0x00, 0x00, 0x3B, 0x91, 0xAC, 0xB9, 0xEE, 0x00, 0x75, 0x12,
+    0x83, 0xB9, 0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x74, 0x09, 0x8B, 0x54, 0x24, 0x04, 0xE9, 0x9E, 0x67,
+    0x01, 0x00, 0xC3,
+];
+const FADE_OUT_BODY_CALLS: [usize; 0] = [];
+const FADE_OUT2_BODY: [u8; 51] = [
+    0x8A, 0x01, 0x3C, 0xFF, 0x74, 0x2C, 0x8B, 0x11, 0xC1, 0xEA, 0x08, 0x74, 0x25, 0x0F, 0xB6, 0xC0,
+    0x8B, 0xC8, 0x69, 0xC9, 0x9C, 0x01, 0x00, 0x00, 0x3B, 0x91, 0xAC, 0xB9, 0xEE, 0x00, 0x75, 0x12,
+    0x83, 0xB9, 0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x74, 0x09, 0x8B, 0x54, 0x24, 0x04, 0xE9, 0x8E, 0xC7,
+    0xFF, 0xFF, 0xC3,
+];
+const FADE_OUT2_BODY_CALLS: [usize; 0] = [];
+const ORIENT_BODY: [u8; 57] = [
+    0x8A, 0x01, 0x3C, 0xFF, 0x74, 0x32, 0x8B, 0x09, 0xC1, 0xE9, 0x08, 0x74, 0x2B, 0x0F, 0xB6, 0xC0,
+    0x69, 0xC0, 0x9C, 0x01, 0x00, 0x00, 0x3B, 0x88, 0xAC, 0xB9, 0xEE, 0x00, 0x75, 0x1A, 0x83, 0xB8,
+    0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x8D, 0x80, 0xF8, 0xB8, 0xEE, 0x00, 0x74, 0x0B, 0x8B, 0x4C, 0x24,
+    0x04, 0x50, 0xE8, 0x99, 0x73, 0x01, 0x00, 0x59, 0xC3,
+];
+const ORIENT_BODY_CALLS: [usize; 1] = [0x32];
+const ORIENT2_BODY: [u8; 57] = [
+    0x8A, 0x01, 0x3C, 0xFF, 0x74, 0x32, 0x8B, 0x09, 0xC1, 0xE9, 0x08, 0x74, 0x2B, 0x0F, 0xB6, 0xC0,
+    0x69, 0xC0, 0x9C, 0x01, 0x00, 0x00, 0x3B, 0x88, 0xAC, 0xB9, 0xEE, 0x00, 0x75, 0x1A, 0x83, 0xB8,
+    0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x8D, 0x80, 0xF8, 0xB8, 0xEE, 0x00, 0x74, 0x0B, 0x8B, 0x4C, 0x24,
+    0x04, 0x50, 0xE8, 0xB9, 0xCF, 0xFF, 0xFF, 0x59, 0xC3,
+];
+const ORIENT2_BODY_CALLS: [usize; 1] = [0x32];
+const SLOT_FADE_OUT_BODY: [u8; 120] = [
+    0x51, 0x69, 0xC0, 0x9C, 0x01, 0x00, 0x00, 0x05, 0xF8, 0xB8, 0xEE, 0x00, 0x8B, 0xC8, 0x0F, 0xB7,
+    0x81, 0x96, 0x01, 0x00, 0x00, 0x84, 0xC0, 0x78, 0x08, 0xD9, 0xEE, 0xD9, 0x99, 0xC4, 0x00, 0x00,
+    0x00, 0xD9, 0x41, 0x1C, 0x25, 0xFF, 0xFE, 0x00, 0x00, 0x0D, 0x80, 0x00, 0x00, 0x00, 0x83, 0xFA,
+    0x20, 0x66, 0x89, 0x81, 0x96, 0x01, 0x00, 0x00, 0x73, 0x08, 0xDC, 0x0D, 0x70, 0xBF, 0xE5, 0x00,
+    0xEB, 0x15, 0xC1, 0xEA, 0x05, 0x85, 0xD2, 0x89, 0x14, 0x24, 0xDB, 0x04, 0x24, 0x7D, 0x06, 0xD8,
+    0x05, 0xD8, 0xBF, 0xE5, 0x00, 0xDE, 0xF9, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0xD9, 0x81, 0xA8,
+    0x00, 0x00, 0x00, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x08, 0xD9, 0x99, 0xA8, 0x00,
+    0x00, 0x00, 0x59, 0xC3, 0xDD, 0xD8, 0x59, 0xC3,
+];
+const SLOT_FADE_OUT_BODY_CALLS: [usize; 0] = [];
+const PI_DEFAULT_BODY: [u8; 67] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0x56, 0xC3, 0x83, 0x00, 0xD9, 0xE8, 0xD9, 0x56, 0x0C, 0x83,
+    0xC4, 0x0C, 0xD9, 0x5E, 0x10, 0x66, 0xC7, 0x06, 0xFF, 0xFF, 0xC7, 0x46, 0x18, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xC7, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00, 0x66, 0xC7, 0x46, 0x30, 0xFF, 0xFF, 0x66, 0xC7,
+    0x46, 0x32, 0x01, 0x00, 0xC7, 0x46, 0x4C, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x46, 0x54, 0x00, 0x00,
+    0x00, 0x00, 0xC3,
+];
+const PI_DEFAULT_BODY_CALLS: [usize; 1] = [0x5];
+const PI_BASIC_BODY: [u8; 74] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0x96, 0xC2, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x44, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x4C, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0x8B, 0x54, 0x24, 0x18, 0x66,
+    0x89, 0x06, 0x83, 0xC4, 0x0C, 0xC7, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00, 0x66, 0xC7, 0x46, 0x30,
+    0xFF, 0xFF, 0x66, 0xC7, 0x46, 0x32, 0x01, 0x00, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00, 0x00, 0x89,
+    0x4E, 0x18, 0x89, 0x56, 0x4C, 0x8B, 0xC6, 0xC2, 0x0C, 0x00,
+];
+const PI_BASIC_BODY_CALLS: [usize; 1] = [0x5];
+const PI_VOLUME_BODY: [u8; 78] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0x46, 0xC2, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x44, 0x24,
+    0x10, 0xD9, 0x5E, 0x10, 0x8B, 0x4C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x1C, 0x8B, 0x54, 0x24, 0x18,
+    0xD9, 0x5E, 0x0C, 0x66, 0x89, 0x06, 0x83, 0xC4, 0x0C, 0xC7, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00,
+    0x66, 0xC7, 0x46, 0x30, 0xFF, 0xFF, 0x66, 0xC7, 0x46, 0x32, 0x01, 0x00, 0xC7, 0x46, 0x54, 0x00,
+    0x00, 0x00, 0x00, 0x89, 0x4E, 0x18, 0x89, 0x56, 0x4C, 0x8B, 0xC6, 0xC2, 0x10, 0x00,
+];
+const PI_VOLUME_BODY_CALLS: [usize; 1] = [0x5];
+const PI_VARIANT_BODY: [u8; 74] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0xF6, 0xC1, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x44, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x4C, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0x8B, 0x54, 0x24, 0x18, 0x66,
+    0x89, 0x06, 0x8B, 0x44, 0x24, 0x1C, 0x89, 0x46, 0x28, 0x83, 0xC4, 0x0C, 0x66, 0xC7, 0x46, 0x30,
+    0xFF, 0xFF, 0x66, 0xC7, 0x46, 0x32, 0x01, 0x00, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00, 0x00, 0x89,
+    0x4E, 0x18, 0x89, 0x56, 0x4C, 0x8B, 0xC6, 0xC2, 0x10, 0x00,
+];
+const PI_VARIANT_BODY_CALLS: [usize; 1] = [0x5];
+const PI_VARIANT_VOLUME_BODY: [u8; 78] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0xA6, 0xC1, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x44, 0x24,
+    0x10, 0xD9, 0x5E, 0x10, 0x8B, 0x4C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x1C, 0x8B, 0x54, 0x24, 0x18,
+    0xD9, 0x5E, 0x0C, 0x66, 0x89, 0x06, 0x83, 0xC4, 0x0C, 0x66, 0xC7, 0x46, 0x30, 0xFF, 0xFF, 0x66,
+    0xC7, 0x46, 0x32, 0x01, 0x00, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x46, 0x18, 0x00,
+    0x00, 0x00, 0x00, 0x89, 0x4E, 0x4C, 0x89, 0x56, 0x28, 0x8B, 0xC6, 0xC2, 0x10, 0x00,
+];
+const PI_VARIANT_VOLUME_BODY_CALLS: [usize; 1] = [0x5];
+const PI_EXT_BODY: [u8; 94] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0x56, 0xC1, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x44, 0x24,
+    0x10, 0xD9, 0x5E, 0x10, 0x8B, 0x4C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x1C, 0x8B, 0x54, 0x24, 0x18,
+    0xD9, 0x5E, 0x0C, 0x66, 0x89, 0x06, 0x66, 0x8B, 0x44, 0x24, 0x20, 0x89, 0x4E, 0x18, 0x8B, 0x4C,
+    0x24, 0x24, 0x66, 0x89, 0x46, 0x02, 0x83, 0xC4, 0x0C, 0xC7, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00,
+    0x66, 0xC7, 0x46, 0x30, 0xFF, 0xFF, 0x66, 0xC7, 0x46, 0x32, 0x01, 0x00, 0xC7, 0x46, 0x54, 0x00,
+    0x00, 0x00, 0x00, 0x89, 0x56, 0x4C, 0x89, 0x4E, 0x04, 0x8B, 0xC6, 0xC2, 0x18, 0x00,
+];
+const PI_EXT_BODY_CALLS: [usize; 1] = [0x5];
+const PI_3D_BODY: [u8; 98] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0xF6, 0xC0, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x4C, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0x66, 0x89, 0x0E, 0x8B, 0x4C,
+    0x24, 0x18, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x66, 0x89, 0x46, 0x32, 0xC7, 0x46, 0x28, 0x00, 0x00,
+    0x00, 0x00, 0x66, 0xC7, 0x46, 0x30, 0xFF, 0xFF, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00, 0x00, 0x89,
+    0x56, 0x18, 0x89, 0x4E, 0x4C, 0x8B, 0x17, 0x89, 0x56, 0x1C, 0x8B, 0x4F, 0x04, 0x89, 0x4E, 0x20,
+    0x8B, 0x57, 0x08, 0x66, 0x09, 0x46, 0x58, 0x83, 0xC4, 0x0C, 0x89, 0x56, 0x24, 0x8B, 0xC6, 0xC2,
+    0x0C, 0x00,
+];
+const PI_3D_BODY_CALLS: [usize; 1] = [0x5];
+const PI_3D_CHAN_BODY: [u8; 103] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0x86, 0xC0, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x4C, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x66, 0xC7, 0x46, 0x30, 0xFF, 0xFF, 0x66, 0x89, 0x46, 0x32, 0x89, 0x46, 0x18, 0x89, 0x56, 0x4C,
+    0xC7, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00, 0x00, 0x66, 0x89,
+    0x0E, 0x8B, 0x0F, 0x89, 0x4E, 0x1C, 0x8B, 0x57, 0x04, 0x89, 0x56, 0x20, 0x8B, 0x4F, 0x08, 0x66,
+    0x8B, 0x54, 0x24, 0x18, 0x66, 0x09, 0x46, 0x58, 0x83, 0xC4, 0x0C, 0x89, 0x4E, 0x24, 0x66, 0x89,
+    0x56, 0x30, 0x8B, 0xC6, 0xC2, 0x0C, 0x00,
+];
+const PI_3D_CHAN_BODY_CALLS: [usize; 1] = [0x5];
+const PI_3D_CHAN2_BODY: [u8; 112] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0x16, 0xC0, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x4C, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x66, 0x89, 0x46, 0x32, 0x66, 0xC7, 0x46, 0x30, 0xFF, 0xFF, 0x66, 0x89, 0x0E, 0x89, 0x46, 0x18,
+    0x89, 0x56, 0x4C, 0xC7, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00,
+    0x00, 0x8B, 0x0F, 0x89, 0x4E, 0x1C, 0x8B, 0x57, 0x04, 0x89, 0x56, 0x20, 0x8B, 0x4F, 0x08, 0x66,
+    0x8B, 0x54, 0x24, 0x18, 0x66, 0x09, 0x46, 0x58, 0x89, 0x4E, 0x24, 0x66, 0x8B, 0x4C, 0x24, 0x1C,
+    0x83, 0xC4, 0x0C, 0x66, 0x89, 0x56, 0x30, 0x66, 0x89, 0x4E, 0x32, 0x8B, 0xC6, 0xC2, 0x10, 0x00,
+];
+const PI_3D_CHAN2_BODY_CALLS: [usize; 1] = [0x5];
+const PI_3D_CHAN_FLAG_BODY: [u8; 137] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0xA6, 0xBF, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x4C, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0x89, 0x56, 0x4C, 0xB8, 0x01,
+    0x00, 0x00, 0x00, 0x66, 0x89, 0x46, 0x32, 0x66, 0xC7, 0x46, 0x30, 0xFF, 0xFF, 0x66, 0x89, 0x0E,
+    0x89, 0x46, 0x18, 0xC7, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00,
+    0x00, 0x8B, 0x0F, 0x89, 0x4E, 0x1C, 0x8B, 0x57, 0x04, 0x89, 0x56, 0x20, 0x8B, 0x4F, 0x08, 0x66,
+    0x8B, 0x54, 0x24, 0x18, 0x66, 0x89, 0x56, 0x30, 0x33, 0xD2, 0x83, 0xC4, 0x0C, 0x38, 0x54, 0x24,
+    0x14, 0x89, 0x4E, 0x24, 0x66, 0x8B, 0x4C, 0x24, 0x10, 0x0F, 0x95, 0xC2, 0xC0, 0xE2, 0x06, 0x32,
+    0x56, 0x58, 0x66, 0x89, 0x4E, 0x32, 0x83, 0xE2, 0x40, 0x66, 0x33, 0x56, 0x58, 0x66, 0x0B, 0xD0,
+    0x66, 0x89, 0x56, 0x58, 0x8B, 0xC6, 0xC2, 0x14, 0x00,
+];
+const PI_3D_CHAN_FLAG_BODY_CALLS: [usize; 1] = [0x5];
+const PI_3D_VOLUME_BODY: [u8; 105] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0x16, 0xBF, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x4C, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0xD9, 0x44, 0x24, 0x1C, 0x66,
+    0x89, 0x0E, 0x8B, 0x4C, 0x24, 0x18, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x66, 0x89, 0x46, 0x32, 0xC7,
+    0x46, 0x28, 0x00, 0x00, 0x00, 0x00, 0x66, 0xC7, 0x46, 0x30, 0xFF, 0xFF, 0xC7, 0x46, 0x54, 0x00,
+    0x00, 0x00, 0x00, 0x89, 0x56, 0x18, 0x89, 0x4E, 0x4C, 0x8B, 0x17, 0x89, 0x56, 0x1C, 0x8B, 0x4F,
+    0x04, 0x89, 0x4E, 0x20, 0x8B, 0x57, 0x08, 0xD9, 0x5E, 0x0C, 0x66, 0x09, 0x46, 0x58, 0x83, 0xC4,
+    0x0C, 0x89, 0x56, 0x24, 0x8B, 0xC6, 0xC2, 0x10, 0x00,
+];
+const PI_3D_VOLUME_BODY_CALLS: [usize; 1] = [0x5];
+const PI_3D_EXT_BODY: [u8; 121] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0xA6, 0xBE, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x4C, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0xD9, 0x44, 0x24, 0x1C, 0x66,
+    0x89, 0x0E, 0x8B, 0x4C, 0x24, 0x18, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x66, 0x89, 0x46, 0x32, 0x89,
+    0x56, 0x18, 0x89, 0x4E, 0x4C, 0xC7, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00, 0x66, 0xC7, 0x46, 0x30,
+    0xFF, 0xFF, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00, 0x00, 0x8B, 0x17, 0x89, 0x56, 0x1C, 0x8B, 0x4F,
+    0x04, 0x89, 0x4E, 0x20, 0x8B, 0x57, 0x08, 0xD9, 0x5E, 0x0C, 0x66, 0x8B, 0x4C, 0x24, 0x20, 0x66,
+    0x09, 0x46, 0x58, 0x89, 0x56, 0x24, 0x8B, 0x54, 0x24, 0x24, 0x83, 0xC4, 0x0C, 0x66, 0x89, 0x4E,
+    0x02, 0x89, 0x56, 0x04, 0x8B, 0xC6, 0xC2, 0x18, 0x00,
+];
+const PI_3D_EXT_BODY_CALLS: [usize; 1] = [0x5];
+const PI_3D_VARIANT_BODY: [u8; 105] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0x26, 0xBE, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x4C, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0xB8, 0x01, 0x00, 0x00, 0x00,
+    0xC7, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00, 0x66, 0x89, 0x46, 0x32, 0x89, 0x56, 0x4C, 0x66, 0xC7,
+    0x46, 0x30, 0xFF, 0xFF, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00, 0x00, 0x66, 0x89, 0x0E, 0xC7, 0x46,
+    0x18, 0x00, 0x00, 0x00, 0x00, 0x8B, 0x0F, 0x89, 0x4E, 0x1C, 0x8B, 0x57, 0x04, 0x89, 0x56, 0x20,
+    0x8B, 0x4F, 0x08, 0x8B, 0x54, 0x24, 0x18, 0x66, 0x09, 0x46, 0x58, 0x83, 0xC4, 0x0C, 0x89, 0x4E,
+    0x24, 0x89, 0x56, 0x28, 0x8B, 0xC6, 0xC2, 0x0C, 0x00,
+];
+const PI_3D_VARIANT_BODY_CALLS: [usize; 1] = [0x5];
+const PI_3D_VARIANT_VOLUME_BODY: [u8; 112] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0xB6, 0xBD, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x4C, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0xD9, 0x44, 0x24, 0x1C, 0xB8,
+    0x01, 0x00, 0x00, 0x00, 0xC7, 0x46, 0x28, 0x00, 0x00, 0x00, 0x00, 0x66, 0x89, 0x46, 0x32, 0x89,
+    0x56, 0x4C, 0x66, 0xC7, 0x46, 0x30, 0xFF, 0xFF, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00, 0x00, 0x66,
+    0x89, 0x0E, 0xC7, 0x46, 0x18, 0x00, 0x00, 0x00, 0x00, 0x8B, 0x0F, 0x89, 0x4E, 0x1C, 0x8B, 0x57,
+    0x04, 0x89, 0x56, 0x20, 0x8B, 0x4F, 0x08, 0xD9, 0x5E, 0x0C, 0x8B, 0x54, 0x24, 0x18, 0x66, 0x09,
+    0x46, 0x58, 0x83, 0xC4, 0x0C, 0x89, 0x4E, 0x24, 0x89, 0x56, 0x28, 0x8B, 0xC6, 0xC2, 0x10, 0x00,
+];
+const PI_3D_VARIANT_VOLUME_BODY_CALLS: [usize; 1] = [0x5];
+const PI_3D_VARIANT_EXT_BODY: [u8; 128] = [
+    0x6A, 0x5C, 0x6A, 0x00, 0x56, 0xE8, 0x46, 0xBD, 0x83, 0x00, 0xD9, 0xE8, 0x66, 0x8B, 0x4C, 0x24,
+    0x10, 0xD9, 0x56, 0x0C, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0x5E, 0x10, 0xD9, 0x44, 0x24, 0x20, 0x66,
+    0x89, 0x0E, 0x8B, 0x4C, 0x24, 0x18, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x89, 0x4E, 0x4C, 0xC7, 0x46,
+    0x28, 0x00, 0x00, 0x00, 0x00, 0x66, 0x89, 0x46, 0x32, 0x89, 0x56, 0x18, 0x66, 0xC7, 0x46, 0x30,
+    0xFF, 0xFF, 0xC7, 0x46, 0x54, 0x00, 0x00, 0x00, 0x00, 0x8B, 0x17, 0x89, 0x56, 0x1C, 0x8B, 0x4F,
+    0x04, 0x89, 0x4E, 0x20, 0x8B, 0x57, 0x08, 0xD9, 0x5E, 0x0C, 0x8B, 0x4C, 0x24, 0x1C, 0x66, 0x09,
+    0x46, 0x58, 0x89, 0x56, 0x24, 0x66, 0x8B, 0x54, 0x24, 0x24, 0x89, 0x4E, 0x28, 0x8B, 0x4C, 0x24,
+    0x28, 0x83, 0xC4, 0x0C, 0x66, 0x89, 0x56, 0x02, 0x89, 0x4E, 0x04, 0x8B, 0xC6, 0xC2, 0x1C, 0x00,
+];
+const PI_3D_VARIANT_EXT_BODY_CALLS: [usize; 1] = [0x5];
+const PAUSE_ALL_BODY: [u8; 234] = [
+    0x80, 0x3D, 0x06, 0xA4, 0x52, 0x02, 0x00, 0x75, 0x37, 0x80, 0x3D, 0xFB, 0x6A, 0x52, 0x02, 0x01,
+    0x74, 0x26, 0x6A, 0x01, 0xE8, 0xF7, 0x2D, 0x00, 0x00, 0xD9, 0xEE, 0xA1, 0x30, 0x2E, 0xF5, 0x00,
+    0x8B, 0x08, 0x8B, 0x51, 0x28, 0x83, 0xC4, 0x04, 0x6A, 0x00, 0x51, 0xD9, 0x1C, 0x24, 0x50, 0xC6,
+    0x05, 0xFB, 0x6A, 0x52, 0x02, 0x01, 0xFF, 0xD2, 0xC6, 0x05, 0xD7, 0x6A, 0x52, 0x02, 0x01, 0xC3,
+    0x83, 0x05, 0x44, 0x6B, 0x52, 0x02, 0x01, 0x53, 0x55, 0x56, 0x57, 0xB8, 0x90, 0xBA, 0xEE, 0x00,
+    0xBF, 0x80, 0x00, 0x00, 0x00, 0x83, 0xCD, 0xFF, 0xB3, 0x40, 0x8D, 0x9B, 0x00, 0x00, 0x00, 0x00,
+    0x39, 0xA8, 0x68, 0xFE, 0xFF, 0xFF, 0x75, 0x08, 0x66, 0xF7, 0x40, 0xFE, 0x00, 0x02, 0x74, 0x67,
+    0x39, 0xA8, 0x0C, 0xFF, 0xFF, 0xFF, 0x75, 0x24, 0x66, 0x8B, 0x08, 0x66, 0x81, 0xE1, 0xFF, 0xBF,
+    0x84, 0x58, 0xFE, 0x0F, 0xB7, 0xD1, 0x66, 0x89, 0x08, 0x75, 0x4C, 0xF6, 0x40, 0xFC, 0x01, 0x75,
+    0x46, 0x81, 0xCA, 0x00, 0x20, 0x00, 0x00, 0x66, 0x89, 0x10, 0xEB, 0x3B, 0x0F, 0xB7, 0x50, 0xFC,
+    0xF6, 0xC2, 0x02, 0x74, 0x11, 0x66, 0x81, 0x08, 0x00, 0x04, 0x81, 0xE2, 0x7F, 0xFF, 0x00, 0x00,
+    0x66, 0x89, 0x50, 0xFC, 0xEB, 0x21, 0x66, 0x8B, 0x08, 0x66, 0x81, 0xE1, 0xFF, 0xBF, 0x84, 0x58,
+    0xFE, 0x0F, 0xB7, 0xF1, 0x66, 0x89, 0x08, 0x75, 0x0E, 0xF6, 0xC2, 0x01, 0x75, 0x09, 0x81, 0xCE,
+    0x00, 0x20, 0x00, 0x00, 0x66, 0x89, 0x30, 0x05, 0x9C, 0x01, 0x00, 0x00, 0x83, 0xEF, 0x01, 0x0F,
+    0x85, 0x7B, 0xFF, 0xFF, 0xFF, 0x5F, 0x5E, 0x5D, 0x5B, 0xC3,
+];
+const PAUSE_ALL_BODY_CALLS: [usize; 1] = [0x14];
+const RESUME_ALL_BODY: [u8; 137] = [
+    0x53, 0x33, 0xDB, 0x38, 0x1D, 0xD7, 0x6A, 0x52, 0x02, 0x74, 0x33, 0x38, 0x1D, 0xFB, 0x6A, 0x52,
+    0x02, 0x74, 0x23, 0x53, 0xE8, 0x07, 0x2D, 0x00, 0x00, 0xD9, 0xE8, 0xA1, 0x30, 0x2E, 0xF5, 0x00,
+    0x8B, 0x08, 0x8B, 0x51, 0x28, 0x83, 0xC4, 0x04, 0x53, 0x51, 0xD9, 0x1C, 0x24, 0x50, 0x88, 0x1D,
+    0xFB, 0x6A, 0x52, 0x02, 0xFF, 0xD2, 0x88, 0x1D, 0xD7, 0x6A, 0x52, 0x02, 0x5B, 0xC3, 0x83, 0x2D,
+    0x44, 0x6B, 0x52, 0x02, 0x01, 0x79, 0x08, 0x89, 0x1D, 0x44, 0x6B, 0x52, 0x02, 0xEB, 0x08, 0x39,
+    0x1D, 0x44, 0x6B, 0x52, 0x02, 0x7F, 0x30, 0xB8, 0x90, 0xBA, 0xEE, 0x00, 0xB9, 0x80, 0x00, 0x00,
+    0x00, 0xB3, 0x40, 0x83, 0xCA, 0xFF, 0x56, 0x84, 0x58, 0xFE, 0x74, 0x10, 0x66, 0x8B, 0x30, 0x66,
+    0x81, 0xE6, 0xFF, 0xDF, 0x66, 0x81, 0xCE, 0x00, 0x40, 0x66, 0x89, 0x30, 0x05, 0x9C, 0x01, 0x00,
+    0x00, 0x83, 0xE9, 0x01, 0x75, 0xE1, 0x5E, 0x5B, 0xC3,
+];
+const RESUME_ALL_BODY_CALLS: [usize; 1] = [0x14];
+const FADE_ALL_BODY: [u8; 76] = [
+    0x83, 0x05, 0x44, 0x6B, 0x52, 0x02, 0x01, 0x55, 0x8B, 0x6C, 0x24, 0x08, 0x56, 0x57, 0x33, 0xFF,
+    0x33, 0xF6, 0x83, 0xBE, 0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x75, 0x0B, 0x66, 0xF7, 0x86, 0x8E, 0xBA,
+    0xEE, 0x00, 0x00, 0x02, 0x74, 0x11, 0x66, 0x83, 0x8E, 0x8C, 0xBA, 0xEE, 0x00, 0x01, 0x8B, 0xD5,
+    0x8B, 0xC7, 0xE8, 0xE9, 0xD6, 0xFF, 0xFF, 0x81, 0xC6, 0x9C, 0x01, 0x00, 0x00, 0x83, 0xC7, 0x01,
+    0x81, 0xFE, 0x00, 0xCE, 0x00, 0x00, 0x72, 0xCA, 0x5F, 0x5E, 0x5D, 0xC3,
+];
+const FADE_ALL_BODY_CALLS: [usize; 1] = [0x32];
+const IS_2D_BODY: [u8; 58] = [
+    0x8A, 0x01, 0x3C, 0xFF, 0x74, 0x21, 0x8B, 0x09, 0xC1, 0xE9, 0x08, 0x74, 0x1A, 0x0F, 0xB6, 0xC0,
+    0x69, 0xC0, 0x9C, 0x01, 0x00, 0x00, 0x3B, 0x88, 0xAC, 0xB9, 0xEE, 0x00, 0x75, 0x09, 0x83, 0xB8,
+    0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0x66, 0x8B, 0x80, 0x8E, 0xBA, 0xEE,
+    0x00, 0x66, 0xC1, 0xE8, 0x0B, 0xF6, 0xD0, 0x24, 0x01, 0xC3,
+];
+const IS_2D_BODY_CALLS: [usize; 0] = [];
+const GET_P30_BODY: [u8; 64] = [
+    0x51, 0x8A, 0x01, 0x3C, 0xFF, 0x74, 0x21, 0x8B, 0x09, 0xC1, 0xE9, 0x08, 0x74, 0x1A, 0x0F, 0xB6,
+    0xC0, 0x69, 0xC0, 0x9C, 0x01, 0x00, 0x00, 0x3B, 0x88, 0xAC, 0xB9, 0xEE, 0x00, 0x75, 0x09, 0x83,
+    0xB8, 0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x75, 0x0A, 0xD9, 0xEE, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24,
+    0x59, 0xC3, 0xD9, 0x80, 0x28, 0xB9, 0xEE, 0x00, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC3,
+];
+const GET_P30_BODY_CALLS: [usize; 0] = [];
+const SET_P28_BODY: [u8; 107] = [
+    0x8A, 0x01, 0x3C, 0xFF, 0x74, 0x21, 0x8B, 0x09, 0xC1, 0xE9, 0x08, 0x74, 0x1A, 0x0F, 0xB6, 0xC0,
+    0x69, 0xC0, 0x9C, 0x01, 0x00, 0x00, 0x3B, 0x88, 0xAC, 0xB9, 0xEE, 0x00, 0x75, 0x09, 0x83, 0xB8,
+    0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0x66, 0x83, 0x88, 0x8E, 0xBA, 0xEE,
+    0x00, 0x02, 0xD9, 0x44, 0x24, 0x04, 0x0F, 0xB6, 0x88, 0x8C, 0xBA, 0xEE, 0x00, 0xD9, 0x98, 0x20,
+    0xB9, 0xEE, 0x00, 0x56, 0x0F, 0xB7, 0xB0, 0x8E, 0xBA, 0xEE, 0x00, 0x0F, 0xB7, 0xD6, 0xC1, 0xE9,
+    0x03, 0xC1, 0xEA, 0x0B, 0x83, 0xE1, 0x01, 0xF7, 0xD2, 0x84, 0xCA, 0x74, 0x0A, 0x83, 0xCE, 0x01,
+    0x66, 0x89, 0xB0, 0x8E, 0xBA, 0xEE, 0x00, 0xB0, 0x01, 0x5E, 0xC3,
+];
+const SET_P28_BODY_CALLS: [usize; 0] = [];
+const SET_P30_BODY: [u8; 107] = [
+    0x8A, 0x01, 0x3C, 0xFF, 0x74, 0x21, 0x8B, 0x09, 0xC1, 0xE9, 0x08, 0x74, 0x1A, 0x0F, 0xB6, 0xC0,
+    0x69, 0xC0, 0x9C, 0x01, 0x00, 0x00, 0x3B, 0x88, 0xAC, 0xB9, 0xEE, 0x00, 0x75, 0x09, 0x83, 0xB8,
+    0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0x66, 0x83, 0x88, 0x8E, 0xBA, 0xEE,
+    0x00, 0x04, 0xD9, 0x44, 0x24, 0x04, 0x0F, 0xB6, 0x88, 0x8C, 0xBA, 0xEE, 0x00, 0xD9, 0x98, 0x28,
+    0xB9, 0xEE, 0x00, 0x56, 0x0F, 0xB7, 0xB0, 0x8E, 0xBA, 0xEE, 0x00, 0x0F, 0xB7, 0xD6, 0xC1, 0xE9,
+    0x04, 0xC1, 0xEA, 0x0B, 0x83, 0xE1, 0x01, 0xF7, 0xD2, 0x84, 0xCA, 0x74, 0x0A, 0x83, 0xCE, 0x01,
+    0x66, 0x89, 0xB0, 0x8E, 0xBA, 0xEE, 0x00, 0xB0, 0x01, 0x5E, 0xC3,
+];
+const SET_P30_BODY_CALLS: [usize; 0] = [];
+const FADE_IN_BODY: [u8; 90] = [
+    0x51, 0x69, 0xC9, 0x9C, 0x01, 0x00, 0x00, 0x81, 0xC1, 0xF8, 0xB8, 0xEE, 0x00, 0x0F, 0xB7, 0x81,
+    0x96, 0x01, 0x00, 0x00, 0xA9, 0x00, 0x01, 0x00, 0x00, 0x75, 0x3D, 0xD9, 0x44, 0x24, 0x0C, 0x25,
+    0x7F, 0xFF, 0x00, 0x00, 0x0D, 0x00, 0x01, 0x00, 0x00, 0xD9, 0x51, 0x1C, 0xD9, 0xEE, 0x66, 0x89,
+    0x81, 0x96, 0x01, 0x00, 0x00, 0x8B, 0x44, 0x24, 0x08, 0xD9, 0x99, 0xC4, 0x00, 0x00, 0x00, 0xD9,
+    0xE8, 0x99, 0x83, 0xE2, 0x1F, 0xDE, 0xE1, 0x03, 0xC2, 0xC1, 0xF8, 0x05, 0x89, 0x04, 0x24, 0xDA,
+    0x34, 0x24, 0xD9, 0x99, 0xA8, 0x00, 0x00, 0x00, 0x59, 0xC3,
+];
+const FADE_IN_BODY_CALLS: [usize; 0] = [];
+const SET_3D_POS_BODY: [u8; 157] = [
+    0x51, 0x8A, 0x01, 0x3C, 0xFF, 0x53, 0x8B, 0x5C, 0x24, 0x0C, 0x56, 0x74, 0x27, 0x8B, 0x09, 0xC1,
+    0xE9, 0x08, 0x74, 0x20, 0x0F, 0xB6, 0xC0, 0x69, 0xC0, 0x9C, 0x01, 0x00, 0x00, 0x3B, 0x88, 0xAC,
+    0xB9, 0xEE, 0x00, 0x75, 0x0F, 0x83, 0xB8, 0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x8D, 0xB0, 0xF8, 0xB8,
+    0xEE, 0x00, 0x75, 0x06, 0x32, 0xC0, 0x5E, 0x5B, 0x59, 0xC3, 0x8B, 0x4C, 0x24, 0x14, 0x56, 0xE8,
+    0x8C, 0xD0, 0xFF, 0xFF, 0xD9, 0x07, 0xD9, 0x5E, 0x68, 0x83, 0xC4, 0x04, 0xD9, 0x47, 0x04, 0x8B,
+    0xCE, 0xD9, 0x5E, 0x6C, 0xD9, 0x47, 0x08, 0xD9, 0x5E, 0x70, 0xD9, 0x03, 0xD9, 0x5E, 0x5C, 0xD9,
+    0x43, 0x04, 0xD9, 0x5E, 0x60, 0xD9, 0x43, 0x08, 0x66, 0x83, 0x8E, 0x98, 0x01, 0x00, 0x00, 0x01,
+    0x66, 0x81, 0x8E, 0x96, 0x01, 0x00, 0x00, 0x12, 0x08, 0xD9, 0x5E, 0x64, 0xC7, 0x86, 0x90, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x25, 0xD4, 0xFF, 0xFF, 0x84, 0xC0, 0x74, 0x08, 0x66,
+    0x83, 0x8E, 0x96, 0x01, 0x00, 0x00, 0x20, 0x5E, 0xB0, 0x01, 0x5B, 0x59, 0xC3,
+];
+const SET_3D_POS_BODY_CALLS: [usize; 2] = [0x3f, 0x86];
+const PLAY_PREPARED_BODY: [u8; 126] = [
+    0x8A, 0x01, 0x3C, 0xFF, 0x74, 0x77, 0x8B, 0x09, 0xC1, 0xE9, 0x08, 0x74, 0x70, 0x0F, 0xB6, 0xC0,
+    0x69, 0xC0, 0x9C, 0x01, 0x00, 0x00, 0x3B, 0x88, 0xAC, 0xB9, 0xEE, 0x00, 0x75, 0x5F, 0x83, 0xB8,
+    0xF8, 0xB8, 0xEE, 0x00, 0xFF, 0x8D, 0x88, 0xF8, 0xB8, 0xEE, 0x00, 0x74, 0x50, 0x66, 0xF7, 0x81,
+    0x98, 0x01, 0x00, 0x00, 0x00, 0x04, 0x75, 0x45, 0xE8, 0x43, 0xDF, 0xFF, 0xFF, 0x84, 0xC0, 0x74,
+    0x18, 0x0F, 0xB7, 0x81, 0x96, 0x01, 0x00, 0x00, 0xA9, 0x00, 0x02, 0x00, 0x00, 0x75, 0x0A, 0x83,
+    0xC8, 0x20, 0x66, 0x89, 0x81, 0x96, 0x01, 0x00, 0x00, 0x66, 0x8B, 0x81, 0x96, 0x01, 0x00, 0x00,
+    0x66, 0xC1, 0xE8, 0x09, 0x66, 0xF7, 0xD0, 0x66, 0xC1, 0xE0, 0x09, 0x66, 0x33, 0x81, 0x98, 0x01,
+    0x00, 0x00, 0x66, 0x25, 0x00, 0x02, 0x66, 0x31, 0x81, 0x98, 0x01, 0x00, 0x00, 0xC3,
+];
+const PLAY_PREPARED_BODY_CALLS: [usize; 1] = [0x38];
+const AMMO_ENTRY_ADD_BODY: [u8; 90] = [
+    0x8A, 0x0D, 0x48, 0x8B, 0x52, 0x02, 0x80, 0xF9, 0x01, 0x53, 0x8A, 0x5C, 0x24, 0x08, 0x57, 0x8B,
+    0xF8, 0x8B, 0x06, 0x75, 0x0F, 0x8A, 0x15, 0x49, 0x8B, 0x52, 0x02, 0x84, 0xD2, 0x75, 0x05, 0x8B,
+    0x50, 0x10, 0xEB, 0x03, 0x8B, 0x50, 0x0C, 0x8B, 0x46, 0x04, 0x8B, 0x4E, 0x08, 0x2B, 0xC8, 0x03,
+    0xCA, 0x84, 0xDB, 0x74, 0x04, 0x8B, 0xD7, 0xEB, 0x06, 0x3B, 0xF9, 0x8B, 0xD1, 0x7C, 0x02, 0x8B,
+    0xFA, 0x03, 0xC7, 0x84, 0xDB, 0x89, 0x46, 0x04, 0x8B, 0xC7, 0x74, 0x09, 0x3B, 0xCA, 0x7D, 0x05,
+    0x2B, 0xD1, 0x89, 0x56, 0x08, 0x5F, 0x5B, 0xC2, 0x04, 0x00,
+];
+const AMMO_ENTRY_ADD_BODY_CALLS: [usize; 0] = [];
+const AMMO_ADD_TYPE_BODY: [u8; 78] = [
+    0x8B, 0x15, 0x50, 0x7B, 0x2D, 0x02, 0x53, 0x33, 0xC0, 0x85, 0xD2, 0x56, 0x7E, 0x26, 0x8B, 0x31,
+    0x8B, 0xCE, 0x8B, 0x19, 0x39, 0x7B, 0x04, 0x74, 0x11, 0x83, 0xC0, 0x01, 0x83, 0xC1, 0x0C, 0x3B,
+    0xC2, 0x7C, 0xEF, 0x5E, 0x33, 0xC0, 0x5B, 0xC2, 0x08, 0x00, 0x8D, 0x14, 0x40, 0x8D, 0x34, 0x96,
+    0x85, 0xF6, 0x75, 0x07, 0x5E, 0x33, 0xC0, 0x5B, 0xC2, 0x08, 0x00, 0x8B, 0x44, 0x24, 0x10, 0x50,
+    0x8B, 0x44, 0x24, 0x10, 0xE8, 0x17, 0xFB, 0xFF, 0xFF, 0x5E, 0x5B, 0xC2, 0x08, 0x00,
+];
+const AMMO_ADD_TYPE_BODY_CALLS: [usize; 1] = [0x44];
+const AMMO_REMOVE_BODY: [u8; 108] = [
+    0x8B, 0x15, 0x50, 0x7B, 0x2D, 0x02, 0x53, 0x8B, 0x5C, 0x24, 0x08, 0x55, 0x33, 0xC0, 0x85, 0xD2,
+    0x56, 0x7E, 0x27, 0x8B, 0x31, 0x8B, 0xCE, 0x8B, 0x29, 0x39, 0x7D, 0x04, 0x74, 0x12, 0x83, 0xC0,
+    0x01, 0x83, 0xC1, 0x0C, 0x3B, 0xC2, 0x7C, 0xEF, 0x5E, 0x5D, 0x33, 0xC0, 0x5B, 0xC2, 0x04, 0x00,
+    0x8D, 0x14, 0x40, 0x8D, 0x0C, 0x96, 0x85, 0xC9, 0x75, 0x08, 0x5E, 0x5D, 0x33, 0xC0, 0x5B, 0xC2,
+    0x04, 0x00, 0x8B, 0x51, 0x04, 0x3B, 0xDA, 0x8B, 0xC3, 0x7C, 0x02, 0x8B, 0xC2, 0x2B, 0xD0, 0x89,
+    0x51, 0x04, 0x8B, 0x51, 0x08, 0x85, 0xD2, 0x76, 0x0D, 0x33, 0xF6, 0x2B, 0xD0, 0x3B, 0xF2, 0x1B,
+    0xF6, 0x23, 0xF2, 0x89, 0x71, 0x08, 0x5E, 0x5D, 0x5B, 0xC2, 0x04, 0x00,
+];
+const AMMO_REMOVE_BODY_CALLS: [usize; 0] = [];
+const WEAPON_AMMO_REMOVE_BODY: [u8; 46] = [
+    0x85, 0xC9, 0x74, 0x27, 0x8B, 0x49, 0x08, 0x85, 0xC9, 0x75, 0x05, 0x33, 0xC0, 0xC2, 0x04, 0x00,
+    0x8B, 0x89, 0xD4, 0x00, 0x00, 0x00, 0x85, 0xC9, 0x74, 0xF1, 0x8B, 0x49, 0x04, 0x57, 0x8B, 0xF9,
+    0x8B, 0x4C, 0x24, 0x08, 0x50, 0xE8, 0x36, 0xFF, 0xFF, 0xFF, 0x5F, 0xC2, 0x04, 0x00,
+];
+const WEAPON_AMMO_REMOVE_BODY_CALLS: [usize; 1] = [0x25];
+const AMMO_CLEAR_BODY: [u8; 42] = [
+    0x56, 0x33, 0xF6, 0x33, 0xC9, 0x39, 0x35, 0x50, 0x7B, 0x2D, 0x02, 0x7E, 0x1B, 0x33, 0xD2, 0x90,
+    0x8B, 0x07, 0x03, 0xC2, 0x83, 0xC1, 0x01, 0x89, 0x70, 0x04, 0x89, 0x70, 0x08, 0x83, 0xC2, 0x0C,
+    0x3B, 0x0D, 0x50, 0x7B, 0x2D, 0x02, 0x7C, 0xE8, 0x5E, 0xC3,
+];
+const AMMO_CLEAR_BODY_CALLS: [usize; 0] = [];
+const IS_THROWN_BODY: [u8; 19] = [
+    0x85, 0xC0, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0x33, 0xC9, 0x83, 0x78, 0x34, 0x05, 0x0F, 0x94, 0xC1,
+    0x8A, 0xC1, 0xC3,
+];
+const IS_THROWN_BODY_CALLS: [usize; 0] = [];
+const INST_ALLOC_BODY: [u8; 436] = [
+    0xA1, 0xC4, 0x7B, 0x2D, 0x02, 0x53, 0x33, 0xDB, 0x3B, 0xC3, 0x75, 0x04, 0x33, 0xC0, 0x5B, 0xC3,
+    0x8B, 0x48, 0x04, 0x3B, 0xC8, 0x8D, 0x50, 0x04, 0x57, 0x75, 0x08, 0x89, 0x1D, 0xC4, 0x7B, 0x2D,
+    0x02, 0xEB, 0x1B, 0x89, 0x0D, 0xC4, 0x7B, 0x2D, 0x02, 0x8B, 0x08, 0x3B, 0xCB, 0x74, 0x05, 0x8B,
+    0x3A, 0x89, 0x79, 0x04, 0x8B, 0x0A, 0x3B, 0xCB, 0x74, 0x04, 0x8B, 0x38, 0x89, 0x39, 0x8B, 0x3D,
+    0x6C, 0x7B, 0x2D, 0x02, 0x3B, 0xFB, 0x89, 0x18, 0x89, 0x1A, 0x75, 0x0B, 0x89, 0x02, 0x89, 0x00,
+    0xA3, 0x6C, 0x7B, 0x2D, 0x02, 0xEB, 0x0D, 0x8B, 0x0F, 0x89, 0x08, 0x89, 0x3A, 0x8B, 0x17, 0x89,
+    0x42, 0x04, 0x89, 0x07, 0x89, 0x70, 0x08, 0x66, 0x89, 0x58, 0x0C, 0x8B, 0x4E, 0x10, 0xC1, 0xE9,
+    0x03, 0xC0, 0xE1, 0x04, 0x32, 0xCB, 0x80, 0xE1, 0x10, 0x30, 0x48, 0x0C, 0xF6, 0x46, 0x10, 0x20,
+    0x8A, 0x48, 0x0C, 0x74, 0x0B, 0x8B, 0x56, 0x10, 0xC1, 0xEA, 0x04, 0x83, 0xE2, 0x01, 0xEB, 0x02,
+    0x33, 0xD2, 0xC0, 0xE2, 0x05, 0x32, 0xD1, 0x80, 0xE2, 0x20, 0x32, 0xD1, 0x88, 0x50, 0x0C, 0x0F,
+    0xB7, 0x96, 0xDC, 0x00, 0x00, 0x00, 0x89, 0x50, 0x10, 0x0F, 0xB7, 0x8E, 0xDC, 0x00, 0x00, 0x00,
+    0x89, 0x48, 0x14, 0xF6, 0x46, 0x10, 0x20, 0x74, 0x09, 0x0F, 0xB7, 0x8E, 0xDC, 0x00, 0x00, 0x00,
+    0xEB, 0x02, 0x33, 0xC9, 0x89, 0x48, 0x18, 0xF6, 0x46, 0x10, 0x20, 0x74, 0x09, 0x0F, 0xB7, 0x8E,
+    0xDC, 0x00, 0x00, 0x00, 0xEB, 0x02, 0x33, 0xC9, 0xD9, 0xEE, 0x83, 0xCA, 0xFF, 0xD9, 0x50, 0x40,
+    0x89, 0x48, 0x1C, 0xD9, 0x50, 0x44, 0xBF, 0xFF, 0x00, 0x00, 0x00, 0xD9, 0x58, 0x48, 0x33, 0xC9,
+    0xD9, 0x05, 0x3C, 0xC5, 0xE5, 0x00, 0x89, 0x50, 0x24, 0xD9, 0x58, 0x4C, 0x89, 0x50, 0x28, 0x89,
+    0x50, 0x2C, 0x89, 0x50, 0x30, 0x89, 0x90, 0xA8, 0x00, 0x00, 0x00, 0x89, 0x90, 0xAC, 0x00, 0x00,
+    0x00, 0x88, 0x58, 0x3C, 0x89, 0x58, 0x50, 0x89, 0x50, 0x34, 0x89, 0x78, 0x54, 0x89, 0x78, 0x60,
+    0x89, 0x78, 0x6C, 0x89, 0x78, 0x78, 0x89, 0xB8, 0x84, 0x00, 0x00, 0x00, 0x89, 0xB8, 0x90, 0x00,
+    0x00, 0x00, 0x89, 0xB8, 0x9C, 0x00, 0x00, 0x00, 0x89, 0x98, 0xB4, 0x00, 0x00, 0x00, 0x89, 0x98,
+    0xB8, 0x00, 0x00, 0x00, 0x89, 0x98, 0xD0, 0x00, 0x00, 0x00, 0x89, 0x98, 0xCC, 0x00, 0x00, 0x00,
+    0x89, 0x88, 0xBC, 0x00, 0x00, 0x00, 0x89, 0x88, 0xC0, 0x00, 0x00, 0x00, 0x89, 0x88, 0xC4, 0x00,
+    0x00, 0x00, 0x89, 0x88, 0xC8, 0x00, 0x00, 0x00, 0xB9, 0x04, 0x00, 0x00, 0x00, 0x39, 0x4E, 0x34,
+    0x75, 0x1A, 0x8B, 0x3D, 0xAC, 0x43, 0xE8, 0x00, 0x81, 0xFF, 0x00, 0xD2, 0x49, 0x6B, 0x89, 0x78,
+    0x30, 0x7E, 0x09, 0x81, 0xC7, 0x00, 0x2E, 0xB6, 0x94, 0x89, 0x78, 0x30, 0x83, 0x7E, 0x34, 0x05,
+    0x5F, 0x75, 0x03, 0x08, 0x48, 0x0D, 0x80, 0x48, 0x0D, 0x20, 0x89, 0x98, 0xE8, 0x00, 0x00, 0x00,
+    0x89, 0x50, 0x38, 0x66, 0xC7, 0x80, 0xE4, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x89, 0x90, 0xEC, 0x00,
+    0x00, 0x00, 0x5B, 0xC3,
+];
+const INST_ALLOC_BODY_CALLS: [usize; 0] = [];

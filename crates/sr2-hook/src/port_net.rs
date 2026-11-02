@@ -251,7 +251,72 @@ const RECENT_IDS: usize = 43;
 const OBJ_OWNER_CONN: usize = 44;
 const HANDLE_OWNER_CONN: usize = 45;
 const REG_FIND_FIELD: usize = 46;
-const COUNT: usize = 47;
+const POOL_BY_ID: usize = 47;
+const POOL_STATE2: usize = 48;
+const POOL_STATE1: usize = 49;
+const SEND_JOIN_NEW_SESSION: usize = 50;
+const SEND_JOIN_SUCCESS: usize = 51;
+const SEND_JOIN_FAILED: usize = 52;
+const SEND_JOIN_COMPLETE: usize = 53;
+const SEND_MP_INFO: usize = 54;
+const SEND_UPD_STATE_SUB3: usize = 55;
+const SET_PHASE_BROADCAST: usize = 56;
+const SEND_JOIN_DENY: usize = 57;
+const SEND_UPD_CONN: usize = 58;
+const SEND_TO_LIST_OR_REMOTES: usize = 59;
+const RECENT_IDS_PUSH: usize = 60;
+const ACK_WINDOW_PUSH: usize = 61;
+const ACK_RECORD: usize = 62;
+const CHECK_TIMEOUT: usize = 63;
+const TIMEOUT_EXPIRED: usize = 64;
+const TIMEOUT_ARM_10S: usize = 65;
+const RATE_METER_INIT: usize = 66;
+const RATE_METER_REMAINING: usize = 67;
+const CONN_NOTE_RECEIVED: usize = 68;
+const ACK_WINDOW_MARK_ALL: usize = 69;
+const RESET_ACK_WINDOW: usize = 70;
+const CLOCK_PREDICTED_MS: usize = 71;
+const CLOCK_ADVANCE: usize = 72;
+const OUT_OF_PHASE_MASK: usize = 73;
+const PEERS_PHASE_EQUAL: usize = 74;
+const ALL_CONNS_STATE_EQ: usize = 75;
+const ALL_CONNS_STATE_GE: usize = 76;
+const LOBBY_ANY_CONN_STATE_4: usize = 77;
+const STATE_IN_SET_B: usize = 78;
+const STATE_IS_8: usize = 79;
+const LOCAL_CONN_ID: usize = 80;
+const ID_TO_HUMAN: usize = 81;
+const MAP_SET: usize = 82;
+const FIND_RESERVATION: usize = 83;
+const REMOVE_RESERVATION: usize = 84;
+const GUID_IN_ARRAY: usize = 85;
+const FIND_BEST_CONN: usize = 86;
+const SESSION_INFO_BASE_INIT: usize = 87;
+const BYTE_NC_INIT: usize = 88;
+const BYTE_NC_INIT_BITS: usize = 89;
+const BIT_NC_INIT: usize = 90;
+const BIT_NC_INIT_BITS: usize = 91;
+const FLOAT_COMP_INIT: usize = 92;
+const FLOAT_COMP_INIT_COPY: usize = 93;
+const FLOAT_COMP_COPY: usize = 94;
+const VECTOR3_COMP_CTOR: usize = 95;
+const VECTOR2_COMP_CTOR: usize = 96;
+const VECTOR3_UNCOMP_CTOR: usize = 97;
+const HEADING_COMP_CTOR: usize = 98;
+const OWNERSHIP_PENDING: usize = 99;
+const CONN_OBJECT_LIST_ADD: usize = 100;
+const CONN_OBJECT_LIST_REMOVE: usize = 101;
+const GUID_ID_EQUAL: usize = 102;
+const GUID_ENTRY_READ: usize = 103;
+const ID_TO_OBJECT_AC: usize = 104;
+const CAPTURE_SNAPSHOT: usize = 105;
+const READ_STATE_DELTA: usize = 106;
+const GET_SEND_PRIORITY: usize = 107;
+const GET_DIRTY_FIELDS: usize = 108;
+const ON_STATE_SENT: usize = 109;
+const CAN_MIGRATE: usize = 110;
+const REQUEST_OWNERSHIP: usize = 111;
+const COUNT: usize = 112;
 
 static PORTS: [Port; COUNT] = [
     port("net_bits_write_at", 0x007F_D030, SAVED),
@@ -301,6 +366,71 @@ static PORTS: [Port; COUNT] = [
     port("net_object_owner_conn", 0x0080_7230, SAVED),
     port("net_handle_owner_conn", 0x0080_7250, SAVED),
     port("net_registration_find_field", 0x0080_7680, SAVED),
+    port("net_pool_find_by_id", 0x0081_7D80, SAVED),
+    port("net_pool_find_by_id_b", 0x0081_7F40, SAVED),
+    port("net_pool_find_by_id_c", 0x0081_8020, SAVED),
+    port("net_send_join_new_session", 0x0081_6460, SAVED),
+    port("net_send_join_success", 0x0081_65F0, SAVED),
+    port("net_send_join_failed", 0x0081_6740, SAVED),
+    port("net_send_join_complete", 0x0081_68A0, SAVED),
+    port("net_send_mp_info", 0x007F_8DF0, SAVED),
+    port("net_send_upd_state_sub3", 0x007F_8D70, SAVED),
+    port("net_conn_set_phase_broadcast", 0x007F_8C50, SAVED),
+    port("net_send_join_deny", 0x0081_6F60, SAVED),
+    port("net_send_upd_conn", 0x0081_6B50, SAVED),
+    port("net_send_packet_to_list_or_remotes", 0x0081_48C0, SAVED),
+    port("net_conn_recent_ids_push", 0x007F_AA60, EAX | SAVED),
+    port("net_conn_ack_window_push", 0x007F_81D0, ECX | SAVED),
+    port("net_conn_ack_record", 0x007F_8270, EAX | SAVED),
+    port("net_conn_check_timeout", 0x007F_A9E0, SAVED),
+    port("net_timeout_expired", 0x007F_C8B0, SAVED),
+    port("net_timeout_arm_10s", 0x007F_C8F0, SAVED),
+    port("net_rate_meter_init", 0x007F_B1C0, SAVED),
+    port("net_rate_meter_remaining", 0x007F_B2B0, SAVED),
+    port("net_conn_note_received", 0x007F_B100, EAX | SAVED),
+    port("net_conn_ack_window_mark_all", 0x007F_B190, EDX | SAVED),
+    port("net_conn_reset_ack_window", 0x007F_8160, EAX | SAVED),
+    port("net_clock_predicted_ms", 0x007F_CAB0, SAVED),
+    port("net_clock_advance", 0x007F_C930, SAVED),
+    port("session_out_of_phase_mask", 0x0080_FF70, SAVED),
+    port("session_peers_phase_equal", 0x0080_FF00, SAVED),
+    port("session_all_conns_state_eq", 0x0081_0040, SAVED),
+    port("session_all_conns_state_ge", 0x0081_00F0, SAVED),
+    port("lobby_any_conn_state_4", 0x0081_0080, SAVED),
+    port("session_state_in_set_b", 0x0080_CEB0, SAVED),
+    port("session_state_is_8", 0x0080_CF10, EDX | SAVED),
+    port("net_local_conn_id", 0x007F_7A00, ECX | EDX | SAVED),
+    port("net_id_to_human", 0x007F_8020, SAVED),
+    port("net_remote_handle_map_set", 0x0080_7A20, SAVED),
+    port("session_find_reservation", 0x0080_F2E0, SAVED),
+    port("session_remove_reservation", 0x0080_F340, SAVED),
+    port("session_guid_in_array", 0x0080_C350, SAVED),
+    port("session_find_best_conn", 0x0080_C4E0, SAVED),
+    port("session_info_base_init", 0x0080_C560, EAX | EDX | SAVED),
+    port("net_byte_noncompressor_init", 0x007F_DBB0, EAX | ECX | EDX | SAVED),
+    port("net_byte_noncompressor_init_bits", 0x007F_DBC0, EAX | EDX | SAVED),
+    port("net_bit_noncompressor_init", 0x007F_DC90, EAX | EDX | SAVED),
+    port("net_bit_noncompressor_init_bits", 0x007F_DCB0, EAX | SAVED),
+    port("net_float_compressor_init", 0x007F_DE30, EAX | ECX | SAVED),
+    port("net_float_compressor_init_copy", 0x007F_DE60, EAX | EDX | SAVED),
+    port("net_float_compressor_copy", 0x007F_E110, EAX | EDX | SAVED),
+    port("net_vector3_compressor_ctor", 0x007F_E0B0, EAX | EDX | SAVED),
+    port("net_vector2_compressor_ctor", 0x007F_E3A0, EAX | EDX | SAVED),
+    port("net_vector3_uncompressed_ctor", 0x007F_E5A0, EAX | ECX | EDX | SAVED),
+    port("net_orientation_heading_compressor_ctor", 0x007F_E6A0, EAX | EDX | SAVED),
+    port("net_ownership_request_pending", 0x0080_6CE0, SAVED),
+    port("net_conn_object_list_add", 0x0080_4940, EAX | EDX | SAVED),
+    port("net_conn_object_list_remove", 0x0080_4960, SAVED),
+    port("net_guid_id_equal", 0x0081_76C0, SAVED),
+    port("net_guid_entry_read", 0x0081_7810, EAX | EDX | SAVED),
+    port("net_id_to_object_ac", 0x007F_FDF0, SAVED),
+    port("net_object_capture_snapshot", 0x0080_5CD0, SAVED),
+    port("net_object_read_state_delta", 0x0080_5D60, SAVED),
+    port("net_object_get_send_priority", 0x0080_5E40, SAVED),
+    port("net_object_get_dirty_fields", 0x0080_5E90, SAVED),
+    port("net_object_on_state_sent", 0x0080_5EC0, SAVED),
+    port("net_object_can_migrate", 0x0080_6D50, SAVED),
+    port("net_request_ownership", 0x0080_6B90, SAVED),
 ];
 
 /// Count a call; `Some((call number, original copy))` while it should be shadowed.
@@ -1311,6 +1441,2164 @@ unsafe fn h_reg_find_field(id: usize, r: &mut Pushad, _a: *const u32) {
 }
 port_thunk!(reg_find_field_thunk, reg_find_field_entry, REG_FIND_FIELD, h_reg_find_field);
 
+// ===== round 2: pool lookups, packet senders ==============================================================================
+// Senders build a packet in a local buffer and call the original send helpers by address
+// (0x814670 net_send_packet_to_conn, 0x814740 net_send_packet_to_remotes, ...) with the registers
+// and stack arguments the original sets up. Their shadow runs the original copy with the send
+// call pointed at a recording stub, then the Rust version with its sends recorded as well; the
+// two lists (target, ESI / EDI, stack arguments, packet bytes) are compared, and the winner's
+// sends are then issued once for real. All of this runs on the game thread.
+
+const SEND_CONN: usize = 0x0081_4670;
+const SEND_REMOTES: usize = 0x0081_4740;
+const SEND_RAW: usize = 0x0081_4790;
+const IAT_ENTER_CS: usize = 0x00DB_80CC;
+const IAT_LEAVE_CS: usize = 0x00DB_80D0;
+const IAT_SET_EVENT: usize = 0x00DB_81DC;
+const POOL_ITER_NEXT: usize = 0x0069_B9D0;
+const POOL_CS: usize = 0x02A1_8944;
+const POOL_USERS: usize = 0x02A1_8968;
+const POOL_WAITERS: usize = 0x02A1_896C;
+const POOL_EVENT: usize = 0x02A1_8960;
+const POOL_COUNT: usize = 0x02A1_8940;
+const POOL_HEAD: usize = 0x02A1_893C;
+const POOL_BASE: usize = 0x02A1_8938;
+
+/// Whether a call now would still be shadowed (no counting).
+fn shadowing_active(id: usize) -> bool {
+    let p = &PORTS[id];
+    p.original.load(Ordering::Relaxed) != 0 && p.calls.load(Ordering::Relaxed) < SHADOW_CALLS
+}
+
+#[derive(Clone, PartialEq, Debug)]
+struct Sent {
+    target: usize,
+    esi: u32,
+    edi: u32,
+    /// Stack arguments; [0] is the buffer pointer (never compared).
+    args: Vec<u32>,
+    data: Vec<u8>,
+}
+
+thread_local! {
+    static RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SENT: std::cell::RefCell<Vec<Sent>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Longest packet copy kept per recorded send (the send helpers reject anything over 0x1FF).
+const MAX_SENT: usize = 0x1000;
+
+unsafe fn record_send(target: usize, esi: u32, edi: u32, args: &[u32]) {
+    unsafe {
+        let len = (args[1] as usize).min(MAX_SENT);
+        let data = snap_bytes(args[0] as usize, len);
+        SENT.with(|s| s.borrow_mut().push(Sent { target, esi, edi, args: args.to_vec(), data }));
+    }
+}
+
+fn take_sent() -> Vec<Sent> {
+    SENT.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+extern "C" fn rec_conn_entry(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        record_send(SEND_CONN, r.esi, 0, &[*a, *a.add(1), *a.add(2), *a.add(3)]);
+        r.eax = 0;
+    }
+}
+regs_thunk!(rec_conn_thunk, rec_conn_entry, "ret");
+
+extern "C" fn rec_remotes_entry(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        record_send(SEND_REMOTES, 0, r.edi, &[*a, *a.add(1)]);
+        r.eax = 0;
+    }
+}
+regs_thunk!(rec_remotes_thunk, rec_remotes_entry, "ret");
+
+extern "C" fn rec_raw_entry(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        record_send(SEND_RAW, 0, 0, &[r.ecx, *a.add(1), *a]);
+        r.eax = 0;
+    }
+}
+regs_thunk!(rec_raw_thunk, rec_raw_entry, "ret");
+
+/// 0x814670: ESI = connection; (buffer, size, a, b) on the stack, `ret` (cdecl).
+unsafe fn send_conn_raw(esi: u32, buf: u32, size: u32, a: u32, b: u32) -> u32 {
+    unsafe {
+        let args = [buf, size, a, b];
+        if RECORDING.get() {
+            record_send(SEND_CONN, esi, 0, &args);
+            return 0;
+        }
+        call_regs(SEND_CONN, 0, 0, 0, esi, 0, &args)
+    }
+}
+
+unsafe fn send_conn(esi: u32, buf: &mut [u8], size: u32, a: u32, b: u32) -> u32 {
+    unsafe { send_conn_raw(esi, buf.as_mut_ptr() as u32, size, a, b) }
+}
+
+/// 0x814740: EDI = session; (buffer, size) on the stack, `ret` (cdecl).
+unsafe fn send_remotes_raw(edi: u32, buf: u32, size: u32) -> u32 {
+    unsafe {
+        let args = [buf, size];
+        if RECORDING.get() {
+            record_send(SEND_REMOTES, 0, edi, &args);
+            return 0;
+        }
+        call_regs(SEND_REMOTES, 0, 0, 0, 0, edi, &args)
+    }
+}
+
+unsafe fn send_remotes(edi: u32, buf: &mut [u8], size: u32) -> u32 {
+    unsafe { send_remotes_raw(edi, buf.as_mut_ptr() as u32, size) }
+}
+
+/// 0x814790: ECX = buffer; stack: an address-like value (the caller's ECX), size; cdecl. The
+/// record keeps [buffer, size, that value].
+unsafe fn send_raw(buf: &mut [u8], ecx_in: u32, size: u32) -> u32 {
+    unsafe {
+        let bp = buf.as_mut_ptr() as u32;
+        if RECORDING.get() {
+            record_send(SEND_RAW, 0, 0, &[bp, size, ecx_in]);
+            return 0;
+        }
+        call_regs(SEND_RAW, 0, bp, 0, 0, 0, &[ecx_in, size])
+    }
+}
+
+fn sent_equal(a: &[Sent], b: &[Sent], skip3: bool) -> Result<(), String> {
+    if a.len() != b.len() {
+        return Err(format!("{} sends in the original, {} in Rust", a.len(), b.len()));
+    }
+    for (k, (x, y)) in a.iter().zip(b).enumerate() {
+        if x.target != y.target || x.esi != y.esi || x.edi != y.edi || x.args[1..] != y.args[1..] {
+            return Err(format!(
+                "send {k}: original {:x?}/{:#x}/{:#x}/{:x?}, Rust {:x?}/{:#x}/{:#x}/{:x?}",
+                x.target,
+                x.esi,
+                x.edi,
+                &x.args[1..],
+                y.target,
+                y.esi,
+                y.edi,
+                &y.args[1..]
+            ));
+        }
+        let mut dx = x.data.clone();
+        let mut dy = y.data.clone();
+        if skip3 && dx.len() > 3 && dy.len() > 3 {
+            // The 4th header byte is the sequence number the send helper writes: stack garbage here.
+            dx[3] = 0;
+            dy[3] = 0;
+        }
+        if dx != dy {
+            let i = (0..dx.len().min(dy.len())).find(|&i| dx[i] != dy[i]).unwrap_or(0);
+            return Err(format!("send {k}: packet byte {i}: original {:x?}, Rust {:x?}", &x.data, &y.data));
+        }
+    }
+    Ok(())
+}
+
+/// Issue the recorded sends for real; the last send's EAX, or None when there were none. With
+/// `live` the buffer is the caller's own (kept), else a copy of the recorded bytes.
+unsafe fn replay(sent: &[Sent], live: bool) -> Option<u32> {
+    unsafe {
+        let mut last = None;
+        for s in sent {
+            let mut buf = vec![0u8; MAX_SENT + 16];
+            buf[..s.data.len()].copy_from_slice(&s.data);
+            let mut args = s.args.clone();
+            if !live {
+                args[0] = buf.as_mut_ptr() as u32;
+            }
+            last = Some(if s.target == SEND_RAW {
+                call_regs(s.target, 0, args[0], 0, 0, 0, &[args[2], args[1]])
+            } else {
+                call_regs(s.target, 0, 0, 0, s.esi, s.edi, &args)
+            });
+        }
+        last
+    }
+}
+
+/// Sender shadow (see above). `ours` runs with its sends recorded and returns (EAX, whether EAX
+/// is the last send's result: then the real send's EAX is used). `regions` are the memory areas
+/// the sender writes besides the packet: the original runs on the real state, the state is put
+/// back, Rust runs, the two end states are compared and the original's is kept. `live`: the
+/// buffer belongs to the caller (the real send writes its 4th byte).
+unsafe fn shadow_send_ex(id: usize, p: &Pushad, args: [u32; 3], skip3: bool, live: bool, regions: &[(usize, usize)], ours: impl FnOnce() -> (u32, bool)) -> u32 {
+    unsafe {
+        let Some((n, orig)) = shadowing(id) else { return ours().0 };
+        take_sent();
+        RECORDING.set(true);
+        let pre: Vec<Vec<u8>> = regions.iter().map(|&(a, l)| snap_bytes(a, l)).collect();
+        let inp = Regs::of(p);
+        let mut o = inp;
+        call_orig(orig, &mut o, args, false);
+        let theirs = take_sent();
+        let post_o: Vec<Vec<u8>> = regions.iter().map(|&(a, l)| snap_bytes(a, l)).collect();
+        for (&(a, l), b) in regions.iter().zip(&pre) {
+            if l > 0 {
+                std::ptr::copy_nonoverlapping(b.as_ptr(), a as *mut u8, l);
+            }
+        }
+        let (v, is_send) = ours();
+        let mine = take_sent();
+        RECORDING.set(false);
+        let post_r: Vec<Vec<u8>> = regions.iter().map(|&(a, l)| snap_bytes(a, l)).collect();
+        check_preserved(id, &inp, &o);
+        let mut bad = String::new();
+        if post_r != post_o {
+            bad = format!("memory: original {post_o:x?}, Rust {post_r:x?}");
+            for (&(a, l), b) in regions.iter().zip(&post_o) {
+                if l > 0 {
+                    std::ptr::copy_nonoverlapping(b.as_ptr(), a as *mut u8, l);
+                }
+            }
+        }
+        let win = match sent_equal(&theirs, &mine, skip3) {
+            Ok(()) if bad.is_empty() => &mine,
+            Ok(()) => &theirs,
+            Err(e) => {
+                bad = format!("{bad} {e}");
+                &theirs
+            }
+        };
+        if !bad.is_empty() {
+            mismatch(id, n, format!("in {inp:x?} args {args:x?}: {bad}"));
+        }
+        match replay(win, live) {
+            Some(last) if is_send => last,
+            _ => v,
+        }
+    }
+}
+
+unsafe fn shadow_send(id: usize, p: &Pushad, args: [u32; 3], skip3: bool, ours: impl FnOnce() -> (u32, bool)) -> u32 {
+    unsafe { shadow_send_ex(id, p, args, skip3, false, &[], ours) }
+}
+
+// --- the pool lookups 0x817D80 / 0x817F40 / 0x818020 ----------------------------------------------------------
+// Each: bump the reader count under the pool's critical section (0x2A18944), walk the pool from
+// its head entry (0x1044-byte entries, iterator 0x69B9D0: EAX = entry, EDI = 0x2A18938 -> next or
+// 0) while the lock is NOT held, drop the reader count under the lock (when it reaches 0 and the
+// waiter count is positive, SetEvent(0x2A18960)); EAX = the matching entry or 0. They have no
+// register inputs; 0x817D80 takes the id byte on the stack (`ret`).
+
+type Cs = extern "system" fn(usize);
+type Ev = extern "system" fn(u32) -> i32;
+
+unsafe fn pool_lock(slot: usize) {
+    unsafe {
+        let f: Cs = std::mem::transmute::<usize, Cs>(import(slot));
+        f(POOL_CS);
+    }
+}
+
+unsafe fn pool_find(mut pred: impl FnMut(u32) -> bool) -> u32 {
+    unsafe {
+        if rd(POOL_COUNT) == 0 {
+            return 0;
+        }
+        let mut e = rd(POOL_HEAD).wrapping_mul(0x1044).wrapping_add(rd(rd(POOL_BASE) as usize));
+        while e != 0 {
+            if pred(e) {
+                return e;
+            }
+            e = call_regs(POOL_ITER_NEXT, e, 0, 0, 0, POOL_BASE as u32, &[]);
+        }
+        0
+    }
+}
+
+unsafe fn pool_lookup(pred: impl FnMut(u32) -> bool) -> u32 {
+    unsafe {
+        pool_lock(IAT_ENTER_CS);
+        wd(POOL_USERS, rd(POOL_USERS).wrapping_add(1));
+        pool_lock(IAT_LEAVE_CS);
+        let found = pool_find(pred);
+        pool_lock(IAT_ENTER_CS);
+        let users = rd(POOL_USERS).wrapping_add(0xFFFF_FFFF);
+        wd(POOL_USERS, users);
+        if users == 0 && (rd(POOL_WAITERS) as i32) > 0 {
+            let f: Ev = std::mem::transmute::<usize, Ev>(import(IAT_SET_EVENT));
+            f(rd(POOL_EVENT));
+        }
+        pool_lock(IAT_LEAVE_CS);
+        found
+    }
+}
+
+/// Shadow: the original (locks and all) runs first; the Rust search (no locks) must find the same entry.
+unsafe fn pool_shadow(id: usize, p: &Pushad, args: [u32; 3], pred: impl FnMut(u32) -> bool) -> u32 {
+    unsafe {
+        let Some((n, orig)) = shadowing(id) else { return pool_lookup(pred) };
+        let inp = Regs::of(p);
+        let mut o = inp;
+        call_orig(orig, &mut o, args, false);
+        check_preserved(id, &inp, &o);
+        let ours = pool_find(pred);
+        if ours != o.eax {
+            mismatch(id, n, format!("args {args:x?}: original {:#x}, Rust {ours:#x}", o.eax));
+        }
+        o.eax
+    }
+}
+
+unsafe fn h_pool_by_id(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let want = *a as u8;
+        r.eax = pool_shadow(id, &p, [*a, 0, 0], |e| rb(e as usize + 4) == want);
+    }
+}
+port_thunk!(pool_by_id_thunk, pool_by_id_entry, POOL_BY_ID, h_pool_by_id);
+
+unsafe fn h_pool_state2(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = pool_shadow(id, &p, [0; 3], |e| rd(rd(e as usize + 0xC) as usize + 0x30) == 2);
+    }
+}
+port_thunk!(pool_state2_thunk, pool_state2_entry, POOL_STATE2, h_pool_state2);
+
+unsafe fn h_pool_state1(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = pool_shadow(id, &p, [0; 3], |e| rd(rd(e as usize + 0xC) as usize + 0x30) == 1);
+    }
+}
+port_thunk!(pool_state1_thunk, pool_state1_entry, POOL_STATE1, h_pool_state1);
+
+// --- the join-flow senders 0x816460 / 0x8165F0 / 0x816740 / 0x8168A0 ------------------------------------------------
+// ECX = connection (-> ESI of the send), [esp+4] = object whose [+0xC] is the payload writer; `ret`.
+// Header: type byte, u16 (size - 3), and a 4th (sequence) byte when the packet's channel byte
+// (record + 0x14) is non-zero. The writer is virtual method `slot` of [obj + 0xC]:
+// thiscall(ECX = writer, buffer, &size) with EAX = the method, EDX = buffer, ESI = connection and
+// EDI the caller's. The send is 0x814670(buffer, size & 0xFFFF, 0, 0) with ESI = connection.
+
+unsafe fn join_body(p: &Pushad, obj: u32, ty: u8, flag: usize, slot: usize) -> (u32, bool) {
+    unsafe {
+        let mut buf = [0u8; 0x51C];
+        buf[0] = ty;
+        let mut size: u32 = if rb(flag) == 0 { 3 } else { 4 };
+        let w = rd(obj as usize + 0xC);
+        let f = vslot(w, slot);
+        let bp = buf.as_mut_ptr() as u32;
+        call_regs(f, f as u32, w, bp, p.ecx, p.edi, &[bp, &mut size as *mut u32 as u32]);
+        let sz = size & 0xFFFF;
+        let len = (size.wrapping_sub(3) & 0xFFFF) as u16;
+        buf[1..3].copy_from_slice(&len.to_le_bytes());
+        (send_conn(p.ecx, &mut buf, sz, 0, 0), true)
+    }
+}
+
+unsafe fn h_join(id: usize, r: &mut Pushad, a: *const u32, ty: u8, flag: usize, slot: usize) {
+    unsafe {
+        let p = *r;
+        let obj = *a;
+        r.eax = shadow_send(id, &p, [obj, 0, 0], rb(flag) != 0, || join_body(&p, obj, ty, flag, slot));
+    }
+}
+unsafe fn h_join_new_session(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe { h_join(id, r, a, 5, 0x00E8_BF94, 8) }
+}
+unsafe fn h_join_success(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe { h_join(id, r, a, 6, 0x00E8_BFAC, 10) }
+}
+unsafe fn h_join_failed(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe { h_join(id, r, a, 7, 0x00E8_BFC4, 10) }
+}
+unsafe fn h_join_complete(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe { h_join(id, r, a, 8, 0x00E8_BFDC, 10) }
+}
+port_thunk!(join_new_session_thunk, join_new_session_entry, SEND_JOIN_NEW_SESSION, h_join_new_session);
+port_thunk!(join_success_thunk, join_success_entry, SEND_JOIN_SUCCESS, h_join_success);
+port_thunk!(join_failed_thunk, join_failed_entry, SEND_JOIN_FAILED, h_join_failed);
+port_thunk!(join_complete_thunk, join_complete_entry, SEND_JOIN_COMPLETE, h_join_complete);
+
+// --- the connection-state senders --------------------------------------------------------------------------------------
+// Common frame of the originals: type byte at buf[0], u16 (size - 3) at buf[1], payload from the
+// header size (3, or 4 when the packet's channel byte at record + 0x14 is non-zero); a local
+// buffer of 0x51C bytes (the original's frame has the same room before its cookie).
+
+/// Header size from the packet's channel byte: 3 or 4.
+unsafe fn hdr_size(flag: usize) -> usize {
+    unsafe { if rb(flag) == 0 { 3 } else { 4 } }
+}
+
+fn set_len(buf: &mut [u8], size: usize) {
+    buf[1..3].copy_from_slice(&(size.wrapping_sub(3) as u16).to_le_bytes());
+}
+
+/// 0x7F8DF0 net_send_mp_info (ECX = connection): packet 0x5B {u8 [conn+0x44], u8 [conn+0x45]}
+/// to the connection's session's remotes (EDI = [conn+0x1AC]). EAX = the send's.
+unsafe fn h_send_mp_info(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = shadow_send(id, &p, [0; 3], rb(0x00E8_BA94) != 0, || {
+            let mut buf = [0u8; 0x51C];
+            buf[0] = 0x5B;
+            let h = hdr_size(0x00E8_BA94);
+            buf[h] = rb(p.ecx as usize + 0x44);
+            buf[h + 1] = rb(p.ecx as usize + 0x45);
+            let size = h + 2;
+            set_len(&mut buf, size);
+            (send_remotes(rd(p.ecx as usize + 0x1AC), &mut buf, size as u32), true)
+        });
+    }
+}
+port_thunk!(send_mp_info_thunk, send_mp_info_entry, SEND_MP_INFO, h_send_mp_info);
+
+/// 0x7F8D70 net_send_upd_state_sub3 (ECX = connection): only for a connection whose byte [+0] is 0:
+/// packet 0x20 {u8 3} to that connection. When it is not sent the original's EAX is the cookie
+/// xor ESP (no meaning); the input EAX is returned then.
+unsafe fn h_send_upd_state_sub3(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = shadow_send(id, &p, [0; 3], rb(0x00E8_C21C) != 0, || {
+            if rb(p.ecx as usize) != 0 {
+                return (p.eax, false);
+            }
+            let mut buf = [0u8; 0x51C];
+            buf[0] = 0x20;
+            let h = hdr_size(0x00E8_C21C);
+            buf[h] = 3;
+            let size = h + 1;
+            set_len(&mut buf, size);
+            (send_conn(p.ecx, &mut buf, size as u32, 0, 0), true)
+        });
+    }
+}
+port_thunk!(send_upd_state_sub3_thunk, send_upd_state_sub3_entry, SEND_UPD_STATE_SUB3, h_send_upd_state_sub3);
+
+/// 0x7F8C50 net_conn_set_phase_broadcast (ECX = connection, EDX = phase): stores the phase at
+/// [conn+0x40] when it changed; for a connection whose byte [+0] is non-zero sends packet 0x20
+/// {u8 1, u32 phase} to the session's remotes (EDI = [conn+0x1AC]). Early exits leave the
+/// cookie xor ESP in EAX (no meaning): the input EAX is returned then.
+unsafe fn h_set_phase_broadcast(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let c = p.ecx as usize;
+        r.eax = shadow_send_ex(id, &p, [0; 3], rb(0x00E8_C21C) != 0, false, &[(c + 0x40, 4)], || {
+            if p.edx == rd(c + 0x40) {
+                return (p.eax, false);
+            }
+            wd(c + 0x40, p.edx);
+            if rb(c) == 0 {
+                return (p.eax, false);
+            }
+            let mut buf = [0u8; 0x51C];
+            buf[0] = 0x20;
+            let h = hdr_size(0x00E8_C21C);
+            buf[h] = 1;
+            buf[h + 1..h + 5].copy_from_slice(&p.edx.to_le_bytes());
+            let size = h + 5;
+            set_len(&mut buf, size);
+            (send_remotes(rd(c + 0x1AC), &mut buf, size as u32), true)
+        });
+    }
+}
+port_thunk!(set_phase_broadcast_thunk, set_phase_broadcast_entry, SET_PHASE_BROADCAST, h_set_phase_broadcast);
+
+/// 0x816F60 net_send_join_deny (ECX passed through, [esp+4] = reason byte): packet 4 {u32 0xC9,
+/// u8 reason} through 0x814790 (ECX = buffer, stack: the incoming ECX, size; cdecl). EAX = its.
+unsafe fn h_send_join_deny(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let arg = *a;
+        r.eax = shadow_send(id, &p, [arg, 0, 0], rb(0x00E8_BF7C) != 0, || {
+            let mut buf = [0u8; 0x51C];
+            buf[0] = 4;
+            let h = hdr_size(0x00E8_BF7C);
+            buf[h..h + 4].copy_from_slice(&0xC9u32.to_le_bytes());
+            buf[h + 4] = arg as u8;
+            let size = h + 5;
+            set_len(&mut buf, size);
+            (send_raw(&mut buf, p.ecx, size as u32), true)
+        });
+    }
+}
+port_thunk!(send_join_deny_thunk, send_join_deny_entry, SEND_JOIN_DENY, h_send_join_deny);
+
+/// 0x816B50 net_send_upd_conn (EDI = connection, no stack arguments): packet 0x0B {u8 [conn+0x1B0],
+/// then the connection description from 0x8157C0 (EAX = conn, ECX = buffer, stack: &size)} to
+/// every other, ready (byte [+0x1B8] == 1), non-local connection of the session's circular list
+/// (head [session+0x400], link +0x22CC). EAX at the end: the session pointer after a pass over
+/// the list, else 0x8157C0's.
+unsafe fn h_send_upd_conn(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = shadow_send(id, &p, [0; 3], rb(0x00E8_C024) != 0, || {
+            let edi = p.edi as usize;
+            let mut buf = [0u8; 0x51C];
+            buf[0] = 0x0B;
+            let h = hdr_size(0x00E8_C024);
+            buf[h] = rb(edi + 0x1B0);
+            let mut size: u32 = h as u32 + 1;
+            let w = call_regs(0x0081_57C0, p.edi, buf.as_mut_ptr() as u32, 0, 0, p.edi, &[&mut size as *mut u32 as u32]);
+            let mut esi = rd(rd(edi + 0x1AC) as usize + 0x400);
+            set_len(&mut buf, size as usize);
+            if esi == 0 {
+                return (w, false);
+            }
+            loop {
+                if rb(esi as usize + 0x1B8) == 1 && esi != p.edi && esi != rd(rd(esi as usize + 0x1AC) as usize + 0x408) {
+                    send_conn(esi, &mut buf, size & 0xFFFF, 0, 0);
+                }
+                esi = rd(esi as usize + 0x22CC);
+                if esi == rd(rd(edi + 0x1AC) as usize + 0x400) || esi == 0 {
+                    break;
+                }
+            }
+            (rd(edi + 0x1AC), false)
+        });
+    }
+}
+port_thunk!(send_upd_conn_thunk, send_upd_conn_entry, SEND_UPD_CONN, h_send_upd_conn);
+
+/// 0x8148C0 net_send_packet_to_list_or_remotes (stack: buffer, size; `ret`): with no explicit
+/// recipient list ([0xEB1FE4] == 0) it is 0x814740 on the session [0x2528C14]; otherwise 0x814670
+/// to every entry of the list [0xEB1FDC] (count [0xEB1FE4]) except the session's local connection
+/// [session+0x408]. The caller's buffer is used as it is (the send helper writes its 4th byte).
+/// EAX: no list -> the send's; empty / negative list -> the count; else the list pointer.
+unsafe fn h_send_to_list_or_remotes(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let (buf, size) = (*a, *a.add(1));
+        r.eax = shadow_send_ex(id, &p, [buf, size, 0], false, true, &[], || {
+            let count = rd(0x00EB_1FE4);
+            let session = rd(0x0252_8C14);
+            let local = rd(session as usize + 0x408);
+            if count == 0 {
+                return (send_remotes_raw(session, buf, size), true);
+            }
+            if (count as i32) <= 0 {
+                return (count, false);
+            }
+            let mut i = 0usize;
+            loop {
+                let list = rd(0x00EB_1FDC) as usize;
+                let e = rd(list + i * 4);
+                if e != local {
+                    send_conn_raw(e, buf, size, 0, 0);
+                }
+                i += 1;
+                if (i as i32) >= count as i32 {
+                    break;
+                }
+            }
+            (rd(0x00EB_1FDC), false)
+        });
+    }
+}
+port_thunk!(send_to_list_or_remotes_thunk, send_to_list_or_remotes_entry, SEND_TO_LIST_OR_REMOTES, h_send_to_list_or_remotes);
+
+// --- connection transport leaves: recent ids, ack window, timeouts, rate meter, network clock -----------------------
+// Shadow: the original copy runs on the real state, the state it touched is put back, Rust runs,
+// and the touched areas and EAX are compared (the original's end state is kept on a mismatch).
+// Stack and registers: ECX / EDX are scratch in all of them (the thunk restores them, a superset).
+
+unsafe fn rw(p: usize) -> u16 {
+    unsafe { std::ptr::read_unaligned(p as *const u16) }
+}
+unsafe fn ww(p: usize, v: u16) {
+    unsafe { std::ptr::write_unaligned(p as *mut u16, v) }
+}
+
+/// `fistp qword` with the rounding mode forced to truncate (control word | 0xC00): the low dword.
+/// Out of range / NaN gives the integer indefinite 0x8000000000000000.
+fn fist_trunc_lo(v: f64) -> u32 {
+    if v.is_nan() || v >= 9.223372036854775808e18 || v < -9.223372036854775808e18 { 0 } else { (v.trunc() as i64) as u32 }
+}
+
+unsafe fn shadow_mem(id: usize, p: &Pushad, args: [u32; 3], regions: &[(usize, usize)], ours: impl FnOnce() -> u32) -> u32 {
+    unsafe {
+        let Some((n, orig)) = shadowing(id) else { return ours() };
+        let snap = || regions.iter().map(|&(a, l)| snap_bytes(a, l)).collect::<Vec<_>>();
+        let put = |s: &Vec<Vec<u8>>| {
+            for (&(a, l), b) in regions.iter().zip(s) {
+                if l > 0 {
+                    std::ptr::copy_nonoverlapping(b.as_ptr(), a as *mut u8, l);
+                }
+            }
+        };
+        let pre = snap();
+        let inp = Regs::of(p);
+        let mut o = inp;
+        call_orig(orig, &mut o, args, false);
+        check_preserved(id, &inp, &o);
+        let post_o = snap();
+        put(&pre);
+        let v = ours();
+        let post_r = snap();
+        if post_r != post_o || v != o.eax {
+            mismatch(id, n, format!("in {inp:x?} args {args:x?}: original eax {:#x} mem {post_o:x?}, Rust eax {v:#x} mem {post_r:x?}", o.eax));
+            put(&post_o);
+            return o.eax;
+        }
+        v
+    }
+}
+
+// --- 0x7FAA60 net_conn_recent_ids_push (EAX = conn, SI = id) --------------------------------------------------------
+// Ring of recent u16 ids at +0x1CBA (count byte +0x1DBA, at most 0x80): drop an existing equal id
+// (shifting the rest down), cap a full ring at 0x7F by dropping the oldest, append. Then a second
+// list of up to 0x20 dword entries at +0x1C38 (count byte +0x1CB8) gets {id, 0}. EAX unchanged.
+
+unsafe fn recent_ids_push(conn: usize, id: u16) {
+    unsafe {
+        let arr = conn + 0x1CBA;
+        let cnt = conn + 0x1DBA;
+        let mut found = false;
+        if rb(cnt) != 0 {
+            let mut dl: u8 = 0;
+            loop {
+                let i = dl as usize;
+                let mut shift = found;
+                if !found && rw(arr + i * 2) == id {
+                    found = true;
+                    shift = true;
+                }
+                if shift && ((i + 1) as i32) < rb(cnt) as i32 {
+                    ww(arr + i * 2, rw(arr + i * 2 + 2));
+                }
+                dl = dl.wrapping_add(1);
+                if dl >= rb(cnt) {
+                    break;
+                }
+            }
+            if found {
+                wb(cnt, rb(cnt).wrapping_add(0xFF));
+            }
+        }
+        if rb(cnt) == 0x80 {
+            wb(cnt, 0x7F);
+            let mut cl: u8 = 0;
+            loop {
+                let i = cl as usize;
+                ww(arr + i * 2, rw(arr + i * 2 + 2));
+                cl = cl.wrapping_add(1);
+                if cl >= rb(cnt) {
+                    break;
+                }
+            }
+        }
+        ww(arr + rb(cnt) as usize * 2, id);
+        let c2 = rb(conn + 0x1CB8);
+        wb(cnt, rb(cnt).wrapping_add(1));
+        if c2 != 0x20 {
+            ww(conn + 0x1C38 + c2 as usize * 4, id);
+            wb(conn + 0x1C3A + rb(conn + 0x1CB8) as usize * 4, 0);
+            wb(conn + 0x1CB8, rb(conn + 0x1CB8).wrapping_add(1));
+        }
+    }
+}
+
+unsafe fn h_recent_ids_push(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let c = p.eax as usize;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(c + 0x1C38, 0x184)], || {
+            recent_ids_push(c, p.esi as u16);
+            p.eax
+        });
+    }
+}
+port_thunk!(recent_ids_push_thunk, recent_ids_push_entry, RECENT_IDS_PUSH, h_recent_ids_push);
+
+// --- 0x7F81D0 net_conn_ack_window_push (ECX = conn) --------------------------------------------------------------------
+// Entries of 0x10 bytes from conn+0x1C0 (count dword +0x15C0, sequence word +0x15C4). When the
+// connection's [+0x1DEC] is a time within 0x35A4E900 of the wall clock [0xE843AC] (either
+// direction, signed), the count is bumped and the entry at index `count` gets {word seq, 0 ...};
+// the sequence word then +1 (0xFFFF is never reached from 1, but the check is kept).
+// EAX: the input (negative stamp), the stamp, stamp - clock, or the new sequence word.
+
+unsafe fn h_ack_window_push_inner(p: &Pushad) -> u32 {
+    unsafe {
+        let c = p.ecx as usize;
+        let v = rd(c + 0x1DEC);
+        if (v as i32) < 0 {
+            return p.eax;
+        }
+        let mut eax = v;
+        let now = rd(0x00E8_43AC);
+        if (eax as i32) > (now as i32) {
+            eax = eax.wrapping_sub(now);
+            if (eax as i32) < 0x35A4_E900 {
+                return eax;
+            }
+        } else if (now.wrapping_sub(eax) as i32) >= 0x35A4_E900 {
+            return eax;
+        }
+        wd(c + 0x15C0, rd(c + 0x15C0).wrapping_add(1));
+        let e = c + (rd(c + 0x15C0).wrapping_add(0x1C) << 4) as usize;
+        let seq = rw(c + 0x15C4);
+        wd(e + 4, 0);
+        ww(e, seq);
+        wb(e + 8, 0);
+        wb(e + 9, 0);
+        wb(e + 0xA, 0);
+        wd(e + 0xC, 0);
+        ww(c + 0x15C4, rw(c + 0x15C4).wrapping_add(1));
+        let n = rw(c + 0x15C4);
+        if n == 0xFFFF {
+            ww(c + 0x15C4, 0);
+        }
+        n as u32
+    }
+}
+
+unsafe fn h_ack_window_push(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let c = p.ecx as usize;
+        let ent = c + (rd(c + 0x15C0).wrapping_add(1).wrapping_add(0x1C) << 4) as usize;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(c + 0x15C0, 8), (ent, 0x10)], || h_ack_window_push_inner(&p));
+    }
+}
+port_thunk!(ack_window_push_thunk, ack_window_push_entry, ACK_WINDOW_PUSH, h_ack_window_push);
+
+// --- 0x7F8270 net_conn_ack_record (EAX = conn, SI = sequence word) ---------------------------------------------------
+// For a connection (id byte +0x1B0 < 0xC): find the ack-window entry (from +0x1C0, 0x10 bytes,
+// count +0x15C0) whose word equals the sequence; if its flag byte (+8) is clear: set it, and push
+// (clock [0x252A3CC] - the entry's stamp (+4)) >> 1 into the ring of 10 dwords at +0x220C (index
+// byte +0x2234, wraps at 10), bumping the total at +0x2238. EAX unchanged.
+
+unsafe fn ack_record(p: &Pushad) {
+    unsafe {
+        let c = p.eax as usize;
+        if c == 0 || rb(c + 0x1B0) >= 0xC {
+            return;
+        }
+        let mut k = 0usize;
+        if rd(c + 0x15C0) == 0 {
+            return;
+        }
+        let mut e = c + 0x1C0;
+        loop {
+            if rw(e) == p.esi as u16 {
+                break;
+            }
+            k += 1;
+            e += 0x10;
+            if k as u32 >= rd(c + 0x15C0) {
+                return;
+            }
+        }
+        if rb(e + 8) != 0 {
+            return;
+        }
+        let d = rd(0x0252_A3CC).wrapping_sub(rd(e + 4));
+        wb(e + 8, 1);
+        let idx = rb(c + 0x2234) as usize;
+        wd(c + 0x2238, rd(c + 0x2238).wrapping_add(1));
+        wd(c + 0x220C + idx * 4, d >> 1);
+        wb(c + 0x2234, rb(c + 0x2234).wrapping_add(1));
+        if rb(c + 0x2234) >= 0xA {
+            wb(c + 0x2234, 0);
+        }
+    }
+}
+
+unsafe fn h_ack_record(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let c = p.eax as usize;
+        let mut regions = vec![];
+        if c != 0 && rb(c + 0x1B0) < 0xC {
+            let n = (rd(c + 0x15C0) as usize).min(0x140);
+            regions = vec![(c + 0x1C0, n * 0x10), (c + 0x2234, 1), (c + 0x2238, 4), (c + 0x220C, 0x28)];
+        }
+        r.eax = shadow_mem(id, &p, [0; 3], &regions, || {
+            ack_record(&p);
+            p.eax
+        });
+    }
+}
+port_thunk!(ack_record_thunk, ack_record_entry, ACK_RECORD, h_ack_record);
+
+// --- 0x7FA9E0 net_conn_check_timeout (EDI = conn -> AL) ----------------------------------------------------------------
+// Always alive (1) on the hosting path ([0x2528B56] set). Otherwise: a connection whose ready byte
+// (+0x1B8) is 0 is dead; one silent for more than 0xEA60 ms (0x3A98 when the session state
+// [session+0x1C] is 0xA) has its ready byte cleared and is dead; one silent for more than 0x3A98 ms
+// is dead without the clear. The silence is [0x252A3CC] - [conn+0x2240] minus 1 when the clock
+// is below the stamp (a wrapped difference). The rest of EAX is untouched.
+
+unsafe fn check_timeout(p: &Pushad) -> u32 {
+    unsafe {
+        if rb(0x0252_8B56) != 0 {
+            return lo(p.eax, 1);
+        }
+        let c = p.edi as usize;
+        if rb(c + 0x1B8) == 0 {
+            return lo(p.eax, 0);
+        }
+        let limit = if rd(rd(c + 0x1AC) as usize + 0x1C) == 0xA { 0x3A98u32 } else { 0xEA60 };
+        let now = rd(0x0252_A3CC);
+        let stamp = rd(c + 0x2240);
+        let mut d = now.wrapping_sub(stamp);
+        if stamp > now {
+            d = d.wrapping_sub(1);
+        }
+        if d > limit {
+            wb(c + 0x1B8, 0);
+            return lo(p.eax, 0);
+        }
+        lo(p.eax, (d <= 0x3A98) as u32)
+    }
+}
+
+unsafe fn h_check_timeout(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(p.edi as usize + 0x1B8, 1)], || check_timeout(&p));
+    }
+}
+port_thunk!(check_timeout_thunk, check_timeout_entry, CHECK_TIMEOUT, h_check_timeout);
+
+// --- 0x7FC8B0 net_timeout_expired (-> AL) -----------------------------------------------------------------------------------
+// Armed ([0x2528B89]) with a non-negative deadline [0xEB1614]: expired when the wall clock
+// [0xE843AC] is at or past it (difference under 0x35A4E900, signed), or the deadline is more than
+// that ahead (the clock wrapped). EAX: the deadline (or the difference) with AL replaced.
+
+unsafe fn h_timeout_expired(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let ours = if rb(0x0252_8B89) == 0 {
+            lo(p.eax, 0)
+        } else {
+            let mut eax = rd(0x00EB_1614);
+            if (eax as i32) < 0 {
+                lo(eax, 0)
+            } else {
+                let ecx = rd(0x00E8_43AC);
+                if (eax as i32) > (ecx as i32) {
+                    eax = eax.wrapping_sub(ecx);
+                    lo(eax, ((eax as i32) >= 0x35A4_E900) as u32)
+                } else {
+                    lo(eax, ((ecx.wrapping_sub(eax) as i32) < 0x35A4_E900) as u32)
+                }
+            }
+        };
+        r.eax = checked_eax(id, &p, [0; 3], ours);
+    }
+}
+port_thunk!(timeout_expired_thunk, timeout_expired_entry, TIMEOUT_EXPIRED, h_timeout_expired);
+
+// --- 0x7FC8F0 net_timeout_arm_10s: deadline = clock + 10000 (wrapped at 0x6B49D200), armed; then a tail jump
+// to 0x80B8D0 (which stores another wrapped deadline in [0xEB1FA0]); EAX = its.
+
+unsafe fn h_timeout_arm_10s(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(0x0252_8B89, 1), (0x00EB_1614, 4), (0x00EB_1FA0, 4)], || {
+            let mut eax = rd(0x00E8_43AC).wrapping_add(0x2710);
+            wb(0x0252_8B89, 1);
+            wd(0x00EB_1614, eax);
+            if (eax as i32) > 0x6B49_D200 {
+                eax = eax.wrapping_sub(0x6B49_D200u32);
+                wd(0x00EB_1614, eax);
+            }
+            call_regs(0x0080_B8D0, eax, p.ecx, p.edx, p.esi, p.edi, &[])
+        });
+    }
+}
+port_thunk!(timeout_arm_10s_thunk, timeout_arm_10s_entry, TIMEOUT_ARM_10S, h_timeout_arm_10s);
+
+// --- 0x7FB1C0 net_rate_meter_init (EDX = byte window, ECX = capacity; stack: meter, word; `ret 8`) -------------------
+// +0x00 capacity (<= 0xE000), +0x04..+0x78 the 30 slots (cleared), +0x7C head (0), +0x7D window
+// (<= 0x1E), +0x7E the word. EAX = meter.
+
+unsafe fn h_rate_meter_init(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let (m, w) = (*a, *a.add(1));
+        r.eax = shadow_mem(id, &p, [m, w, 0], &[(m as usize, 0x80)], || {
+            let dl = p.edx as u8;
+            let win = if dl < 0x1E { dl as u32 } else { 0x1E };
+            wb(m as usize + 0x7D, win as u8);
+            ww(m as usize + 0x7E, w as u16);
+            let cap = if p.ecx > 0xE000 { 0xE000 } else { p.ecx };
+            wd(m as usize, cap);
+            for i in 1..=0x1E {
+                wd(m as usize + i * 4, 0);
+            }
+            wb(m as usize + 0x7C, 0);
+            m
+        });
+    }
+}
+port_thunk!(rate_meter_init_thunk, rate_meter_init_entry, RATE_METER_INIT, h_rate_meter_init, "ret 8");
+
+// --- 0x7FB2B0 net_rate_meter_remaining (EDX = meter -> EAX) ------------------------------------------------------------
+// capacity - (the sum of the last `window` slots, walking back from the head with wrap at 0x1D), or 0
+// when the sum exceeds the capacity.
+
+unsafe fn h_rate_meter_remaining(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let m = p.edx as usize;
+        let mut head = rb(m + 0x7C) as u32;
+        let mut n = rb(m + 0x7D) as u32;
+        let mut sum = 0u32;
+        while n > 0 {
+            sum = sum.wrapping_add(rd(m + head as usize * 4 + 4));
+            head = if head == 0 { 0x1D } else { head - 1 };
+            n -= 1;
+        }
+        let cap = rd(m);
+        let ours = if sum > cap { 0 } else { cap - sum };
+        r.eax = checked_eax(id, &p, [0; 3], ours);
+    }
+}
+port_thunk!(rate_meter_remaining_thunk, rate_meter_remaining_entry, RATE_METER_REMAINING, h_rate_meter_remaining);
+
+// --- 0x7FB100 net_conn_note_received (EAX = conn, DX = id) --------------------------------------------------------------
+// Pushes the id (unless 0xFFFF) on the list of up to 100 words at +0x15C6 (count word +0x168E) for a
+// ready connection, and stamps +0x2240 with the clock [0x252A3CC]. EAX unchanged.
+
+unsafe fn h_conn_note_received(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let c = p.eax as usize;
+        let regions = if c != 0 { vec![(c + 0x168E, 2), (c + 0x15C6, 0xC8), (c + 0x2240, 4)] } else { vec![] };
+        r.eax = shadow_mem(id, &p, [0; 3], &regions, || {
+            if c != 0 {
+                if rb(c + 0x1B8) != 0 && p.edx as u16 != 0xFFFF {
+                    let n = rw(c + 0x168E);
+                    if n < 0x64 {
+                        ww(c + n as usize * 2 + 0x15C6, p.edx as u16);
+                        ww(c + 0x168E, rw(c + 0x168E).wrapping_add(1));
+                    }
+                }
+                wd(c + 0x2240, rd(0x0252_A3CC));
+            }
+            p.eax
+        });
+    }
+}
+port_thunk!(conn_note_received_thunk, conn_note_received_entry, CONN_NOTE_RECEIVED, h_conn_note_received);
+
+// --- 0x7FB190 net_conn_ack_window_mark_all (EDX = conn) ------------------------------------------------------------------
+// Sets byte +9 of every ack-window entry. EAX = the count (0 when empty); unchanged for no connection.
+
+unsafe fn h_ack_window_mark_all(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let c = p.edx as usize;
+        let n = if c != 0 { rd(c + 0x15C0) } else { 0 };
+        let regions = if c != 0 { vec![(c + 0x1C0, (n as usize).min(0x140) * 0x10)] } else { vec![] };
+        r.eax = shadow_mem(id, &p, [0; 3], &regions, || {
+            if c == 0 {
+                return p.eax;
+            }
+            let mut i = 0u32;
+            while i < rd(c + 0x15C0) {
+                wb(c + 0x1C9 + i as usize * 0x10, 1);
+                i += 1;
+            }
+            i
+        });
+    }
+}
+port_thunk!(ack_window_mark_all_thunk, ack_window_mark_all_entry, ACK_WINDOW_MARK_ALL, h_ack_window_mark_all);
+
+// --- 0x7F8160 net_conn_reset_ack_window (EAX = conn) --------------------------------------------------------------------
+// Clears the count, the received-list count and +0x1690, sets the sequence word to 1 and clears the first
+// entry. EAX unchanged.
+
+unsafe fn h_reset_ack_window(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let c = p.eax as usize;
+        let regions = if c != 0 { vec![(c + 0x15C0, 8), (c + 0x168E, 4), (c + 0x1C0, 0x10)] } else { vec![] };
+        r.eax = shadow_mem(id, &p, [0; 3], &regions, || {
+            if c != 0 {
+                wd(c + 0x15C0, 0);
+                ww(c + 0x168E, 0);
+                ww(c + 0x1690, 0);
+                ww(c + 0x15C4, 0);
+                wd(c + 0x1C4, 0);
+                ww(c + 0x1C0, 0);
+                wb(c + 0x1C8, 0);
+                wb(c + 0x1C9, 0);
+                wb(c + 0x1CA, 0);
+                wd(c + 0x1CC, 0);
+                ww(c + 0x15C4, 1);
+            }
+            p.eax
+        });
+    }
+}
+port_thunk!(reset_ack_window_thunk, reset_ack_window_entry, RESET_ACK_WINDOW, h_reset_ack_window);
+
+// --- 0x7FCAB0 net_clock_predicted_ms (-> EAX) ----------------------------------------------------------------------------
+// With the hosting path ([0x2528B56] set and [0x2528B2B] clear) or an unset session byte (+0x3F8): the
+// session clock ([session+8]) plus 1000 * the local connection's [+0x1DE8] (0 -> just the clock).
+// Otherwise the clock minus trunc(f32[0x213002C] * f64[0xE5C200]) plus 100.
+
+unsafe fn h_clock_predicted_ms(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let s = rd(0x0252_8C14) as usize;
+        let local_path = if rb(0x0252_8B56) != 0 && rb(0x0252_8B2B) == 0 { true } else { rb(s + 0x3F8) == 0 };
+        let ours = if !local_path {
+            let t = fist_trunc_lo(rf(0x0213_002C) as f64 * f64::from_bits(((rd(0x00E5_C204) as u64) << 32) | rd(0x00E5_C200) as u64));
+            rd(s + 8).wrapping_sub(t).wrapping_add(0x64)
+        } else {
+            let n = rd(rd(s + 0x408) as usize + 0x1DE8);
+            if n == 0 { rd(s + 8) } else { n.wrapping_mul(0x3E8).wrapping_add(rd(s + 8)) }
+        };
+        r.eax = checked_eax(id, &p, [0; 3], ours);
+    }
+}
+port_thunk!(clock_predicted_ms_thunk, clock_predicted_ms_entry, CLOCK_PREDICTED_MS, h_clock_predicted_ms);
+
+// --- 0x7FC930 net_clock_advance -----------------------------------------------------------------------------------------------
+// Unless the session is the hosting kind ([0x2528B56] set, a session, [0x2528B2B] clear or +0x3F8 clear
+// -> straight out with EAX = session): add the frame delta [0x212B15C] to field +8 of every pooled
+// entry (same reader-count / lock pattern as the pool lookups), add it to the offline clock
+// [0x212B160], then recompute the delta as trunc(f32[0xE8437C or 0xE84380] * f64[0xE5C0D8]) clamped
+// to 0xFA (unsigned). EAX = the unclamped value.
+
+unsafe fn clock_advance(p: &Pushad) -> u32 {
+    unsafe {
+        let _ = p;
+        if rb(0x0252_8B56) != 0 {
+            let s = rd(0x0252_8C14);
+            if s != 0 && (rb(0x0252_8B2B) == 0 || rb(s as usize + 0x3F8) == 0) {
+                return s;
+            }
+        }
+        let delta = rd(0x0212_B15C);
+        pool_lookup(|e| {
+            wd(e as usize + 8, rd(e as usize + 8).wrapping_add(delta));
+            false
+        });
+        wd(0x0212_B160, rd(0x0212_B160).wrapping_add(rd(0x0212_B15C)));
+        let f = if rb(0x0252_8B56) != 0 { rf(0x00E8_437C) } else { rf(0x00E8_4380) };
+        let c = f64::from_bits(((rd(0x00E5_C0DC) as u64) << 32) | rd(0x00E5_C0D8) as u64);
+        let eax = fist_trunc_lo(f as f64 * c);
+        wd(0x0212_B15C, eax);
+        if eax > 0xFA {
+            wd(0x0212_B15C, 0xFA);
+        }
+        eax
+    }
+}
+
+unsafe fn h_clock_advance(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let mut regions = vec![(0x0212_B15Cusize, 4usize), (0x0212_B160, 4)];
+        if shadowing_active(id) {
+            pool_find(|e| {
+                regions.push((e as usize + 8, 4));
+                false
+            });
+        }
+        r.eax = shadow_mem(id, &p, [0; 3], &regions, || clock_advance(&p));
+    }
+}
+port_thunk!(clock_advance_thunk, clock_advance_entry, CLOCK_ADVANCE, h_clock_advance);
+
+// --- session predicates and list walkers --------------------------------------------------------------------------------
+// Circular connection list: head [session+0x400], link [conn+0x22CC]; the walks stop on the head or 0.
+
+/// 0x80FF70 net_session_out_of_phase_mask (ECX = session -> EAX): bit [conn+0x1B0] for every
+/// connection whose phase [+0x40] differs from the designated peer's ([session+0x404]) phase
+/// (the peer itself and the empty list give 0).
+unsafe fn h_out_of_phase_mask(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let s = p.ecx as usize;
+        let head = rd(s + 0x400);
+        let mut mask = 0u32;
+        if head != 0 {
+            let peer = rd(s + 0x404);
+            let mut n = head;
+            loop {
+                if n != peer && rd(peer as usize + 0x40) != rd(n as usize + 0x40) {
+                    mask |= 1u32.wrapping_shl(rb(n as usize + 0x1B0) as u32);
+                }
+                n = rd(n as usize + 0x22CC);
+                if n == head || n == 0 {
+                    break;
+                }
+            }
+        }
+        r.eax = checked_eax(id, &p, [0; 3], mask);
+    }
+}
+port_thunk!(out_of_phase_mask_thunk, out_of_phase_mask_entry, OUT_OF_PHASE_MASK, h_out_of_phase_mask);
+
+/// 0x80FF00 session_peers_phase_equal (EDX = session -> AL): true when this is not the hosting
+/// path ([0x2528B56] set, [0x2528B2B] clear) or the session byte +0x3F8 is clear; false when
+/// 0x8CD8D0 (EAX = session) says so; else whether every connection but the peer shares the peer's phase.
+/// The upper EAX bytes are the original's: the node it stopped on, or 0x8CD8D0's.
+unsafe fn peers_phase_equal(p: &Pushad) -> u32 {
+    unsafe {
+        let s = p.edx as usize;
+        if (rb(0x0252_8B56) != 0 && rb(0x0252_8B2B) == 0) || rb(s + 0x3F8) == 0 {
+            return lo(p.eax, 1);
+        }
+        let r = call_regs(0x008C_D8D0, p.edx, 0, 0, 0, 0, &[]);
+        if r as u8 != 0 {
+            return lo(r, 0);
+        }
+        let head = rd(s + 0x400);
+        let mut n = head;
+        if n == 0 {
+            return lo(n, 1);
+        }
+        let peer = rd(s + 0x404);
+        loop {
+            if n != peer && rd(peer as usize + 0x40) != rd(n as usize + 0x40) {
+                return lo(n, 0);
+            }
+            n = rd(n as usize + 0x22CC);
+            if n == head || n == 0 {
+                return lo(n, 1);
+            }
+        }
+    }
+}
+
+unsafe fn h_peers_phase_equal(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = checked_eax(id, &p, [0; 3], peers_phase_equal(&p));
+    }
+}
+port_thunk!(peers_phase_equal_thunk, peers_phase_equal_entry, PEERS_PHASE_EQUAL, h_peers_phase_equal);
+
+/// 0x810040 session_all_conns_state_eq / 0x8100F0 session_all_conns_state_ge (ESI = session,
+/// EDI = state -> AL): needs 0x80FF00 (EDX = session) to say yes, then every connection's state
+/// [+0x3C] must equal / be >= (signed) EDI. The upper EAX bytes: 0x80FF00's, or the node that failed / ended the walk.
+unsafe fn all_conns_state(p: &Pushad, ge: bool) -> u32 {
+    unsafe {
+        let s = p.esi as usize;
+        let r = call_regs(0x0080_FF00, p.eax, p.ecx, p.esi, p.esi, p.edi, &[]);
+        if r as u8 == 0 {
+            return lo(r, 0);
+        }
+        let head = rd(s + 0x400);
+        let mut n = head;
+        if n == 0 {
+            return lo(0, 1);
+        }
+        loop {
+            let st = rd(n as usize + 0x3C);
+            let bad = if ge { (st as i32) < (p.edi as i32) } else { st != p.edi };
+            if bad {
+                return lo(n, 0);
+            }
+            n = rd(n as usize + 0x22CC);
+            if n == head || n == 0 {
+                return lo(n, 1);
+            }
+        }
+    }
+}
+
+unsafe fn h_all_conns_state_eq(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = checked_eax(id, &p, [0; 3], all_conns_state(&p, false));
+    }
+}
+port_thunk!(all_conns_state_eq_thunk, all_conns_state_eq_entry, ALL_CONNS_STATE_EQ, h_all_conns_state_eq);
+
+unsafe fn h_all_conns_state_ge(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = checked_eax(id, &p, [0; 3], all_conns_state(&p, true));
+    }
+}
+port_thunk!(all_conns_state_ge_thunk, all_conns_state_ge_entry, ALL_CONNS_STATE_GE, h_all_conns_state_ge);
+
+/// 0x810080 lobby_any_conn_state_4 (-> AL): some connection of the list of the session at [0x2528CE8] is in state 4.
+unsafe fn h_lobby_any_conn_state_4(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let head = rd(rd(0x0252_8CE8) as usize + 0x400);
+        let mut n = head;
+        let ours = if n == 0 {
+            lo(n, 0)
+        } else {
+            loop {
+                if rd(n as usize + 0x3C) == 4 {
+                    break lo(n, 1);
+                }
+                n = rd(n as usize + 0x22CC);
+                if n == head || n == 0 {
+                    break lo(n, 0);
+                }
+            }
+        };
+        r.eax = checked_eax(id, &p, [0; 3], ours);
+    }
+}
+port_thunk!(lobby_any_conn_state_4_thunk, lobby_any_conn_state_4_entry, LOBBY_ANY_CONN_STATE_4, h_lobby_any_conn_state_4);
+
+/// 0x80CEB0 session_state_in_set_b (EAX = session -> AL): state ([+0x1C]) in {2, 4, 7, 9, 10, 11, 12}.
+/// EAX keeps state - 2 above the low byte.
+unsafe fn h_state_in_set_b(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let e = rd(p.eax as usize + 0x1C).wrapping_sub(2);
+        let yes = e <= 0xA && [0u8, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0][e as usize] == 0;
+        r.eax = checked_eax(id, &p, [0; 3], lo(e, yes as u32));
+    }
+}
+port_thunk!(state_in_set_b_thunk, state_in_set_b_entry, STATE_IN_SET_B, h_state_in_set_b);
+
+/// 0x80CF10 session_state_is_8 (-> EAX 0 / 1): the state of the session at [0x2528CB4] is 8.
+unsafe fn h_state_is_8(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let ours = (rd(rd(0x0252_8CB4) as usize + 0x1C) == 8) as u32;
+        r.eax = checked_eax(id, &p, [0; 3], ours);
+    }
+}
+port_thunk!(state_is_8_thunk, state_is_8_entry, STATE_IS_8, h_state_is_8);
+
+/// 0x7F7A00 net_local_conn_id (-> AL): the id byte [+0x1B0] of the session's local connection ([session+0x408]), 0 without a session.
+/// EAX keeps the connection pointer above AL.
+unsafe fn h_local_conn_id(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let s = rd(0x0252_8C14);
+        let ours = if s == 0 {
+            0
+        } else {
+            let c = rd(s as usize + 0x408);
+            lo(c, rb(c as usize + 0x1B0) as u32)
+        };
+        r.eax = checked_eax(id, &p, [0; 3], ours);
+    }
+}
+port_thunk!(local_conn_id_thunk, local_conn_id_entry, LOCAL_CONN_ID, h_local_conn_id);
+
+/// 0x7F8020 net_id_to_human (AX = net id -> EAX): the object a net id maps to (map 0x212E258, find
+/// 0x808E30 (ESI = map; id, 0)), through the handle slot table, when its flag byte +0x3CC is exactly 1
+/// (the original builds an all-ones / zero mask with `neg` / `sbb` / `not`); else 0.
+unsafe fn id_to_human(p: &Pushad) -> u32 {
+    unsafe {
+        let key = p.eax & 0xFFFF;
+        if p.eax as u16 == 0xFFFF {
+            return 0;
+        }
+        let node = call_regs(0x0080_8E30, key, p.ecx, p.edx, rd(NET_ID_MAP), p.edi, &[key, 0]);
+        if node == 0 {
+            return 0;
+        }
+        let rec = rd(node as usize);
+        if rec == 0 {
+            return 0;
+        }
+        let handle = rd(rec as usize + 4);
+        if handle == 0 {
+            return 0;
+        }
+        let o = rd(HANDLES + ((handle & 0xFFF) as usize) * 16);
+        if o == 0 || rd(o as usize + 0x44) != handle || rd(o as usize + 0x4C) != 1 {
+            return 0;
+        }
+        if rb(o as usize + 0x3CC).wrapping_sub(1) != 0 { 0 } else { o }
+    }
+}
+
+unsafe fn h_id_to_human(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = checked_eax(id, &p, [0; 3], id_to_human(&p));
+    }
+}
+port_thunk!(id_to_human_thunk, id_to_human_entry, ID_TO_HUMAN, h_id_to_human);
+
+/// 0x807A20 net_remote_handle_map_set (EAX = key, [esp+4] = value, `ret 4`; ESI saved): find-or-create
+/// (0x808E30 with create = 1) the node of the key in map 0x212E258 and store the value in its first
+/// dword. AL = 1 (EAX = the node pointer above it), or 0 (EAX = 0) without a node.
+/// Shadow: Rust first (it creates the node), then the original copy finds the same node and stores the same value.
+unsafe fn h_map_set(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let v = *a;
+        let node = call_regs(0x0080_8E30, p.eax, p.ecx, p.edx, rd(NET_ID_MAP), p.edi, &[p.eax, 1]);
+        let ours = if node == 0 {
+            0
+        } else {
+            wd(node as usize, v);
+            lo(node, 1)
+        };
+        let Some((n, orig)) = shadowing(id) else {
+            r.eax = ours;
+            return;
+        };
+        let inp = Regs::of(&p);
+        let mut o = inp;
+        call_orig(orig, &mut o, [v, 0, 0], false);
+        check_preserved(id, &inp, &o);
+        if o.eax != ours {
+            mismatch(id, n, format!("key {:#x} value {v:#x}: original {:#x}, Rust {ours:#x}", p.eax, o.eax));
+            r.eax = o.eax;
+            return;
+        }
+        r.eax = ours;
+    }
+}
+port_thunk!(map_set_thunk, map_set_entry, MAP_SET, h_map_set, "ret 4");
+
+/// 0x80F2E0 session_find_reservation (EAX = session, stack: guid*, out index*; `ret 8`): the last-to-first
+/// scan of the session's reservations (count +0x3F4, 0x50-byte entries from +0x5C, GUID at +0 compared with
+/// 0x8176E0 (ECX = wanted, EDX = entry), id dword at +0x24 compared with the wanted one's). Found: store
+/// the index through the out pointer (when non-null), AL = 1; else AL = 0. The upper EAX bytes are 0x8176E0's.
+unsafe fn find_reservation(p: &Pushad, guid: u32, out: u32) -> u32 {
+    unsafe {
+        let s = p.eax as usize;
+        let mut i = (rd(s + 0x3F4) as i32).wrapping_sub(1);
+        if i < 0 {
+            return lo(p.eax, 0);
+        }
+        let mut e = (s + 0x5C + (i as usize).wrapping_mul(0x50)) as u32;
+        let mut r;
+        loop {
+            r = call_regs(0x0081_76E0, p.eax, guid, e, 0, 0, &[]);
+            if r as u8 != 0 && rd(e as usize + 0x24) == rd(guid as usize + 0x24) {
+                if out != 0 {
+                    wd(out as usize, i as u32);
+                }
+                return lo(r, 1);
+            }
+            i -= 1;
+            e = e.wrapping_sub(0x50);
+            if i < 0 {
+                return lo(r, 0);
+            }
+        }
+    }
+}
+
+unsafe fn h_find_reservation(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let (guid, out) = (*a, *a.add(1));
+        let regions = if out != 0 { vec![(out as usize, 4usize)] } else { vec![] };
+        r.eax = shadow_mem(id, &p, [guid, out, 0], &regions, || find_reservation(&p, guid, out));
+    }
+}
+port_thunk!(find_reservation_thunk, find_reservation_entry, FIND_RESERVATION, h_find_reservation, "ret 8");
+
+/// 0x80F340 session_remove_reservation (EAX = session, EDX = index): count -= 1 and, unless the removed index
+/// is the new count, the last entry's two 0x28-byte halves (+0x34 and +0x5C of the 0x50-byte entry slot)
+/// overwrite the removed one's. EAX = the session, or the removed slot's +0x5C half.
+unsafe fn remove_reservation(p: &Pushad) -> u32 {
+    unsafe {
+        let s = p.eax as usize;
+        wd(s + 0x3F4, rd(s + 0x3F4).wrapping_add(0xFFFF_FFFF));
+        let last = rd(s + 0x3F4);
+        if last == p.edx {
+            return p.eax;
+        }
+        let l = (last as usize).wrapping_mul(0x50);
+        let d = (p.edx as usize).wrapping_mul(0x50).wrapping_add(s);
+        let tmp1 = snap_bytes(l.wrapping_add(s).wrapping_add(0x34), 0x28);
+        std::ptr::copy_nonoverlapping(tmp1.as_ptr(), d.wrapping_add(0x34) as *mut u8, 0x28);
+        let tmp2 = snap_bytes(l.wrapping_add(s).wrapping_add(0x5C), 0x28);
+        std::ptr::copy_nonoverlapping(tmp2.as_ptr(), d.wrapping_add(0x5C) as *mut u8, 0x28);
+        d.wrapping_add(0x5C) as u32
+    }
+}
+
+unsafe fn h_remove_reservation(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let s = p.eax as usize;
+        let d = (p.edx as usize).wrapping_mul(0x50).wrapping_add(s);
+        r.eax = shadow_mem(id, &p, [0; 3], &[(s + 0x3F4, 4), (d.wrapping_add(0x34), 0x50)], || remove_reservation(&p));
+    }
+}
+port_thunk!(remove_reservation_thunk, remove_reservation_entry, REMOVE_RESERVATION, h_remove_reservation);
+
+/// 0x80C350 session_guid_in_array (EAX = array of 0x28-byte GUID entries; stack: count, base; cdecl): AL = 1 when some
+/// entry matches the GUID at base + 0x14C (0x8176E0: ECX = entry, EDX = GUID) with an equal id dword (+0x24).
+/// EAX: the id dword with AL = 1 when found; else the last value EAX held with AL = 0.
+unsafe fn guid_in_array(p: &Pushad, count: u32, base: u32) -> u32 {
+    unsafe {
+        let g = base.wrapping_add(0x14C);
+        let mut eax = p.eax;
+        let mut e = p.eax;
+        let mut i = 0i32;
+        if (count as i32) > 0 {
+            loop {
+                eax = call_regs(0x0081_76E0, eax, e, g, 0, 0, &[]);
+                if eax as u8 != 0 {
+                    eax = rd(g as usize + 0x24);
+                    if eax == rd(e as usize + 0x24) {
+                        return lo(eax, 1);
+                    }
+                }
+                i += 1;
+                e = e.wrapping_add(0x28);
+                if i >= count as i32 {
+                    break;
+                }
+            }
+        }
+        lo(eax, 0)
+    }
+}
+
+unsafe fn h_guid_in_array(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let (count, base) = (*a, *a.add(1));
+        r.eax = checked_eax(id, &p, [count, base, 0], guid_in_array(&p, count, base));
+    }
+}
+port_thunk!(guid_in_array_thunk, guid_in_array_entry, GUID_IN_ARRAY, h_guid_in_array);
+
+/// 0x80C4E0 session_find_best_conn (EDI = list head, [esp+4] = connection to skip -> EAX): among the ready (byte +0x1B8),
+/// not-flagged (byte +0x1DCC clear) connections but the skipped one, the one with the largest dword +0x1DBC
+/// (the first wins ties; any beats nothing); 0 for none.
+unsafe fn h_find_best_conn(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let skip = *a;
+        let (mut best, mut score) = (0u32, 0u32);
+        let head = p.edi;
+        if head != 0 {
+            let mut c = head;
+            loop {
+                if c != skip && rb(c as usize + 0x1DCC) == 0 && rb(c as usize + 0x1B8) != 0 {
+                    let v = rd(c as usize + 0x1DBC);
+                    if v > score || best == 0 {
+                        best = c;
+                        score = v;
+                    }
+                }
+                c = rd(c as usize + 0x22CC);
+                if c == head || c == 0 {
+                    break;
+                }
+            }
+        }
+        r.eax = checked_eax(id, &p, [skip, 0, 0], best);
+    }
+}
+port_thunk!(find_best_conn_thunk, find_best_conn_entry, FIND_BEST_CONN, h_find_best_conn);
+
+/// 0x80C560 session_info_base_init (EAX = object): vtable 0xDFFD54 and the base fields cleared / set.
+unsafe fn h_session_info_base_init(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(o, 0x4A)], || {
+            wd(o, 0x00DF_FD54);
+            wd(o + 0x30, 0);
+            wb(o + 0x34, 0);
+            wd(o + 0x38, 0);
+            wd(o + 0x3C, 1);
+            for off in [0x41, 0x42, 0x43, 0x44, 0x46, 0x47, 0x48, 0x49] {
+                wb(o + off, 0);
+            }
+            p.eax
+        });
+    }
+}
+port_thunk!(session_info_base_init_thunk, session_info_base_init_entry, SESSION_INFO_BASE_INIT, h_session_info_base_init);
+
+// --- serialiser helper-object constructors (EAX = object) ----------------------------------------------------------------
+// Stores only. Floats pass through `fld dword` / `fstp dword` (a signalling NaN is quieted: q32).
+// Several take many stack arguments, so their shadow calls the original copy with `call_regs`.
+
+/// `shadow_mem` for originals with many stack arguments (`call_regs` restores ESP after a `ret N`).
+unsafe fn shadow_mem_regs(id: usize, p: &Pushad, args: &[u32], regions: &[(usize, usize)], ours: impl FnOnce() -> u32) -> u32 {
+    unsafe {
+        let Some((n, orig)) = shadowing(id) else { return ours() };
+        let snap = || regions.iter().map(|&(a, l)| snap_bytes(a, l)).collect::<Vec<_>>();
+        let put = |s: &Vec<Vec<u8>>| {
+            for (&(a, l), b) in regions.iter().zip(s) {
+                if l > 0 {
+                    std::ptr::copy_nonoverlapping(b.as_ptr(), a as *mut u8, l);
+                }
+            }
+        };
+        let pre = snap();
+        let eax = call_regs(orig, p.eax, p.ecx, p.edx, p.esi, p.edi, args);
+        let post_o = snap();
+        put(&pre);
+        let v = ours();
+        let post_r = snap();
+        if post_r != post_o || v != eax {
+            mismatch(id, n, format!("in {:x?} args {args:x?}: original eax {eax:#x} mem {post_o:x?}, Rust eax {v:#x} mem {post_r:x?}", Regs::of(p)));
+            put(&post_o);
+            return eax;
+        }
+        v
+    }
+}
+
+unsafe fn args_of(a: *const u32, n: usize) -> Vec<u32> {
+    (0..n).map(|i| unsafe { *a.add(i) }).collect()
+}
+
+/// 0x7FDBB0 / 0x7FDBC0 byte noncompressor init (EAX = object [, ECX = bit count]): vtable 0xE264C4, byte count (0 / ECX >> 3) at +4.
+unsafe fn h_byte_nc_init(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(o, 8)], || {
+            wd(o, 0x00E2_64C4);
+            wd(o + 4, 0);
+            p.eax
+        });
+    }
+}
+unsafe fn h_byte_nc_init_bits(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(o, 8)], || {
+            wd(o, 0x00E2_64C4);
+            wd(o + 4, p.ecx >> 3);
+            p.eax
+        });
+    }
+}
+port_thunk!(byte_nc_init_thunk, byte_nc_init_entry, BYTE_NC_INIT, h_byte_nc_init);
+port_thunk!(byte_nc_init_bits_thunk, byte_nc_init_bits_entry, BYTE_NC_INIT_BITS, h_byte_nc_init_bits);
+
+/// 0x7FDC90 / 0x7FDCB0 bit noncompressor init (EAX = object [, ECX = bit count]): vtable 0xE264D8, {bits, bytes, rest} at +4 / +8 / +0xC.
+unsafe fn h_bit_nc_init(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(o, 0x10)], || {
+            wd(o, 0x00E2_64D8);
+            wd(o + 4, 0);
+            wd(o + 8, 0);
+            wd(o + 0xC, 0);
+            p.eax
+        });
+    }
+}
+unsafe fn h_bit_nc_init_bits(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(o, 0x10)], || {
+            wd(o + 4, p.ecx);
+            wd(o, 0x00E2_64D8);
+            wd(o + 8, p.ecx >> 3);
+            wd(o + 0xC, p.ecx & 7);
+            p.eax
+        });
+    }
+}
+port_thunk!(bit_nc_init_thunk, bit_nc_init_entry, BIT_NC_INIT, h_bit_nc_init);
+port_thunk!(bit_nc_init_bits_thunk, bit_nc_init_bits_entry, BIT_NC_INIT_BITS, h_bit_nc_init_bits);
+
+/// 0x7FDE30 net_float_compressor_init (EAX = object, ECX = +0; stack: 5 floats, a byte; `ret 0x18`).
+unsafe fn h_float_comp_init(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        let v = args_of(a, 6);
+        r.eax = shadow_mem_regs(id, &p, &v, &[(o, 0x1C)], || {
+            wd(o + 4, q32(v[0]));
+            wd(o, p.ecx);
+            wb(o + 0x18, v[5] as u8);
+            wd(o + 8, q32(v[1]));
+            wd(o + 0xC, q32(v[2]));
+            wd(o + 0x10, q32(v[3]));
+            wd(o + 0x14, q32(v[4]));
+            p.eax
+        });
+    }
+}
+port_thunk!(float_comp_init_thunk, float_comp_init_entry, FLOAT_COMP_INIT, h_float_comp_init, "ret 24");
+
+/// 0x7FDE60 net_float_compressor_init_copy (EAX = object; stack: 7 dwords copied to +4; vtable 0xE264EC; `ret 0x1C`).
+unsafe fn h_float_comp_init_copy(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        let v = args_of(a, 7);
+        r.eax = shadow_mem_regs(id, &p, &v, &[(o, 0x20)], || {
+            for (i, x) in v.iter().enumerate() {
+                wd(o + 4 + i * 4, *x);
+            }
+            wd(o, 0x00E2_64EC);
+            p.eax
+        });
+    }
+}
+port_thunk!(float_comp_init_copy_thunk, float_comp_init_copy_entry, FLOAT_COMP_INIT_COPY, h_float_comp_init_copy, "ret 28");
+
+/// 0x7FE110 net_float_compressor_copy (EAX = destination, ECX = source): 7 dwords from source + 4 to destination + 4.
+unsafe fn h_float_comp_copy(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(o + 4, 0x1C)], || {
+            let tmp = snap_bytes(p.ecx as usize + 4, 0x1C);
+            std::ptr::copy_nonoverlapping(tmp.as_ptr(), (o + 4) as *mut u8, 0x1C);
+            p.eax
+        });
+    }
+}
+port_thunk!(float_comp_copy_thunk, float_comp_copy_entry, FLOAT_COMP_COPY, h_float_comp_copy);
+
+/// 0x7FE0B0 net_vector3_compressor_ctor (EAX = object; stack: three 7-dword blocks and a float; `ret 0x58`):
+/// vtable 0xE26500, 0xE264EC at +4 / +0x24 / +0x44, the blocks at +8 / +0x28 / +0x48, the float at +0x64.
+unsafe fn h_vector3_comp_ctor(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        let v = args_of(a, 22);
+        r.eax = shadow_mem_regs(id, &p, &v, &[(o, 0x68)], || {
+            wd(o, 0x00E2_6500);
+            wd(o + 4, 0x00E2_64EC);
+            wd(o + 0x24, 0x00E2_64EC);
+            wd(o + 0x44, 0x00E2_64EC);
+            for i in 0..7 {
+                wd(o + 8 + i * 4, v[i]);
+            }
+            for i in 0..7 {
+                wd(o + 0x28 + i * 4, v[7 + i]);
+            }
+            for i in 0..7 {
+                wd(o + 0x48 + i * 4, v[14 + i]);
+            }
+            wd(o + 0x64, q32(v[21]));
+            p.eax
+        });
+    }
+}
+port_thunk!(vector3_comp_ctor_thunk, vector3_comp_ctor_entry, VECTOR3_COMP_CTOR, h_vector3_comp_ctor, "ret 88");
+
+/// 0x7FE3A0 net_vector2_compressor_ctor (EAX = object; stack: two 7-dword blocks and a float; `ret 0x3C`).
+unsafe fn h_vector2_comp_ctor(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        let v = args_of(a, 15);
+        r.eax = shadow_mem_regs(id, &p, &v, &[(o, 0x48)], || {
+            wd(o, 0x00E2_6514);
+            wd(o + 4, 0x00E2_64EC);
+            wd(o + 0x24, 0x00E2_64EC);
+            for i in 0..7 {
+                wd(o + 8 + i * 4, v[i]);
+            }
+            for i in 0..7 {
+                wd(o + 0x28 + i * 4, v[7 + i]);
+            }
+            wd(o + 0x44, q32(v[14]));
+            p.eax
+        });
+    }
+}
+port_thunk!(vector2_comp_ctor_thunk, vector2_comp_ctor_entry, VECTOR2_COMP_CTOR, h_vector2_comp_ctor, "ret 60");
+
+/// 0x7FE5A0 net_vector3_uncompressed_ctor (EAX = object; stack: a float; `ret 4`): vtable 0xE26528, the float at +4.
+unsafe fn h_vector3_uncomp_ctor(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        let v = args_of(a, 1);
+        r.eax = shadow_mem_regs(id, &p, &v, &[(o, 8)], || {
+            wd(o, 0x00E2_6528);
+            wd(o + 4, q32(v[0]));
+            p.eax
+        });
+    }
+}
+port_thunk!(vector3_uncomp_ctor_thunk, vector3_uncomp_ctor_entry, VECTOR3_UNCOMP_CTOR, h_vector3_uncomp_ctor, "ret 4");
+
+/// 0x7FE6A0 net_orientation_heading_compressor_ctor (EAX = object; stack: a 7-dword block; `ret 0x1C`): vtable
+/// 0xE2653C, 0xE264EC at +4, the block at +8, then +0x24 = the block's SECOND dword as a float (the original
+/// loads it with `fld [esp+8]` before its pushes).
+unsafe fn h_heading_comp_ctor(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        let v = args_of(a, 7);
+        r.eax = shadow_mem_regs(id, &p, &v, &[(o, 0x28)], || {
+            wd(o, 0x00E2_653C);
+            wd(o + 4, 0x00E2_64EC);
+            for i in 0..7 {
+                wd(o + 8 + i * 4, v[i]);
+            }
+            wd(o + 0x24, q32(v[1]));
+            p.eax
+        });
+    }
+}
+port_thunk!(heading_comp_ctor_thunk, heading_comp_ctor_entry, HEADING_COMP_CTOR, h_heading_comp_ctor, "ret 28");
+
+// --- replicated-object helpers --------------------------------------------------------------------------------------------
+// Handle slots: HANDLES + (handle & 0xFFF) * 16 -> object, valid when [obj + 0x44] == handle; [obj + 0xB0] is its
+// replication record ([rec + 8] picks the manager in the table at 0x212E25C, [rec + 2] is the net id).
+
+const MANAGERS: usize = 0x0212_E25C;
+
+/// The object of a handle, or 0 (handle 0, empty slot, stale handle).
+unsafe fn handle_obj(h: u32) -> u32 {
+    unsafe {
+        if h == 0 {
+            return 0;
+        }
+        let o = rd(HANDLES + ((h & 0xFFF) as usize) * 16);
+        if o != 0 && rd(o as usize + 0x44) == h { o } else { 0 }
+    }
+}
+
+/// 0x806CE0 net_ownership_request_pending (EAX = object -> AL): is a request for the object's net id
+/// (0xFFFF without a record) queued in the pending table (count [0x2528BAC], words at 0x212BB38 + 8 * i)?
+/// EAX = the index reached, AL replaced.
+unsafe fn h_ownership_pending(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let o = p.eax as usize;
+        let h = rd(o + 0x44);
+        let nid: u16 = if h == 0 {
+            0xFFFF
+        } else {
+            let obj = handle_obj(h);
+            if obj == 0 {
+                0xFFFF
+            } else {
+                let rec = rd(obj as usize + 0xB0);
+                if rec == 0 { 0xFFFF } else { rw(rec as usize + 2) }
+            }
+        };
+        let count = rd(0x0252_8BAC) as i32;
+        let mut ours = 0;
+        if count > 0 {
+            let mut i = 0i32;
+            ours = loop {
+                if rw(0x0212_BB38 + i as usize * 8) == nid {
+                    break lo(i as u32, 1);
+                }
+                i += 1;
+                if i >= count {
+                    break lo(i as u32, 0);
+                }
+            };
+        }
+        r.eax = checked_eax(id, &p, [0; 3], ours);
+    }
+}
+port_thunk!(ownership_pending_thunk, ownership_pending_entry, OWNERSHIP_PENDING, h_ownership_pending);
+
+/// 0x804940 net_conn_object_list_add (EAX = connection, EDX = handle): append to the connection's handle list
+/// (dwords at +0x1DF0, count +0x21F0).
+unsafe fn h_conn_object_list_add(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let c = p.eax as usize;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(c + 0x1DF0, 0x404)], || {
+            let n = rd(c + 0x21F0) as usize;
+            wd(c + n.wrapping_mul(4).wrapping_add(0x1DF0), p.edx);
+            wd(c + 0x21F0, rd(c + 0x21F0).wrapping_add(1));
+            p.eax
+        });
+    }
+}
+port_thunk!(conn_object_list_add_thunk, conn_object_list_add_entry, CONN_OBJECT_LIST_ADD, h_conn_object_list_add);
+
+/// 0x804960 net_conn_object_list_remove (EAX = connection, EDI = handle -> AL): swap-remove the handle
+/// from that list; AL = 1 when it was there. EAX = the connection with AL replaced.
+unsafe fn h_conn_object_list_remove(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let c = p.eax as usize;
+        r.eax = shadow_mem(id, &p, [0; 3], &[(c + 0x1DF0, 0x404)], || {
+            let n = rd(c + 0x21F0);
+            let mut i = 0u32;
+            if n != 0 {
+                loop {
+                    if rd(c + 0x1DF0 + i as usize * 4) == p.edi {
+                        let last = rd(c + (n as usize).wrapping_mul(4).wrapping_add(0x1DEC));
+                        wd(c + 0x1DF0 + i as usize * 4, last);
+                        wd(c + 0x21F0, rd(c + 0x21F0).wrapping_add(0xFFFF_FFFF));
+                        return lo(p.eax, 1);
+                    }
+                    i += 1;
+                    if i >= n {
+                        break;
+                    }
+                }
+            }
+            lo(p.eax, 0)
+        });
+    }
+}
+port_thunk!(conn_object_list_remove_thunk, conn_object_list_remove_entry, CONN_OBJECT_LIST_REMOVE, h_conn_object_list_remove);
+
+/// 0x8176C0 net_guid_id_equal (ESI, EDI = two GUID entries -> EAX 0 / 1): 0x8176E0 (ECX = ESI, EDX = EDI) and
+/// equal id dwords (+0x24).
+unsafe fn h_guid_id_equal(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let g = call_regs(0x0081_76E0, p.eax, p.esi, p.edi, p.esi, p.edi, &[]);
+        let ours = (g as u8 != 0 && rd(p.edi as usize + 0x24) == rd(p.esi as usize + 0x24)) as u32;
+        r.eax = checked_eax(id, &p, [0; 3], ours);
+    }
+}
+port_thunk!(guid_id_equal_thunk, guid_id_equal_entry, GUID_ID_EQUAL, h_guid_id_equal);
+
+/// 0x817810 net_guid_entry_read (EAX = entry (0x28 bytes), EDX = cursor (byte offset) pointer, ESI = buffer):
+/// clear the entry (id dword +0x24 = -1), read {8 bytes, 8 bytes, 4 bytes} from buffer + cursor into
+/// +0 / +8 / +0x24, advancing the cursor by 8 / 8 / 4. EAX unchanged.
+unsafe fn h_guid_entry_read(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let (e, cur, buf) = (p.eax as usize, p.edx as usize, p.esi);
+        r.eax = shadow_mem(id, &p, [0; 3], &[(e, 0x28), (cur, 4)], || {
+            for i in 0..9 {
+                wd(e + i * 4, 0);
+            }
+            wd(e + 0x24, 0xFFFF_FFFF);
+            let at = |c: u32, o: u32| buf.wrapping_add(c).wrapping_add(o) as usize;
+            let c = rd(cur);
+            wd(e, rd(at(c, 0)));
+            wd(e + 4, rd(at(c, 4)));
+            wd(cur, rd(cur).wrapping_add(8));
+            let c = rd(cur);
+            wd(e + 8, rd(at(c, 0)));
+            wd(e + 0xC, rd(at(c, 4)));
+            wd(cur, rd(cur).wrapping_add(8));
+            let c = rd(cur);
+            wd(e + 0x24, rd(at(c, 0)));
+            wd(cur, rd(cur).wrapping_add(4));
+            p.eax
+        });
+    }
+}
+port_thunk!(guid_entry_read_thunk, guid_entry_read_entry, GUID_ENTRY_READ, h_guid_entry_read);
+
+/// 0x7FFDF0 net_id_to_object_ac (AX = net id -> EAX): like net_id_to_human without the flag test: the field
+/// +0xAC of the object the net id's handle names, 0 when anything is missing.
+unsafe fn h_id_to_object_ac(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        let ours = if p.eax as u16 == 0xFFFF {
+            0
+        } else {
+            let key = p.eax & 0xFFFF;
+            let node = call_regs(0x0080_8E30, key, p.ecx, p.edx, rd(NET_ID_MAP), p.edi, &[key, 0]);
+            let rec = if node != 0 { rd(node as usize) } else { 0 };
+            let handle = if rec != 0 { rd(rec as usize + 4) } else { 0 };
+            if handle == 0 {
+                0
+            } else {
+                let o = handle_obj(handle);
+                if o == 0 { 0 } else { rd(o as usize + 0xAC) }
+            }
+        };
+        r.eax = checked_eax(id, &p, [0; 3], ours);
+    }
+}
+port_thunk!(id_to_object_ac_thunk, id_to_object_ac_entry, ID_TO_OBJECT_AC, h_id_to_object_ac);
+
+// --- virtual-dispatch wrappers (no shadow: a second run would repeat the virtual call) --------------------------------------
+// Each looks up the handle's record manager (table 0x212E25C, index [rec + 8]) and calls one of its virtual methods
+// with the handle (and the caller's own arguments) pushed, ECX = the manager. Counted, not shadowed.
+
+/// 0x805CD0 net_object_capture_snapshot (EDX = handle, ESI passed on): vtable +0x24 (handle, ESI), `ret 8`.
+/// EAX when nothing is called: the input, the slot (stale), 0, or the record.
+unsafe fn h_capture_snapshot(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        PORTS[id].calls.fetch_add(1, Ordering::Relaxed);
+        if p.edx == 0 {
+            return;
+        }
+        let slot = rd(HANDLES + ((p.edx & 0xFFF) as usize) * 16);
+        if slot == 0 {
+            r.eax = 0;
+            return;
+        }
+        if rd(slot as usize + 0x44) != p.edx {
+            r.eax = slot;
+            return;
+        }
+        let rec = rd(slot as usize + 0xB0);
+        if rec == 0 {
+            r.eax = 0;
+            return;
+        }
+        let m = rd(MANAGERS + rd(rec as usize + 8) as usize * 4);
+        if m == 0 {
+            r.eax = rec;
+            return;
+        }
+        let vt = rd(m as usize);
+        let f = rd(vt as usize + 0x24);
+        r.eax = call_regs(f as usize, vt, m, f, p.esi, p.edi, &[p.edx, p.esi]);
+    }
+}
+port_thunk!(capture_snapshot_thunk, capture_snapshot_entry, CAPTURE_SNAPSHOT, h_capture_snapshot);
+
+/// 0x805D60 net_object_read_state_delta (EAX = handle; stack a0..a3; `ret`): vtable +0x30 (handle, a0..a3), `ret 0x14`;
+/// EAX = 2 for a stale / recordless handle.
+unsafe fn h_read_state_delta(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        PORTS[id].calls.fetch_add(1, Ordering::Relaxed);
+        let rec = if p.eax != 0 {
+            let o = handle_obj(p.eax);
+            if o == 0 { 0 } else { rd(o as usize + 0xB0) }
+        } else {
+            0
+        };
+        if rec == 0 {
+            r.eax = 2;
+            return;
+        }
+        let m = rd(MANAGERS + rd(rec as usize + 8) as usize * 4);
+        let vt = rd(m as usize);
+        let f = rd(vt as usize + 0x30);
+        r.eax = call_regs(f as usize, f, m, vt, *a, p.edi, &[p.eax, *a, *a.add(1), *a.add(2), *a.add(3)]);
+    }
+}
+port_thunk!(read_state_delta_thunk, read_state_delta_entry, READ_STATE_DELTA, h_read_state_delta);
+
+/// 0x805E40 net_object_get_send_priority (EAX = record; stack a0..a6; `ret`): vtable +0x38 ([rec + 4], a0..a6)
+/// with ECX = the manager of [rec + 8]; `ret 0x20`. EAX = AX 0 (upper half kept) without a record. Returns AX.
+unsafe fn h_get_send_priority(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        PORTS[id].calls.fetch_add(1, Ordering::Relaxed);
+        if p.eax == 0 {
+            r.eax = lo(p.eax, 0) & 0xFFFF_0000;
+            return;
+        }
+        let m = rd(MANAGERS + rd(p.eax as usize + 8) as usize * 4);
+        let vt = rd(m as usize);
+        let h = rd(p.eax as usize + 4);
+        let f = rd(vt as usize + 0x38);
+        let args = [h, *a, *a.add(1), *a.add(2), *a.add(3), *a.add(4), *a.add(5), *a.add(6)];
+        r.eax = call_regs(f as usize, h, m, vt, *a, p.edi, &args);
+    }
+}
+port_thunk!(get_send_priority_thunk, get_send_priority_entry, GET_SEND_PRIORITY, h_get_send_priority);
+
+/// 0x805E90 net_object_get_dirty_fields (EAX = handle, ECX = record; stack a0, a1; `ret`): vtable +0x34 (handle, a0, a1),
+/// `ret 0xC`; EAX = AX 0 (upper half kept) for handle 0.
+unsafe fn h_get_dirty_fields(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        PORTS[id].calls.fetch_add(1, Ordering::Relaxed);
+        if p.eax == 0 {
+            r.eax = p.eax & 0xFFFF_0000;
+            return;
+        }
+        let m = rd(MANAGERS + rd(p.ecx as usize + 8) as usize * 4);
+        let vt = rd(m as usize);
+        let f = rd(vt as usize + 0x34);
+        r.eax = call_regs(f as usize, f, m, vt, *a, p.edi, &[p.eax, *a, *a.add(1)]);
+    }
+}
+port_thunk!(get_dirty_fields_thunk, get_dirty_fields_entry, GET_DIRTY_FIELDS, h_get_dirty_fields);
+
+/// 0x805EC0 net_object_on_state_sent (EAX = handle; stack a0..a2; `ret`): vtable +0x3C (handle, a0..a2), `ret 0x10`.
+/// EAX stays the handle when it is stale / recordless.
+unsafe fn h_on_state_sent(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        PORTS[id].calls.fetch_add(1, Ordering::Relaxed);
+        let rec = if p.eax != 0 {
+            let o = handle_obj(p.eax);
+            if o == 0 { 0 } else { rd(o as usize + 0xB0) }
+        } else {
+            0
+        };
+        if rec == 0 {
+            return;
+        }
+        let m = rd(MANAGERS + rd(rec as usize + 8) as usize * 4);
+        let vt = rd(m as usize);
+        let f = rd(vt as usize + 0x3C);
+        r.eax = call_regs(f as usize, f, m, vt, *a, p.edi, &[p.eax, *a, *a.add(1), *a.add(2)]);
+    }
+}
+port_thunk!(on_state_sent_thunk, on_state_sent_entry, ON_STATE_SENT, h_on_state_sent);
+
+/// 0x806D50 net_object_can_migrate (EAX = object -> AL/EAX): no for a null object, flag bits 0x0B (+0x80), no record,
+/// or a record whose word +0x67E is not 0xFFFF (EAX = 0, or the object with AL = 0 for the first three);
+/// else the manager's vtable +0x44 (handle), `ret 4`, decides (EAX = 1 / 0).
+unsafe fn can_migrate(p: &Pushad) -> u32 {
+    unsafe {
+        let o = p.eax as usize;
+        if p.eax == 0 {
+            return 0;
+        }
+        if rb(o + 0x80) & 0xB != 0 {
+            return lo(p.eax, 0);
+        }
+        let rec = rd(o + 0xB0);
+        if rec == 0 {
+            return lo(p.eax, 0);
+        }
+        if rw(rec as usize + 0x67E) != 0xFFFF {
+            return 0;
+        }
+        let m = rd(MANAGERS + rd(rec as usize + 8) as usize * 4);
+        let vt = rd(m as usize);
+        let f = rd(vt as usize + 0x44);
+        let h = rd(o + 0x44);
+        let r = call_regs(f as usize, h, m, f, p.esi, p.edi, &[h]);
+        (r as u8 != 0) as u32
+    }
+}
+
+unsafe fn h_can_migrate(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        r.eax = checked_eax(id, &p, [0; 3], can_migrate(&p));
+    }
+}
+port_thunk!(can_migrate_thunk, can_migrate_entry, CAN_MIGRATE, h_can_migrate);
+
+// --- 0x806B90 net_request_ownership (stack: object, byte, callback; `ret`) -------------------------------------------------
+// Object -> record (as above). With no session or no record: AL = 0 (EAX = the object's handle). A record that
+// is flagged (+0x67C bit 1) or owned locally (0x806760: EAX = handle, ECX = record, ESI = session) needs no request:
+// the callback (when non-null) is called with ([rec + 4], 1). Otherwise, unless the pending table [0x2528BAC] is full
+// (0x20: AL = 0, EAX = 0x806760's), packet 0x28 {u16 [rec + 2], u8 arg2} goes to the connection 0x80FE80 finds for
+// the record's owner byte [rec], and {word [rec + 2], callback} is appended to the pending table (0x212BB38, 8
+// bytes each). AL = 1 at the end; EAX = the callback's / the count + 1 / the handle or 0x806760's.
+
+unsafe fn request_ownership(p: &Pushad, obj: u32, arg2: u32, cb: u32) -> (u32, bool) {
+    unsafe {
+        let h = rd(obj as usize + 0x44);
+        let rec = {
+            let o = handle_obj(h);
+            if o == 0 { 0 } else { rd(o as usize + 0xB0) }
+        };
+        let sess = rd(SESSION);
+        if sess == 0 || rec == 0 {
+            return (lo(h, 0), false);
+        }
+        let mut eax = h;
+        let local = if rb(rec as usize + 0x67C) & 2 != 0 {
+            true
+        } else {
+            eax = call_regs(0x0080_6760, h, rec, p.edx, sess, rec, &[]);
+            eax as u8 != 0
+        };
+        if local {
+            if cb != 0 {
+                eax = call_regs(cb as usize, rd(rec as usize + 4), 0, 0, 0, 0, &[rd(rec as usize + 4), 1]);
+            }
+            return (lo(eax, 1), false);
+        }
+        let n = rd(0x0252_8BAC);
+        if n == 0x20 {
+            return (lo(eax, 0), false);
+        }
+        let mut buf = [0u8; 0x51C];
+        buf[0] = 0x28;
+        let hd = hdr_size(0x00E8_C2DC);
+        buf[hd..hd + 2].copy_from_slice(&rw(rec as usize + 2).to_le_bytes());
+        buf[hd + 2] = arg2 as u8;
+        let size = hd + 3;
+        set_len(&mut buf, size);
+        let conn = call_regs(0x0080_FE80, sess, rec, rb(rec as usize) as u32, sess, rec, &[0, 0, size as u32, buf.as_ptr() as u32]);
+        send_conn(conn, &mut buf, size as u32, 0, 0);
+        let n = rd(0x0252_8BAC);
+        ww(0x0212_BB38 + n as usize * 8, rw(rec as usize + 2));
+        wd(0x0212_BB3C + n as usize * 8, cb);
+        wd(0x0252_8BAC, n + 1);
+        (lo(n + 1, 1), false)
+    }
+}
+
+unsafe fn h_request_ownership(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let (obj, arg2, cb) = (*a, *a.add(1), *a.add(2));
+        // A callback call cannot be shadowed (it would run twice): that path is only counted.
+        if shadowing_active(id) && cb != 0 {
+            let h = rd(obj as usize + 0x44);
+            let o = handle_obj(h);
+            let rec = if o == 0 { 0 } else { rd(o as usize + 0xB0) };
+            if rec != 0 && rd(SESSION) != 0 && (rb(rec as usize + 0x67C) & 2 != 0 || call_regs(0x0080_6760, h, rec, p.edx, rd(SESSION), rec, &[]) as u8 != 0) {
+                PORTS[id].calls.fetch_add(1, Ordering::Relaxed);
+                r.eax = request_ownership(&p, obj, arg2, cb).0;
+                return;
+            }
+        }
+        let n = rd(0x0252_8BAC) as usize;
+        let regions = [(0x0252_8BACusize, 4usize), (0x0212_BB38 + n.min(0x20) * 8, 8)];
+        r.eax = shadow_send_ex(id, &p, [obj, arg2, cb], rb(0x00E8_C2DC) != 0, false, &regions, || request_ownership(&p, obj, arg2, cb));
+    }
+}
+port_thunk!(request_ownership_thunk, request_ownership_entry, REQUEST_OWNERSHIP, h_request_ownership);
+
+/// The shadow copies' sends (port, offset of the `call`, recording stub): the copy of a sender
+/// calls the stub instead of the send helper, so the original never really sends in a shadow run.
+fn stub_table() -> Vec<(usize, usize, usize)> {
+    let conn = rec_conn_thunk as *const () as usize;
+    let remotes = rec_remotes_thunk as *const () as usize;
+    let raw = rec_raw_thunk as *const () as usize;
+    vec![
+        (TIMEOUT_ARM_10S, 0x27, 0x0080_B8D0),
+        (REQUEST_OWNERSHIP, 0xF5, conn),
+        (SEND_MP_INFO, 0x61, remotes),
+        (SEND_UPD_STATE_SUB3, 0x54, conn),
+        (SET_PHASE_BROADCAST, 0x67, remotes),
+        (SEND_JOIN_DENY, 0x5A, raw),
+        (SEND_UPD_CONN, 0x99, conn),
+        (SEND_TO_LIST_OR_REMOTES, 0x2E, remotes),
+        (SEND_TO_LIST_OR_REMOTES, 0x5B, conn),
+        (SEND_JOIN_NEW_SESSION, 0x69, conn),
+        (SEND_JOIN_SUCCESS, 0x69, conn),
+        (SEND_JOIN_FAILED, 0x69, conn),
+        (SEND_JOIN_COMPLETE, 0x69, conn),
+    ]
+}
+
+/// Calls of a copy into another ported function: (port, offset of the call, callee port); the copy
+/// then calls the callee's original copy instead of the (Rust) replacement.
+const DEPS2: [(usize, usize, usize); 10] = [
+    (ID_TO_OBJECT_AC, 0x13, MAP_FIND),
+    (GUID_ID_EQUAL, 0x4, GUID_EQUAL),
+    (REQUEST_OWNERSHIP, 0x87, RECORD_OWNED),
+    (REQUEST_OWNERSHIP, 0xEE, FIND_CONN),
+    (ALL_CONNS_STATE_EQ, 0x2, PEERS_PHASE_EQUAL),
+    (ALL_CONNS_STATE_GE, 0x2, PEERS_PHASE_EQUAL),
+    (FIND_RESERVATION, 0x25, GUID_EQUAL),
+    (GUID_IN_ARRAY, 0x24, GUID_EQUAL),
+    (ID_TO_HUMAN, 0x13, MAP_FIND),
+    (MAP_SET, 0xB, MAP_FIND),
+];
+
+fn round2_patch_copies() {
+    for &(id, off, dep) in &DEPS2 {
+        let (copy, callee) = (PORTS[id].original.load(Ordering::Relaxed), PORTS[dep].original.load(Ordering::Relaxed));
+        if copy != 0 && callee != 0 {
+            unsafe { set_rel32(copy, off, callee) };
+        } else if copy != 0 {
+            PORTS[id].original.store(0, Ordering::Relaxed);
+        }
+    }
+    for (id, off, stub) in stub_table() {
+        let copy = PORTS[id].original.load(Ordering::Relaxed);
+        if copy != 0 {
+            unsafe { set_rel32(copy, off, stub) };
+        }
+    }
+}
+
+
 // --- install ------------------------------------------------------------------------------------------------------------------
 
 /// Re-aim the rel32 of the `call` / `jmp` at `off` in a relocated copy.
@@ -1399,6 +3687,71 @@ pub fn install() {
         (OBJ_OWNER_CONN, &B_OBJ_OWNER_CONN, &B_OBJ_OWNER_CONN_CALLS, obj_owner_conn_thunk),
         (HANDLE_OWNER_CONN, &B_HANDLE_OWNER_CONN, &B_HANDLE_OWNER_CONN_CALLS, handle_owner_conn_thunk),
         (REG_FIND_FIELD, &B_REG_FIND_FIELD, &B_REG_FIND_FIELD_CALLS, reg_find_field_thunk),
+        (POOL_BY_ID, &B_POOL_BY_ID, &B_POOL_BY_ID_CALLS, pool_by_id_thunk),
+        (POOL_STATE2, &B_POOL_STATE2, &B_POOL_STATE2_CALLS, pool_state2_thunk),
+        (POOL_STATE1, &B_POOL_STATE1, &B_POOL_STATE1_CALLS, pool_state1_thunk),
+        (SEND_JOIN_NEW_SESSION, &B_SEND_JOIN_NEW_SESSION, &B_SEND_JOIN_NEW_SESSION_CALLS, join_new_session_thunk),
+        (SEND_JOIN_SUCCESS, &B_SEND_JOIN_SUCCESS, &B_SEND_JOIN_SUCCESS_CALLS, join_success_thunk),
+        (SEND_JOIN_FAILED, &B_SEND_JOIN_FAILED, &B_SEND_JOIN_FAILED_CALLS, join_failed_thunk),
+        (SEND_JOIN_COMPLETE, &B_SEND_JOIN_COMPLETE, &B_SEND_JOIN_COMPLETE_CALLS, join_complete_thunk),
+        (SEND_MP_INFO, &B_SEND_MP_INFO, &B_SEND_MP_INFO_CALLS, send_mp_info_thunk),
+        (SEND_UPD_STATE_SUB3, &B_SEND_UPD_STATE_SUB3, &B_SEND_UPD_STATE_SUB3_CALLS, send_upd_state_sub3_thunk),
+        (SET_PHASE_BROADCAST, &B_SET_PHASE_BROADCAST, &B_SET_PHASE_BROADCAST_CALLS, set_phase_broadcast_thunk),
+        (SEND_JOIN_DENY, &B_SEND_JOIN_DENY, &B_SEND_JOIN_DENY_CALLS, send_join_deny_thunk),
+        (SEND_UPD_CONN, &B_SEND_UPD_CONN, &B_SEND_UPD_CONN_CALLS, send_upd_conn_thunk),
+        (SEND_TO_LIST_OR_REMOTES, &B_SEND_TO_LIST_OR_REMOTES, &B_SEND_TO_LIST_OR_REMOTES_CALLS, send_to_list_or_remotes_thunk),
+        (RECENT_IDS_PUSH, &B_RECENT_IDS_PUSH, &B_RECENT_IDS_PUSH_CALLS, recent_ids_push_thunk),
+        (ACK_WINDOW_PUSH, &B_ACK_WINDOW_PUSH, &B_ACK_WINDOW_PUSH_CALLS, ack_window_push_thunk),
+        (ACK_RECORD, &B_ACK_RECORD, &B_ACK_RECORD_CALLS, ack_record_thunk),
+        (CHECK_TIMEOUT, &B_CHECK_TIMEOUT, &B_CHECK_TIMEOUT_CALLS, check_timeout_thunk),
+        (TIMEOUT_EXPIRED, &B_TIMEOUT_EXPIRED, &B_TIMEOUT_EXPIRED_CALLS, timeout_expired_thunk),
+        (TIMEOUT_ARM_10S, &B_TIMEOUT_ARM_10S, &B_TIMEOUT_ARM_10S_CALLS, timeout_arm_10s_thunk),
+        (RATE_METER_INIT, &B_RATE_METER_INIT, &B_RATE_METER_INIT_CALLS, rate_meter_init_thunk),
+        (RATE_METER_REMAINING, &B_RATE_METER_REMAINING, &B_RATE_METER_REMAINING_CALLS, rate_meter_remaining_thunk),
+        (CONN_NOTE_RECEIVED, &B_CONN_NOTE_RECEIVED, &B_CONN_NOTE_RECEIVED_CALLS, conn_note_received_thunk),
+        (ACK_WINDOW_MARK_ALL, &B_ACK_WINDOW_MARK_ALL, &B_ACK_WINDOW_MARK_ALL_CALLS, ack_window_mark_all_thunk),
+        (RESET_ACK_WINDOW, &B_RESET_ACK_WINDOW, &B_RESET_ACK_WINDOW_CALLS, reset_ack_window_thunk),
+        (CLOCK_PREDICTED_MS, &B_CLOCK_PREDICTED_MS, &B_CLOCK_PREDICTED_MS_CALLS, clock_predicted_ms_thunk),
+        (CLOCK_ADVANCE, &B_CLOCK_ADVANCE, &B_CLOCK_ADVANCE_CALLS, clock_advance_thunk),
+        (OUT_OF_PHASE_MASK, &B_OUT_OF_PHASE_MASK, &B_OUT_OF_PHASE_MASK_CALLS, out_of_phase_mask_thunk),
+        (PEERS_PHASE_EQUAL, &B_PEERS_PHASE_EQUAL, &B_PEERS_PHASE_EQUAL_CALLS, peers_phase_equal_thunk),
+        (ALL_CONNS_STATE_EQ, &B_ALL_CONNS_STATE_EQ, &B_ALL_CONNS_STATE_EQ_CALLS, all_conns_state_eq_thunk),
+        (ALL_CONNS_STATE_GE, &B_ALL_CONNS_STATE_GE, &B_ALL_CONNS_STATE_GE_CALLS, all_conns_state_ge_thunk),
+        (LOBBY_ANY_CONN_STATE_4, &B_LOBBY_ANY_CONN_STATE_4, &B_LOBBY_ANY_CONN_STATE_4_CALLS, lobby_any_conn_state_4_thunk),
+        (STATE_IN_SET_B, &B_STATE_IN_SET_B, &B_STATE_IN_SET_B_CALLS, state_in_set_b_thunk),
+        (STATE_IS_8, &B_STATE_IS_8, &B_STATE_IS_8_CALLS, state_is_8_thunk),
+        (LOCAL_CONN_ID, &B_LOCAL_CONN_ID, &B_LOCAL_CONN_ID_CALLS, local_conn_id_thunk),
+        (ID_TO_HUMAN, &B_ID_TO_HUMAN, &B_ID_TO_HUMAN_CALLS, id_to_human_thunk),
+        (MAP_SET, &B_MAP_SET, &B_MAP_SET_CALLS, map_set_thunk),
+        (FIND_RESERVATION, &B_FIND_RESERVATION, &B_FIND_RESERVATION_CALLS, find_reservation_thunk),
+        (REMOVE_RESERVATION, &B_REMOVE_RESERVATION, &B_REMOVE_RESERVATION_CALLS, remove_reservation_thunk),
+        (GUID_IN_ARRAY, &B_GUID_IN_ARRAY, &B_GUID_IN_ARRAY_CALLS, guid_in_array_thunk),
+        (FIND_BEST_CONN, &B_FIND_BEST_CONN, &B_FIND_BEST_CONN_CALLS, find_best_conn_thunk),
+        (SESSION_INFO_BASE_INIT, &B_SESSION_INFO_BASE_INIT, &B_SESSION_INFO_BASE_INIT_CALLS, session_info_base_init_thunk),
+        (BYTE_NC_INIT, &B_BYTE_NC_INIT, &B_BYTE_NC_INIT_CALLS, byte_nc_init_thunk),
+        (BYTE_NC_INIT_BITS, &B_BYTE_NC_INIT_BITS, &B_BYTE_NC_INIT_BITS_CALLS, byte_nc_init_bits_thunk),
+        (BIT_NC_INIT, &B_BIT_NC_INIT, &B_BIT_NC_INIT_CALLS, bit_nc_init_thunk),
+        (BIT_NC_INIT_BITS, &B_BIT_NC_INIT_BITS, &B_BIT_NC_INIT_BITS_CALLS, bit_nc_init_bits_thunk),
+        (FLOAT_COMP_INIT, &B_FLOAT_COMP_INIT, &B_FLOAT_COMP_INIT_CALLS, float_comp_init_thunk),
+        (FLOAT_COMP_INIT_COPY, &B_FLOAT_COMP_INIT_COPY, &B_FLOAT_COMP_INIT_COPY_CALLS, float_comp_init_copy_thunk),
+        (FLOAT_COMP_COPY, &B_FLOAT_COMP_COPY, &B_FLOAT_COMP_COPY_CALLS, float_comp_copy_thunk),
+        (VECTOR3_COMP_CTOR, &B_VECTOR3_COMP_CTOR, &B_VECTOR3_COMP_CTOR_CALLS, vector3_comp_ctor_thunk),
+        (VECTOR2_COMP_CTOR, &B_VECTOR2_COMP_CTOR, &B_VECTOR2_COMP_CTOR_CALLS, vector2_comp_ctor_thunk),
+        (VECTOR3_UNCOMP_CTOR, &B_VECTOR3_UNCOMP_CTOR, &B_VECTOR3_UNCOMP_CTOR_CALLS, vector3_uncomp_ctor_thunk),
+        (HEADING_COMP_CTOR, &B_HEADING_COMP_CTOR, &B_HEADING_COMP_CTOR_CALLS, heading_comp_ctor_thunk),
+        (OWNERSHIP_PENDING, &B_OWNERSHIP_PENDING, &B_OWNERSHIP_PENDING_CALLS, ownership_pending_thunk),
+        (CONN_OBJECT_LIST_ADD, &B_CONN_OBJECT_LIST_ADD, &B_CONN_OBJECT_LIST_ADD_CALLS, conn_object_list_add_thunk),
+        (CONN_OBJECT_LIST_REMOVE, &B_CONN_OBJECT_LIST_REMOVE, &B_CONN_OBJECT_LIST_REMOVE_CALLS, conn_object_list_remove_thunk),
+        (GUID_ID_EQUAL, &B_GUID_ID_EQUAL, &B_GUID_ID_EQUAL_CALLS, guid_id_equal_thunk),
+        (GUID_ENTRY_READ, &B_GUID_ENTRY_READ, &B_GUID_ENTRY_READ_CALLS, guid_entry_read_thunk),
+        (ID_TO_OBJECT_AC, &B_ID_TO_OBJECT_AC, &B_ID_TO_OBJECT_AC_CALLS, id_to_object_ac_thunk),
+        (CAPTURE_SNAPSHOT, &B_CAPTURE_SNAPSHOT, &B_CAPTURE_SNAPSHOT_CALLS, capture_snapshot_thunk),
+        (READ_STATE_DELTA, &B_READ_STATE_DELTA, &B_READ_STATE_DELTA_CALLS, read_state_delta_thunk),
+        (GET_SEND_PRIORITY, &B_GET_SEND_PRIORITY, &B_GET_SEND_PRIORITY_CALLS, get_send_priority_thunk),
+        (GET_DIRTY_FIELDS, &B_GET_DIRTY_FIELDS, &B_GET_DIRTY_FIELDS_CALLS, get_dirty_fields_thunk),
+        (ON_STATE_SENT, &B_ON_STATE_SENT, &B_ON_STATE_SENT_CALLS, on_state_sent_thunk),
+        (CAN_MIGRATE, &B_CAN_MIGRATE, &B_CAN_MIGRATE_CALLS, can_migrate_thunk),
+        (REQUEST_OWNERSHIP, &B_REQUEST_OWNERSHIP, &B_REQUEST_OWNERSHIP_CALLS, request_ownership_thunk),
     ];
     // The shadow copies first: replacing patches the entry.
     for &(id, body, call_offsets, _) in &list {
@@ -1408,6 +3761,7 @@ pub fn install() {
             Err(e) => log(&format!("port_net: {}: no shadow copy: {e:?}", port.name)),
         }
     }
+    round2_patch_copies();
     for &(id, off, dep) in &DEPS {
         let (copy, callee) = (PORTS[id].original.load(Ordering::Relaxed), PORTS[dep].original.load(Ordering::Relaxed));
         if copy != 0 && callee != 0 {
@@ -1844,6 +4198,611 @@ const B_READ_VEC3: [u8; 96] = [
     0x89, 0x44, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C, 0x5D, 0xD9, 0x5B, 0x08, 0x5B, 0xC2, 0x04, 0x00,
 ];
 const B_READ_VEC3_CALLS: [usize; 3] = [0x13, 0x27, 0x44];
+
+const B_POOL_BY_ID: [u8; 210] = [
+    0x53, 0x55, 0x8B, 0x2D, 0xCC, 0x80, 0xDB, 0x00, 0x56, 0x57, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF,
+    0xD5, 0x8B, 0x1D, 0xD0, 0x80, 0xDB, 0x00, 0x83, 0x05, 0x68, 0x89, 0xA1, 0x02, 0x01, 0x68, 0x44,
+    0x89, 0xA1, 0x02, 0xFF, 0xD3, 0x83, 0x3D, 0x40, 0x89, 0xA1, 0x02, 0x00, 0x74, 0x30, 0x8B, 0x35,
+    0x3C, 0x89, 0xA1, 0x02, 0xA1, 0x38, 0x89, 0xA1, 0x02, 0x69, 0xF6, 0x44, 0x10, 0x00, 0x00, 0x03,
+    0x30, 0x74, 0x1B, 0x8A, 0x4C, 0x24, 0x14, 0x38, 0x4E, 0x04, 0x74, 0x4C, 0x8B, 0xC6, 0xBF, 0x38,
+    0x89, 0xA1, 0x02, 0xE8, 0xF8, 0x3B, 0xE8, 0xFF, 0x8B, 0xF0, 0x85, 0xF6, 0x75, 0xE5, 0x68, 0x44,
+    0x89, 0xA1, 0x02, 0xFF, 0xD5, 0x83, 0x05, 0x68, 0x89, 0xA1, 0x02, 0xFF, 0x8B, 0x15, 0x68, 0x89,
+    0xA1, 0x02, 0x75, 0x16, 0xA1, 0x6C, 0x89, 0xA1, 0x02, 0x85, 0xC0, 0x7E, 0x0D, 0x8B, 0x0D, 0x60,
+    0x89, 0xA1, 0x02, 0x51, 0xFF, 0x15, 0xDC, 0x81, 0xDB, 0x00, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF,
+    0xD3, 0x33, 0xC0, 0x5F, 0x5E, 0x5D, 0x5B, 0xC3, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF, 0xD5, 0x83,
+    0x05, 0x68, 0x89, 0xA1, 0x02, 0xFF, 0x8B, 0x15, 0x68, 0x89, 0xA1, 0x02, 0x75, 0x16, 0xA1, 0x6C,
+    0x89, 0xA1, 0x02, 0x85, 0xC0, 0x7E, 0x0D, 0x8B, 0x0D, 0x60, 0x89, 0xA1, 0x02, 0x51, 0xFF, 0x15,
+    0xDC, 0x81, 0xDB, 0x00, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF, 0xD3, 0x5F, 0x8B, 0xC6, 0x5E, 0x5D,
+    0x5B, 0xC3,
+];
+const B_POOL_BY_ID_CALLS: [usize; 1] = [0x53];
+const B_POOL_STATE2: [u8; 210] = [
+    0x53, 0x8B, 0x1D, 0xCC, 0x80, 0xDB, 0x00, 0x55, 0x56, 0x57, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF,
+    0xD3, 0x8B, 0x2D, 0xD0, 0x80, 0xDB, 0x00, 0x83, 0x05, 0x68, 0x89, 0xA1, 0x02, 0x01, 0x68, 0x44,
+    0x89, 0xA1, 0x02, 0xFF, 0xD5, 0x83, 0x3D, 0x40, 0x89, 0xA1, 0x02, 0x00, 0x74, 0x30, 0x8B, 0x35,
+    0x3C, 0x89, 0xA1, 0x02, 0xA1, 0x38, 0x89, 0xA1, 0x02, 0x69, 0xF6, 0x44, 0x10, 0x00, 0x00, 0x03,
+    0x30, 0x74, 0x1B, 0x8B, 0x4E, 0x0C, 0x83, 0x79, 0x30, 0x02, 0x74, 0x4C, 0x8B, 0xC6, 0xBF, 0x38,
+    0x89, 0xA1, 0x02, 0xE8, 0x38, 0x3A, 0xE8, 0xFF, 0x8B, 0xF0, 0x85, 0xF6, 0x75, 0xE5, 0x68, 0x44,
+    0x89, 0xA1, 0x02, 0xFF, 0xD3, 0x83, 0x05, 0x68, 0x89, 0xA1, 0x02, 0xFF, 0x8B, 0x15, 0x68, 0x89,
+    0xA1, 0x02, 0x75, 0x16, 0xA1, 0x6C, 0x89, 0xA1, 0x02, 0x85, 0xC0, 0x7E, 0x0D, 0x8B, 0x0D, 0x60,
+    0x89, 0xA1, 0x02, 0x51, 0xFF, 0x15, 0xDC, 0x81, 0xDB, 0x00, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF,
+    0xD5, 0x33, 0xC0, 0x5F, 0x5E, 0x5D, 0x5B, 0xC3, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF, 0xD3, 0x83,
+    0x05, 0x68, 0x89, 0xA1, 0x02, 0xFF, 0x8B, 0x15, 0x68, 0x89, 0xA1, 0x02, 0x75, 0x16, 0xA1, 0x6C,
+    0x89, 0xA1, 0x02, 0x85, 0xC0, 0x7E, 0x0D, 0x8B, 0x0D, 0x60, 0x89, 0xA1, 0x02, 0x51, 0xFF, 0x15,
+    0xDC, 0x81, 0xDB, 0x00, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF, 0xD5, 0x5F, 0x8B, 0xC6, 0x5E, 0x5D,
+    0x5B, 0xC3,
+];
+const B_POOL_STATE2_CALLS: [usize; 1] = [0x53];
+const B_POOL_STATE1: [u8; 210] = [
+    0x53, 0x8B, 0x1D, 0xCC, 0x80, 0xDB, 0x00, 0x55, 0x56, 0x57, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF,
+    0xD3, 0x8B, 0x2D, 0xD0, 0x80, 0xDB, 0x00, 0x83, 0x05, 0x68, 0x89, 0xA1, 0x02, 0x01, 0x68, 0x44,
+    0x89, 0xA1, 0x02, 0xFF, 0xD5, 0x83, 0x3D, 0x40, 0x89, 0xA1, 0x02, 0x00, 0x74, 0x30, 0x8B, 0x35,
+    0x3C, 0x89, 0xA1, 0x02, 0xA1, 0x38, 0x89, 0xA1, 0x02, 0x69, 0xF6, 0x44, 0x10, 0x00, 0x00, 0x03,
+    0x30, 0x74, 0x1B, 0x8B, 0x4E, 0x0C, 0x83, 0x79, 0x30, 0x01, 0x74, 0x4C, 0x8B, 0xC6, 0xBF, 0x38,
+    0x89, 0xA1, 0x02, 0xE8, 0x58, 0x39, 0xE8, 0xFF, 0x8B, 0xF0, 0x85, 0xF6, 0x75, 0xE5, 0x68, 0x44,
+    0x89, 0xA1, 0x02, 0xFF, 0xD3, 0x83, 0x05, 0x68, 0x89, 0xA1, 0x02, 0xFF, 0x8B, 0x15, 0x68, 0x89,
+    0xA1, 0x02, 0x75, 0x16, 0xA1, 0x6C, 0x89, 0xA1, 0x02, 0x85, 0xC0, 0x7E, 0x0D, 0x8B, 0x0D, 0x60,
+    0x89, 0xA1, 0x02, 0x51, 0xFF, 0x15, 0xDC, 0x81, 0xDB, 0x00, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF,
+    0xD5, 0x33, 0xC0, 0x5F, 0x5E, 0x5D, 0x5B, 0xC3, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF, 0xD3, 0x83,
+    0x05, 0x68, 0x89, 0xA1, 0x02, 0xFF, 0x8B, 0x15, 0x68, 0x89, 0xA1, 0x02, 0x75, 0x16, 0xA1, 0x6C,
+    0x89, 0xA1, 0x02, 0x85, 0xC0, 0x7E, 0x0D, 0x8B, 0x0D, 0x60, 0x89, 0xA1, 0x02, 0x51, 0xFF, 0x15,
+    0xDC, 0x81, 0xDB, 0x00, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF, 0xD5, 0x5F, 0x8B, 0xC6, 0x5E, 0x5D,
+    0x5B, 0xC3,
+];
+const B_POOL_STATE1_CALLS: [usize; 1] = [0x53];
+const B_SEND_JOIN_NEW_SESSION: [u8; 135] = [
+    0x81, 0xEC, 0x24, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x20, 0x05, 0x00, 0x00, 0x80, 0x3D, 0x94, 0xBF, 0xE8, 0x00, 0x00, 0x8B, 0x84, 0x24, 0x28, 0x05,
+    0x00, 0x00, 0x56, 0x8B, 0xF1, 0xC6, 0x44, 0x24, 0x08, 0x05, 0xC7, 0x44, 0x24, 0x04, 0x03, 0x00,
+    0x00, 0x00, 0x74, 0x08, 0xC7, 0x44, 0x24, 0x04, 0x04, 0x00, 0x00, 0x00, 0x8B, 0x48, 0x0C, 0x8B,
+    0x01, 0x8B, 0x40, 0x20, 0x8D, 0x54, 0x24, 0x04, 0x52, 0x8D, 0x54, 0x24, 0x0C, 0x52, 0xFF, 0xD0,
+    0x8B, 0x44, 0x24, 0x04, 0x6A, 0x00, 0x0F, 0xB7, 0xD0, 0x8D, 0x48, 0xFD, 0x6A, 0x00, 0x52, 0x8D,
+    0x44, 0x24, 0x14, 0x50, 0x66, 0x89, 0x4C, 0x24, 0x19, 0xE8, 0xA2, 0xE1, 0xFF, 0xFF, 0x8B, 0x8C,
+    0x24, 0x34, 0x05, 0x00, 0x00, 0x83, 0xC4, 0x10, 0x5E, 0x33, 0xCC, 0xE8, 0x6F, 0xFB, 0x47, 0x00,
+    0x81, 0xC4, 0x24, 0x05, 0x00, 0x00, 0xC3,
+];
+const B_SEND_JOIN_NEW_SESSION_CALLS: [usize; 2] = [0x69, 0x7b];
+const B_SEND_JOIN_SUCCESS: [u8; 135] = [
+    0x81, 0xEC, 0x24, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x20, 0x05, 0x00, 0x00, 0x80, 0x3D, 0xAC, 0xBF, 0xE8, 0x00, 0x00, 0x8B, 0x84, 0x24, 0x28, 0x05,
+    0x00, 0x00, 0x56, 0x8B, 0xF1, 0xC6, 0x44, 0x24, 0x08, 0x06, 0xC7, 0x44, 0x24, 0x04, 0x03, 0x00,
+    0x00, 0x00, 0x74, 0x08, 0xC7, 0x44, 0x24, 0x04, 0x04, 0x00, 0x00, 0x00, 0x8B, 0x48, 0x0C, 0x8B,
+    0x01, 0x8B, 0x40, 0x28, 0x8D, 0x54, 0x24, 0x04, 0x52, 0x8D, 0x54, 0x24, 0x0C, 0x52, 0xFF, 0xD0,
+    0x8B, 0x44, 0x24, 0x04, 0x6A, 0x00, 0x0F, 0xB7, 0xD0, 0x8D, 0x48, 0xFD, 0x6A, 0x00, 0x52, 0x8D,
+    0x44, 0x24, 0x14, 0x50, 0x66, 0x89, 0x4C, 0x24, 0x19, 0xE8, 0x12, 0xE0, 0xFF, 0xFF, 0x8B, 0x8C,
+    0x24, 0x34, 0x05, 0x00, 0x00, 0x83, 0xC4, 0x10, 0x5E, 0x33, 0xCC, 0xE8, 0xDF, 0xF9, 0x47, 0x00,
+    0x81, 0xC4, 0x24, 0x05, 0x00, 0x00, 0xC3,
+];
+const B_SEND_JOIN_SUCCESS_CALLS: [usize; 2] = [0x69, 0x7b];
+const B_SEND_JOIN_FAILED: [u8; 135] = [
+    0x81, 0xEC, 0x24, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x20, 0x05, 0x00, 0x00, 0x80, 0x3D, 0xC4, 0xBF, 0xE8, 0x00, 0x00, 0x8B, 0x84, 0x24, 0x28, 0x05,
+    0x00, 0x00, 0x56, 0x8B, 0xF1, 0xC6, 0x44, 0x24, 0x08, 0x07, 0xC7, 0x44, 0x24, 0x04, 0x03, 0x00,
+    0x00, 0x00, 0x74, 0x08, 0xC7, 0x44, 0x24, 0x04, 0x04, 0x00, 0x00, 0x00, 0x8B, 0x48, 0x0C, 0x8B,
+    0x01, 0x8B, 0x40, 0x28, 0x8D, 0x54, 0x24, 0x04, 0x52, 0x8D, 0x54, 0x24, 0x0C, 0x52, 0xFF, 0xD0,
+    0x8B, 0x44, 0x24, 0x04, 0x6A, 0x00, 0x0F, 0xB7, 0xD0, 0x8D, 0x48, 0xFD, 0x6A, 0x00, 0x52, 0x8D,
+    0x44, 0x24, 0x14, 0x50, 0x66, 0x89, 0x4C, 0x24, 0x19, 0xE8, 0xC2, 0xDE, 0xFF, 0xFF, 0x8B, 0x8C,
+    0x24, 0x34, 0x05, 0x00, 0x00, 0x83, 0xC4, 0x10, 0x5E, 0x33, 0xCC, 0xE8, 0x8F, 0xF8, 0x47, 0x00,
+    0x81, 0xC4, 0x24, 0x05, 0x00, 0x00, 0xC3,
+];
+const B_SEND_JOIN_FAILED_CALLS: [usize; 2] = [0x69, 0x7b];
+const B_SEND_JOIN_COMPLETE: [u8; 135] = [
+    0x81, 0xEC, 0x24, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x20, 0x05, 0x00, 0x00, 0x80, 0x3D, 0xDC, 0xBF, 0xE8, 0x00, 0x00, 0x8B, 0x84, 0x24, 0x28, 0x05,
+    0x00, 0x00, 0x56, 0x8B, 0xF1, 0xC6, 0x44, 0x24, 0x08, 0x08, 0xC7, 0x44, 0x24, 0x04, 0x03, 0x00,
+    0x00, 0x00, 0x74, 0x08, 0xC7, 0x44, 0x24, 0x04, 0x04, 0x00, 0x00, 0x00, 0x8B, 0x48, 0x0C, 0x8B,
+    0x01, 0x8B, 0x40, 0x28, 0x8D, 0x54, 0x24, 0x04, 0x52, 0x8D, 0x54, 0x24, 0x0C, 0x52, 0xFF, 0xD0,
+    0x8B, 0x44, 0x24, 0x04, 0x6A, 0x00, 0x0F, 0xB7, 0xD0, 0x8D, 0x48, 0xFD, 0x6A, 0x00, 0x52, 0x8D,
+    0x44, 0x24, 0x14, 0x50, 0x66, 0x89, 0x4C, 0x24, 0x19, 0xE8, 0x62, 0xDD, 0xFF, 0xFF, 0x8B, 0x8C,
+    0x24, 0x34, 0x05, 0x00, 0x00, 0x83, 0xC4, 0x10, 0x5E, 0x33, 0xCC, 0xE8, 0x2F, 0xF7, 0x47, 0x00,
+    0x81, 0xC4, 0x24, 0x05, 0x00, 0x00, 0xC3,
+];
+const B_SEND_JOIN_COMPLETE_CALLS: [usize; 2] = [0x69, 0x7b];
+const B_SEND_MP_INFO: [u8; 156] = [
+    0x81, 0xEC, 0x24, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x20, 0x05, 0x00, 0x00, 0x80, 0x3D, 0x94, 0xBA, 0xE8, 0x00, 0x00, 0x53, 0x57, 0xC6, 0x44, 0x24,
+    0x0C, 0x5B, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x74, 0x05, 0xB8, 0x04, 0x00, 0x00, 0x00, 0x0F, 0xB6,
+    0x59, 0x44, 0x8B, 0xB9, 0xAC, 0x01, 0x00, 0x00, 0x0F, 0xB7, 0xD0, 0x88, 0x5C, 0x14, 0x0C, 0x0F,
+    0xB6, 0x59, 0x45, 0x83, 0xC0, 0x01, 0x0F, 0xB7, 0xD0, 0x88, 0x5C, 0x14, 0x0C, 0x83, 0xC0, 0x01,
+    0x8D, 0x50, 0xFD, 0x0F, 0xB7, 0xC0, 0x66, 0x89, 0x54, 0x24, 0x0D, 0x50, 0x8D, 0x54, 0x24, 0x10,
+    0x52, 0xE8, 0xEA, 0xB8, 0x01, 0x00, 0x8B, 0x8C, 0x24, 0x30, 0x05, 0x00, 0x00, 0x83, 0xC4, 0x08,
+    0x5F, 0x5B, 0x33, 0xCC, 0xE8, 0xE6, 0xD1, 0x49, 0x00, 0x81, 0xC4, 0x24, 0x05, 0x00, 0x00, 0xC3,
+    0x8B, 0x44, 0x24, 0x04, 0x8A, 0x48, 0x01, 0x8B, 0x54, 0x24, 0x08, 0x8A, 0x00, 0x56, 0x8B, 0x72,
+    0x04, 0x88, 0x46, 0x44, 0x8B, 0x52, 0x04, 0x88, 0x4A, 0x45, 0x5E, 0xC3,
+];
+const B_SEND_MP_INFO_CALLS: [usize; 2] = [0x61, 0x74];
+const B_SEND_UPD_STATE_SUB3: [u8; 114] = [
+    0x81, 0xEC, 0x20, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x1C, 0x05, 0x00, 0x00, 0x56, 0x8B, 0xF1, 0x80, 0x3E, 0x00, 0x75, 0x40, 0x80, 0x3D, 0x1C, 0xC2,
+    0xE8, 0x00, 0x00, 0xC6, 0x44, 0x24, 0x04, 0x20, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x74, 0x05, 0xB8,
+    0x04, 0x00, 0x00, 0x00, 0x0F, 0xB7, 0xC8, 0x83, 0xC0, 0x01, 0x8D, 0x50, 0xFD, 0x6A, 0x00, 0x0F,
+    0xB7, 0xC0, 0xC6, 0x44, 0x0C, 0x08, 0x03, 0x6A, 0x00, 0x50, 0x8D, 0x4C, 0x24, 0x10, 0x51, 0x66,
+    0x89, 0x54, 0x24, 0x15, 0xE8, 0xA7, 0xB8, 0x01, 0x00, 0x83, 0xC4, 0x10, 0x8B, 0x8C, 0x24, 0x20,
+    0x05, 0x00, 0x00, 0x5E, 0x33, 0xCC, 0xE8, 0x74, 0xD2, 0x49, 0x00, 0x81, 0xC4, 0x20, 0x05, 0x00,
+    0x00, 0xC3,
+];
+const B_SEND_UPD_STATE_SUB3_CALLS: [usize; 2] = [0x54, 0x66];
+const B_SET_PHASE_BROADCAST: [u8; 134] = [
+    0x81, 0xEC, 0x24, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x20, 0x05, 0x00, 0x00, 0x3B, 0x51, 0x40, 0x56, 0x57, 0x74, 0x54, 0x80, 0x39, 0x00, 0x89, 0x51,
+    0x40, 0x74, 0x4C, 0x80, 0x3D, 0x1C, 0xC2, 0xE8, 0x00, 0x00, 0xC6, 0x44, 0x24, 0x0C, 0x20, 0xB8,
+    0x03, 0x00, 0x00, 0x00, 0x74, 0x05, 0xB8, 0x04, 0x00, 0x00, 0x00, 0x8B, 0xB9, 0xAC, 0x01, 0x00,
+    0x00, 0x0F, 0xB7, 0xF0, 0x83, 0xC0, 0x01, 0xC6, 0x44, 0x34, 0x0C, 0x01, 0x0F, 0xB7, 0xF0, 0x89,
+    0x54, 0x34, 0x0C, 0x83, 0xC0, 0x04, 0x8D, 0x50, 0xFD, 0x0F, 0xB7, 0xC0, 0x66, 0x89, 0x54, 0x24,
+    0x0D, 0x50, 0x8D, 0x54, 0x24, 0x10, 0x52, 0xE8, 0x84, 0xBA, 0x01, 0x00, 0x83, 0xC4, 0x08, 0x8B,
+    0x8C, 0x24, 0x28, 0x05, 0x00, 0x00, 0x5F, 0x5E, 0x33, 0xCC, 0xE8, 0x80, 0xD3, 0x49, 0x00, 0x81,
+    0xC4, 0x24, 0x05, 0x00, 0x00, 0xC3,
+];
+const B_SET_PHASE_BROADCAST_CALLS: [usize; 2] = [0x67, 0x7a];
+const B_SEND_JOIN_DENY: [u8; 120] = [
+    0x81, 0xEC, 0x24, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x20, 0x05, 0x00, 0x00, 0x80, 0x3D, 0x7C, 0xBF, 0xE8, 0x00, 0x00, 0x53, 0xC6, 0x44, 0x24, 0x08,
+    0x04, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x74, 0x05, 0xB8, 0x04, 0x00, 0x00, 0x00, 0x8A, 0x9C, 0x24,
+    0x2C, 0x05, 0x00, 0x00, 0x0F, 0xB7, 0xD0, 0xC7, 0x44, 0x14, 0x08, 0xC9, 0x00, 0x00, 0x00, 0x83,
+    0xC0, 0x04, 0x0F, 0xB7, 0xD0, 0x83, 0xC0, 0x01, 0x88, 0x5C, 0x14, 0x08, 0x50, 0x8D, 0x50, 0xFD,
+    0x51, 0x8D, 0x4C, 0x24, 0x10, 0x66, 0x89, 0x54, 0x24, 0x11, 0xE8, 0xD1, 0xD7, 0xFF, 0xFF, 0x8B,
+    0x8C, 0x24, 0x2C, 0x05, 0x00, 0x00, 0x83, 0xC4, 0x08, 0x5B, 0x33, 0xCC, 0xE8, 0x7E, 0xF0, 0x47,
+    0x00, 0x81, 0xC4, 0x24, 0x05, 0x00, 0x00, 0xC3,
+];
+const B_SEND_JOIN_DENY_CALLS: [usize; 2] = [0x5a, 0x6c];
+const B_SEND_UPD_CONN: [u8; 208] = [
+    0x81, 0xEC, 0x24, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x20, 0x05, 0x00, 0x00, 0x80, 0x3D, 0x24, 0xC0, 0xE8, 0x00, 0x00, 0x55, 0x56, 0xC6, 0x44, 0x24,
+    0x0C, 0x0B, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x74, 0x05, 0xB8, 0x04, 0x00, 0x00, 0x00, 0x8A, 0x97,
+    0xB0, 0x01, 0x00, 0x00, 0x0F, 0xB7, 0xC8, 0x83, 0xC0, 0x01, 0x89, 0x44, 0x24, 0x08, 0x8D, 0x44,
+    0x24, 0x08, 0x88, 0x54, 0x0C, 0x0C, 0x50, 0x8B, 0xC7, 0x8D, 0x4C, 0x24, 0x10, 0xE8, 0x1E, 0xEC,
+    0xFF, 0xFF, 0x8B, 0x97, 0xAC, 0x01, 0x00, 0x00, 0x8B, 0x6C, 0x24, 0x0C, 0x8B, 0xB2, 0x00, 0x04,
+    0x00, 0x00, 0x83, 0xC4, 0x04, 0x85, 0xF6, 0x8D, 0x4D, 0xFD, 0x66, 0x89, 0x4C, 0x24, 0x0D, 0x74,
+    0x48, 0x80, 0xBE, 0xB8, 0x01, 0x00, 0x00, 0x01, 0x75, 0x27, 0x3B, 0xF7, 0x74, 0x23, 0x8B, 0x86,
+    0xAC, 0x01, 0x00, 0x00, 0x3B, 0xB0, 0x08, 0x04, 0x00, 0x00, 0x74, 0x15, 0x6A, 0x00, 0x0F, 0xB7,
+    0xCD, 0x6A, 0x00, 0x51, 0x8D, 0x54, 0x24, 0x18, 0x52, 0xE8, 0x82, 0xDA, 0xFF, 0xFF, 0x83, 0xC4,
+    0x10, 0x8B, 0xB6, 0xCC, 0x22, 0x00, 0x00, 0x8B, 0x87, 0xAC, 0x01, 0x00, 0x00, 0x3B, 0xB0, 0x00,
+    0x04, 0x00, 0x00, 0x74, 0x04, 0x85, 0xF6, 0x75, 0xB8, 0x8B, 0x8C, 0x24, 0x28, 0x05, 0x00, 0x00,
+    0x5E, 0x5D, 0x33, 0xCC, 0xE8, 0x36, 0xF4, 0x47, 0x00, 0x81, 0xC4, 0x24, 0x05, 0x00, 0x00, 0xC3,
+];
+const B_SEND_UPD_CONN_CALLS: [usize; 3] = [0x4d, 0x99, 0xc4];
+const B_SEND_TO_LIST_OR_REMOTES: [u8; 121] = [
+    0x83, 0xEC, 0x0C, 0xA1, 0xE4, 0x1F, 0xEB, 0x00, 0x85, 0xC0, 0x53, 0x8B, 0x5C, 0x24, 0x18, 0x55,
+    0x8B, 0x6C, 0x24, 0x18, 0x56, 0x57, 0x8B, 0x3D, 0x14, 0x8C, 0x52, 0x02, 0x8B, 0x8F, 0x08, 0x04,
+    0x00, 0x00, 0x89, 0x44, 0x24, 0x18, 0x89, 0x4C, 0x24, 0x14, 0x75, 0x12, 0x53, 0x55, 0xE8, 0x4D,
+    0xFE, 0xFF, 0xFF, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5D, 0x5B, 0x83, 0xC4, 0x0C, 0xC3, 0x33, 0xFF,
+    0x85, 0xC0, 0x7E, 0x2D, 0xA1, 0xDC, 0x1F, 0xEB, 0x00, 0x8B, 0x54, 0x24, 0x14, 0x39, 0x14, 0xB8,
+    0x74, 0x16, 0x8B, 0x34, 0xB8, 0x6A, 0x00, 0x6A, 0x00, 0x53, 0x55, 0xE8, 0x50, 0xFD, 0xFF, 0xFF,
+    0xA1, 0xDC, 0x1F, 0xEB, 0x00, 0x83, 0xC4, 0x10, 0x83, 0xC7, 0x01, 0x3B, 0x7C, 0x24, 0x18, 0x7C,
+    0xD8, 0x5F, 0x5E, 0x5D, 0x5B, 0x83, 0xC4, 0x0C, 0xC3,
+];
+const B_SEND_TO_LIST_OR_REMOTES_CALLS: [usize; 2] = [0x2e, 0x5b];
+const B_RECENT_IDS_PUSH: [u8; 227] = [
+    0x53, 0x32, 0xD2, 0x32, 0xDB, 0x38, 0x90, 0xBA, 0x1D, 0x00, 0x00, 0x57, 0x76, 0x4C, 0x55, 0x90,
+    0x80, 0xFB, 0x01, 0x0F, 0xB6, 0xCA, 0x74, 0x0C, 0x66, 0x39, 0xB4, 0x48, 0xBA, 0x1C, 0x00, 0x00,
+    0x75, 0x20, 0xB3, 0x01, 0x0F, 0xB6, 0xA8, 0xBA, 0x1D, 0x00, 0x00, 0x8D, 0x79, 0x01, 0x3B, 0xFD,
+    0x7D, 0x10, 0x66, 0x8B, 0xBC, 0x48, 0xBC, 0x1C, 0x00, 0x00, 0x66, 0x89, 0xBC, 0x48, 0xBA, 0x1C,
+    0x00, 0x00, 0x80, 0xC2, 0x01, 0x3A, 0x90, 0xBA, 0x1D, 0x00, 0x00, 0x72, 0xC3, 0x80, 0xFB, 0x01,
+    0x5D, 0x75, 0x07, 0x80, 0x80, 0xBA, 0x1D, 0x00, 0x00, 0xFF, 0x80, 0xB8, 0xBA, 0x1D, 0x00, 0x00,
+    0x80, 0x75, 0x3B, 0x32, 0xD2, 0x32, 0xC9, 0x80, 0xFA, 0x7F, 0xC6, 0x80, 0xBA, 0x1D, 0x00, 0x00,
+    0x7F, 0x73, 0x2B, 0xEB, 0x0B, 0x8D, 0xA4, 0x24, 0x00, 0x00, 0x00, 0x00, 0x8D, 0x64, 0x24, 0x00,
+    0x0F, 0xB6, 0xD1, 0x66, 0x8B, 0xBC, 0x50, 0xBC, 0x1C, 0x00, 0x00, 0x80, 0xC1, 0x01, 0x66, 0x89,
+    0xBC, 0x50, 0xBA, 0x1C, 0x00, 0x00, 0x3A, 0x88, 0xBA, 0x1D, 0x00, 0x00, 0x72, 0xE2, 0x0F, 0xB6,
+    0x88, 0xBA, 0x1D, 0x00, 0x00, 0x66, 0x89, 0xB4, 0x48, 0xBA, 0x1C, 0x00, 0x00, 0x8A, 0x88, 0xB8,
+    0x1C, 0x00, 0x00, 0x80, 0x80, 0xBA, 0x1D, 0x00, 0x00, 0x01, 0x80, 0xF9, 0x20, 0x5F, 0x5B, 0x74,
+    0x21, 0x0F, 0xB6, 0xD1, 0x66, 0x89, 0xB4, 0x90, 0x38, 0x1C, 0x00, 0x00, 0x0F, 0xB6, 0x88, 0xB8,
+    0x1C, 0x00, 0x00, 0xC6, 0x84, 0x88, 0x3A, 0x1C, 0x00, 0x00, 0x00, 0x80, 0x80, 0xB8, 0x1C, 0x00,
+    0x00, 0x01, 0xC3,
+];
+const B_RECENT_IDS_PUSH_CALLS: [usize; 0] = [];
+const B_ACK_WINDOW_PUSH: [u8; 128] = [
+    0x33, 0xD2, 0x39, 0x91, 0xEC, 0x1D, 0x00, 0x00, 0x7C, 0x75, 0x8B, 0x81, 0xEC, 0x1D, 0x00, 0x00,
+    0x3B, 0xC2, 0x7C, 0x6B, 0x56, 0x8B, 0x35, 0xAC, 0x43, 0xE8, 0x00, 0x3B, 0xC6, 0x7E, 0x0B, 0x2B,
+    0xC6, 0x3D, 0x00, 0xE9, 0xA4, 0x35, 0x7C, 0x56, 0xEB, 0x0A, 0x2B, 0xF0, 0x81, 0xFE, 0x00, 0xE9,
+    0xA4, 0x35, 0x7D, 0x4A, 0x83, 0x81, 0xC0, 0x15, 0x00, 0x00, 0x01, 0x8B, 0x81, 0xC0, 0x15, 0x00,
+    0x00, 0x0F, 0xB7, 0xB1, 0xC4, 0x15, 0x00, 0x00, 0x83, 0xC0, 0x1C, 0xC1, 0xE0, 0x04, 0x03, 0xC1,
+    0x89, 0x50, 0x04, 0x66, 0x89, 0x30, 0x88, 0x50, 0x08, 0x88, 0x50, 0x09, 0x88, 0x50, 0x0A, 0x89,
+    0x50, 0x0C, 0x66, 0x83, 0x81, 0xC4, 0x15, 0x00, 0x00, 0x01, 0x0F, 0xB7, 0x81, 0xC4, 0x15, 0x00,
+    0x00, 0x66, 0x3D, 0xFF, 0xFF, 0x75, 0x07, 0x66, 0x89, 0x91, 0xC4, 0x15, 0x00, 0x00, 0x5E, 0xC3,
+];
+const B_ACK_WINDOW_PUSH_CALLS: [usize; 0] = [];
+const B_ACK_RECORD: [u8; 135] = [
+    0x85, 0xC0, 0x0F, 0x84, 0x7E, 0x00, 0x00, 0x00, 0x80, 0xB8, 0xB0, 0x01, 0x00, 0x00, 0x0C, 0x73,
+    0x75, 0x33, 0xC9, 0x39, 0x88, 0xC0, 0x15, 0x00, 0x00, 0x76, 0x6B, 0x8D, 0x90, 0xC0, 0x01, 0x00,
+    0x00, 0x66, 0x39, 0x32, 0x74, 0x0F, 0x83, 0xC1, 0x01, 0x83, 0xC2, 0x10, 0x3B, 0x88, 0xC0, 0x15,
+    0x00, 0x00, 0x72, 0xED, 0xC3, 0xC1, 0xE1, 0x04, 0x80, 0xBC, 0x01, 0xC8, 0x01, 0x00, 0x00, 0x00,
+    0x8D, 0x14, 0x01, 0x75, 0x41, 0x8B, 0x0D, 0xCC, 0xA3, 0x52, 0x02, 0x2B, 0x8A, 0xC4, 0x01, 0x00,
+    0x00, 0xC6, 0x82, 0xC8, 0x01, 0x00, 0x00, 0x01, 0x0F, 0xB6, 0x90, 0x34, 0x22, 0x00, 0x00, 0x83,
+    0x80, 0x38, 0x22, 0x00, 0x00, 0x01, 0xD1, 0xE9, 0x89, 0x8C, 0x90, 0x0C, 0x22, 0x00, 0x00, 0x80,
+    0x80, 0x34, 0x22, 0x00, 0x00, 0x01, 0x80, 0xB8, 0x34, 0x22, 0x00, 0x00, 0x0A, 0x72, 0x07, 0xC6,
+    0x80, 0x34, 0x22, 0x00, 0x00, 0x00, 0xC3,
+];
+const B_ACK_RECORD_CALLS: [usize; 0] = [];
+const B_CHECK_TIMEOUT: [u8; 115] = [
+    0x80, 0x3D, 0x56, 0x8B, 0x52, 0x02, 0x00, 0x74, 0x03, 0xB0, 0x01, 0xC3, 0x80, 0xBF, 0xB8, 0x01,
+    0x00, 0x00, 0x00, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0x8B, 0x8F, 0xAC, 0x01, 0x00, 0x00, 0x83, 0x79,
+    0x1C, 0x0A, 0x53, 0x56, 0xB0, 0x01, 0xBB, 0x60, 0xEA, 0x00, 0x00, 0x75, 0x05, 0xBB, 0x98, 0x3A,
+    0x00, 0x00, 0x8B, 0x0D, 0xCC, 0xA3, 0x52, 0x02, 0x8B, 0xB7, 0x40, 0x22, 0x00, 0x00, 0x8B, 0xD1,
+    0x2B, 0xD6, 0x3B, 0xF1, 0x76, 0x03, 0x83, 0xEA, 0x01, 0x3B, 0xD3, 0x76, 0x0C, 0x5E, 0xC6, 0x87,
+    0xB8, 0x01, 0x00, 0x00, 0x00, 0x32, 0xC0, 0x5B, 0xC3, 0x3B, 0xF1, 0x76, 0x07, 0x2B, 0xCE, 0x83,
+    0xE9, 0x01, 0xEB, 0x02, 0x2B, 0xCE, 0x81, 0xF9, 0x98, 0x3A, 0x00, 0x00, 0x76, 0x02, 0x32, 0xC0,
+    0x5E, 0x5B, 0xC3,
+];
+const B_CHECK_TIMEOUT_CALLS: [usize; 0] = [];
+const B_TIMEOUT_EXPIRED: [u8; 53] = [
+    0x80, 0x3D, 0x89, 0x8B, 0x52, 0x02, 0x00, 0x74, 0x1C, 0xA1, 0x14, 0x16, 0xEB, 0x00, 0x85, 0xC0,
+    0x7C, 0x13, 0x8B, 0x0D, 0xAC, 0x43, 0xE8, 0x00, 0x3B, 0xC1, 0x7E, 0x0C, 0x2B, 0xC1, 0x3D, 0x00,
+    0xE9, 0xA4, 0x35, 0x7D, 0x0D, 0x32, 0xC0, 0xC3, 0x2B, 0xC8, 0x81, 0xF9, 0x00, 0xE9, 0xA4, 0x35,
+    0x7D, 0xF3, 0xB0, 0x01, 0xC3,
+];
+const B_TIMEOUT_EXPIRED_CALLS: [usize; 0] = [];
+const B_TIMEOUT_ARM_10S: [u8; 44] = [
+    0xA1, 0xAC, 0x43, 0xE8, 0x00, 0x05, 0x10, 0x27, 0x00, 0x00, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0xC6,
+    0x05, 0x89, 0x8B, 0x52, 0x02, 0x01, 0xA3, 0x14, 0x16, 0xEB, 0x00, 0x7E, 0x0A, 0x2D, 0x00, 0xD2,
+    0x49, 0x6B, 0xA3, 0x14, 0x16, 0xEB, 0x00, 0xE9, 0xB4, 0xEF, 0x00, 0x00,
+];
+const B_TIMEOUT_ARM_10S_CALLS: [usize; 0] = [];
+const B_RATE_METER_INIT: [u8; 142] = [
+    0x8B, 0x44, 0x24, 0x04, 0x80, 0xFA, 0x1E, 0x0F, 0xB6, 0xD2, 0x72, 0x05, 0xBA, 0x1E, 0x00, 0x00,
+    0x00, 0x81, 0xF9, 0x00, 0xE0, 0x00, 0x00, 0x88, 0x50, 0x7D, 0x66, 0x8B, 0x54, 0x24, 0x08, 0x66,
+    0x89, 0x50, 0x7E, 0x76, 0x05, 0xB9, 0x00, 0xE0, 0x00, 0x00, 0x89, 0x08, 0x33, 0xC9, 0x89, 0x48,
+    0x04, 0x89, 0x48, 0x08, 0x89, 0x48, 0x0C, 0x89, 0x48, 0x10, 0x89, 0x48, 0x14, 0x89, 0x48, 0x18,
+    0x89, 0x48, 0x1C, 0x89, 0x48, 0x20, 0x89, 0x48, 0x24, 0x89, 0x48, 0x28, 0x89, 0x48, 0x2C, 0x89,
+    0x48, 0x30, 0x89, 0x48, 0x34, 0x89, 0x48, 0x38, 0x89, 0x48, 0x3C, 0x89, 0x48, 0x40, 0x89, 0x48,
+    0x44, 0x89, 0x48, 0x48, 0x89, 0x48, 0x4C, 0x89, 0x48, 0x50, 0x89, 0x48, 0x54, 0x89, 0x48, 0x58,
+    0x89, 0x48, 0x5C, 0x89, 0x48, 0x60, 0x89, 0x48, 0x64, 0x89, 0x48, 0x68, 0x89, 0x48, 0x6C, 0x89,
+    0x48, 0x70, 0x89, 0x48, 0x74, 0x89, 0x48, 0x78, 0x88, 0x48, 0x7C, 0xC2, 0x08, 0x00,
+];
+const B_RATE_METER_INIT_CALLS: [usize; 0] = [];
+const B_RATE_METER_REMAINING: [u8; 52] = [
+    0x0F, 0xB6, 0x42, 0x7C, 0x56, 0x0F, 0xB6, 0x72, 0x7D, 0x33, 0xC9, 0x85, 0xF6, 0x7E, 0x18, 0x90,
+    0x03, 0x4C, 0x82, 0x04, 0x85, 0xC0, 0x75, 0x07, 0xB8, 0x1D, 0x00, 0x00, 0x00, 0xEB, 0x03, 0x83,
+    0xE8, 0x01, 0x83, 0xEE, 0x01, 0x75, 0xE9, 0x8B, 0x02, 0x3B, 0xC8, 0x5E, 0x76, 0x03, 0x33, 0xC0,
+    0xC3, 0x2B, 0xC1, 0xC3,
+];
+const B_RATE_METER_REMAINING_CALLS: [usize; 0] = [];
+const B_CONN_NOTE_RECEIVED: [u8; 65] = [
+    0x85, 0xC0, 0x74, 0x3C, 0x80, 0xB8, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x74, 0x27, 0x66, 0x81, 0xFA,
+    0xFF, 0xFF, 0x74, 0x20, 0x0F, 0xB7, 0x88, 0x8E, 0x16, 0x00, 0x00, 0x66, 0x83, 0xF9, 0x64, 0x73,
+    0x13, 0x0F, 0xB7, 0xC9, 0x66, 0x89, 0x94, 0x48, 0xC6, 0x15, 0x00, 0x00, 0x66, 0x83, 0x80, 0x8E,
+    0x16, 0x00, 0x00, 0x01, 0x8B, 0x15, 0xCC, 0xA3, 0x52, 0x02, 0x89, 0x90, 0x40, 0x22, 0x00, 0x00,
+    0xC3,
+];
+const B_CONN_NOTE_RECEIVED_CALLS: [usize; 0] = [];
+const B_ACK_WINDOW_MARK_ALL: [u8; 38] = [
+    0x85, 0xD2, 0x74, 0x21, 0x33, 0xC0, 0x39, 0x82, 0xC0, 0x15, 0x00, 0x00, 0x76, 0x17, 0x8D, 0x8A,
+    0xC9, 0x01, 0x00, 0x00, 0xC6, 0x01, 0x01, 0x83, 0xC0, 0x01, 0x83, 0xC1, 0x10, 0x3B, 0x82, 0xC0,
+    0x15, 0x00, 0x00, 0x72, 0xEF, 0xC3,
+];
+const B_ACK_WINDOW_MARK_ALL_CALLS: [usize; 0] = [];
+const B_RESET_ACK_WINDOW: [u8; 100] = [
+    0x33, 0xC9, 0x3B, 0xC1, 0x74, 0x5D, 0x89, 0x88, 0xC0, 0x15, 0x00, 0x00, 0x66, 0x89, 0x88, 0x8E,
+    0x16, 0x00, 0x00, 0x66, 0x89, 0x88, 0x90, 0x16, 0x00, 0x00, 0x66, 0x89, 0x88, 0xC4, 0x15, 0x00,
+    0x00, 0x89, 0x88, 0xC4, 0x01, 0x00, 0x00, 0x66, 0x89, 0x88, 0xC0, 0x01, 0x00, 0x00, 0x88, 0x88,
+    0xC8, 0x01, 0x00, 0x00, 0x88, 0x88, 0xC9, 0x01, 0x00, 0x00, 0x88, 0x88, 0xCA, 0x01, 0x00, 0x00,
+    0x89, 0x88, 0xCC, 0x01, 0x00, 0x00, 0x66, 0x83, 0x80, 0xC4, 0x15, 0x00, 0x00, 0x01, 0x0F, 0xB7,
+    0x90, 0xC4, 0x15, 0x00, 0x00, 0x66, 0x81, 0xFA, 0xFF, 0xFF, 0x75, 0x07, 0x66, 0x89, 0x88, 0xC4,
+    0x15, 0x00, 0x00, 0xC3,
+];
+const B_RESET_ACK_WINDOW_CALLS: [usize; 0] = [];
+const B_CLOCK_PREDICTED_MS: [u8; 130] = [
+    0x8B, 0x0D, 0x14, 0x8C, 0x52, 0x02, 0x83, 0xEC, 0x0C, 0x80, 0x3D, 0x56, 0x8B, 0x52, 0x02, 0x00,
+    0x74, 0x09, 0x80, 0x3D, 0x2B, 0x8B, 0x52, 0x02, 0x00, 0x74, 0x43, 0x80, 0xB9, 0xF8, 0x03, 0x00,
+    0x00, 0x00, 0x74, 0x3A, 0xD9, 0x05, 0x2C, 0x00, 0x13, 0x02, 0xDC, 0x0D, 0x00, 0xC2, 0xE5, 0x00,
+    0xD9, 0x7C, 0x24, 0x02, 0x0F, 0xB7, 0x44, 0x24, 0x02, 0x0D, 0x00, 0x0C, 0x00, 0x00, 0x89, 0x44,
+    0x24, 0x04, 0x8B, 0x41, 0x08, 0xD9, 0x6C, 0x24, 0x04, 0xDF, 0x7C, 0x24, 0x04, 0x8B, 0x54, 0x24,
+    0x04, 0x2B, 0xC2, 0x83, 0xC0, 0x64, 0xD9, 0x6C, 0x24, 0x02, 0x83, 0xC4, 0x0C, 0xC3, 0x8B, 0x81,
+    0x08, 0x04, 0x00, 0x00, 0x8B, 0x80, 0xE8, 0x1D, 0x00, 0x00, 0x85, 0xC0, 0x76, 0x0D, 0x69, 0xC0,
+    0xE8, 0x03, 0x00, 0x00, 0x03, 0x41, 0x08, 0x83, 0xC4, 0x0C, 0xC3, 0x8B, 0x41, 0x08, 0x83, 0xC4,
+    0x0C, 0xC3,
+];
+const B_CLOCK_PREDICTED_MS_CALLS: [usize; 0] = [];
+const B_CLOCK_ADVANCE: [u8; 341] = [
+    0x83, 0xEC, 0x14, 0x80, 0x3D, 0x56, 0x8B, 0x52, 0x02, 0x00, 0x53, 0x55, 0x56, 0x57, 0x74, 0x23,
+    0xA1, 0x14, 0x8C, 0x52, 0x02, 0x85, 0xC0, 0x74, 0x1A, 0x80, 0x3D, 0x2B, 0x8B, 0x52, 0x02, 0x00,
+    0x0F, 0x84, 0x27, 0x01, 0x00, 0x00, 0x80, 0xB8, 0xF8, 0x03, 0x00, 0x00, 0x00, 0x0F, 0x84, 0x1A,
+    0x01, 0x00, 0x00, 0x8B, 0x2D, 0xCC, 0x80, 0xDB, 0x00, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF, 0xD5,
+    0x8B, 0x1D, 0xD0, 0x80, 0xDB, 0x00, 0x83, 0x05, 0x68, 0x89, 0xA1, 0x02, 0x01, 0x68, 0x44, 0x89,
+    0xA1, 0x02, 0xFF, 0xD3, 0x83, 0x3D, 0x40, 0x89, 0xA1, 0x02, 0x00, 0x74, 0x34, 0xA1, 0x3C, 0x89,
+    0xA1, 0x02, 0x8B, 0x0D, 0x38, 0x89, 0xA1, 0x02, 0x69, 0xC0, 0x44, 0x10, 0x00, 0x00, 0x03, 0x01,
+    0x74, 0x1F, 0x8B, 0x35, 0x5C, 0xB1, 0x12, 0x02, 0xEB, 0x06, 0x8D, 0x9B, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x70, 0x08, 0xBF, 0x38, 0x89, 0xA1, 0x02, 0xE8, 0x13, 0xF0, 0xE9, 0xFF, 0x85, 0xC0, 0x75,
+    0xEF, 0x68, 0x44, 0x89, 0xA1, 0x02, 0xFF, 0xD5, 0x83, 0x05, 0x68, 0x89, 0xA1, 0x02, 0xFF, 0x8B,
+    0x15, 0x68, 0x89, 0xA1, 0x02, 0x75, 0x16, 0xA1, 0x6C, 0x89, 0xA1, 0x02, 0x85, 0xC0, 0x7E, 0x0D,
+    0x8B, 0x0D, 0x60, 0x89, 0xA1, 0x02, 0x51, 0xFF, 0x15, 0xDC, 0x81, 0xDB, 0x00, 0x68, 0x44, 0x89,
+    0xA1, 0x02, 0xFF, 0xD3, 0x8B, 0x15, 0x5C, 0xB1, 0x12, 0x02, 0x01, 0x15, 0x60, 0xB1, 0x12, 0x02,
+    0x80, 0x3D, 0x56, 0x8B, 0x52, 0x02, 0x00, 0x74, 0x30, 0xD9, 0x05, 0x7C, 0x43, 0xE8, 0x00, 0xDC,
+    0x0D, 0xD8, 0xC0, 0xE5, 0x00, 0xD9, 0x7C, 0x24, 0x16, 0x0F, 0xB7, 0x44, 0x24, 0x16, 0x0D, 0x00,
+    0x0C, 0x00, 0x00, 0x89, 0x44, 0x24, 0x18, 0xD9, 0x6C, 0x24, 0x18, 0xDF, 0x7C, 0x24, 0x18, 0x8B,
+    0x44, 0x24, 0x18, 0xD9, 0x6C, 0x24, 0x16, 0xEB, 0x2E, 0xD9, 0x05, 0x80, 0x43, 0xE8, 0x00, 0xDC,
+    0x0D, 0xD8, 0xC0, 0xE5, 0x00, 0xD9, 0x7C, 0x24, 0x16, 0x0F, 0xB7, 0x44, 0x24, 0x16, 0x0D, 0x00,
+    0x0C, 0x00, 0x00, 0x89, 0x44, 0x24, 0x18, 0xD9, 0x6C, 0x24, 0x18, 0xDF, 0x7C, 0x24, 0x18, 0x8B,
+    0x44, 0x24, 0x18, 0xD9, 0x6C, 0x24, 0x16, 0x3D, 0xFA, 0x00, 0x00, 0x00, 0xA3, 0x5C, 0xB1, 0x12,
+    0x02, 0x76, 0x0A, 0xC7, 0x05, 0x5C, 0xB1, 0x12, 0x02, 0xFA, 0x00, 0x00, 0x00, 0x5F, 0x5E, 0x5D,
+    0x5B, 0x83, 0xC4, 0x14, 0xC3,
+];
+const B_CLOCK_ADVANCE_CALLS: [usize; 1] = [0x88];
+const B_OUT_OF_PHASE_MASK: [u8; 68] = [
+    0x56, 0x8B, 0xB1, 0x00, 0x04, 0x00, 0x00, 0x8B, 0xD6, 0x33, 0xC0, 0x85, 0xD2, 0x74, 0x33, 0x57,
+    0x8B, 0xB9, 0x04, 0x04, 0x00, 0x00, 0x53, 0x3B, 0xD7, 0x74, 0x17, 0x8B, 0x4F, 0x40, 0x3B, 0x4A,
+    0x40, 0x74, 0x0F, 0x8A, 0x8A, 0xB0, 0x01, 0x00, 0x00, 0xBB, 0x01, 0x00, 0x00, 0x00, 0xD3, 0xE3,
+    0x0B, 0xC3, 0x8B, 0x92, 0xCC, 0x22, 0x00, 0x00, 0x3B, 0xD6, 0x74, 0x04, 0x85, 0xD2, 0x75, 0xD7,
+    0x5B, 0x5F, 0x5E, 0xC3,
+];
+const B_OUT_OF_PHASE_MASK_CALLS: [usize; 0] = [];
+const B_PEERS_PHASE_EQUAL: [u8; 98] = [
+    0x80, 0x3D, 0x56, 0x8B, 0x52, 0x02, 0x00, 0x74, 0x09, 0x80, 0x3D, 0x2B, 0x8B, 0x52, 0x02, 0x00,
+    0x74, 0x09, 0x80, 0xBA, 0xF8, 0x03, 0x00, 0x00, 0x00, 0x75, 0x03, 0xB0, 0x01, 0xC3, 0x8B, 0xC2,
+    0xE8, 0xAB, 0xD9, 0x0B, 0x00, 0x84, 0xC0, 0x74, 0x03, 0x32, 0xC0, 0xC3, 0x8B, 0x8A, 0x00, 0x04,
+    0x00, 0x00, 0x8B, 0xC1, 0x85, 0xC0, 0x56, 0x74, 0x21, 0x8B, 0x92, 0x04, 0x04, 0x00, 0x00, 0x90,
+    0x3B, 0xC2, 0x74, 0x08, 0x8B, 0x72, 0x40, 0x3B, 0x70, 0x40, 0x75, 0x12, 0x8B, 0x80, 0xCC, 0x22,
+    0x00, 0x00, 0x3B, 0xC1, 0x74, 0x04, 0x85, 0xC0, 0x75, 0xE6, 0xB0, 0x01, 0x5E, 0xC3, 0x32, 0xC0,
+    0x5E, 0xC3,
+];
+const B_PEERS_PHASE_EQUAL_CALLS: [usize; 1] = [0x20];
+const B_ALL_CONNS_STATE_EQ: [u8; 54] = [
+    0x8B, 0xD6, 0xE8, 0xB9, 0xFE, 0xFF, 0xFF, 0x84, 0xC0, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0x8B, 0x8E,
+    0x00, 0x04, 0x00, 0x00, 0x8B, 0xC1, 0x85, 0xC0, 0x74, 0x19, 0x8D, 0x9B, 0x00, 0x00, 0x00, 0x00,
+    0x39, 0x78, 0x3C, 0x75, 0xE6, 0x8B, 0x80, 0xCC, 0x22, 0x00, 0x00, 0x3B, 0xC1, 0x74, 0x04, 0x85,
+    0xC0, 0x75, 0xED, 0xB0, 0x01, 0xC3,
+];
+const B_ALL_CONNS_STATE_EQ_CALLS: [usize; 1] = [0x2];
+const B_ALL_CONNS_STATE_GE: [u8; 54] = [
+    0x8B, 0xD6, 0xE8, 0x09, 0xFE, 0xFF, 0xFF, 0x84, 0xC0, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0x8B, 0x8E,
+    0x00, 0x04, 0x00, 0x00, 0x8B, 0xC1, 0x85, 0xC0, 0x74, 0x19, 0x8D, 0x9B, 0x00, 0x00, 0x00, 0x00,
+    0x39, 0x78, 0x3C, 0x7C, 0xE6, 0x8B, 0x80, 0xCC, 0x22, 0x00, 0x00, 0x3B, 0xC1, 0x74, 0x04, 0x85,
+    0xC0, 0x75, 0xED, 0xB0, 0x01, 0xC3,
+];
+const B_ALL_CONNS_STATE_GE_CALLS: [usize; 1] = [0x2];
+const B_LOBBY_ANY_CONN_STATE_4: [u8; 47] = [
+    0xA1, 0xE8, 0x8C, 0x52, 0x02, 0x8B, 0x88, 0x00, 0x04, 0x00, 0x00, 0x8B, 0xC1, 0x85, 0xC0, 0x74,
+    0x18, 0xBA, 0x04, 0x00, 0x00, 0x00, 0x39, 0x50, 0x3C, 0x74, 0x11, 0x8B, 0x80, 0xCC, 0x22, 0x00,
+    0x00, 0x3B, 0xC1, 0x74, 0x04, 0x85, 0xC0, 0x75, 0xED, 0x32, 0xC0, 0xC3, 0xB0, 0x01, 0xC3,
+];
+const B_LOBBY_ANY_CONN_STATE_4_CALLS: [usize; 0] = [];
+const B_STATE_IN_SET_B: [u8; 51] = [
+    0x8B, 0x40, 0x1C, 0x83, 0xC0, 0xFE, 0x83, 0xF8, 0x0A, 0x77, 0x11, 0x0F, 0xB6, 0x88, 0xD8, 0xCE,
+    0x80, 0x00, 0xFF, 0x24, 0x8D, 0xD0, 0xCE, 0x80, 0x00, 0xB0, 0x01, 0xC3, 0x32, 0xC0, 0xC3, 0x90,
+    0xC9, 0xCE, 0x80, 0x00, 0xCC, 0xCE, 0x80, 0x00, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00, 0x01, 0x00,
+    0x00, 0x00, 0x00,
+];
+const B_STATE_IN_SET_B_CALLS: [usize; 0] = [];
+const B_STATE_IS_8: [u8; 16] = [
+    0x8B, 0x0D, 0xB4, 0x8C, 0x52, 0x02, 0x33, 0xC0, 0x83, 0x79, 0x1C, 0x08, 0x0F, 0x94, 0xC0, 0xC3,
+];
+const B_STATE_IS_8_CALLS: [usize; 0] = [];
+const B_LOCAL_CONN_ID: [u8; 25] = [
+    0xA1, 0x14, 0x8C, 0x52, 0x02, 0x85, 0xC0, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0x8B, 0x80, 0x08, 0x04,
+    0x00, 0x00, 0x8A, 0x80, 0xB0, 0x01, 0x00, 0x00, 0xC3,
+];
+const B_LOCAL_CONN_ID_CALLS: [usize; 0] = [];
+const B_ID_TO_HUMAN: [u8; 95] = [
+    0x66, 0x3D, 0xFF, 0xFF, 0x74, 0x44, 0x56, 0x8B, 0x35, 0x58, 0xE2, 0x12, 0x02, 0x0F, 0xB7, 0xC0,
+    0x6A, 0x00, 0x50, 0xE8, 0xF8, 0x0D, 0x01, 0x00, 0x85, 0xC0, 0x5E, 0x74, 0x2D, 0x8B, 0x00, 0x85,
+    0xC0, 0x74, 0x27, 0x8B, 0x48, 0x04, 0x85, 0xC9, 0x74, 0x20, 0x8B, 0xD1, 0x81, 0xE2, 0xFF, 0x0F,
+    0x00, 0x00, 0xC1, 0xE2, 0x04, 0x8B, 0x82, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x74, 0x0B, 0x39,
+    0x48, 0x44, 0x75, 0x06, 0x83, 0x78, 0x4C, 0x01, 0x74, 0x03, 0x33, 0xC0, 0xC3, 0x8A, 0x88, 0xCC,
+    0x03, 0x00, 0x00, 0x80, 0xE9, 0x01, 0xF6, 0xD9, 0x1B, 0xC9, 0xF7, 0xD1, 0x23, 0xC1, 0xC3,
+];
+const B_ID_TO_HUMAN_CALLS: [usize; 1] = [0x13];
+const B_MAP_SET: [u8; 40] = [
+    0x51, 0x56, 0x8B, 0x35, 0x58, 0xE2, 0x12, 0x02, 0x6A, 0x01, 0x50, 0xE8, 0x00, 0x14, 0x00, 0x00,
+    0x85, 0xC0, 0x75, 0x07, 0x32, 0xC0, 0x5E, 0x59, 0xC2, 0x04, 0x00, 0x8B, 0x4C, 0x24, 0x0C, 0x89,
+    0x08, 0xB0, 0x01, 0x5E, 0x59, 0xC2, 0x04, 0x00,
+];
+const B_MAP_SET_CALLS: [usize; 1] = [0xb];
+const B_FIND_RESERVATION: [u8; 89] = [
+    0x53, 0x8B, 0x5C, 0x24, 0x08, 0x55, 0x8B, 0x6C, 0x24, 0x10, 0x56, 0x8B, 0xB0, 0xF4, 0x03, 0x00,
+    0x00, 0x83, 0xEE, 0x01, 0x57, 0x78, 0x29, 0x8D, 0x0C, 0xB6, 0xC1, 0xE1, 0x04, 0x8D, 0x7C, 0x01,
+    0x5C, 0x8B, 0xCB, 0x8B, 0xD7, 0xE8, 0xD6, 0x83, 0x00, 0x00, 0x84, 0xC0, 0x74, 0x08, 0x8B, 0x57,
+    0x24, 0x3B, 0x53, 0x24, 0x74, 0x13, 0x83, 0xEE, 0x01, 0x83, 0xEF, 0x50, 0x85, 0xF6, 0x7D, 0xE1,
+    0x5F, 0x5E, 0x5D, 0x32, 0xC0, 0x5B, 0xC2, 0x08, 0x00, 0x85, 0xED, 0x74, 0x03, 0x89, 0x75, 0x00,
+    0x5F, 0x5E, 0x5D, 0xB0, 0x01, 0x5B, 0xC2, 0x08, 0x00,
+];
+const B_FIND_RESERVATION_CALLS: [usize; 1] = [0x25];
+const B_REMOVE_RESERVATION: [u8; 97] = [
+    0x83, 0x80, 0xF4, 0x03, 0x00, 0x00, 0xFF, 0x8B, 0x88, 0xF4, 0x03, 0x00, 0x00, 0x3B, 0xCA, 0x74,
+    0x4F, 0x53, 0x8D, 0x0C, 0x89, 0x55, 0x56, 0xC1, 0xE1, 0x04, 0x8B, 0x6C, 0x01, 0x58, 0x8D, 0x14,
+    0x92, 0x8D, 0x74, 0x01, 0x34, 0x57, 0xC1, 0xE2, 0x04, 0x03, 0xD0, 0x8D, 0x5A, 0x34, 0x8B, 0xFB,
+    0xB9, 0x09, 0x00, 0x00, 0x00, 0xF3, 0xA5, 0x89, 0x6B, 0x24, 0x8B, 0x88, 0xF4, 0x03, 0x00, 0x00,
+    0x8D, 0x0C, 0x89, 0xC1, 0xE1, 0x04, 0x8D, 0x74, 0x01, 0x5C, 0x8D, 0x42, 0x5C, 0x8B, 0x56, 0x24,
+    0xB9, 0x09, 0x00, 0x00, 0x00, 0x8B, 0xF8, 0xF3, 0xA5, 0x5F, 0x5E, 0x5D, 0x89, 0x50, 0x24, 0x5B,
+    0xC3,
+];
+const B_REMOVE_RESERVATION_CALLS: [usize; 0] = [];
+const B_GUID_IN_ARRAY: [u8; 77] = [
+    0x53, 0x8B, 0x5C, 0x24, 0x08, 0x55, 0x56, 0x57, 0x33, 0xFF, 0x85, 0xDB, 0x7E, 0x31, 0x8B, 0x6C,
+    0x24, 0x18, 0x81, 0xC5, 0x4C, 0x01, 0x00, 0x00, 0x8B, 0xF0, 0x8D, 0x9B, 0x00, 0x00, 0x00, 0x00,
+    0x8B, 0xCE, 0x8B, 0xD5, 0xE8, 0x67, 0xB3, 0x00, 0x00, 0x84, 0xC0, 0x74, 0x08, 0x8B, 0x45, 0x24,
+    0x3B, 0x46, 0x24, 0x74, 0x11, 0x83, 0xC7, 0x01, 0x83, 0xC6, 0x28, 0x3B, 0xFB, 0x7C, 0xE1, 0x5F,
+    0x5E, 0x5D, 0x32, 0xC0, 0x5B, 0xC3, 0x5F, 0x5E, 0x5D, 0xB0, 0x01, 0x5B, 0xC3,
+];
+const B_GUID_IN_ARRAY_CALLS: [usize; 1] = [0x24];
+const B_FIND_BEST_CONN: [u8; 73] = [
+    0x53, 0x8B, 0x5C, 0x24, 0x08, 0x56, 0x33, 0xC0, 0x33, 0xF6, 0x85, 0xFF, 0x8B, 0xCF, 0x74, 0x36,
+    0x3B, 0xCB, 0x74, 0x24, 0x80, 0xB9, 0xCC, 0x1D, 0x00, 0x00, 0x00, 0x75, 0x1B, 0x80, 0xB9, 0xB8,
+    0x01, 0x00, 0x00, 0x00, 0x74, 0x12, 0x8B, 0x91, 0xBC, 0x1D, 0x00, 0x00, 0x3B, 0xD6, 0x77, 0x04,
+    0x85, 0xC0, 0x75, 0x04, 0x8B, 0xC1, 0x8B, 0xF2, 0x8B, 0x89, 0xCC, 0x22, 0x00, 0x00, 0x3B, 0xCF,
+    0x74, 0x04, 0x85, 0xC9, 0x75, 0xCA, 0x5E, 0x5B, 0xC3,
+];
+const B_FIND_BEST_CONN_CALLS: [usize; 0] = [];
+const B_SESSION_INFO_BASE_INIT: [u8; 49] = [
+    0x33, 0xC9, 0xC7, 0x00, 0x54, 0xFD, 0xDF, 0x00, 0x89, 0x48, 0x30, 0x88, 0x48, 0x34, 0x89, 0x48,
+    0x38, 0xC7, 0x40, 0x3C, 0x01, 0x00, 0x00, 0x00, 0x88, 0x48, 0x41, 0x88, 0x48, 0x42, 0x88, 0x48,
+    0x43, 0x88, 0x48, 0x44, 0x88, 0x48, 0x46, 0x88, 0x48, 0x47, 0x88, 0x48, 0x48, 0x88, 0x48, 0x49,
+    0xC3,
+];
+const B_SESSION_INFO_BASE_INIT_CALLS: [usize; 0] = [];
+const B_BYTE_NC_INIT: [u8; 14] = [
+    0xC7, 0x00, 0xC4, 0x64, 0xE2, 0x00, 0xC7, 0x40, 0x04, 0x00, 0x00, 0x00, 0x00, 0xC3,
+];
+const B_BYTE_NC_INIT_CALLS: [usize; 0] = [];
+const B_BYTE_NC_INIT_BITS: [u8; 13] = [
+    0xC1, 0xE9, 0x03, 0xC7, 0x00, 0xC4, 0x64, 0xE2, 0x00, 0x89, 0x48, 0x04, 0xC3,
+];
+const B_BYTE_NC_INIT_BITS_CALLS: [usize; 0] = [];
+const B_BIT_NC_INIT: [u8; 18] = [
+    0x33, 0xC9, 0xC7, 0x00, 0xD8, 0x64, 0xE2, 0x00, 0x89, 0x48, 0x04, 0x89, 0x48, 0x08, 0x89, 0x48,
+    0x0C, 0xC3,
+];
+const B_BIT_NC_INIT_CALLS: [usize; 0] = [];
+const B_BIT_NC_INIT_BITS: [u8; 24] = [
+    0x8B, 0xD1, 0x89, 0x48, 0x04, 0xC1, 0xEA, 0x03, 0x83, 0xE1, 0x07, 0xC7, 0x00, 0xD8, 0x64, 0xE2,
+    0x00, 0x89, 0x50, 0x08, 0x89, 0x48, 0x0C, 0xC3,
+];
+const B_BIT_NC_INIT_BITS_CALLS: [usize; 0] = [];
+const B_FLOAT_COMP_INIT: [u8; 47] = [
+    0xD9, 0x44, 0x24, 0x04, 0x8A, 0x54, 0x24, 0x18, 0xD9, 0x58, 0x04, 0x89, 0x08, 0xD9, 0x44, 0x24,
+    0x08, 0x88, 0x50, 0x18, 0xD9, 0x58, 0x08, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x58, 0x0C, 0xD9, 0x44,
+    0x24, 0x10, 0xD9, 0x58, 0x10, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0x58, 0x14, 0xC2, 0x18, 0x00,
+];
+const B_FLOAT_COMP_INIT_CALLS: [usize; 0] = [];
+const B_FLOAT_COMP_INIT_COPY: [u8; 27] = [
+    0x56, 0x57, 0x8D, 0x78, 0x04, 0xB9, 0x07, 0x00, 0x00, 0x00, 0x8D, 0x74, 0x24, 0x0C, 0xF3, 0xA5,
+    0x5F, 0xC7, 0x00, 0xEC, 0x64, 0xE2, 0x00, 0x5E, 0xC2, 0x1C, 0x00,
+];
+const B_FLOAT_COMP_INIT_COPY_CALLS: [usize; 0] = [];
+const B_FLOAT_COMP_COPY: [u8; 20] = [
+    0x56, 0x57, 0x8B, 0xF1, 0x83, 0xC6, 0x04, 0x8D, 0x78, 0x04, 0xB9, 0x07, 0x00, 0x00, 0x00, 0xF3,
+    0xA5, 0x5F, 0x5E, 0xC3,
+];
+const B_FLOAT_COMP_COPY_CALLS: [usize; 0] = [];
+const B_VECTOR3_COMP_CTOR: [u8; 81] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0xD9, 0x45, 0x5C, 0x56, 0xC7, 0x00, 0x00, 0x65, 0xE2, 0x00,
+    0x57, 0xB9, 0xEC, 0x64, 0xE2, 0x00, 0x89, 0x48, 0x04, 0x89, 0x48, 0x24, 0x89, 0x48, 0x44, 0x8D,
+    0x78, 0x08, 0xB9, 0x07, 0x00, 0x00, 0x00, 0x8D, 0x75, 0x08, 0xF3, 0xA5, 0x8D, 0x78, 0x28, 0xB9,
+    0x07, 0x00, 0x00, 0x00, 0x8D, 0x75, 0x24, 0xF3, 0xA5, 0x8D, 0x78, 0x48, 0xB9, 0x07, 0x00, 0x00,
+    0x00, 0x8D, 0x75, 0x40, 0xF3, 0xA5, 0xD9, 0x58, 0x64, 0x5F, 0x5E, 0x8B, 0xE5, 0x5D, 0xC2, 0x58,
+    0x00,
+];
+const B_VECTOR3_COMP_CTOR_CALLS: [usize; 0] = [];
+const B_VECTOR2_COMP_CTOR: [u8; 59] = [
+    0xD9, 0x44, 0x24, 0x3C, 0x56, 0x57, 0xC7, 0x00, 0x14, 0x65, 0xE2, 0x00, 0xB9, 0xEC, 0x64, 0xE2,
+    0x00, 0x89, 0x48, 0x04, 0x89, 0x48, 0x24, 0x8D, 0x78, 0x08, 0xB9, 0x07, 0x00, 0x00, 0x00, 0x8D,
+    0x74, 0x24, 0x0C, 0xF3, 0xA5, 0x8D, 0x78, 0x28, 0xB9, 0x07, 0x00, 0x00, 0x00, 0x8D, 0x74, 0x24,
+    0x28, 0xF3, 0xA5, 0xD9, 0x58, 0x44, 0x5F, 0x5E, 0xC2, 0x3C, 0x00,
+];
+const B_VECTOR2_COMP_CTOR_CALLS: [usize; 0] = [];
+const B_VECTOR3_UNCOMP_CTOR: [u8; 14] = [
+    0xD9, 0x44, 0x24, 0x04, 0xC7, 0x00, 0x28, 0x65, 0xE2, 0x00, 0xD9, 0x58, 0x04, 0xC2,
+];
+const B_VECTOR3_UNCOMP_CTOR_CALLS: [usize; 0] = [];
+const B_HEADING_COMP_CTOR: [u8; 41] = [
+    0xD9, 0x44, 0x24, 0x08, 0x56, 0x57, 0xC7, 0x00, 0x3C, 0x65, 0xE2, 0x00, 0xC7, 0x40, 0x04, 0xEC,
+    0x64, 0xE2, 0x00, 0x8D, 0x78, 0x08, 0xB9, 0x07, 0x00, 0x00, 0x00, 0x8D, 0x74, 0x24, 0x0C, 0xF3,
+    0xA5, 0xD9, 0x58, 0x24, 0x5F, 0x5E, 0xC2, 0x1C, 0x00,
+];
+const B_HEADING_COMP_CTOR_CALLS: [usize; 0] = [];
+const B_OWNERSHIP_PENDING: [u8; 106] = [
+    0x8B, 0x48, 0x44, 0x85, 0xC9, 0x75, 0x07, 0xBA, 0xFF, 0xFF, 0x00, 0x00, 0xEB, 0x39, 0x8B, 0xD1,
+    0x81, 0xE2, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE2, 0x04, 0x8B, 0x82, 0x64, 0x9C, 0x14, 0x02, 0x85,
+    0xC0, 0x74, 0x05, 0x39, 0x48, 0x44, 0x74, 0x07, 0xB8, 0xFF, 0xFF, 0x00, 0x00, 0xEB, 0x15, 0x8B,
+    0x80, 0xB0, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x75, 0x07, 0xB8, 0xFF, 0xFF, 0x00, 0x00, 0xEB, 0x04,
+    0x0F, 0xB7, 0x40, 0x02, 0x0F, 0xB7, 0xD0, 0x8B, 0x0D, 0xAC, 0x8B, 0x52, 0x02, 0x33, 0xC0, 0x85,
+    0xC9, 0x7E, 0x11, 0x66, 0x39, 0x14, 0xC5, 0x38, 0xBB, 0x12, 0x02, 0x74, 0x0A, 0x83, 0xC0, 0x01,
+    0x3B, 0xC1, 0x7C, 0xEF, 0x32, 0xC0, 0xC3, 0xB0, 0x01, 0xC3,
+];
+const B_OWNERSHIP_PENDING_CALLS: [usize; 0] = [];
+const B_CONN_OBJECT_LIST_ADD: [u8; 21] = [
+    0x8B, 0x88, 0xF0, 0x21, 0x00, 0x00, 0x89, 0x94, 0x88, 0xF0, 0x1D, 0x00, 0x00, 0x83, 0x80, 0xF0,
+    0x21, 0x00, 0x00, 0x01, 0xC3,
+];
+const B_CONN_OBJECT_LIST_ADD_CALLS: [usize; 0] = [];
+const B_CONN_OBJECT_LIST_REMOVE: [u8; 62] = [
+    0x56, 0x8B, 0xB0, 0xF0, 0x21, 0x00, 0x00, 0x33, 0xC9, 0x85, 0xF6, 0x76, 0x14, 0x8D, 0x90, 0xF0,
+    0x1D, 0x00, 0x00, 0x39, 0x3A, 0x74, 0x0E, 0x83, 0xC1, 0x01, 0x83, 0xC2, 0x04, 0x3B, 0xCE, 0x72,
+    0xF2, 0x32, 0xC0, 0x5E, 0xC3, 0x8B, 0x94, 0xB0, 0xEC, 0x1D, 0x00, 0x00, 0x89, 0x94, 0x88, 0xF0,
+    0x1D, 0x00, 0x00, 0x83, 0x80, 0xF0, 0x21, 0x00, 0x00, 0xFF, 0xB0, 0x01, 0x5E, 0xC3,
+];
+const B_CONN_OBJECT_LIST_REMOVE_CALLS: [usize; 0] = [];
+const B_GUID_ID_EQUAL: [u8; 30] = [
+    0x8B, 0xCE, 0x8B, 0xD7, 0xE8, 0x17, 0x00, 0x00, 0x00, 0x84, 0xC0, 0x74, 0x0E, 0x8B, 0x47, 0x24,
+    0x3B, 0x46, 0x24, 0x75, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x33, 0xC0, 0xC3,
+];
+const B_GUID_ID_EQUAL_CALLS: [usize; 1] = [0x4];
+const B_GUID_ENTRY_READ: [u8; 84] = [
+    0x33, 0xC9, 0x89, 0x08, 0x89, 0x48, 0x04, 0x89, 0x48, 0x08, 0x89, 0x48, 0x0C, 0x89, 0x48, 0x10,
+    0x89, 0x48, 0x14, 0x89, 0x48, 0x18, 0x89, 0x48, 0x1C, 0x89, 0x48, 0x20, 0xC7, 0x40, 0x24, 0xFF,
+    0xFF, 0xFF, 0xFF, 0x8B, 0x0A, 0x57, 0x8B, 0x3C, 0x31, 0x89, 0x38, 0x8B, 0x4C, 0x31, 0x04, 0x89,
+    0x48, 0x04, 0x83, 0x02, 0x08, 0x8B, 0x0A, 0x8B, 0x3C, 0x31, 0x89, 0x78, 0x08, 0x8B, 0x4C, 0x31,
+    0x04, 0x89, 0x48, 0x0C, 0x83, 0x02, 0x08, 0x8B, 0x0A, 0x8B, 0x0C, 0x31, 0x89, 0x48, 0x24, 0x83,
+    0x02, 0x04, 0x5F, 0xC3,
+];
+const B_GUID_ENTRY_READ_CALLS: [usize; 0] = [];
+const B_ID_TO_OBJECT_AC: [u8; 78] = [
+    0x66, 0x3D, 0xFF, 0xFF, 0x74, 0x3E, 0x56, 0x8B, 0x35, 0x58, 0xE2, 0x12, 0x02, 0x0F, 0xB7, 0xC0,
+    0x6A, 0x00, 0x50, 0xE8, 0x28, 0x90, 0x00, 0x00, 0x85, 0xC0, 0x5E, 0x74, 0x27, 0x8B, 0x00, 0x85,
+    0xC0, 0x74, 0x21, 0x8B, 0x40, 0x04, 0x85, 0xC0, 0x74, 0x1A, 0x8B, 0xC8, 0x81, 0xE1, 0xFF, 0x0F,
+    0x00, 0x00, 0xC1, 0xE1, 0x04, 0x8B, 0x89, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC9, 0x74, 0x05, 0x39,
+    0x41, 0x44, 0x74, 0x03, 0x33, 0xC0, 0xC3, 0x8B, 0x81, 0xAC, 0x00, 0x00, 0x00, 0xC3,
+];
+const B_ID_TO_OBJECT_AC_CALLS: [usize; 1] = [0x13];
+const B_CAPTURE_SNAPSHOT: [u8; 63] = [
+    0x85, 0xD2, 0x74, 0x3A, 0x8B, 0xC2, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80,
+    0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x74, 0x26, 0x39, 0x50, 0x44, 0x75, 0x21, 0x8B, 0x80, 0xB0,
+    0x00, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x17, 0x8B, 0x48, 0x08, 0x8B, 0x0C, 0x8D, 0x5C, 0xE2, 0x12,
+    0x02, 0x85, 0xC9, 0x74, 0x09, 0x8B, 0x01, 0x56, 0x52, 0x8B, 0x50, 0x24, 0xFF, 0xD2, 0xC3,
+];
+const B_CAPTURE_SNAPSHOT_CALLS: [usize; 0] = [];
+const B_READ_STATE_DELTA: [u8; 87] = [
+    0x85, 0xC0, 0x74, 0x24, 0x8B, 0xC8, 0x81, 0xE1, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE1, 0x04, 0x8B,
+    0x89, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC9, 0x74, 0x0F, 0x39, 0x41, 0x44, 0x75, 0x0A, 0x8B, 0x89,
+    0xB0, 0x00, 0x00, 0x00, 0x85, 0xC9, 0x75, 0x06, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3, 0x8B, 0x51,
+    0x08, 0x8B, 0x0C, 0x95, 0x5C, 0xE2, 0x12, 0x02, 0x8B, 0x11, 0x56, 0x8B, 0x74, 0x24, 0x14, 0x56,
+    0x8B, 0x74, 0x24, 0x14, 0x56, 0x8B, 0x74, 0x24, 0x14, 0x56, 0x8B, 0x74, 0x24, 0x14, 0x56, 0x50,
+    0x8B, 0x42, 0x30, 0xFF, 0xD0, 0x5E, 0xC3,
+];
+const B_READ_STATE_DELTA_CALLS: [usize; 0] = [];
+const B_GET_SEND_PRIORITY: [u8; 67] = [
+    0x85, 0xC0, 0x75, 0x04, 0x66, 0x33, 0xC0, 0xC3, 0x8B, 0x48, 0x08, 0x56, 0x8B, 0x74, 0x24, 0x20,
+    0x8B, 0x0C, 0x8D, 0x5C, 0xE2, 0x12, 0x02, 0x8B, 0x11, 0x8B, 0x40, 0x04, 0x56, 0x8B, 0x74, 0x24,
+    0x20, 0x8B, 0x52, 0x38, 0x56, 0x8B, 0x74, 0x24, 0x20, 0x56, 0x8B, 0x74, 0x24, 0x20, 0x56, 0x8B,
+    0x74, 0x24, 0x20, 0x56, 0x8B, 0x74, 0x24, 0x20, 0x56, 0x8B, 0x74, 0x24, 0x20, 0x56, 0x50, 0xFF,
+    0xD2, 0x5E, 0xC3,
+];
+const B_GET_SEND_PRIORITY_CALLS: [usize; 0] = [];
+const B_GET_DIRTY_FIELDS: [u8; 39] = [
+    0x85, 0xC0, 0x75, 0x04, 0x66, 0x33, 0xC0, 0xC3, 0x8B, 0x51, 0x08, 0x8B, 0x0C, 0x95, 0x5C, 0xE2,
+    0x12, 0x02, 0x8B, 0x11, 0x56, 0x8B, 0x74, 0x24, 0x0C, 0x56, 0x8B, 0x74, 0x24, 0x0C, 0x56, 0x50,
+    0x8B, 0x42, 0x34, 0xFF, 0xD0, 0x5E, 0xC3,
+];
+const B_GET_DIRTY_FIELDS_CALLS: [usize; 0] = [];
+const B_ON_STATE_SENT: [u8; 76] = [
+    0x85, 0xC0, 0x74, 0x47, 0x8B, 0xC8, 0x81, 0xE1, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE1, 0x04, 0x8B,
+    0x89, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC9, 0x74, 0x32, 0x39, 0x41, 0x44, 0x75, 0x2D, 0x8B, 0x89,
+    0xB0, 0x00, 0x00, 0x00, 0x85, 0xC9, 0x74, 0x23, 0x8B, 0x51, 0x08, 0x8B, 0x0C, 0x95, 0x5C, 0xE2,
+    0x12, 0x02, 0x8B, 0x11, 0x56, 0x8B, 0x74, 0x24, 0x10, 0x56, 0x8B, 0x74, 0x24, 0x10, 0x56, 0x8B,
+    0x74, 0x24, 0x10, 0x56, 0x50, 0x8B, 0x42, 0x3C, 0xFF, 0xD0, 0x5E, 0xC3,
+];
+const B_ON_STATE_SENT_CALLS: [usize; 0] = [];
+const B_CAN_MIGRATE: [u8; 82] = [
+    0x85, 0xC0, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0xF6, 0x80, 0x80, 0x00, 0x00, 0x00, 0x0B, 0x75, 0xF4,
+    0x8B, 0x88, 0xB0, 0x00, 0x00, 0x00, 0x85, 0xC9, 0x74, 0xEA, 0x66, 0x81, 0xB9, 0x7E, 0x06, 0x00,
+    0x00, 0xFF, 0xFF, 0x0F, 0x94, 0xC1, 0x84, 0xC9, 0x74, 0x25, 0x8B, 0x88, 0xB0, 0x00, 0x00, 0x00,
+    0x8B, 0x51, 0x08, 0x8B, 0x0C, 0x95, 0x5C, 0xE2, 0x12, 0x02, 0x8B, 0x11, 0x8B, 0x40, 0x44, 0x8B,
+    0x52, 0x44, 0x50, 0xFF, 0xD2, 0x84, 0xC0, 0x74, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x33,
+    0xC0, 0xC3,
+];
+const B_CAN_MIGRATE_CALLS: [usize; 0] = [];
+const B_REQUEST_OWNERSHIP: [u8; 328] = [
+    0x81, 0xEC, 0x24, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x20, 0x05, 0x00, 0x00, 0x8B, 0x84, 0x24, 0x28, 0x05, 0x00, 0x00, 0x8B, 0x40, 0x44, 0x85, 0xC0,
+    0x53, 0x8B, 0x9C, 0x24, 0x34, 0x05, 0x00, 0x00, 0x56, 0x57, 0x74, 0x1A, 0x8B, 0xC8, 0x81, 0xE1,
+    0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE1, 0x04, 0x8B, 0x89, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC9, 0x74,
+    0x05, 0x39, 0x41, 0x44, 0x74, 0x04, 0x33, 0xFF, 0xEB, 0x06, 0x8B, 0xB9, 0xB0, 0x00, 0x00, 0x00,
+    0x8B, 0x35, 0x14, 0x8C, 0x52, 0x02, 0x85, 0xF6, 0x75, 0x1A, 0x32, 0xC0, 0x5F, 0x5E, 0x5B, 0x8B,
+    0x8C, 0x24, 0x20, 0x05, 0x00, 0x00, 0x33, 0xCC, 0xE8, 0x52, 0xF4, 0x48, 0x00, 0x81, 0xC4, 0x24,
+    0x05, 0x00, 0x00, 0xC3, 0x85, 0xFF, 0x74, 0xE2, 0xF6, 0x87, 0x7C, 0x06, 0x00, 0x00, 0x02, 0x0F,
+    0x85, 0x9A, 0x00, 0x00, 0x00, 0x8B, 0xCF, 0xE8, 0x44, 0xFB, 0xFF, 0xFF, 0x84, 0xC0, 0x0F, 0x85,
+    0x8B, 0x00, 0x00, 0x00, 0x83, 0x3D, 0xAC, 0x8B, 0x52, 0x02, 0x20, 0x74, 0xBD, 0x80, 0x3D, 0xDC,
+    0xC2, 0xE8, 0x00, 0x00, 0xC6, 0x44, 0x24, 0x10, 0x28, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x74, 0x05,
+    0xB8, 0x04, 0x00, 0x00, 0x00, 0x66, 0x8B, 0x4F, 0x02, 0x0F, 0xB7, 0xD0, 0x66, 0x89, 0x4C, 0x14,
+    0x10, 0x8A, 0x8C, 0x24, 0x38, 0x05, 0x00, 0x00, 0x83, 0xC0, 0x02, 0x0F, 0xB7, 0xD0, 0x88, 0x4C,
+    0x14, 0x10, 0x83, 0xC0, 0x01, 0x8D, 0x50, 0xFD, 0x6A, 0x00, 0x0F, 0xB7, 0xC0, 0x6A, 0x00, 0x50,
+    0x8D, 0x4C, 0x24, 0x1C, 0x66, 0x89, 0x54, 0x24, 0x1D, 0x8A, 0x17, 0x51, 0x8B, 0xC6, 0xE8, 0xFD,
+    0x91, 0x00, 0x00, 0x8B, 0xF0, 0xE8, 0xE6, 0xD9, 0x00, 0x00, 0xA1, 0xAC, 0x8B, 0x52, 0x02, 0x66,
+    0x8B, 0x57, 0x02, 0x66, 0x89, 0x14, 0xC5, 0x38, 0xBB, 0x12, 0x02, 0x83, 0xC4, 0x10, 0x89, 0x1C,
+    0xC5, 0x3C, 0xBB, 0x12, 0x02, 0x83, 0xC0, 0x01, 0xA3, 0xAC, 0x8B, 0x52, 0x02, 0xEB, 0x0F, 0x85,
+    0xDB, 0x74, 0x0B, 0x8B, 0x47, 0x04, 0x6A, 0x01, 0x50, 0xFF, 0xD3, 0x83, 0xC4, 0x08, 0x8B, 0x8C,
+    0x24, 0x2C, 0x05, 0x00, 0x00, 0x5F, 0x5E, 0x5B, 0x33, 0xCC, 0xB0, 0x01, 0xE8, 0x7E, 0xF3, 0x48,
+    0x00, 0x81, 0xC4, 0x24, 0x05, 0x00, 0x00, 0xC3,
+];
+const B_REQUEST_OWNERSHIP_CALLS: [usize; 5] = [0x68, 0x87, 0xee, 0xf5, 0x13c];
 
 // --- differential tests: the Rust bodies against the original machine code, on random data ---------------------------------
 

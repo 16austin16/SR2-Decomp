@@ -178,7 +178,37 @@ const OBSTACLE_RELEASE: usize = 32;
 const CHUNK_CELL_INDEX: usize = 33;
 const CELL_LOCATE: usize = 34;
 const SPLINE_EVAL_POS: usize = 35;
-const COUNT: usize = 36;
+const SPLINE_EVAL_TANGENT: usize = 36;
+const SPLINE_EVAL_2ND: usize = 37;
+const HULL_RELEASE: usize = 38;
+const ROAD_ROUTE_LEN: usize = 39;
+const TRI_EDGE_SIDE: usize = 40;
+const RECORD_VALID: usize = 41;
+const PATH_REQ_INIT: usize = 42;
+const LANES_ADD: usize = 43;
+const BIND_CHUNK: usize = 44;
+const HULL_BY_HANDLE: usize = 45;
+const LINK_CLOSEST: usize = 46;
+const SEGMENT_INTERSECT: usize = 47;
+const QUERY_TREE_CB: usize = 48;
+const QUERY_FILTER: usize = 49;
+const QUERY_FIRST_HIT: usize = 50;
+const ROAD_PROBE: usize = 51;
+const FREE_PATH_LISTS: usize = 52;
+const ROUTE_REFILL: usize = 53;
+const PATH_MARK_ENDS: usize = 54;
+const GOAL_INSTALL: usize = 55;
+const COUNT: usize = 56;
+
+const ROAD_PATH_RECYCLE_ADDR: usize = 0x00B1_CCD0;
+const NAV_ROUTE_CLEAR_ADDR: usize = 0x00A1_F730;
+const NAV_ROUTE_PUSH_ADDR: usize = 0x00A1_F770;
+const NAV_PATH_SETUP_ADDR: usize = 0x00A1_21B0;
+const NAV_PATH_FINISH_ADDR: usize = 0x00A1_1520;
+const NAV_GOAL_HOOK_ADDR: usize = 0x0068_3FB0;
+const NAV_GOAL_COMMIT_ADDR: usize = 0x00B2_C220;
+/// Ports without a shadow copy (their callees rewrite rings / pools that cannot be snapshotted).
+const NO_SHADOW: [usize; 8] = [ROUTE_CLEAR, HULL_RELEASE, HULL_BY_HANDLE, ROAD_PROBE, FREE_PATH_LISTS, ROUTE_REFILL, PATH_MARK_ENDS, GOAL_INSTALL];
 
 const NAV_CELL_LOCATE: usize = 0x00A0_2C10;
 const NAV_ROUTE_LIST_FREE: usize = 0x00A1_8500;
@@ -224,6 +254,26 @@ static PORTS: [Port; COUNT] = [
     port("nav_chunk_cell_index", 0x00A0_52D0, SAVED),
     port("nav_cell_locate", 0x00A0_2C10, ECX | SAVED),
     port("spline_eval_position", 0x00C0_3910, SAVED),
+    port("spline_eval_tangent", 0x00C0_3AF0, SAVED),
+    port("spline_eval_second_derivative", 0x00C0_3DC0, SAVED),
+    port("nav_detour_release_hull", 0x00A0_AED0, SAVED),
+    port("road_route_total_length", 0x00B1_EA90, SAVED),
+    port("nav_tri_edge_side_xz", 0x00A0_F3D0, SAVED),
+    port("nav_route_record_valid", 0x00A1_7F60, SAVED),
+    port("nav_path_request_init", 0x00A1_3100, ECX | SAVED),
+    port("road_lanes_add_neighbours", 0x00B1_E570, SAVED),
+    port("road_network_bind_chunk_entries", 0x00A8_D970, SAVED),
+    port("nav_detour_release_hull_by_handle", 0x00A0_E1D0, SAVED),
+    port("nav_link_closest_point", 0x00A0_2CA0, ECX | SAVED),
+    port("nav_segment_intersect_xz", 0x00A0_3C30, ECX | EDX | SAVED),
+    port("road_query_tree_cb", 0x00A8_9A20, SAVED),
+    port("road_query_filter", 0x00A8_9A50, SAVED),
+    port("road_query_cb_first_hit", 0x00A8_9AB0, SAVED),
+    port("road_network_probe", 0x00A8_A5D0, SAVED),
+    port("vehicle_free_path_lists", 0x00B2_6130, SAVED),
+    port("nav_route_refill_from_list", 0x00A1_8570, SAVED),
+    port("nav_path_mark_ends", 0x00A1_3660, ECX | SAVED),
+    port("vehicle_ai_goal_install", 0x00B2_EE60, ECX | SAVED),
 ];
 
 fn shadowing(id: usize) -> Option<(u32, usize)> {
@@ -855,12 +905,12 @@ unsafe fn restore(regions: &[(usize, usize)], s: &[Vec<u8>]) {
 /// the copy the original saw is compared with the real slots `ours` left) and EAX when `cmp_eax`.
 /// On a mismatch the original's writes are put back and its EAX is returned. Returns EAX as `ours`
 /// / the original produced it.
-unsafe fn shadow_run(
+unsafe fn shadow_run_m(
     id: usize,
     p: &Pushad,
     argp: *mut u32,
     nargs: usize,
-    cmp_eax: bool,
+    eax_mask: u32,
     regions: impl FnOnce() -> Option<Vec<(usize, usize)>>,
     ours: impl FnOnce() -> u32,
 ) -> u32 {
@@ -874,14 +924,20 @@ unsafe fn shadow_run(
         let pre = snap(&reg);
         let inp = Regs::of(p);
         let mut o = inp;
-        let oargs = if id == SPLINE_EVAL_POS { call_full4_ret4(orig, &mut o, args) } else { call_full4(orig, &mut o, args) };
+        let oargs = if RET4.contains(&id) {
+            call_full4_ret4(orig, &mut o, args)
+        } else if id == PATH_REQ_INIT {
+            call_full4_ret12(orig, &mut o, args)
+        } else {
+            call_full4(orig, &mut o, args)
+        };
         check_preserved(id, &inp, &o);
         let after_orig = snap(&reg);
         restore(&reg, &pre);
         let e = ours();
         let after_ours = snap(&reg);
         let args_ok = (0..nargs).all(|i| *argp.add(i) == oargs[i]);
-        if after_ours != after_orig || !args_ok || (cmp_eax && e != o.eax) {
+        if after_ours != after_orig || !args_ok || ((e ^ o.eax) & eax_mask != 0) {
             let diff = after_ours.iter().zip(&after_orig).position(|(a, b)| a != b);
             mismatch(id, n, format!("in {inp:x?} args {args:x?}: eax original {:#x}, Rust {e:#x}; first differing region {diff:?}, args ok {args_ok}", o.eax));
             restore(&reg, &after_orig);
@@ -890,9 +946,26 @@ unsafe fn shadow_run(
             }
             return o.eax;
         }
-        e
+        // a partial EAX compare: the caller gets the original's whole EAX while it is being shadowed
+        if eax_mask != 0 && eax_mask != u32::MAX { o.eax } else { e }
     }
 }
+
+/// [`shadow_run_m`] comparing all of EAX (`cmp_eax`) or none of it.
+unsafe fn shadow_run(
+    id: usize,
+    p: &Pushad,
+    argp: *mut u32,
+    nargs: usize,
+    cmp_eax: bool,
+    regions: impl FnOnce() -> Option<Vec<(usize, usize)>>,
+    ours: impl FnOnce() -> u32,
+) -> u32 {
+    unsafe { shadow_run_m(id, p, argp, nargs, if cmp_eax { u32::MAX } else { 0 }, regions, ours) }
+}
+
+/// Ports whose original pops its stack arguments (`ret 4`).
+const RET4: [usize; 3] = [SPLINE_EVAL_POS, SPLINE_EVAL_TANGENT, SPLINE_EVAL_2ND];
 
 const ROUTE_POOL: usize = 0x02E4_00D0;
 const ROUTE_POOL_SIZE: usize = 0x6800;
@@ -2183,6 +2256,1313 @@ extern "C" fn spline_eval_position_entry(r: &mut Pushad, args: *const u32) {
 }
 regs_thunk_ret4!(spline_eval_position_thunk, spline_eval_position_entry);
 
+// Round 3 (ports 36..55): all finished and checked offline against the original in an emulator (about 30000
+// random cases, 0 differences; only a signalling-NaN quieting case differs in the emulator). Nothing is in
+// progress. Not done: spline_param_at_distance*, lane walks, road_network_query, nav_tri_* with callees.
+
+// --- 0xC03AF0 spline_eval_tangent (EAX = spline, ECX = &out vec3, stack f32 t, `ret 4`) --------------------
+
+const SPLINE_K6: usize = 0x00E5_C058; // 6.0
+const SPLINE_KM3: usize = 0x00E5_C858; // -3.0
+const SPLINE_K9: usize = 0x00E5_C208; // 9.0
+const SPLINE_KM12: usize = 0x00E5_C528; // -12.0
+const SPLINE_KM9: usize = 0x00E5_C850; // -9.0
+const SPLINE_K2: usize = 0x00E5_BFE8; // 2.0
+const SPLINE_KM6: usize = 0x00E5_C500; // -6.0
+const SPLINE_K18: usize = 0x00E5_C2F8; // 18.0
+const SPLINE_K12: usize = 0x00E5_C530; // 12.0
+const SPLINE_KM18: usize = 0x00E5_C848; // -18.0
+
+/// Bezier tangent of the spline (control points: point i, tangent-B[i], tangent-A[i+1], point i+1; the
+/// constants are read from the exe, 3.0 = SPLINE_C1). Count < 2 (signed): the default vec3. Then on
+/// `comiss 0, t` / `jb` (taken for 0 < t and NaN): t <= 0 gives `f32(C1 * f32(tb[0] - p[0]))` per axis.
+/// Otherwise the arg slot is overwritten with count - 1 and `t < count - 1` (x87 fcomi, jb: also NaN)
+/// goes interior; the rest gives `f32(C1 * f32(p[last] - ta[last]))`. Interior: i = cvttss2si(t),
+/// u = f32(t - i), F2 = f32(u*u), V1 = f32(K4*F2 + K3*u - C1) (K3 = 6, K4 = -3), V2 = f32(F2*9 + u*-12 + C1),
+/// V3 = f32(K3*u + F2*-9), V4 = f32(F2 + (F2 + F2)); per axis I = f32(p[i]*V1), B = f32(tb[i]*V2),
+/// P = f32(p[i+1]*V4), T = f32(ta[i+1]*V3), out = f32(f32(f32(I + P) + B) + T). Every `fstp dword` rounds
+/// to f32, the rest stays f64 (53-bit precision). The dead stack-argument slot ends up holding V3's bits
+/// (interior) or count - 1 (t >= count - 1); it is untouched for the first two cases.
+unsafe fn spline_eval_tangent(spline: u32, out: u32, args: *mut u32) {
+    unsafe {
+        let (s, o) = (spline as usize, out as usize);
+        let count = rd(s + 0xC) as i32;
+        if count < 2 {
+            copy_vec3(o, SPLINE_DEFAULT);
+            return;
+        }
+        let t = rf(args as usize);
+        let c1 = rd_f64(SPLINE_C1);
+        if !(0.0 < t || t.is_nan()) {
+            let (pts, tb) = (rd(s) as usize, rd(s + 8) as usize);
+            for k in 0..3 {
+                let d = (rf(tb + 4 * k) as f64 - rf(pts + 4 * k) as f64) as f32;
+                wf(o + 4 * k, (d as f64 * c1) as f32);
+            }
+            return;
+        }
+        let cm1 = count.wrapping_sub(1);
+        *args = cm1 as u32;
+        if !(t.is_nan() || (t as f64) < cm1 as f64) {
+            let (pts, ta) = (rd(s) as usize, rd(s + 4) as usize);
+            let off = (count as usize).wrapping_mul(12).wrapping_sub(12);
+            for k in 0..3 {
+                let d = (rf(pts.wrapping_add(off) + 4 * k) as f64 - rf(ta.wrapping_add(off) + 4 * k) as f64) as f32;
+                wf(o + 4 * k, (d as f64 * c1) as f32);
+            }
+            return;
+        }
+        let i = cvtt(t);
+        let (k3, k4, k5, k6, k7) = (rd_f64(SPLINE_K6), rd_f64(SPLINE_KM3), rd_f64(SPLINE_K9), rd_f64(SPLINE_KM12), rd_f64(SPLINE_KM9));
+        let u = ((t as f64) - (i as f64)) as f32;
+        let ud = u as f64;
+        let f2 = (ud * ud) as f32;
+        let f2d = f2 as f64;
+        let k3u = k3 * ud;
+        let v1 = ((k4 * f2d + k3u) - c1) as f32 as f64;
+        let v2 = ((f2d * k5 + ud * k6) + c1) as f32 as f64;
+        let v3 = (k3u + f2d * k7) as f32;
+        let v3d = v3 as f64;
+        let v4 = (f2d + (f2d + f2d)) as f32 as f64;
+        let (pts, ta0, tb0) = (rd(s) as usize, rd(s + 4) as usize, rd(s + 8) as usize);
+        let iu = i as usize;
+        let pi = pts.wrapping_add(iu.wrapping_mul(12));
+        let pj = pts.wrapping_add(iu.wrapping_add(1).wrapping_mul(12));
+        let ta = ta0.wrapping_add(iu.wrapping_add(1).wrapping_mul(12));
+        let tb = tb0.wrapping_add(iu.wrapping_mul(12));
+        let mut res = [0f32; 3];
+        for (k, r) in res.iter_mut().enumerate() {
+            let ii = (rf(pi + 4 * k) as f64 * v1) as f32;
+            let bb = (rf(tb + 4 * k) as f64 * v2) as f32;
+            let pp = (rf(pj + 4 * k) as f64 * v4) as f32;
+            let tt = (rf(ta + 4 * k) as f64 * v3d) as f32;
+            let q = (ii as f64 + pp as f64) as f32;
+            let rr = (q as f64 + bb as f64) as f32;
+            *r = (rr as f64 + tt as f64) as f32;
+        }
+        for (k, r) in res.iter().enumerate() {
+            wf(o + 4 * k, *r);
+        }
+        *args = v3.to_bits();
+    }
+}
+
+extern "C" fn spline_eval_tangent_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        shadow_run(
+            SPLINE_EVAL_TANGENT,
+            &p,
+            args as *mut u32,
+            1,
+            false,
+            || Some(vec![(p.ecx as usize, 12)]),
+            || {
+                spline_eval_tangent(p.eax, p.ecx, args as *mut u32);
+                0
+            },
+        )
+    };
+}
+regs_thunk_ret4!(spline_eval_tangent_thunk, spline_eval_tangent_entry);
+
+// --- 0xC03DC0 spline_eval_second_derivative (ECX = spline, EDX = &out vec3, stack f32 t, `ret 4`) -----------
+
+/// Second derivative of the same Bezier. Count < 2 gives the default vec3. `comiss 0, t` / `jbe` is taken for
+/// t >= 0 and NaN, so only t < 0 takes the first path: `6 * f32(ta[1] + f32(p[0] - f32(2 * tb[0])))` per
+/// axis (f32 rounding after each step; K2 = 2, K6 = 6). Then the arg slot is overwritten with count - 1 and
+/// `t < count - 1` (or NaN) goes interior; else `6 * f32(p[last] + f32(tb[count-2] - f32(2 * ta[last])))`.
+/// Interior: i = cvttss2si(t), u = f32(t - i), W1 = f32(-6u + 6), W2 = f32(18u - 12), W3 = f32(-18u + 6),
+/// W4 = f32(6u); per axis I = f32(p[i]*W1), B = f32(tb[i]*W2), T = f32(ta[i+1]*W3), P = f32(p[i+1]*W4),
+/// out = f32(f32(f32(I + B) + T) + P). The dead stack-argument slot ends up holding W4's bits (interior),
+/// count - 1 (t >= count - 1) or the untouched t (t < 0).
+unsafe fn spline_eval_second_derivative(spline: u32, out: u32, args: *mut u32) {
+    unsafe {
+        let (s, o) = (spline as usize, out as usize);
+        let count = rd(s + 0xC) as i32;
+        if count < 2 {
+            copy_vec3(o, SPLINE_DEFAULT);
+            return;
+        }
+        let t = rf(args as usize);
+        let (k2, k6) = (rd_f64(SPLINE_K2), rd_f64(SPLINE_K6));
+        if t < 0.0 {
+            let (pts, tb, ta1) = (rd(s) as usize, rd(s + 8) as usize, (rd(s + 4) as usize).wrapping_add(12));
+            for k in 0..3 {
+                let w = (rf(tb + 4 * k) as f64 * k2) as f32;
+                let d = (rf(pts + 4 * k) as f64 - w as f64) as f32;
+                let e = (rf(ta1 + 4 * k) as f64 + d as f64) as f32;
+                wf(o + 4 * k, (e as f64 * k6) as f32);
+            }
+            return;
+        }
+        let cm1 = count.wrapping_sub(1);
+        *args = cm1 as u32;
+        if !(t.is_nan() || (t as f64) < cm1 as f64) {
+            let (pts, ta, tb) = (rd(s) as usize, rd(s + 4) as usize, rd(s + 8) as usize);
+            let off = (count as usize).wrapping_mul(12);
+            let a_last = ta.wrapping_add(off).wrapping_sub(12);
+            let b2 = tb.wrapping_add(off).wrapping_sub(24);
+            let p_last = pts.wrapping_add(off).wrapping_sub(12);
+            for k in 0..3 {
+                let w = (rf(a_last + 4 * k) as f64 * k2) as f32;
+                let d = (rf(b2 + 4 * k) as f64 - w as f64) as f32;
+                let e = (rf(p_last + 4 * k) as f64 + d as f64) as f32;
+                wf(o + 4 * k, (e as f64 * k6) as f32);
+            }
+            return;
+        }
+        let i = cvtt(t);
+        let (kq, kb, kc, kd) = (rd_f64(SPLINE_KM6), rd_f64(SPLINE_K18), rd_f64(SPLINE_K12), rd_f64(SPLINE_KM18));
+        let u = ((t as f64) - (i as f64)) as f32;
+        let ud = u as f64;
+        let w1 = (kq * ud + k6) as f32 as f64;
+        let w2 = (ud * kb - kc) as f32 as f64;
+        let w3 = (ud * kd + k6) as f32 as f64;
+        let w4 = (k6 * ud) as f32;
+        let w4d = w4 as f64;
+        let (pts, ta0, tb0) = (rd(s) as usize, rd(s + 4) as usize, rd(s + 8) as usize);
+        let iu = i as usize;
+        let pi = pts.wrapping_add(iu.wrapping_mul(12));
+        let pj = pts.wrapping_add(iu.wrapping_add(1).wrapping_mul(12));
+        let ta = ta0.wrapping_add(iu.wrapping_add(1).wrapping_mul(12));
+        let tb = tb0.wrapping_add(iu.wrapping_mul(12));
+        let mut res = [0f32; 3];
+        for (k, r) in res.iter_mut().enumerate() {
+            let pp = (rf(pj + 4 * k) as f64 * w4d) as f32;
+            let tt = (rf(ta + 4 * k) as f64 * w3) as f32;
+            let bb = (rf(tb + 4 * k) as f64 * w2) as f32;
+            let ii = (rf(pi + 4 * k) as f64 * w1) as f32;
+            let q = (ii as f64 + bb as f64) as f32;
+            let rr = (q as f64 + tt as f64) as f32;
+            *r = (rr as f64 + pp as f64) as f32;
+        }
+        for (k, r) in res.iter().enumerate() {
+            wf(o + 4 * k, *r);
+        }
+        *args = w4.to_bits();
+    }
+}
+
+extern "C" fn spline_eval_2nd_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        shadow_run(
+            SPLINE_EVAL_2ND,
+            &p,
+            args as *mut u32,
+            1,
+            false,
+            || Some(vec![(p.edx as usize, 12)]),
+            || {
+                spline_eval_second_derivative(p.ecx, p.edx, args as *mut u32);
+                0
+            },
+        )
+    };
+}
+regs_thunk_ret4!(spline_eval_2nd_thunk, spline_eval_2nd_entry);
+
+// --- 0xA0AED0 nav_detour_release_hull (EDI = hull object; EAX = the original's leftover) -------------------------
+
+const HULL_LIST: usize = 0x021F_B8C0; // list walked while the hull's ring node has flag bit 0
+const HULL_FREE_RING: usize = 0x021F_C194;
+const HULL_RING_FLAG: usize = 0x021F_C190; // ring head used with the flag set
+const HULL_RING_PLAIN: usize = 0x021F_C198; // ring head used with the flag clear
+const NAV_HULL_RELEASE: usize = 0x00A0_AED0;
+const NAV_LIST_UNLINK: usize = 0x00A0_7DB0;
+const NAV_HULL_FREE_REFS: usize = 0x00A0_7E20;
+
+/// `node = [hull + 0x18]` (a ring node; 0 = nothing to do, EAX 0). Flag byte `[node + 8] & 1` set: for every
+/// entry E of the circular list at [0x21FB8C0] (stops when the next link is the head or 0) with a sub-list
+/// `[E + 0x2C]`, the first element whose `[+8]` equals `[hull + 8]` goes to 0xA07DB0 (EAX = element,
+/// ECX = sub-list head, EDX = ESI = E, EDI = hull) and the sub-list scan stops; then the node leaves the ring
+/// whose head slot is 0x21FC190. Flag clear: if `[node + 0x54]` is non-null 0xA07E20 runs (ESI = that, stack
+/// arg 0) and the node is re-read; the head slot is 0x21FC198. A head slot equal to the node either clears a
+/// single-node ring (`[node] == node`: [node] = 0, [[hull+0x18]+4] = 0, head = 0, straight to the free-ring
+/// step) or moves to `[node]`. Then generic unlink (prev [+4], next [+0]), both links cleared, and the node
+/// goes into the free ring 0x21FC194 (empty: self-linked and it becomes the head; else inserted before the
+/// head), `[hull + 0x18] = 0`. Every field is re-read from memory exactly where the original re-reads it.
+/// EAX leaves 0 (no node), the node (empty free ring) or the old free-ring head. ECX / EDX are passed through
+/// to 0xA07E20 as the caller left them (nothing touches them before that call). No shadow: the ring writes are
+/// unbounded; checked offline against the original in an emulator instead.
+unsafe fn detour_release_hull(hull: u32, ecx_in: u32, edx_in: u32) -> u32 {
+    unsafe {
+        let h = hull as usize;
+        let mut eax = rd(h + 0x18) as usize;
+        if eax == 0 {
+            return 0;
+        }
+        let single_clear;
+        if rb(eax + 8) & 1 != 0 {
+            let ebx = rd(HULL_LIST) as usize;
+            if ebx != 0 {
+                let mut esi = ebx;
+                loop {
+                    let ecx = rd(esi + 0x2C) as usize;
+                    let mut e = ecx;
+                    if e != 0 {
+                        let edx = rd(h + 8);
+                        loop {
+                            if rd(e + 8) == edx {
+                                call_regs(NAV_LIST_UNLINK, e as u32, ecx as u32, esi as u32, esi as u32, hull, &[]);
+                                break;
+                            }
+                            e = rd(e) as usize;
+                            if e == ecx || e == 0 {
+                                break;
+                            }
+                        }
+                    }
+                    let next = rd(esi) as usize;
+                    if next == ebx {
+                        break;
+                    }
+                    esi = next;
+                    if esi == 0 {
+                        break;
+                    }
+                }
+            }
+            eax = rd(h + 0x18) as usize;
+            if rd(HULL_RING_FLAG) as usize != eax {
+                single_clear = false;
+            } else if rd(eax) as usize == eax {
+                wd(eax, 0);
+                eax = rd(h + 0x18) as usize;
+                wd(eax + 4, 0);
+                wd(HULL_RING_FLAG, 0);
+                single_clear = true;
+            } else {
+                wd(HULL_RING_FLAG, rd(eax));
+                single_clear = false;
+            }
+        } else {
+            let esi = rd(eax + 0x54);
+            if esi != 0 {
+                call_regs(NAV_HULL_FREE_REFS, eax as u32, ecx_in, edx_in, esi, hull, &[0]);
+                eax = rd(h + 0x18) as usize;
+            }
+            if rd(HULL_RING_PLAIN) as usize != eax {
+                single_clear = false;
+            } else if rd(eax) as usize == eax {
+                wd(eax, 0);
+                let edx = rd(h + 0x18) as usize;
+                wd(HULL_RING_PLAIN, 0);
+                wd(edx + 4, 0);
+                single_clear = true;
+            } else {
+                wd(HULL_RING_PLAIN, rd(eax));
+                single_clear = false;
+            }
+        }
+        if !single_clear {
+            let prev = rd(eax + 4) as usize;
+            if prev != 0 {
+                wd(prev, rd(eax));
+            }
+            eax = rd(h + 0x18) as usize;
+            if rd(eax) != 0 {
+                let next = rd(eax) as usize;
+                wd(next + 4, rd(eax + 4));
+            }
+            eax = rd(h + 0x18) as usize;
+            wd(eax, 0);
+            let ecx = rd(h + 0x18) as usize;
+            wd(ecx + 4, 0);
+        }
+        eax = rd(HULL_FREE_RING) as usize;
+        if eax == 0 {
+            let n = rd(h + 0x18) as usize;
+            wd(n, n as u32);
+            let n = rd(h + 0x18) as usize;
+            wd(n + 4, n as u32);
+            wd(HULL_FREE_RING, rd(h + 0x18));
+            wd(h + 0x18, 0);
+            return n as u32;
+        }
+        let ecx = rd(h + 0x18) as usize;
+        wd(ecx + 4, rd(eax + 4));
+        let ecx = rd(h + 0x18) as usize;
+        wd(ecx, eax as u32);
+        let edx = rd(eax + 4) as usize;
+        let ecx = rd(h + 0x18);
+        wd(edx, ecx);
+        let edx = rd(h + 0x18);
+        wd(eax + 4, edx);
+        wd(h + 0x18, 0);
+        eax as u32
+    }
+}
+
+extern "C" fn hull_release_entry(r: &mut Pushad, _: *const u32) {
+    PORTS[HULL_RELEASE].calls.fetch_add(1, Ordering::Relaxed);
+    r.eax = unsafe { detour_release_hull(r.edi, r.ecx, r.edx) };
+}
+regs_thunk!(hull_release_thunk, hull_release_entry);
+
+// --- 0xB1EA90 road_route_total_length (ESI = ring head, stack u8 flag -> ST0, EAX = last link read) ---------
+
+const ROAD_LEN_SCALE: usize = 0x00E5_BF70;
+
+/// `sum` starts at 0.0f. Head 0: sum 0, EAX 0. Otherwise walks the ring from the head (EAX = ESI, link
+/// [+0], stop when it equals the head or is 0): `ctl = [[p + 0xC] + 0x10]`, `rec = [p + 0xC]`; ctl bit 29
+/// set skips the step; else x = f32 [rec + 0x14] (the load quiets a signalling NaN), when the flag byte == 1
+/// and ctl bit 4 is set x = f32(x * [0xE5BF70]); `sum = f32(x + sum)`. Returns the sum in ST0 and
+/// EAX = the final link (the head or 0).
+unsafe fn road_route_total_length(head: u32, flag: u8) -> (f32, u32) {
+    unsafe {
+        let mut sum = 0.0f32;
+        if head == 0 {
+            return (sum, 0);
+        }
+        let scale = rd_f64(ROAD_LEN_SCALE);
+        let mut p = head;
+        loop {
+            let rec = rd(p as usize + 0xC) as usize;
+            let ctl = rd(rec + 0x10);
+            if ctl & 0x2000_0000 == 0 {
+                let mut x = f32::from_bits(quiet32(rd(rec + 0x14)));
+                if flag == 1 && ctl & 0x10 != 0 {
+                    x = (x as f64 * scale) as f32;
+                }
+                sum = (x as f64 + sum as f64) as f32;
+            }
+            p = rd(p as usize);
+            if p == head || p == 0 {
+                return (sum, p);
+            }
+        }
+    }
+}
+
+/// `fld dword` quiets a signalling NaN (bit 22 set) and keeps everything else.
+fn quiet32(bits: u32) -> u32 {
+    if bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x7F_FFFF != 0 { bits | 0x40_0000 } else { bits }
+}
+
+extern "C" fn road_route_len_entry(r: &mut Pushad, args: *const u32) -> f32 {
+    let p = *r;
+    let arg0 = unsafe { *args };
+    let flag = arg0 as u8;
+    let (mut ours, eax) = unsafe { road_route_total_length(p.esi, flag) };
+    r.eax = eax;
+    let Some((n, orig)) = shadowing(ROAD_ROUTE_LEN) else { return ours };
+    let inp = Regs::of(&p);
+    let mut out = inp;
+    let theirs = unsafe { call_full(orig, &mut out, arg0, true) } as f32;
+    check_preserved(ROAD_ROUTE_LEN, &inp, &out);
+    if theirs.to_bits() != ours.to_bits() || out.eax != eax {
+        mismatch(ROAD_ROUTE_LEN, n, format!("in {inp:x?} flag {flag}: original {:#x} eax {:#x}, Rust {:#x} eax {eax:#x}", theirs.to_bits(), out.eax, ours.to_bits()));
+        r.eax = out.eax;
+        ours = theirs;
+    }
+    ours
+}
+regs_thunk!(road_route_len_thunk, road_route_len_entry);
+
+// --- 0xA0F3D0 nav_tri_edge_side_xz (ESI = tri (3 vertex ptrs), EAX = edge, EDI = point (x, z) -> EAX 0 / 1 / 2) ---
+
+const TRI_EPS: usize = 0x00E5_C1A0; // 1e-4
+const TRI_NEG_EPS: usize = 0x00E5_C430; // -1e-4
+
+/// a = tri[edge], b = tri[(edge + 1) % 3] (signed idiv remainder); when a > b (unsigned pointers) they
+/// swap and the swapped flag is set. d = b - a on z (`dz`) and a - b on x (`dx`), p = point - a
+/// (`px = pt.x - a.x`, `pz = pt.z - a.z`), each stored as f32; `cross = f32(pz*dx + px*dz)`. Then
+/// (`fcom` against +-1e-4, f64 constants): not swapped gives 2 for cross > eps, 1 for cross < -eps;
+/// swapped gives 1 for cross > eps, 2 for cross < -eps; anything else (including NaN) 0.
+unsafe fn tri_edge_side(tri: u32, edge: u32, pt: u32) -> u32 {
+    unsafe {
+        let t = tri as usize;
+        let mut a = rd(t.wrapping_add((edge as usize).wrapping_mul(4))) as usize;
+        let rem = (edge as i32).wrapping_add(1) % 3;
+        let mut b = rd(t.wrapping_add((rem as u32 as usize).wrapping_mul(4))) as usize;
+        let mut swapped = false;
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+            swapped = true;
+        }
+        let dz = (rf(b + 8) as f64 - rf(a + 8) as f64) as f32;
+        let dx = (rf(a) as f64 - rf(b) as f64) as f32;
+        let px = (rf(pt as usize) as f64 - rf(a) as f64) as f32;
+        let pz = (rf(pt as usize + 4) as f64 - rf(a + 8) as f64) as f32;
+        let cross = ((pz as f64 * dx as f64) + (px as f64 * dz as f64)) as f32 as f64;
+        let (eps, neg_eps) = (rd_f64(TRI_EPS), rd_f64(TRI_NEG_EPS));
+        if cross > eps {
+            if swapped { 1 } else { 2 }
+        } else if cross < neg_eps {
+            if swapped { 2 } else { 1 }
+        } else {
+            0
+        }
+    }
+}
+
+extern "C" fn tri_edge_side_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(TRI_EDGE_SIDE, &p, unsafe { tri_edge_side(p.esi, p.eax, p.edi) });
+}
+regs_thunk!(tri_edge_side_thunk, tri_edge_side_entry);
+
+// --- 0xA17F60 nav_route_record_valid (ECX = pointer -> AL: inside the route pool on a 0x34 boundary) --------
+
+/// `off = ecx - 0x2E400D0`; negative (signed) or >= 0x6800 gives AL = 0. Else AL = `off % 0x34 == 0` via
+/// the reciprocal multiply (`hi32(off * 0x4EC4EC4F) >> 4`, times 0x34, subtracted). Registers as the
+/// original leaves them: EAX = the low half of the product with AL replaced (valid range) or the caller's
+/// EAX with AL cleared; ECX = off (invalid) or the remainder; EDX = the quotient times 0x34 (valid range).
+fn route_record_valid(ecx: u32, eax: u32, edx: u32) -> (u32, u32, u32) {
+    let off = ecx.wrapping_sub(0x02E4_00D0);
+    if (off as i32) < 0 || off >= 0x6800 {
+        return (eax & !0xFF, off, edx);
+    }
+    let prod = off as u64 * 0x4EC4_EC4F;
+    let q = ((prod >> 32) as u32) >> 4;
+    let m = q.wrapping_mul(0x34);
+    let rem = off.wrapping_sub(m);
+    ((prod as u32 & !0xFF) | (rem == 0) as u32, rem, m)
+}
+
+extern "C" fn record_valid_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let (eax, ecx, edx) = route_record_valid(p.ecx, p.eax, p.edx);
+    let eax = checked_eax(RECORD_VALID, &p, eax);
+    r.eax = eax;
+    r.ecx = ecx;
+    r.edx = edx;
+}
+regs_thunk!(record_valid_thunk, record_valid_entry);
+
+// --- 0xA13100 nav_path_request_init (ECX = request, EDX = &{u16 flags, u8 extra}, ESI = start vec3, EDI = goal vec3;
+//     stack count, waypoints, f32 radius; `ret 0xC`; EAX = request) ----------------------------------------------
+
+/// Stores: [+0] count, [+4] waypoint ptr, [+8] u16 flags and [+0xA] extra byte from EDX's struct; start
+/// position (+0xC..) copied from ESI when flags bit 15 is set, else three 0.0 bit patterns; [+0x24] =
+/// radius (`fld`/`fst` dword: a signalling NaN comes out quieted); goal (+0x18..) copied from EDI when
+/// the radius is strictly greater than 0 (an x87 `fcomp` against 0.0 with `test ah, 0x41`, so <= 0 and NaN
+/// take the zero branch), else three zeros. The leading clears of +8 / +9 / +0xA are overwritten, but done
+/// in the original order.
+unsafe fn path_request_init(req: u32, flags: u32, start: u32, goal: u32, args: *const u32) {
+    unsafe {
+        let c = req as usize;
+        wb(c + 8, 0);
+        wb(c + 9, 0);
+        wb(c + 0xA, 0);
+        wd(c, *args);
+        wd(c + 4, *args.add(1));
+        let f = flags as usize;
+        let (lo, hi, ex) = (rb(f), rb(f + 1), rb(f + 2));
+        wb(c + 8, lo);
+        wb(c + 9, hi);
+        wb(c + 0xA, ex);
+        if rb(c + 9) & 0x80 != 0 {
+            copy_vec3(c + 0xC, start as usize);
+        } else {
+            for k in 0..3 {
+                wd(c + 0xC + 4 * k, 0);
+            }
+        }
+        let radius_bits = quiet32(*args.add(2));
+        wd(c + 0x24, radius_bits);
+        if f32::from_bits(radius_bits) > 0.0 {
+            copy_vec3(c + 0x18, goal as usize);
+        } else {
+            for k in 0..3 {
+                wd(c + 0x18 + 4 * k, 0);
+            }
+        }
+    }
+}
+
+/// Like [`regs_thunk_ret4`] for `ret 0xC`.
+macro_rules! regs_thunk_ret12 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "pushad",
+                "mov eax, esp",
+                "lea ecx, [esp + 36]",
+                "push ecx",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "popad",
+                "ret 12",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+/// Like [`call_full4`] for a callee that pops 12 bytes of stack arguments (`ret 0xC`).
+unsafe fn call_full4_ret12(f: usize, r: &mut Regs, args: [u32; 4]) -> [u32; 4] {
+    let mut b = Block4 { f: f as u32, r: *r, esp: 0, args };
+    unsafe {
+        std::arch::asm!(
+            "push ebp", "push ebx", "push esi", "push edi",
+            "mov [eax + 32], esp",
+            "push eax",
+            "push dword ptr [eax]",
+            "push dword ptr [eax + 48]", "push dword ptr [eax + 44]", "push dword ptr [eax + 40]", "push dword ptr [eax + 36]",
+            "mov ecx, [eax + 8]", "mov edx, [eax + 12]", "mov ebx, [eax + 16]",
+            "mov esi, [eax + 20]", "mov edi, [eax + 24]", "mov ebp, [eax + 28]",
+            "mov eax, [eax + 4]",
+            "call dword ptr [esp + 16]",
+            "sub esp, 12",
+            "push ebx",
+            "mov ebx, [esp + 24]",
+            "mov [ebx + 4], eax", "mov [ebx + 8], ecx", "mov [ebx + 12], edx",
+            "mov [ebx + 20], esi", "mov [ebx + 24], edi", "mov [ebx + 28], ebp",
+            "mov ecx, [esp + 4]", "mov [ebx + 36], ecx",
+            "mov ecx, [esp + 8]", "mov [ebx + 40], ecx",
+            "mov ecx, [esp + 12]", "mov [ebx + 44], ecx",
+            "mov ecx, [esp + 16]", "mov [ebx + 48], ecx",
+            "pop dword ptr [ebx + 16]",
+            "mov esp, [ebx + 32]",
+            "pop edi", "pop esi", "pop ebx", "pop ebp",
+            inout("eax") &mut b as *mut Block4 => _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    *r = b.r;
+    b.args
+}
+
+extern "C" fn path_request_init_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    r.eax = unsafe {
+        shadow_run(
+            PATH_REQ_INIT,
+            &p,
+            args as *mut u32,
+            3,
+            true,
+            || Some(vec![(p.ecx as usize, 0x28)]),
+            || {
+                path_request_init(p.ecx, p.edx, p.esi, p.edi, args);
+                p.ecx
+            },
+        )
+    };
+}
+regs_thunk_ret12!(path_request_init_thunk, path_request_init_entry);
+
+// --- 0xB1E570 road_lanes_add_neighbours (EAX = &count, ESI = lane ptr array, stack cap (int), u8 flag; AL = count >= cap) ---
+
+
+/// The lane record of index `cx` (u16): `[[net] + 4] + cx * 0x3C` (the original multiplies by 15 and uses a
+/// `*4` addressing mode). Returns the 32-bit wrapped address.
+unsafe fn lane_rec(cx: u16) -> usize {
+    unsafe { (rd(rd(ROAD_NET) as usize + 4) as usize).wrapping_add((cx as usize * 15).wrapping_mul(4)) }
+}
+
+/// The dedupe-and-append step: `edi` entries are scanned (signed `edi <= 0` scans nothing); a hit leaves
+/// the array alone; otherwise `arr[edi] = rec` and `[count] = edi + 1`.
+unsafe fn lane_append(cnt: usize, arr: usize, edi: i32, rec: usize) {
+    unsafe {
+        let mut k = 0i32;
+        while k < edi {
+            if rd(arr.wrapping_add((k as u32 as usize).wrapping_mul(4))) as usize == rec {
+                return;
+            }
+            k += 1;
+        }
+        wd(arr.wrapping_add((edi as u32 as usize).wrapping_mul(4)), rec as u32);
+        wd(cnt, (edi as u32).wrapping_add(1));
+    }
+}
+
+/// Pass 1, for ebx = 0 .. count (count re-read): leave when count >= cap; append the lane in u16 [lane + 0x36]
+/// (0xFFFF = none, null address = none, already present = skip), then, when lane byte [+0x10] bit 0 is clear
+/// and count < cap, the one in u16 [lane + 0x38]. Flag byte 0 stops there. Else pass 2 over the entries
+/// that existed when pass 1 ended (n = count): those with [+0x10] bit 0 set append their [+0x38] lane while
+/// count < cap; pass 3 over the entries from n to the growing count appends their [+0x36] lanes. AL leaves
+/// as `count >= cap` (signed) and the rest of EAX is the pointer's.
+unsafe fn lanes_add_neighbours(cnt: u32, arr: u32, cap: i32, flag: u8) -> u32 {
+    unsafe {
+        let (cnt_p, arr_p) = (cnt as usize, arr as usize);
+        let item = |i: i32| rd(arr_p.wrapping_add((i as u32 as usize).wrapping_mul(4))) as usize;
+        let count = || rd(cnt_p) as i32;
+        let mut ebx = 0i32;
+        if count() > 0 {
+            loop {
+                let edi = count();
+                if edi >= cap {
+                    break;
+                }
+                let e = item(ebx);
+                let cx = rw(e + 0x36);
+                if cx != 0xFFFF {
+                    let rec = lane_rec(cx);
+                    if rec != 0 {
+                        lane_append(cnt_p, arr_p, edi, rec);
+                    }
+                }
+                let e = item(ebx);
+                if rb(e + 0x10) & 1 == 0 {
+                    let cx = rw(e + 0x38);
+                    if cx != 0xFFFF {
+                        let rec = lane_rec(cx);
+                        if rec != 0 {
+                            let edi = count();
+                            if edi < cap {
+                                lane_append(cnt_p, arr_p, edi, rec);
+                            }
+                        }
+                    }
+                }
+                ebx += 1;
+                if ebx >= count() {
+                    break;
+                }
+            }
+        }
+        if flag != 0 {
+            let n = count();
+            let mut ebp = 0i32;
+            if n > 0 {
+                loop {
+                    let edi = count();
+                    if edi >= cap {
+                        break;
+                    }
+                    let e = item(ebp);
+                    if rb(e + 0x10) & 1 != 0 {
+                        let cx = rw(e + 0x38);
+                        if cx != 0xFFFF {
+                            let rec = lane_rec(cx);
+                            if rec != 0 {
+                                lane_append(cnt_p, arr_p, edi, rec);
+                            }
+                        }
+                    }
+                    ebp += 1;
+                    if ebp >= n {
+                        break;
+                    }
+                }
+            }
+            ebp = n;
+            if n < count() {
+                loop {
+                    let edi = count();
+                    if edi >= cap {
+                        break;
+                    }
+                    let e = item(ebp);
+                    let cx = rw(e + 0x36);
+                    if cx != 0xFFFF {
+                        let rec = lane_rec(cx);
+                        if rec != 0 {
+                            lane_append(cnt_p, arr_p, edi, rec);
+                        }
+                    }
+                    ebp += 1;
+                    if ebp >= count() {
+                        break;
+                    }
+                }
+            }
+        }
+        (cnt & !0xFF) | (count() >= cap) as u32
+    }
+}
+
+extern "C" fn lanes_add_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let (cap, flag) = (*args as i32, *args.add(1) as u8);
+        r.eax = shadow_run(
+            LANES_ADD,
+            &p,
+            args as *mut u32,
+            2,
+            true,
+            || {
+                let count = rd(p.eax as usize) as i32;
+                let room = (cap as i64 - count.max(0) as i64).clamp(0, 0x4000) as usize;
+                // entries from max(count, 0) up to cap can be written (the count itself is the other region)
+                if cap as i64 - count.max(0) as i64 > 0x4000 {
+                    return None;
+                }
+                Some(vec![(p.eax as usize, 4), (p.esi as usize + 4 * count.max(0) as usize, 4 * room)])
+            },
+            || lanes_add_neighbours(p.eax, p.esi, cap, flag),
+        );
+    }
+}
+regs_thunk!(lanes_add_thunk, lanes_add_entry);
+
+// --- 0xA8D970 road_network_bind_chunk_entries (stack table, table count, owner; plain `ret`) ----------------
+
+/// Table = `arg0` (20-byte records: key [+4], handle [+8], two values [+0xC], [+0x10]), `n = arg1` (signed);
+/// owner = `arg2` with entry count [+0x144] (signed) and entries pointer [+0x148] (40-byte entries, key [+0]).
+/// Nothing happens when the entries pointer is 0, n <= 0 or the count <= 0. Else for each entry j the scan
+/// resumes at the last matched table index (`edx`, starting 0; skipped when edx >= n): the first record at
+/// or after it whose key equals the entry's key; on a hit, a record with handle -1 gets
+/// word [rec] = u16 [owner + 8] and handle = j; then entry[+4] = rec[+0xC], entry[+8] = rec[+0x10] and the
+/// resume index becomes the hit. EAX leaves as the entries pointer (nothing done) or the final count.
+unsafe fn bind_chunk_entries(table: u32, n: i32, owner: u32) -> u32 {
+    unsafe {
+        let o = owner as usize;
+        let entries = rd(o + 0x148);
+        let m = rd(o + 0x144) as i32;
+        if entries == 0 || n <= 0 || m <= 0 {
+            return entries;
+        }
+        let tb = table as usize;
+        let rec_at = |i: i32| tb.wrapping_add((i as u32 as usize).wrapping_mul(20));
+        let mut edx = 0i32;
+        let mut edi = entries as usize;
+        let mut j = 0i32;
+        loop {
+            let mut eax = edx;
+            if edx < n {
+                let key = rd(edi);
+                let mut found = false;
+                loop {
+                    if rd(rec_at(eax) + 4) == key {
+                        found = true;
+                        break;
+                    }
+                    eax += 1;
+                    if eax >= n {
+                        break;
+                    }
+                }
+                if found && eax < n {
+                    let rec = rec_at(eax);
+                    if rd(rec + 4) == key {
+                        if rd(rec + 8) == 0xFFFF_FFFF {
+                            let w = rw(o + 8);
+                            wb(rec, w as u8);
+                            wb(rec + 1, (w >> 8) as u8);
+                            wd(rec + 8, j as u32);
+                        }
+                        wd(edi + 4, rd(rec + 0xC));
+                        wd(edi + 8, rd(rec + 0x10));
+                        edx = eax;
+                    }
+                }
+            }
+            j += 1;
+            edi = edi.wrapping_add(0x28);
+            if j >= m {
+                return j as u32;
+            }
+        }
+    }
+}
+
+extern "C" fn bind_chunk_entries_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let (table, n, owner) = (*args, *args.add(1) as i32, *args.add(2));
+        r.eax = shadow_run(
+            BIND_CHUNK,
+            &p,
+            args as *mut u32,
+            3,
+            true,
+            || {
+                let (entries, m) = (rd(owner as usize + 0x148) as usize, rd(owner as usize + 0x144) as i32);
+                if entries == 0 || n <= 0 || m <= 0 {
+                    return Some(vec![]);
+                }
+                if m > 0x2000 || n > 0x2000 {
+                    return None;
+                }
+                Some(vec![(entries, 0x28 * m as usize), (table as usize, 20 * n as usize)])
+            },
+            || bind_chunk_entries(table, n, owner),
+        );
+    }
+}
+regs_thunk!(bind_chunk_entries_thunk, bind_chunk_entries_entry);
+
+// --- 0xA0E1D0 nav_detour_release_hull_by_handle (ECX = handle or -1) -------------------------------------------
+
+/// `-1` does nothing. Else slot = handle & 0xFFF in the 40-byte table at 0x2DEE0B8 (handle at [+8]); a
+/// matching handle runs nav_detour_release_hull (EDI = the slot, called by address); EAX leaves as the
+/// call's result, `handle & 0xFFF` (no match) or unchanged (-1). No shadow: the call changes the rings.
+extern "C" fn hull_by_handle_entry(r: &mut Pushad, _: *const u32) {
+    PORTS[HULL_BY_HANDLE].calls.fetch_add(1, Ordering::Relaxed);
+    let h = r.ecx;
+    if h == 0xFFFF_FFFF {
+        return;
+    }
+    unsafe {
+        let idx = (h & 0xFFF) as usize;
+        let slot = 0x02DE_E0B8 + idx * 40;
+        r.eax = h & 0xFFF;
+        if rd(slot + 8) == h {
+            r.eax = call_regs(NAV_HULL_RELEASE, h & 0xFFF, r.ecx, r.edx, r.esi, slot as u32, &[]);
+        }
+    }
+}
+regs_thunk!(hull_by_handle_thunk, hull_by_handle_entry);
+
+// --- 0xA02CA0 nav_link_closest_point (ECX = link, EAX = point P, ESI = point Q -> AL) ----------------------------
+
+const LINK_ZERO: usize = 0x00E5_BFA0; // 0.0
+
+/// `checked_eax` that only compares the bits in `mask` (the rest of EAX is x87 status junk from `fnstsw ax`).
+/// While shadowing, the original's whole EAX is what the caller gets.
+fn checked_eax_masked(id: usize, p: &Pushad, ours: u32, mask: u32) -> u32 {
+    let Some((n, orig)) = shadowing(id) else { return ours };
+    let r = run_original(id, orig, p);
+    if (r.eax ^ ours) & mask != 0 {
+        mismatch(id, n, format!("in {:x?}: original {:#x}, Rust {ours:#x} (mask {mask:#x})", Regs::of(p), r.eax));
+    }
+    r.eax
+}
+
+/// Link record: endpoints A = [+0 .. +8], B = [+0xC .. +0x14] (f32 vec3), flags byte [+0x18]. Bit 1 clear
+/// gives AL = 0 (the rest of EAX untouched). Else `d = B - A` (each f32), P' = f32(P - A), Q' = f32(Q - A).
+/// Bit 0 set: `dot1 = f32(P'.x*d.z + P'.y*d.y + P'.z*(-d.x))` must not be negative (NaN passes) and
+/// `dot2 = f32(Q'.z*(-d.x) + (Q'.x*d.z + Q'.y*d.y))` must be negative or NaN for AL = 1. Bit 0 clear:
+/// `dotQ` (the same expression over Q') times `dotP` (over P') must be < 0.0 for EAX = 1 (NaN gives 0).
+/// Only AL is meaningful (the original leaves the x87 status word in AH on most paths).
+unsafe fn link_closest_point(link: u32, p: u32, q: u32, eax_in: u32) -> u32 {
+    unsafe {
+        let l = link as usize;
+        let flags = rb(l + 0x18);
+        let low = eax_in & !0xFF;
+        if flags & 2 == 0 {
+            return low;
+        }
+        let (ax, ay, az) = (rf(l) as f64, rf(l + 4) as f64, rf(l + 8) as f64);
+        let dx = (rf(l + 0xC) as f64 - ax) as f32;
+        let dy = (rf(l + 0x10) as f64 - ay) as f32;
+        let dz = (rf(l + 0x14) as f64 - az) as f32;
+        let ndx = -dx;
+        let (dyd, dzd, ndxd) = (dy as f64, dz as f64, ndx as f64);
+        let sub = |v: u32, k: usize, a: f64| (rf(v as usize + 4 * k) as f64 - a) as f32 as f64;
+        if flags & 1 != 0 {
+            let (px, py, pz) = (sub(p, 0, ax), sub(p, 1, ay), sub(p, 2, az));
+            let dot1 = ((px * dzd + py * dyd) + pz * ndxd) as f32;
+            if dot1 < 0.0 {
+                return low;
+            }
+            let (qx, qy, qz) = (sub(q, 0, ax), sub(q, 1, ay), sub(q, 2, az));
+            let dot2 = ((dyd * qy + dzd * qx) + ndxd * qz) as f32;
+            if dot2 < 0.0 || dot2.is_nan() { low | 1 } else { low }
+        } else {
+            let (px, py, pz) = (sub(p, 0, ax), sub(p, 1, ay), sub(p, 2, az));
+            let (qx, qy, qz) = (sub(q, 0, ax), sub(q, 1, ay), sub(q, 2, az));
+            let dot_q = ((qx * dzd + qy * dyd) + qz * ndxd) as f32;
+            let dot_p = ((dyd * py + dzd * px) + ndxd * pz) as f32;
+            let prod = dot_q as f64 * dot_p as f64;
+            (prod < rd_f64(LINK_ZERO)) as u32
+        }
+    }
+}
+
+extern "C" fn link_closest_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax_masked(LINK_CLOSEST, &p, unsafe { link_closest_point(p.ecx, p.eax, p.esi, p.eax) }, 0xFF);
+}
+regs_thunk!(link_closest_thunk, link_closest_entry);
+
+// --- 0xA03C30 nav_segment_intersect_xz (ESI = A, ECX = B, EDX = C, EDI = D (vec3, x and z used), stack out (x, z);
+//     AL = 1 and out written when segment A-B crosses C-D) -------------------------------------------------------
+
+/// With `s0 = A.x - B.x`, `s1 = D.x - C.x`, `s2 = D.z - C.z` (53-bit, no f32 rounding), `det = f32(s2*s0 -
+/// (A.z - B.z)*s1)`; det == 0 (ordered) gives AL = 0. `r = f32(f32(s1*(B.z - C.z) - s2*(B.x - C.x)) / det)`,
+/// `q = f32(f32((B.z - C.z)*s0 - (B.x - C.x)*(A.z - B.z)) / det)`; r or q below 0 or above 1 gives AL = 0
+/// (NaN passes both tests). Else out.x = f32(B.x + f32(f32(s0)*r)), out.z = f32(f32(r*f32(A.z - B.z)) + B.z),
+/// EAX = (bits of out.x & ~0xFF) | 1. On failure only AL = 0 is defined (AH holds the x87 status word).
+unsafe fn segment_intersect_xz(a: u32, b: u32, c: u32, d: u32, out: u32, eax_in: u32) -> u32 {
+    unsafe {
+        let (a, b, c, d) = (a as usize, b as usize, c as usize, d as usize);
+        let low = eax_in & !0xFF;
+        let f = |p: usize, k: usize| rf(p + 4 * k) as f64;
+        let (ax, az, bx, bz, cx, cz, dx, dz) = (f(a, 0), f(a, 1), f(b, 0), f(b, 1), f(c, 0), f(c, 1), f(d, 0), f(d, 1));
+        let s0 = ax - bx;
+        let s1 = dx - cx;
+        let s2 = dz - cz;
+        let m1 = s2 * s0;
+        let s3 = az - bz;
+        let m2 = s3 * s1;
+        let det = (m1 - m2) as f32;
+        if det == 0.0 {
+            return low;
+        }
+        let detd = det as f64;
+        let t0 = bx - cx;
+        let t1 = bz - cz;
+        let n1 = (s1 * t1 - s2 * t0) as f32;
+        let r = (n1 as f64 / detd) as f32;
+        if r < 0.0 || 1.0 < r {
+            return low;
+        }
+        let v = az - bz;
+        let m1b = (t1 * s0 - t0 * v) as f32;
+        let q = (m1b as f64 / detd) as f32;
+        if q < 0.0 || 1.0 < q {
+            return low;
+        }
+        let s0f = s0 as f32;
+        let vf = v as f32;
+        let w1 = (s0f as f64 * r as f64) as f32;
+        let w2 = (r as f64 * vf as f64) as f32;
+        let ox = (bx + w1 as f64) as f32;
+        let oz = (w2 as f64 + bz) as f32;
+        wf(out as usize, ox);
+        wf(out as usize + 4, oz);
+        (ox.to_bits() & !0xFF) | 1
+    }
+}
+
+extern "C" fn segment_intersect_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let out = *args;
+        r.eax = shadow_run_m(
+            SEGMENT_INTERSECT,
+            &p,
+            args as *mut u32,
+            1,
+            0xFF,
+            || Some(vec![(out as usize, 8)]),
+            || segment_intersect_xz(p.esi, p.ecx, p.edx, p.edi, out, p.eax),
+        );
+    }
+}
+regs_thunk!(segment_intersect_thunk, segment_intersect_entry);
+
+// --- road query callbacks and the probe (globals of the current query: 0x2FA8CC0..0x2FA8D2C) --------------------
+
+const RQ_MASK_BITS: usize = 0x02FA_8CC0; // u32: records with any of these ctl bits are skipped
+const RQ_WANT_BITS: usize = 0x02FA_8CC4; // u32: wanted ctl bits (all of them in mode 1, any of them in mode 0)
+const RQ_MAX: usize = 0x02FA_8CC8; // i32: capacity of the result buffer
+const RQ_MODE: usize = 0x02FA_8CCC; // u8: 1 = all wanted bits, 0 = any
+const RQ_KIND: usize = 0x02FA_8CD0; // u32: required (ctl >> 26) & 3, or -1 for any
+const RQ_EXTRA: usize = 0x02FA_8CD4; // u32 (an object for the 0xA8D010 test), 0 = none
+const RQ_BUF: usize = 0x02FA_8D24; // u32*: result buffer
+const RQ_COUNT: usize = 0x02FA_8D28; // i32: results stored
+const RQ_TREE_ADD: usize = 0x0063_2C60;
+const RQ_EXTRA_TEST: usize = 0x00A8_D010;
+const RQ_FILTER: usize = 0x00A8_9A50;
+const RQ_TREE_QUERY: usize = 0x00BF_73B0;
+const RQ_TREE_CB: usize = 0x00A8_9A20;
+const RQ_FIRST_HIT_CB: usize = 0x00A8_9AB0;
+
+// --- 0xA89A20 road_query_tree_cb (stack: a, b, c vec3 pointers; AL = 1) ----------------------------------
+
+/// `s = [a]`; 0x632C60(EAX = [s], ECX = s + 0x1C, EDX = ESI = s, stack b) then 0x632C60(EAX = [s], ECX = s + 0x22,
+/// stack c) (EDX is the first call's leftover = b); AL = 1 on top of the second call's EAX.
+unsafe fn query_tree_cb(a: u32, b: u32, c: u32, edi: u32) -> u32 {
+    unsafe {
+        let s = rd(a as usize);
+        call_regs(RQ_TREE_ADD, rd(s as usize), s + 0x1C, b, s, edi, &[b]);
+        let e = call_regs(RQ_TREE_ADD, rd(s as usize), s + 0x22, b, s, edi, &[c]);
+        (e & !0xFF) | 1
+    }
+}
+
+extern "C" fn query_tree_cb_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let (a, b, c) = (*args, *args.add(1), *args.add(2));
+        r.eax = shadow_run(
+            QUERY_TREE_CB,
+            &p,
+            args as *mut u32,
+            3,
+            true,
+            || Some(vec![(b as usize, 12), (c as usize, 12)]),
+            || query_tree_cb(a, b, c, p.edi),
+        );
+    }
+}
+regs_thunk!(query_tree_cb_thunk, query_tree_cb_entry);
+
+// --- 0xA89A50 road_query_filter (EDX = lane record; AL = 1 filtered out, 0 accepted) ------------------------------
+
+/// `ctl = [rec + 0x10]`. Mode byte 1: ctl must contain all the wanted bits ([0x2FA8CC4]); mode 0: any of them.
+/// Failing that gives AL = 1. Then ctl & [0x2FA8CC0] != 0 gives 1; the kind [0x2FA8CD0] (unless -1) must equal
+/// `(ctl >> 26) & 3` (EAX holds that value from then on) else 1; with [0x2FA8CD4] non-null 0xA8D010
+/// (ECX = it, stack = record) must return 0 for 1, else the result is 0. `mov al, 1` / `xor al, al`
+/// keep the rest of EAX as it stands (ctl, the shifted kind, or 0xA8D010's EAX).
+unsafe fn query_filter(rec: u32, esi: u32, edi: u32) -> u32 {
+    unsafe {
+        let mut eax = rd(rec as usize + 0x10);
+        let want = rd(RQ_WANT_BITS);
+        let hit = if rb(RQ_MODE) != 0 { eax & want == want } else { want & eax != 0 };
+        if !hit {
+            return (eax & !0xFF) | 1;
+        }
+        if rd(RQ_MASK_BITS) & eax != 0 {
+            return (eax & !0xFF) | 1;
+        }
+        let kind = rd(RQ_KIND);
+        if kind != 0xFFFF_FFFF {
+            eax = (eax >> 26) & 3;
+            if eax != kind {
+                return (eax & !0xFF) | 1;
+            }
+        }
+        let extra = rd(RQ_EXTRA);
+        if extra == 0 {
+            return eax & !0xFF;
+        }
+        let e = call_regs(RQ_EXTRA_TEST, eax, extra, rec, esi, edi, &[rec]);
+        if e & 0xFF == 0 { (e & !0xFF) | 1 } else { e & !0xFF }
+    }
+}
+
+extern "C" fn query_filter_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked_eax(QUERY_FILTER, &p, unsafe { query_filter(p.edx, p.esi, p.edi) });
+}
+regs_thunk!(query_filter_thunk, query_filter_entry);
+
+// --- 0xA89AB0 road_query_cb_first_hit (stack: node**; AL = continue) -------------------------------------------
+
+/// `rec = [a]`; the filter (0xA89A50, EDX = rec) saying 1 gives AL = 1 (EAX = the filter's with AL = 1).
+/// Else `buf[count] = rec`, count += 1, AL = (count < max, signed) with the rest of EAX = the new count.
+unsafe fn query_first_hit(a: u32, ecx: u32, esi: u32, edi: u32) -> u32 {
+    unsafe {
+        let rec = rd(a as usize);
+        let e = call_regs(RQ_FILTER, a, ecx, rec, rec, edi, &[]);
+        let _ = esi;
+        if e & 0xFF != 0 {
+            return (e & !0xFF) | 1;
+        }
+        let count = rd(RQ_COUNT);
+        let buf = rd(RQ_BUF);
+        wd(buf as usize + (count as usize).wrapping_mul(4), rec);
+        let n = rd(RQ_COUNT).wrapping_add(1);
+        let lt = (n as i32) < (rd(RQ_MAX) as i32);
+        wd(RQ_COUNT, n);
+        (n & !0xFF) | lt as u32
+    }
+}
+
+extern "C" fn query_first_hit_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let a = *args;
+        r.eax = shadow_run(
+            QUERY_FIRST_HIT,
+            &p,
+            args as *mut u32,
+            1,
+            true,
+            || {
+                let (count, buf) = (rd(RQ_COUNT), rd(RQ_BUF));
+                if buf == 0 {
+                    return None;
+                }
+                Some(vec![(RQ_COUNT, 4), (buf as usize + (count as usize).wrapping_mul(4), 4)])
+            },
+            || query_first_hit(a, p.ecx, p.esi, p.edi),
+        );
+    }
+}
+regs_thunk!(query_first_hit_entry_thunk, query_first_hit_entry);
+
+// --- 0xA8A5D0 road_network_probe (EDX = result buffer, ESI = &count out; stack: a, b, wanted bits) ----------------
+
+/// No network ([0x2225B64] == 0) or no tree ([net + 0x84] == 0): `[ESI] = 0`, EAX = net. Else the query globals
+/// are set (buffer = EDX, count = 0, wanted bits = arg2, extra = 0, max = 0x20, mask = 0x100, mode = 1,
+/// kind = -1) and the tree query 0xBF73B0 runs with (EAX = tree, ECX = a, EDX = [tree + 8]; stack [tree + 8], a,
+/// b, [tree], tree_cb 0xA89A20, first_hit_cb 0xA89AB0; it pops 0x18); `[ESI] = count`, EAX = count.
+/// No shadow: the callbacks write the buffer and whatever the tree query touches.
+unsafe fn road_network_probe(buf: u32, out: u32, args: *const u32, ecx: u32, edi: u32) -> u32 {
+    unsafe {
+        let net = rd(ROAD_NET);
+        if net == 0 || rd(net as usize + 0x84) == 0 {
+            wd(out as usize, 0);
+            return net;
+        }
+        wd(RQ_BUF, buf);
+        wd(RQ_COUNT, 0);
+        wd(RQ_WANT_BITS, *args.add(2));
+        wd(RQ_EXTRA, 0);
+        wd(RQ_MAX, 0x20);
+        wd(RQ_MASK_BITS, 0x100);
+        wb(RQ_MODE, 1);
+        wd(RQ_KIND, 0xFFFF_FFFF);
+        let tree = rd(net as usize + 0x84);
+        let root = rd(tree as usize);
+        let t8 = rd(tree as usize + 8);
+        let _ = ecx;
+        call_regs(
+            RQ_TREE_QUERY,
+            tree,
+            *args,
+            t8,
+            out,
+            edi,
+            &[t8, *args, *args.add(1), root, RQ_TREE_CB as u32, RQ_FIRST_HIT_CB as u32],
+        );
+        let c = rd(RQ_COUNT);
+        wd(out as usize, c);
+        c
+    }
+}
+
+extern "C" fn road_network_probe_entry(r: &mut Pushad, args: *const u32) {
+    PORTS[ROAD_PROBE].calls.fetch_add(1, Ordering::Relaxed);
+    r.eax = unsafe { road_network_probe(r.edx, r.esi, args, r.ecx, r.edi) };
+}
+regs_thunk!(road_probe_thunk, road_network_probe_entry);
+
+// --- 0xB26130 vehicle_free_path_lists (stack: vehicle) ---------------------------------------------------------
+
+/// Walks the ring whose head slot is `vehicle + 0x458`: for each node (`next = [node]`, 0 when it equals the
+/// head slot's current value, read before the recycle) road_path_node_recycle (0xB1CCD0: EAX = node, ECX = the
+/// raw next, EDX = EDI = the slot, ESI = next). Then tail-jumps to nav_route_list_free (0xA18500) with
+/// EAX = `vehicle + 0x45C`, ESI / EDI as the caller had them. No shadow: the recycles rewrite rings.
+extern "C" fn vehicle_free_path_lists_entry(r: &mut Pushad, args: *const u32) {
+    PORTS[FREE_PATH_LISTS].calls.fetch_add(1, Ordering::Relaxed);
+    let p = *r;
+    unsafe {
+        let veh = *args;
+        let slot = veh + 0x458;
+        let mut eax = rd(slot as usize);
+        let (mut ecx, mut edx) = (p.ecx, p.edx);
+        while eax != 0 {
+            ecx = rd(eax as usize);
+            let esi = if ecx != rd(slot as usize) { ecx } else { 0 };
+            edx = slot;
+            call_regs(ROAD_PATH_RECYCLE_ADDR, eax, ecx, edx, esi, slot, &[]);
+            eax = esi;
+        }
+        r.eax = call_regs(NAV_ROUTE_LIST_FREE, veh + 0x45C, ecx, edx, p.esi, p.edi, &[]);
+    }
+}
+regs_thunk!(free_path_lists_thunk, vehicle_free_path_lists_entry);
+
+// --- 0xA18570 nav_route_refill_from_list (EAX = route, EDI = &list head slot) -----------------------------------
+
+/// Empty list (`[EDI] == 0`): nothing. Else nav_route_clear (0xA1F730, ESI = route), then up to 3 times: the
+/// head node of the circular list (links +0x1C next, +0x20 prev; a single node empties the slot) is unlinked
+/// and made a one-node ring, and handed to nav_route_push (0xA1F770: ESI = route, stack node, 0, 1).
+/// EAX leaves 0 when the list ran dry, else the last push's.
+extern "C" fn route_refill_entry(r: &mut Pushad, _: *const u32) {
+    PORTS[ROUTE_REFILL].calls.fetch_add(1, Ordering::Relaxed);
+    let p = *r;
+    unsafe {
+        let (route, slot) = (p.eax, p.edi);
+        if rd(slot as usize) == 0 {
+            return;
+        }
+        call_regs(NAV_ROUTE_CLEAR_ADDR, route, p.ecx, p.edx, route, slot, &[]);
+        let mut ecx: u32;
+        let mut edx = p.edx;
+        let mut eax;
+        let mut n = 0;
+        loop {
+            eax = rd(slot as usize);
+            if eax == 0 {
+                break;
+            }
+            let e = eax as usize;
+            ecx = rd(e + 0x1C);
+            if ecx == eax {
+                wd(e + 0x1C, 0);
+                wd(e + 0x20, 0);
+                wd(slot as usize, 0);
+            } else {
+                wd(slot as usize, ecx);
+                ecx = rd(e + 0x20);
+                if ecx != 0 {
+                    edx = rd(e + 0x1C);
+                    wd(ecx as usize + 0x1C, edx);
+                }
+                ecx = rd(e + 0x1C);
+                if ecx != 0 {
+                    edx = rd(e + 0x20);
+                    wd(ecx as usize + 0x20, edx);
+                }
+                wd(e + 0x1C, 0);
+                wd(e + 0x20, 0);
+            }
+            wd(e + 0x1C, eax);
+            wd(e + 0x20, eax);
+            eax = call_regs(NAV_ROUTE_PUSH_ADDR, eax, ecx, edx, route, slot, &[eax, 0, 1]);
+            n += 1;
+            if n >= 3 {
+                break;
+            }
+        }
+        r.eax = eax;
+    }
+}
+regs_thunk!(route_refill_thunk, route_refill_entry);
+
+// --- 0xA13660 nav_path_mark_ends (ESI = &path head, EDI = request) -------------------------------------------------
+
+/// 0xA121B0(EAX = ESI, stack EDI) runs first. With a head node: byte `[[head + 4] + 0x37]` |= 1, then the same
+/// node again |= 2; when `request[+9] & 0x10` and the head is still non-null 0xA11520(EAX = request + 8, stack
+/// ESI, 0, 0) runs. EAX leaves as the original's last value (0 / the marked node / the callee's).
+extern "C" fn path_mark_ends_entry(r: &mut Pushad, _: *const u32) {
+    PORTS[PATH_MARK_ENDS].calls.fetch_add(1, Ordering::Relaxed);
+    let p = *r;
+    unsafe {
+        let (head_slot, req) = (p.esi, p.edi);
+        call_regs(NAV_PATH_SETUP_ADDR, head_slot, p.ecx, p.edx, head_slot, req, &[req]);
+        let mut eax = rd(head_slot as usize);
+        if eax == 0 {
+            r.eax = 0;
+            return;
+        }
+        let n = rd(eax as usize + 4) as usize;
+        wb(n + 0x37, rb(n + 0x37) | 1);
+        let h = rd(head_slot as usize);
+        let n2 = if h != 0 { rd(h as usize + 4) as usize } else { 0 };
+        wb(n2 + 0x37, rb(n2 + 0x37) | 2);
+        eax = n2 as u32;
+        if rb(req as usize + 9) & 0x10 != 0 && rd(head_slot as usize) != 0 {
+            eax = call_regs(NAV_PATH_FINISH_ADDR, req + 8, p.ecx, p.edx, head_slot, req, &[head_slot, 0, 0]);
+        }
+        r.eax = eax;
+    }
+}
+regs_thunk!(path_mark_ends_thunk, path_mark_ends_entry);
+
+// --- 0xB2EE60 vehicle_ai_goal_install (EAX = 13-dword block or 0; stack: object, value, u16) -------------------------
+
+/// If `u16 [obj + 0x5C]` is non-zero 0x683FB0 runs (EDX = that value, ESI = EAX). Then `[obj + 0x24] = value`,
+/// a non-null block is copied (13 dwords) to `obj + 0x28`, `u16 [obj + 0x5C] = arg2`, and 0xB2C220 runs
+/// (stack obj, 0; it pops 8) with ESI / EDI as left by the copy. AL = 1 on top of its EAX.
+extern "C" fn goal_install_entry(r: &mut Pushad, args: *const u32) {
+    PORTS[GOAL_INSTALL].calls.fetch_add(1, Ordering::Relaxed);
+    let p = *r;
+    unsafe {
+        let (obj, val, half) = (*args, *args.add(1), *args.add(2));
+        let src = p.eax;
+        let o = obj as usize;
+        let old = rb(o + 0x5C) as u32 | (rb(o + 0x5D) as u32) << 8;
+        if old != 0 {
+            call_regs(NAV_GOAL_HOOK_ADDR, src, p.ecx, old, src, p.edi, &[]);
+        }
+        wd(o + 0x24, val);
+        let (mut esi, mut edi, mut ecx) = (src, p.edi, p.ecx);
+        if src != 0 {
+            edi = obj + 0x28;
+            ecx = 0xD;
+            while ecx != 0 {
+                wd(edi as usize, rd(esi as usize));
+                esi += 4;
+                edi += 4;
+                ecx -= 1;
+            }
+        }
+        ecx = (ecx & 0xFFFF_0000) | (half & 0xFFFF);
+        wb(o + 0x5C, half as u8);
+        wb(o + 0x5D, (half >> 8) as u8);
+        let e = call_regs(NAV_GOAL_COMMIT_ADDR, val, ecx, old, esi, edi, &[obj, 0]);
+        r.eax = (e & !0xFF) | 1;
+    }
+}
+regs_thunk!(goal_install_thunk, goal_install_entry);
+
 // --- install ---------------------------------------------------------------------------------------
 
 /// `(port, offset of an E8 / E9 rel32 in its body, port whose relocated original that branch must reach, the
@@ -2236,6 +3616,26 @@ pub fn install() {
         (CHUNK_CELL_INDEX, &CHUNK_CELL_INDEX_BODY, &[], chunk_cell_index_thunk),
         (CELL_LOCATE, &CELL_LOCATE_BODY, &[0x31], cell_locate_thunk),
         (SPLINE_EVAL_POS, &SPLINE_EVAL_POS_BODY, &[], spline_eval_position_thunk),
+        (SPLINE_EVAL_TANGENT, &SPLINE_EVAL_TANGENT_BODY, &[], spline_eval_tangent_thunk),
+        (SPLINE_EVAL_2ND, &SPLINE_EVAL_2ND_BODY, &[], spline_eval_2nd_thunk),
+        (HULL_RELEASE, &HULL_RELEASE_BODY, &HULL_RELEASE_BODY_CALLS, hull_release_thunk),
+        (ROAD_ROUTE_LEN, &ROAD_ROUTE_LEN_BODY, &[], road_route_len_thunk),
+        (TRI_EDGE_SIDE, &TRI_EDGE_SIDE_BODY, &[], tri_edge_side_thunk),
+        (RECORD_VALID, &RECORD_VALID_BODY, &[], record_valid_thunk),
+        (PATH_REQ_INIT, &PATH_REQ_INIT_BODY, &[], path_request_init_thunk),
+        (LANES_ADD, &LANES_ADD_BODY, &[], lanes_add_thunk),
+        (BIND_CHUNK, &BIND_CHUNK_BODY, &[], bind_chunk_entries_thunk),
+        (HULL_BY_HANDLE, &HULL_BY_HANDLE_BODY, &HULL_BY_HANDLE_BODY_CALLS, hull_by_handle_thunk),
+        (LINK_CLOSEST, &LINK_CLOSEST_BODY, &[], link_closest_thunk),
+        (SEGMENT_INTERSECT, &SEGMENT_INTERSECT_BODY, &[], segment_intersect_thunk),
+        (QUERY_TREE_CB, &QUERY_TREE_CB_BODY, &QUERY_TREE_CB_BODY_CALLS, query_tree_cb_thunk),
+        (QUERY_FILTER, &QUERY_FILTER_BODY, &QUERY_FILTER_BODY_CALLS, query_filter_thunk),
+        (QUERY_FIRST_HIT, &QUERY_FIRST_HIT_BODY, &QUERY_FIRST_HIT_BODY_CALLS, query_first_hit_entry_thunk),
+        (ROAD_PROBE, &ROAD_PROBE_BODY, &ROAD_PROBE_BODY_CALLS, road_probe_thunk),
+        (FREE_PATH_LISTS, &FREE_PATH_LISTS_BODY, &FREE_PATH_LISTS_BODY_CALLS, free_path_lists_thunk),
+        (ROUTE_REFILL, &ROUTE_REFILL_BODY, &ROUTE_REFILL_BODY_CALLS, route_refill_thunk),
+        (PATH_MARK_ENDS, &PATH_MARK_ENDS_BODY, &PATH_MARK_ENDS_BODY_CALLS, path_mark_ends_thunk),
+        (GOAL_INSTALL, &GOAL_INSTALL_BODY, &GOAL_INSTALL_BODY_CALLS, goal_install_thunk),
     ];
     let mut ok = 0;
     for (id, body, call_offsets, thunk) in list {
@@ -2243,7 +3643,7 @@ pub fn install() {
         match unsafe { detour::relocate(port.addr, body, call_offsets) } {
             // nav_route_clear has no shadow. The two speed-override shadows stop before their call:
             // `add esp, 4` (undoing the push) replaces `call 0xB2B8A0`.
-            Ok(_) if id == ROUTE_CLEAR => {}
+            Ok(_) if NO_SHADOW.contains(&id) => {}
             Ok(copy) => {
                 if id == SET_SPEED_OVERRIDE || id == CLEAR_SPEED_OVERRIDE {
                     let o = if id == SET_SPEED_OVERRIDE { 0x37 } else { 0x11 };
@@ -2617,3 +4017,327 @@ const SPLINE_EVAL_POS_BODY: [u8; 468] = [
     0xDE, 0xC9, 0xF3, 0x0F, 0x11, 0x46, 0x08, 0x5F, 0xD8, 0x44, 0x24, 0x0C, 0xD9, 0x1E, 0x83, 0xC4,
     0x08, 0xC2, 0x04, 0x00,
 ];
+const SPLINE_EVAL_TANGENT_BODY: [u8; 705] = [
+    0x83, 0xEC, 0x48, 0x56, 0x8B, 0xF0, 0x8B, 0x46, 0x0C, 0x83, 0xF8, 0x02, 0x7D, 0x1F, 0xA1, 0xD0,
+    0xA6, 0x52, 0x02, 0x89, 0x01, 0x8B, 0x15, 0xD4, 0xA6, 0x52, 0x02, 0x89, 0x51, 0x04, 0xA1, 0xD8,
+    0xA6, 0x52, 0x02, 0x89, 0x41, 0x08, 0x5E, 0x83, 0xC4, 0x48, 0xC2, 0x04, 0x00, 0x0F, 0x57, 0xC9,
+    0xF3, 0x0F, 0x10, 0x44, 0x24, 0x50, 0x0F, 0x2F, 0xC8, 0x72, 0x60, 0x8B, 0x06, 0x8B, 0x76, 0x08,
+    0xD9, 0x06, 0xD8, 0x20, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x46, 0x04, 0xD8, 0x60, 0x04, 0xD9, 0x5C,
+    0x24, 0x14, 0xD9, 0x46, 0x08, 0x5E, 0xD8, 0x60, 0x08, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24,
+    0x0C, 0xDD, 0x05, 0xF8, 0xBF, 0xE5, 0x00, 0xDC, 0xC9, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0x8B,
+    0x54, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x10, 0x89, 0x11, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0x8B,
+    0x44, 0x24, 0x1C, 0x89, 0x41, 0x04, 0xD8, 0x4C, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x20, 0x8B, 0x54,
+    0x24, 0x20, 0x89, 0x51, 0x08, 0x83, 0xC4, 0x48, 0xC2, 0x04, 0x00, 0xD9, 0x44, 0x24, 0x50, 0x83,
+    0xC0, 0xFF, 0x89, 0x44, 0x24, 0x50, 0xDB, 0x44, 0x24, 0x50, 0xD9, 0xC9, 0xDB, 0xF1, 0xDD, 0xD9,
+    0x72, 0x76, 0x8B, 0x46, 0x0C, 0xDD, 0xD8, 0x8B, 0x56, 0x04, 0x8B, 0x36, 0x8D, 0x04, 0x40, 0x03,
+    0xC0, 0x03, 0xC0, 0xD9, 0x44, 0x30, 0xF4, 0x8D, 0x54, 0x02, 0xF4, 0xD8, 0x22, 0x8D, 0x44, 0x30,
+    0xF4, 0x5E, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x40, 0x04, 0xD8, 0x62, 0x04, 0xD9, 0x5C, 0x24, 0x1C,
+    0xD9, 0x40, 0x08, 0xD8, 0x62, 0x08, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xDD, 0x05,
+    0xF8, 0xBF, 0xE5, 0x00, 0xDC, 0xC9, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x44, 0x24, 0x0C,
+    0xD9, 0x44, 0x24, 0x1C, 0x89, 0x01, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x10, 0x8B, 0x54, 0x24, 0x10,
+    0x89, 0x51, 0x04, 0xD8, 0x4C, 0x24, 0x20, 0xD9, 0x5C, 0x24, 0x14, 0x8B, 0x44, 0x24, 0x14, 0x89,
+    0x41, 0x08, 0x83, 0xC4, 0x48, 0xC2, 0x04, 0x00, 0x57, 0xF3, 0x0F, 0x2C, 0xF8, 0x89, 0x7C, 0x24,
+    0x54, 0xDA, 0x64, 0x24, 0x54, 0x8B, 0x56, 0x04, 0x8D, 0x44, 0x7F, 0x03, 0x03, 0xC0, 0x03, 0xC0,
+    0x03, 0xD0, 0xD9, 0x5C, 0x24, 0x54, 0xD9, 0x44, 0x24, 0x54, 0xD9, 0xC0, 0xDC, 0xC8, 0xD9, 0x5C,
+    0x24, 0x54, 0xDD, 0x05, 0x58, 0xC0, 0xE5, 0x00, 0xD8, 0xC9, 0xD9, 0x44, 0x24, 0x54, 0xDD, 0x05,
+    0x58, 0xC8, 0xE5, 0x00, 0xD8, 0xC9, 0xD8, 0xC2, 0xDD, 0x05, 0xF8, 0xBF, 0xE5, 0x00, 0xDC, 0xE9,
+    0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0xC1, 0xDC, 0x0D, 0x08, 0xC2, 0xE5, 0x00, 0xD9, 0xCC,
+    0xDC, 0x0D, 0x28, 0xC5, 0xE5, 0x00, 0xDE, 0xC4, 0xDE, 0xC3, 0xD9, 0xCA, 0xD9, 0x5C, 0x24, 0x08,
+    0xD9, 0xC1, 0xDC, 0x0D, 0x50, 0xC8, 0xE5, 0x00, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x54, 0xD9, 0xC0,
+    0xDC, 0xC0, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x02, 0xD9, 0x44, 0x24, 0x54, 0xD9, 0xC0,
+    0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x44, 0xD9, 0x42, 0x04, 0xD8, 0xC9, 0xD9, 0x5C, 0x24,
+    0x48, 0xD8, 0x4A, 0x08, 0x8D, 0x14, 0x7F, 0x8B, 0x7E, 0x08, 0x8B, 0x36, 0xD9, 0x5C, 0x24, 0x4C,
+    0x03, 0xD2, 0x03, 0xD2, 0xD9, 0x04, 0x17, 0x03, 0xFA, 0xD9, 0x44, 0x24, 0x08, 0xD9, 0xC0, 0xDE,
+    0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x38, 0xD9, 0x47, 0x04, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x3C,
+    0xD8, 0x4F, 0x08, 0xD9, 0x5C, 0x24, 0x40, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0xC0, 0xD8, 0x0C, 0x30,
+    0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x30, 0x04, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD8, 0x4C,
+    0x30, 0x08, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x04, 0x32, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC0, 0xDE,
+    0xCA, 0xD9, 0xC9, 0x5F, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x32, 0x04, 0xD8, 0xC9, 0xD9, 0x5C,
+    0x24, 0x20, 0xD8, 0x4C, 0x32, 0x08, 0x5E, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8,
+    0x44, 0x24, 0x0C, 0xD9, 0x5C, 0x24, 0x24, 0xD9, 0x44, 0x24, 0x1C, 0xD8, 0x44, 0x24, 0x10, 0xD9,
+    0x5C, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0x44, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x2C, 0xD9,
+    0x44, 0x24, 0x24, 0xD8, 0x44, 0x24, 0x30, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x28, 0xD8,
+    0x44, 0x24, 0x34, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x2C, 0xD8, 0x44, 0x24, 0x38, 0xD9,
+    0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0x44, 0x24, 0x3C, 0xD9, 0x5C, 0x24, 0x30, 0x8B,
+    0x54, 0x24, 0x30, 0xD9, 0x44, 0x24, 0x1C, 0x89, 0x11, 0xD8, 0x44, 0x24, 0x40, 0xD9, 0x5C, 0x24,
+    0x34, 0x8B, 0x44, 0x24, 0x34, 0xD9, 0x44, 0x24, 0x20, 0x89, 0x41, 0x04, 0xD8, 0x44, 0x24, 0x44,
+    0xD9, 0x5C, 0x24, 0x38, 0x8B, 0x54, 0x24, 0x38, 0x89, 0x51, 0x08, 0x83, 0xC4, 0x48, 0xC2, 0x04,
+    0x00,
+];
+const SPLINE_EVAL_2ND_BODY: [u8; 833] = [
+    0x8B, 0x41, 0x0C, 0x83, 0xEC, 0x48, 0x83, 0xF8, 0x02, 0x7D, 0x1E, 0xA1, 0xD0, 0xA6, 0x52, 0x02,
+    0x89, 0x02, 0x8B, 0x0D, 0xD4, 0xA6, 0x52, 0x02, 0x89, 0x4A, 0x04, 0xA1, 0xD8, 0xA6, 0x52, 0x02,
+    0x89, 0x42, 0x08, 0x83, 0xC4, 0x48, 0xC2, 0x04, 0x00, 0x0F, 0x57, 0xC9, 0xF3, 0x0F, 0x10, 0x44,
+    0x24, 0x4C, 0x0F, 0x2F, 0xC8, 0x0F, 0x86, 0xA9, 0x00, 0x00, 0x00, 0x8B, 0x41, 0x08, 0xD9, 0x00,
+    0xDD, 0x05, 0xE8, 0xBF, 0xE5, 0x00, 0xDC, 0xC9, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x40,
+    0x04, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x10, 0xD8, 0x48, 0x08, 0x8B, 0x01, 0x8B, 0x49, 0x04, 0x83,
+    0xC1, 0x0C, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x00, 0xD8, 0x64, 0x24, 0x0C, 0xD9, 0x5C, 0x24, 0x18,
+    0xD9, 0x40, 0x04, 0xD8, 0x64, 0x24, 0x10, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x40, 0x08, 0xD8, 0x64,
+    0x24, 0x14, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x01, 0xD8, 0x44, 0x24, 0x18, 0xD9, 0x5C, 0x24, 0x0C,
+    0xD9, 0x41, 0x04, 0xD8, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x41, 0x08, 0xD8, 0x44,
+    0x24, 0x20, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xDD, 0x05, 0x58, 0xC0, 0xE5, 0x00,
+    0xDC, 0xC9, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0x8B, 0x4C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x10,
+    0x89, 0x0A, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0x8B, 0x44, 0x24, 0x1C, 0x89, 0x42, 0x04, 0xD8,
+    0x4C, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x20, 0x8B, 0x4C, 0x24, 0x20, 0x89, 0x4A, 0x08, 0x83, 0xC4,
+    0x48, 0xC2, 0x04, 0x00, 0xD9, 0x44, 0x24, 0x4C, 0x83, 0xC0, 0xFF, 0x89, 0x44, 0x24, 0x4C, 0xDB,
+    0x44, 0x24, 0x4C, 0x56, 0xD9, 0xC9, 0x57, 0xDB, 0xF1, 0xDD, 0xD9, 0x0F, 0x82, 0xC5, 0x00, 0x00,
+    0x00, 0x8B, 0x41, 0x0C, 0xDD, 0xD8, 0x8B, 0x79, 0x04, 0x8D, 0x34, 0x40, 0x03, 0xF6, 0x03, 0xF6,
+    0xD9, 0x44, 0x37, 0xF4, 0x8D, 0x7C, 0x37, 0xF4, 0xDD, 0x05, 0xE8, 0xBF, 0xE5, 0x00, 0x8D, 0x44,
+    0x40, 0xFA, 0xDC, 0xC9, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x47, 0x04, 0xD8, 0xC9, 0xD9,
+    0x5C, 0x24, 0x24, 0xD8, 0x4F, 0x08, 0x8B, 0x79, 0x08, 0x8B, 0x09, 0x8D, 0x04, 0x87, 0xD9, 0x5C,
+    0x24, 0x28, 0x5F, 0xD9, 0x00, 0xD8, 0x64, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x40, 0x04,
+    0xD8, 0x64, 0x24, 0x20, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x40, 0x08, 0x8D, 0x44, 0x0E, 0xF4, 0xD8,
+    0x64, 0x24, 0x24, 0x5E, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x00, 0xD8, 0x44, 0x24, 0x0C, 0xD9, 0x5C,
+    0x24, 0x18, 0xD9, 0x40, 0x04, 0xD8, 0x44, 0x24, 0x10, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x40, 0x08,
+    0xD8, 0x44, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xDD, 0x05, 0x58, 0xC0,
+    0xE5, 0x00, 0xDC, 0xC9, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x44, 0x24, 0x0C, 0xD9, 0x44,
+    0x24, 0x1C, 0x89, 0x02, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x10, 0x8B, 0x4C, 0x24, 0x10, 0x89, 0x4A,
+    0x04, 0xD8, 0x4C, 0x24, 0x20, 0xD9, 0x5C, 0x24, 0x14, 0x8B, 0x44, 0x24, 0x14, 0x89, 0x42, 0x08,
+    0x83, 0xC4, 0x48, 0xC2, 0x04, 0x00, 0x53, 0xF3, 0x0F, 0x2C, 0xD8, 0x89, 0x5C, 0x24, 0x58, 0xDA,
+    0x64, 0x24, 0x58, 0x8B, 0x31, 0x8B, 0x79, 0x04, 0x8D, 0x44, 0x5B, 0x03, 0x03, 0xC0, 0x03, 0xC0,
+    0x8B, 0x49, 0x08, 0x03, 0xF8, 0xD9, 0x5C, 0x24, 0x58, 0xD9, 0x44, 0x24, 0x58, 0xDD, 0x05, 0x00,
+    0xC5, 0xE5, 0x00, 0xD8, 0xC9, 0xDD, 0x05, 0x58, 0xC0, 0xE5, 0x00, 0xDC, 0xC1, 0xD9, 0xC9, 0xD9,
+    0x5C, 0x24, 0x14, 0xD9, 0xC1, 0xDC, 0x0D, 0xF8, 0xC2, 0xE5, 0x00, 0xDC, 0x25, 0x30, 0xC5, 0xE5,
+    0x00, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0xC1, 0xDC, 0x0D, 0x48, 0xC8, 0xE5, 0x00, 0xD8, 0xC1, 0xD9,
+    0x5C, 0x24, 0x0C, 0xDE, 0xC9, 0xD9, 0x5C, 0x24, 0x58, 0xD9, 0x04, 0x30, 0xD9, 0x44, 0x24, 0x58,
+    0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x48, 0xD9, 0x44, 0x30, 0x04, 0xD8, 0xC9,
+    0xD9, 0x5C, 0x24, 0x4C, 0xD8, 0x4C, 0x30, 0x08, 0x8D, 0x04, 0x5B, 0x03, 0xC0, 0x03, 0xC0, 0xD9,
+    0x5C, 0x24, 0x50, 0x03, 0xC8, 0xD9, 0x07, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9,
+    0xC9, 0xD9, 0x5C, 0x24, 0x3C, 0xD9, 0x47, 0x04, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x40, 0xD8, 0x4F,
+    0x08, 0xD9, 0x5C, 0x24, 0x44, 0xD9, 0x01, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9,
+    0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x41, 0x04, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD8, 0x49,
+    0x08, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x04, 0x30, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xC0, 0xDE, 0xCA,
+    0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x24, 0xD9, 0x44, 0x30, 0x04, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x28,
+    0xD8, 0x4C, 0x30, 0x08, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x44, 0x24, 0x24, 0xD8, 0x44, 0x24, 0x18,
+    0xD9, 0x5C, 0x24, 0x30, 0xD9, 0x44, 0x24, 0x28, 0xD8, 0x44, 0x24, 0x1C, 0x5B, 0x5F, 0x5E, 0xD9,
+    0x5C, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0x44, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x2C, 0xD9,
+    0x44, 0x24, 0x24, 0xD8, 0x44, 0x24, 0x30, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x28, 0xD8,
+    0x44, 0x24, 0x34, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x2C, 0xD8, 0x44, 0x24, 0x38, 0xD9,
+    0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0x44, 0x24, 0x3C, 0xD9, 0x5C, 0x24, 0x30, 0x8B,
+    0x4C, 0x24, 0x30, 0xD9, 0x44, 0x24, 0x1C, 0x89, 0x0A, 0xD8, 0x44, 0x24, 0x40, 0xD9, 0x5C, 0x24,
+    0x34, 0x8B, 0x44, 0x24, 0x34, 0xD9, 0x44, 0x24, 0x20, 0x89, 0x42, 0x04, 0xD8, 0x44, 0x24, 0x44,
+    0xD9, 0x5C, 0x24, 0x38, 0x8B, 0x4C, 0x24, 0x38, 0x89, 0x4A, 0x08, 0x83, 0xC4, 0x48, 0xC2, 0x04,
+    0x00,
+];
+const HULL_RELEASE_BODY: [u8; 288] = [
+    0x8B, 0x47, 0x18, 0x53, 0x55, 0x33, 0xED, 0x3B, 0xC5, 0x56, 0x0F, 0x84, 0x0C, 0x01, 0x00, 0x00,
+    0xF6, 0x40, 0x08, 0x01, 0x74, 0x67, 0x8B, 0x1D, 0xC0, 0xB8, 0x1F, 0x02, 0x3B, 0xDD, 0x8B, 0xF3,
+    0x74, 0x32, 0x8B, 0x4E, 0x2C, 0x8B, 0xC1, 0x3B, 0xC5, 0x74, 0x1D, 0x8B, 0x57, 0x08, 0x8B, 0xFF,
+    0x39, 0x50, 0x08, 0x74, 0x0C, 0x8B, 0x00, 0x3B, 0xC1, 0x74, 0x0D, 0x3B, 0xC5, 0x75, 0xF1, 0xEB,
+    0x07, 0x8B, 0xD6, 0xE8, 0x98, 0xCE, 0xFF, 0xFF, 0x8B, 0x06, 0x3B, 0xC3, 0x74, 0x06, 0x8B, 0xF0,
+    0x3B, 0xF5, 0x75, 0xCE, 0x8B, 0x47, 0x18, 0x39, 0x05, 0x90, 0xC1, 0x1F, 0x02, 0x75, 0x55, 0x39,
+    0x00, 0x75, 0x10, 0x89, 0x28, 0x8B, 0x47, 0x18, 0x89, 0x68, 0x04, 0x89, 0x2D, 0x90, 0xC1, 0x1F,
+    0x02, 0xEB, 0x66, 0x8B, 0x08, 0x89, 0x0D, 0x90, 0xC1, 0x1F, 0x02, 0xEB, 0x37, 0x8B, 0x70, 0x54,
+    0x3B, 0xF5, 0x74, 0x0C, 0x55, 0xE8, 0xC6, 0xCE, 0xFF, 0xFF, 0x8B, 0x47, 0x18, 0x83, 0xC4, 0x04,
+    0x39, 0x05, 0x98, 0xC1, 0x1F, 0x02, 0x75, 0x1C, 0x39, 0x00, 0x75, 0x10, 0x89, 0x28, 0x8B, 0x57,
+    0x18, 0x89, 0x2D, 0x98, 0xC1, 0x1F, 0x02, 0x89, 0x6A, 0x04, 0xEB, 0x2D, 0x8B, 0x08, 0x89, 0x0D,
+    0x98, 0xC1, 0x1F, 0x02, 0x8B, 0x48, 0x04, 0x3B, 0xCD, 0x74, 0x04, 0x8B, 0x10, 0x89, 0x11, 0x8B,
+    0x47, 0x18, 0x39, 0x28, 0x74, 0x08, 0x8B, 0x08, 0x8B, 0x50, 0x04, 0x89, 0x51, 0x04, 0x8B, 0x47,
+    0x18, 0x89, 0x28, 0x8B, 0x4F, 0x18, 0x89, 0x69, 0x04, 0xA1, 0x94, 0xC1, 0x1F, 0x02, 0x3B, 0xC5,
+    0x75, 0x1B, 0x8B, 0x47, 0x18, 0x89, 0x00, 0x8B, 0x47, 0x18, 0x89, 0x40, 0x04, 0x8B, 0x57, 0x18,
+    0x89, 0x15, 0x94, 0xC1, 0x1F, 0x02, 0x89, 0x6F, 0x18, 0x5E, 0x5D, 0x5B, 0xC3, 0x8B, 0x4F, 0x18,
+    0x8B, 0x50, 0x04, 0x89, 0x51, 0x04, 0x8B, 0x4F, 0x18, 0x89, 0x01, 0x8B, 0x50, 0x04, 0x8B, 0x4F,
+    0x18, 0x89, 0x0A, 0x8B, 0x57, 0x18, 0x89, 0x50, 0x04, 0x89, 0x6F, 0x18, 0x5E, 0x5D, 0x5B, 0xC3,
+];
+const HULL_RELEASE_BODY_CALLS: [usize; 2] = [0x43, 0x85];
+const ROAD_ROUTE_LEN_BODY: [u8; 100] = [
+    0x83, 0xEC, 0x08, 0x85, 0xF6, 0xD9, 0xEE, 0x53, 0xD9, 0x5C, 0x24, 0x04, 0x8A, 0x5C, 0x24, 0x10,
+    0x8B, 0xC6, 0x74, 0x47, 0xDD, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0x8B, 0x48, 0x0C, 0x8B, 0x51, 0x10,
+    0xF7, 0xC2, 0x00, 0x00, 0x00, 0x20, 0x75, 0x27, 0x80, 0xFB, 0x01, 0xD9, 0x41, 0x14, 0xD9, 0x5C,
+    0x24, 0x08, 0x75, 0x0F, 0xF6, 0xC2, 0x10, 0x74, 0x0A, 0xD9, 0x44, 0x24, 0x08, 0xD8, 0xC9, 0xD9,
+    0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x08, 0xD8, 0x44, 0x24, 0x04, 0xD9, 0x5C, 0x24, 0x04, 0x8B,
+    0x00, 0x3B, 0xC6, 0x74, 0x04, 0x85, 0xC0, 0x75, 0xC1, 0xDD, 0xD8, 0xD9, 0x44, 0x24, 0x04, 0x5B,
+    0x83, 0xC4, 0x08, 0xC3,
+];
+const TRI_EDGE_SIDE_BODY: [u8; 186] = [
+    0x8B, 0x0C, 0x86, 0x83, 0xC0, 0x01, 0x83, 0xEC, 0x10, 0x99, 0x53, 0xBB, 0x03, 0x00, 0x00, 0x00,
+    0xF7, 0xFB, 0x32, 0xC0, 0x8B, 0x14, 0x96, 0x3B, 0xCA, 0x76, 0x08, 0x8B, 0xC1, 0x8B, 0xCA, 0x8B,
+    0xD0, 0xB0, 0x01, 0xD9, 0x42, 0x08, 0x84, 0xC0, 0xD8, 0x61, 0x08, 0xD9, 0x5C, 0x24, 0x0C, 0xD9,
+    0x01, 0xD8, 0x22, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x07, 0xD8, 0x21, 0xD9, 0x5C, 0x24, 0x04, 0xD9,
+    0x47, 0x04, 0xD8, 0x61, 0x08, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x08, 0xD8, 0x4C, 0x24,
+    0x10, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0x4C, 0x24, 0x0C, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x04, 0xD9,
+    0x44, 0x24, 0x04, 0xDC, 0x15, 0xA0, 0xC1, 0xE5, 0x00, 0xDF, 0xE0, 0x74, 0x28, 0xF6, 0xC4, 0x41,
+    0x75, 0x0C, 0xDD, 0xD8, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x5B, 0x83, 0xC4, 0x10, 0xC3, 0xDC, 0x1D,
+    0x30, 0xC4, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x28, 0xB8, 0x02, 0x00, 0x00, 0x00,
+    0x5B, 0x83, 0xC4, 0x10, 0xC3, 0xF6, 0xC4, 0x41, 0x75, 0x0C, 0xDD, 0xD8, 0xB8, 0x02, 0x00, 0x00,
+    0x00, 0x5B, 0x83, 0xC4, 0x10, 0xC3, 0xDC, 0x1D, 0x30, 0xC4, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x05, 0x7B, 0xC1, 0x33, 0xC0, 0x5B, 0x83, 0xC4, 0x10, 0xC3,
+];
+const RECORD_VALID_BODY: [u8; 38] = [
+    0x81, 0xE9, 0xD0, 0x00, 0xE4, 0x02, 0x78, 0x1B, 0x81, 0xF9, 0x00, 0x68, 0x00, 0x00, 0x73, 0x13,
+    0xB8, 0x4F, 0xEC, 0xC4, 0x4E, 0xF7, 0xE1, 0xC1, 0xEA, 0x04, 0x6B, 0xD2, 0x34, 0x2B, 0xCA, 0x0F,
+    0x94, 0xC0, 0xC3, 0x32, 0xC0, 0xC3,
+];
+const PATH_REQ_INIT_BODY: [u8; 129] = [
+    0xD9, 0xEE, 0x33, 0xC0, 0x66, 0x89, 0x41, 0x08, 0x88, 0x41, 0x0A, 0x80, 0x61, 0x09, 0xBF, 0x8B,
+    0x44, 0x24, 0x04, 0x89, 0x01, 0x8B, 0x44, 0x24, 0x08, 0x89, 0x41, 0x04, 0x66, 0x8B, 0x02, 0x66,
+    0x89, 0x41, 0x08, 0x8A, 0x52, 0x02, 0x88, 0x51, 0x0A, 0xF6, 0x41, 0x09, 0x80, 0x74, 0x13, 0x8B,
+    0x06, 0x89, 0x41, 0x0C, 0x8B, 0x56, 0x04, 0x89, 0x51, 0x10, 0x8B, 0x46, 0x08, 0x89, 0x41, 0x14,
+    0xEB, 0x09, 0xD9, 0x51, 0x0C, 0xD9, 0x51, 0x10, 0xD9, 0x51, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD9,
+    0x51, 0x24, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x18, 0x8B, 0x17, 0xDD, 0xD8, 0x89,
+    0x51, 0x18, 0x8B, 0x47, 0x04, 0x89, 0x41, 0x1C, 0x8B, 0x57, 0x08, 0x89, 0x51, 0x20, 0x8B, 0xC1,
+    0xC2, 0x0C, 0x00, 0xD9, 0x51, 0x18, 0x8B, 0xC1, 0xD9, 0x51, 0x1C, 0xD9, 0x59, 0x20, 0xC2, 0x0C,
+    0x00,
+];
+const LANES_ADD_BODY: [u8; 403] = [
+    0x53, 0x33, 0xDB, 0x39, 0x18, 0x57, 0x0F, 0x8E, 0xB3, 0x00, 0x00, 0x00, 0x8D, 0x64, 0x24, 0x00,
+    0x8B, 0x38, 0x3B, 0x7C, 0x24, 0x0C, 0x0F, 0x8D, 0xA3, 0x00, 0x00, 0x00, 0x8B, 0x0C, 0x9E, 0x0F,
+    0xB7, 0x49, 0x36, 0x66, 0x81, 0xF9, 0xFF, 0xFF, 0x74, 0x3A, 0x0F, 0xB7, 0xC9, 0x8B, 0xD1, 0xC1,
+    0xE2, 0x04, 0x2B, 0xD1, 0x8B, 0x0D, 0x64, 0x5B, 0x22, 0x02, 0x8B, 0x49, 0x04, 0x8D, 0x14, 0x91,
+    0x85, 0xD2, 0x74, 0x20, 0x33, 0xC9, 0x85, 0xFF, 0x7E, 0x12, 0x8D, 0x9B, 0x00, 0x00, 0x00, 0x00,
+    0x39, 0x14, 0x8E, 0x74, 0x0F, 0x83, 0xC1, 0x01, 0x3B, 0xCF, 0x7C, 0xF4, 0x89, 0x14, 0xBE, 0x83,
+    0xC7, 0x01, 0x89, 0x38, 0x8B, 0x0C, 0x9E, 0xF6, 0x41, 0x10, 0x01, 0x75, 0x47, 0x0F, 0xB7, 0x49,
+    0x38, 0x66, 0x81, 0xF9, 0xFF, 0xFF, 0x74, 0x3C, 0x0F, 0xB7, 0xC9, 0x8B, 0xD1, 0xC1, 0xE2, 0x04,
+    0x2B, 0xD1, 0x8B, 0x0D, 0x64, 0x5B, 0x22, 0x02, 0x8B, 0x49, 0x04, 0x8D, 0x14, 0x91, 0x85, 0xD2,
+    0x74, 0x22, 0x8B, 0x38, 0x3B, 0x7C, 0x24, 0x0C, 0x7D, 0x1A, 0x33, 0xC9, 0x85, 0xFF, 0x7E, 0x0C,
+    0x39, 0x14, 0x8E, 0x74, 0x0F, 0x83, 0xC1, 0x01, 0x3B, 0xCF, 0x7C, 0xF4, 0x89, 0x14, 0xBE, 0x83,
+    0xC7, 0x01, 0x89, 0x38, 0x83, 0xC3, 0x01, 0x3B, 0x18, 0x0F, 0x8C, 0x51, 0xFF, 0xFF, 0xFF, 0x80,
+    0x7C, 0x24, 0x10, 0x00, 0x0F, 0x84, 0xB9, 0x00, 0x00, 0x00, 0x8B, 0x18, 0x55, 0x33, 0xED, 0x85,
+    0xDB, 0x7E, 0x58, 0x8B, 0x38, 0x3B, 0x7C, 0x24, 0x10, 0x7D, 0x50, 0x8B, 0x0C, 0xAE, 0xF6, 0x41,
+    0x10, 0x01, 0x74, 0x40, 0x0F, 0xB7, 0x49, 0x38, 0x66, 0x81, 0xF9, 0xFF, 0xFF, 0x74, 0x35, 0x0F,
+    0xB7, 0xC9, 0x8B, 0xD1, 0xC1, 0xE2, 0x04, 0x2B, 0xD1, 0x8B, 0x0D, 0x64, 0x5B, 0x22, 0x02, 0x8B,
+    0x49, 0x04, 0x8D, 0x14, 0x91, 0x85, 0xD2, 0x74, 0x1B, 0x33, 0xC9, 0x85, 0xFF, 0x7E, 0x0D, 0x90,
+    0x39, 0x14, 0x8E, 0x74, 0x0F, 0x83, 0xC1, 0x01, 0x3B, 0xCF, 0x7C, 0xF4, 0x89, 0x14, 0xBE, 0x83,
+    0xC7, 0x01, 0x89, 0x38, 0x83, 0xC5, 0x01, 0x3B, 0xEB, 0x7C, 0xA8, 0x3B, 0x18, 0x8B, 0xEB, 0x7D,
+    0x51, 0x8B, 0x38, 0x3B, 0x7C, 0x24, 0x10, 0x7D, 0x49, 0x8B, 0x0C, 0xAE, 0x0F, 0xB7, 0x49, 0x36,
+    0x66, 0x81, 0xF9, 0xFF, 0xFF, 0x74, 0x34, 0x0F, 0xB7, 0xC9, 0x8B, 0xD1, 0xC1, 0xE2, 0x04, 0x2B,
+    0xD1, 0x8B, 0x0D, 0x64, 0x5B, 0x22, 0x02, 0x8B, 0x49, 0x04, 0x8D, 0x14, 0x91, 0x85, 0xD2, 0x74,
+    0x1A, 0x33, 0xC9, 0x85, 0xFF, 0x7E, 0x0C, 0x39, 0x14, 0x8E, 0x74, 0x0F, 0x83, 0xC1, 0x01, 0x3B,
+    0xCF, 0x7C, 0xF4, 0x89, 0x14, 0xBE, 0x83, 0xC7, 0x01, 0x89, 0x38, 0x83, 0xC5, 0x01, 0x3B, 0x28,
+    0x7C, 0xAF, 0x5D, 0x8B, 0x4C, 0x24, 0x0C, 0x33, 0xD2, 0x39, 0x08, 0x5F, 0x0F, 0x9D, 0xC2, 0x8A,
+    0xC2, 0x5B, 0xC3,
+];
+const BIND_CHUNK_BODY: [u8; 169] = [
+    0x83, 0xEC, 0x08, 0x8B, 0x4C, 0x24, 0x14, 0x8B, 0x81, 0x48, 0x01, 0x00, 0x00, 0x8B, 0x89, 0x44,
+    0x01, 0x00, 0x00, 0x53, 0x8B, 0x5C, 0x24, 0x14, 0x33, 0xD2, 0x3B, 0xC2, 0x55, 0x8B, 0x6C, 0x24,
+    0x14, 0x89, 0x4C, 0x24, 0x0C, 0x76, 0x7C, 0x3B, 0xDA, 0x7E, 0x78, 0x3B, 0xCA, 0x89, 0x54, 0x24,
+    0x08, 0x7E, 0x70, 0x56, 0x57, 0x8B, 0xF8, 0x3B, 0xD3, 0x8B, 0xC2, 0x7D, 0x50, 0x8B, 0x37, 0x8D,
+    0x0C, 0x92, 0x8D, 0x4C, 0x8D, 0x04, 0x39, 0x31, 0x74, 0x0C, 0x83, 0xC0, 0x01, 0x83, 0xC1, 0x14,
+    0x3B, 0xC3, 0x7C, 0xF2, 0xEB, 0x37, 0x3B, 0xC3, 0x7D, 0x33, 0x8D, 0x0C, 0x80, 0x39, 0x74, 0x8D,
+    0x04, 0x8D, 0x4C, 0x8D, 0x00, 0x75, 0x26, 0x83, 0x79, 0x08, 0xFF, 0x75, 0x12, 0x8B, 0x54, 0x24,
+    0x24, 0x66, 0x8B, 0x52, 0x08, 0x66, 0x89, 0x11, 0x8B, 0x54, 0x24, 0x10, 0x89, 0x51, 0x08, 0x8B,
+    0x51, 0x0C, 0x89, 0x57, 0x04, 0x8B, 0x49, 0x10, 0x89, 0x4F, 0x08, 0x8B, 0xD0, 0x8B, 0x44, 0x24,
+    0x10, 0x83, 0xC0, 0x01, 0x83, 0xC7, 0x28, 0x3B, 0x44, 0x24, 0x14, 0x89, 0x44, 0x24, 0x10, 0x7C,
+    0x96, 0x5F, 0x5E, 0x5D, 0x5B, 0x83, 0xC4, 0x08, 0xC3,
+];
+const HULL_BY_HANDLE_BODY: [u8; 39] = [
+    0x83, 0xF9, 0xFF, 0x57, 0x74, 0x1F, 0x8B, 0xC1, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0x8D, 0x3C, 0x80,
+    0x39, 0x0C, 0xFD, 0xC0, 0xE0, 0xDE, 0x02, 0x8D, 0x3C, 0xFD, 0xB8, 0xE0, 0xDE, 0x02, 0x75, 0x05,
+    0xE8, 0xDB, 0xCC, 0xFF, 0xFF, 0x5F, 0xC3,
+];
+const HULL_BY_HANDLE_BODY_CALLS: [usize; 1] = [0x20];
+const LINK_CLOSEST_BODY: [u8; 399] = [
+    0x8A, 0x51, 0x18, 0x83, 0xEC, 0x34, 0xF6, 0xC2, 0x02, 0x0F, 0x84, 0x93, 0x00, 0x00, 0x00, 0xF6,
+    0xC2, 0x01, 0xD9, 0x41, 0x0C, 0xD8, 0x21, 0xD9, 0x5C, 0x24, 0x28, 0xD9, 0x41, 0x10, 0xD8, 0x61,
+    0x04, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x41, 0x14, 0xD8, 0x61, 0x08, 0xD9, 0x5C, 0x24, 0x10, 0xD9,
+    0x44, 0x24, 0x28, 0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x00, 0xD8, 0x21, 0x0F, 0x84, 0xAC,
+    0x00, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x40, 0x04, 0xD8, 0x61, 0x04, 0xD9, 0x5C, 0x24,
+    0x08, 0xD9, 0x40, 0x08, 0xD8, 0x61, 0x08, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x04, 0xD9,
+    0x44, 0x24, 0x10, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0x44, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x2C, 0xD9,
+    0xC0, 0xDE, 0xCA, 0xD9, 0xCB, 0xDE, 0xC1, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x18, 0xD9,
+    0xC0, 0xDE, 0xCA, 0xD9, 0xCA, 0xDE, 0xC1, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0xD9, 0xEE, 0xD8,
+    0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0x75, 0x0E, 0xDD, 0xDA, 0xDD, 0xDA, 0xDD, 0xD9,
+    0xDD, 0xD8, 0x32, 0xC0, 0x83, 0xC4, 0x34, 0xC3, 0xD9, 0x06, 0xD8, 0x21, 0xD9, 0x5C, 0x24, 0x04,
+    0xD9, 0x46, 0x04, 0xD8, 0x61, 0x04, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x46, 0x08, 0xD8, 0x61, 0x08,
+    0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x04, 0xDE, 0xCB, 0xD9, 0x44, 0x24, 0x08, 0xDE, 0xCC,
+    0xD9, 0xCA, 0xDE, 0xC3, 0xD8, 0x4C, 0x24, 0x0C, 0xDE, 0xC2, 0xD9, 0xC9, 0xD9, 0x1C, 0x24, 0xD8,
+    0x1C, 0x24, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x7B, 0xB9, 0xB0, 0x01, 0x83, 0xC4, 0x34, 0xC3, 0xD9,
+    0x5C, 0x24, 0x1C, 0xD9, 0x40, 0x04, 0xD8, 0x61, 0x04, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x40, 0x08,
+    0xD8, 0x61, 0x08, 0xD9, 0x5C, 0x24, 0x24, 0xD9, 0x06, 0xD8, 0x21, 0xD9, 0x5C, 0x24, 0x04, 0xD9,
+    0x46, 0x04, 0xD8, 0x61, 0x04, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x46, 0x08, 0xD8, 0x61, 0x08, 0xD9,
+    0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9,
+    0x44, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xCB, 0xDE, 0xC1, 0xD9,
+    0x44, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xCA, 0xDE, 0xC1, 0xD9,
+    0x1C, 0x24, 0xD9, 0x04, 0x24, 0xD9, 0x44, 0x24, 0x1C, 0xDE, 0xCB, 0xD9, 0x44, 0x24, 0x20, 0xDE,
+    0xCC, 0xD9, 0xCA, 0xDE, 0xC3, 0xD8, 0x4C, 0x24, 0x24, 0xDE, 0xC2, 0xD9, 0xC9, 0xD9, 0x1C, 0x24,
+    0xD8, 0x0C, 0x24, 0xDC, 0x1D, 0xA0, 0xBF, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x09,
+    0xB8, 0x01, 0x00, 0x00, 0x00, 0x83, 0xC4, 0x34, 0xC3, 0x33, 0xC0, 0x83, 0xC4, 0x34, 0xC3,
+];
+const SEGMENT_INTERSECT_BODY: [u8; 281] = [
+    0x83, 0xEC, 0x10, 0xD9, 0x06, 0x53, 0xD8, 0x21, 0x8B, 0x5C, 0x24, 0x18, 0xD9, 0x07, 0xD8, 0x22,
+    0xD9, 0x47, 0x04, 0xD8, 0x62, 0x04, 0xD8, 0xCA, 0xD9, 0x46, 0x04, 0xD8, 0x61, 0x04, 0xD8, 0xCA,
+    0xDE, 0xE9, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0xEE, 0xD9, 0xC0, 0xD9, 0x44, 0x24, 0x04, 0xDD, 0xE1,
+    0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x44, 0x0F, 0x8B, 0xCD, 0x00, 0x00, 0x00, 0xD9, 0x01, 0xD8,
+    0x22, 0xD9, 0x41, 0x04, 0xD8, 0x62, 0x04, 0xDE, 0xCC, 0xD9, 0x47, 0x04, 0xD8, 0x62, 0x04, 0xD8,
+    0xC9, 0xDE, 0xEC, 0xD9, 0xCB, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0xF1, 0xD9,
+    0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0xD2, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x0F, 0x8B,
+    0x94, 0x00, 0x00, 0x00, 0xD9, 0xE8, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x0F, 0x8B, 0x85,
+    0x00, 0x00, 0x00, 0xD9, 0x41, 0x04, 0xD8, 0x62, 0x04, 0xD8, 0xCD, 0xD9, 0x46, 0x04, 0xD8, 0x61,
+    0x04, 0xDE, 0xCD, 0xDE, 0xE4, 0xD9, 0xCB, 0xD9, 0x5C, 0x24, 0x04, 0xD8, 0x7C, 0x24, 0x04, 0xD9,
+    0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x05,
+    0x7B, 0x5A, 0xD9, 0xE8, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7B, 0x51, 0xD9, 0xC9, 0xD9,
+    0x5C, 0x24, 0x04, 0xD9, 0x46, 0x04, 0xD8, 0x61, 0x04, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24,
+    0x04, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x0C, 0xD8, 0x4C, 0x24, 0x08, 0xD9, 0x5C, 0x24, 0x10, 0xD9,
+    0x01, 0xD8, 0x44, 0x24, 0x0C, 0xD9, 0x5C, 0x24, 0x04, 0x8B, 0x44, 0x24, 0x04, 0xD9, 0x44, 0x24,
+    0x10, 0xD8, 0x41, 0x04, 0x89, 0x03, 0xB0, 0x01, 0xD9, 0x5C, 0x24, 0x08, 0x8B, 0x4C, 0x24, 0x08,
+    0x89, 0x4B, 0x04, 0x5B, 0x83, 0xC4, 0x10, 0xC3, 0xDD, 0xDB, 0xDD, 0xDA, 0xDD, 0xD8, 0xDD, 0xD8,
+    0x32, 0xC0, 0xDD, 0xD8, 0x5B, 0x83, 0xC4, 0x10, 0xC3,
+];
+const QUERY_TREE_CB_BODY: [u8; 44] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x08, 0x56, 0x8B, 0x30, 0x8B, 0x06, 0x8D, 0x4E, 0x1C,
+    0x52, 0xE8, 0x2A, 0x92, 0xBA, 0xFF, 0x8B, 0x44, 0x24, 0x14, 0x50, 0x8B, 0x06, 0x8D, 0x4E, 0x22,
+    0xE8, 0x1B, 0x92, 0xBA, 0xFF, 0x83, 0xC4, 0x08, 0xB0, 0x01, 0x5E, 0xC3,
+];
+const QUERY_TREE_CB_BODY_CALLS: [usize; 2] = [0x11, 0x20];
+const QUERY_FILTER_BODY: [u8; 94] = [
+    0x80, 0x3D, 0xCC, 0x8C, 0xFA, 0x02, 0x00, 0x8B, 0x42, 0x10, 0x74, 0x13, 0x8B, 0x0D, 0xC4, 0x8C,
+    0xFA, 0x02, 0x56, 0x8B, 0xF0, 0x23, 0xF1, 0x3B, 0xF1, 0x5E, 0x74, 0x0B, 0xB0, 0x01, 0xC3, 0x85,
+    0x05, 0xC4, 0x8C, 0xFA, 0x02, 0x74, 0xF5, 0x85, 0x05, 0xC0, 0x8C, 0xFA, 0x02, 0x75, 0xED, 0x8B,
+    0x0D, 0xD0, 0x8C, 0xFA, 0x02, 0x83, 0xF9, 0xFF, 0x74, 0x0A, 0xC1, 0xE8, 0x1A, 0x83, 0xE0, 0x03,
+    0x3B, 0xC1, 0x75, 0xD8, 0x8B, 0x0D, 0xD4, 0x8C, 0xFA, 0x02, 0x85, 0xC9, 0x74, 0x0D, 0x52, 0xE8,
+    0x6C, 0x35, 0x00, 0x00, 0x83, 0xC4, 0x04, 0x84, 0xC0, 0x74, 0xC1, 0x32, 0xC0, 0xC3,
+];
+const QUERY_FILTER_BODY_CALLS: [usize; 1] = [0x4f];
+const QUERY_FIRST_HIT_BODY: [u8; 65] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x8B, 0x30, 0x8B, 0xD6, 0xE8, 0x92, 0xFF, 0xFF, 0xFF, 0x84, 0xC0,
+    0x74, 0x04, 0xB0, 0x01, 0x5E, 0xC3, 0x8B, 0x0D, 0x28, 0x8D, 0xFA, 0x02, 0x8B, 0x15, 0x24, 0x8D,
+    0xFA, 0x02, 0x89, 0x34, 0x8A, 0xA1, 0x28, 0x8D, 0xFA, 0x02, 0x83, 0xC0, 0x01, 0x33, 0xC9, 0x3B,
+    0x05, 0xC8, 0x8C, 0xFA, 0x02, 0xA3, 0x28, 0x8D, 0xFA, 0x02, 0x0F, 0x9C, 0xC1, 0x8A, 0xC1, 0x5E,
+    0xC3,
+];
+const QUERY_FIRST_HIT_BODY_CALLS: [usize; 1] = [0x9];
+const ROAD_PROBE_BODY: [u8; 133] = [
+    0xA1, 0x64, 0x5B, 0x22, 0x02, 0x33, 0xC9, 0x3B, 0xC1, 0x74, 0x77, 0x39, 0x88, 0x84, 0x00, 0x00,
+    0x00, 0x74, 0x6F, 0x89, 0x15, 0x24, 0x8D, 0xFA, 0x02, 0x8B, 0x54, 0x24, 0x0C, 0x89, 0x0D, 0x28,
+    0x8D, 0xFA, 0x02, 0x89, 0x15, 0xC4, 0x8C, 0xFA, 0x02, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x0D, 0xD4,
+    0x8C, 0xFA, 0x02, 0x68, 0xB0, 0x9A, 0xA8, 0x00, 0xC7, 0x05, 0xC8, 0x8C, 0xFA, 0x02, 0x20, 0x00,
+    0x00, 0x00, 0xC7, 0x05, 0xC0, 0x8C, 0xFA, 0x02, 0x00, 0x01, 0x00, 0x00, 0xC6, 0x05, 0xCC, 0x8C,
+    0xFA, 0x02, 0x01, 0xC7, 0x05, 0xD0, 0x8C, 0xFA, 0x02, 0xFF, 0xFF, 0xFF, 0xFF, 0x8B, 0x80, 0x84,
+    0x00, 0x00, 0x00, 0x8B, 0x08, 0x68, 0x20, 0x9A, 0xA8, 0x00, 0x51, 0x8B, 0x4C, 0x24, 0x10, 0x52,
+    0x8B, 0x50, 0x08, 0x51, 0x52, 0xE8, 0x66, 0xCD, 0x16, 0x00, 0xA1, 0x28, 0x8D, 0xFA, 0x02, 0x89,
+    0x06, 0xC3, 0x89, 0x0E, 0xC3,
+];
+const ROAD_PROBE_BODY_CALLS: [usize; 1] = [0x75];
+const FREE_PATH_LISTS_BODY: [u8; 60] = [
+    0x53, 0x8B, 0x5C, 0x24, 0x08, 0x8B, 0x83, 0x58, 0x04, 0x00, 0x00, 0x56, 0x57, 0x8D, 0xBB, 0x58,
+    0x04, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x17, 0x8B, 0x08, 0x8B, 0xF1, 0x2B, 0x37, 0x8B, 0xD7, 0xF7,
+    0xDE, 0x1B, 0xF6, 0x23, 0xF1, 0xE8, 0x76, 0x6B, 0xFF, 0xFF, 0x8B, 0xC6, 0xEB, 0xE5, 0x5F, 0x5E,
+    0x8D, 0x83, 0x5C, 0x04, 0x00, 0x00, 0x5B, 0xE9, 0x94, 0x23, 0xEF, 0xFF,
+];
+const FREE_PATH_LISTS_BODY_CALLS: [usize; 1] = [0x25];
+const ROUTE_REFILL_BODY: [u8; 105] = [
+    0x55, 0x33, 0xED, 0x39, 0x2F, 0x56, 0x8B, 0xF0, 0x74, 0x5C, 0x53, 0xE8, 0xB0, 0x71, 0x00, 0x00,
+    0x33, 0xDB, 0x8B, 0x07, 0x3B, 0xC5, 0x74, 0x4D, 0x8B, 0x48, 0x1C, 0x3B, 0xC8, 0x75, 0x0A, 0x89,
+    0x68, 0x1C, 0x89, 0x68, 0x20, 0x89, 0x2F, 0xEB, 0x22, 0x89, 0x0F, 0x8B, 0x48, 0x20, 0x3B, 0xCD,
+    0x74, 0x06, 0x8B, 0x50, 0x1C, 0x89, 0x51, 0x1C, 0x8B, 0x48, 0x1C, 0x3B, 0xCD, 0x74, 0x06, 0x8B,
+    0x50, 0x20, 0x89, 0x51, 0x20, 0x89, 0x68, 0x1C, 0x89, 0x68, 0x20, 0x6A, 0x01, 0x55, 0x50, 0x89,
+    0x40, 0x1C, 0x89, 0x40, 0x20, 0xE8, 0xA6, 0x71, 0x00, 0x00, 0x83, 0xC3, 0x01, 0x83, 0xC4, 0x0C,
+    0x83, 0xFB, 0x03, 0x7C, 0xAD, 0x5B, 0x5E, 0x5D, 0xC3,
+];
+const ROUTE_REFILL_BODY_CALLS: [usize; 2] = [0xb, 0x55];
+const PATH_MARK_ENDS_BODY: [u8; 71] = [
+    0x51, 0x57, 0x8B, 0xC6, 0xE8, 0x47, 0xEB, 0xFF, 0xFF, 0x8B, 0x06, 0x83, 0xC4, 0x04, 0x85, 0xC0,
+    0x74, 0x33, 0x8B, 0x40, 0x04, 0x80, 0x48, 0x37, 0x01, 0x8B, 0x06, 0x85, 0xC0, 0x74, 0x05, 0x8B,
+    0x40, 0x04, 0xEB, 0x02, 0x33, 0xC0, 0x80, 0x48, 0x37, 0x02, 0xF6, 0x47, 0x09, 0x10, 0x74, 0x15,
+    0x83, 0x3E, 0x00, 0x74, 0x10, 0x6A, 0x00, 0x6A, 0x00, 0x8D, 0x47, 0x08, 0x56, 0xE8, 0x7E, 0xDE,
+    0xFF, 0xFF, 0x83, 0xC4, 0x0C, 0x59, 0xC3,
+];
+const PATH_MARK_ENDS_BODY_CALLS: [usize; 2] = [0x4, 0x3d];
+const GOAL_INSTALL_BODY: [u8; 69] = [
+    0x51, 0x53, 0x8B, 0x5C, 0x24, 0x0C, 0x0F, 0xB7, 0x53, 0x5C, 0x66, 0x85, 0xD2, 0x56, 0x57, 0x8B,
+    0xF0, 0x74, 0x05, 0xE8, 0x38, 0x51, 0xB5, 0xFF, 0x85, 0xF6, 0x8B, 0x44, 0x24, 0x18, 0x89, 0x43,
+    0x24, 0x74, 0x0A, 0x8D, 0x7B, 0x28, 0xB9, 0x0D, 0x00, 0x00, 0x00, 0xF3, 0xA5, 0x66, 0x8B, 0x4C,
+    0x24, 0x1C, 0x6A, 0x00, 0x53, 0x66, 0x89, 0x4B, 0x5C, 0xE8, 0x82, 0xD3, 0xFF, 0xFF, 0x5F, 0x5E,
+    0xB0, 0x01, 0x5B, 0x59, 0xC3,
+];
+const GOAL_INSTALL_BODY_CALLS: [usize; 2] = [0x13, 0x39];

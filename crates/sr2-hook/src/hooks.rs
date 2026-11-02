@@ -35,7 +35,18 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if n == 1 || n.is_multiple_of(3600) {
         log(&format!("game_frame_tick: frame {n}{}", if RUST_FRAME { " (Rust body)" } else { "" }));
     }
-    if n > 3600 && n.is_multiple_of(900) {
+    if n.is_multiple_of(300) {
+        // Frame rate over the last 300 frames, to spot a slow port.
+        static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+        let now = std::time::Instant::now();
+        if let Ok(mut last) = LAST.lock() {
+            if let Some(t) = *last {
+                log(&format!("frame rate: {:.1} fps at frame {n}", 300.0 / now.duration_since(t).as_secs_f64()));
+            }
+            *last = Some(now);
+        }
+    }
+    if (n > 3600 && n.is_multiple_of(900)) || n == 900 || n == 1800 {
         log(&crate::actions::summary());
         log(&crate::lua_bindings::summary());
         for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary(), crate::port_sim_leaves::summary(), crate::port_weapons_audio::summary(), crate::port_human_states::summary(), crate::port_ai::summary(), crate::port_render_func::summary(), crate::port_effects::summary(), crate::port_nav::summary(), crate::port_net::summary(), crate::port_leaves::summary(), crate::port_leaves_fp::summary(), crate::port_registrars::summary(), crate::port_big::summary(), crate::port_bindings3::summary(), crate::port_tables::summary(), crate::port_frame2::summary(), crate::port_vint2::summary(), crate::port_bindings4::summary()] {
@@ -2155,7 +2166,7 @@ pub fn install_all() {
         crate::port_registrars::install();
         crate::port_big::install();
         crate::port_bindings3::install();
-        crate::port_tables::install();
+        // crate::port_tables::install(); // held back until its native differential test passes
         crate::port_frame2::install();
         crate::port_vint2::install();
         crate::port_bindings4::install();
