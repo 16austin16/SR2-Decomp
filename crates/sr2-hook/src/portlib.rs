@@ -222,9 +222,25 @@ macro_rules! keep_ecx_edx_arg2 {
 pub(crate) use keep_ecx_edx_arg2;
 
 /// Install a port pinned to its whole original body, logging the outcome.
+/// Every address replace_pinned installed, for `installed_list()`.
+pub(crate) static INSTALLED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+/// One log line listing every address replace_pinned installed (so docs/functions.csv can be
+/// marked from what really runs).
+pub(crate) fn installed_list() -> String {
+    let v = INSTALLED.lock().map(|v| v.clone()).unwrap_or_default();
+    let parts: Vec<String> = v.iter().map(|a| format!("{a:x}")).collect();
+    format!("installed ({}): {}", parts.len(), parts.join(" "))
+}
+
 pub(crate) fn replace_pinned(name: &str, addr: usize, body: &[u8], thunk: usize) -> bool {
     match unsafe { crate::detour::replace(addr, body, thunk) } {
-        Ok(()) => true,
+        Ok(()) => {
+            if let Ok(mut v) = INSTALLED.lock() {
+                v.push(addr);
+            }
+            true
+        }
         Err(e) => {
             crate::log(&format!("{name}: replacing @ {addr:#x} failed: {e:?}"));
             false

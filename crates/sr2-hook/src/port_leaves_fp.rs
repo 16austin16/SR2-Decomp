@@ -101,16 +101,27 @@ struct Block {
 /// the written bytes).
 struct W {
     log: Option<Vec<(usize, usize, u64)>>,
+    /// Writes to this address range (the translated body's own stack) are not logged.
+    skip_lo: usize,
+    skip_hi: usize,
 }
 
 impl W {
     fn real() -> W {
-        W { log: None }
+        W { log: None, skip_lo: 0, skip_hi: 0 }
     }
     fn dry() -> W {
-        W { log: Some(Vec::new()) }
+        W { log: Some(Vec::new()), skip_lo: 0, skip_hi: 0 }
+    }
+    /// The translated body's stack buffer: pointers into it are written but not logged.
+    fn skip(&mut self, r: (usize, usize)) {
+        self.skip_lo = r.0;
+        self.skip_hi = r.0 + r.1;
     }
     fn note(&mut self, a: usize, n: usize) {
+        if a >= self.skip_lo && a < self.skip_hi {
+            return;
+        }
         if let Some(l) = &mut self.log {
             let mut old = 0u64;
             unsafe { std::ptr::copy_nonoverlapping(a as *const u8, &mut old as *mut u64 as *mut u8, n) };
@@ -275,6 +286,18 @@ call_full!(cf_4, "36", "nop");
 call_full!(cf_4s, "36", "fstp qword ptr [ebx + 68]");
 call_full!(cf_8, "32", "nop");
 call_full!(cf_8s, "32", "fstp qword ptr [ebx + 68]");
+call_full!(cf_12, "28", "nop");
+call_full!(cf_12s, "28", "fstp qword ptr [ebx + 68]");
+call_full!(cf_16, "24", "nop");
+call_full!(cf_16s, "24", "fstp qword ptr [ebx + 68]");
+call_full!(cf_20, "20", "nop");
+call_full!(cf_20s, "20", "fstp qword ptr [ebx + 68]");
+call_full!(cf_24, "16", "nop");
+call_full!(cf_24s, "16", "fstp qword ptr [ebx + 68]");
+call_full!(cf_28, "12", "nop");
+call_full!(cf_28s, "12", "fstp qword ptr [ebx + 68]");
+call_full!(cf_32, "8", "nop");
+call_full!(cf_32s, "8", "fstp qword ptr [ebx + 68]");
 
 unsafe fn call_orig(pop: u32, st0: bool, f: usize, r: &mut Regs, args: *const u32, nargs: usize, st: &mut u64) {
     unsafe {
@@ -285,6 +308,18 @@ unsafe fn call_orig(pop: u32, st0: bool, f: usize, r: &mut Regs, args: *const u3
             (4, true) => cf_4s(f, r, args, nargs, st),
             (8, false) => cf_8(f, r, args, nargs, st),
             (8, true) => cf_8s(f, r, args, nargs, st),
+            (12, false) => cf_12(f, r, args, nargs, st),
+            (12, true) => cf_12s(f, r, args, nargs, st),
+            (16, false) => cf_16(f, r, args, nargs, st),
+            (16, true) => cf_16s(f, r, args, nargs, st),
+            (20, false) => cf_20(f, r, args, nargs, st),
+            (20, true) => cf_20s(f, r, args, nargs, st),
+            (24, false) => cf_24(f, r, args, nargs, st),
+            (24, true) => cf_24s(f, r, args, nargs, st),
+            (28, false) => cf_28(f, r, args, nargs, st),
+            (28, true) => cf_28s(f, r, args, nargs, st),
+            (32, false) => cf_32(f, r, args, nargs, st),
+            (32, true) => cf_32s(f, r, args, nargs, st),
             _ => unreachable!(),
         }
     }
@@ -314,6 +349,10 @@ struct Port {
     /// Registers the shadow does not compare (bit 1 = ECX, bit 2 = EDX): a CRT call leaves stack
     /// addresses in them, and the callers treat them as clobbered.
     ignore_regs: u32,
+    /// No shadow copy (callees with side effects run once): only block hit counters.
+    no_shadow: bool,
+    /// Hit counters of the basic blocks of the translated body (ports without shadow).
+    hits: &'static [AtomicU32],
     calls: AtomicU32,
     mismatches: AtomicU32,
     original: AtomicUsize,
@@ -342,6 +381,8 @@ const fn port(
         thunk,
         call_offsets: &[],
         ignore_regs: 0,
+        no_shadow: false,
+        hits: &[],
         calls: AtomicU32::new(0),
         mismatches: AtomicU32::new(0),
         original: AtomicUsize::new(0),
@@ -365,6 +406,28 @@ const fn port_c(
     let mut p = port(name, addr, body, nargs, pop, st0, eax_mask, run, thunk);
     p.call_offsets = call_offsets;
     p.ignore_regs = ignore_regs;
+    p
+}
+
+/// As [`port_c`], with the shadow switch and the block hit counters.
+const fn port_x(
+    name: &'static str,
+    addr: usize,
+    body: &'static [u8],
+    call_offsets: &'static [usize],
+    nargs: usize,
+    pop: u32,
+    st0: bool,
+    eax_mask: u32,
+    ignore_regs: u32,
+    no_shadow: bool,
+    hits: &'static [AtomicU32],
+    run: Run,
+    thunk: extern "C" fn(),
+) -> Port {
+    let mut p = port_c(name, addr, body, call_offsets, nargs, pop, st0, eax_mask, ignore_regs, run, thunk);
+    p.no_shadow = no_shadow;
+    p.hits = hits;
     p
 }
 
@@ -7457,6 +7520,12118 @@ fn g2_b9e5f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     }
 }
 
+// --- helpers for the third batch of branching ports (SSE, x87 control word, generic calls) ---------
+
+/// `adc`: the result and the flags.
+#[allow(dead_code)]
+fn fl_adc(a: u32, b: u32, bits: u32, cin: bool) -> (u32, Fl) {
+    let m = width_mask(bits);
+    let (a, b) = (a & m, b & m);
+    let c = cin as u32;
+    let r = a.wrapping_add(b).wrapping_add(c) & m;
+    let sb = 1u32 << (bits - 1);
+    let fl = Fl {
+        zf: r == 0,
+        sf: r & sb != 0,
+        cf: a as u64 + b as u64 + c as u64 > m as u64,
+        of: (!(a ^ b) & (a ^ r)) & sb != 0,
+        pf: parity(r),
+    };
+    (r, fl)
+}
+
+/// `sbb`: the result and the flags.
+#[allow(dead_code)]
+fn fl_sbb(a: u32, b: u32, bits: u32, cin: bool) -> (u32, Fl) {
+    let m = width_mask(bits);
+    let (a, b) = (a & m, b & m);
+    let c = cin as u32;
+    let r = a.wrapping_sub(b).wrapping_sub(c) & m;
+    let sb = 1u32 << (bits - 1);
+    let fl = Fl {
+        zf: r == 0,
+        sf: r & sb != 0,
+        cf: (a as u64) < b as u64 + c as u64,
+        of: ((a ^ b) & (a ^ r)) & sb != 0,
+        pf: parity(r),
+    };
+    (r, fl)
+}
+
+/// A 16-byte read of game memory.
+#[allow(dead_code)]
+fn rx(a: usize) -> [u32; 4] {
+    unsafe { std::ptr::read_unaligned(a as *const [u32; 4]) }
+}
+
+/// `fld qword; fistp dword` with the live x87 control word (rounding mode, overflow -> 0x80000000).
+#[allow(dead_code)]
+fn fist32(v: f64) -> u32 {
+    let mut out = 0u32;
+    unsafe {
+        std::arch::asm!("fld qword ptr [{v}]", "fistp dword ptr [{o}]", v = in(reg) &v, o = in(reg) &mut out, options(nostack));
+    }
+    out
+}
+
+/// `fld qword; fistp qword` with the live x87 control word.
+#[allow(dead_code)]
+fn fist64(v: f64) -> u64 {
+    let mut out = 0u64;
+    unsafe {
+        std::arch::asm!("fld qword ptr [{v}]", "fistp qword ptr [{o}]", v = in(reg) &v, o = in(reg) &mut out, options(nostack));
+    }
+    out
+}
+
+/// `fld qword; fistp word` with the live x87 control word.
+#[allow(dead_code)]
+fn fist16(v: f64) -> u32 {
+    let mut out = 0u16;
+    unsafe {
+        std::arch::asm!("fld qword ptr [{v}]", "fistp word ptr [{o}]", v = in(reg) &v, o = in(reg) &mut out, options(nostack));
+    }
+    out as u32
+}
+
+/// `fnstcw`: the live x87 control word.
+#[allow(dead_code)]
+fn fnstcw16() -> u16 {
+    let mut cw = 0u16;
+    unsafe { std::arch::asm!("fnstcw word ptr [{p}]", p = in(reg) &mut cw, options(nostack)) };
+    cw
+}
+
+/// `fldcw`: set the live x87 control word.
+#[allow(dead_code)]
+fn fldcw16(cw: u16) {
+    unsafe { std::arch::asm!("fldcw word ptr [{p}]", p = in(reg) &cw, options(nostack)) };
+}
+
+/// Call `_ftol2_sse` (0xDA0140) with `v` in ST0; returns EAX / ECX / EDX as it leaves them (the
+/// function consumes ST0).
+#[allow(dead_code)]
+fn crt_ftol2(eax: u32, ecx: u32, edx: u32, v: f64) -> (u32, u32, u32) {
+    let mut b = CrtBlock {
+        f: 0xda0140,
+        eax,
+        ecx,
+        edx,
+        arg: 0,
+        out: [0; 2],
+        in1: [0; 2],
+        in0: [v.to_bits() as u32, (v.to_bits() >> 32) as u32],
+    };
+    unsafe {
+        std::arch::asm!(
+            "push ebx",
+            "mov ebx, eax",
+            "fld qword ptr [ebx + 36]",
+            "mov ecx, [ebx + 8]",
+            "mov edx, [ebx + 12]",
+            "mov eax, [ebx + 4]",
+            "call dword ptr [ebx]",
+            "mov [ebx + 4], eax",
+            "mov [ebx + 8], ecx",
+            "mov [ebx + 12], edx",
+            "pop ebx",
+            inout("eax") &mut b as *mut CrtBlock => _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    (b.eax, b.ecx, b.edx)
+}
+
+/// Bitwise xorps (0) / andps (1) / orps (2) / andnps (3: !a & b) on four lanes.
+#[allow(dead_code)]
+fn bitop4(op: u32, a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    let mut r = [0u32; 4];
+    for i in 0..4 {
+        r[i] = match op {
+            0 => a[i] ^ b[i],
+            1 => a[i] & b[i],
+            2 => a[i] | b[i],
+            _ => !a[i] & b[i],
+        };
+    }
+    r
+}
+
+/// SSE arithmetic done by the real instruction (so NaN operands behave as on the CPU): 0..6 scalar
+/// add / sub / mul / div / sqrt / min / max (low lane, upper lanes of `a` kept), 8..14 the packed ones.
+#[allow(dead_code)]
+fn sse_arith(op: u32, a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    use std::arch::x86::__m128;
+    unsafe {
+        let mut r: __m128 = std::mem::transmute(a);
+        let bb: __m128 = std::mem::transmute(b);
+        match op {
+            0 => std::arch::asm!("addss {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            1 => std::arch::asm!("subss {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            2 => std::arch::asm!("mulss {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            3 => std::arch::asm!("divss {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            4 => std::arch::asm!("sqrtss {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            5 => std::arch::asm!("minss {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            6 => std::arch::asm!("maxss {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            8 => std::arch::asm!("addps {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            9 => std::arch::asm!("subps {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            10 => std::arch::asm!("mulps {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            11 => std::arch::asm!("divps {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            12 => std::arch::asm!("sqrtps {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            13 => std::arch::asm!("minps {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+            _ => std::arch::asm!("maxps {0}, {1}", inout(xmm_reg) r, in(xmm_reg) bb, options(pure, nomem, nostack)),
+        }
+        std::mem::transmute(r)
+    }
+}
+
+/// `cmpXXps` / `cmpXXss` (predicates 0..7 = eq lt le unord neq nlt nle ord).
+#[allow(dead_code)]
+fn sse_cmp(pred: u32, a: [u32; 4], b: [u32; 4], scalar: bool) -> [u32; 4] {
+    let mut r = a;
+    for i in 0..(if scalar { 1 } else { 4 }) {
+        let (x, y) = (f32::from_bits(a[i]), f32::from_bits(b[i]));
+        let un = x.is_nan() || y.is_nan();
+        let t = match pred {
+            0 => x == y,
+            1 => x < y,
+            2 => x <= y,
+            3 => un,
+            4 => !(x == y),
+            5 => !(x < y),
+            6 => !(x <= y),
+            _ => !un,
+        };
+        r[i] = if t { 0xffff_ffff } else { 0 };
+    }
+    r
+}
+
+/// `shufps a, b, imm`.
+#[allow(dead_code)]
+fn shufps(a: [u32; 4], b: [u32; 4], imm: u32) -> [u32; 4] {
+    [a[(imm & 3) as usize], a[((imm >> 2) & 3) as usize], b[((imm >> 4) & 3) as usize], b[((imm >> 6) & 3) as usize]]
+}
+
+/// unpcklps (0), unpckhps (1), movlhps (2), movhlps (3).
+#[allow(dead_code)]
+fn sse_perm(op: u32, a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    match op {
+        0 => [a[0], b[0], a[1], b[1]],
+        1 => [a[2], b[2], a[3], b[3]],
+        2 => [a[0], a[1], b[0], b[1]],
+        _ => [b[2], b[3], a[2], a[3]],
+    }
+}
+
+/// `movmskps`.
+#[allow(dead_code)]
+fn movmskps(a: [u32; 4]) -> u32 {
+    (a[0] >> 31) | ((a[1] >> 31) << 1) | ((a[2] >> 31) << 2) | ((a[3] >> 31) << 3)
+}
+
+/// `cvttss2si`: truncate; NaN and out-of-range give 0x80000000.
+#[allow(dead_code)]
+fn cvttss2si(bits: u32) -> u32 {
+    let v = f32::from_bits(bits);
+    if v.is_nan() || v >= 2147483648.0 || v < -2147483648.0 { 0x8000_0000 } else { (v as i32) as u32 }
+}
+
+/// `mov reg, fs:[off]` (the thread information block).
+#[allow(dead_code)]
+fn fs_rd32(off: u32) -> u32 {
+    let v: u32;
+    unsafe { std::arch::asm!("mov {v}, fs:[{o}]", v = out(reg) v, o = in(reg) off, options(nostack, readonly)) };
+    v
+}
+
+/// `fmul dword [m]` and friends: widen an f32 operand without quieting a signalling NaN.
+fn ldr32(b: u32) -> f64 {
+    if b & 0x7F80_0000 == 0x7F80_0000 && b & 0x007F_FFFF != 0 {
+        f64::from_bits(((b >> 31) as u64) << 63 | 0x7FFu64 << 52 | ((b & 0x007F_FFFF) as u64) << 29)
+    } else {
+        f32::from_bits(b) as f64
+    }
+}
+
+/// As `xn`, with the FPU's NaN rules for an x87 arithmetic instruction: a QNaN beats an SNaN, then the
+/// larger significand wins, then the clear sign; a lone NaN comes out quieted.
+fn xn3(a: f64, b: f64, r: f64) -> f64 {
+    const SIG: u64 = 0x000F_FFFF_FFFF_FFFF;
+    const QUIET: u64 = 0x0008_0000_0000_0000;
+    if a.is_nan() || b.is_nan() {
+        let pick = if a.is_nan() && b.is_nan() {
+            let (sa, sb) = (a.to_bits() & QUIET == 0, b.to_bits() & QUIET == 0);
+            if sa != sb {
+                if sa { b } else { a }
+            } else {
+                let (ma, mb) = (a.to_bits() & SIG, b.to_bits() & SIG);
+                if mb > ma {
+                    b
+                } else if ma > mb {
+                    a
+                } else if a.is_sign_negative() && !b.is_sign_negative() {
+                    b
+                } else {
+                    a
+                }
+            }
+        } else if a.is_nan() {
+            a
+        } else {
+            b
+        };
+        f64::from_bits(pick.to_bits() | QUIET)
+    } else {
+        r
+    }
+}
+
+// --- Rust bodies: third batch (translated one per exe function) ----------
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_40b6a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x40b6a0u32;
+    loop {
+        match pc {
+            0x40b6a0 => {
+                // 40b6a0 fld dword ptr [edx]
+                f[0] = ldq(rd((edx) as usize));
+                // 40b6a2 fld dword ptr [ecx]
+                f[1] = ldq(rd((ecx) as usize));
+                // 40b6a4 fucompp 
+                cc87 = cc(f[1], f[0]);
+                // 40b6a6 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 40b6a8 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // 40b6ab jp 0x40b6ce
+                pc = if fl.pf { 0x40b6ce } else { 0x40b6ad };
+            }
+            0x40b6ad => {
+                // 40b6ad fld dword ptr [edx + 4]
+                f[0] = ldq(rd((edx.wrapping_add(0x4)) as usize));
+                // 40b6b0 fld dword ptr [ecx + 4]
+                f[1] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
+                // 40b6b3 fucompp 
+                cc87 = cc(f[1], f[0]);
+                // 40b6b5 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 40b6b7 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // 40b6ba jp 0x40b6ce
+                pc = if fl.pf { 0x40b6ce } else { 0x40b6bc };
+            }
+            0x40b6bc => {
+                // 40b6bc fld dword ptr [edx + 8]
+                f[0] = ldq(rd((edx.wrapping_add(0x8)) as usize));
+                // 40b6bf fld dword ptr [ecx + 8]
+                f[1] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
+                // 40b6c2 fucompp 
+                cc87 = cc(f[1], f[0]);
+                // 40b6c4 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 40b6c6 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // 40b6c9 jp 0x40b6ce
+                pc = if fl.pf { 0x40b6ce } else { 0x40b6cb };
+            }
+            0x40b6cb => {
+                // 40b6cb xor al, al
+                eax = set_part(eax, 0, 0xff, 0);
+                fl = fl_logic(0, 32);
+                // 40b6cd ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x40b6ce => {
+                // 40b6ce mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // 40b6d0 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_417120(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 22];
+    s[9] = unsafe { *a.add(0) };
+    s[10] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x417120u32;
+    loop {
+        match pc {
+            0x417120 => {
+                // 417120 fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                // 417122 fld dword ptr [esp + 4]
+                f[1] = ldq(s[9]);
+                // 417126 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 417128 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 41712a fstp st(1)
+                f[0] = f[1];
+                // 41712c test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 41712f jp 0x417139
+                pc = if fl.pf { 0x417139 } else { 0x417131 };
+            }
+            0x417131 => {
+                // 417131 fld dword ptr [ecx]
+                f[1] = ldq(rd((ecx) as usize));
+                // 417133 fstp dword ptr [esp + 4]
+                s[9] = (f[1] as f32).to_bits();
+                // 417137 jmp 0x41713d
+                pc = 0x41713d;
+            }
+            0x417139 => {
+                // 417139 fst dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                pc = 0x41713d;
+            }
+            0x41713d => {
+                // 41713d fld dword ptr [esp + 4]
+                f[1] = ldq(s[9]);
+                // 417141 fld dword ptr [esp + 8]
+                f[2] = ldq(s[10]);
+                // 417145 fcom st(1)
+                cc87 = cc(f[2], f[1]);
+                // 417147 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 3);
+                // 417149 fstp st(1)
+                f[1] = f[2];
+                // 41714b test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 41714e jne 0x41716c
+                pc = if !fl.zf { 0x41716c } else { 0x417150 };
+            }
+            0x417150 => {
+                // 417150 fstp st(0)
+                // 417152 fld dword ptr [ecx]
+                f[1] = ldq(rd((ecx) as usize));
+                // 417154 fcomp st(1)
+                cc87 = cc(f[1], f[0]);
+                // 417156 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 417158 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 41715b jne 0x41716e
+                pc = if !fl.zf { 0x41716e } else { 0x41715d };
+            }
+            0x41715d => {
+                // 41715d fstp st(0)
+                // 41715f fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                // 417161 fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // 417165 fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // 417169 fstp dword ptr [ecx]
+                w.d((ecx) as usize, (f[0] as f32).to_bits());
+                // 41716b ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x41716c => {
+                // 41716c fstp st(1)
+                f[0] = f[1];
+                pc = 0x41716e;
+            }
+            0x41716e => {
+                // 41716e fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // 417172 fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // 417176 fstp dword ptr [ecx]
+                w.d((ecx) as usize, (f[0] as f32).to_bits());
+                // 417178 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_46fe30(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 22];
+    s[10] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x46fe30u32;
+    loop {
+        match pc {
+            0x46fe30 => {
+                // 46fe30 push ecx
+                s[8] = ecx;
+                // 46fe31 fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                // 46fe33 fld dword ptr [edx]
+                f[1] = ldq(rd((edx) as usize));
+                // 46fe35 fcompp 
+                cc87 = cc(f[1], f[0]);
+                // 46fe37 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 46fe39 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 46fe3c jne 0x46fe6d
+                pc = if !fl.zf { 0x46fe6d } else { 0x46fe3e };
+            }
+            0x46fe3e => {
+                // 46fe3e fld dword ptr [edx]
+                f[0] = ldq(rd((edx) as usize));
+                // 46fe40 fld dword ptr [0xe99c44]
+                f[1] = ldq(rd((0xe99c44u32) as usize));
+                // 46fe46 fmul dword ptr [esp + 8]
+                f[1] = xn3(f[1], ldr32(s[10]), f[1] * ldr32(s[10]));
+                // 46fe4a fsubp st(1)
+                f[0] = xn3(f[0], f[1], f[0] - f[1]);
+                // 46fe4c fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 46fe4f fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                // 46fe51 fld dword ptr [esp]
+                f[1] = ldq(s[8]);
+                // 46fe54 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 46fe56 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 46fe58 fstp st(1)
+                f[0] = f[1];
+                // 46fe5a test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 46fe5d jp 0x46fe63
+                pc = if fl.pf { 0x46fe63 } else { 0x46fe5f };
+            }
+            0x46fe5f => {
+                // 46fe5f fstp st(0)
+                // 46fe61 fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                pc = 0x46fe63;
+            }
+            0x46fe63 => {
+                // 46fe63 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 46fe66 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // 46fe69 fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // 46fe6b pop ecx
+                ecx = s[8];
+                // 46fe6c ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x46fe6d => {
+                // 46fe6d fld dword ptr [0xe99c44]
+                f[0] = ldq(rd((0xe99c44u32) as usize));
+                // 46fe73 fmul dword ptr [esp + 8]
+                f[0] = xn3(f[0], ldr32(s[10]), f[0] * ldr32(s[10]));
+                // 46fe77 fadd dword ptr [edx]
+                f[0] = xn3(f[0], ldr32(rd((edx) as usize)), f[0] + ldr32(rd((edx) as usize)));
+                // 46fe79 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 46fe7c fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                // 46fe7e fld dword ptr [esp]
+                f[1] = ldq(s[8]);
+                // 46fe81 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 46fe83 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 46fe85 fstp st(1)
+                f[0] = f[1];
+                // 46fe87 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 46fe8a jne 0x46fe90
+                pc = if !fl.zf { 0x46fe90 } else { 0x46fe8c };
+            }
+            0x46fe8c => {
+                // 46fe8c fstp st(0)
+                // 46fe8e fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                pc = 0x46fe90;
+            }
+            0x46fe90 => {
+                // 46fe90 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 46fe93 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // 46fe96 fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // 46fe98 pop ecx
+                ecx = s[8];
+                // 46fe99 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_479a80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x479a80u32;
+    loop {
+        match pc {
+            0x479a80 => {
+                // 479a80 push ecx
+                s[8] = ecx;
+                // 479a81 cmp ax, 0xffff
+                fl = fl_sub((eax & 0xffff), 0xffffu32, 16).1;
+                // 479a85 jne 0x479a8b
+                pc = if !fl.zf { 0x479a8b } else { 0x479a87 };
+            }
+            0x479a87 => {
+                // 479a87 fldz 
+                f[0] = 0.0;
+                // 479a89 pop ecx
+                ecx = s[8];
+                // 479a8a ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0x479a8b => {
+                // 479a8b movzx eax, ax
+                eax = (eax & 0xffff);
+                // 479a8e mov ecx, dword ptr [eax*4 + 0xee5558]
+                ecx = rd((eax.wrapping_mul(4).wrapping_add(0xee5558)) as usize);
+                // 479a95 mov edx, dword ptr [ecx + 0x10]
+                edx = rd((ecx.wrapping_add(0x10)) as usize);
+                // 479a98 and edx, 0xfff
+                let r_ = (edx) & (0xfffu32);
+                fl = fl_logic(r_, 32);
+                edx = r_;
+                // 479a9e mov eax, dword ptr [edx*4 + 0xee9178]
+                eax = rd((edx.wrapping_mul(4).wrapping_add(0xee9178)) as usize);
+                // 479aa5 fld dword ptr [eax + 0x28]
+                f[0] = ldq(rd((eax.wrapping_add(0x28)) as usize));
+                // 479aa8 fmul qword ptr [0xe5c400]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5c400u32) as usize)), f[0] * f64::from_bits(rq((0xe5c400u32) as usize)));
+                // 479aae fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 479ab1 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // 479ab4 pop ecx
+                ecx = s[8];
+                // 479ab5 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_47bc90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[9] = unsafe { *a.add(0) };
+    s[10] = unsafe { *a.add(1) };
+    s[11] = unsafe { *a.add(2) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x47bc90u32;
+    loop {
+        match pc {
+            0x47bc90 => {
+                // 47bc90 fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // 47bc94 fld dword ptr [esp + 0xc]
+                f[1] = ldq(s[11]);
+                // 47bc98 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 47bc9a fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 47bc9c test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 47bc9f jnp 0x47bd14
+                pc = if !fl.pf { 0x47bd14 } else { 0x47bca1 };
+            }
+            0x47bca1 => {
+                // 47bca1 mov eax, dword ptr [esp + 4]
+                eax = s[9];
+                // 47bca5 mov ecx, dword ptr [eax*4 + 0xee9178]
+                ecx = rd((eax.wrapping_mul(4).wrapping_add(0xee9178)) as usize);
+                // 47bcac test byte ptr [ecx + 0x2c], 2
+                let r_ = ((rb((ecx.wrapping_add(0x2c)) as usize) as u32)) & (0x2u32);
+                fl = fl_logic(r_, 8);
+                // 47bcb0 je 0x47bd14
+                pc = if fl.zf { 0x47bd14 } else { 0x47bcb2 };
+            }
+            0x47bcb2 => {
+                // 47bcb2 fxch st(1)
+                f.swap(1, 0);
+                // 47bcb4 fst dword ptr [ecx]
+                w.d((ecx) as usize, (f[1] as f32).to_bits());
+                // 47bcb6 fxch st(1)
+                f.swap(1, 0);
+                // 47bcb8 fst dword ptr [ecx + 4]
+                w.d((ecx.wrapping_add(0x4)) as usize, (f[1] as f32).to_bits());
+                // 47bcbb fst dword ptr [ecx + 0x28]
+                w.d((ecx.wrapping_add(0x28)) as usize, (f[1] as f32).to_bits());
+                // 47bcbe fldz 
+                f[2] = 0.0;
+                // 47bcc0 fst dword ptr [ecx + 0x10]
+                w.d((ecx.wrapping_add(0x10)) as usize, (f[2] as f32).to_bits());
+                // 47bcc3 fld1 
+                f[3] = 1.0;
+                // 47bcc5 fst dword ptr [ecx + 0x14]
+                w.d((ecx.wrapping_add(0x14)) as usize, (f[3] as f32).to_bits());
+                // 47bcc8 fxch st(3)
+                f.swap(3, 0);
+                // 47bcca fdivrp st(2)
+                f[1] = xn3(f[1], f[3], f[3] / f[1]);
+                // 47bccc fld qword ptr [0xe5bfe0]
+                f[3] = f64::from_bits(q64(rq((0xe5bfe0u32) as usize)));
+                // 47bcd2 fcom st(2)
+                cc87 = cc(f[3], f[1]);
+                // 47bcd4 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 4);
+                // 47bcd6 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 47bcd9 jp 0x47bcf0
+                pc = if fl.pf { 0x47bcf0 } else { 0x47bcdb };
+            }
+            0x47bcdb => {
+                // 47bcdb fld st(2)
+                f[4] = f[1];
+                // 47bcdd fld qword ptr [0xe5c3f8]
+                f[5] = f64::from_bits(q64(rq((0xe5c3f8u32) as usize)));
+                // 47bce3 fcom st(1)
+                cc87 = cc(f[5], f[4]);
+                // 47bce5 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 6);
+                // 47bce7 fstp st(1)
+                f[4] = f[5];
+                // 47bce9 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 47bcec jne 0x47bcfd
+                pc = if !fl.zf { 0x47bcfd } else { 0x47bcee };
+            }
+            0x47bcee => {
+                // 47bcee fstp st(0)
+                pc = 0x47bcf0;
+            }
+            0x47bcf0 => {
+                // 47bcf0 fcom st(2)
+                cc87 = cc(f[3], f[1]);
+                // 47bcf2 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 4);
+                // 47bcf4 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 47bcf7 jnp 0x47bcff
+                pc = if !fl.pf { 0x47bcff } else { 0x47bcf9 };
+            }
+            0x47bcf9 => {
+                // 47bcf9 fstp st(2)
+                f[1] = f[3];
+                // 47bcfb jmp 0x47bd01
+                pc = 0x47bd01;
+            }
+            0x47bcfd => {
+                // 47bcfd fstp st(3)
+                f[1] = f[4];
+                pc = 0x47bcff;
+            }
+            0x47bcff => {
+                // 47bcff fstp st(0)
+                pc = 0x47bd01;
+            }
+            0x47bd01 => {
+                // 47bd01 fxch st(1)
+                f.swap(2, 1);
+                // 47bd03 mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // 47bd05 fstp dword ptr [ecx + 0x18]
+                w.d((ecx.wrapping_add(0x18)) as usize, (f[2] as f32).to_bits());
+                // 47bd08 fxch st(1)
+                f.swap(1, 0);
+                // 47bd0a fst dword ptr [ecx + 0x1c]
+                w.d((ecx.wrapping_add(0x1c)) as usize, (f[1] as f32).to_bits());
+                // 47bd0d fstp dword ptr [ecx + 0x20]
+                w.d((ecx.wrapping_add(0x20)) as usize, (f[1] as f32).to_bits());
+                // 47bd10 fstp dword ptr [ecx + 0x24]
+                w.d((ecx.wrapping_add(0x24)) as usize, (f[0] as f32).to_bits());
+                // 47bd13 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x47bd14 => {
+                // 47bd14 fstp st(0)
+                // 47bd16 xor al, al
+                eax = set_part(eax, 0, 0xff, 0);
+                fl = fl_logic(0, 32);
+                // 47bd18 fstp st(0)
+                // 47bd1a ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_47ffc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 26];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x47ffc0u32;
+    loop {
+        match pc {
+            0x47ffc0 => {
+                // 47ffc0 mov al, byte ptr [edx]
+                eax = set_part(eax, 0, 0xff, (rb((edx) as usize) as u32));
+                // 47ffc2 sub esp, 0x18
+                // 47ffc5 cmp al, 0xff
+                fl = fl_sub((eax & 0xff), 0xffu32, 8).1;
+                // 47ffc7 je 0x47ffea
+                pc = if fl.zf { 0x47ffea } else { 0x47ffc9 };
+            }
+            0x47ffc9 => {
+                // 47ffc9 mov edx, dword ptr [edx]
+                edx = rd((edx) as usize);
+                // 47ffcb shr edx, 8
+                let (r_, f_) = fl_shift("shr", edx, 8, 32); fl = f_;
+                edx = r_;
+                // 47ffce je 0x47ffea
+                pc = if fl.zf { 0x47ffea } else { 0x47ffd0 };
+            }
+            0x47ffd0 => {
+                // 47ffd0 movzx eax, al
+                eax = (eax & 0xff);
+                // 47ffd3 imul eax, eax, 0x19c
+                eax = ((eax) as i32).wrapping_mul(412i32) as u32;
+                fl = Fl::default(); // imul flags are not used
+                // 47ffd9 cmp edx, dword ptr [eax + 0xeeb9ac]
+                fl = fl_sub(edx, rd((eax.wrapping_add(0xeeb9ac)) as usize), 32).1;
+                // 47ffdf jne 0x47ffea
+                pc = if !fl.zf { 0x47ffea } else { 0x47ffe1 };
+            }
+            0x47ffe1 => {
+                // 47ffe1 cmp dword ptr [eax + 0xeeb8f8], -1
+                fl = fl_sub(rd((eax.wrapping_add(0xeeb8f8)) as usize), 0xffffffffu32, 32).1;
+                // 47ffe8 jne 0x47fff0
+                pc = if !fl.zf { 0x47fff0 } else { 0x47ffea };
+            }
+            0x47ffea => {
+                // 47ffea xor al, al
+                eax = set_part(eax, 0, 0xff, 0);
+                fl = fl_logic(0, 32);
+                // 47ffec add esp, 0x18
+                // 47ffef ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x47fff0 => {
+                // 47fff0 mov edx, dword ptr [eax + 0xeeb954]
+                edx = rd((eax.wrapping_add(0xeeb954)) as usize);
+                // 47fff6 fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                // 47fff8 mov dword ptr [esp], edx
+                s[8] = edx;
+                // 47fffb fsub dword ptr [esp]
+                f[0] = xn3(f[0], ldr32(s[8]), f[0] - ldr32(s[8]));
+                // 47fffe mov edx, dword ptr [eax + 0xeeb958]
+                edx = rd((eax.wrapping_add(0xeeb958)) as usize);
+                // 480004 mov dword ptr [esp + 4], edx
+                s[9] = edx;
+                // 480008 mov edx, dword ptr [eax + 0xeeb95c]
+                edx = rd((eax.wrapping_add(0xeeb95c)) as usize);
+                // 48000e fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // 480012 fld dword ptr [ecx + 4]
+                f[0] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
+                // 480015 mov dword ptr [esp + 8], edx
+                s[10] = edx;
+                // 480019 fsub dword ptr [esp + 4]
+                f[0] = xn3(f[0], ldr32(s[9]), f[0] - ldr32(s[9]));
+                // 48001d fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // 480021 fld dword ptr [ecx + 8]
+                f[0] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
+                // 480024 fsub dword ptr [esp + 8]
+                f[0] = xn3(f[0], ldr32(s[10]), f[0] - ldr32(s[10]));
+                // 480028 fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // 48002c fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[11]);
+                // 480030 fstp dword ptr [eax + 0xeeb960]
+                w.d((eax.wrapping_add(0xeeb960)) as usize, (f[0] as f32).to_bits());
+                // 480036 fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[12]);
+                // 48003a fstp dword ptr [eax + 0xeeb964]
+                w.d((eax.wrapping_add(0xeeb964)) as usize, (f[0] as f32).to_bits());
+                // 480040 fld dword ptr [esp + 0x14]
+                f[0] = ldq(s[13]);
+                // 480044 fstp dword ptr [eax + 0xeeb968]
+                w.d((eax.wrapping_add(0xeeb968)) as usize, (f[0] as f32).to_bits());
+                // 48004a fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                // 48004c fstp dword ptr [eax + 0xeeb954]
+                w.d((eax.wrapping_add(0xeeb954)) as usize, (f[0] as f32).to_bits());
+                // 480052 fld dword ptr [ecx + 4]
+                f[0] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
+                // 480055 fstp dword ptr [eax + 0xeeb958]
+                w.d((eax.wrapping_add(0xeeb958)) as usize, (f[0] as f32).to_bits());
+                // 48005b fld dword ptr [ecx + 8]
+                f[0] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
+                // 48005e fstp dword ptr [eax + 0xeeb95c]
+                w.d((eax.wrapping_add(0xeeb95c)) as usize, (f[0] as f32).to_bits());
+                // 480064 mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // 480066 add esp, 0x18
+                // 480069 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_499af0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x499af0u32;
+    loop {
+        match pc {
+            0x499af0 => {
+                // 499af0 mov eax, dword ptr [0xe9a5b8]
+                eax = rd((0xe9a5b8u32) as usize);
+                // 499af5 cmp eax, dword ptr [ecx]
+                fl = fl_sub(eax, rd((ecx) as usize), 32).1;
+                // 499af7 je 0x499afc
+                pc = if fl.zf { 0x499afc } else { 0x499af9 };
+            }
+            0x499af9 => {
+                // 499af9 xor al, al
+                eax = set_part(eax, 0, 0xff, 0);
+                fl = fl_logic(0, 32);
+                // 499afb ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x499afc => {
+                // 499afc mov edx, dword ptr [0xe9a5bc]
+                edx = rd((0xe9a5bcu32) as usize);
+                // 499b02 cmp edx, dword ptr [ecx + 4]
+                fl = fl_sub(edx, rd((ecx.wrapping_add(0x4)) as usize), 32).1;
+                // 499b05 jne 0x499af9
+                pc = if !fl.zf { 0x499af9 } else { 0x499b07 };
+            }
+            0x499b07 => {
+                // 499b07 mov eax, dword ptr [0xe9a5c0]
+                eax = rd((0xe9a5c0u32) as usize);
+                // 499b0c cmp eax, dword ptr [ecx + 8]
+                fl = fl_sub(eax, rd((ecx.wrapping_add(0x8)) as usize), 32).1;
+                // 499b0f jne 0x499af9
+                pc = if !fl.zf { 0x499af9 } else { 0x499b11 };
+            }
+            0x499b11 => {
+                // 499b11 fld dword ptr [0xe9a5c4]
+                f[0] = ldq(rd((0xe9a5c4u32) as usize));
+                // 499b17 fld dword ptr [ecx + 0xc]
+                f[1] = ldq(rd((ecx.wrapping_add(0xc)) as usize));
+                // 499b1a fucompp 
+                cc87 = cc(f[1], f[0]);
+                // 499b1c fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 499b1e test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // 499b21 jp 0x499af9
+                pc = if fl.pf { 0x499af9 } else { 0x499b23 };
+            }
+            0x499b23 => {
+                // 499b23 fld dword ptr [0xe9a5c8]
+                f[0] = ldq(rd((0xe9a5c8u32) as usize));
+                // 499b29 fld dword ptr [ecx + 0x10]
+                f[1] = ldq(rd((ecx.wrapping_add(0x10)) as usize));
+                // 499b2c fucompp 
+                cc87 = cc(f[1], f[0]);
+                // 499b2e fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 499b30 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // 499b33 jp 0x499af9
+                pc = if fl.pf { 0x499af9 } else { 0x499b35 };
+            }
+            0x499b35 => {
+                // 499b35 mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // 499b37 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_49e210(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    s[9] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x49e210u32;
+    loop {
+        match pc {
+            0x49e210 => {
+                // 49e210 cmp byte ptr [0x2526ba3], 0
+                fl = fl_sub((rb((0x2526ba3u32) as usize) as u32), 0x0u32, 8).1;
+                // 49e217 je 0x49e21d
+                pc = if fl.zf { 0x49e21d } else { 0x49e219 };
+            }
+            0x49e219 => {
+                // 49e219 test cl, cl
+                let r_ = ((ecx & 0xff)) & ((ecx & 0xff));
+                fl = fl_logic(r_, 8);
+                // 49e21b je 0x49e26f
+                pc = if fl.zf { 0x49e26f } else { 0x49e21d };
+            }
+            0x49e21d => {
+                // 49e21d fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // 49e221 fld qword ptr [0xdd50e8]
+                f[1] = f64::from_bits(q64(rq((0xdd50e8u32) as usize)));
+                // 49e227 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 49e229 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 49e22b test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 49e22e jp 0x49e241
+                pc = if fl.pf { 0x49e241 } else { 0x49e230 };
+            }
+            0x49e230 => {
+                // 49e230 fld dword ptr [0xe5c3d4]
+                f[2] = ldq(rd((0xe5c3d4u32) as usize));
+                // 49e236 fcom st(2)
+                cc87 = cc(f[2], f[0]);
+                // 49e238 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 3);
+                // 49e23a test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 49e23d jne 0x49e25f
+                pc = if !fl.zf { 0x49e25f } else { 0x49e23f };
+            }
+            0x49e23f => {
+                // 49e23f fstp st(0)
+                pc = 0x49e241;
+            }
+            0x49e241 => {
+                // 49e241 fcomp st(1)
+                cc87 = cc(f[1], f[0]);
+                // 49e243 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 49e245 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 49e248 jnp 0x49e263
+                pc = if !fl.pf { 0x49e263 } else { 0x49e24a };
+            }
+            0x49e24a => {
+                // 49e24a fstp st(0)
+                // 49e24c mov byte ptr [0x2526ba3], cl
+                w.b((0x2526ba3u32) as usize, ((ecx & 0xff)) as u8);
+                // 49e252 fld dword ptr [0xdd1c88]
+                f[0] = ldq(rd((0xdd1c88u32) as usize));
+                // 49e258 fstp dword ptr [0x25f5d38]
+                w.d((0x25f5d38u32) as usize, (f[0] as f32).to_bits());
+                // 49e25e ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x49e25f => {
+                // 49e25f fstp st(2)
+                f[0] = f[2];
+                // 49e261 fstp st(0)
+                pc = 0x49e263;
+            }
+            0x49e263 => {
+                // 49e263 fstp dword ptr [0x25f5d38]
+                w.d((0x25f5d38u32) as usize, (f[0] as f32).to_bits());
+                // 49e269 mov byte ptr [0x2526ba3], cl
+                w.b((0x2526ba3u32) as usize, ((ecx & 0xff)) as u8);
+                pc = 0x49e26f;
+            }
+            0x49e26f => {
+                // 49e26f ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_49fca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x49fca0u32;
+    loop {
+        match pc {
+            0x49fca0 => {
+                // 49fca0 push ecx
+                s[8] = ecx;
+                // 49fca1 cmp dword ptr [0x25f5ae8], 4
+                fl = fl_sub(rd((0x25f5ae8u32) as usize), 0x4u32, 32).1;
+                // 49fca8 je 0x49fcae
+                pc = if fl.zf { 0x49fcae } else { 0x49fcaa };
+            }
+            0x49fcaa => {
+                // 49fcaa mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // 49fcac pop ecx
+                ecx = s[8];
+                // 49fcad ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x49fcae => {
+                // 49fcae fld dword ptr [0x25f6244]
+                f[0] = ldq(rd((0x25f6244u32) as usize));
+                // 49fcb4 mov eax, dword ptr [0x25f5d98]
+                eax = rd((0x25f5d98u32) as usize);
+                // 49fcb9 fdiv dword ptr [0x25f5d9c]
+                f[0] = xn3(f[0], ldr32(rd((0x25f5d9cu32) as usize)), f[0] / ldr32(rd((0x25f5d9cu32) as usize)));
+                // 49fcbf add eax, -1
+                let (r_, f_) = fl_add(eax, 0xffffffffu32, 32); fl = f_;
+                eax = r_;
+                // 49fcc2 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 49fcc5 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // 49fcc8 mov dword ptr [esp], eax
+                s[8] = eax;
+                // 49fccb fild dword ptr [esp]
+                f[1] = (((s[8]) as i32) as f64);
+                // 49fcce fcompp 
+                cc87 = cc(f[1], f[0]);
+                // 49fcd0 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 49fcd2 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 49fcd5 jp 0x49fcde
+                pc = if fl.pf { 0x49fcde } else { 0x49fcd7 };
+            }
+            0x49fcd7 => {
+                // 49fcd7 mov eax, 1
+                eax = 0x1u32;
+                // 49fcdc pop ecx
+                ecx = s[8];
+                // 49fcdd ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x49fcde => {
+                // 49fcde xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // 49fce0 pop ecx
+                ecx = s[8];
+                // 49fce1 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_4d1900(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x4d1900u32;
+    loop {
+        match pc {
+            0x4d1900 => {
+                // 4d1900 fldz 
+                f[0] = 0.0;
+                // 4d1902 fcomp dword ptr [0x2526da0]
+                cc87 = cc(f[0], ldq(rd((0x2526da0u32) as usize)));
+                // 4d1908 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 4d190a test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // 4d190d jp 0x4d1915
+                pc = if fl.pf { 0x4d1915 } else { 0x4d190f };
+            }
+            0x4d190f => {
+                // 4d190f mov eax, 1
+                eax = 0x1u32;
+                // 4d1914 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x4d1915 => {
+                // 4d1915 xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // 4d1917 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_4d1920(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x4d1920u32;
+    loop {
+        match pc {
+            0x4d1920 => {
+                // 4d1920 fld1 
+                f[0] = 1.0;
+                // 4d1922 fcomp dword ptr [0x2526da0]
+                cc87 = cc(f[0], ldq(rd((0x2526da0u32) as usize)));
+                // 4d1928 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 4d192a test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // 4d192d jp 0x4d1935
+                pc = if fl.pf { 0x4d1935 } else { 0x4d192f };
+            }
+            0x4d192f => {
+                // 4d192f mov eax, 1
+                eax = 0x1u32;
+                // 4d1934 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x4d1935 => {
+                // 4d1935 xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // 4d1937 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_503fe0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 25];
+    s[12] = unsafe { *a.add(0) };
+    s[13] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x503fe0u32;
+    loop {
+        match pc {
+            0x503fe0 => {
+                // 503fe0 cmp byte ptr [esp + 8], 0
+                fl = fl_sub(((s[13] >> 0) & 0xff), 0x0u32, 8).1;
+                // 503fe5 push ebx
+                s[10] = ebx;
+                // 503fe6 mov ebx, dword ptr [esp + 8]
+                ebx = s[12];
+                // 503fea fld dword ptr [ebx + 0x1c]
+                f[0] = ldq(rd((ebx.wrapping_add(0x1c)) as usize));
+                // 503fed push esi
+                s[9] = esi;
+                // 503fee fstp dword ptr [esp + 0xc]
+                s[12] = (f[0] as f32).to_bits();
+                // 503ff2 push edi
+                s[8] = edi;
+                // 503ff3 je 0x504001
+                pc = if fl.zf { 0x504001 } else { 0x503ff5 };
+            }
+            0x503ff5 => {
+                // 503ff5 fld dword ptr [0xe87998]
+                f[0] = ldq(rd((0xe87998u32) as usize));
+                // 503ffb fstp dword ptr [ebx + 0x200]
+                w.d((ebx.wrapping_add(0x200)) as usize, (f[0] as f32).to_bits());
+                pc = 0x504001;
+            }
+            0x504001 => {
+                // 504001 movzx edx, word ptr [eax + 0x24]
+                edx = (rw((eax.wrapping_add(0x24)) as usize) as u32);
+                // 504005 mov esi, dword ptr [0xf5389c]
+                esi = rd((0xf5389cu32) as usize);
+                // 50400b movzx eax, dx
+                eax = (edx & 0xffff);
+                // 50400e cmp ax, word ptr [0x2526bd0]
+                fl = fl_sub((eax & 0xffff), (rw((0x2526bd0u32) as usize) as u32), 16).1;
+                // 504015 jb 0x50401b
+                pc = if fl.cf { 0x50401b } else { 0x504017 };
+            }
+            0x504017 => {
+                // 504017 xor edi, edi
+                edi = 0;
+                fl = fl_logic(0, 32);
+                // 504019 jmp 0x504026
+                pc = 0x504026;
+            }
+            0x50401b => {
+                // 50401b movzx eax, ax
+                eax = (eax & 0xffff);
+                // 50401e lea ecx, [eax + eax*2]
+                ecx = eax.wrapping_add(eax.wrapping_mul(2));
+                // 504021 movzx edi, word ptr [esi + ecx*4 + 8]
+                edi = (rw((esi.wrapping_add(ecx.wrapping_mul(4)).wrapping_add(0x8)) as usize) as u32);
+                pc = 0x504026;
+            }
+            0x504026 => {
+                // 504026 lea eax, [edi - 1]
+                eax = edi.wrapping_add(0xffffffff);
+                // 504029 movzx ecx, ax
+                ecx = (eax & 0xffff);
+                // 50402c cmp cx, di
+                fl = fl_sub((ecx & 0xffff), (edi & 0xffff), 16).1;
+                // 50402f jae 0x504089
+                pc = if !fl.cf { 0x504089 } else { 0x504031 };
+            }
+            0x504031 => {
+                // 504031 fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[12]);
+                // 504035 movzx eax, dx
+                eax = (edx & 0xffff);
+                // 504038 lea edx, [eax + eax*2]
+                edx = eax.wrapping_add(eax.wrapping_mul(2));
+                // 50403b mov esi, dword ptr [esi + edx*4 + 4]
+                esi = rd((esi.wrapping_add(edx.wrapping_mul(4)).wrapping_add(0x4)) as usize);
+                pc = 0x50403f;
+            }
+            0x50403f => {
+                // 50403f movzx eax, cx
+                eax = (ecx & 0xffff);
+                // 504042 fld dword ptr [esi + eax*8]
+                f[1] = ldq(rd((esi.wrapping_add(eax.wrapping_mul(8))) as usize));
+                // 504045 movzx edx, word ptr [esi + eax*8 + 4]
+                edx = (rw((esi.wrapping_add(eax.wrapping_mul(8)).wrapping_add(0x4)) as usize) as u32);
+                // 50404a fstp dword ptr [esp + 0x14]
+                s[13] = (f[1] as f32).to_bits();
+                // 50404e fld dword ptr [esp + 0x14]
+                f[1] = ldq(s[13]);
+                // 504052 fld dword ptr [ebx + 0x200]
+                f[2] = ldq(rd((ebx.wrapping_add(0x200)) as usize));
+                // 504058 lea eax, [esi + eax*8]
+                eax = esi.wrapping_add(eax.wrapping_mul(8));
+                // 50405b fcomp st(1)
+                cc87 = cc(f[2], f[1]);
+                // 50405d fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 50405f test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 504062 jp 0x50407a
+                pc = if fl.pf { 0x50407a } else { 0x504064 };
+            }
+            0x504064 => {
+                // 504064 fcomp st(1)
+                cc87 = cc(f[1], f[0]);
+                // 504066 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 504068 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 50406b jp 0x50407c
+                pc = if fl.pf { 0x50407c } else { 0x50406d };
+            }
+            0x50406d => {
+                // 50406d pop edi
+                edi = s[8];
+                // 50406e fstp dword ptr [ebx + 0x200]
+                w.d((ebx.wrapping_add(0x200)) as usize, (f[0] as f32).to_bits());
+                // 504074 pop esi
+                esi = s[9];
+                // 504075 mov ax, dx
+                eax = set_part(eax, 0, 0xffff, (edx & 0xffff));
+                // 504078 pop ebx
+                ebx = s[10];
+                // 504079 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x50407a => {
+                // 50407a fstp st(0)
+                pc = 0x50407c;
+            }
+            0x50407c => {
+                // 50407c add ecx, 0xffff
+                let (r_, f_) = fl_add(ecx, 0xffffu32, 32); fl = f_;
+                ecx = r_;
+                // 504082 cmp cx, di
+                fl = fl_sub((ecx & 0xffff), (edi & 0xffff), 16).1;
+                // 504085 jb 0x50403f
+                pc = if fl.cf { 0x50403f } else { 0x504087 };
+            }
+            0x504087 => {
+                // 504087 fstp st(0)
+                pc = 0x504089;
+            }
+            0x504089 => {
+                // 504089 pop edi
+                edi = s[8];
+                // 50408a pop esi
+                esi = s[9];
+                // 50408b or ax, 0xffff
+                let r_ = ((eax & 0xffff)) | (0xffffu32);
+                fl = fl_logic(r_, 16);
+                eax = set_part(eax, 0, 0xffff, r_);
+                // 50408f pop ebx
+                ebx = s[10];
+                // 504090 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_514f80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 25];
+    s[12] = unsafe { *a.add(0) };
+    s[13] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x514f80u32;
+    loop {
+        match pc {
+            0x514f80 => {
+                // 514f80 push ecx
+                s[10] = ecx;
+                // 514f81 cmp esi, 1
+                fl = fl_sub(esi, 0x1u32, 32).1;
+                // 514f84 push ebx
+                s[9] = ebx;
+                // 514f85 mov ebx, dword ptr [esp + 0x10]
+                ebx = s[13];
+                // 514f89 jne 0x514f91
+                pc = if !fl.zf { 0x514f91 } else { 0x514f8b };
+            }
+            0x514f8b => {
+                // 514f8b fld dword ptr [ebx + 4]
+                f[0] = ldq(rd((ebx.wrapping_add(0x4)) as usize));
+                // 514f8e pop ebx
+                ebx = s[9];
+                // 514f8f pop ecx
+                ecx = s[10];
+                // 514f90 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0x514f91 => {
+                // 514f91 push edi
+                s[8] = edi;
+                // 514f92 xor edi, edi
+                edi = 0;
+                fl = fl_logic(0, 32);
+                // 514f94 xor ecx, ecx
+                ecx = 0;
+                fl = fl_logic(0, 32);
+                // 514f96 test esi, esi
+                let r_ = (esi) & (esi);
+                fl = fl_logic(r_, 32);
+                // 514f98 jle 0x514fe2
+                pc = if (fl.zf || fl.sf != fl.of) { 0x514fe2 } else { 0x514f9a };
+            }
+            0x514f9a => {
+                // 514f9a fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[12]);
+                // 514f9e mov edx, ebx
+                edx = ebx;
+                pc = 0x514fa0;
+            }
+            0x514fa0 => {
+                // 514fa0 fld dword ptr [edx]
+                f[1] = ldq(rd((edx) as usize));
+                // 514fa2 fld st(1)
+                f[2] = f[0];
+                // 514fa4 fucompp 
+                cc87 = cc(f[2], f[1]);
+                // 514fa6 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 514fa8 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // 514fab jnp 0x514fc1
+                pc = if !fl.pf { 0x514fc1 } else { 0x514fad };
+            }
+            0x514fad => {
+                // 514fad fld dword ptr [edx]
+                f[1] = ldq(rd((edx) as usize));
+                // 514faf fcomp st(1)
+                cc87 = cc(f[1], f[0]);
+                // 514fb1 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 514fb3 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 514fb6 jp 0x514fcb
+                pc = if fl.pf { 0x514fcb } else { 0x514fb8 };
+            }
+            0x514fb8 => {
+                // 514fb8 lea eax, [esi - 1]
+                eax = esi.wrapping_add(0xffffffff);
+                // 514fbb cmp ecx, eax
+                fl = fl_sub(ecx, eax, 32).1;
+                // 514fbd mov edi, edx
+                edi = edx;
+                // 514fbf jl 0x514fd6
+                pc = if (fl.sf != fl.of) { 0x514fd6 } else { 0x514fc1 };
+            }
+            0x514fc1 => {
+                // 514fc1 fstp st(0)
+                // 514fc3 pop edi
+                edi = s[8];
+                // 514fc4 fld dword ptr [ebx + ecx*8 + 4]
+                f[0] = ldq(rd((ebx.wrapping_add(ecx.wrapping_mul(8)).wrapping_add(0x4)) as usize));
+                // 514fc8 pop ebx
+                ebx = s[9];
+                // 514fc9 pop ecx
+                ecx = s[10];
+                // 514fca ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0x514fcb => {
+                // 514fcb fld dword ptr [edx]
+                f[1] = ldq(rd((edx) as usize));
+                // 514fcd fcomp st(1)
+                cc87 = cc(f[1], f[0]);
+                // 514fcf fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 514fd1 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 514fd4 je 0x514fe8
+                pc = if fl.zf { 0x514fe8 } else { 0x514fd6 };
+            }
+            0x514fd6 => {
+                // 514fd6 add ecx, 1
+                let (r_, f_) = fl_add(ecx, 0x1u32, 32); fl = f_;
+                ecx = r_;
+                // 514fd9 add edx, 8
+                let (r_, f_) = fl_add(edx, 0x8u32, 32); fl = f_;
+                edx = r_;
+                // 514fdc cmp ecx, esi
+                fl = fl_sub(ecx, esi, 32).1;
+                // 514fde jl 0x514fa0
+                pc = if (fl.sf != fl.of) { 0x514fa0 } else { 0x514fe0 };
+            }
+            0x514fe0 => {
+                // 514fe0 fstp st(0)
+                pc = 0x514fe2;
+            }
+            0x514fe2 => {
+                // 514fe2 fldz 
+                f[0] = 0.0;
+                // 514fe4 pop edi
+                edi = s[8];
+                // 514fe5 pop ebx
+                ebx = s[9];
+                // 514fe6 pop ecx
+                ecx = s[10];
+                // 514fe7 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0x514fe8 => {
+                // 514fe8 test edi, edi
+                let r_ = (edi) & (edi);
+                fl = fl_logic(r_, 32);
+                // 514fea je 0x514fc1
+                pc = if fl.zf { 0x514fc1 } else { 0x514fec };
+            }
+            0x514fec => {
+                // 514fec fsub dword ptr [edi]
+                f[0] = xn3(f[0], ldr32(rd((edi) as usize)), f[0] - ldr32(rd((edi) as usize)));
+                // 514fee fld dword ptr [ebx + ecx*8]
+                f[1] = ldq(rd((ebx.wrapping_add(ecx.wrapping_mul(8))) as usize));
+                // 514ff1 fsub dword ptr [edi]
+                f[1] = xn3(f[1], ldr32(rd((edi) as usize)), f[1] - ldr32(rd((edi) as usize)));
+                // 514ff3 fdivp st(1)
+                f[0] = xn3(f[0], f[1], f[0] / f[1]);
+                // 514ff5 fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // 514ff9 fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // 514ffd fld dword ptr [ebx + ecx*8 + 4]
+                f[1] = ldq(rd((ebx.wrapping_add(ecx.wrapping_mul(8)).wrapping_add(0x4)) as usize));
+                // 515001 fsub dword ptr [edi + 4]
+                f[1] = xn3(f[1], ldr32(rd((edi.wrapping_add(0x4)) as usize)), f[1] - ldr32(rd((edi.wrapping_add(0x4)) as usize)));
+                // 515004 fmulp st(1)
+                f[0] = xn3(f[0], f[1], f[0] * f[1]);
+                // 515006 fadd dword ptr [edi + 4]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x4)) as usize)), f[0] + ldr32(rd((edi.wrapping_add(0x4)) as usize)));
+                // 515009 pop edi
+                edi = s[8];
+                // 51500a pop ebx
+                ebx = s[9];
+                // 51500b fstp dword ptr [esp]
+                s[10] = (f[0] as f32).to_bits();
+                // 51500e fld dword ptr [esp]
+                f[0] = ldq(s[10]);
+                // 515011 pop ecx
+                ecx = s[10];
+                // 515012 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 33];
+    s[19] = unsafe { *a.add(0) };
+    s[20] = unsafe { *a.add(1) };
+    s[21] = unsafe { *a.add(2) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x5151e0u32;
+    loop {
+        match pc {
+            0x5151e0 => {
+                // 5151e0 sub esp, 0x18
+                // 5151e3 push ebx
+                s[11] = ebx;
+                // 5151e4 mov ebx, dword ptr [esp + 0x24]
+                ebx = s[20];
+                // 5151e8 cmp ebx, 1
+                fl = fl_sub(ebx, 0x1u32, 32).1;
+                // 5151eb push ebp
+                s[10] = ebp;
+                // 5151ec mov ebp, dword ptr [esp + 0x2c]
+                ebp = s[21];
+                // 5151f0 jne 0x51520b
+                pc = if !fl.zf { 0x51520b } else { 0x5151f2 };
+            }
+            0x5151f2 => {
+                // 5151f2 fld dword ptr [ebp + 4]
+                f[0] = ldq(rd((ebp.wrapping_add(0x4)) as usize));
+                // 5151f5 mov eax, edx
+                eax = edx;
+                // 5151f7 fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // 5151f9 fld dword ptr [ebp + 8]
+                f[0] = ldq(rd((ebp.wrapping_add(0x8)) as usize));
+                // 5151fc fstp dword ptr [edx + 4]
+                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // 5151ff fld dword ptr [ebp + 0xc]
+                f[0] = ldq(rd((ebp.wrapping_add(0xc)) as usize));
+                // 515202 pop ebp
+                ebp = s[10];
+                // 515203 fstp dword ptr [edx + 8]
+                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // 515206 pop ebx
+                ebx = s[11];
+                // 515207 add esp, 0x18
+                // 51520a ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x51520b => {
+                // 51520b push esi
+                s[9] = esi;
+                // 51520c xor esi, esi
+                esi = 0;
+                fl = fl_logic(0, 32);
+                // 51520e xor ecx, ecx
+                ecx = 0;
+                fl = fl_logic(0, 32);
+                // 515210 test ebx, ebx
+                let r_ = (ebx) & (ebx);
+                fl = fl_logic(r_, 32);
+                // 515212 push edi
+                s[8] = edi;
+                // 515213 jle 0x515278
+                pc = if (fl.zf || fl.sf != fl.of) { 0x515278 } else { 0x515215 };
+            }
+            0x515215 => {
+                // 515215 fld dword ptr [esp + 0x2c]
+                f[0] = ldq(s[19]);
+                // 515219 mov edi, ebp
+                edi = ebp;
+                pc = 0x51521b;
+            }
+            0x51521b => {
+                // 51521b fld dword ptr [edi]
+                f[1] = ldq(rd((edi) as usize));
+                // 51521d fld st(1)
+                f[2] = f[0];
+                // 51521f fucompp 
+                cc87 = cc(f[2], f[1]);
+                // 515221 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 515223 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // 515226 jnp 0x51523c
+                pc = if !fl.pf { 0x51523c } else { 0x515228 };
+            }
+            0x515228 => {
+                // 515228 fld dword ptr [edi]
+                f[1] = ldq(rd((edi) as usize));
+                // 51522a fcomp st(1)
+                cc87 = cc(f[1], f[0]);
+                // 51522c fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 51522e test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 515231 jp 0x515261
+                pc = if fl.pf { 0x515261 } else { 0x515233 };
+            }
+            0x515233 => {
+                // 515233 lea eax, [ebx - 1]
+                eax = ebx.wrapping_add(0xffffffff);
+                // 515236 cmp ecx, eax
+                fl = fl_sub(ecx, eax, 32).1;
+                // 515238 mov esi, edi
+                esi = edi;
+                // 51523a jl 0x51526c
+                pc = if (fl.sf != fl.of) { 0x51526c } else { 0x51523c };
+            }
+            0x51523c => {
+                // 51523c fstp st(0)
+                // 51523e shl ecx, 4
+                let (r_, f_) = fl_shift("shl", ecx, 4, 32); fl = f_;
+                ecx = r_;
+                // 515241 fld dword ptr [ecx + ebp + 4]
+                f[0] = ldq(rd((ecx.wrapping_add(ebp).wrapping_add(0x4)) as usize));
+                // 515245 lea eax, [ecx + ebp + 4]
+                eax = ecx.wrapping_add(ebp).wrapping_add(0x4);
+                // 515249 fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // 51524b pop edi
+                edi = s[8];
+                // 51524c fld dword ptr [eax + 4]
+                f[0] = ldq(rd((eax.wrapping_add(0x4)) as usize));
+                // 51524f pop esi
+                esi = s[9];
+                // 515250 fstp dword ptr [edx + 4]
+                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // 515253 pop ebp
+                ebp = s[10];
+                // 515254 fld dword ptr [eax + 8]
+                f[0] = ldq(rd((eax.wrapping_add(0x8)) as usize));
+                // 515257 mov eax, edx
+                eax = edx;
+                // 515259 fstp dword ptr [edx + 8]
+                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // 51525c pop ebx
+                ebx = s[11];
+                // 51525d add esp, 0x18
+                // 515260 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x515261 => {
+                // 515261 fld dword ptr [edi]
+                f[1] = ldq(rd((edi) as usize));
+                // 515263 fcomp st(1)
+                cc87 = cc(f[1], f[0]);
+                // 515265 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 515267 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 51526a je 0x51529c
+                pc = if fl.zf { 0x51529c } else { 0x51526c };
+            }
+            0x51526c => {
+                // 51526c add ecx, 1
+                let (r_, f_) = fl_add(ecx, 0x1u32, 32); fl = f_;
+                ecx = r_;
+                // 51526f add edi, 0x10
+                let (r_, f_) = fl_add(edi, 0x10u32, 32); fl = f_;
+                edi = r_;
+                // 515272 cmp ecx, ebx
+                fl = fl_sub(ecx, ebx, 32).1;
+                // 515274 jl 0x51521b
+                pc = if (fl.sf != fl.of) { 0x51521b } else { 0x515276 };
+            }
+            0x515276 => {
+                // 515276 fstp st(0)
+                pc = 0x515278;
+            }
+            0x515278 => {
+                // 515278 fld dword ptr [0x252a6d0]
+                f[0] = ldq(rd((0x252a6d0u32) as usize));
+                // 51527e pop edi
+                edi = s[8];
+                // 51527f fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // 515281 pop esi
+                esi = s[9];
+                // 515282 fld dword ptr [0x252a6d4]
+                f[0] = ldq(rd((0x252a6d4u32) as usize));
+                // 515288 pop ebp
+                ebp = s[10];
+                // 515289 fstp dword ptr [edx + 4]
+                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // 51528c mov eax, edx
+                eax = edx;
+                // 51528e fld dword ptr [0x252a6d8]
+                f[0] = ldq(rd((0x252a6d8u32) as usize));
+                // 515294 pop ebx
+                ebx = s[11];
+                // 515295 fstp dword ptr [edx + 8]
+                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // 515298 add esp, 0x18
+                // 51529b ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x51529c => {
+                // 51529c shl ecx, 4
+                let (r_, f_) = fl_shift("shl", ecx, 4, 32); fl = f_;
+                ecx = r_;
+                // 51529f test esi, esi
+                let r_ = (esi) & (esi);
+                fl = fl_logic(r_, 32);
+                // 5152a1 lea eax, [ecx + ebp]
+                eax = ecx.wrapping_add(ebp);
+                // 5152a4 je 0x51531b
+                pc = if fl.zf { 0x51531b } else { 0x5152a6 };
+            }
+            0x5152a6 => {
+                // 5152a6 fsub dword ptr [esi]
+                f[0] = xn3(f[0], ldr32(rd((esi) as usize)), f[0] - ldr32(rd((esi) as usize)));
+                // 5152a8 pop edi
+                edi = s[8];
+                // 5152a9 fld dword ptr [eax]
+                f[1] = ldq(rd((eax) as usize));
+                // 5152ab fsub dword ptr [esi]
+                f[1] = xn3(f[1], ldr32(rd((esi) as usize)), f[1] - ldr32(rd((esi) as usize)));
+                // 5152ad fdivp st(1)
+                f[0] = xn3(f[0], f[1], f[0] / f[1]);
+                // 5152af fstp dword ptr [esp + 0x2c]
+                s[20] = (f[0] as f32).to_bits();
+                // 5152b3 fld dword ptr [eax + 4]
+                f[0] = ldq(rd((eax.wrapping_add(0x4)) as usize));
+                // 5152b6 fsub dword ptr [esi + 4]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x4)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x4)) as usize)));
+                // 5152b9 fstp dword ptr [esp + 0xc]
+                s[12] = (f[0] as f32).to_bits();
+                // 5152bd fld dword ptr [eax + 8]
+                f[0] = ldq(rd((eax.wrapping_add(0x8)) as usize));
+                // 5152c0 fsub dword ptr [esi + 8]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x8)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x8)) as usize)));
+                // 5152c3 fstp dword ptr [esp + 0x10]
+                s[13] = (f[0] as f32).to_bits();
+                // 5152c7 fld dword ptr [eax + 0xc]
+                f[0] = ldq(rd((eax.wrapping_add(0xc)) as usize));
+                // 5152ca mov eax, edx
+                eax = edx;
+                // 5152cc fsub dword ptr [esi + 0xc]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0xc)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0xc)) as usize)));
+                // 5152cf fstp dword ptr [esp + 0x14]
+                s[14] = (f[0] as f32).to_bits();
+                // 5152d3 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[12]);
+                // 5152d7 fld dword ptr [esp + 0x2c]
+                f[1] = ldq(s[20]);
+                // 5152db fld st(0)
+                f[2] = f[1];
+                // 5152dd fmulp st(2)
+                f[0] = xn3(f[0], f[2], f[0] * f[2]);
+                // 5152df fxch st(1)
+                f.swap(1, 0);
+                // 5152e1 fstp dword ptr [esp + 0x18]
+                s[15] = (f[1] as f32).to_bits();
+                // 5152e5 fld dword ptr [esp + 0x10]
+                f[1] = ldq(s[13]);
+                // 5152e9 fmul st(1)
+                f[1] = xn3(f[1], f[0], f[1] * f[0]);
+                // 5152eb fstp dword ptr [esp + 0x1c]
+                s[16] = (f[1] as f32).to_bits();
+                // 5152ef fmul dword ptr [esp + 0x14]
+                f[0] = xn3(f[0], ldr32(s[14]), f[0] * ldr32(s[14]));
+                // 5152f3 fstp dword ptr [esp + 0x20]
+                s[17] = (f[0] as f32).to_bits();
+                // 5152f7 fld dword ptr [esp + 0x18]
+                f[0] = ldq(s[15]);
+                // 5152fb fadd dword ptr [esi + 4]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x4)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x4)) as usize)));
+                // 5152fe fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // 515300 fld dword ptr [esi + 8]
+                f[0] = ldq(rd((esi.wrapping_add(0x8)) as usize));
+                // 515303 fadd dword ptr [esp + 0x1c]
+                f[0] = xn3(f[0], ldr32(s[16]), f[0] + ldr32(s[16]));
+                // 515307 fstp dword ptr [edx + 4]
+                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // 51530a fld dword ptr [esi + 0xc]
+                f[0] = ldq(rd((esi.wrapping_add(0xc)) as usize));
+                // 51530d pop esi
+                esi = s[9];
+                // 51530e fadd dword ptr [esp + 0x1c]
+                f[0] = xn3(f[0], ldr32(s[17]), f[0] + ldr32(s[17]));
+                // 515312 pop ebp
+                ebp = s[10];
+                // 515313 pop ebx
+                ebx = s[11];
+                // 515314 fstp dword ptr [edx + 8]
+                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // 515317 add esp, 0x18
+                // 51531a ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x51531b => {
+                // 51531b fstp st(0)
+                // 51531d pop edi
+                edi = s[8];
+                // 51531e fld dword ptr [eax + 4]
+                f[0] = ldq(rd((eax.wrapping_add(0x4)) as usize));
+                // 515321 pop esi
+                esi = s[9];
+                // 515322 fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // 515324 pop ebp
+                ebp = s[10];
+                // 515325 fld dword ptr [eax + 8]
+                f[0] = ldq(rd((eax.wrapping_add(0x8)) as usize));
+                // 515328 pop ebx
+                ebx = s[11];
+                // 515329 fstp dword ptr [edx + 4]
+                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // 51532c fld dword ptr [eax + 0xc]
+                f[0] = ldq(rd((eax.wrapping_add(0xc)) as usize));
+                // 51532f mov eax, edx
+                eax = edx;
+                // 515331 fstp dword ptr [edx + 8]
+                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // 515334 add esp, 0x18
+                // 515337 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_569ec0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x569ec0u32;
+    loop {
+        match pc {
+            0x569ec0 => {
+                // 569ec0 push ecx
+                s[8] = ecx;
+                // 569ec1 cmp dword ptr [0xe9e6cc], 2
+                fl = fl_sub(rd((0xe9e6ccu32) as usize), 0x2u32, 32).1;
+                // 569ec8 jne 0x569f11
+                pc = if !fl.zf { 0x569f11 } else { 0x569eca };
+            }
+            0x569eca => {
+                // 569eca fild dword ptr [0xe9e6f0]
+                f[0] = (((rd((0xe9e6f0u32) as usize)) as i32) as f64);
+                // 569ed0 fidiv dword ptr [0xe9e6f4]
+                f[0] = xn3(f[0], (((rd((0xe9e6f4u32) as usize)) as i32) as f64), f[0] / (((rd((0xe9e6f4u32) as usize)) as i32) as f64));
+                // 569ed6 fldz 
+                f[1] = 0.0;
+                // 569ed8 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 569eda fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 569edc test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 569edf jp 0x569ef2
+                pc = if fl.pf { 0x569ef2 } else { 0x569ee1 };
+            }
+            0x569ee1 => {
+                // 569ee1 fld st(1)
+                f[2] = f[0];
+                // 569ee3 fld1 
+                f[3] = 1.0;
+                // 569ee5 fcom st(1)
+                cc87 = cc(f[3], f[2]);
+                // 569ee7 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 4);
+                // 569ee9 fstp st(1)
+                f[2] = f[3];
+                // 569eeb test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 569eee jne 0x569f05
+                pc = if !fl.zf { 0x569f05 } else { 0x569ef0 };
+            }
+            0x569ef0 => {
+                // 569ef0 fstp st(0)
+                pc = 0x569ef2;
+            }
+            0x569ef2 => {
+                // 569ef2 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 569ef4 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 569ef6 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 569ef9 jnp 0x569f07
+                pc = if !fl.pf { 0x569f07 } else { 0x569efb };
+            }
+            0x569efb => {
+                // 569efb fstp st(1)
+                f[0] = f[1];
+                // 569efd fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 569f00 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // 569f03 pop ecx
+                ecx = s[8];
+                // 569f04 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0x569f05 => {
+                // 569f05 fstp st(2)
+                f[0] = f[2];
+                pc = 0x569f07;
+            }
+            0x569f07 => {
+                // 569f07 fstp st(0)
+                // 569f09 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 569f0c fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // 569f0f pop ecx
+                ecx = s[8];
+                // 569f10 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0x569f11 => {
+                // 569f11 fld1 
+                f[0] = 1.0;
+                // 569f13 pop ecx
+                ecx = s[8];
+                // 569f14 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_6c6e00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x6c6e00u32;
+    loop {
+        match pc {
+            0x6c6e00 => {
+                // 6c6e00 cmp byte ptr [0x2527d14], 0
+                fl = fl_sub((rb((0x2527d14u32) as usize) as u32), 0x0u32, 8).1;
+                // 6c6e07 je 0x6c6e21
+                pc = if fl.zf { 0x6c6e21 } else { 0x6c6e09 };
+            }
+            0x6c6e09 => {
+                // 6c6e09 fld dword ptr [0x27e66fc]
+                f[0] = ldq(rd((0x27e66fcu32) as usize));
+                // 6c6e0f fld dword ptr [0x27e6700]
+                f[1] = ldq(rd((0x27e6700u32) as usize));
+                // 6c6e15 fcompp 
+                cc87 = cc(f[1], f[0]);
+                // 6c6e17 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 6c6e19 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 6c6e1c jp 0x6c6e21
+                pc = if fl.pf { 0x6c6e21 } else { 0x6c6e1e };
+            }
+            0x6c6e1e => {
+                // 6c6e1e mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // 6c6e20 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x6c6e21 => {
+                // 6c6e21 xor al, al
+                eax = set_part(eax, 0, 0xff, 0);
+                fl = fl_logic(0, 32);
+                // 6c6e23 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_6cb590(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x6cb590u32;
+    loop {
+        match pc {
+            0x6cb590 => {
+                // 6cb590 mov eax, dword ptr [0x2527d10]
+                eax = rd((0x2527d10u32) as usize);
+                // 6cb595 test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // 6cb597 jne 0x6cb59c
+                pc = if !fl.zf { 0x6cb59c } else { 0x6cb599 };
+            }
+            0x6cb599 => {
+                // 6cb599 mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // 6cb59b ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x6cb59c => {
+                // 6cb59c mov eax, dword ptr [eax + 0x1540]
+                eax = rd((eax.wrapping_add(0x1540)) as usize);
+                // 6cb5a2 add eax, 0x1c
+                let (r_, f_) = fl_add(eax, 0x1cu32, 32); fl = f_;
+                eax = r_;
+                // 6cb5a5 cmp byte ptr [eax], 0
+                fl = fl_sub((rb((eax) as usize) as u32), 0x0u32, 8).1;
+                // 6cb5a8 je 0x6cb5c8
+                pc = if fl.zf { 0x6cb5c8 } else { 0x6cb5aa };
+            }
+            0x6cb5aa => {
+                // 6cb5aa fld dword ptr [0x27e6710]
+                f[0] = ldq(rd((0x27e6710u32) as usize));
+                // 6cb5b0 fld dword ptr [eax + 0x18]
+                f[1] = ldq(rd((eax.wrapping_add(0x18)) as usize));
+                // 6cb5b3 fcompp 
+                cc87 = cc(f[1], f[0]);
+                // 6cb5b5 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 6cb5b7 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 6cb5ba jnp 0x6cb5c8
+                pc = if !fl.pf { 0x6cb5c8 } else { 0x6cb5bc };
+            }
+            0x6cb5bc => {
+                // 6cb5bc xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // 6cb5be xor ecx, ecx
+                ecx = 0;
+                fl = fl_logic(0, 32);
+                // 6cb5c0 cmp al, 1
+                fl = fl_sub((eax & 0xff), 0x1u32, 8).1;
+                // 6cb5c2 sete cl
+                ecx = set_part(ecx, 0, 0xff, (fl.zf) as u32);
+                // 6cb5c5 mov al, cl
+                eax = set_part(eax, 0, 0xff, (ecx & 0xff));
+                // 6cb5c7 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x6cb5c8 => {
+                // 6cb5c8 mov eax, 1
+                eax = 0x1u32;
+                // 6cb5cd xor ecx, ecx
+                ecx = 0;
+                fl = fl_logic(0, 32);
+                // 6cb5cf cmp al, al
+                fl = fl_sub((eax & 0xff), (eax & 0xff), 8).1;
+                // 6cb5d1 sete cl
+                ecx = set_part(ecx, 0, 0xff, (fl.zf) as u32);
+                // 6cb5d4 mov al, cl
+                eax = set_part(eax, 0, 0xff, (ecx & 0xff));
+                // 6cb5d6 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_6cc4c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x6cc4c0u32;
+    loop {
+        match pc {
+            0x6cc4c0 => {
+                // 6cc4c0 mov eax, dword ptr [0x2526d9c]
+                eax = rd((0x2526d9cu32) as usize);
+                // 6cc4c5 test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // 6cc4c7 je 0x6cc4e9
+                pc = if fl.zf { 0x6cc4e9 } else { 0x6cc4c9 };
+            }
+            0x6cc4c9 => {
+                // 6cc4c9 cmp eax, 2
+                fl = fl_sub(eax, 0x2u32, 32).1;
+                // 6cc4cc jne 0x6cc4d2
+                pc = if !fl.zf { 0x6cc4d2 } else { 0x6cc4ce };
+            }
+            0x6cc4ce => {
+                // 6cc4ce fldz 
+                f[0] = 0.0;
+                // 6cc4d0 jmp 0x6cc4d9
+                pc = 0x6cc4d9;
+            }
+            0x6cc4d2 => {
+                // 6cc4d2 cmp eax, 1
+                fl = fl_sub(eax, 0x1u32, 32).1;
+                // 6cc4d5 jne 0x6cc4e6
+                pc = if !fl.zf { 0x6cc4e6 } else { 0x6cc4d7 };
+            }
+            0x6cc4d7 => {
+                // 6cc4d7 fld1 
+                f[0] = 1.0;
+                pc = 0x6cc4d9;
+            }
+            0x6cc4d9 => {
+                // 6cc4d9 fcomp dword ptr [0x2526da0]
+                cc87 = cc(f[0], ldq(rd((0x2526da0u32) as usize)));
+                // 6cc4df fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 6cc4e1 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // 6cc4e4 jnp 0x6cc4e9
+                pc = if !fl.pf { 0x6cc4e9 } else { 0x6cc4e6 };
+            }
+            0x6cc4e6 => {
+                // 6cc4e6 xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // 6cc4e8 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x6cc4e9 => {
+                // 6cc4e9 mov eax, 1
+                eax = 0x1u32;
+                // 6cc4ee ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_6d7840(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    s[9] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x6d7840u32;
+    loop {
+        match pc {
+            0x6d7840 => {
+                // 6d7840 fldz 
+                f[0] = 0.0;
+                // 6d7842 mov ecx, dword ptr [esp + 4]
+                ecx = s[9];
+                // 6d7846 fcom dword ptr [ecx + 8]
+                cc87 = cc(f[0], ldq(rd((ecx.wrapping_add(0x8)) as usize)));
+                // 6d7849 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 6d784b test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 6d784e jp 0x6d788d
+                pc = if fl.pf { 0x6d788d } else { 0x6d7850 };
+            }
+            0x6d7850 => {
+                // 6d7850 fld dword ptr [0x27e6714]
+                f[1] = ldq(rd((0x27e6714u32) as usize));
+                // 6d7856 mov eax, dword ptr [0x2527d10]
+                eax = rd((0x2527d10u32) as usize);
+                // 6d785b fsub dword ptr [0x27e6710]
+                f[1] = xn3(f[1], ldr32(rd((0x27e6710u32) as usize)), f[1] - ldr32(rd((0x27e6710u32) as usize)));
+                // 6d7861 fstp dword ptr [esp + 4]
+                s[9] = (f[1] as f32).to_bits();
+                // 6d7865 fld dword ptr [esp + 4]
+                f[1] = ldq(s[9]);
+                // 6d7869 fsub dword ptr [ecx + 8]
+                f[1] = xn3(f[1], ldr32(rd((ecx.wrapping_add(0x8)) as usize)), f[1] - ldr32(rd((ecx.wrapping_add(0x8)) as usize)));
+                // 6d786c mov ecx, dword ptr [eax + 0x1540]
+                ecx = rd((eax.wrapping_add(0x1540)) as usize);
+                // 6d7872 fstp dword ptr [esp + 4]
+                s[9] = (f[1] as f32).to_bits();
+                // 6d7876 fld dword ptr [esp + 4]
+                f[1] = ldq(s[9]);
+                // 6d787a fstp dword ptr [ecx + 0x164]
+                w.d((ecx.wrapping_add(0x164)) as usize, (f[1] as f32).to_bits());
+                // 6d7880 mov edx, dword ptr [eax + 0x1540]
+                edx = rd((eax.wrapping_add(0x1540)) as usize);
+                // 6d7886 fstp dword ptr [edx + 0x168]
+                w.d((edx.wrapping_add(0x168)) as usize, (f[0] as f32).to_bits());
+                // 6d788c ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x6d788d => {
+                // 6d788d fstp st(0)
+                // 6d788f ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_6d8170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 24];
+    s[12] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x6d8170u32;
+    loop {
+        match pc {
+            0x6d8170 => {
+                // 6d8170 mov eax, dword ptr [esp + 4]
+                eax = s[12];
+                // 6d8174 fldz 
+                f[0] = 0.0;
+                // 6d8176 mov ecx, dword ptr [eax + 8]
+                ecx = rd((eax.wrapping_add(0x8)) as usize);
+                // 6d8179 fcom dword ptr [ecx]
+                cc87 = cc(f[0], ldq(rd((ecx) as usize)));
+                // 6d817b sub esp, 0xc
+                // 6d817e fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 6d8180 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 6d8183 jp 0x6d81d3
+                pc = if fl.pf { 0x6d81d3 } else { 0x6d8185 };
+            }
+            0x6d8185 => {
+                // 6d8185 fcom dword ptr [ecx + 4]
+                cc87 = cc(f[0], ldq(rd((ecx.wrapping_add(0x4)) as usize)));
+                // 6d8188 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 6d818a test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 6d818d jp 0x6d81d3
+                pc = if fl.pf { 0x6d81d3 } else { 0x6d818f };
+            }
+            0x6d818f => {
+                // 6d818f fcomp dword ptr [ecx + 8]
+                cc87 = cc(f[0], ldq(rd((ecx.wrapping_add(0x8)) as usize)));
+                // 6d8192 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 6d8194 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 6d8197 jp 0x6d81d5
+                pc = if fl.pf { 0x6d81d5 } else { 0x6d8199 };
+            }
+            0x6d8199 => {
+                // 6d8199 fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                // 6d819b fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 6d819e fld dword ptr [ecx + 4]
+                f[0] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
+                // 6d81a1 fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // 6d81a5 mov edx, dword ptr [esp + 4]
+                edx = s[9];
+                // 6d81a9 fld dword ptr [ecx + 8]
+                f[0] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
+                // 6d81ac mov ecx, dword ptr [esp]
+                ecx = s[8];
+                // 6d81af fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // 6d81b3 mov eax, dword ptr [esp + 8]
+                eax = s[10];
+                // 6d81b7 mov byte ptr [0x2658ca4], 1
+                w.b((0x2658ca4u32) as usize, (0x1u32) as u8);
+                // 6d81be mov dword ptr [0x2658ca8], ecx
+                w.d((0x2658ca8u32) as usize, ecx);
+                // 6d81c4 mov dword ptr [0x2658cac], edx
+                w.d((0x2658cacu32) as usize, edx);
+                // 6d81ca mov dword ptr [0x2658cb0], eax
+                w.d((0x2658cb0u32) as usize, eax);
+                // 6d81cf add esp, 0xc
+                // 6d81d2 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x6d81d3 => {
+                // 6d81d3 fstp st(0)
+                pc = 0x6d81d5;
+            }
+            0x6d81d5 => {
+                // 6d81d5 mov byte ptr [0x2658ca4], 0
+                w.b((0x2658ca4u32) as usize, (0x0u32) as u8);
+                // 6d81dc add esp, 0xc
+                // 6d81df ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_6d8240(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    s[9] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x6d8240u32;
+    loop {
+        match pc {
+            0x6d8240 => {
+                // 6d8240 mov eax, dword ptr [esp + 4]
+                eax = s[9];
+                // 6d8244 fld dword ptr [eax + 8]
+                f[0] = ldq(rd((eax.wrapping_add(0x8)) as usize));
+                // 6d8247 fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // 6d824b fldz 
+                f[0] = 0.0;
+                // 6d824d fld dword ptr [esp + 4]
+                f[1] = ldq(s[9]);
+                // 6d8251 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 6d8253 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 6d8255 test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // 6d8258 jne 0x6d826a
+                pc = if !fl.zf { 0x6d826a } else { 0x6d825a };
+            }
+            0x6d825a => {
+                // 6d825a fstp st(1)
+                f[0] = f[1];
+                // 6d825c mov byte ptr [0x2526d78], 1
+                w.b((0x2526d78u32) as usize, (0x1u32) as u8);
+                // 6d8263 fstp dword ptr [0x2526d7c]
+                w.d((0x2526d7cu32) as usize, (f[0] as f32).to_bits());
+                // 6d8269 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x6d826a => {
+                // 6d826a fstp st(0)
+                // 6d826c mov byte ptr [0x2526d78], 0
+                w.b((0x2526d78u32) as usize, (0x0u32) as u8);
+                // 6d8273 fstp dword ptr [0x2526d7c]
+                w.d((0x2526d7cu32) as usize, (f[0] as f32).to_bits());
+                // 6d8279 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_7277f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    s[9] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x7277f0u32;
+    loop {
+        match pc {
+            0x7277f0 => {
+                // 7277f0 mov eax, dword ptr [esp + 4]
+                eax = s[9];
+                // 7277f4 movzx eax, word ptr [eax]
+                eax = (rw((eax) as usize) as u32);
+                // 7277f7 movzx eax, ax
+                eax = (eax & 0xffff);
+                // 7277fa mov ecx, eax
+                ecx = eax;
+                // 7277fc mov edx, eax
+                edx = eax;
+                // 7277fe and ecx, 0xffff8000
+                let r_ = (ecx) & (0xffff8000u32);
+                fl = fl_logic(r_, 32);
+                ecx = r_;
+                // 727804 shr eax, 0xb
+                let (r_, f_) = fl_shift("shr", eax, 11, 32); fl = f_;
+                eax = r_;
+                // 727807 shl ecx, 4
+                let (r_, f_) = fl_shift("shl", ecx, 4, 32); fl = f_;
+                ecx = r_;
+                // 72780a and eax, 0xf
+                let r_ = (eax) & (0xfu32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // 72780d and edx, 0x7ff
+                let r_ = (edx) & (0x7ffu32);
+                fl = fl_logic(r_, 32);
+                edx = r_;
+                // 727813 or ecx, edx
+                let r_ = (ecx) | (edx);
+                fl = fl_logic(r_, 32);
+                ecx = r_;
+                // 727815 add eax, 0x78
+                let (r_, f_) = fl_add(eax, 0x78u32, 32); fl = f_;
+                eax = r_;
+                // 727818 shl eax, 0x17
+                let (r_, f_) = fl_shift("shl", eax, 23, 32); fl = f_;
+                eax = r_;
+                // 72781b shl ecx, 0xc
+                let (r_, f_) = fl_shift("shl", ecx, 12, 32); fl = f_;
+                ecx = r_;
+                // 72781e or ecx, eax
+                let r_ = (ecx) | (eax);
+                fl = fl_logic(r_, 32);
+                ecx = r_;
+                // 727820 mov dword ptr [esp + 4], ecx
+                s[9] = ecx;
+                // 727824 fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // 727828 fld dword ptr [0x176be14]
+                f[1] = ldq(rd((0x176be14u32) as usize));
+                // 72782e fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 727830 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 727832 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 727835 jne 0x727864
+                pc = if !fl.zf { 0x727864 } else { 0x727837 };
+            }
+            0x727837 => {
+                // 727837 fld st(1)
+                f[2] = f[0];
+                // 727839 fadd qword ptr [0xe5c700]
+                f[2] = xn3(f[2], f64::from_bits(rq((0xe5c700u32) as usize)), f[2] + f64::from_bits(rq((0xe5c700u32) as usize)));
+                // 72783f fsub st(1)
+                f[2] = xn3(f[2], f[1], f[2] - f[1]);
+                // 727841 fld st(1)
+                f[3] = f[1];
+                // 727843 fsub st(3)
+                f[3] = xn3(f[3], f[0], f[3] - f[0]);
+                // 727845 fcomp st(1)
+                cc87 = cc(f[3], f[2]);
+                // 727847 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 3);
+                // 727849 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 72784c jne 0x727859
+                pc = if !fl.zf { 0x727859 } else { 0x72784e };
+            }
+            0x72784e => {
+                // 72784e fstp st(2)
+                f[0] = f[2];
+                // 727850 fstp st(0)
+                // 727852 fstp dword ptr [0x2527e3c]
+                w.d((0x2527e3cu32) as usize, (f[0] as f32).to_bits());
+                // 727858 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x727859 => {
+                // 727859 fstp st(0)
+                // 72785b fsubp st(1)
+                f[0] = xn3(f[0], f[1], f[0] - f[1]);
+                // 72785d fstp dword ptr [0x2527e3c]
+                w.d((0x2527e3cu32) as usize, (f[0] as f32).to_bits());
+                // 727863 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x727864 => {
+                // 727864 fld qword ptr [0xe5c700]
+                f[2] = f64::from_bits(q64(rq((0xe5c700u32) as usize)));
+                // 72786a fadd st(1)
+                f[2] = xn3(f[2], f[1], f[2] + f[1]);
+                // 72786c fsub st(2)
+                f[2] = xn3(f[2], f[0], f[2] - f[0]);
+                // 72786e fxch st(2)
+                f.swap(2, 0);
+                // 727870 fsubrp st(1)
+                f[1] = xn3(f[1], f[2], f[2] - f[1]);
+                // 727872 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 727874 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 727876 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 727879 jne 0x727886
+                pc = if !fl.zf { 0x727886 } else { 0x72787b };
+            }
+            0x72787b => {
+                // 72787b fstp st(0)
+                // 72787d fchs 
+                f[0] = -f[0];
+                // 72787f fstp dword ptr [0x2527e3c]
+                w.d((0x2527e3cu32) as usize, (f[0] as f32).to_bits());
+                // 727885 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x727886 => {
+                // 727886 fstp st(1)
+                f[0] = f[1];
+                // 727888 fstp dword ptr [0x2527e3c]
+                w.d((0x2527e3cu32) as usize, (f[0] as f32).to_bits());
+                // 72788e ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_92a8e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 24];
+    s[11] = unsafe { *a.add(0) };
+    s[12] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x92a8e0u32;
+    loop {
+        match pc {
+            0x92a8e0 => {
+                // 92a8e0 cmp byte ptr [ecx + 0x244], 1
+                fl = fl_sub((rb((ecx.wrapping_add(0x244)) as usize) as u32), 0x1u32, 8).1;
+                // 92a8e7 je 0x92a906
+                pc = if fl.zf { 0x92a906 } else { 0x92a8e9 };
+            }
+            0x92a8e9 => {
+                // 92a8e9 fldz 
+                f[0] = 0.0;
+                // 92a8eb mov eax, dword ptr [esp + 4]
+                eax = s[11];
+                // 92a8ef fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // 92a8f1 fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // 92a8f4 fst dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // 92a8f7 mov eax, dword ptr [esp + 8]
+                eax = s[12];
+                // 92a8fb fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // 92a8fd fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // 92a900 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // 92a903 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x92a906 => {
+                // 92a906 mov eax, dword ptr [ecx + 0x1e8]
+                eax = rd((ecx.wrapping_add(0x1e8)) as usize);
+                // 92a90c mov edx, dword ptr [eax + 0x30]
+                edx = rd((eax.wrapping_add(0x30)) as usize);
+                // 92a90f mov eax, dword ptr [esp + 4]
+                eax = s[11];
+                // 92a913 push esi
+                s[9] = esi;
+                // 92a914 mov esi, dword ptr [edx]
+                esi = rd((edx) as usize);
+                // 92a916 mov dword ptr [eax], esi
+                w.d((eax) as usize, esi);
+                // 92a918 mov esi, dword ptr [edx + 4]
+                esi = rd((edx.wrapping_add(0x4)) as usize);
+                // 92a91b mov dword ptr [eax + 4], esi
+                w.d((eax.wrapping_add(0x4)) as usize, esi);
+                // 92a91e mov edx, dword ptr [edx + 8]
+                edx = rd((edx.wrapping_add(0x8)) as usize);
+                // 92a921 mov dword ptr [eax + 8], edx
+                w.d((eax.wrapping_add(0x8)) as usize, edx);
+                // 92a924 mov edx, dword ptr [ecx + 0x1e8]
+                edx = rd((ecx.wrapping_add(0x1e8)) as usize);
+                // 92a92a mov esi, dword ptr [edx + 0x30]
+                esi = rd((edx.wrapping_add(0x30)) as usize);
+                // 92a92d mov edx, dword ptr [esp + 0xc]
+                edx = s[12];
+                // 92a931 add esi, 0xc
+                let (r_, f_) = fl_add(esi, 0xcu32, 32); fl = f_;
+                esi = r_;
+                // 92a934 push edi
+                s[8] = edi;
+                // 92a935 mov edi, dword ptr [esi]
+                edi = rd((esi) as usize);
+                // 92a937 mov dword ptr [edx], edi
+                w.d((edx) as usize, edi);
+                // 92a939 mov edi, dword ptr [esi + 4]
+                edi = rd((esi.wrapping_add(0x4)) as usize);
+                // 92a93c mov dword ptr [edx + 4], edi
+                w.d((edx.wrapping_add(0x4)) as usize, edi);
+                // 92a93f mov esi, dword ptr [esi + 8]
+                esi = rd((esi.wrapping_add(0x8)) as usize);
+                // 92a942 mov dword ptr [edx + 8], esi
+                w.d((edx.wrapping_add(0x8)) as usize, esi);
+                // 92a945 fld dword ptr [ecx + 0x1ec]
+                f[0] = ldq(rd((ecx.wrapping_add(0x1ec)) as usize));
+                // 92a94b fmul dword ptr [eax]
+                f[0] = xn3(f[0], ldr32(rd((eax) as usize)), f[0] * ldr32(rd((eax) as usize)));
+                // 92a94d pop edi
+                edi = s[8];
+                // 92a94e pop esi
+                esi = s[9];
+                // 92a94f fstp dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // 92a951 fld dword ptr [ecx + 0x1f0]
+                f[0] = ldq(rd((ecx.wrapping_add(0x1f0)) as usize));
+                // 92a957 fmul dword ptr [eax + 4]
+                f[0] = xn3(f[0], ldr32(rd((eax.wrapping_add(0x4)) as usize)), f[0] * ldr32(rd((eax.wrapping_add(0x4)) as usize)));
+                // 92a95a fstp dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // 92a95d fld dword ptr [ecx + 0x1f4]
+                f[0] = ldq(rd((ecx.wrapping_add(0x1f4)) as usize));
+                // 92a963 fmul dword ptr [eax + 8]
+                f[0] = xn3(f[0], ldr32(rd((eax.wrapping_add(0x8)) as usize)), f[0] * ldr32(rd((eax.wrapping_add(0x8)) as usize)));
+                // 92a966 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // 92a969 fld dword ptr [edx]
+                f[0] = ldq(rd((edx) as usize));
+                // 92a96b fmul dword ptr [ecx + 0x1ec]
+                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0x1ec)) as usize)), f[0] * ldr32(rd((ecx.wrapping_add(0x1ec)) as usize)));
+                // 92a971 fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // 92a973 fld dword ptr [ecx + 0x1f0]
+                f[0] = ldq(rd((ecx.wrapping_add(0x1f0)) as usize));
+                // 92a979 fmul dword ptr [edx + 4]
+                f[0] = xn3(f[0], ldr32(rd((edx.wrapping_add(0x4)) as usize)), f[0] * ldr32(rd((edx.wrapping_add(0x4)) as usize)));
+                // 92a97c fstp dword ptr [edx + 4]
+                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // 92a97f fld dword ptr [ecx + 0x1f4]
+                f[0] = ldq(rd((ecx.wrapping_add(0x1f4)) as usize));
+                // 92a985 fmul dword ptr [edx + 8]
+                f[0] = xn3(f[0], ldr32(rd((edx.wrapping_add(0x8)) as usize)), f[0] * ldr32(rd((edx.wrapping_add(0x8)) as usize)));
+                // 92a988 fstp dword ptr [edx + 8]
+                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // 92a98b ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_9b5c80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 22];
+    s[9] = unsafe { *a.add(0) };
+    s[10] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x9b5c80u32;
+    loop {
+        match pc {
+            0x9b5c80 => {
+                // 9b5c80 mov eax, dword ptr [esp + 4]
+                eax = s[9];
+                // 9b5c84 add eax, 0x730
+                let (r_, f_) = fl_add(eax, 0x730u32, 32); fl = f_;
+                eax = r_;
+                // 9b5c89 je 0x9b5cda
+                pc = if fl.zf { 0x9b5cda } else { 0x9b5c8b };
+            }
+            0x9b5c8b => {
+                // 9b5c8b xor ecx, dword ptr [eax + 0x30]
+                let r_ = (ecx) ^ (rd((eax.wrapping_add(0x30)) as usize));
+                fl = fl_logic(r_, 32);
+                ecx = r_;
+                // 9b5c8e fldz 
+                f[0] = 0.0;
+                // 9b5c90 fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // 9b5c92 and ecx, 1
+                let r_ = (ecx) & (0x1u32);
+                fl = fl_logic(r_, 32);
+                ecx = r_;
+                // 9b5c95 fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // 9b5c98 xor dword ptr [eax + 0x30], ecx
+                let r_ = (rd((eax.wrapping_add(0x30)) as usize)) ^ (ecx);
+                fl = fl_logic(r_, 32);
+                w.d((eax.wrapping_add(0x30)) as usize, r_);
+                // 9b5c9b fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // 9b5c9e mov ecx, dword ptr [esp + 8]
+                ecx = s[10];
+                // 9b5ca2 mov dword ptr [eax + 0xc], ecx
+                w.d((eax.wrapping_add(0xc)) as usize, ecx);
+                // 9b5ca5 fld dword ptr [0xdd0c54]
+                f[0] = ldq(rd((0xdd0c54u32) as usize));
+                // 9b5cab or byte ptr [eax + 0x2c], 1
+                let r_ = ((rb((eax.wrapping_add(0x2c)) as usize) as u32)) | (0x1u32);
+                fl = fl_logic(r_, 8);
+                w.b((eax.wrapping_add(0x2c)) as usize, (r_) as u8);
+                // 9b5caf fstp dword ptr [eax + 0x1c]
+                w.d((eax.wrapping_add(0x1c)) as usize, (f[0] as f32).to_bits());
+                // 9b5cb2 test edx, edx
+                let r_ = (edx) & (edx);
+                fl = fl_logic(r_, 32);
+                // 9b5cb4 jle 0x9b5cd3
+                pc = if (fl.zf || fl.sf != fl.of) { 0x9b5cd3 } else { 0x9b5cb6 };
+            }
+            0x9b5cb6 => {
+                // 9b5cb6 mov ecx, dword ptr [0xe843ac]
+                ecx = rd((0xe843acu32) as usize);
+                // 9b5cbc add ecx, edx
+                let (r_, f_) = fl_add(ecx, edx, 32); fl = f_;
+                ecx = r_;
+                // 9b5cbe cmp ecx, 0x6b49d200
+                fl = fl_sub(ecx, 0x6b49d200u32, 32).1;
+                // 9b5cc4 mov dword ptr [eax + 0x18], ecx
+                w.d((eax.wrapping_add(0x18)) as usize, ecx);
+                // 9b5cc7 jle 0x9b5cda
+                pc = if (fl.zf || fl.sf != fl.of) { 0x9b5cda } else { 0x9b5cc9 };
+            }
+            0x9b5cc9 => {
+                // 9b5cc9 add ecx, 0x94b62e00
+                let (r_, f_) = fl_add(ecx, 0x94b62e00u32, 32); fl = f_;
+                ecx = r_;
+                // 9b5ccf mov dword ptr [eax + 0x18], ecx
+                w.d((eax.wrapping_add(0x18)) as usize, ecx);
+                // 9b5cd2 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x9b5cd3 => {
+                // 9b5cd3 mov dword ptr [eax + 0x18], 0xffffffff
+                w.d((eax.wrapping_add(0x18)) as usize, 0xffffffffu32);
+                pc = 0x9b5cda;
+            }
+            0x9b5cda => {
+                // 9b5cda ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_a00230(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 22];
+    s[9] = unsafe { *a.add(0) };
+    s[10] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xa00230u32;
+    loop {
+        match pc {
+            0xa00230 => {
+                // a00230 movzx eax, word ptr [ecx + 0x48]
+                eax = (rw((ecx.wrapping_add(0x48)) as usize) as u32);
+                // a00234 cmp ax, 0xbeef
+                fl = fl_sub((eax & 0xffff), 0xbeefu32, 16).1;
+                // a00238 je 0xa00260
+                pc = if fl.zf { 0xa00260 } else { 0xa0023a };
+            }
+            0xa0023a => {
+                // a0023a movzx eax, ax
+                eax = (eax & 0xffff);
+                // a0023d cmp eax, 0xffff
+                fl = fl_sub(eax, 0xffffu32, 32).1;
+                // a00242 je 0xa00260
+                pc = if fl.zf { 0xa00260 } else { 0xa00244 };
+            }
+            0xa00244 => {
+                // a00244 cmp eax, 0x866
+                fl = fl_sub(eax, 0x866u32, 32).1;
+                // a00249 jae 0xa00260
+                pc = if !fl.cf { 0xa00260 } else { 0xa0024b };
+            }
+            0xa0024b => {
+                // a0024b mov eax, dword ptr [eax*4 + 0xf7aae8]
+                eax = rd((eax.wrapping_mul(4).wrapping_add(0xf7aae8)) as usize);
+                // a00252 test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // a00254 je 0xa00260
+                pc = if fl.zf { 0xa00260 } else { 0xa00256 };
+            }
+            0xa00256 => {
+                // a00256 mov eax, dword ptr [ecx + 0x13c]
+                eax = rd((ecx.wrapping_add(0x13c)) as usize);
+                // a0025c test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // a0025e jne 0xa0027d
+                pc = if !fl.zf { 0xa0027d } else { 0xa00260 };
+            }
+            0xa00260 => {
+                // a00260 fldz 
+                f[0] = 0.0;
+                // a00262 mov eax, dword ptr [esp + 4]
+                eax = s[9];
+                // a00266 fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a00268 fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a0026b fst dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a0026e mov eax, dword ptr [esp + 8]
+                eax = s[10];
+                // a00272 fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a00274 fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a00277 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a0027a ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xa0027d => {
+                // a0027d mov edx, dword ptr [eax]
+                edx = rd((eax) as usize);
+                // a0027f mov ecx, dword ptr [esp + 4]
+                ecx = s[9];
+                // a00283 mov dword ptr [ecx], edx
+                w.d((ecx) as usize, edx);
+                // a00285 mov edx, dword ptr [eax + 4]
+                edx = rd((eax.wrapping_add(0x4)) as usize);
+                // a00288 mov dword ptr [ecx + 4], edx
+                w.d((ecx.wrapping_add(0x4)) as usize, edx);
+                // a0028b mov edx, dword ptr [eax + 8]
+                edx = rd((eax.wrapping_add(0x8)) as usize);
+                // a0028e mov dword ptr [ecx + 8], edx
+                w.d((ecx.wrapping_add(0x8)) as usize, edx);
+                // a00291 mov edx, dword ptr [eax + 0x10]
+                edx = rd((eax.wrapping_add(0x10)) as usize);
+                // a00294 mov ecx, dword ptr [esp + 8]
+                ecx = s[10];
+                // a00298 mov dword ptr [ecx], edx
+                w.d((ecx) as usize, edx);
+                // a0029a mov edx, dword ptr [eax + 0x14]
+                edx = rd((eax.wrapping_add(0x14)) as usize);
+                // a0029d mov dword ptr [ecx + 4], edx
+                w.d((ecx.wrapping_add(0x4)) as usize, edx);
+                // a002a0 mov eax, dword ptr [eax + 0x18]
+                eax = rd((eax.wrapping_add(0x18)) as usize);
+                // a002a3 mov dword ptr [ecx + 8], eax
+                w.d((ecx.wrapping_add(0x8)) as usize, eax);
+                // a002a6 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_a002b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[10] = unsafe { *a.add(0) };
+    s[11] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xa002b0u32;
+    loop {
+        match pc {
+            0xa002b0 => {
+                // a002b0 movzx eax, word ptr [ecx + 0x48]
+                eax = (rw((ecx.wrapping_add(0x48)) as usize) as u32);
+                // a002b4 cmp ax, 0xbeef
+                fl = fl_sub((eax & 0xffff), 0xbeefu32, 16).1;
+                // a002b8 je 0xa002e0
+                pc = if fl.zf { 0xa002e0 } else { 0xa002ba };
+            }
+            0xa002ba => {
+                // a002ba movzx eax, ax
+                eax = (eax & 0xffff);
+                // a002bd cmp eax, 0xffff
+                fl = fl_sub(eax, 0xffffu32, 32).1;
+                // a002c2 je 0xa002e0
+                pc = if fl.zf { 0xa002e0 } else { 0xa002c4 };
+            }
+            0xa002c4 => {
+                // a002c4 cmp eax, 0x866
+                fl = fl_sub(eax, 0x866u32, 32).1;
+                // a002c9 jae 0xa002e0
+                pc = if !fl.cf { 0xa002e0 } else { 0xa002cb };
+            }
+            0xa002cb => {
+                // a002cb mov eax, dword ptr [eax*4 + 0xf7aae8]
+                eax = rd((eax.wrapping_mul(4).wrapping_add(0xf7aae8)) as usize);
+                // a002d2 test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // a002d4 je 0xa002e0
+                pc = if fl.zf { 0xa002e0 } else { 0xa002d6 };
+            }
+            0xa002d6 => {
+                // a002d6 mov ecx, dword ptr [ecx + 0x13c]
+                ecx = rd((ecx.wrapping_add(0x13c)) as usize);
+                // a002dc test ecx, ecx
+                let r_ = (ecx) & (ecx);
+                fl = fl_logic(r_, 32);
+                // a002de jne 0xa002fd
+                pc = if !fl.zf { 0xa002fd } else { 0xa002e0 };
+            }
+            0xa002e0 => {
+                // a002e0 fldz 
+                f[0] = 0.0;
+                // a002e2 mov eax, dword ptr [esp + 4]
+                eax = s[10];
+                // a002e6 fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a002e8 fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a002eb fst dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a002ee mov eax, dword ptr [esp + 8]
+                eax = s[11];
+                // a002f2 fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a002f4 fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a002f7 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a002fa ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xa002fd => {
+                // a002fd push esi
+                s[8] = esi;
+                // a002fe mov esi, dword ptr [ecx + 0x48]
+                esi = rd((ecx.wrapping_add(0x48)) as usize);
+                // a00301 test esi, esi
+                let r_ = (esi) & (esi);
+                fl = fl_logic(r_, 32);
+                // a00303 je 0xa00317
+                pc = if fl.zf { 0xa00317 } else { 0xa00305 };
+            }
+            0xa00305 => {
+                // a00305 mov eax, dword ptr [ecx + 0x30]
+                eax = rd((ecx.wrapping_add(0x30)) as usize);
+                // a00308 and eax, 0x10000
+                let r_ = (eax) & (0x10000u32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // a0030d xor edx, edx
+                edx = 0;
+                fl = fl_logic(0, 32);
+                // a0030f or eax, edx
+                let r_ = (eax) | (edx);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // a00311 je 0xa00317
+                pc = if fl.zf { 0xa00317 } else { 0xa00313 };
+            }
+            0xa00313 => {
+                // a00313 mov ecx, esi
+                ecx = esi;
+                // a00315 jmp 0xa0031a
+                pc = 0xa0031a;
+            }
+            0xa00317 => {
+                // a00317 mov ecx, dword ptr [ecx + 0x40]
+                ecx = rd((ecx.wrapping_add(0x40)) as usize);
+                pc = 0xa0031a;
+            }
+            0xa0031a => {
+                // a0031a mov ecx, dword ptr [ecx + 0x58]
+                ecx = rd((ecx.wrapping_add(0x58)) as usize);
+                // a0031d mov eax, dword ptr [ecx]
+                eax = rd((ecx) as usize);
+                // a0031f mov esi, dword ptr [eax]
+                esi = rd((eax) as usize);
+                // a00321 mov edx, dword ptr [esp + 8]
+                edx = s[10];
+                // a00325 mov dword ptr [edx], esi
+                w.d((edx) as usize, esi);
+                // a00327 mov esi, dword ptr [eax + 4]
+                esi = rd((eax.wrapping_add(0x4)) as usize);
+                // a0032a mov dword ptr [edx + 4], esi
+                w.d((edx.wrapping_add(0x4)) as usize, esi);
+                // a0032d mov eax, dword ptr [eax + 8]
+                eax = rd((eax.wrapping_add(0x8)) as usize);
+                // a00330 mov dword ptr [edx + 8], eax
+                w.d((edx.wrapping_add(0x8)) as usize, eax);
+                // a00333 mov eax, dword ptr [ecx]
+                eax = rd((ecx) as usize);
+                // a00335 mov edx, dword ptr [eax + 0xc]
+                edx = rd((eax.wrapping_add(0xc)) as usize);
+                // a00338 mov ecx, dword ptr [esp + 0xc]
+                ecx = s[11];
+                // a0033c add eax, 0xc
+                let (r_, f_) = fl_add(eax, 0xcu32, 32); fl = f_;
+                eax = r_;
+                // a0033f mov dword ptr [ecx], edx
+                w.d((ecx) as usize, edx);
+                // a00341 mov edx, dword ptr [eax + 4]
+                edx = rd((eax.wrapping_add(0x4)) as usize);
+                // a00344 mov dword ptr [ecx + 4], edx
+                w.d((ecx.wrapping_add(0x4)) as usize, edx);
+                // a00347 mov eax, dword ptr [eax + 8]
+                eax = rd((eax.wrapping_add(0x8)) as usize);
+                // a0034a mov dword ptr [ecx + 8], eax
+                w.d((ecx.wrapping_add(0x8)) as usize, eax);
+                // a0034d pop esi
+                esi = s[8];
+                // a0034e ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_a6be10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 24];
+    s[11] = unsafe { *a.add(0) };
+    s[12] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xa6be10u32;
+    loop {
+        match pc {
+            0xa6be10 => {
+                // a6be10 mov eax, dword ptr [ecx + 0x120]
+                eax = rd((ecx.wrapping_add(0x120)) as usize);
+                // a6be16 sub esp, 8
+                // a6be19 sub eax, 0
+                let (r_, f_) = fl_sub(eax, 0x0u32, 32); fl = f_;
+                eax = r_;
+                // a6be1c je 0xa6bee0
+                pc = if fl.zf { 0xa6bee0 } else { 0xa6be22 };
+            }
+            0xa6be22 => {
+                // a6be22 sub eax, 1
+                let (r_, f_) = fl_sub(eax, 0x1u32, 32); fl = f_;
+                eax = r_;
+                // a6be25 je 0xa6be9c
+                pc = if fl.zf { 0xa6be9c } else { 0xa6be27 };
+            }
+            0xa6be27 => {
+                // a6be27 sub eax, 1
+                let (r_, f_) = fl_sub(eax, 0x1u32, 32); fl = f_;
+                eax = r_;
+                // a6be2a mov eax, dword ptr [esp + 0xc]
+                eax = s[11];
+                // a6be2e je 0xa6be4c
+                pc = if fl.zf { 0xa6be4c } else { 0xa6be30 };
+            }
+            0xa6be30 => {
+                // a6be30 fldz 
+                f[0] = 0.0;
+                // a6be32 fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a6be34 fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a6be37 fst dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a6be3a mov eax, dword ptr [esp + 0x10]
+                eax = s[12];
+                // a6be3e fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a6be40 fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a6be43 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a6be46 add esp, 8
+                // a6be49 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xa6be4c => {
+                // a6be4c fld dword ptr [ecx + 0x128]
+                f[0] = ldq(rd((ecx.wrapping_add(0x128)) as usize));
+                // a6be52 fchs 
+                f[0] = -f[0];
+                // a6be54 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // a6be57 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // a6be5a fst dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // a6be5d fstp dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a6be5f fldz 
+                f[0] = 0.0;
+                // a6be61 fstp dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a6be64 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // a6be67 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a6be6a fld dword ptr [ecx + 0x124]
+                f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
+                // a6be70 mov eax, dword ptr [esp + 0x10]
+                eax = s[12];
+                // a6be74 fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // a6be78 fld dword ptr [ecx + 0x128]
+                f[0] = ldq(rd((ecx.wrapping_add(0x128)) as usize));
+                // a6be7e fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // a6be81 fld dword ptr [ecx + 0x128]
+                f[0] = ldq(rd((ecx.wrapping_add(0x128)) as usize));
+                // a6be87 fstp dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a6be89 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[11]);
+                // a6be8d fstp dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a6be90 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // a6be93 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a6be96 add esp, 8
+                // a6be99 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xa6be9c => {
+                // a6be9c fld dword ptr [ecx + 0x124]
+                f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
+                // a6bea2 mov eax, dword ptr [esp + 0xc]
+                eax = s[11];
+                // a6bea6 fchs 
+                f[0] = -f[0];
+                // a6bea8 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // a6beab fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // a6beae fst dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // a6beb1 fst dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // a6beb5 fstp dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a6beb7 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // a6beba fstp dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a6bebd fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // a6bec1 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a6bec4 fld dword ptr [ecx + 0x124]
+                f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
+                // a6beca fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // a6bece fld dword ptr [ecx + 0x124]
+                f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
+                // a6bed4 fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // a6bed8 fld dword ptr [ecx + 0x124]
+                f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
+                // a6bede jmp 0xa6bf26
+                pc = 0xa6bf26;
+            }
+            0xa6bee0 => {
+                // a6bee0 fld dword ptr [ecx + 0x128]
+                f[0] = ldq(rd((ecx.wrapping_add(0x128)) as usize));
+                // a6bee6 mov eax, dword ptr [esp + 0xc]
+                eax = s[11];
+                // a6beea fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // a6beee fld dword ptr [ecx + 0x12c]
+                f[0] = ldq(rd((ecx.wrapping_add(0x12c)) as usize));
+                // a6bef4 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // a6bef7 fld dword ptr [ecx + 0x124]
+                f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
+                // a6befd fstp dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a6beff fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // a6bf03 fstp dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a6bf06 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // a6bf09 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a6bf0c fld dword ptr [ecx + 0x134]
+                f[0] = ldq(rd((ecx.wrapping_add(0x134)) as usize));
+                // a6bf12 fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // a6bf16 fld dword ptr [ecx + 0x138]
+                f[0] = ldq(rd((ecx.wrapping_add(0x138)) as usize));
+                // a6bf1c fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // a6bf20 fld dword ptr [ecx + 0x130]
+                f[0] = ldq(rd((ecx.wrapping_add(0x130)) as usize));
+                pc = 0xa6bf26;
+            }
+            0xa6bf26 => {
+                // a6bf26 mov eax, dword ptr [esp + 0x10]
+                eax = s[12];
+                // a6bf2a fstp dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // a6bf2c fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[11]);
+                // a6bf30 fstp dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // a6bf33 fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // a6bf37 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // a6bf3a add esp, 8
+                // a6bf3d ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_a97a90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xa97a90u32;
+    loop {
+        match pc {
+            0xa97a90 => {
+                // a97a90 push ecx
+                s[8] = ecx;
+                // a97a91 test byte ptr [eax + 0xcc], 2
+                let r_ = ((rb((eax.wrapping_add(0xcc)) as usize) as u32)) & (0x2u32);
+                fl = fl_logic(r_, 8);
+                // a97a98 je 0xa97aa5
+                pc = if fl.zf { 0xa97aa5 } else { 0xa97a9a };
+            }
+            0xa97a9a => {
+                // a97a9a fld dword ptr [eax + 0x7c]
+                f[0] = ldq(rd((eax.wrapping_add(0x7c)) as usize));
+                // a97a9d fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // a97aa0 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // a97aa3 pop ecx
+                ecx = s[8];
+                // a97aa4 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xa97aa5 => {
+                // a97aa5 fldz 
+                f[0] = 0.0;
+                // a97aa7 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // a97aaa fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // a97aad pop ecx
+                ecx = s[8];
+                // a97aae ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_aa4400(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 22];
+    s[9] = unsafe { *a.add(0) };
+    s[10] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xaa4400u32;
+    loop {
+        match pc {
+            0xaa4400 => {
+                // aa4400 mov eax, dword ptr [ecx + 0x84e4]
+                eax = rd((ecx.wrapping_add(0x84e4)) as usize);
+                // aa4406 add eax, 4
+                let (r_, f_) = fl_add(eax, 0x4u32, 32); fl = f_;
+                eax = r_;
+                // aa4409 cmp byte ptr [eax + 0x78], 1
+                fl = fl_sub((rb((eax.wrapping_add(0x78)) as usize) as u32), 0x1u32, 8).1;
+                // aa440d je 0xaa442c
+                pc = if fl.zf { 0xaa442c } else { 0xaa440f };
+            }
+            0xaa440f => {
+                // aa440f fldz 
+                f[0] = 0.0;
+                // aa4411 mov eax, dword ptr [esp + 4]
+                eax = s[9];
+                // aa4415 fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // aa4417 fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // aa441a fst dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // aa441d mov eax, dword ptr [esp + 8]
+                eax = s[10];
+                // aa4421 fst dword ptr [eax]
+                w.d((eax) as usize, (f[0] as f32).to_bits());
+                // aa4423 fst dword ptr [eax + 4]
+                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // aa4426 fstp dword ptr [eax + 8]
+                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // aa4429 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xaa442c => {
+                // aa442c mov edx, dword ptr [eax + 0x34]
+                edx = rd((eax.wrapping_add(0x34)) as usize);
+                // aa442f mov ecx, dword ptr [esp + 4]
+                ecx = s[9];
+                // aa4433 mov dword ptr [ecx], edx
+                w.d((ecx) as usize, edx);
+                // aa4435 mov edx, dword ptr [eax + 0x38]
+                edx = rd((eax.wrapping_add(0x38)) as usize);
+                // aa4438 mov dword ptr [ecx + 4], edx
+                w.d((ecx.wrapping_add(0x4)) as usize, edx);
+                // aa443b mov edx, dword ptr [eax + 0x3c]
+                edx = rd((eax.wrapping_add(0x3c)) as usize);
+                // aa443e mov dword ptr [ecx + 8], edx
+                w.d((ecx.wrapping_add(0x8)) as usize, edx);
+                // aa4441 mov edx, dword ptr [eax + 0x40]
+                edx = rd((eax.wrapping_add(0x40)) as usize);
+                // aa4444 mov ecx, dword ptr [esp + 8]
+                ecx = s[10];
+                // aa4448 mov dword ptr [ecx], edx
+                w.d((ecx) as usize, edx);
+                // aa444a mov edx, dword ptr [eax + 0x44]
+                edx = rd((eax.wrapping_add(0x44)) as usize);
+                // aa444d mov dword ptr [ecx + 4], edx
+                w.d((ecx.wrapping_add(0x4)) as usize, edx);
+                // aa4450 mov eax, dword ptr [eax + 0x48]
+                eax = rd((eax.wrapping_add(0x48)) as usize);
+                // aa4453 mov dword ptr [ecx + 8], eax
+                w.d((ecx.wrapping_add(0x8)) as usize, eax);
+                // aa4456 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_ac0290(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xac0290u32;
+    loop {
+        match pc {
+            0xac0290 => {
+                // ac0290 push ecx
+                s[8] = ecx;
+                // ac0291 fld dword ptr [eax + 0x30]
+                f[0] = ldq(rd((eax.wrapping_add(0x30)) as usize));
+                // ac0294 fsub qword ptr [0xe5bfa0]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bfa0u32) as usize)), f[0] - f64::from_bits(rq((0xe5bfa0u32) as usize)));
+                // ac029a fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // ac029d fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // ac02a0 fld qword ptr [0xe5c188]
+                f[1] = f64::from_bits(q64(rq((0xe5c188u32) as usize)));
+                // ac02a6 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // ac02a8 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // ac02aa test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // ac02ad jne 0xac02c0
+                pc = if !fl.zf { 0xac02c0 } else { 0xac02af };
+            }
+            0xac02af => {
+                // ac02af fxch st(1)
+                f.swap(1, 0);
+                // ac02b1 fchs 
+                f[1] = -f[1];
+                // ac02b3 fcompp 
+                cc87 = cc(f[1], f[0]);
+                // ac02b5 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // ac02b7 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // ac02ba jp 0xac02c4
+                pc = if fl.pf { 0xac02c4 } else { 0xac02bc };
+            }
+            0xac02bc => {
+                // ac02bc mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // ac02be pop ecx
+                ecx = s[8];
+                // ac02bf ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xac02c0 => {
+                // ac02c0 fstp st(1)
+                f[0] = f[1];
+                // ac02c2 fstp st(0)
+                pc = 0xac02c4;
+            }
+            0xac02c4 => {
+                // ac02c4 xor al, al
+                eax = set_part(eax, 0, 0xff, 0);
+                fl = fl_logic(0, 32);
+                // ac02c6 pop ecx
+                ecx = s[8];
+                // ac02c7 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_af2a00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xaf2a00u32;
+    loop {
+        match pc {
+            0xaf2a00 => {
+                // af2a00 cmp dword ptr [ecx + 0xc], 0
+                fl = fl_sub(rd((ecx.wrapping_add(0xc)) as usize), 0x0u32, 32).1;
+                // af2a04 je 0xaf2a0d
+                pc = if fl.zf { 0xaf2a0d } else { 0xaf2a06 };
+            }
+            0xaf2a06 => {
+                // af2a06 fld dword ptr [0xdd1c90]
+                f[0] = ldq(rd((0xdd1c90u32) as usize));
+                // af2a0c ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xaf2a0d => {
+                // af2a0d fld1 
+                f[0] = 1.0;
+                // af2a0f ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_af9950(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 25];
+    s[10] = unsafe { *a.add(0) };
+    s[11] = unsafe { *a.add(1) };
+    s[12] = unsafe { *a.add(2) };
+    s[13] = unsafe { *a.add(3) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xaf9950u32;
+    loop {
+        match pc {
+            0xaf9950 => {
+                // af9950 push ecx
+                s[8] = ecx;
+                // af9951 fld dword ptr [ecx + 0x2c]
+                f[0] = ldq(rd((ecx.wrapping_add(0x2c)) as usize));
+                // af9954 mov eax, dword ptr [esp + 0x10]
+                eax = s[12];
+                // af9958 fsub dword ptr [ecx + 8]
+                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0x8)) as usize)), f[0] - ldr32(rd((ecx.wrapping_add(0x8)) as usize)));
+                // af995b fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // af995e fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // af9961 fmul dword ptr [eax]
+                f[0] = xn3(f[0], ldr32(rd((eax) as usize)), f[0] * ldr32(rd((eax) as usize)));
+                // af9963 fadd dword ptr [ecx + 8]
+                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0x8)) as usize)), f[0] + ldr32(rd((ecx.wrapping_add(0x8)) as usize)));
+                // af9966 mov ecx, dword ptr [esp + 0x14]
+                ecx = s[13];
+                // af996a fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // af996e fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                // af9970 fld dword ptr [esp + 0x10]
+                f[1] = ldq(s[12]);
+                // af9974 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // af9976 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // af9978 fstp st(1)
+                f[0] = f[1];
+                // af997a test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // af997d jp 0xaf9987
+                pc = if fl.pf { 0xaf9987 } else { 0xaf997f };
+            }
+            0xaf997f => {
+                // af997f fstp st(0)
+                // af9981 fld dword ptr [ecx]
+                f[0] = ldq(rd((ecx) as usize));
+                // af9983 pop ecx
+                ecx = s[8];
+                // af9984 ret 0x10
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xaf9987 => {
+                // af9987 mov ecx, dword ptr [esp + 0xc]
+                ecx = s[11];
+                // af998b fsub dword ptr [ecx + 0xb8]
+                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0xb8)) as usize)), f[0] - ldr32(rd((ecx.wrapping_add(0xb8)) as usize)));
+                // af9991 fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // af9995 fldz 
+                f[0] = 0.0;
+                // af9997 fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                // af999b fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // af999d fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // af999f fstp st(1)
+                f[0] = f[1];
+                // af99a1 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // af99a4 jne 0xaf99ae
+                pc = if !fl.zf { 0xaf99ae } else { 0xaf99a6 };
+            }
+            0xaf99a6 => {
+                // af99a6 fld st(0)
+                f[1] = f[0];
+                // af99a8 fld1 
+                f[2] = 1.0;
+                // af99aa fdivrp st(1)
+                f[1] = xn3(f[1], f[2], f[2] / f[1]);
+                // af99ac jmp 0xaf99b0
+                pc = 0xaf99b0;
+            }
+            0xaf99ae => {
+                // af99ae fldz 
+                f[1] = 0.0;
+                pc = 0xaf99b0;
+            }
+            0xaf99b0 => {
+                // af99b0 fstp dword ptr [esp + 0x10]
+                s[12] = (f[1] as f32).to_bits();
+                // af99b4 fld dword ptr [esp + 0x10]
+                f[1] = ldq(s[12]);
+                // af99b8 fld dword ptr [esp + 0x14]
+                f[2] = ldq(s[13]);
+                // af99bc fld st(0)
+                f[3] = f[2];
+                // af99be fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // af99c0 fxch st(1)
+                f.swap(2, 1);
+                // af99c2 fstp dword ptr [esp + 0x10]
+                s[12] = (f[2] as f32).to_bits();
+                // af99c6 fld dword ptr [0xe5c154]
+                f[2] = ldq(rd((0xe5c154u32) as usize));
+                // af99cc fld dword ptr [esp + 0x10]
+                f[3] = ldq(s[12]);
+                // af99d0 fcom st(1)
+                cc87 = cc(f[3], f[2]);
+                // af99d2 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 4);
+                // af99d4 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // af99d7 jne 0xaf99ea
+                pc = if !fl.zf { 0xaf99ea } else { 0xaf99d9 };
+            }
+            0xaf99d9 => {
+                // af99d9 fstp st(1)
+                f[2] = f[3];
+                // af99db fld dword ptr [0xe9802c]
+                f[3] = ldq(rd((0xe9802cu32) as usize));
+                // af99e1 fcom st(1)
+                cc87 = cc(f[3], f[2]);
+                // af99e3 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 4);
+                // af99e5 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // af99e8 jne 0xaf99ee
+                pc = if !fl.zf { 0xaf99ee } else { 0xaf99ea };
+            }
+            0xaf99ea => {
+                // af99ea fstp st(0)
+                // af99ec jmp 0xaf99f0
+                pc = 0xaf99f0;
+            }
+            0xaf99ee => {
+                // af99ee fstp st(1)
+                f[2] = f[3];
+                pc = 0xaf99f0;
+            }
+            0xaf99f0 => {
+                // af99f0 fstp dword ptr [esp + 0x10]
+                s[12] = (f[2] as f32).to_bits();
+                // af99f4 fabs 
+                f[1] = f[1].abs();
+                // af99f6 fstp dword ptr [esp + 0x14]
+                s[13] = (f[1] as f32).to_bits();
+                // af99fa fld dword ptr [esp + 0x14]
+                f[1] = ldq(s[13]);
+                // af99fe fstp dword ptr [esp + 0x14]
+                s[13] = (f[1] as f32).to_bits();
+                // af9a02 fld dword ptr [0xe5c150]
+                f[1] = ldq(rd((0xe5c150u32) as usize));
+                // af9a08 fld dword ptr [esp + 0x14]
+                f[2] = ldq(s[13]);
+                // af9a0c fcom st(1)
+                cc87 = cc(f[2], f[1]);
+                // af9a0e fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 3);
+                // af9a10 fstp st(1)
+                f[1] = f[2];
+                // af9a12 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // af9a15 jp 0xaf9a1f
+                pc = if fl.pf { 0xaf9a1f } else { 0xaf9a17 };
+            }
+            0xaf9a17 => {
+                // af9a17 fdiv qword ptr [0xe5c148]
+                f[1] = xn3(f[1], f64::from_bits(rq((0xe5c148u32) as usize)), f[1] / f64::from_bits(rq((0xe5c148u32) as usize)));
+                // af9a1d jmp 0xaf9a23
+                pc = 0xaf9a23;
+            }
+            0xaf9a1f => {
+                // af9a1f fstp st(0)
+                // af9a21 fld1 
+                f[1] = 1.0;
+                pc = 0xaf9a23;
+            }
+            0xaf9a23 => {
+                // af9a23 fstp dword ptr [esp + 0x14]
+                s[13] = (f[1] as f32).to_bits();
+                // af9a27 fld dword ptr [esp + 0x14]
+                f[1] = ldq(s[13]);
+                // af9a2b fmul dword ptr [esp + 0x10]
+                f[1] = xn3(f[1], ldr32(s[12]), f[1] * ldr32(s[12]));
+                // af9a2f fmulp st(1)
+                f[0] = xn3(f[0], f[1], f[0] * f[1]);
+                // af9a31 fadd dword ptr [ecx + 0xb8]
+                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0xb8)) as usize)), f[0] + ldr32(rd((ecx.wrapping_add(0xb8)) as usize)));
+                // af9a37 fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // af9a3b fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[12]);
+                // af9a3f pop ecx
+                ecx = s[8];
+                // af9a40 ret 0x10
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_afe2c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xafe2c0u32;
+    loop {
+        match pc {
+            0xafe2c0 => {
+                // afe2c0 push ecx
+                s[8] = ecx;
+                // afe2c1 test byte ptr [eax + 0x158], 2
+                let r_ = ((rb((eax.wrapping_add(0x158)) as usize) as u32)) & (0x2u32);
+                fl = fl_logic(r_, 8);
+                // afe2c8 je 0xafe2d8
+                pc = if fl.zf { 0xafe2d8 } else { 0xafe2ca };
+            }
+            0xafe2ca => {
+                // afe2ca fld dword ptr [eax + 0x120]
+                f[0] = ldq(rd((eax.wrapping_add(0x120)) as usize));
+                // afe2d0 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // afe2d3 fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // afe2d6 pop ecx
+                ecx = s[8];
+                // afe2d7 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xafe2d8 => {
+                // afe2d8 fldz 
+                f[0] = 0.0;
+                // afe2da fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // afe2dd fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // afe2e0 pop ecx
+                ecx = s[8];
+                // afe2e1 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_b8d150(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xb8d150u32;
+    loop {
+        match pc {
+            0xb8d150 => {
+                // b8d150 mov eax, dword ptr [ecx + 0x24]
+                eax = rd((ecx.wrapping_add(0x24)) as usize);
+                // b8d153 sub eax, 1
+                let (r_, f_) = fl_sub(eax, 0x1u32, 32); fl = f_;
+                eax = r_;
+                // b8d156 je 0xb8d15f
+                pc = if fl.zf { 0xb8d15f } else { 0xb8d158 };
+            }
+            0xb8d158 => {
+                // b8d158 fld dword ptr [0xe87998]
+                f[0] = ldq(rd((0xe87998u32) as usize));
+                // b8d15e ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xb8d15f => {
+                // b8d15f fld dword ptr [ecx + 0x2c]
+                f[0] = ldq(rd((ecx.wrapping_add(0x2c)) as usize));
+                // b8d162 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_b92cc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xb92cc0u32;
+    loop {
+        match pc {
+            0xb92cc0 => {
+                // b92cc0 fld dword ptr [edx]
+                f[0] = ldq(rd((edx) as usize));
+                // b92cc2 fld dword ptr [ecx]
+                f[1] = ldq(rd((ecx) as usize));
+                // b92cc4 fucompp 
+                cc87 = cc(f[1], f[0]);
+                // b92cc6 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // b92cc8 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // b92ccb jp 0xb92ce2
+                pc = if fl.pf { 0xb92ce2 } else { 0xb92ccd };
+            }
+            0xb92ccd => {
+                // b92ccd fld dword ptr [edx + 4]
+                f[0] = ldq(rd((edx.wrapping_add(0x4)) as usize));
+                // b92cd0 fld dword ptr [ecx + 4]
+                f[1] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
+                // b92cd3 fucompp 
+                cc87 = cc(f[1], f[0]);
+                // b92cd5 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // b92cd7 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // b92cda jp 0xb92ce2
+                pc = if fl.pf { 0xb92ce2 } else { 0xb92cdc };
+            }
+            0xb92cdc => {
+                // b92cdc mov eax, 1
+                eax = 0x1u32;
+                // b92ce1 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xb92ce2 => {
+                // b92ce2 xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // b92ce4 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_b92cf0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 20];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xb92cf0u32;
+    loop {
+        match pc {
+            0xb92cf0 => {
+                // b92cf0 fld dword ptr [edx]
+                f[0] = ldq(rd((edx) as usize));
+                // b92cf2 fld dword ptr [ecx]
+                f[1] = ldq(rd((ecx) as usize));
+                // b92cf4 fucompp 
+                cc87 = cc(f[1], f[0]);
+                // b92cf6 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // b92cf8 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // b92cfb jp 0xb92d21
+                pc = if fl.pf { 0xb92d21 } else { 0xb92cfd };
+            }
+            0xb92cfd => {
+                // b92cfd fld dword ptr [edx + 4]
+                f[0] = ldq(rd((edx.wrapping_add(0x4)) as usize));
+                // b92d00 fld dword ptr [ecx + 4]
+                f[1] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
+                // b92d03 fucompp 
+                cc87 = cc(f[1], f[0]);
+                // b92d05 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // b92d07 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // b92d0a jp 0xb92d21
+                pc = if fl.pf { 0xb92d21 } else { 0xb92d0c };
+            }
+            0xb92d0c => {
+                // b92d0c fld dword ptr [edx + 8]
+                f[0] = ldq(rd((edx.wrapping_add(0x8)) as usize));
+                // b92d0f fld dword ptr [ecx + 8]
+                f[1] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
+                // b92d12 fucompp 
+                cc87 = cc(f[1], f[0]);
+                // b92d14 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // b92d16 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // b92d19 jp 0xb92d21
+                pc = if fl.pf { 0xb92d21 } else { 0xb92d1b };
+            }
+            0xb92d1b => {
+                // b92d1b mov eax, 1
+                eax = 0x1u32;
+                // b92d20 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xb92d21 => {
+                // b92d21 xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // b92d23 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_b99980(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 24];
+    s[12] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xb99980u32;
+    loop {
+        match pc {
+            0xb99980 => {
+                // b99980 sub esp, 8
+                // b99983 cmp byte ptr [esp + 0xc], 1
+                fl = fl_sub(((s[12] >> 0) & 0xff), 0x1u32, 8).1;
+                // b99988 jne 0xb9998f
+                pc = if !fl.zf { 0xb9998f } else { 0xb9998a };
+            }
+            0xb9998a => {
+                // b9998a fld dword ptr [ecx + 0x48]
+                f[0] = ldq(rd((ecx.wrapping_add(0x48)) as usize));
+                // b9998d jmp 0xb99995
+                pc = 0xb99995;
+            }
+            0xb9998f => {
+                // b9998f fld dword ptr [0xe5c0d0]
+                f[0] = ldq(rd((0xe5c0d0u32) as usize));
+                pc = 0xb99995;
+            }
+            0xb99995 => {
+                // b99995 fstp dword ptr [esp + 0xc]
+                s[12] = (f[0] as f32).to_bits();
+                // b99999 push ebx
+                s[8] = ebx;
+                // b9999a mov bl, byte ptr [ecx + 0x3c]
+                ebx = set_part(ebx, 0, 0xff, (rb((ecx.wrapping_add(0x3c)) as usize) as u32));
+                // b9999d fld1 
+                f[0] = 1.0;
+                // b9999f cmp bl, 1
+                fl = fl_sub((ebx & 0xff), 0x1u32, 8).1;
+                // b999a2 fld dword ptr [esp + 0x10]
+                f[1] = ldq(s[12]);
+                // b999a6 fld1 
+                f[2] = 1.0;
+                // b999a8 jne 0xb999b1
+                pc = if !fl.zf { 0xb999b1 } else { 0xb999aa };
+            }
+            0xb999aa => {
+                // b999aa fxch st(2)
+                f.swap(2, 0);
+                // b999ac fst dword ptr [ecx + 0x34]
+                w.d((ecx.wrapping_add(0x34)) as usize, (f[2] as f32).to_bits());
+                // b999af jmp 0xb999d1
+                pc = 0xb999d1;
+            }
+            0xb999b1 => {
+                // b999b1 cmp byte ptr [ecx + 0x3d], 1
+                fl = fl_sub((rb((ecx.wrapping_add(0x3d)) as usize) as u32), 0x1u32, 8).1;
+                // b999b5 jne 0xb999c6
+                pc = if !fl.zf { 0xb999c6 } else { 0xb999b7 };
+            }
+            0xb999b7 => {
+                // b999b7 fld dword ptr [0xe84380]
+                f[3] = ldq(rd((0xe84380u32) as usize));
+                // b999bd fmul st(2)
+                f[3] = xn3(f[3], f[1], f[3] * f[1]);
+                // b999bf fadd st(1)
+                f[3] = xn3(f[3], f[2], f[3] + f[2]);
+                // b999c1 fmul dword ptr [ecx + 0x40]
+                f[3] = xn3(f[3], ldr32(rd((ecx.wrapping_add(0x40)) as usize)), f[3] * ldr32(rd((ecx.wrapping_add(0x40)) as usize)));
+                // b999c4 jmp 0xb999c9
+                pc = 0xb999c9;
+            }
+            0xb999c6 => {
+                // b999c6 fld dword ptr [ecx + 0x40]
+                f[3] = ldq(rd((ecx.wrapping_add(0x40)) as usize));
+                pc = 0xb999c9;
+            }
+            0xb999c9 => {
+                // b999c9 fmul dword ptr [ecx + 0x34]
+                f[3] = xn3(f[3], ldr32(rd((ecx.wrapping_add(0x34)) as usize)), f[3] * ldr32(rd((ecx.wrapping_add(0x34)) as usize)));
+                // b999cc fstp dword ptr [ecx + 0x34]
+                w.d((ecx.wrapping_add(0x34)) as usize, (f[3] as f32).to_bits());
+                // b999cf fxch st(2)
+                f.swap(2, 0);
+                pc = 0xb999d1;
+            }
+            0xb999d1 => {
+                // b999d1 fld dword ptr [ecx + 0x34]
+                f[3] = ldq(rd((ecx.wrapping_add(0x34)) as usize));
+                // b999d4 fld dword ptr [ecx + 0x44]
+                f[4] = ldq(rd((ecx.wrapping_add(0x44)) as usize));
+                // b999d7 fcompp 
+                cc87 = cc(f[4], f[3]);
+                // b999d9 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 3);
+                // b999db test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // b999de jne 0xb999e5
+                pc = if !fl.zf { 0xb999e5 } else { 0xb999e0 };
+            }
+            0xb999e0 => {
+                // b999e0 fld dword ptr [ecx + 0x34]
+                f[3] = ldq(rd((ecx.wrapping_add(0x34)) as usize));
+                // b999e3 jmp 0xb999e8
+                pc = 0xb999e8;
+            }
+            0xb999e5 => {
+                // b999e5 fld dword ptr [ecx + 0x44]
+                f[3] = ldq(rd((ecx.wrapping_add(0x44)) as usize));
+                pc = 0xb999e8;
+            }
+            0xb999e8 => {
+                // b999e8 fstp dword ptr [esp + 0x10]
+                s[12] = (f[3] as f32).to_bits();
+                // b999ec xor edx, edx
+                edx = 0;
+                fl = fl_logic(0, 32);
+                // b999ee cmp byte ptr [ecx + 0x3d], 1
+                fl = fl_sub((rb((ecx.wrapping_add(0x3d)) as usize) as u32), 0x1u32, 8).1;
+                // b999f2 fld dword ptr [esp + 0x10]
+                f[3] = ldq(s[12]);
+                // b999f6 fst dword ptr [ecx + 0x34]
+                w.d((ecx.wrapping_add(0x34)) as usize, (f[3] as f32).to_bits());
+                // b999f9 jne 0xb99a20
+                pc = if !fl.zf { 0xb99a20 } else { 0xb999fb };
+            }
+            0xb999fb => {
+                // b999fb cmp bl, dl
+                fl = fl_sub((ebx & 0xff), (edx & 0xff), 8).1;
+                // b999fd jne 0xb99a20
+                pc = if !fl.zf { 0xb99a20 } else { 0xb999ff };
+            }
+            0xb999ff => {
+                // b999ff fstp st(2)
+                f[1] = f[3];
+                // b99a01 pop ebx
+                ebx = s[8];
+                // b99a02 fstp st(2)
+                f[0] = f[2];
+                // b99a04 fstp st(1)
+                f[0] = f[1];
+                // b99a06 fld dword ptr [ecx + 0x48]
+                f[1] = ldq(rd((ecx.wrapping_add(0x48)) as usize));
+                // b99a09 fmul dword ptr [0xe84380]
+                f[1] = xn3(f[1], ldr32(rd((0xe84380u32) as usize)), f[1] * ldr32(rd((0xe84380u32) as usize)));
+                // b99a0f fmulp st(1)
+                f[0] = xn3(f[0], f[1], f[0] * f[1]);
+                // b99a11 fstp dword ptr [ecx + 0x38]
+                w.d((ecx.wrapping_add(0x38)) as usize, (f[0] as f32).to_bits());
+                // b99a14 mov dword ptr [esi + 4], edx
+                w.d((esi.wrapping_add(0x4)) as usize, edx);
+                // b99a17 mov byte ptr [ecx + 0x3c], dl
+                w.b((ecx.wrapping_add(0x3c)) as usize, ((edx & 0xff)) as u8);
+                // b99a1a add esp, 8
+                // b99a1d ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xb99a20 => {
+                // b99a20 fxch st(1)
+                f.swap(3, 2);
+                // b99a22 pop ebx
+                ebx = s[8];
+                // b99a23 fstp dword ptr [ecx + 0x38]
+                w.d((ecx.wrapping_add(0x38)) as usize, (f[3] as f32).to_bits());
+                // b99a26 fnstcw word ptr [esp + 0xc]
+                s[12] = set_part(s[12], 0, 0xffff, fnstcw16() as u32);
+                // b99a2a fdivp st(2)
+                f[0] = xn3(f[0], f[2], f[0] / f[2]);
+                // b99a2c movzx eax, word ptr [esp + 0xc]
+                eax = ((s[12] >> 0) & 0xffff);
+                // b99a31 or eax, 0xc00
+                let r_ = (eax) | (0xc00u32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // b99a36 mov dword ptr [esp], eax
+                s[9] = eax;
+                // b99a39 fmul qword ptr [0xe5c0d8]
+                f[1] = xn3(f[1], f64::from_bits(rq((0xe5c0d8u32) as usize)), f[1] * f64::from_bits(rq((0xe5c0d8u32) as usize)));
+                // b99a3f fmulp st(1)
+                f[0] = xn3(f[0], f[1], f[0] * f[1]);
+                // b99a41 fldcw word ptr [esp]
+                fldcw16((((s[9] >> 0) & 0xffff)) as u16);
+                // b99a44 fistp qword ptr [esp]
+                { let v_: u64 = fist64(f[0]); s[9] = v_ as u32; s[10] = (v_ >> 32) as u32; }
+                // b99a47 mov eax, dword ptr [esp]
+                eax = s[9];
+                // b99a4a mov dword ptr [esi + 4], eax
+                w.d((esi.wrapping_add(0x4)) as usize, eax);
+                // b99a4d mov byte ptr [ecx + 0x3c], dl
+                w.b((ecx.wrapping_add(0x3c)) as usize, ((edx & 0xff)) as u8);
+                // b99a50 fldcw word ptr [esp + 0xc]
+                fldcw16((((s[12] >> 0) & 0xffff)) as u16);
+                // b99a54 add esp, 8
+                // b99a57 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 26];
+    s[10] = unsafe { *a.add(0) };
+    s[11] = unsafe { *a.add(1) };
+    s[12] = unsafe { *a.add(2) };
+    s[13] = unsafe { *a.add(3) };
+    s[14] = unsafe { *a.add(4) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xcee7e0u32;
+    loop {
+        match pc {
+            0xcee7e0 => {
+                // cee7e0 mov edx, dword ptr [esp + 0x14]
+                edx = s[14];
+                // cee7e4 mov eax, dword ptr [esp + 0xc]
+                eax = s[12];
+                // cee7e8 push esi
+                s[8] = esi;
+                // cee7e9 mov esi, dword ptr [esp + 0x14]
+                esi = s[13];
+                // cee7ed movss xmm0, dword ptr [esi]
+                x[0] = [rd((esi) as usize), 0, 0, 0];
+                // cee7f1 movss dword ptr [edx + 4], xmm0
+                w.d((edx.wrapping_add(0x4)) as usize, x[0][0]);
+                // cee7f6 fld dword ptr [ecx + 8]
+                f[0] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
+                // cee7f9 fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // cee7fd movss dword ptr [esp + 0x18], xmm0
+                s[14] = x[0][0];
+                // cee803 fld dword ptr [esp + 0x18]
+                f[0] = ldq(s[14]);
+                // cee807 movss xmm0, dword ptr [eax]
+                x[0] = [rd((eax) as usize), 0, 0, 0];
+                // cee80b fld dword ptr [esp + 0x14]
+                f[1] = ldq(s[13]);
+                // cee80f movss dword ptr [esp + 0x10], xmm0
+                s[12] = x[0][0];
+                // cee815 fcomi st(1)
+                fl = fl_fcomi(f[1], f[0]);
+                // cee817 fld dword ptr [esp + 0x10]
+                f[2] = ldq(s[12]);
+                // cee81b jbe 0xcee871
+                pc = if (fl.cf || fl.zf) { 0xcee871 } else { 0xcee81d };
+            }
+            0xcee81d => {
+                // cee81d fld dword ptr [ecx + 0x2c]
+                f[3] = ldq(rd((ecx.wrapping_add(0x2c)) as usize));
+                // cee820 fmul st(1)
+                f[3] = xn3(f[3], f[2], f[3] * f[2]);
+                // cee822 fstp dword ptr [esp + 0x18]
+                s[14] = (f[3] as f32).to_bits();
+                // cee826 fld st(1)
+                f[3] = f[1];
+                // cee828 fmul qword ptr [0xe5bf70]
+                f[3] = xn3(f[3], f64::from_bits(rq((0xe5bf70u32) as usize)), f[3] * f64::from_bits(rq((0xe5bf70u32) as usize)));
+                // cee82e fstp dword ptr [esp + 0x14]
+                s[13] = (f[3] as f32).to_bits();
+                // cee832 fld dword ptr [esp + 0x14]
+                f[3] = ldq(s[13]);
+                // cee836 fcomi st(3)
+                fl = fl_fcomi(f[3], f[0]);
+                // cee838 jbe 0xcee847
+                pc = if (fl.cf || fl.zf) { 0xcee847 } else { 0xcee83a };
+            }
+            0xcee83a => {
+                // cee83a fstp st(0)
+                // cee83c fstp st(2)
+                f[0] = f[2];
+                // cee83e fadd dword ptr [esp + 0x18]
+                f[1] = xn3(f[1], ldr32(s[14]), f[1] + ldr32(s[14]));
+                // cee842 fstp dword ptr [edx + 4]
+                w.d((edx.wrapping_add(0x4)) as usize, (f[1] as f32).to_bits());
+                // cee845 jmp 0xcee875
+                pc = 0xcee875;
+            }
+            0xcee847 => {
+                // cee847 fstp st(2)
+                f[1] = f[3];
+                // cee849 fld dword ptr [ecx + 8]
+                f[3] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
+                // cee84c fstp dword ptr [esp + 0x14]
+                s[13] = (f[3] as f32).to_bits();
+                // cee850 fld st(1)
+                f[3] = f[1];
+                // cee852 fsubp st(3)
+                f[0] = xn3(f[0], f[3], f[0] - f[3]);
+                // cee854 fld dword ptr [esp + 0x18]
+                f[3] = ldq(s[14]);
+                // cee858 fmulp st(3)
+                f[0] = xn3(f[0], f[3], f[0] * f[3]);
+                // cee85a fld dword ptr [esp + 0x14]
+                f[3] = ldq(s[13]);
+                // cee85e fld st(0)
+                f[4] = f[3];
+                // cee860 fsubrp st(3)
+                f[1] = xn3(f[1], f[4], f[4] - f[1]);
+                // cee862 fxch st(3)
+                f.swap(3, 0);
+                // cee864 fdivrp st(2)
+                f[1] = xn3(f[1], f[3], f[3] / f[1]);
+                // cee866 fxch st(1)
+                f.swap(2, 1);
+                // cee868 faddp st(2)
+                f[0] = xn3(f[0], f[2], f[0] + f[2]);
+                // cee86a fxch st(1)
+                f.swap(1, 0);
+                // cee86c fstp dword ptr [edx + 4]
+                w.d((edx.wrapping_add(0x4)) as usize, (f[1] as f32).to_bits());
+                // cee86f jmp 0xcee875
+                pc = 0xcee875;
+            }
+            0xcee871 => {
+                // cee871 fstp st(2)
+                f[0] = f[2];
+                // cee873 fstp st(0)
+                pc = 0xcee875;
+            }
+            0xcee875 => {
+                // cee875 fld dword ptr [edx + 4]
+                f[1] = ldq(rd((edx.wrapping_add(0x4)) as usize));
+                // cee878 fstp dword ptr [esp + 0x18]
+                s[14] = (f[1] as f32).to_bits();
+                // cee87c fld dword ptr [ecx + 0xc]
+                f[1] = ldq(rd((ecx.wrapping_add(0xc)) as usize));
+                // cee87f fstp dword ptr [esp + 0x14]
+                s[13] = (f[1] as f32).to_bits();
+                // cee883 fld dword ptr [esp + 0x18]
+                f[1] = ldq(s[14]);
+                // cee887 fld st(0)
+                f[2] = f[1];
+                // cee889 fld dword ptr [esp + 0x14]
+                f[3] = ldq(s[13]);
+                // cee88d fld st(0)
+                f[4] = f[3];
+                // cee88f fsubp st(2)
+                f[2] = xn3(f[2], f[4], f[2] - f[4]);
+                // cee891 fxch st(1)
+                f.swap(3, 2);
+                // cee893 fstp dword ptr [esp + 0x18]
+                s[14] = (f[3] as f32).to_bits();
+                // cee897 fld dword ptr [esp + 0x18]
+                f[3] = ldq(s[14]);
+                // cee89b fldz 
+                f[4] = 0.0;
+                // cee89d fcompi st(1)
+                fl = fl_fcomi(f[4], f[3]);
+                // cee89f jbe 0xcee953
+                pc = if (fl.cf || fl.zf) { 0xcee953 } else { 0xcee8a5 };
+            }
+            0xcee8a5 => {
+                // cee8a5 fstp st(2)
+                f[1] = f[3];
+                // cee8a7 fld dword ptr [ecx + 8]
+                f[3] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
+                // cee8aa fstp dword ptr [esp + 0x18]
+                s[14] = (f[3] as f32).to_bits();
+                // cee8ae fld dword ptr [esp + 0x18]
+                f[3] = ldq(s[14]);
+                // cee8b2 fld st(0)
+                f[4] = f[3];
+                // cee8b4 fsubrp st(2)
+                f[2] = xn3(f[2], f[4], f[4] - f[2]);
+                // cee8b6 fld1 
+                f[4] = 1.0;
+                // cee8b8 fld st(0)
+                f[5] = f[4];
+                // cee8ba fdivrp st(3)
+                f[2] = xn3(f[2], f[5], f[5] / f[2]);
+                // cee8bc fxch st(2)
+                f.swap(4, 2);
+                // cee8be fstp dword ptr [esp + 0x14]
+                s[13] = (f[4] as f32).to_bits();
+                // cee8c2 fld dword ptr [ecx + 0x24]
+                f[4] = ldq(rd((ecx.wrapping_add(0x24)) as usize));
+                // cee8c5 fstp dword ptr [esp + 0x18]
+                s[14] = (f[4] as f32).to_bits();
+                // cee8c9 fld dword ptr [ecx + 0x14]
+                f[4] = ldq(rd((ecx.wrapping_add(0x14)) as usize));
+                // cee8cc fstp dword ptr [esp + 0x10]
+                s[12] = (f[4] as f32).to_bits();
+                // cee8d0 fld dword ptr [ecx + 0x20]
+                f[4] = ldq(rd((ecx.wrapping_add(0x20)) as usize));
+                // cee8d3 fld dword ptr [esp + 0x18]
+                f[5] = ldq(s[14]);
+                // cee8d7 fld st(0)
+                f[6] = f[5];
+                // cee8d9 fsubp st(2)
+                f[4] = xn3(f[4], f[6], f[4] - f[6]);
+                // cee8db fld dword ptr [esp + 0x14]
+                f[6] = ldq(s[13]);
+                // cee8df fld st(0)
+                f[7] = f[6];
+                // cee8e1 fmulp st(3)
+                f[4] = xn3(f[4], f[7], f[4] * f[7]);
+                // cee8e3 fxch st(2)
+                f.swap(6, 4);
+                // cee8e5 fstp dword ptr [esp + 0x18]
+                s[14] = (f[6] as f32).to_bits();
+                // cee8e9 fld dword ptr [esp + 0x18]
+                f[6] = ldq(s[14]);
+                // cee8ed fmul st(5)
+                f[6] = xn3(f[6], f[1], f[6] * f[1]);
+                // cee8ef faddp st(1)
+                f[5] = xn3(f[5], f[6], f[5] + f[6]);
+                // cee8f1 fld dword ptr [esp + 0x10]
+                f[6] = ldq(s[12]);
+                // cee8f5 fld st(0)
+                f[7] = f[6];
+                // cee8f7 fmulp st(2)
+                f[5] = xn3(f[5], f[7], f[5] * f[7]);
+                // cee8f9 fxch st(1)
+                f.swap(6, 5);
+                // cee8fb fstp dword ptr [esp + 0x18]
+                s[14] = (f[6] as f32).to_bits();
+                // cee8ff fld dword ptr [ecx + 0x18]
+                f[6] = ldq(rd((ecx.wrapping_add(0x18)) as usize));
+                // cee902 fsub st(4)
+                f[6] = xn3(f[6], f[2], f[6] - f[2]);
+                // cee904 fmul st(2)
+                f[6] = xn3(f[6], f[4], f[6] * f[4]);
+                // cee906 fmulp st(2)
+                f[4] = xn3(f[4], f[6], f[4] * f[6]);
+                // cee908 fxch st(1)
+                f.swap(5, 4);
+                // cee90a fstp dword ptr [esp + 0x14]
+                s[13] = (f[5] as f32).to_bits();
+                // cee90e fld dword ptr [esp + 0x14]
+                f[5] = ldq(s[13]);
+                // cee912 fld st(4)
+                f[6] = f[1];
+                // cee914 fmulp st(5)
+                f[1] = xn3(f[1], f[6], f[1] * f[6]);
+                // cee916 fmulp st(4)
+                f[1] = xn3(f[1], f[5], f[1] * f[5]);
+                // cee918 fxch st(3)
+                f.swap(4, 1);
+                // cee91a faddp st(2)
+                f[2] = xn3(f[2], f[4], f[2] + f[4]);
+                // cee91c fxch st(1)
+                f.swap(3, 2);
+                // cee91e fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // cee920 fxch st(1)
+                f.swap(2, 1);
+                // cee922 fstp dword ptr [esp + 0x14]
+                s[13] = (f[2] as f32).to_bits();
+                // cee926 fld dword ptr [esi]
+                f[2] = ldq(rd((esi) as usize));
+                // cee928 fstp dword ptr [esp + 0x10]
+                s[12] = (f[2] as f32).to_bits();
+                // cee92c fld dword ptr [esp + 0x10]
+                f[2] = ldq(s[12]);
+                // cee930 fxch st(1)
+                f.swap(2, 1);
+                // cee932 fcompi st(1)
+                fl = fl_fcomi(f[2], f[1]);
+                // cee934 jbe 0xceea14
+                pc = if (fl.cf || fl.zf) { 0xceea14 } else { 0xcee93a };
+            }
+            0xcee93a => {
+                // cee93a fdiv dword ptr [ecx + 8]
+                f[1] = xn3(f[1], ldr32(rd((ecx.wrapping_add(0x8)) as usize)), f[1] / ldr32(rd((ecx.wrapping_add(0x8)) as usize)));
+                // cee93d pop esi
+                esi = s[8];
+                // cee93e fmul dword ptr [esp + 0x14]
+                f[1] = xn3(f[1], ldr32(s[14]), f[1] * ldr32(s[14]));
+                // cee942 fstp dword ptr [esp + 0x14]
+                s[14] = (f[1] as f32).to_bits();
+                // cee946 fmul dword ptr [esp + 0x10]
+                f[0] = xn3(f[0], ldr32(s[13]), f[0] * ldr32(s[13]));
+                // cee94a fsub dword ptr [esp + 0x14]
+                f[0] = xn3(f[0], ldr32(s[14]), f[0] - ldr32(s[14]));
+                // cee94e fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // cee950 ret 0x14
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xcee953 => {
+                // cee953 fld dword ptr [ecx + 0x10]
+                f[4] = ldq(rd((ecx.wrapping_add(0x10)) as usize));
+                // cee956 fstp dword ptr [esp + 0x18]
+                s[14] = (f[4] as f32).to_bits();
+                // cee95a fld dword ptr [esp + 0x18]
+                f[4] = ldq(s[14]);
+                // cee95e fcomi st(3)
+                fl = fl_fcomi(f[4], f[1]);
+                // cee960 fstp st(3)
+                f[1] = f[4];
+                // cee962 jbe 0xcee9e2
+                pc = if (fl.cf || fl.zf) { 0xcee9e2 } else { 0xcee964 };
+            }
+            0xcee964 => {
+                // cee964 fxch st(2)
+                f.swap(3, 1);
+                // cee966 pop esi
+                esi = s[8];
+                // cee967 fsubrp st(1)
+                f[2] = xn3(f[2], f[3], f[3] - f[2]);
+                // cee969 fld1 
+                f[3] = 1.0;
+                // cee96b fld st(0)
+                f[4] = f[3];
+                // cee96d fdivrp st(2)
+                f[2] = xn3(f[2], f[4], f[4] / f[2]);
+                // cee96f fxch st(1)
+                f.swap(3, 2);
+                // cee971 fstp dword ptr [esp + 0x10]
+                s[13] = (f[3] as f32).to_bits();
+                // cee975 fld dword ptr [ecx + 0x24]
+                f[3] = ldq(rd((ecx.wrapping_add(0x24)) as usize));
+                // cee978 fstp dword ptr [esp + 0x14]
+                s[14] = (f[3] as f32).to_bits();
+                // cee97c fld dword ptr [ecx + 0x14]
+                f[3] = ldq(rd((ecx.wrapping_add(0x14)) as usize));
+                // cee97f fstp dword ptr [esp + 0xc]
+                s[12] = (f[3] as f32).to_bits();
+                // cee983 fld dword ptr [ecx + 0x28]
+                f[3] = ldq(rd((ecx.wrapping_add(0x28)) as usize));
+                // cee986 fld dword ptr [esp + 0x14]
+                f[4] = ldq(s[14]);
+                // cee98a fld st(0)
+                f[5] = f[4];
+                // cee98c fsubp st(2)
+                f[3] = xn3(f[3], f[5], f[3] - f[5]);
+                // cee98e fld dword ptr [esp + 0x10]
+                f[5] = ldq(s[13]);
+                // cee992 fld st(0)
+                f[6] = f[5];
+                // cee994 fmulp st(3)
+                f[3] = xn3(f[3], f[6], f[3] * f[6]);
+                // cee996 fxch st(2)
+                f.swap(5, 3);
+                // cee998 fstp dword ptr [esp + 0x14]
+                s[14] = (f[5] as f32).to_bits();
+                // cee99c fld dword ptr [esp + 0x14]
+                f[5] = ldq(s[14]);
+                // cee9a0 fmul st(4)
+                f[5] = xn3(f[5], f[1], f[5] * f[1]);
+                // cee9a2 faddp st(1)
+                f[4] = xn3(f[4], f[5], f[4] + f[5]);
+                // cee9a4 fld dword ptr [esp + 0xc]
+                f[5] = ldq(s[12]);
+                // cee9a8 fld st(0)
+                f[6] = f[5];
+                // cee9aa fmulp st(2)
+                f[4] = xn3(f[4], f[6], f[4] * f[6]);
+                // cee9ac fxch st(1)
+                f.swap(5, 4);
+                // cee9ae fstp dword ptr [esp + 0x14]
+                s[14] = (f[5] as f32).to_bits();
+                // cee9b2 fld dword ptr [ecx + 0x1c]
+                f[5] = ldq(rd((ecx.wrapping_add(0x1c)) as usize));
+                // cee9b5 fsub st(3)
+                f[5] = xn3(f[5], f[2], f[5] - f[2]);
+                // cee9b7 fmul st(2)
+                f[5] = xn3(f[5], f[3], f[5] * f[3]);
+                // cee9b9 fmulp st(2)
+                f[3] = xn3(f[3], f[5], f[3] * f[5]);
+                // cee9bb fxch st(1)
+                f.swap(4, 3);
+                // cee9bd fstp dword ptr [esp + 0x10]
+                s[13] = (f[4] as f32).to_bits();
+                // cee9c1 fld dword ptr [esp + 0x10]
+                f[4] = ldq(s[13]);
+                // cee9c5 fld st(3)
+                f[5] = f[1];
+                // cee9c7 fmulp st(4)
+                f[1] = xn3(f[1], f[5], f[1] * f[5]);
+                // cee9c9 fmulp st(3)
+                f[1] = xn3(f[1], f[4], f[1] * f[4]);
+                // cee9cb fxch st(2)
+                f.swap(3, 1);
+                // cee9cd faddp st(1)
+                f[2] = xn3(f[2], f[3], f[2] + f[3]);
+                // cee9cf fmulp st(1)
+                f[1] = xn3(f[1], f[2], f[1] * f[2]);
+                // cee9d1 fstp dword ptr [esp + 0x10]
+                s[13] = (f[1] as f32).to_bits();
+                // cee9d5 fmul dword ptr [esp + 0x10]
+                f[0] = xn3(f[0], ldr32(s[13]), f[0] * ldr32(s[13]));
+                // cee9d9 fsub dword ptr [esp + 0x14]
+                f[0] = xn3(f[0], ldr32(s[14]), f[0] - ldr32(s[14]));
+                // cee9dd fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // cee9df ret 0x14
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xcee9e2 => {
+                // cee9e2 movss xmm0, dword ptr [esp + 0x18]
+                x[0] = [s[14], 0, 0, 0];
+                // cee9e8 fstp st(0)
+                // cee9ea fstp st(0)
+                // cee9ec movss dword ptr [edx + 4], xmm0
+                w.d((edx.wrapping_add(0x4)) as usize, x[0][0]);
+                // cee9f1 xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // cee9f4 fstp st(0)
+                // cee9f6 fld dword ptr [ecx + 0x28]
+                f[1] = ldq(rd((ecx.wrapping_add(0x28)) as usize));
+                // cee9f9 movss dword ptr [esp + 0x14], xmm0
+                s[13] = x[0][0];
+                // cee9ff fmul dword ptr [ecx + 0x14]
+                f[1] = xn3(f[1], ldr32(rd((ecx.wrapping_add(0x14)) as usize)), f[1] * ldr32(rd((ecx.wrapping_add(0x14)) as usize)));
+                // ceea02 pop esi
+                esi = s[8];
+                // ceea03 fstp dword ptr [esp + 0x14]
+                s[14] = (f[1] as f32).to_bits();
+                // ceea07 fmul dword ptr [esp + 0x10]
+                f[0] = xn3(f[0], ldr32(s[13]), f[0] * ldr32(s[13]));
+                // ceea0b fsub dword ptr [esp + 0x14]
+                f[0] = xn3(f[0], ldr32(s[14]), f[0] - ldr32(s[14]));
+                // ceea0f fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // ceea11 ret 0x14
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xceea14 => {
+                // ceea14 fstp st(0)
+                // ceea16 pop esi
+                esi = s[8];
+                // ceea17 fmul dword ptr [esp + 0x10]
+                f[0] = xn3(f[0], ldr32(s[13]), f[0] * ldr32(s[13]));
+                // ceea1b fsub dword ptr [esp + 0x14]
+                f[0] = xn3(f[0], ldr32(s[14]), f[0] - ldr32(s[14]));
+                // ceea1f fstp dword ptr [edx]
+                w.d((edx) as usize, (f[0] as f32).to_bits());
+                // ceea21 ret 0x14
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_ceeb40(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 24];
+    s[9] = unsafe { *a.add(0) };
+    s[10] = unsafe { *a.add(1) };
+    s[11] = unsafe { *a.add(2) };
+    s[12] = unsafe { *a.add(3) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xceeb40u32;
+    loop {
+        match pc {
+            0xceeb40 => {
+                // ceeb40 mov eax, dword ptr [esp + 8]
+                eax = s[10];
+                // ceeb44 mov al, byte ptr [eax + 0xcc]
+                eax = set_part(eax, 0, 0xff, (rb((eax.wrapping_add(0xcc)) as usize) as u32));
+                // ceeb4a test al, al
+                let r_ = ((eax & 0xff)) & ((eax & 0xff));
+                fl = fl_logic(r_, 8);
+                // ceeb4c je 0xceeb67
+                pc = if fl.zf { 0xceeb67 } else { 0xceeb4e };
+            }
+            0xceeb4e => {
+                // ceeb4e cmp byte ptr [ecx + 0x14], 0
+                fl = fl_sub((rb((ecx.wrapping_add(0x14)) as usize) as u32), 0x0u32, 8).1;
+                // ceeb52 je 0xceeb67
+                pc = if fl.zf { 0xceeb67 } else { 0xceeb54 };
+            }
+            0xceeb54 => {
+                // ceeb54 mov ecx, dword ptr [esp + 0xc]
+                ecx = s[11];
+                // ceeb58 movss xmm0, dword ptr [0xe5bfb0]
+                x[0] = [rd((0xe5bfb0u32) as usize), 0, 0, 0];
+                // ceeb60 subss xmm0, dword ptr [ecx + 0xc]
+                { let b_ = [rd((ecx.wrapping_add(0xc)) as usize), 0, 0, 0]; x[0] = sse_arith(1, x[0], b_); }
+                // ceeb65 jmp 0xceeb70
+                pc = 0xceeb70;
+            }
+            0xceeb67 => {
+                // ceeb67 mov edx, dword ptr [esp + 0xc]
+                edx = s[11];
+                // ceeb6b movss xmm0, dword ptr [edx + 0xc]
+                x[0] = [rd((edx.wrapping_add(0xc)) as usize), 0, 0, 0];
+                pc = 0xceeb70;
+            }
+            0xceeb70 => {
+                // ceeb70 xorps xmm1, xmm1
+                { let b_ = x[1]; let a_ = x[1]; x[1] = bitop4(0, a_, b_); }
+                // ceeb73 comiss xmm1, xmm0
+                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // ceeb76 movss dword ptr [esp + 0xc], xmm0
+                s[11] = x[0][0];
+                // ceeb7c jbe 0xceeb83
+                pc = if (fl.cf || fl.zf) { 0xceeb83 } else { 0xceeb7e };
+            }
+            0xceeb7e => {
+                // ceeb7e fldz 
+                f[0] = 0.0;
+                // ceeb80 ret 0x10
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xceeb83 => {
+                // ceeb83 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[11]);
+                // ceeb87 ret 0x10
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_ceeb90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 24];
+    s[9] = unsafe { *a.add(0) };
+    s[10] = unsafe { *a.add(1) };
+    s[11] = unsafe { *a.add(2) };
+    s[12] = unsafe { *a.add(3) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xceeb90u32;
+    loop {
+        match pc {
+            0xceeb90 => {
+                // ceeb90 mov eax, dword ptr [esp + 8]
+                eax = s[10];
+                // ceeb94 mov al, byte ptr [eax + 0xcc]
+                eax = set_part(eax, 0, 0xff, (rb((eax.wrapping_add(0xcc)) as usize) as u32));
+                // ceeb9a test al, al
+                let r_ = ((eax & 0xff)) & ((eax & 0xff));
+                fl = fl_logic(r_, 8);
+                // ceeb9c je 0xceebb7
+                pc = if fl.zf { 0xceebb7 } else { 0xceeb9e };
+            }
+            0xceeb9e => {
+                // ceeb9e cmp byte ptr [ecx + 0x14], 0
+                fl = fl_sub((rb((ecx.wrapping_add(0x14)) as usize) as u32), 0x0u32, 8).1;
+                // ceeba2 je 0xceebb7
+                pc = if fl.zf { 0xceebb7 } else { 0xceeba4 };
+            }
+            0xceeba4 => {
+                // ceeba4 mov edx, dword ptr [esp + 0xc]
+                edx = s[11];
+                // ceeba8 movss xmm0, dword ptr [0xe5bfb0]
+                x[0] = [rd((0xe5bfb0u32) as usize), 0, 0, 0];
+                // ceebb0 subss xmm0, dword ptr [edx + 0xc]
+                { let b_ = [rd((edx.wrapping_add(0xc)) as usize), 0, 0, 0]; x[0] = sse_arith(1, x[0], b_); }
+                // ceebb5 jmp 0xceebc0
+                pc = 0xceebc0;
+            }
+            0xceebb7 => {
+                // ceebb7 mov edx, dword ptr [esp + 0xc]
+                edx = s[11];
+                // ceebbb movss xmm0, dword ptr [edx + 0xc]
+                x[0] = [rd((edx.wrapping_add(0xc)) as usize), 0, 0, 0];
+                pc = 0xceebc0;
+            }
+            0xceebc0 => {
+                // ceebc0 cmp byte ptr [ecx + 0x14], 0
+                fl = fl_sub((rb((ecx.wrapping_add(0x14)) as usize) as u32), 0x0u32, 8).1;
+                // ceebc4 movss dword ptr [esp + 0xc], xmm0
+                s[11] = x[0][0];
+                // ceebca jne 0xceebd5
+                pc = if !fl.zf { 0xceebd5 } else { 0xceebcc };
+            }
+            0xceebcc => {
+                // ceebcc test al, al
+                let r_ = ((eax & 0xff)) & ((eax & 0xff));
+                fl = fl_logic(r_, 8);
+                // ceebce je 0xceebd5
+                pc = if fl.zf { 0xceebd5 } else { 0xceebd0 };
+            }
+            0xceebd0 => {
+                // ceebd0 fld1 
+                f[0] = 1.0;
+                // ceebd2 ret 0x10
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xceebd5 => {
+                // ceebd5 comiss xmm0, dword ptr [0xdd32c0]
+                { let b_ = [rd((0xdd32c0u32) as usize), 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // ceebdc jbe 0xceebe3
+                pc = if (fl.cf || fl.zf) { 0xceebe3 } else { 0xceebde };
+            }
+            0xceebde => {
+                // ceebde fldz 
+                f[0] = 0.0;
+                // ceebe0 ret 0x10
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xceebe3 => {
+                // ceebe3 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[11]);
+                // ceebe7 fmul qword ptr [0xe5c180]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5c180u32) as usize)), f[0] * f64::from_bits(rq((0xe5c180u32) as usize)));
+                // ceebed fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // ceebf1 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[11]);
+                // ceebf5 ret 0x10
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_cf20a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 22];
+    s[9] = unsafe { *a.add(0) };
+    s[10] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xcf20a0u32;
+    loop {
+        match pc {
+            0xcf20a0 => {
+                // cf20a0 mov eax, dword ptr [esp + 8]
+                eax = s[10];
+                // cf20a4 cmp byte ptr [eax + 0xd], 0
+                fl = fl_sub((rb((eax.wrapping_add(0xd)) as usize) as u32), 0x0u32, 8).1;
+                // cf20a8 je 0xcf20cf
+                pc = if fl.zf { 0xcf20cf } else { 0xcf20aa };
+            }
+            0xcf20aa => {
+                // cf20aa movss xmm0, dword ptr [0xe5bfb0]
+                x[0] = [rd((0xe5bfb0u32) as usize), 0, 0, 0];
+                // cf20b2 fld dword ptr [ecx + 0x10]
+                f[0] = ldq(rd((ecx.wrapping_add(0x10)) as usize));
+                // cf20b5 subss xmm0, dword ptr [ecx + 0x18]
+                { let b_ = [rd((ecx.wrapping_add(0x18)) as usize), 0, 0, 0]; x[0] = sse_arith(1, x[0], b_); }
+                // cf20ba movss dword ptr [esp + 8], xmm0
+                s[10] = x[0][0];
+                // cf20c0 fmul dword ptr [esp + 8]
+                f[0] = xn3(f[0], ldr32(s[10]), f[0] * ldr32(s[10]));
+                // cf20c4 fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // cf20c8 fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // cf20cc ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xcf20cf => {
+                // cf20cf movsx eax, byte ptr [eax + 0xe]
+                eax = ((((((rb((eax.wrapping_add(0xe)) as usize) as u32)) as u32) << 24) as i32) >> 24) as u32;
+                // cf20d3 fld dword ptr [ecx + 0x10]
+                f[0] = ldq(rd((ecx.wrapping_add(0x10)) as usize));
+                // cf20d6 mov edx, dword ptr [ecx + 0x1c]
+                edx = rd((ecx.wrapping_add(0x1c)) as usize);
+                // cf20d9 movss xmm0, dword ptr [edx + eax*4]
+                x[0] = [rd((edx.wrapping_add(eax.wrapping_mul(4))) as usize), 0, 0, 0];
+                // cf20de movss dword ptr [esp + 8], xmm0
+                s[10] = x[0][0];
+                // cf20e4 fmul dword ptr [esp + 8]
+                f[0] = xn3(f[0], ldr32(s[10]), f[0] * ldr32(s[10]));
+                // cf20e8 fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // cf20ec fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // cf20f0 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_cfdd80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 31];
+    s[12] = unsafe { *a.add(0) };
+    s[13] = unsafe { *a.add(1) };
+    s[14] = unsafe { *a.add(2) };
+    s[15] = unsafe { *a.add(3) };
+    s[16] = unsafe { *a.add(4) };
+    s[17] = unsafe { *a.add(5) };
+    s[18] = unsafe { *a.add(6) };
+    s[19] = unsafe { *a.add(7) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xcfdd80u32;
+    loop {
+        match pc {
+            0xcfdd80 => {
+                // cfdd80 mov ecx, dword ptr [0x252a364]
+                ecx = rd((0x252a364u32) as usize);
+                // cfdd86 cmp ecx, 0x40
+                fl = fl_sub(ecx, 0x40u32, 32).1;
+                // cfdd89 push ebx
+                s[10] = ebx;
+                // cfdd8a mov ebx, dword ptr [esp + 0x1c]
+                ebx = s[17];
+                // cfdd8e push esi
+                s[9] = esi;
+                // cfdd8f push edi
+                s[8] = edi;
+                // cfdd90 mov edi, dword ptr [esp + 0x10]
+                edi = s[12];
+                // cfdd94 mov esi, eax
+                esi = eax;
+                // cfdd96 jge 0xcfde3a
+                pc = if (fl.sf == fl.of) { 0xcfde3a } else { 0xcfdd9c };
+            }
+            0xcfdd9c => {
+                // cfdd9c mov eax, ecx
+                eax = ecx;
+                // cfdd9e imul eax, eax, 0x54
+                eax = ((eax) as i32).wrapping_mul(84i32) as u32;
+                fl = Fl::default(); // imul flags are not used
+                // cfdda1 add eax, 0x33d4dd0
+                let (r_, f_) = fl_add(eax, 0x33d4dd0u32, 32); fl = f_;
+                eax = r_;
+                // cfdda6 cmp byte ptr [esp + 0x2c], 0
+                fl = fl_sub(((s[19] >> 0) & 0xff), 0x0u32, 8).1;
+                // cfddab mov dword ptr [eax], 2
+                w.d((eax) as usize, 0x2u32);
+                // cfddb1 mov dword ptr [eax + 8], ebx
+                w.d((eax.wrapping_add(0x8)) as usize, ebx);
+                // cfddb4 jne 0xcfddbf
+                pc = if !fl.zf { 0xcfddbf } else { 0xcfddb6 };
+            }
+            0xcfddb6 => {
+                // cfddb6 or ebx, 0x10000
+                let r_ = (ebx) | (0x10000u32);
+                fl = fl_logic(r_, 32);
+                ebx = r_;
+                // cfddbc mov dword ptr [eax + 8], ebx
+                w.d((eax.wrapping_add(0x8)) as usize, ebx);
+                pc = 0xcfddbf;
+            }
+            0xcfddbf => {
+                // cfddbf mov ebx, dword ptr [edi]
+                ebx = rd((edi) as usize);
+                // cfddc1 fldz 
+                f[0] = 0.0;
+                // cfddc3 mov dword ptr [eax + 0x10], ebx
+                w.d((eax.wrapping_add(0x10)) as usize, ebx);
+                // cfddc6 mov ebx, dword ptr [edi + 4]
+                ebx = rd((edi.wrapping_add(0x4)) as usize);
+                // cfddc9 mov dword ptr [eax + 0x14], ebx
+                w.d((eax.wrapping_add(0x14)) as usize, ebx);
+                // cfddcc mov edi, dword ptr [edi + 8]
+                edi = rd((edi.wrapping_add(0x8)) as usize);
+                // cfddcf mov dword ptr [eax + 0x18], edi
+                w.d((eax.wrapping_add(0x18)) as usize, edi);
+                // cfddd2 fst dword ptr [eax + 0x34]
+                w.d((eax.wrapping_add(0x34)) as usize, (f[0] as f32).to_bits());
+                // cfddd5 fst dword ptr [eax + 0x38]
+                w.d((eax.wrapping_add(0x38)) as usize, (f[0] as f32).to_bits());
+                // cfddd8 fstp dword ptr [eax + 0x3c]
+                w.d((eax.wrapping_add(0x3c)) as usize, (f[0] as f32).to_bits());
+                // cfdddb mov edi, dword ptr [esi]
+                edi = rd((esi) as usize);
+                // cfdddd fld dword ptr [esp + 0x14]
+                f[0] = ldq(s[13]);
+                // cfdde1 mov dword ptr [eax + 0x1c], edi
+                w.d((eax.wrapping_add(0x1c)) as usize, edi);
+                // cfdde4 mov edi, dword ptr [esi + 4]
+                edi = rd((esi.wrapping_add(0x4)) as usize);
+                // cfdde7 mov dword ptr [eax + 0x20], edi
+                w.d((eax.wrapping_add(0x20)) as usize, edi);
+                // cfddea mov esi, dword ptr [esi + 8]
+                esi = rd((esi.wrapping_add(0x8)) as usize);
+                // cfdded mov dword ptr [eax + 0x24], esi
+                w.d((eax.wrapping_add(0x24)) as usize, esi);
+                // cfddf0 mov esi, dword ptr [edx]
+                esi = rd((edx) as usize);
+                // cfddf2 mov dword ptr [eax + 0x28], esi
+                w.d((eax.wrapping_add(0x28)) as usize, esi);
+                // cfddf5 mov esi, dword ptr [edx + 4]
+                esi = rd((edx.wrapping_add(0x4)) as usize);
+                // cfddf8 mov dword ptr [eax + 0x2c], esi
+                w.d((eax.wrapping_add(0x2c)) as usize, esi);
+                // cfddfb mov edx, dword ptr [edx + 8]
+                edx = rd((edx.wrapping_add(0x8)) as usize);
+                // cfddfe fstp dword ptr [eax + 0x44]
+                w.d((eax.wrapping_add(0x44)) as usize, (f[0] as f32).to_bits());
+                // cfde01 fld dword ptr [esp + 0x18]
+                f[0] = ldq(s[14]);
+                // cfde05 mov dword ptr [eax + 0x30], edx
+                w.d((eax.wrapping_add(0x30)) as usize, edx);
+                // cfde08 mov edx, dword ptr [esp + 0x28]
+                edx = s[18];
+                // cfde0c fstp dword ptr [eax + 0x48]
+                w.d((eax.wrapping_add(0x48)) as usize, (f[0] as f32).to_bits());
+                // cfde0f fld dword ptr [esp + 0x1c]
+                f[0] = ldq(s[15]);
+                // cfde13 mov dword ptr [eax + 0xc], edx
+                w.d((eax.wrapping_add(0xc)) as usize, edx);
+                // cfde16 fstp dword ptr [eax + 0x4c]
+                w.d((eax.wrapping_add(0x4c)) as usize, (f[0] as f32).to_bits());
+                // cfde19 mov edx, ecx
+                edx = ecx;
+                // cfde1b fld dword ptr [esp + 0x20]
+                f[0] = ldq(s[16]);
+                // cfde1f or edx, 0xc0000000
+                let r_ = (edx) | (0xc0000000u32);
+                fl = fl_logic(r_, 32);
+                edx = r_;
+                // cfde25 pop edi
+                edi = s[8];
+                // cfde26 fstp dword ptr [eax + 0x50]
+                w.d((eax.wrapping_add(0x50)) as usize, (f[0] as f32).to_bits());
+                // cfde29 add ecx, 1
+                let (r_, f_) = fl_add(ecx, 0x1u32, 32); fl = f_;
+                ecx = r_;
+                // cfde2c pop esi
+                esi = s[9];
+                // cfde2d mov dword ptr [eax + 4], edx
+                w.d((eax.wrapping_add(0x4)) as usize, edx);
+                // cfde30 mov dword ptr [0x252a364], ecx
+                w.d((0x252a364u32) as usize, ecx);
+                // cfde36 mov eax, edx
+                eax = edx;
+                // cfde38 pop ebx
+                ebx = s[10];
+                // cfde39 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xcfde3a => {
+                // cfde3a pop edi
+                edi = s[8];
+                // cfde3b pop esi
+                esi = s[9];
+                // cfde3c or eax, 0xffffffff
+                let r_ = (eax) | (0xffffffffu32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // cfde3f pop ebx
+                ebx = s[10];
+                // cfde40 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_cfde50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 27];
+    s[11] = unsafe { *a.add(0) };
+    s[12] = unsafe { *a.add(1) };
+    s[13] = unsafe { *a.add(2) };
+    s[14] = unsafe { *a.add(3) };
+    s[15] = unsafe { *a.add(4) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xcfde50u32;
+    loop {
+        match pc {
+            0xcfde50 => {
+                // cfde50 mov ecx, dword ptr [0x252a364]
+                ecx = rd((0x252a364u32) as usize);
+                // cfde56 cmp ecx, 0x40
+                fl = fl_sub(ecx, 0x40u32, 32).1;
+                // cfde59 push esi
+                s[9] = esi;
+                // cfde5a mov esi, dword ptr [esp + 8]
+                esi = s[11];
+                // cfde5e push edi
+                s[8] = edi;
+                // cfde5f mov edi, eax
+                edi = eax;
+                // cfde61 jge 0xcfdeee
+                pc = if (fl.sf == fl.of) { 0xcfdeee } else { 0xcfde67 };
+            }
+            0xcfde67 => {
+                // cfde67 mov eax, ecx
+                eax = ecx;
+                // cfde69 imul eax, eax, 0x54
+                eax = ((eax) as i32).wrapping_mul(84i32) as u32;
+                fl = Fl::default(); // imul flags are not used
+                // cfde6c add eax, 0x33d4dd0
+                let (r_, f_) = fl_add(eax, 0x33d4dd0u32, 32); fl = f_;
+                eax = r_;
+                // cfde71 cmp byte ptr [esp + 0x1c], 0
+                fl = fl_sub(((s[15] >> 0) & 0xff), 0x0u32, 8).1;
+                // cfde76 mov dword ptr [eax], 0
+                w.d((eax) as usize, 0x0u32);
+                // cfde7c mov dword ptr [eax + 8], edi
+                w.d((eax.wrapping_add(0x8)) as usize, edi);
+                // cfde7f jne 0xcfde8a
+                pc = if !fl.zf { 0xcfde8a } else { 0xcfde81 };
+            }
+            0xcfde81 => {
+                // cfde81 or edi, 0x10000
+                let r_ = (edi) | (0x10000u32);
+                fl = fl_logic(r_, 32);
+                edi = r_;
+                // cfde87 mov dword ptr [eax + 8], edi
+                w.d((eax.wrapping_add(0x8)) as usize, edi);
+                pc = 0xcfde8a;
+            }
+            0xcfde8a => {
+                // cfde8a mov edi, dword ptr [esi]
+                edi = rd((esi) as usize);
+                // cfde8c fldz 
+                f[0] = 0.0;
+                // cfde8e mov dword ptr [eax + 0x10], edi
+                w.d((eax.wrapping_add(0x10)) as usize, edi);
+                // cfde91 mov edi, dword ptr [esi + 4]
+                edi = rd((esi.wrapping_add(0x4)) as usize);
+                // cfde94 mov dword ptr [eax + 0x14], edi
+                w.d((eax.wrapping_add(0x14)) as usize, edi);
+                // cfde97 mov esi, dword ptr [esi + 8]
+                esi = rd((esi.wrapping_add(0x8)) as usize);
+                // cfde9a mov dword ptr [eax + 0x18], esi
+                w.d((eax.wrapping_add(0x18)) as usize, esi);
+                // cfde9d fst dword ptr [eax + 0x1c]
+                w.d((eax.wrapping_add(0x1c)) as usize, (f[0] as f32).to_bits());
+                // cfdea0 fst dword ptr [eax + 0x20]
+                w.d((eax.wrapping_add(0x20)) as usize, (f[0] as f32).to_bits());
+                // cfdea3 pop edi
+                edi = s[8];
+                // cfdea4 fst dword ptr [eax + 0x24]
+                w.d((eax.wrapping_add(0x24)) as usize, (f[0] as f32).to_bits());
+                // cfdea7 mov esi, dword ptr [edx]
+                esi = rd((edx) as usize);
+                // cfdea9 mov dword ptr [eax + 0x28], esi
+                w.d((eax.wrapping_add(0x28)) as usize, esi);
+                // cfdeac mov esi, dword ptr [edx + 4]
+                esi = rd((edx.wrapping_add(0x4)) as usize);
+                // cfdeaf mov dword ptr [eax + 0x2c], esi
+                w.d((eax.wrapping_add(0x2c)) as usize, esi);
+                // cfdeb2 mov edx, dword ptr [edx + 8]
+                edx = rd((edx.wrapping_add(0x8)) as usize);
+                // cfdeb5 mov dword ptr [eax + 0x30], edx
+                w.d((eax.wrapping_add(0x30)) as usize, edx);
+                // cfdeb8 fst dword ptr [eax + 0x34]
+                w.d((eax.wrapping_add(0x34)) as usize, (f[0] as f32).to_bits());
+                // cfdebb mov edx, dword ptr [esp + 0x14]
+                edx = s[14];
+                // cfdebf fst dword ptr [eax + 0x38]
+                w.d((eax.wrapping_add(0x38)) as usize, (f[0] as f32).to_bits());
+                // cfdec2 fstp dword ptr [eax + 0x3c]
+                w.d((eax.wrapping_add(0x3c)) as usize, (f[0] as f32).to_bits());
+                // cfdec5 mov dword ptr [eax + 0xc], edx
+                w.d((eax.wrapping_add(0xc)) as usize, edx);
+                // cfdec8 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[12]);
+                // cfdecc mov edx, ecx
+                edx = ecx;
+                // cfdece fstp dword ptr [eax + 0x44]
+                w.d((eax.wrapping_add(0x44)) as usize, (f[0] as f32).to_bits());
+                // cfded1 or edx, 0xc0000000
+                let r_ = (edx) | (0xc0000000u32);
+                fl = fl_logic(r_, 32);
+                edx = r_;
+                // cfded7 fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[13]);
+                // cfdedb add ecx, 1
+                let (r_, f_) = fl_add(ecx, 0x1u32, 32); fl = f_;
+                ecx = r_;
+                // cfdede fstp dword ptr [eax + 0x48]
+                w.d((eax.wrapping_add(0x48)) as usize, (f[0] as f32).to_bits());
+                // cfdee1 mov dword ptr [eax + 4], edx
+                w.d((eax.wrapping_add(0x4)) as usize, edx);
+                // cfdee4 mov dword ptr [0x252a364], ecx
+                w.d((0x252a364u32) as usize, ecx);
+                // cfdeea mov eax, edx
+                eax = edx;
+                // cfdeec pop esi
+                esi = s[9];
+                // cfdeed ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xcfdeee => {
+                // cfdeee pop edi
+                edi = s[8];
+                // cfdeef or eax, 0xffffffff
+                let r_ = (eax) | (0xffffffffu32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // cfdef2 pop esi
+                esi = s[9];
+                // cfdef3 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d09830(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd09830u32;
+    loop {
+        match pc {
+            0xd09830 => {
+                // d09830 cmp byte ptr [ecx + 0x348], 0xff
+                fl = fl_sub((rb((ecx.wrapping_add(0x348)) as usize) as u32), 0xffu32, 8).1;
+                // d09837 jne 0xd098a3
+                pc = if !fl.zf { 0xd098a3 } else { 0xd09839 };
+            }
+            0xd09839 => {
+                // d09839 mov al, byte ptr [ecx + 0x349]
+                eax = set_part(eax, 0, 0xff, (rb((ecx.wrapping_add(0x349)) as usize) as u32));
+                // d0983f cmp al, 0xff
+                fl = fl_sub((eax & 0xff), 0xffu32, 8).1;
+                // d09841 je 0xd0984d
+                pc = if fl.zf { 0xd0984d } else { 0xd09843 };
+            }
+            0xd09843 => {
+                // d09843 mov byte ptr [ecx + 0x348], al
+                w.b((ecx.wrapping_add(0x348)) as usize, ((eax & 0xff)) as u8);
+                // d09849 movzx eax, al
+                eax = (eax & 0xff);
+                // d0984c ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xd0984d => {
+                // d0984d push esi
+                s[8] = esi;
+                // d0984e lea esi, [ecx + 0x338]
+                esi = ecx.wrapping_add(0x338);
+                // d09854 xor edx, edx
+                edx = 0;
+                fl = fl_logic(0, 32);
+                // d09856 cmp esi, edx
+                fl = fl_sub(esi, edx, 32).1;
+                // d09858 je 0xd0989c
+                pc = if fl.zf { 0xd0989c } else { 0xd0985a };
+            }
+            0xd0985a => {
+                // d0985a cmp dword ptr [ecx + 0x334], edx
+                fl = fl_sub(rd((ecx.wrapping_add(0x334)) as usize), edx, 32).1;
+                // d09860 jle 0xd09881
+                pc = if (fl.zf || fl.sf != fl.of) { 0xd09881 } else { 0xd09862 };
+            }
+            0xd09862 => {
+                // d09862 fld dword ptr [ecx + 0x330]
+                f[0] = ldq(rd((ecx.wrapping_add(0x330)) as usize));
+                // d09868 fld dword ptr [esi]
+                f[1] = ldq(rd((esi) as usize));
+                // d0986a fcompp 
+                cc87 = cc(f[1], f[0]);
+                // d0986c fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // d0986e test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // d09871 je 0xd09881
+                pc = if fl.zf { 0xd09881 } else { 0xd09873 };
+            }
+            0xd09873 => {
+                // d09873 add edx, 1
+                let (r_, f_) = fl_add(edx, 0x1u32, 32); fl = f_;
+                edx = r_;
+                // d09876 add esi, 4
+                let (r_, f_) = fl_add(esi, 0x4u32, 32); fl = f_;
+                esi = r_;
+                // d09879 cmp edx, dword ptr [ecx + 0x334]
+                fl = fl_sub(edx, rd((ecx.wrapping_add(0x334)) as usize), 32).1;
+                // d0987f jl 0xd09862
+                pc = if (fl.sf != fl.of) { 0xd09862 } else { 0xd09881 };
+            }
+            0xd09881 => {
+                // d09881 mov eax, dword ptr [ecx + 0x70]
+                eax = rd((ecx.wrapping_add(0x70)) as usize);
+                // d09884 movsx eax, word ptr [eax + 0x1c]
+                eax = ((((((rw((eax.wrapping_add(0x1c)) as usize) as u32)) as u32) << 16) as i32) >> 16) as u32;
+                // d09888 add eax, -1
+                let (r_, f_) = fl_add(eax, 0xffffffffu32, 32); fl = f_;
+                eax = r_;
+                // d0988b cmp edx, eax
+                fl = fl_sub(edx, eax, 32).1;
+                // d0988d jge 0xd09891
+                pc = if (fl.sf == fl.of) { 0xd09891 } else { 0xd0988f };
+            }
+            0xd0988f => {
+                // d0988f mov eax, edx
+                eax = edx;
+                pc = 0xd09891;
+            }
+            0xd09891 => {
+                // d09891 mov byte ptr [ecx + 0x348], al
+                w.b((ecx.wrapping_add(0x348)) as usize, ((eax & 0xff)) as u8);
+                // d09897 pop esi
+                esi = s[8];
+                // d09898 movzx eax, al
+                eax = (eax & 0xff);
+                // d0989b ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xd0989c => {
+                // d0989c mov byte ptr [ecx + 0x348], dl
+                w.b((ecx.wrapping_add(0x348)) as usize, ((edx & 0xff)) as u8);
+                // d098a2 pop esi
+                esi = s[8];
+                pc = 0xd098a3;
+            }
+            0xd098a3 => {
+                // d098a3 movzx eax, byte ptr [ecx + 0x348]
+                eax = (rb((ecx.wrapping_add(0x348)) as usize) as u32);
+                // d098aa ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d2bad0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 24];
+    s[10] = unsafe { *a.add(0) };
+    s[11] = unsafe { *a.add(1) };
+    s[12] = unsafe { *a.add(2) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd2bad0u32;
+    loop {
+        match pc {
+            0xd2bad0 => {
+                // d2bad0 push ebp
+                s[8] = ebp;
+                // d2bad1 mov ebp, esp
+                // mov ebp, esp (frame)
+                // d2bad3 and esp, 0xfffffff0
+                // and esp, -N (alignment is not modelled)
+                // d2bad6 fld dword ptr [ebp + 8]
+                f[0] = ldq(s[10]);
+                // d2bad9 fld dword ptr [ecx + 0x18]
+                f[1] = ldq(rd((ecx.wrapping_add(0x18)) as usize));
+                // d2badc fucompi st(1)
+                fl = fl_fcomi(f[1], f[0]);
+                // d2bade fstp st(0)
+                // d2bae0 lahf 
+                eax = set_part(eax, 8, 0xff, ((fl.sf as u32) << 7) | ((fl.zf as u32) << 6) | ((fl.pf as u32) << 2) | 2 | (fl.cf as u32));
+                // d2bae1 test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // d2bae4 jp 0xd2baf6
+                pc = if fl.pf { 0xd2baf6 } else { 0xd2bae6 };
+            }
+            0xd2bae6 => {
+                // d2bae6 movss xmm0, dword ptr [ebp + 0xc]
+                x[0] = [s[11], 0, 0, 0];
+                // d2baeb movss dword ptr [ecx + 0x18], xmm0
+                w.d((ecx.wrapping_add(0x18)) as usize, x[0][0]);
+                // d2baf0 mov esp, ebp
+                // mov esp, ebp
+                // d2baf2 pop ebp
+                ebp = s[8];
+                // d2baf3 ret 0xc
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xd2baf6 => {
+                // d2baf6 movss xmm0, dword ptr [0xe87998]
+                x[0] = [rd((0xe87998u32) as usize), 0, 0, 0];
+                // d2bafe movss dword ptr [ecx + 0x18], xmm0
+                w.d((ecx.wrapping_add(0x18)) as usize, x[0][0]);
+                // d2bb03 xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // d2bb06 movaps xmmword ptr [ecx + 0x20], xmm0
+                { let v_: [u32; 4] = x[0]; let a_ = (ecx.wrapping_add(0x20)) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                // d2bb0a mov esp, ebp
+                // mov esp, ebp
+                // d2bb0c pop ebp
+                ebp = s[8];
+                // d2bb0d ret 0xc
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 36];
+    s[22] = unsafe { *a.add(0) };
+    s[23] = unsafe { *a.add(1) };
+    s[24] = unsafe { *a.add(2) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd38770u32;
+    loop {
+        match pc {
+            0xd38770 => {
+                // d38770 push ebp
+                s[20] = ebp;
+                // d38771 mov ebp, esp
+                // mov ebp, esp (frame)
+                // d38773 and esp, 0xfffffff0
+                // and esp, -N (alignment is not modelled)
+                // d38776 sub esp, 0x30
+                // d38779 mov eax, dword ptr [ebp + 0xc]
+                eax = s[23];
+                // d3877c movaps xmm1, xmmword ptr [ecx + 0x10]
+                x[1] = rx((ecx.wrapping_add(0x10)) as usize);
+                // d38780 movaps xmm3, xmmword ptr [eax]
+                x[3] = rx((eax) as usize);
+                // d38783 movaps xmm0, xmm3
+                x[0] = x[3];
+                // d38786 mulps xmm0, xmm1
+                { let b_ = x[1]; x[0] = sse_arith(10, x[0], b_); }
+                // d38789 shufps xmm1, xmm1, 0xff
+                { let b_ = x[1]; let a_ = x[1]; x[1] = shufps(a_, b_, 255); }
+                // d3878d movaps xmm2, xmm0
+                x[2] = x[0];
+                // d38790 shufps xmm2, xmm0, 0xaa
+                { let b_ = x[0]; let a_ = x[2]; x[2] = shufps(a_, b_, 170); }
+                // d38794 addss xmm2, xmm1
+                { let b_ = x[1]; x[2] = sse_arith(0, x[2], b_); }
+                // d38798 movaps xmm1, xmm0
+                x[1] = x[0];
+                // d3879b shufps xmm1, xmm0, 0x55
+                { let b_ = x[0]; let a_ = x[1]; x[1] = shufps(a_, b_, 85); }
+                // d3879f addss xmm1, xmm0
+                { let b_ = x[0]; x[1] = sse_arith(0, x[1], b_); }
+                // d387a3 addps xmm2, xmm1
+                { let b_ = x[1]; x[2] = sse_arith(8, x[2], b_); }
+                // d387a6 movaps xmm1, xmmword ptr [ecx + 0x10]
+                x[1] = rx((ecx.wrapping_add(0x10)) as usize);
+                // d387aa movaps xmm0, xmm1
+                x[0] = x[1];
+                // d387ad movss dword ptr [esp + 0x10], xmm2
+                s[12] = x[2][0];
+                // d387b3 movaps xmm2, xmmword ptr [eax + 0x10]
+                x[2] = rx((eax.wrapping_add(0x10)) as usize);
+                // d387b7 mulps xmm0, xmm2
+                { let b_ = x[2]; x[0] = sse_arith(10, x[0], b_); }
+                // d387ba shufps xmm1, xmm1, 0xff
+                { let b_ = x[1]; let a_ = x[1]; x[1] = shufps(a_, b_, 255); }
+                // d387be movaps xmm4, xmm0
+                x[4] = x[0];
+                // d387c1 shufps xmm4, xmm0, 0xaa
+                { let b_ = x[0]; let a_ = x[4]; x[4] = shufps(a_, b_, 170); }
+                // d387c5 addss xmm4, xmm1
+                { let b_ = x[1]; x[4] = sse_arith(0, x[4], b_); }
+                // d387c9 movaps xmm1, xmm0
+                x[1] = x[0];
+                // d387cc shufps xmm1, xmm0, 0x55
+                { let b_ = x[0]; let a_ = x[1]; x[1] = shufps(a_, b_, 85); }
+                // d387d0 addss xmm1, xmm0
+                { let b_ = x[0]; x[1] = sse_arith(0, x[1], b_); }
+                // d387d4 xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // d387d7 addps xmm4, xmm1
+                { let b_ = x[1]; x[4] = sse_arith(8, x[4], b_); }
+                // d387da movss xmm1, dword ptr [esp + 0x10]
+                x[1] = [s[12], 0, 0, 0];
+                // d387e0 comiss xmm1, xmm0
+                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d387e3 movss dword ptr [esp + 0x20], xmm4
+                s[16] = x[4][0];
+                // d387e9 jb 0xd38870
+                pc = if fl.cf { 0xd38870 } else { 0xd387ef };
+            }
+            0xd387ef => {
+                // d387ef comiss xmm0, dword ptr [esp + 0x20]
+                { let b_ = [s[16], 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d387f4 jbe 0xd38870
+                pc = if (fl.cf || fl.zf) { 0xd38870 } else { 0xd387f6 };
+            }
+            0xd387f6 => {
+                // d387f6 fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[12]);
+                // d387fa movaps xmm4, xmmword ptr [0xe18ab0]
+                x[4] = rx((0xe18ab0u32) as usize);
+                // d38801 fld dword ptr [esp + 0x20]
+                f[1] = ldq(s[16]);
+                // d38805 fsubr st(1)
+                f[1] = xn3(f[1], f[0], f[0] - f[1]);
+                // d38807 fdivp st(1)
+                f[0] = xn3(f[0], f[1], f[0] / f[1]);
+                // d38809 fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // d3880d movss xmm1, dword ptr [esp + 0xc]
+                x[1] = [s[11], 0, 0, 0];
+                // d38813 movss xmm0, xmm1
+                x[0][0] = x[1][0];
+                // d38817 shufps xmm0, xmm0, 0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = shufps(a_, b_, 0); }
+                // d3881b subps xmm4, xmm0
+                { let b_ = x[0]; x[4] = sse_arith(9, x[4], b_); }
+                // d3881e mulps xmm4, xmm3
+                { let b_ = x[3]; x[4] = sse_arith(10, x[4], b_); }
+                // d38821 mulps xmm2, xmm0
+                { let b_ = x[0]; x[2] = sse_arith(10, x[2], b_); }
+                // d38824 movaps xmm0, xmmword ptr [ecx + 0x20]
+                x[0] = rx((ecx.wrapping_add(0x20)) as usize);
+                // d38828 addps xmm4, xmm2
+                { let b_ = x[2]; x[4] = sse_arith(8, x[4], b_); }
+                // d3882b subps xmm4, xmm0
+                { let b_ = x[0]; x[4] = sse_arith(9, x[4], b_); }
+                // d3882e movaps xmm0, xmmword ptr [0xe18c90]
+                x[0] = rx((0xe18c90u32) as usize);
+                // d38835 andps xmm4, xmm0
+                { let b_ = x[0]; let a_ = x[4]; x[4] = bitop4(1, a_, b_); }
+                // d38838 movaps xmm0, xmmword ptr [ecx + 0x30]
+                x[0] = rx((ecx.wrapping_add(0x30)) as usize);
+                // d3883c cmpleps xmm4, xmm0
+                { let b_ = x[0]; x[4] = sse_cmp(2, x[4], b_, false); }
+                // d38840 movmskps eax, xmm4
+                eax = movmskps(x[4]);
+                // d38843 and eax, 7
+                let r_ = (eax) & (0x7u32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // d38846 cmp al, 7
+                fl = fl_sub((eax & 0xff), 0x7u32, 8).1;
+                // d38848 jne 0xd38870
+                pc = if !fl.zf { 0xd38870 } else { 0xd3884a };
+            }
+            0xd3884a => {
+                // d3884a mov eax, dword ptr [ebp + 0x10]
+                eax = s[24];
+                // d3884d movss dword ptr [eax + 0x10], xmm1
+                w.d((eax.wrapping_add(0x10)) as usize, x[1][0]);
+                // d38852 movaps xmm0, xmmword ptr [ecx + 0x10]
+                x[0] = rx((ecx.wrapping_add(0x10)) as usize);
+                // d38856 mov ecx, dword ptr [eax + 0x40]
+                ecx = rd((eax.wrapping_add(0x40)) as usize);
+                // d38859 movaps xmmword ptr [eax], xmm0
+                { let v_: [u32; 4] = x[0]; let a_ = (eax) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                // d3885c mov dword ptr [eax + ecx*4 + 0x20], 0xffffffff
+                w.d((eax.wrapping_add(ecx.wrapping_mul(4)).wrapping_add(0x20)) as usize, 0xffffffffu32);
+                // d38864 mov eax, dword ptr [ebp + 8]
+                eax = s[22];
+                // d38867 mov byte ptr [eax], 1
+                w.b((eax) as usize, (0x1u32) as u8);
+                // d3886a mov esp, ebp
+                // mov esp, ebp
+                // d3886c pop ebp
+                ebp = s[20];
+                // d3886d ret 0xc
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xd38870 => {
+                // d38870 mov eax, dword ptr [ebp + 8]
+                eax = s[22];
+                // d38873 mov byte ptr [eax], 0
+                w.b((eax) as usize, (0x0u32) as u8);
+                // d38876 mov esp, ebp
+                // mov esp, ebp
+                // d38878 pop ebp
+                ebp = s[20];
+                // d38879 ret 0xc
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 44];
+    s[30] = unsafe { *a.add(0) };
+    s[31] = unsafe { *a.add(1) };
+    s[32] = unsafe { *a.add(2) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd3e470u32;
+    loop {
+        match pc {
+            0xd3e470 => {
+                // d3e470 push ebp
+                s[28] = ebp;
+                // d3e471 mov ebp, esp
+                // mov ebp, esp (frame)
+                // d3e473 and esp, 0xfffffff0
+                // and esp, -N (alignment is not modelled)
+                // d3e476 sub esp, 0x48
+                // d3e479 movss xmm0, dword ptr [0xe87998]
+                x[0] = [rd((0xe87998u32) as usize), 0, 0, 0];
+                // d3e481 mov edx, dword ptr [ecx + 0x54]
+                edx = rd((ecx.wrapping_add(0x54)) as usize);
+                // d3e484 sub edx, 1
+                let (r_, f_) = fl_sub(edx, 0x1u32, 32); fl = f_;
+                edx = r_;
+                // d3e487 push esi
+                s[9] = esi;
+                // d3e488 push edi
+                s[8] = edi;
+                // d3e489 mov edi, dword ptr [ebp + 0x10]
+                edi = s[32];
+                // d3e48c movss dword ptr [esp + 0x14], xmm0
+                s[13] = x[0][0];
+                // d3e492 movss xmm0, dword ptr [edi + 0x10]
+                x[0] = [rd((edi.wrapping_add(0x10)) as usize), 0, 0, 0];
+                // d3e497 movss dword ptr [esp + 0x18], xmm0
+                s[14] = x[0][0];
+                // d3e49d xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // d3e4a0 movaps xmmword ptr [esp + 0x40], xmm0
+                { let v_: [u32; 4] = x[0]; s[24] = v_[0]; s[25] = v_[1]; s[26] = v_[2]; s[27] = v_[3]; }
+                // d3e4a5 js 0xd3e5fb
+                pc = if fl.sf { 0xd3e5fb } else { 0xd3e4ab };
+            }
+            0xd3e4ab => {
+                // d3e4ab mov eax, dword ptr [ebp + 0xc]
+                eax = s[31];
+                // d3e4ae fld dword ptr [esp + 0x14]
+                f[0] = ldq(s[13]);
+                // d3e4b2 movaps xmm4, xmmword ptr [eax]
+                x[4] = rx((eax) as usize);
+                // d3e4b5 fld dword ptr [esp + 0x18]
+                f[1] = ldq(s[14]);
+                // d3e4b9 movaps xmm5, xmmword ptr [eax + 0x10]
+                x[5] = rx((eax.wrapping_add(0x10)) as usize);
+                // d3e4bd xorps xmm3, xmm3
+                { let b_ = x[3]; let a_ = x[3]; x[3] = bitop4(0, a_, b_); }
+                // d3e4c0 mov esi, edx
+                esi = edx;
+                // d3e4c2 shl esi, 4
+                let (r_, f_) = fl_shift("shl", esi, 4, 32); fl = f_;
+                esi = r_;
+                // d3e4c5 add esi, dword ptr [ecx + 0x50]
+                let (r_, f_) = fl_add(esi, rd((ecx.wrapping_add(0x50)) as usize), 32); fl = f_;
+                esi = r_;
+                // d3e4c8 jmp 0xd3e4cc
+                pc = 0xd3e4cc;
+            }
+            0xd3e4ca => {
+                // d3e4ca fxch st(1)
+                f.swap(1, 0);
+                pc = 0xd3e4cc;
+            }
+            0xd3e4cc => {
+                // d3e4cc movaps xmm1, xmmword ptr [esi]
+                x[1] = rx((esi) as usize);
+                // d3e4cf movaps xmm0, xmm1
+                x[0] = x[1];
+                // d3e4d2 mulps xmm0, xmm4
+                { let b_ = x[4]; x[0] = sse_arith(10, x[0], b_); }
+                // d3e4d5 movaps xmm6, xmm0
+                x[6] = x[0];
+                // d3e4d8 shufps xmm6, xmm0, 0xaa
+                { let b_ = x[0]; let a_ = x[6]; x[6] = shufps(a_, b_, 170); }
+                // d3e4dc movaps xmm7, xmm0
+                x[7] = x[0];
+                // d3e4df shufps xmm7, xmm0, 0x55
+                { let b_ = x[0]; let a_ = x[7]; x[7] = shufps(a_, b_, 85); }
+                // d3e4e3 addss xmm7, xmm0
+                { let b_ = x[0]; x[7] = sse_arith(0, x[7], b_); }
+                // d3e4e7 movaps xmm2, xmm1
+                x[2] = x[1];
+                // d3e4ea shufps xmm2, xmm1, 0xff
+                { let b_ = x[1]; let a_ = x[2]; x[2] = shufps(a_, b_, 255); }
+                // d3e4ee addss xmm6, xmm2
+                { let b_ = x[2]; x[6] = sse_arith(0, x[6], b_); }
+                // d3e4f2 addps xmm6, xmm7
+                { let b_ = x[7]; x[6] = sse_arith(8, x[6], b_); }
+                // d3e4f5 movss dword ptr [esp + 0x30], xmm6
+                s[20] = x[6][0];
+                // d3e4fb movaps xmm0, xmm1
+                x[0] = x[1];
+                // d3e4fe mulps xmm0, xmm5
+                { let b_ = x[5]; x[0] = sse_arith(10, x[0], b_); }
+                // d3e501 movaps xmm6, xmm0
+                x[6] = x[0];
+                // d3e504 shufps xmm6, xmm0, 0x55
+                { let b_ = x[0]; let a_ = x[6]; x[6] = shufps(a_, b_, 85); }
+                // d3e508 movaps xmm7, xmm0
+                x[7] = x[0];
+                // d3e50b shufps xmm7, xmm0, 0xaa
+                { let b_ = x[0]; let a_ = x[7]; x[7] = shufps(a_, b_, 170); }
+                // d3e50f addss xmm6, xmm0
+                { let b_ = x[0]; x[6] = sse_arith(0, x[6], b_); }
+                // d3e513 movss xmm0, dword ptr [esp + 0x30]
+                x[0] = [s[20], 0, 0, 0];
+                // d3e519 addss xmm7, xmm2
+                { let b_ = x[2]; x[7] = sse_arith(0, x[7], b_); }
+                // d3e51d addps xmm6, xmm7
+                { let b_ = x[7]; x[6] = sse_arith(8, x[6], b_); }
+                // d3e520 movss dword ptr [esp + 0x20], xmm6
+                s[16] = x[6][0];
+                // d3e526 comiss xmm0, xmm3
+                { let b_ = x[3]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d3e529 movss xmm0, dword ptr [esp + 0x20]
+                x[0] = [s[16], 0, 0, 0];
+                // d3e52f jb 0xd3e56b
+                pc = if fl.cf { 0xd3e56b } else { 0xd3e531 };
+            }
+            0xd3e531 => {
+                // d3e531 comiss xmm0, xmm3
+                { let b_ = x[3]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d3e534 jae 0xd3e5f7
+                pc = if !fl.cf { 0xd3e5f7 } else { 0xd3e53a };
+            }
+            0xd3e53a => {
+                // d3e53a fld dword ptr [esp + 0x30]
+                f[2] = ldq(s[20]);
+                // d3e53e fld dword ptr [esp + 0x20]
+                f[3] = ldq(s[16]);
+                // d3e542 fsubr st(1)
+                f[3] = xn3(f[3], f[2], f[2] - f[3]);
+                // d3e544 fdivp st(1)
+                f[2] = xn3(f[2], f[3], f[2] / f[3]);
+                // d3e546 fstp dword ptr [esp + 0x1c]
+                s[15] = (f[2] as f32).to_bits();
+                // d3e54a fld dword ptr [esp + 0x1c]
+                f[2] = ldq(s[15]);
+                // d3e54e fcompi st(2)
+                fl = fl_fcomi(f[2], f[0]);
+                // d3e550 jb 0xd3e59a
+                pc = if fl.cf { 0xd3e59a } else { 0xd3e552 };
+            }
+            0xd3e552 => {
+                // d3e552 movss xmm0, dword ptr [esp + 0x1c]
+                x[0] = [s[15], 0, 0, 0];
+                // d3e558 fstp st(1)
+                f[0] = f[1];
+                // d3e55a movss dword ptr [esp + 0x14], xmm0
+                s[13] = x[0][0];
+                // d3e560 fld dword ptr [esp + 0x14]
+                f[1] = ldq(s[13]);
+                // d3e564 movaps xmmword ptr [esp + 0x40], xmm1
+                { let v_: [u32; 4] = x[1]; s[24] = v_[0]; s[25] = v_[1]; s[26] = v_[2]; s[27] = v_[3]; }
+                // d3e569 jmp 0xd3e59c
+                pc = 0xd3e59c;
+            }
+            0xd3e56b => {
+                // d3e56b comiss xmm0, xmm3
+                { let b_ = x[3]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d3e56e jb 0xd3e5b2
+                pc = if fl.cf { 0xd3e5b2 } else { 0xd3e570 };
+            }
+            0xd3e570 => {
+                // d3e570 fld dword ptr [esp + 0x30]
+                f[2] = ldq(s[20]);
+                // d3e574 fld dword ptr [esp + 0x20]
+                f[3] = ldq(s[16]);
+                // d3e578 fsubr st(1)
+                f[3] = xn3(f[3], f[2], f[2] - f[3]);
+                // d3e57a fdivp st(1)
+                f[2] = xn3(f[2], f[3], f[2] / f[3]);
+                // d3e57c fstp dword ptr [esp + 0x1c]
+                s[15] = (f[2] as f32).to_bits();
+                // d3e580 fld dword ptr [esp + 0x1c]
+                f[2] = ldq(s[15]);
+                // d3e584 fcompi st(1)
+                fl = fl_fcomi(f[2], f[1]);
+                // d3e586 ja 0xd3e59a
+                pc = if (!fl.cf && !fl.zf) { 0xd3e59a } else { 0xd3e588 };
+            }
+            0xd3e588 => {
+                // d3e588 movss xmm0, dword ptr [esp + 0x1c]
+                x[0] = [s[15], 0, 0, 0];
+                // d3e58e fstp st(0)
+                // d3e590 movss dword ptr [esp + 0x18], xmm0
+                s[14] = x[0][0];
+                // d3e596 fld dword ptr [esp + 0x18]
+                f[1] = ldq(s[14]);
+                pc = 0xd3e59a;
+            }
+            0xd3e59a => {
+                // d3e59a fxch st(1)
+                f.swap(1, 0);
+                pc = 0xd3e59c;
+            }
+            0xd3e59c => {
+                // d3e59c fcomi st(1)
+                fl = fl_fcomi(f[1], f[0]);
+                // d3e59e jbe 0xd3e5b4
+                pc = if (fl.cf || fl.zf) { 0xd3e5b4 } else { 0xd3e5a0 };
+            }
+            0xd3e5a0 => {
+                // d3e5a0 mov eax, dword ptr [ebp + 8]
+                eax = s[30];
+                // d3e5a3 fstp st(1)
+                f[0] = f[1];
+                // d3e5a5 fstp st(0)
+                // d3e5a7 mov byte ptr [eax], 0
+                w.b((eax) as usize, (0x0u32) as u8);
+                // d3e5aa pop edi
+                edi = s[8];
+                // d3e5ab pop esi
+                esi = s[9];
+                // d3e5ac mov esp, ebp
+                // mov esp, ebp
+                // d3e5ae pop ebp
+                ebp = s[28];
+                // d3e5af ret 0xc
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xd3e5b2 => {
+                // d3e5b2 fxch st(1)
+                f.swap(1, 0);
+                pc = 0xd3e5b4;
+            }
+            0xd3e5b4 => {
+                // d3e5b4 sub edx, 1
+                let (r_, f_) = fl_sub(edx, 0x1u32, 32); fl = f_;
+                edx = r_;
+                // d3e5b7 sub esi, 0x10
+                let (r_, f_) = fl_sub(esi, 0x10u32, 32); fl = f_;
+                esi = r_;
+                // d3e5ba test edx, edx
+                let r_ = (edx) & (edx);
+                fl = fl_logic(r_, 32);
+                // d3e5bc jge 0xd3e4ca
+                pc = if (fl.sf == fl.of) { 0xd3e4ca } else { 0xd3e5c2 };
+            }
+            0xd3e5c2 => {
+                // d3e5c2 movss xmm0, dword ptr [esp + 0x14]
+                x[0] = [s[13], 0, 0, 0];
+                // d3e5c8 fstp st(1)
+                f[0] = f[1];
+                // d3e5ca comiss xmm3, xmm0
+                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[3][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d3e5cd fstp st(0)
+                // d3e5cf ja 0xd3e5fb
+                pc = if (!fl.cf && !fl.zf) { 0xd3e5fb } else { 0xd3e5d1 };
+            }
+            0xd3e5d1 => {
+                // d3e5d1 mov eax, dword ptr [edi + 0x40]
+                eax = rd((edi.wrapping_add(0x40)) as usize);
+                // d3e5d4 movaps xmm1, xmmword ptr [esp + 0x40]
+                x[1] = [s[24], s[25], s[26], s[27]];
+                // d3e5d9 movaps xmmword ptr [edi], xmm1
+                { let v_: [u32; 4] = x[1]; let a_ = (edi) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                // d3e5dc movss dword ptr [edi + 0x10], xmm0
+                w.d((edi.wrapping_add(0x10)) as usize, x[0][0]);
+                // d3e5e1 mov dword ptr [edi + eax*4 + 0x20], 0xffffffff
+                w.d((edi.wrapping_add(eax.wrapping_mul(4)).wrapping_add(0x20)) as usize, 0xffffffffu32);
+                // d3e5e9 mov eax, dword ptr [ebp + 8]
+                eax = s[30];
+                // d3e5ec mov byte ptr [eax], 1
+                w.b((eax) as usize, (0x1u32) as u8);
+                // d3e5ef pop edi
+                edi = s[8];
+                // d3e5f0 pop esi
+                esi = s[9];
+                // d3e5f1 mov esp, ebp
+                // mov esp, ebp
+                // d3e5f3 pop ebp
+                ebp = s[28];
+                // d3e5f4 ret 0xc
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xd3e5f7 => {
+                // d3e5f7 fstp st(0)
+                // d3e5f9 fstp st(0)
+                pc = 0xd3e5fb;
+            }
+            0xd3e5fb => {
+                // d3e5fb mov eax, dword ptr [ebp + 8]
+                eax = s[30];
+                // d3e5fe pop edi
+                edi = s[8];
+                // d3e5ff mov byte ptr [eax], 0
+                w.b((eax) as usize, (0x0u32) as u8);
+                // d3e602 pop esi
+                esi = s[9];
+                // d3e603 mov esp, ebp
+                // mov esp, ebp
+                // d3e605 pop ebp
+                ebp = s[28];
+                // d3e606 ret 0xc
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d3f650(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 27];
+    s[14] = unsafe { *a.add(0) };
+    s[15] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd3f650u32;
+    loop {
+        match pc {
+            0xd3f650 => {
+                // d3f650 push ebp
+                s[12] = ebp;
+                // d3f651 mov ebp, esp
+                // mov ebp, esp (frame)
+                // d3f653 and esp, 0xfffffff0
+                // and esp, -N (alignment is not modelled)
+                // d3f656 sub esp, 0x10
+                // d3f659 movaps xmm1, xmmword ptr [ecx + 0x30]
+                x[1] = rx((ecx.wrapping_add(0x30)) as usize);
+                // d3f65d movaps xmm2, xmmword ptr [ecx + 0x20]
+                x[2] = rx((ecx.wrapping_add(0x20)) as usize);
+                // d3f661 mov eax, dword ptr [ebp + 8]
+                eax = s[14];
+                // d3f664 movaps xmm3, xmmword ptr [eax]
+                x[3] = rx((eax) as usize);
+                // d3f667 mov ecx, dword ptr [ebp + 0xc]
+                ecx = s[15];
+                // d3f66a movaps xmm0, xmm1
+                x[0] = x[1];
+                // d3f66d subps xmm0, xmm2
+                { let b_ = x[2]; x[0] = sse_arith(9, x[0], b_); }
+                // d3f670 mulps xmm0, xmm3
+                { let b_ = x[3]; x[0] = sse_arith(10, x[0], b_); }
+                // d3f673 movaps xmm3, xmm0
+                x[3] = x[0];
+                // d3f676 shufps xmm3, xmm0, 0x55
+                { let b_ = x[0]; let a_ = x[3]; x[3] = shufps(a_, b_, 85); }
+                // d3f67a movaps xmm4, xmm0
+                x[4] = x[0];
+                // d3f67d addss xmm3, xmm0
+                { let b_ = x[0]; x[3] = sse_arith(0, x[3], b_); }
+                // d3f681 shufps xmm4, xmm0, 0xaa
+                { let b_ = x[0]; let a_ = x[4]; x[4] = shufps(a_, b_, 170); }
+                // d3f685 xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // d3f688 addss xmm4, xmm3
+                { let b_ = x[3]; x[4] = sse_arith(0, x[4], b_); }
+                // d3f68c movss dword ptr [esp], xmm4
+                s[8] = x[4][0];
+                // d3f691 comiss xmm0, dword ptr [esp]
+                { let b_ = [s[8], 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d3f695 jbe 0xd3f6aa
+                pc = if (fl.cf || fl.zf) { 0xd3f6aa } else { 0xd3f697 };
+            }
+            0xd3f697 => {
+                // d3f697 xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // d3f699 or eax, 0x3f000000
+                let r_ = (eax) | (0x3f000000u32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // d3f69e movaps xmmword ptr [ecx], xmm2
+                { let v_: [u32; 4] = x[2]; let a_ = (ecx) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                // d3f6a1 mov dword ptr [ecx + 0xc], eax
+                w.d((ecx.wrapping_add(0xc)) as usize, eax);
+                // d3f6a4 mov esp, ebp
+                // mov esp, ebp
+                // d3f6a6 pop ebp
+                ebp = s[12];
+                // d3f6a7 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xd3f6aa => {
+                // d3f6aa mov eax, 0x10
+                eax = 0x10u32;
+                // d3f6af or eax, 0x3f000000
+                let r_ = (eax) | (0x3f000000u32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // d3f6b4 movaps xmmword ptr [ecx], xmm1
+                { let v_: [u32; 4] = x[1]; let a_ = (ecx) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                // d3f6b7 mov dword ptr [ecx + 0xc], eax
+                w.d((ecx.wrapping_add(0xc)) as usize, eax);
+                // d3f6ba mov esp, ebp
+                // mov esp, ebp
+                // d3f6bc pop ebp
+                ebp = s[12];
+                // d3f6bd ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d47dc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    s[9] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd47dc0u32;
+    loop {
+        match pc {
+            0xd47dc0 => {
+                // d47dc0 movss xmm1, dword ptr [ecx + 0x70]
+                x[1] = [rd((ecx.wrapping_add(0x70)) as usize), 0, 0, 0];
+                // d47dc5 xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // d47dc8 comiss xmm1, xmm0
+                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d47dcb jbe 0xd47de2
+                pc = if (fl.cf || fl.zf) { 0xd47de2 } else { 0xd47dcd };
+            }
+            0xd47dcd => {
+                // d47dcd movss xmm1, dword ptr [ecx + 0x74]
+                x[1] = [rd((ecx.wrapping_add(0x74)) as usize), 0, 0, 0];
+                // d47dd2 comiss xmm1, xmm0
+                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d47dd5 jbe 0xd47de2
+                pc = if (fl.cf || fl.zf) { 0xd47de2 } else { 0xd47dd7 };
+            }
+            0xd47dd7 => {
+                // d47dd7 mov eax, dword ptr [esp + 4]
+                eax = s[9];
+                // d47ddb mov cl, 1
+                ecx = set_part(ecx, 0, 0xff, 0x1u32);
+                // d47ddd mov byte ptr [eax], cl
+                w.b((eax) as usize, ((ecx & 0xff)) as u8);
+                // d47ddf ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xd47de2 => {
+                // d47de2 mov eax, dword ptr [esp + 4]
+                eax = s[9];
+                // d47de6 xor cl, cl
+                ecx = set_part(ecx, 0, 0xff, 0);
+                fl = fl_logic(0, 32);
+                // d47de8 mov byte ptr [eax], cl
+                w.b((eax) as usize, ((ecx & 0xff)) as u8);
+                // d47dea ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d489c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    s[9] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd489c0u32;
+    loop {
+        match pc {
+            0xd489c0 => {
+                // d489c0 movss xmm0, dword ptr [ecx + 0x44]
+                x[0] = [rd((ecx.wrapping_add(0x44)) as usize), 0, 0, 0];
+                // d489c5 comiss xmm0, dword ptr [0xdd32c0]
+                { let b_ = [rd((0xdd32c0u32) as usize), 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d489cc mov eax, dword ptr [esp + 4]
+                eax = s[9];
+                // d489d0 jbe 0xd489d9
+                pc = if (fl.cf || fl.zf) { 0xd489d9 } else { 0xd489d2 };
+            }
+            0xd489d2 => {
+                // d489d2 mov cl, 1
+                ecx = set_part(ecx, 0, 0xff, 0x1u32);
+                // d489d4 mov byte ptr [eax], cl
+                w.b((eax) as usize, ((ecx & 0xff)) as u8);
+                // d489d6 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xd489d9 => {
+                // d489d9 xor cl, cl
+                ecx = set_part(ecx, 0, 0xff, 0);
+                fl = fl_logic(0, 32);
+                // d489db mov byte ptr [eax], cl
+                w.b((eax) as usize, ((ecx & 0xff)) as u8);
+                // d489dd ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_493b80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 26];
+    w.skip((s.as_ptr() as usize, std::mem::size_of_val(&s)));
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x493b80u32;
+    loop {
+        match pc {
+            0x493b80 => {
+                // 493b80 sub esp, 0x10
+                // 493b83 mov ecx, dword ptr [eax]
+                ecx = rd((eax) as usize);
+                // 493b85 fld dword ptr [0x25f5b14]
+                f[0] = ldq(rd((0x25f5b14u32) as usize));
+                // 493b8b mov dword ptr [0x25f5b20], ecx
+                w.d((0x25f5b20u32) as usize, ecx);
+                // 493b91 fstp dword ptr [esp + 4]
+                s[11] = (f[0] as f32).to_bits();
+                // 493b95 mov edx, dword ptr [eax + 4]
+                edx = rd((eax.wrapping_add(0x4)) as usize);
+                // 493b98 fld dword ptr [0x25f5b18]
+                f[0] = ldq(rd((0x25f5b18u32) as usize));
+                // 493b9e mov dword ptr [0x25f5b24], edx
+                w.d((0x25f5b24u32) as usize, edx);
+                // 493ba4 fstp dword ptr [esp + 8]
+                s[12] = (f[0] as f32).to_bits();
+                // 493ba8 mov ecx, dword ptr [eax + 8]
+                ecx = rd((eax.wrapping_add(0x8)) as usize);
+                // 493bab fld dword ptr [0x25f5b1c]
+                f[0] = ldq(rd((0x25f5b1cu32) as usize));
+                // 493bb1 mov dword ptr [0x25f5b28], ecx
+                w.d((0x25f5b28u32) as usize, ecx);
+                // 493bb7 fstp dword ptr [esp + 0xc]
+                s[13] = (f[0] as f32).to_bits();
+                // 493bbb mov edx, dword ptr [eax]
+                edx = rd((eax) as usize);
+                // 493bbd mov dword ptr [0x25f5b14], edx
+                w.d((0x25f5b14u32) as usize, edx);
+                // 493bc3 mov ecx, dword ptr [eax + 4]
+                ecx = rd((eax.wrapping_add(0x4)) as usize);
+                // 493bc6 mov dword ptr [0x25f5b18], ecx
+                w.d((0x25f5b18u32) as usize, ecx);
+                // 493bcc mov edx, dword ptr [eax + 8]
+                edx = rd((eax.wrapping_add(0x8)) as usize);
+                // 493bcf lea eax, [esp + 4]
+                eax = ((s.as_ptr() as u32).wrapping_add(44));
+                // 493bd3 push 0x25f5b14
+                s[9] = 0x25f5b14u32;
+                // 493bd8 push eax
+                s[8] = eax;
+                // 493bd9 mov dword ptr [0x25f5b1c], edx
+                w.d((0x25f5b1cu32) as usize, edx);
+                // 493bdf call 0xbde980
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xbde980, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // 493be4 fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // 493be8 fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // 493bec add esp, 8
+                // 493bef fld dword ptr [0x2526be8]
+                f[1] = ldq(rd((0x2526be8u32) as usize));
+                // 493bf5 fcomp st(1)
+                cc87 = cc(f[1], f[0]);
+                // 493bf7 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 493bf9 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 493bfc jp 0x493c08
+                pc = if fl.pf { 0x493c08 } else { 0x493bfe };
+            }
+            0x493bfe => {
+                // 493bfe fstp dword ptr [0x2526be8]
+                w.d((0x2526be8u32) as usize, (f[0] as f32).to_bits());
+                // 493c04 add esp, 0x10
+                // 493c07 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x493c08 => {
+                // 493c08 fstp st(0)
+                // 493c0a add esp, 0x10
+                // 493c0d ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+static H188: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_495590(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 26];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x495590u32;
+    loop {
+        match pc {
+            0x495590 => {
+                H188[0].fetch_add(1, Ordering::Relaxed);
+                // 495590 sub esp, 0x10
+                // 495593 fld dword ptr [0x25f5b2c]
+                f[0] = ldq(rd((0x25f5b2cu32) as usize));
+                // 495599 push esi
+                s[9] = esi;
+                // 49559a push edi
+                s[8] = edi;
+                // 49559b mov edi, dword ptr [0x21703d4]
+                edi = rd((0x21703d4u32) as usize);
+                // 4955a1 fsub dword ptr [edi + 0x14]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x14)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x14)) as usize)));
+                // 4955a4 mov esi, 0x25f62e8
+                esi = 0x25f62e8u32;
+                // 4955a9 fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // 4955ad mov eax, dword ptr [esp + 0xc]
+                eax = s[11];
+                // 4955b1 fld dword ptr [0x25f5b30]
+                f[0] = ldq(rd((0x25f5b30u32) as usize));
+                // 4955b7 fsub dword ptr [edi + 0x18]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x18)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x18)) as usize)));
+                // 4955ba fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // 4955be mov ecx, dword ptr [esp + 0x10]
+                ecx = s[12];
+                // 4955c2 fld dword ptr [0x25f5b34]
+                f[0] = ldq(rd((0x25f5b34u32) as usize));
+                // 4955c8 fsub dword ptr [edi + 0x1c]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x1c)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x1c)) as usize)));
+                // 4955cb mov dword ptr [0x25f62ec], ecx
+                w.d((0x25f62ecu32) as usize, ecx);
+                // 4955d1 mov dword ptr [0x25f62e8], eax
+                w.d((0x25f62e8u32) as usize, eax);
+                // 4955d6 fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // 4955da mov edx, dword ptr [esp + 0x14]
+                edx = s[13];
+                // 4955de fldz 
+                f[0] = 0.0;
+                // 4955e0 mov dword ptr [0x25f62f0], edx
+                w.d((0x25f62f0u32) as usize, edx);
+                // 4955e6 fstp dword ptr [0x25f62ec]
+                w.d((0x25f62ecu32) as usize, (f[0] as f32).to_bits());
+                // 4955ec call 0xbde150
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0xbde150, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // 4955f1 fld dword ptr [0x25f5b2c]
+                f[0] = ldq(rd((0x25f5b2cu32) as usize));
+                // 4955f7 fsub dword ptr [edi + 0x14]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x14)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x14)) as usize)));
+                // 4955fa fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // 4955fe mov eax, dword ptr [esp + 0xc]
+                eax = s[11];
+                // 495602 fld dword ptr [0x25f5b30]
+                f[0] = ldq(rd((0x25f5b30u32) as usize));
+                // 495608 fsub dword ptr [edi + 0x18]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x18)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x18)) as usize)));
+                // 49560b fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // 49560f mov ecx, dword ptr [esp + 0x10]
+                ecx = s[12];
+                // 495613 fld dword ptr [0x25f5b34]
+                f[0] = ldq(rd((0x25f5b34u32) as usize));
+                // 495619 fsub dword ptr [edi + 0x1c]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x1c)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x1c)) as usize)));
+                // 49561c mov dword ptr [0x25f62f4], eax
+                w.d((0x25f62f4u32) as usize, eax);
+                // 495621 mov al, byte ptr [0x2528b48]
+                eax = set_part(eax, 0, 0xff, (rb((0x2528b48u32) as usize) as u32));
+                // 495626 cmp al, 1
+                fl = fl_sub((eax & 0xff), 0x1u32, 8).1;
+                // 495628 fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // 49562c mov edx, dword ptr [esp + 0x14]
+                edx = s[13];
+                // 495630 fldz 
+                f[0] = 0.0;
+                // 495632 pop edi
+                edi = s[8];
+                // 495633 fstp dword ptr [0xf53930]
+                w.d((0xf53930u32) as usize, (f[0] as f32).to_bits());
+                // 495639 mov dword ptr [0x25f62f8], ecx
+                w.d((0x25f62f8u32) as usize, ecx);
+                // 49563f mov dword ptr [0x25f62fc], edx
+                w.d((0x25f62fcu32) as usize, edx);
+                // 495645 pop esi
+                esi = s[9];
+                // 495646 jne 0x49565a
+                pc = if !fl.zf { 0x49565a } else { 0x495648 };
+            }
+            0x495648 => {
+                H188[1].fetch_add(1, Ordering::Relaxed);
+                // 495648 mov cl, byte ptr [0x2528b49]
+                ecx = set_part(ecx, 0, 0xff, (rb((0x2528b49u32) as usize) as u32));
+                // 49564e test cl, cl
+                let r_ = ((ecx & 0xff)) & ((ecx & 0xff));
+                fl = fl_logic(r_, 8);
+                // 495650 jne 0x49565a
+                pc = if !fl.zf { 0x49565a } else { 0x495652 };
+            }
+            0x495652 => {
+                H188[2].fetch_add(1, Ordering::Relaxed);
+                // 495652 fld dword ptr [0xdd0794]
+                f[0] = ldq(rd((0xdd0794u32) as usize));
+                // 495658 jmp 0x495660
+                pc = 0x495660;
+            }
+            0x49565a => {
+                H188[3].fetch_add(1, Ordering::Relaxed);
+                // 49565a fld dword ptr [0xdd071c]
+                f[0] = ldq(rd((0xdd071cu32) as usize));
+                pc = 0x495660;
+            }
+            0x495660 => {
+                H188[4].fetch_add(1, Ordering::Relaxed);
+                // 495660 fstp dword ptr [esp]
+                s[10] = (f[0] as f32).to_bits();
+                // 495663 push ecx
+                s[9] = ecx;
+                // 495664 fld dword ptr [esp + 4]
+                f[0] = ldq(s[10]);
+                // 495668 fdiv qword ptr [0xe5c3d8]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5c3d8u32) as usize)), f[0] / f64::from_bits(rq((0xe5c3d8u32) as usize)));
+                // 49566e fstp dword ptr [esp + 4]
+                s[10] = (f[0] as f32).to_bits();
+                // 495672 fld dword ptr [esp + 4]
+                f[0] = ldq(s[10]);
+                // 495676 fstp dword ptr [esp]
+                s[9] = (f[0] as f32).to_bits();
+                // 495679 call 0x40ea20
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[9..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // 49567e fstp dword ptr [0xf5392c]
+                w.d((0xf5392cu32) as usize, (f[0] as f32).to_bits());
+                // 495684 mov edx, dword ptr [0xe9a664]
+                edx = rd((0xe9a664u32) as usize);
+                // 49568a mov eax, dword ptr [0xe9a668]
+                eax = rd((0xe9a668u32) as usize);
+                // 49568f mov ecx, dword ptr [0xe9a66c]
+                ecx = rd((0xe9a66cu32) as usize);
+                // 495695 mov dword ptr [0x25f6300], edx
+                w.d((0x25f6300u32) as usize, edx);
+                // 49569b mov dword ptr [0x25f6304], eax
+                w.d((0x25f6304u32) as usize, eax);
+                // 4956a0 mov dword ptr [0x25f6308], ecx
+                w.d((0x25f6308u32) as usize, ecx);
+                // 4956a6 mov byte ptr [0xf53928], 0
+                w.b((0xf53928u32) as usize, (0x0u32) as u8);
+                // 4956ad add esp, 0x14
+                // 4956b0 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+static H189: [AtomicU32; 19] = [const { AtomicU32::new(0) }; 19];
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_4a0ca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[11] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x4a0ca0u32;
+    loop {
+        match pc {
+            0x4a0ca0 => {
+                H189[0].fetch_add(1, Ordering::Relaxed);
+                // 4a0ca0 push ecx
+                s[9] = ecx;
+                // 4a0ca1 mov eax, dword ptr [0xe9a6c0]
+                eax = rd((0xe9a6c0u32) as usize);
+                // 4a0ca6 test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // 4a0ca8 push esi
+                s[8] = esi;
+                // 4a0ca9 mov esi, dword ptr [0xe843ac]
+                esi = rd((0xe843acu32) as usize);
+                // 4a0caf jl 0x4a0cbe
+                pc = if (fl.sf != fl.of) { 0x4a0cbe } else { 0x4a0cb1 };
+            }
+            0x4a0cb1 => {
+                H189[1].fetch_add(1, Ordering::Relaxed);
+                // 4a0cb1 cmp eax, esi
+                fl = fl_sub(eax, esi, 32).1;
+                // 4a0cb3 jle 0x4a0cf6
+                pc = if (fl.zf || fl.sf != fl.of) { 0x4a0cf6 } else { 0x4a0cb5 };
+            }
+            0x4a0cb5 => {
+                H189[2].fetch_add(1, Ordering::Relaxed);
+                // 4a0cb5 sub eax, esi
+                let (r_, f_) = fl_sub(eax, esi, 32); fl = f_;
+                eax = r_;
+                // 4a0cb7 cmp eax, 0x35a4e900
+                fl = fl_sub(eax, 0x35a4e900u32, 32).1;
+                // 4a0cbc jl 0x4a0d02
+                pc = if (fl.sf != fl.of) { 0x4a0d02 } else { 0x4a0cbe };
+            }
+            0x4a0cbe => {
+                H189[3].fetch_add(1, Ordering::Relaxed);
+                // 4a0cbe test edi, edi
+                let r_ = (edi) & (edi);
+                fl = fl_logic(r_, 32);
+                // 4a0cc0 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[11]);
+                // 4a0cc4 lea eax, [esi + edi]
+                eax = esi.wrapping_add(edi);
+                // 4a0cc7 fstp dword ptr [0xf53aa8]
+                w.d((0xf53aa8u32) as usize, (f[0] as f32).to_bits());
+                // 4a0ccd mov dword ptr [0xe9a6c0], eax
+                w.d((0xe9a6c0u32) as usize, eax);
+                // 4a0cd2 jl 0x4a0dc4
+                pc = if (fl.sf != fl.of) { 0x4a0dc4 } else { 0x4a0cd8 };
+            }
+            0x4a0cd8 => {
+                H189[4].fetch_add(1, Ordering::Relaxed);
+                // 4a0cd8 cmp eax, 0x6b49d200
+                fl = fl_sub(eax, 0x6b49d200u32, 32).1;
+                // 4a0cdd jle 0x4a0dd2
+                pc = if (fl.zf || fl.sf != fl.of) { 0x4a0dd2 } else { 0x4a0ce3 };
+            }
+            0x4a0ce3 => {
+                H189[5].fetch_add(1, Ordering::Relaxed);
+                // 4a0ce3 sub eax, 0x6b49d200
+                let (r_, f_) = fl_sub(eax, 0x6b49d200u32, 32); fl = f_;
+                eax = r_;
+                // 4a0ce8 mov dword ptr [0xe9a6c0], eax
+                w.d((0xe9a6c0u32) as usize, eax);
+                // 4a0ced mov dword ptr [0xf53ab0], edi
+                w.d((0xf53ab0u32) as usize, edi);
+                // 4a0cf3 pop esi
+                esi = s[8];
+                // 4a0cf4 pop ecx
+                ecx = s[9];
+                // 4a0cf5 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x4a0cf6 => {
+                H189[6].fetch_add(1, Ordering::Relaxed);
+                // 4a0cf6 mov ecx, esi
+                ecx = esi;
+                // 4a0cf8 sub ecx, eax
+                let (r_, f_) = fl_sub(ecx, eax, 32); fl = f_;
+                ecx = r_;
+                // 4a0cfa cmp ecx, 0x35a4e900
+                fl = fl_sub(ecx, 0x35a4e900u32, 32).1;
+                // 4a0d00 jl 0x4a0cbe
+                pc = if (fl.sf != fl.of) { 0x4a0cbe } else { 0x4a0d02 };
+            }
+            0x4a0d02 => {
+                H189[7].fetch_add(1, Ordering::Relaxed);
+                // 4a0d02 mov eax, 0xe9a6c0
+                eax = 0xe9a6c0u32;
+                // 4a0d07 call 0xbdd260
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0xbdd260, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // 4a0d0c mov ecx, eax
+                ecx = eax;
+                // 4a0d0e mov dword ptr [esp + 4], ecx
+                s[9] = ecx;
+                // 4a0d12 fild dword ptr [esp + 4]
+                f[0] = (((s[9]) as i32) as f64);
+                // 4a0d16 fidiv dword ptr [0xf53ab0]
+                f[0] = xn3(f[0], (((rd((0xf53ab0u32) as usize)) as i32) as f64), f[0] / (((rd((0xf53ab0u32) as usize)) as i32) as f64));
+                // 4a0d1c fld1 
+                f[1] = 1.0;
+                // 4a0d1e fsubrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] - f[0]);
+                // 4a0d20 fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // 4a0d24 fld dword ptr [0xe44850]
+                f[0] = ldq(rd((0xe44850u32) as usize));
+                // 4a0d2a fld dword ptr [esp + 4]
+                f[1] = ldq(s[9]);
+                // 4a0d2e fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 4a0d30 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 4a0d32 fstp st(1)
+                f[0] = f[1];
+                // 4a0d34 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // 4a0d37 jp 0x4a0d51
+                pc = if fl.pf { 0x4a0d51 } else { 0x4a0d39 };
+            }
+            0x4a0d39 => {
+                H189[8].fetch_add(1, Ordering::Relaxed);
+                // 4a0d39 fmul qword ptr [0xe5c270]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5c270u32) as usize)), f[0] * f64::from_bits(rq((0xe5c270u32) as usize)));
+                // 4a0d3f fld dword ptr [0xf53aa8]
+                f[1] = ldq(rd((0xf53aa8u32) as usize));
+                // 4a0d45 fldz 
+                f[2] = 0.0;
+                // 4a0d47 fsub st(1), st(0)
+                f[1] = xn3(f[1], f[2], f[1] - f[2]);
+                // 4a0d49 fxch st(2)
+                f.swap(2, 0);
+                // 4a0d4b fmulp st(1)
+                f[1] = xn3(f[1], f[2], f[1] * f[2]);
+                // 4a0d4d faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // 4a0d4f jmp 0x4a0d6d
+                pc = 0x4a0d6d;
+            }
+            0x4a0d51 => {
+                H189[9].fetch_add(1, Ordering::Relaxed);
+                // 4a0d51 fsub qword ptr [0xe5bfc8]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bfc8u32) as usize)), f[0] - f64::from_bits(rq((0xe5bfc8u32) as usize)));
+                // 4a0d57 fdiv qword ptr [0xe5c370]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5c370u32) as usize)), f[0] / f64::from_bits(rq((0xe5c370u32) as usize)));
+                // 4a0d5d fld dword ptr [0xf53aa8]
+                f[1] = ldq(rd((0xf53aa8u32) as usize));
+                // 4a0d63 fld st(0)
+                f[2] = f[1];
+                // 4a0d65 fldz 
+                f[3] = 0.0;
+                // 4a0d67 fsubrp st(1)
+                f[2] = xn3(f[2], f[3], f[3] - f[2]);
+                // 4a0d69 fmulp st(2)
+                f[0] = xn3(f[0], f[2], f[0] * f[2]);
+                // 4a0d6b faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                pc = 0x4a0d6d;
+            }
+            0x4a0d6d => {
+                H189[10].fetch_add(1, Ordering::Relaxed);
+                // 4a0d6d mov eax, ecx
+                eax = ecx;
+                // 4a0d6f fstp dword ptr [0xf53aa8]
+                w.d((0xf53aa8u32) as usize, (f[0] as f32).to_bits());
+                // 4a0d75 fld dword ptr [0xf53aa8]
+                f[0] = ldq(rd((0xf53aa8u32) as usize));
+                // 4a0d7b cdq 
+                edx = if (eax as i32) < 0 { 0xffffffff } else { 0 };
+                // 4a0d7c fadd dword ptr [esp + 0xc]
+                f[0] = xn3(f[0], ldr32(s[11]), f[0] + ldr32(s[11]));
+                // 4a0d80 sub eax, edx
+                let (r_, f_) = fl_sub(eax, edx, 32); fl = f_;
+                eax = r_;
+                // 4a0d82 sar eax, 1
+                let (r_, f_) = fl_shift("sar", eax, 1, 32); fl = f_;
+                eax = r_;
+                // 4a0d84 add eax, edi
+                let (r_, f_) = fl_add(eax, edi, 32); fl = f_;
+                eax = r_;
+                // 4a0d86 fstp dword ptr [0xf53aa8]
+                w.d((0xf53aa8u32) as usize, (f[0] as f32).to_bits());
+                // 4a0d8c mov dword ptr [0xf53ab0], eax
+                w.d((0xf53ab0u32) as usize, eax);
+                // 4a0d91 js 0x4a0dae
+                pc = if fl.sf { 0x4a0dae } else { 0x4a0d93 };
+            }
+            0x4a0d93 => {
+                H189[11].fetch_add(1, Ordering::Relaxed);
+                // 4a0d93 add eax, esi
+                let (r_, f_) = fl_add(eax, esi, 32); fl = f_;
+                eax = r_;
+                // 4a0d95 cmp eax, 0x6b49d200
+                fl = fl_sub(eax, 0x6b49d200u32, 32).1;
+                // 4a0d9a mov dword ptr [0xe9a6c0], eax
+                w.d((0xe9a6c0u32) as usize, eax);
+                // 4a0d9f jle 0x4a0dd8
+                pc = if (fl.zf || fl.sf != fl.of) { 0x4a0dd8 } else { 0x4a0da1 };
+            }
+            0x4a0da1 => {
+                H189[12].fetch_add(1, Ordering::Relaxed);
+                // 4a0da1 sub eax, 0x6b49d200
+                let (r_, f_) = fl_sub(eax, 0x6b49d200u32, 32); fl = f_;
+                eax = r_;
+                // 4a0da6 mov dword ptr [0xe9a6c0], eax
+                w.d((0xe9a6c0u32) as usize, eax);
+                // 4a0dab pop esi
+                esi = s[8];
+                // 4a0dac pop ecx
+                ecx = s[9];
+                // 4a0dad ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x4a0dae => {
+                H189[13].fetch_add(1, Ordering::Relaxed);
+                // 4a0dae add eax, esi
+                let (r_, f_) = fl_add(eax, esi, 32); fl = f_;
+                eax = r_;
+                // 4a0db0 mov dword ptr [0xe9a6c0], eax
+                w.d((0xe9a6c0u32) as usize, eax);
+                // 4a0db5 jns 0x4a0dd8
+                pc = if !fl.sf { 0x4a0dd8 } else { 0x4a0db7 };
+            }
+            0x4a0db7 => {
+                H189[14].fetch_add(1, Ordering::Relaxed);
+                // 4a0db7 add eax, 0x6b49d200
+                let (r_, f_) = fl_add(eax, 0x6b49d200u32, 32); fl = f_;
+                eax = r_;
+                // 4a0dbc mov dword ptr [0xe9a6c0], eax
+                w.d((0xe9a6c0u32) as usize, eax);
+                // 4a0dc1 pop esi
+                esi = s[8];
+                // 4a0dc2 pop ecx
+                ecx = s[9];
+                // 4a0dc3 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x4a0dc4 => {
+                H189[15].fetch_add(1, Ordering::Relaxed);
+                // 4a0dc4 test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // 4a0dc6 jge 0x4a0dd2
+                pc = if (fl.sf == fl.of) { 0x4a0dd2 } else { 0x4a0dc8 };
+            }
+            0x4a0dc8 => {
+                H189[16].fetch_add(1, Ordering::Relaxed);
+                // 4a0dc8 add eax, 0x6b49d200
+                let (r_, f_) = fl_add(eax, 0x6b49d200u32, 32); fl = f_;
+                eax = r_;
+                // 4a0dcd mov dword ptr [0xe9a6c0], eax
+                w.d((0xe9a6c0u32) as usize, eax);
+                pc = 0x4a0dd2;
+            }
+            0x4a0dd2 => {
+                H189[17].fetch_add(1, Ordering::Relaxed);
+                // 4a0dd2 mov dword ptr [0xf53ab0], edi
+                w.d((0xf53ab0u32) as usize, edi);
+                pc = 0x4a0dd8;
+            }
+            0x4a0dd8 => {
+                H189[18].fetch_add(1, Ordering::Relaxed);
+                // 4a0dd8 pop esi
+                esi = s[8];
+                // 4a0dd9 pop ecx
+                ecx = s[9];
+                // 4a0dda ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_4b2680(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    s[9] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x4b2680u32;
+    loop {
+        match pc {
+            0x4b2680 => {
+                // 4b2680 fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // 4b2684 fmul qword ptr [0xe5c190]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5c190u32) as usize)), f[0] * f64::from_bits(rq((0xe5c190u32) as usize)));
+                // 4b268a fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // 4b268e fldz 
+                f[0] = 0.0;
+                // 4b2690 fld dword ptr [esp + 4]
+                f[1] = ldq(s[9]);
+                // 4b2694 fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 4b2696 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 4b2698 fstp st(1)
+                f[0] = f[1];
+                // 4b269a test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // 4b269d jne 0x4b26a7
+                pc = if !fl.zf { 0x4b26a7 } else { 0x4b269f };
+            }
+            0x4b269f => {
+                // 4b269f fadd qword ptr [0xe5bf70]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf70u32) as usize)), f[0] + f64::from_bits(rq((0xe5bf70u32) as usize)));
+                // 4b26a5 jmp 0x4b26ad
+                pc = 0x4b26ad;
+            }
+            0x4b26a7 => {
+                // 4b26a7 fsub qword ptr [0xe5bf70]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf70u32) as usize)), f[0] - f64::from_bits(rq((0xe5bf70u32) as usize)));
+                pc = 0x4b26ad;
+            }
+            0x4b26ad => {
+                // 4b26ad call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                // 4b26b2 cmp eax, 0x77359400
+                fl = fl_sub(eax, 0x77359400u32, 32).1;
+                // 4b26b7 jle 0x4b26c4
+                pc = if (fl.zf || fl.sf != fl.of) { 0x4b26c4 } else { 0x4b26b9 };
+            }
+            0x4b26b9 => {
+                // 4b26b9 mov dword ptr [esi], 0x77359400
+                w.d((esi) as usize, 0x77359400u32);
+                // 4b26bf mov eax, esi
+                eax = esi;
+                // 4b26c1 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x4b26c4 => {
+                // 4b26c4 cmp eax, 0x88ca6c00
+                fl = fl_sub(eax, 0x88ca6c00u32, 32).1;
+                // 4b26c9 jge 0x4b26d6
+                pc = if (fl.sf == fl.of) { 0x4b26d6 } else { 0x4b26cb };
+            }
+            0x4b26cb => {
+                // 4b26cb mov dword ptr [esi], 0x88ca6c00
+                w.d((esi) as usize, 0x88ca6c00u32);
+                // 4b26d1 mov eax, esi
+                eax = esi;
+                // 4b26d3 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x4b26d6 => {
+                // 4b26d6 mov dword ptr [esi], eax
+                w.d((esi) as usize, eax);
+                // 4b26d8 mov eax, esi
+                eax = esi;
+                // 4b26da ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_523b10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 24];
+    s[11] = unsafe { *a.add(0) };
+    s[12] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x523b10u32;
+    loop {
+        match pc {
+            0x523b10 => {
+                // 523b10 mov eax, dword ptr [esp + 4]
+                eax = s[11];
+                // 523b14 mov ecx, dword ptr [eax]
+                ecx = rd((eax) as usize);
+                // 523b16 sub esp, 8
+                // 523b19 test ecx, ecx
+                let r_ = (ecx) & (ecx);
+                fl = fl_logic(r_, 32);
+                // 523b1b jne 0x523b2c
+                pc = if !fl.zf { 0x523b2c } else { 0x523b1d };
+            }
+            0x523b1d => {
+                // 523b1d mov ecx, dword ptr [esp + 0x10]
+                ecx = s[12];
+                // 523b21 xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // 523b23 cmp dword ptr [ecx], eax
+                fl = fl_sub(rd((ecx) as usize), eax, 32).1;
+                // 523b25 sete al
+                eax = set_part(eax, 0, 0xff, (fl.zf) as u32);
+                // 523b28 add esp, 8
+                // 523b2b ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x523b2c => {
+                // 523b2c mov edx, dword ptr [esp + 0x10]
+                edx = s[12];
+                // 523b30 mov edx, dword ptr [edx]
+                edx = rd((edx) as usize);
+                // 523b32 test edx, edx
+                let r_ = (edx) & (edx);
+                fl = fl_logic(r_, 32);
+                // 523b34 jne 0x523b3c
+                pc = if !fl.zf { 0x523b3c } else { 0x523b36 };
+            }
+            0x523b36 => {
+                // 523b36 mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // 523b38 add esp, 8
+                // 523b3b ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x523b3c => {
+                // 523b3c mov eax, dword ptr fs:[0x2c]
+                eax = fs_rd32(0x2c);
+                // 523b42 mov eax, dword ptr [eax]
+                eax = rd((eax) as usize);
+                // 523b44 mov eax, dword ptr [eax + 0x58]
+                eax = rd((eax.wrapping_add(0x58)) as usize);
+                // 523b47 add eax, 0x710
+                let (r_, f_) = fl_add(eax, 0x710u32, 32); fl = f_;
+                eax = r_;
+                // 523b4c add ecx, 4
+                let (r_, f_) = fl_add(ecx, 0x4u32, 32); fl = f_;
+                ecx = r_;
+                // 523b4f call 0xbdea30
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xbdea30, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // 523b54 fstp qword ptr [esp]
+                { let v_: u64 = f[0].to_bits(); s[8] = v_ as u32; s[9] = (v_ >> 32) as u32; }
+                // 523b57 lea ecx, [edx + 4]
+                ecx = edx.wrapping_add(0x4);
+                // 523b5a call 0xbdea30
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xbdea30, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // 523b5f fcomp qword ptr [esp]
+                cc87 = cc(f[0], f64::from_bits(q64(((s[8] as u64) | ((s[9] as u64) << 32)))));
+                // 523b62 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 523b64 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 523b67 jne 0x523b72
+                pc = if !fl.zf { 0x523b72 } else { 0x523b69 };
+            }
+            0x523b69 => {
+                // 523b69 mov eax, 1
+                eax = 0x1u32;
+                // 523b6e add esp, 8
+                // 523b71 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x523b72 => {
+                // 523b72 xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // 523b74 add esp, 8
+                // 523b77 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+static H192: [AtomicU32; 4] = [const { AtomicU32::new(0) }; 4];
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_523fa0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x523fa0u32;
+    loop {
+        match pc {
+            0x523fa0 => {
+                H192[0].fetch_add(1, Ordering::Relaxed);
+                // 523fa0 push ecx
+                s[8] = ecx;
+                // 523fa1 cmp dword ptr [0xe9d7f8], 0
+                fl = fl_sub(rd((0xe9d7f8u32) as usize), 0x0u32, 32).1;
+                // 523fa8 jge 0x523fc5
+                pc = if (fl.sf == fl.of) { 0x523fc5 } else { 0x523faa };
+            }
+            0x523faa => {
+                H192[1].fetch_add(1, Ordering::Relaxed);
+                // 523faa mov eax, dword ptr [0xe843ac]
+                eax = rd((0xe843acu32) as usize);
+                // 523faf cmp eax, 0x6b49d200
+                fl = fl_sub(eax, 0x6b49d200u32, 32).1;
+                // 523fb4 mov dword ptr [0xe9d7f8], eax
+                w.d((0xe9d7f8u32) as usize, eax);
+                // 523fb9 jle 0x523fc5
+                pc = if (fl.zf || fl.sf != fl.of) { 0x523fc5 } else { 0x523fbb };
+            }
+            0x523fbb => {
+                H192[2].fetch_add(1, Ordering::Relaxed);
+                // 523fbb add eax, 0x94b62e00
+                let (r_, f_) = fl_add(eax, 0x94b62e00u32, 32); fl = f_;
+                eax = r_;
+                // 523fc0 mov dword ptr [0xe9d7f8], eax
+                w.d((0xe9d7f8u32) as usize, eax);
+                pc = 0x523fc5;
+            }
+            0x523fc5 => {
+                H192[3].fetch_add(1, Ordering::Relaxed);
+                // 523fc5 mov eax, 0xe9d7f8
+                eax = 0xe9d7f8u32;
+                // 523fca call 0xbdd2a0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0xbdd2a0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // 523fcf mov dword ptr [esp], eax
+                s[8] = eax;
+                // 523fd2 fild dword ptr [esp]
+                f[0] = (((s[8]) as i32) as f64);
+                // 523fd5 fmul qword ptr [0xe5bfe0]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bfe0u32) as usize)), f[0] * f64::from_bits(rq((0xe5bfe0u32) as usize)));
+                // 523fdb fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 523fde fld dword ptr [esp]
+                f[0] = ldq(s[8]);
+                // 523fe1 pop ecx
+                ecx = s[8];
+                // 523fe2 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+static H193: [AtomicU32; 6] = [const { AtomicU32::new(0) }; 6];
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_5ce2b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 26];
+    s[14] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x5ce2b0u32;
+    loop {
+        match pc {
+            0x5ce2b0 => {
+                H193[0].fetch_add(1, Ordering::Relaxed);
+                // 5ce2b0 sub esp, 0xc
+                // 5ce2b3 push esi
+                s[9] = esi;
+                // 5ce2b4 push edi
+                s[8] = edi;
+                // 5ce2b5 mov edi, dword ptr [0x21703d4]
+                edi = rd((0x21703d4u32) as usize);
+                // 5ce2bb mov esi, ecx
+                esi = ecx;
+                // 5ce2bd call 0x9d7bd0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x9d7bd0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // 5ce2c2 fld dword ptr [edi + 0x14]
+                f[0] = ldq(rd((edi.wrapping_add(0x14)) as usize));
+                // 5ce2c5 fsub dword ptr [esi + 0x108]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x108)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x108)) as usize)));
+                // 5ce2cb add esi, 0x108
+                let (r_, f_) = fl_add(esi, 0x108u32, 32); fl = f_;
+                esi = r_;
+                // 5ce2d1 test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // 5ce2d3 fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // 5ce2d7 fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // 5ce2db fmul st(0), st(0)
+                f[0] = xn3(f[0], f[0], f[0] * f[0]);
+                // 5ce2dd fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // 5ce2e1 fld dword ptr [edi + 0x18]
+                f[0] = ldq(rd((edi.wrapping_add(0x18)) as usize));
+                // 5ce2e4 fsub dword ptr [esi + 4]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x4)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x4)) as usize)));
+                // 5ce2e7 fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // 5ce2eb fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // 5ce2ef fmul st(0), st(0)
+                f[0] = xn3(f[0], f[0], f[0] * f[0]);
+                // 5ce2f1 fadd dword ptr [esp + 0x10]
+                f[0] = xn3(f[0], ldr32(s[12]), f[0] + ldr32(s[12]));
+                // 5ce2f5 fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // 5ce2f9 fld dword ptr [edi + 0x1c]
+                f[0] = ldq(rd((edi.wrapping_add(0x1c)) as usize));
+                // 5ce2fc fsub dword ptr [esi + 8]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x8)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x8)) as usize)));
+                // 5ce2ff fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // 5ce303 fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // 5ce307 fmul st(0), st(0)
+                f[0] = xn3(f[0], f[0], f[0] * f[0]);
+                // 5ce309 fadd dword ptr [esp + 0x10]
+                f[0] = xn3(f[0], ldr32(s[12]), f[0] + ldr32(s[12]));
+                // 5ce30d fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // 5ce311 je 0x5ce33f
+                pc = if fl.zf { 0x5ce33f } else { 0x5ce313 };
+            }
+            0x5ce313 => {
+                H193[1].fetch_add(1, Ordering::Relaxed);
+                // 5ce313 fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[12]);
+                // 5ce317 lea edi, [eax + 0x14]
+                edi = eax.wrapping_add(0x14);
+                // 5ce31a mov eax, esi
+                eax = esi;
+                // 5ce31c fstp qword ptr [esp + 8]
+                { let v_: u64 = f[0].to_bits(); s[10] = v_ as u32; s[11] = (v_ >> 32) as u32; }
+                // 5ce320 mov ecx, edi
+                ecx = edi;
+                // 5ce322 call 0x404a20
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x404a20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // 5ce327 fcomp qword ptr [esp + 8]
+                cc87 = cc(f[0], f64::from_bits(q64(((s[10] as u64) | ((s[11] as u64) << 32)))));
+                // 5ce32b fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 5ce32d test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 5ce330 je 0x5ce33f
+                pc = if fl.zf { 0x5ce33f } else { 0x5ce332 };
+            }
+            0x5ce332 => {
+                H193[2].fetch_add(1, Ordering::Relaxed);
+                // 5ce332 mov eax, esi
+                eax = esi;
+                // 5ce334 mov ecx, edi
+                ecx = edi;
+                // 5ce336 call 0x404a20
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x404a20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // 5ce33b fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                pc = 0x5ce33f;
+            }
+            0x5ce33f => {
+                H193[3].fetch_add(1, Ordering::Relaxed);
+                // 5ce33f fld dword ptr [esp + 0x18]
+                f[0] = ldq(s[14]);
+                // 5ce343 pop edi
+                edi = s[8];
+                // 5ce344 fld dword ptr [esp + 0xc]
+                f[1] = ldq(s[12]);
+                // 5ce348 pop esi
+                esi = s[9];
+                // 5ce349 fld st(1)
+                f[2] = f[0];
+                // 5ce34b fmulp st(2)
+                f[0] = xn3(f[0], f[2], f[0] * f[2]);
+                // 5ce34d fxch st(1)
+                f.swap(1, 0);
+                // 5ce34f fstp dword ptr [esp + 0x10]
+                s[14] = (f[1] as f32).to_bits();
+                // 5ce353 fld dword ptr [esp + 0x10]
+                f[1] = ldq(s[14]);
+                // 5ce357 fcompp 
+                cc87 = cc(f[1], f[0]);
+                // 5ce359 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // 5ce35b test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 5ce35e jne 0x5ce36b
+                pc = if !fl.zf { 0x5ce36b } else { 0x5ce360 };
+            }
+            0x5ce360 => {
+                H193[4].fetch_add(1, Ordering::Relaxed);
+                // 5ce360 mov eax, 1
+                eax = 0x1u32;
+                // 5ce365 add esp, 0xc
+                // 5ce368 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0x5ce36b => {
+                H193[5].fetch_add(1, Ordering::Relaxed);
+                // 5ce36b xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // 5ce36d add esp, 0xc
+                // 5ce370 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+static H194: [AtomicU32; 10] = [const { AtomicU32::new(0) }; 10];
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_5d03d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x5d03d0u32;
+    loop {
+        match pc {
+            0x5d03d0 => {
+                H194[0].fetch_add(1, Ordering::Relaxed);
+                // 5d03d0 sub esp, 8
+                // 5d03d3 push esi
+                s[8] = esi;
+                // 5d03d4 mov esi, ecx
+                esi = ecx;
+                // 5d03d6 cmp dword ptr [esi + 0x100], 0
+                fl = fl_sub(rd((esi.wrapping_add(0x100)) as usize), 0x0u32, 32).1;
+                // 5d03dd lea eax, [esi + 0x100]
+                eax = esi.wrapping_add(0x100);
+                // 5d03e3 jge 0x5d03ec
+                pc = if (fl.sf == fl.of) { 0x5d03ec } else { 0x5d03e5 };
+            }
+            0x5d03e5 => {
+                H194[1].fetch_add(1, Ordering::Relaxed);
+                // 5d03e5 fld1 
+                f[0] = 1.0;
+                // 5d03e7 pop esi
+                esi = s[8];
+                // 5d03e8 add esp, 8
+                // 5d03eb ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0x5d03ec => {
+                H194[2].fetch_add(1, Ordering::Relaxed);
+                // 5d03ec call 0xbdd260
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0xbdd260, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // 5d03f1 mov dword ptr [esp + 4], eax
+                s[9] = eax;
+                // 5d03f5 fild dword ptr [esp + 4]
+                f[0] = (((s[9]) as i32) as f64);
+                // 5d03f9 fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // 5d03fd fild dword ptr [esi + 0x104]
+                f[0] = (((rd((esi.wrapping_add(0x104)) as usize)) as i32) as f64);
+                // 5d0403 fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // 5d0407 fldz 
+                f[0] = 0.0;
+                // 5d0409 fld dword ptr [esp + 4]
+                f[1] = ldq(s[9]);
+                // 5d040d fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // 5d040f fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // 5d0411 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 5d0414 jne 0x5d041c
+                pc = if !fl.zf { 0x5d041c } else { 0x5d0416 };
+            }
+            0x5d0416 => {
+                H194[3].fetch_add(1, Ordering::Relaxed);
+                // 5d0416 fst dword ptr [esp + 4]
+                s[9] = (f[1] as f32).to_bits();
+                // 5d041a jmp 0x5d0424
+                pc = 0x5d0424;
+            }
+            0x5d041c => {
+                H194[4].fetch_add(1, Ordering::Relaxed);
+                // 5d041c fxch st(1)
+                f.swap(1, 0);
+                // 5d041e fst dword ptr [esp + 4]
+                s[9] = (f[1] as f32).to_bits();
+                // 5d0422 fxch st(1)
+                f.swap(1, 0);
+                pc = 0x5d0424;
+            }
+            0x5d0424 => {
+                H194[5].fetch_add(1, Ordering::Relaxed);
+                // 5d0424 fld dword ptr [esp + 4]
+                f[2] = ldq(s[9]);
+                // 5d0428 fld dword ptr [esp + 8]
+                f[3] = ldq(s[10]);
+                // 5d042c fcom st(1)
+                cc87 = cc(f[3], f[2]);
+                // 5d042e fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 4);
+                // 5d0430 fstp st(1)
+                f[2] = f[3];
+                // 5d0432 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 5d0435 jne 0x5d045d
+                pc = if !fl.zf { 0x5d045d } else { 0x5d0437 };
+            }
+            0x5d0437 => {
+                H194[6].fetch_add(1, Ordering::Relaxed);
+                // 5d0437 fxch st(1)
+                f.swap(2, 1);
+                // 5d0439 fcom st(2)
+                cc87 = cc(f[2], f[0]);
+                // 5d043b fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 3);
+                // 5d043d test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 5d0440 je 0x5d0478
+                pc = if fl.zf { 0x5d0478 } else { 0x5d0442 };
+            }
+            0x5d0442 => {
+                H194[7].fetch_add(1, Ordering::Relaxed);
+                // 5d0442 fstp st(0)
+                // 5d0444 pop esi
+                esi = s[8];
+                // 5d0445 fxch st(1)
+                f.swap(1, 0);
+                // 5d0447 fstp dword ptr [esp]
+                s[9] = (f[1] as f32).to_bits();
+                // 5d044a fld dword ptr [esp]
+                f[1] = ldq(s[9]);
+                // 5d044d fxch st(1)
+                f.swap(1, 0);
+                // 5d044f fdivp st(1)
+                f[0] = xn3(f[0], f[1], f[0] / f[1]);
+                // 5d0451 fstp dword ptr [esp + 4]
+                s[10] = (f[0] as f32).to_bits();
+                // 5d0455 fld dword ptr [esp + 4]
+                f[0] = ldq(s[10]);
+                // 5d0459 add esp, 8
+                // 5d045c ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0x5d045d => {
+                H194[8].fetch_add(1, Ordering::Relaxed);
+                // 5d045d fstp st(1)
+                f[1] = f[2];
+                // 5d045f pop esi
+                esi = s[8];
+                // 5d0460 fstp st(1)
+                f[0] = f[1];
+                // 5d0462 fst dword ptr [esp]
+                s[9] = (f[0] as f32).to_bits();
+                // 5d0465 fld dword ptr [esp]
+                f[1] = ldq(s[9]);
+                // 5d0468 fxch st(1)
+                f.swap(1, 0);
+                // 5d046a fdivp st(1)
+                f[0] = xn3(f[0], f[1], f[0] / f[1]);
+                // 5d046c fstp dword ptr [esp + 4]
+                s[10] = (f[0] as f32).to_bits();
+                // 5d0470 fld dword ptr [esp + 4]
+                f[0] = ldq(s[10]);
+                // 5d0474 add esp, 8
+                // 5d0477 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0x5d0478 => {
+                H194[9].fetch_add(1, Ordering::Relaxed);
+                // 5d0478 fstp st(2)
+                f[0] = f[2];
+                // 5d047a pop esi
+                esi = s[8];
+                // 5d047b fdivp st(1)
+                f[0] = xn3(f[0], f[1], f[0] / f[1]);
+                // 5d047d fstp dword ptr [esp + 4]
+                s[10] = (f[0] as f32).to_bits();
+                // 5d0481 fld dword ptr [esp + 4]
+                f[0] = ldq(s[10]);
+                // 5d0485 add esp, 8
+                // 5d0488 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_7a9730(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 32];
+    s[20] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0x7a9730u32;
+    loop {
+        match pc {
+            0x7a9730 => {
+                // 7a9730 sub esp, 0x18
+                // 7a9733 fldz 
+                f[0] = 0.0;
+                // 7a9735 push ebx
+                s[12] = ebx;
+                // 7a9736 mov ebx, dword ptr [esp + 0x20]
+                ebx = s[20];
+                // 7a973a fstp dword ptr [esp + 8]
+                s[14] = (f[0] as f32).to_bits();
+                // 7a973e push ebp
+                s[11] = ebp;
+                // 7a973f push esi
+                s[10] = esi;
+                // 7a9740 push edi
+                s[9] = edi;
+                // 7a9741 xor edi, edi
+                edi = 0;
+                fl = fl_logic(0, 32);
+                // 7a9743 xor ebp, ebp
+                ebp = 0;
+                fl = fl_logic(0, 32);
+                // 7a9745 cmp dword ptr [0x252866c], edi
+                fl = fl_sub(rd((0x252866cu32) as usize), edi, 32).1;
+                // 7a974b jle 0x7a97d8
+                pc = if (fl.zf || fl.sf != fl.of) { 0x7a97d8 } else { 0x7a9751 };
+            }
+            0x7a9751 => {
+                // 7a9751 mov esi, dword ptr [edi*4 + 0x1f91670]
+                esi = rd((edi.wrapping_mul(4).wrapping_add(0x1f91670)) as usize);
+                // 7a9758 fld dword ptr [ebx + 0x14]
+                f[0] = ldq(rd((ebx.wrapping_add(0x14)) as usize));
+                // 7a975b fsub dword ptr [esi + 0x14]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x14)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x14)) as usize)));
+                // 7a975e push ecx
+                s[8] = ecx;
+                // 7a975f fstp dword ptr [esp + 0x20]
+                s[16] = (f[0] as f32).to_bits();
+                // 7a9763 fld dword ptr [ebx + 0x18]
+                f[0] = ldq(rd((ebx.wrapping_add(0x18)) as usize));
+                // 7a9766 fsub dword ptr [esi + 0x18]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x18)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x18)) as usize)));
+                // 7a9769 fstp dword ptr [esp + 0x24]
+                s[17] = (f[0] as f32).to_bits();
+                // 7a976d fld dword ptr [ebx + 0x1c]
+                f[0] = ldq(rd((ebx.wrapping_add(0x1c)) as usize));
+                // 7a9770 fsub dword ptr [esi + 0x1c]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x1c)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x1c)) as usize)));
+                // 7a9773 fstp dword ptr [esp + 0x28]
+                s[18] = (f[0] as f32).to_bits();
+                // 7a9777 fld dword ptr [esp + 0x20]
+                f[0] = ldq(s[16]);
+                // 7a977b fld dword ptr [esp + 0x24]
+                f[1] = ldq(s[17]);
+                // 7a977f fld dword ptr [esp + 0x28]
+                f[2] = ldq(s[18]);
+                // 7a9783 fld st(1)
+                f[3] = f[1];
+                // 7a9785 fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // 7a9787 fld st(2)
+                f[3] = f[0];
+                // 7a9789 fmulp st(3)
+                f[0] = xn3(f[0], f[3], f[0] * f[3]);
+                // 7a978b fxch st(1)
+                f.swap(2, 1);
+                // 7a978d faddp st(2)
+                f[0] = xn3(f[0], f[2], f[0] + f[2]);
+                // 7a978f fmul st(0), st(0)
+                f[1] = xn3(f[1], f[1], f[1] * f[1]);
+                // 7a9791 faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // 7a9793 fstp dword ptr [esp + 0x1c]
+                s[15] = (f[0] as f32).to_bits();
+                // 7a9797 fld dword ptr [esp + 0x1c]
+                f[0] = ldq(s[15]);
+                // 7a979b fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // 7a979e call 0x40ea20
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // 7a97a3 fstp dword ptr [esp + 0x1c]
+                s[15] = (f[0] as f32).to_bits();
+                // 7a97a7 add esp, 4
+                // 7a97aa fld dword ptr [esp + 0x18]
+                f[0] = ldq(s[15]);
+                // 7a97ae fld dword ptr [esp + 0x14]
+                f[1] = ldq(s[14]);
+                // 7a97b2 fcomp st(1)
+                cc87 = cc(f[1], f[0]);
+                // 7a97b4 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // 7a97b6 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // 7a97b9 je 0x7a97bf
+                pc = if fl.zf { 0x7a97bf } else { 0x7a97bb };
+            }
+            0x7a97bb => {
+                // 7a97bb test ebp, ebp
+                let r_ = (ebp) & (ebp);
+                fl = fl_logic(r_, 32);
+                // 7a97bd jne 0x7a97c7
+                pc = if !fl.zf { 0x7a97c7 } else { 0x7a97bf };
+            }
+            0x7a97bf => {
+                // 7a97bf fstp dword ptr [esp + 0x14]
+                s[14] = (f[0] as f32).to_bits();
+                // 7a97c3 mov ebp, esi
+                ebp = esi;
+                // 7a97c5 jmp 0x7a97c9
+                pc = 0x7a97c9;
+            }
+            0x7a97c7 => {
+                // 7a97c7 fstp st(0)
+                pc = 0x7a97c9;
+            }
+            0x7a97c9 => {
+                // 7a97c9 add edi, 1
+                let (r_, f_) = fl_add(edi, 0x1u32, 32); fl = f_;
+                edi = r_;
+                // 7a97cc cmp edi, dword ptr [0x252866c]
+                fl = fl_sub(edi, rd((0x252866cu32) as usize), 32).1;
+                // 7a97d2 jl 0x7a9751
+                pc = if (fl.sf != fl.of) { 0x7a9751 } else { 0x7a97d8 };
+            }
+            0x7a97d8 => {
+                // 7a97d8 pop edi
+                edi = s[9];
+                // 7a97d9 pop esi
+                esi = s[10];
+                // 7a97da mov eax, ebp
+                eax = ebp;
+                // 7a97dc pop ebp
+                ebp = s[11];
+                // 7a97dd pop ebx
+                ebx = s[12];
+                // 7a97de add esp, 0x18
+                // 7a97e1 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+static H196: [AtomicU32; 19] = [const { AtomicU32::new(0) }; 19];
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_b00ce0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 27];
+    s[13] = unsafe { *a.add(0) };
+    s[14] = unsafe { *a.add(1) };
+    s[15] = unsafe { *a.add(2) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xb00ce0u32;
+    loop {
+        match pc {
+            0xb00ce0 => {
+                H196[0].fetch_add(1, Ordering::Relaxed);
+                // b00ce0 push ebx
+                s[11] = ebx;
+                // b00ce1 push esi
+                s[10] = esi;
+                // b00ce2 mov esi, dword ptr [esp + 0x14]
+                esi = s[15];
+                // b00ce6 fld dword ptr [esi + 0x10]
+                f[0] = ldq(rd((esi.wrapping_add(0x10)) as usize));
+                // b00ce9 mov ebx, 1
+                ebx = 0x1u32;
+                // b00cee cmp byte ptr [esi + 0xf], bl
+                fl = fl_sub((rb((esi.wrapping_add(0xf)) as usize) as u32), (ebx & 0xff), 8).1;
+                // b00cf1 fsub dword ptr [esp + 0xc]
+                f[0] = xn3(f[0], ldr32(s[13]), f[0] - ldr32(s[13]));
+                // b00cf5 push edi
+                s[9] = edi;
+                // b00cf6 mov edi, ecx
+                edi = ecx;
+                // b00cf8 fstp dword ptr [esp + 0x18]
+                s[15] = (f[0] as f32).to_bits();
+                // b00cfc fld dword ptr [esp + 0x18]
+                f[0] = ldq(s[15]);
+                // b00d00 fst dword ptr [esi + 0x10]
+                w.d((esi.wrapping_add(0x10)) as usize, (f[0] as f32).to_bits());
+                // b00d03 jne 0xb00d15
+                pc = if !fl.zf { 0xb00d15 } else { 0xb00d05 };
+            }
+            0xb00d05 => {
+                H196[1].fetch_add(1, Ordering::Relaxed);
+                // b00d05 fldz 
+                f[1] = 0.0;
+                // b00d07 fcompp 
+                cc87 = cc(f[1], f[0]);
+                // b00d09 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // b00d0b test bl, ah
+                let r_ = ((ebx & 0xff)) & (((eax >> 8) & 0xff));
+                fl = fl_logic(r_, 8);
+                // b00d0d jne 0xb00d17
+                pc = if !fl.zf { 0xb00d17 } else { 0xb00d0f };
+            }
+            0xb00d0f => {
+                H196[2].fetch_add(1, Ordering::Relaxed);
+                // b00d0f mov byte ptr [esi + 0xf], 0
+                w.b((esi.wrapping_add(0xf)) as usize, (0x0u32) as u8);
+                // b00d13 jmp 0xb00d17
+                pc = 0xb00d17;
+            }
+            0xb00d15 => {
+                H196[3].fetch_add(1, Ordering::Relaxed);
+                // b00d15 fstp st(0)
+                pc = 0xb00d17;
+            }
+            0xb00d17 => {
+                H196[4].fetch_add(1, Ordering::Relaxed);
+                // b00d17 cmp byte ptr [esi + 0xd], bl
+                fl = fl_sub((rb((esi.wrapping_add(0xd)) as usize) as u32), (ebx & 0xff), 8).1;
+                // b00d1a je 0xb00dc7
+                pc = if fl.zf { 0xb00dc7 } else { 0xb00d20 };
+            }
+            0xb00d20 => {
+                H196[5].fetch_add(1, Ordering::Relaxed);
+                // b00d20 push ebp
+                s[8] = ebp;
+                // b00d21 mov ebp, dword ptr [esp + 0x18]
+                ebp = s[14];
+                // b00d25 cmp dword ptr [ebp + 0x150], 0
+                fl = fl_sub(rd((ebp.wrapping_add(0x150)) as usize), 0x0u32, 32).1;
+                // b00d2c lea eax, [ebp + 0x150]
+                eax = ebp.wrapping_add(0x150);
+                // b00d32 jl 0xb00d49
+                pc = if (fl.sf != fl.of) { 0xb00d49 } else { 0xb00d34 };
+            }
+            0xb00d34 => {
+                H196[6].fetch_add(1, Ordering::Relaxed);
+                // b00d34 call 0xbdd2a0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0xbdd2a0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // b00d39 test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // b00d3b jl 0xb00d49
+                pc = if (fl.sf != fl.of) { 0xb00d49 } else { 0xb00d3d };
+            }
+            0xb00d3d => {
+                H196[7].fetch_add(1, Ordering::Relaxed);
+                // b00d3d cmp eax, 0x1f4
+                fl = fl_sub(eax, 0x1f4u32, 32).1;
+                // b00d42 seta al
+                eax = set_part(eax, 0, 0xff, ((!fl.cf && !fl.zf)) as u32);
+                // b00d45 test al, al
+                let r_ = ((eax & 0xff)) & ((eax & 0xff));
+                fl = fl_logic(r_, 8);
+                // b00d47 je 0xb00dc6
+                pc = if fl.zf { 0xb00dc6 } else { 0xb00d49 };
+            }
+            0xb00d49 => {
+                H196[8].fetch_add(1, Ordering::Relaxed);
+                // b00d49 mov cl, byte ptr [esi + 0xe]
+                ecx = set_part(ecx, 0, 0xff, (rb((esi.wrapping_add(0xe)) as usize) as u32));
+                // b00d4c test cl, cl
+                let r_ = ((ecx & 0xff)) & ((ecx & 0xff));
+                fl = fl_logic(r_, 8);
+                // b00d4e jle 0xb00d73
+                pc = if (fl.zf || fl.sf != fl.of) { 0xb00d73 } else { 0xb00d50 };
+            }
+            0xb00d50 => {
+                H196[9].fetch_add(1, Ordering::Relaxed);
+                // b00d50 fld dword ptr [esi]
+                f[0] = ldq(rd((esi) as usize));
+                // b00d52 mov edx, dword ptr [edi + 0x34]
+                edx = rd((edi.wrapping_add(0x34)) as usize);
+                // b00d55 movsx eax, cl
+                eax = ((((((ecx & 0xff)) as u32) << 24) as i32) >> 24) as u32;
+                // b00d58 fld dword ptr [edx + eax*4 - 4]
+                f[1] = ldq(rd((edx.wrapping_add(eax.wrapping_mul(4)).wrapping_add(0xfffffffc)) as usize));
+                // b00d5c fcompp 
+                cc87 = cc(f[1], f[0]);
+                // b00d5e fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // b00d60 test ah, 0x41
+                let r_ = (((eax >> 8) & 0xff)) & (0x41u32);
+                fl = fl_logic(r_, 8);
+                // b00d63 jne 0xb00d73
+                pc = if !fl.zf { 0xb00d73 } else { 0xb00d65 };
+            }
+            0xb00d65 => {
+                H196[10].fetch_add(1, Ordering::Relaxed);
+                // b00d65 sub cl, bl
+                let (r_, f_) = fl_sub((ecx & 0xff), (ebx & 0xff), 8); fl = f_;
+                ecx = set_part(ecx, 0, 0xff, r_);
+                // b00d67 mov byte ptr [esi + 0xe], cl
+                w.b((esi.wrapping_add(0xe)) as usize, ((ecx & 0xff)) as u8);
+                // b00d6a fld dword ptr [edi + 0x14]
+                f[0] = ldq(rd((edi.wrapping_add(0x14)) as usize));
+                // b00d6d fstp dword ptr [esi + 0x10]
+                w.d((esi.wrapping_add(0x10)) as usize, (f[0] as f32).to_bits());
+                // b00d70 mov byte ptr [esi + 0xf], bl
+                w.b((esi.wrapping_add(0xf)) as usize, ((ebx & 0xff)) as u8);
+                pc = 0xb00d73;
+            }
+            0xb00d73 => {
+                H196[11].fetch_add(1, Ordering::Relaxed);
+                // b00d73 test byte ptr [ebp + 0x180], 2
+                let r_ = ((rb((ebp.wrapping_add(0x180)) as usize) as u32)) & (0x2u32);
+                fl = fl_logic(r_, 8);
+                // b00d7a jne 0xb00dc6
+                pc = if !fl.zf { 0xb00dc6 } else { 0xb00d7c };
+            }
+            0xb00d7c => {
+                H196[12].fetch_add(1, Ordering::Relaxed);
+                // b00d7c cmp dword ptr [ebp + 0x17c], 0
+                fl = fl_sub(rd((ebp.wrapping_add(0x17c)) as usize), 0x0u32, 32).1;
+                // b00d83 lea eax, [ebp + 0x17c]
+                eax = ebp.wrapping_add(0x17c);
+                // b00d89 jl 0xb00d9d
+                pc = if (fl.sf != fl.of) { 0xb00d9d } else { 0xb00d8b };
+            }
+            0xb00d8b => {
+                H196[13].fetch_add(1, Ordering::Relaxed);
+                // b00d8b call 0xbdd260
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0xbdd260, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // b00d90 xor ecx, ecx
+                ecx = 0;
+                fl = fl_logic(0, 32);
+                // b00d92 test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // b00d94 setl cl
+                ecx = set_part(ecx, 0, 0xff, ((fl.sf != fl.of)) as u32);
+                // b00d97 sub ecx, ebx
+                let (r_, f_) = fl_sub(ecx, ebx, 32); fl = f_;
+                ecx = r_;
+                // b00d99 and ecx, eax
+                let r_ = (ecx) & (eax);
+                fl = fl_logic(r_, 32);
+                ecx = r_;
+                // b00d9b ja 0xb00dc6
+                pc = if (!fl.cf && !fl.zf) { 0xb00dc6 } else { 0xb00d9d };
+            }
+            0xb00d9d => {
+                H196[14].fetch_add(1, Ordering::Relaxed);
+                // b00d9d fld dword ptr [esi]
+                f[0] = ldq(rd((esi) as usize));
+                // b00d9f fld dword ptr [edi + 0xc]
+                f[1] = ldq(rd((edi.wrapping_add(0xc)) as usize));
+                // b00da2 fcompp 
+                cc87 = cc(f[1], f[0]);
+                // b00da4 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
+                // b00da6 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // b00da9 jp 0xb00dc6
+                pc = if fl.pf { 0xb00dc6 } else { 0xb00dab };
+            }
+            0xb00dab => {
+                H196[15].fetch_add(1, Ordering::Relaxed);
+                // b00dab mov al, byte ptr [esi + 0xe]
+                eax = set_part(eax, 0, 0xff, (rb((esi.wrapping_add(0xe)) as usize) as u32));
+                // b00dae movsx edx, al
+                edx = ((((((eax & 0xff)) as u32) << 24) as i32) >> 24) as u32;
+                // b00db1 add edx, ebx
+                let (r_, f_) = fl_add(edx, ebx, 32); fl = f_;
+                edx = r_;
+                // b00db3 cmp edx, dword ptr [edi + 0x20]
+                fl = fl_sub(edx, rd((edi.wrapping_add(0x20)) as usize), 32).1;
+                // b00db6 jge 0xb00dc6
+                pc = if (fl.sf == fl.of) { 0xb00dc6 } else { 0xb00db8 };
+            }
+            0xb00db8 => {
+                H196[16].fetch_add(1, Ordering::Relaxed);
+                // b00db8 add al, bl
+                let (r_, f_) = fl_add((eax & 0xff), (ebx & 0xff), 8); fl = f_;
+                eax = set_part(eax, 0, 0xff, r_);
+                // b00dba mov byte ptr [esi + 0xe], al
+                w.b((esi.wrapping_add(0xe)) as usize, ((eax & 0xff)) as u8);
+                // b00dbd fld dword ptr [edi + 0x14]
+                f[0] = ldq(rd((edi.wrapping_add(0x14)) as usize));
+                // b00dc0 fstp dword ptr [esi + 0x10]
+                w.d((esi.wrapping_add(0x10)) as usize, (f[0] as f32).to_bits());
+                // b00dc3 mov byte ptr [esi + 0xf], bl
+                w.b((esi.wrapping_add(0xf)) as usize, ((ebx & 0xff)) as u8);
+                pc = 0xb00dc6;
+            }
+            0xb00dc6 => {
+                H196[17].fetch_add(1, Ordering::Relaxed);
+                // b00dc6 pop ebp
+                ebp = s[8];
+                pc = 0xb00dc7;
+            }
+            0xb00dc7 => {
+                H196[18].fetch_add(1, Ordering::Relaxed);
+                // b00dc7 pop edi
+                edi = s[9];
+                // b00dc8 pop esi
+                esi = s[10];
+                // b00dc9 pop ebx
+                ebx = s[11];
+                // b00dca ret 0xc
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_b957b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 46];
+    s[34] = unsafe { *a.add(0) };
+    w.skip((s.as_ptr() as usize, std::mem::size_of_val(&s)));
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xb957b0u32;
+    loop {
+        match pc {
+            0xb957b0 => {
+                // b957b0 sub esp, 0x58
+                // b957b3 push ebx
+                s[10] = ebx;
+                // b957b4 mov ebx, dword ptr [esp + 0x60]
+                ebx = s[34];
+                // b957b8 mov eax, dword ptr [ebx + 0x8c]
+                eax = rd((ebx.wrapping_add(0x8c)) as usize);
+                // b957be test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // b957c0 push esi
+                s[9] = esi;
+                // b957c1 je 0xb957c5
+                pc = if fl.zf { 0xb957c5 } else { 0xb957c3 };
+            }
+            0xb957c3 => {
+                // b957c3 mov dword ptr [edi], eax
+                w.d((edi) as usize, eax);
+                pc = 0xb957c5;
+            }
+            0xb957c5 => {
+                // b957c5 cmp byte ptr [edi + 0x14], 0
+                fl = fl_sub((rb((edi.wrapping_add(0x14)) as usize) as u32), 0x0u32, 8).1;
+                // b957c9 jne 0xb957d5
+                pc = if !fl.zf { 0xb957d5 } else { 0xb957cb };
+            }
+            0xb957cb => {
+                // b957cb cmp byte ptr [ebx + 0x58], 0
+                fl = fl_sub((rb((ebx.wrapping_add(0x58)) as usize) as u32), 0x0u32, 8).1;
+                // b957cf jne 0xb957d5
+                pc = if !fl.zf { 0xb957d5 } else { 0xb957d1 };
+            }
+            0xb957d1 => {
+                // b957d1 xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                // b957d3 jmp 0xb957da
+                pc = 0xb957da;
+            }
+            0xb957d5 => {
+                // b957d5 mov eax, 1
+                eax = 0x1u32;
+                pc = 0xb957da;
+            }
+            0xb957da => {
+                // b957da mov byte ptr [edi + 0x14], al
+                w.b((edi.wrapping_add(0x14)) as usize, ((eax & 0xff)) as u8);
+                // b957dd fld dword ptr [ebx + 0x7c]
+                f[0] = ldq(rd((ebx.wrapping_add(0x7c)) as usize));
+                // b957e0 fmul dword ptr [edi + 4]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x4)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x4)) as usize)));
+                // b957e3 push ecx
+                s[8] = ecx;
+                // b957e4 fstp dword ptr [edi + 4]
+                w.d((edi.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // b957e7 fld dword ptr [ebx + 0x80]
+                f[0] = ldq(rd((ebx.wrapping_add(0x80)) as usize));
+                // b957ed fmul dword ptr [edi + 8]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x8)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x8)) as usize)));
+                // b957f0 fstp dword ptr [edi + 8]
+                w.d((edi.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // b957f3 fld dword ptr [ebx + 0x84]
+                f[0] = ldq(rd((ebx.wrapping_add(0x84)) as usize));
+                // b957f9 fmul dword ptr [edi + 0xc]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0xc)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0xc)) as usize)));
+                // b957fc fstp dword ptr [edi + 0xc]
+                w.d((edi.wrapping_add(0xc)) as usize, (f[0] as f32).to_bits());
+                // b957ff fld dword ptr [ebx + 0x88]
+                f[0] = ldq(rd((ebx.wrapping_add(0x88)) as usize));
+                // b95805 fmul dword ptr [edi + 0x10]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x10)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x10)) as usize)));
+                // b95808 fstp dword ptr [edi + 0x10]
+                w.d((edi.wrapping_add(0x10)) as usize, (f[0] as f32).to_bits());
+                // b9580b fld dword ptr [ebx + 0x78]
+                f[0] = ldq(rd((ebx.wrapping_add(0x78)) as usize));
+                // b9580e fstp dword ptr [esp + 0x68]
+                s[34] = (f[0] as f32).to_bits();
+                // b95812 fld dword ptr [esp + 0x68]
+                f[0] = ldq(s[34]);
+                // b95816 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // b95819 call 0x428cd0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x428cd0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // b9581e fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // b95822 fld dword ptr [esp + 0x68]
+                f[0] = ldq(s[34]);
+                // b95826 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // b95829 call 0x40b820
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40b820, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // b9582e fstp dword ptr [esp + 0x68]
+                s[34] = (f[0] as f32).to_bits();
+                // b95832 lea esi, [edi + 0x34]
+                esi = edi.wrapping_add(0x34);
+                // b95835 fld dword ptr [esp + 0x68]
+                f[0] = ldq(s[34]);
+                // b95839 add esp, 4
+                // b9583c fst dword ptr [esp + 0x18]
+                s[15] = (f[0] as f32).to_bits();
+                // b95840 push esi
+                s[8] = esi;
+                // b95841 fld dword ptr [esp + 0xc]
+                f[1] = ldq(s[11]);
+                // b95845 lea edx, [esp + 0x1c]
+                edx = ((s.as_ptr() as u32).wrapping_add(60));
+                // b95849 fld st(0)
+                f[2] = f[1];
+                // b9584b lea eax, [esp + 0x4c]
+                eax = ((s.as_ptr() as u32).wrapping_add(108));
+                // b9584f fchs 
+                f[2] = -f[2];
+                // b95851 fstp dword ptr [esp + 0x20]
+                s[16] = (f[2] as f32).to_bits();
+                // b95855 fldz 
+                f[2] = 0.0;
+                // b95857 fst dword ptr [esp + 0x24]
+                s[17] = (f[2] as f32).to_bits();
+                // b9585b fst dword ptr [esp + 0x30]
+                s[20] = (f[2] as f32).to_bits();
+                // b9585f fxch st(1)
+                f.swap(2, 1);
+                // b95861 fstp dword ptr [esp + 0x28]
+                s[18] = (f[2] as f32).to_bits();
+                // b95865 fxch st(1)
+                f.swap(1, 0);
+                // b95867 fstp dword ptr [esp + 0x2c]
+                s[19] = (f[1] as f32).to_bits();
+                // b9586b fld dword ptr [ebx + 0x90]
+                f[1] = ldq(rd((ebx.wrapping_add(0x90)) as usize));
+                // b95871 fstp dword ptr [esp + 0x34]
+                s[21] = (f[1] as f32).to_bits();
+                // b95875 fst dword ptr [esp + 0x38]
+                s[22] = (f[0] as f32).to_bits();
+                // b95879 fst dword ptr [esp + 0x3c]
+                s[23] = (f[0] as f32).to_bits();
+                // b9587d fst dword ptr [esp + 0x40]
+                s[24] = (f[0] as f32).to_bits();
+                // b95881 fld dword ptr [ebx + 0x94]
+                f[1] = ldq(rd((ebx.wrapping_add(0x94)) as usize));
+                // b95887 fstp dword ptr [esp + 0x44]
+                s[25] = (f[1] as f32).to_bits();
+                // b9588b fstp dword ptr [esp + 0x48]
+                s[26] = (f[0] as f32).to_bits();
+                // b9588f fld dword ptr [esi + 4]
+                f[0] = ldq(rd((esi.wrapping_add(0x4)) as usize));
+                // b95892 fmul dword ptr [ebx + 0x60]
+                f[0] = xn3(f[0], ldr32(rd((ebx.wrapping_add(0x60)) as usize)), f[0] * ldr32(rd((ebx.wrapping_add(0x60)) as usize)));
+                // b95895 fld dword ptr [esi]
+                f[1] = ldq(rd((esi) as usize));
+                // b95897 fmul dword ptr [ebx + 0x5c]
+                f[1] = xn3(f[1], ldr32(rd((ebx.wrapping_add(0x5c)) as usize)), f[1] * ldr32(rd((ebx.wrapping_add(0x5c)) as usize)));
+                // b9589a faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // b9589c fadd dword ptr [esi + 8]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x8)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x8)) as usize)));
+                // b9589f fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // b958a3 fld dword ptr [esi + 0x10]
+                f[0] = ldq(rd((esi.wrapping_add(0x10)) as usize));
+                // b958a6 fmul dword ptr [ebx + 0x60]
+                f[0] = xn3(f[0], ldr32(rd((ebx.wrapping_add(0x60)) as usize)), f[0] * ldr32(rd((ebx.wrapping_add(0x60)) as usize)));
+                // b958a9 fld dword ptr [esi + 0xc]
+                f[1] = ldq(rd((esi.wrapping_add(0xc)) as usize));
+                // b958ac fmul dword ptr [ebx + 0x5c]
+                f[1] = xn3(f[1], ldr32(rd((ebx.wrapping_add(0x5c)) as usize)), f[1] * ldr32(rd((ebx.wrapping_add(0x5c)) as usize)));
+                // b958af faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // b958b1 fadd dword ptr [esi + 0x14]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x14)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x14)) as usize)));
+                // b958b4 fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // b958b8 fld dword ptr [edi + 0x2c]
+                f[0] = ldq(rd((edi.wrapping_add(0x2c)) as usize));
+                // b958bb fadd dword ptr [esp + 0xc]
+                f[0] = xn3(f[0], ldr32(s[11]), f[0] + ldr32(s[11]));
+                // b958bf fstp dword ptr [edi + 0x2c]
+                w.d((edi.wrapping_add(0x2c)) as usize, (f[0] as f32).to_bits());
+                // b958c2 fld dword ptr [edi + 0x30]
+                f[0] = ldq(rd((edi.wrapping_add(0x30)) as usize));
+                // b958c5 fadd dword ptr [esp + 0x10]
+                f[0] = xn3(f[0], ldr32(s[12]), f[0] + ldr32(s[12]));
+                // b958c9 fstp dword ptr [edi + 0x30]
+                w.d((edi.wrapping_add(0x30)) as usize, (f[0] as f32).to_bits());
+                // b958cc call 0x729f30
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(4, false, 0x729f30, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // b958d1 mov ecx, dword ptr [eax]
+                ecx = rd((eax) as usize);
+                // b958d3 mov dword ptr [esi], ecx
+                w.d((esi) as usize, ecx);
+                // b958d5 mov edx, dword ptr [eax + 4]
+                edx = rd((eax.wrapping_add(0x4)) as usize);
+                // b958d8 mov dword ptr [esi + 4], edx
+                w.d((esi.wrapping_add(0x4)) as usize, edx);
+                // b958db mov ecx, dword ptr [eax + 8]
+                ecx = rd((eax.wrapping_add(0x8)) as usize);
+                // b958de mov dword ptr [esi + 8], ecx
+                w.d((esi.wrapping_add(0x8)) as usize, ecx);
+                // b958e1 mov edx, dword ptr [eax + 0xc]
+                edx = rd((eax.wrapping_add(0xc)) as usize);
+                // b958e4 mov dword ptr [esi + 0xc], edx
+                w.d((esi.wrapping_add(0xc)) as usize, edx);
+                // b958e7 mov ecx, dword ptr [eax + 0x10]
+                ecx = rd((eax.wrapping_add(0x10)) as usize);
+                // b958ea mov dword ptr [esi + 0x10], ecx
+                w.d((esi.wrapping_add(0x10)) as usize, ecx);
+                // b958ed mov edx, dword ptr [eax + 0x14]
+                edx = rd((eax.wrapping_add(0x14)) as usize);
+                // b958f0 mov dword ptr [esi + 0x14], edx
+                w.d((esi.wrapping_add(0x14)) as usize, edx);
+                // b958f3 push esi
+                s[8] = esi;
+                // b958f4 lea edx, [esp + 0x34]
+                edx = ((s.as_ptr() as u32).wrapping_add(84));
+                // b958f8 lea eax, [esp + 0x4c]
+                eax = ((s.as_ptr() as u32).wrapping_add(108));
+                // b958fc call 0x729f30
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(4, false, 0x729f30, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // b95901 mov ecx, dword ptr [eax]
+                ecx = rd((eax) as usize);
+                // b95903 mov dword ptr [esi], ecx
+                w.d((esi) as usize, ecx);
+                // b95905 mov edx, dword ptr [eax + 4]
+                edx = rd((eax.wrapping_add(0x4)) as usize);
+                // b95908 mov dword ptr [esi + 4], edx
+                w.d((esi.wrapping_add(0x4)) as usize, edx);
+                // b9590b mov ecx, dword ptr [eax + 8]
+                ecx = rd((eax.wrapping_add(0x8)) as usize);
+                // b9590e mov dword ptr [esi + 8], ecx
+                w.d((esi.wrapping_add(0x8)) as usize, ecx);
+                // b95911 mov edx, dword ptr [eax + 0xc]
+                edx = rd((eax.wrapping_add(0xc)) as usize);
+                // b95914 mov dword ptr [esi + 0xc], edx
+                w.d((esi.wrapping_add(0xc)) as usize, edx);
+                // b95917 mov ecx, dword ptr [eax + 0x10]
+                ecx = rd((eax.wrapping_add(0x10)) as usize);
+                // b9591a mov dword ptr [esi + 0x10], ecx
+                w.d((esi.wrapping_add(0x10)) as usize, ecx);
+                // b9591d mov edx, dword ptr [eax + 0x14]
+                edx = rd((eax.wrapping_add(0x14)) as usize);
+                // b95920 mov dword ptr [esi + 0x14], edx
+                w.d((esi.wrapping_add(0x14)) as usize, edx);
+                // b95923 fld dword ptr [esi + 4]
+                f[0] = ldq(rd((esi.wrapping_add(0x4)) as usize));
+                // b95926 fmul dword ptr [ebx + 0x68]
+                f[0] = xn3(f[0], ldr32(rd((ebx.wrapping_add(0x68)) as usize)), f[0] * ldr32(rd((ebx.wrapping_add(0x68)) as usize)));
+                // b95929 fld dword ptr [ebx + 0x64]
+                f[1] = ldq(rd((ebx.wrapping_add(0x64)) as usize));
+                // b9592c fmul dword ptr [esi]
+                f[1] = xn3(f[1], ldr32(rd((esi) as usize)), f[1] * ldr32(rd((esi) as usize)));
+                // b9592e faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // b95930 fadd dword ptr [esi + 8]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x8)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x8)) as usize)));
+                // b95933 fstp dword ptr [esp + 8]
+                s[11] = (f[0] as f32).to_bits();
+                // b95937 fld dword ptr [esi + 0x10]
+                f[0] = ldq(rd((esi.wrapping_add(0x10)) as usize));
+                // b9593a fmul dword ptr [ebx + 0x68]
+                f[0] = xn3(f[0], ldr32(rd((ebx.wrapping_add(0x68)) as usize)), f[0] * ldr32(rd((ebx.wrapping_add(0x68)) as usize)));
+                // b9593d fld dword ptr [esi + 0xc]
+                f[1] = ldq(rd((esi.wrapping_add(0xc)) as usize));
+                // b95940 fmul dword ptr [ebx + 0x64]
+                f[1] = xn3(f[1], ldr32(rd((ebx.wrapping_add(0x64)) as usize)), f[1] * ldr32(rd((ebx.wrapping_add(0x64)) as usize)));
+                // b95943 faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // b95945 fadd dword ptr [esi + 0x14]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x14)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x14)) as usize)));
+                // b95948 pop esi
+                esi = s[9];
+                // b95949 fstp dword ptr [esp + 8]
+                s[12] = (f[0] as f32).to_bits();
+                // b9594d fld dword ptr [edi + 0x2c]
+                f[0] = ldq(rd((edi.wrapping_add(0x2c)) as usize));
+                // b95950 fadd dword ptr [esp + 4]
+                f[0] = xn3(f[0], ldr32(s[11]), f[0] + ldr32(s[11]));
+                // b95954 fstp dword ptr [esp + 0xc]
+                s[13] = (f[0] as f32).to_bits();
+                // b95958 mov eax, dword ptr [esp + 0xc]
+                eax = s[13];
+                // b9595c fld dword ptr [edi + 0x30]
+                f[0] = ldq(rd((edi.wrapping_add(0x30)) as usize));
+                // b9595f mov dword ptr [edi + 0x4c], eax
+                w.d((edi.wrapping_add(0x4c)) as usize, eax);
+                // b95962 fadd dword ptr [esp + 8]
+                f[0] = xn3(f[0], ldr32(s[12]), f[0] + ldr32(s[12]));
+                // b95966 fstp dword ptr [esp + 0x10]
+                s[14] = (f[0] as f32).to_bits();
+                // b9596a mov ecx, dword ptr [esp + 0x10]
+                ecx = s[14];
+                // b9596e mov dword ptr [edi + 0x50], ecx
+                w.d((edi.wrapping_add(0x50)) as usize, ecx);
+                // b95971 fld dword ptr [ebx + 0x94]
+                f[0] = ldq(rd((ebx.wrapping_add(0x94)) as usize));
+                // b95977 fmul dword ptr [edi + 0x28]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x28)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x28)) as usize)));
+                // b9597a fstp dword ptr [esp + 0x60]
+                s[34] = (f[0] as f32).to_bits();
+                // b9597e fld dword ptr [ebx + 0x90]
+                f[0] = ldq(rd((ebx.wrapping_add(0x90)) as usize));
+                // b95984 pop ebx
+                ebx = s[10];
+                // b95985 fmul dword ptr [edi + 0x24]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x24)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x24)) as usize)));
+                // b95988 fstp dword ptr [edi + 0x24]
+                w.d((edi.wrapping_add(0x24)) as usize, (f[0] as f32).to_bits());
+                // b9598b fld dword ptr [esp + 0x5c]
+                f[0] = ldq(s[34]);
+                // b9598f fstp dword ptr [edi + 0x28]
+                w.d((edi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                // b95992 add esp, 0x58
+                // b95995 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_b9f6d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[10] = unsafe { *a.add(0) };
+    s[11] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xb9f6d0u32;
+    loop {
+        match pc {
+            0xb9f6d0 => {
+                // b9f6d0 fldz 
+                f[0] = 0.0;
+                // b9f6d2 push esi
+                s[8] = esi;
+                // b9f6d3 mov esi, ecx
+                esi = ecx;
+                // b9f6d5 mov ecx, dword ptr [esp + 8]
+                ecx = s[10];
+                // b9f6d9 mov eax, dword ptr [ecx]
+                eax = rd((ecx) as usize);
+                // b9f6db sub eax, 1
+                let (r_, f_) = fl_sub(eax, 0x1u32, 32); fl = f_;
+                eax = r_;
+                // b9f6de je 0xb9f707
+                pc = if fl.zf { 0xb9f707 } else { 0xb9f6e0 };
+            }
+            0xb9f6e0 => {
+                // b9f6e0 sub eax, 1
+                let (r_, f_) = fl_sub(eax, 0x1u32, 32); fl = f_;
+                eax = r_;
+                // b9f6e3 je 0xb9f6f5
+                pc = if fl.zf { 0xb9f6f5 } else { 0xb9f6e5 };
+            }
+            0xb9f6e5 => {
+                // b9f6e5 sub eax, 1
+                let (r_, f_) = fl_sub(eax, 0x1u32, 32); fl = f_;
+                eax = r_;
+                // b9f6e8 je 0xb9f6f0
+                pc = if fl.zf { 0xb9f6f0 } else { 0xb9f6ea };
+            }
+            0xb9f6ea => {
+                // b9f6ea fst dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // b9f6ee jmp 0xb9f70e
+                pc = 0xb9f70e;
+            }
+            0xb9f6f0 => {
+                // b9f6f0 fld dword ptr [ecx + 4]
+                f[1] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
+                // b9f6f3 jmp 0xb9f70a
+                pc = 0xb9f70a;
+            }
+            0xb9f6f5 => {
+                // b9f6f5 mov eax, dword ptr [ecx + 4]
+                eax = rd((ecx.wrapping_add(0x4)) as usize);
+                // b9f6f8 fild dword ptr [ecx + 4]
+                f[1] = (((rd((ecx.wrapping_add(0x4)) as usize)) as i32) as f64);
+                // b9f6fb test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // b9f6fd jge 0xb9f70a
+                pc = if (fl.sf == fl.of) { 0xb9f70a } else { 0xb9f6ff };
+            }
+            0xb9f6ff => {
+                // b9f6ff fadd dword ptr [0xe5bfd8]
+                f[1] = xn3(f[1], ldr32(rd((0xe5bfd8u32) as usize)), f[1] + ldr32(rd((0xe5bfd8u32) as usize)));
+                // b9f705 jmp 0xb9f70a
+                pc = 0xb9f70a;
+            }
+            0xb9f707 => {
+                // b9f707 fild dword ptr [ecx + 4]
+                f[1] = (((rd((ecx.wrapping_add(0x4)) as usize)) as i32) as f64);
+                pc = 0xb9f70a;
+            }
+            0xb9f70a => {
+                // b9f70a fstp dword ptr [esp + 8]
+                s[10] = (f[1] as f32).to_bits();
+                pc = 0xb9f70e;
+            }
+            0xb9f70e => {
+                // b9f70e fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                // b9f712 fst dword ptr [esi + 0x7c]
+                w.d((esi.wrapping_add(0x7c)) as usize, (f[1] as f32).to_bits());
+                // b9f715 fcomp st(1)
+                cc87 = cc(f[1], f[0]);
+                // b9f717 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
+                // b9f719 test ah, 5
+                let r_ = (((eax >> 8) & 0xff)) & (0x5u32);
+                fl = fl_logic(r_, 8);
+                // b9f71c jp 0xb9f723
+                pc = if fl.pf { 0xb9f723 } else { 0xb9f71e };
+            }
+            0xb9f71e => {
+                // b9f71e fstp dword ptr [esi + 0x7c]
+                w.d((esi.wrapping_add(0x7c)) as usize, (f[0] as f32).to_bits());
+                // b9f721 jmp 0xb9f725
+                pc = 0xb9f725;
+            }
+            0xb9f723 => {
+                // b9f723 fstp st(0)
+                pc = 0xb9f725;
+            }
+            0xb9f725 => {
+                // b9f725 fld dword ptr [esi + 0x74]
+                f[0] = ldq(rd((esi.wrapping_add(0x74)) as usize));
+                // b9f728 fadd dword ptr [esi + 0x7c]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x7c)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x7c)) as usize)));
+                // b9f72b fmul qword ptr [0xe5c0c8]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5c0c8u32) as usize)), f[0] * f64::from_bits(rq((0xe5c0c8u32) as usize)));
+                // b9f731 call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                // b9f736 mov dword ptr [esi + 0x78], eax
+                w.d((esi.wrapping_add(0x78)) as usize, eax);
+                // b9f739 mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // b9f73b pop esi
+                esi = s[8];
+                // b9f73c ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_b9f7c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[10] = unsafe { *a.add(0) };
+    s[11] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xb9f7c0u32;
+    loop {
+        match pc {
+            0xb9f7c0 => {
+                // b9f7c0 push esi
+                s[8] = esi;
+                // b9f7c1 mov esi, ecx
+                esi = ecx;
+                // b9f7c3 mov ecx, dword ptr [esp + 8]
+                ecx = s[10];
+                // b9f7c7 mov eax, dword ptr [ecx]
+                eax = rd((ecx) as usize);
+                // b9f7c9 sub eax, 1
+                let (r_, f_) = fl_sub(eax, 0x1u32, 32); fl = f_;
+                eax = r_;
+                // b9f7cc je 0xb9f7f3
+                pc = if fl.zf { 0xb9f7f3 } else { 0xb9f7ce };
+            }
+            0xb9f7ce => {
+                // b9f7ce sub eax, 1
+                let (r_, f_) = fl_sub(eax, 0x1u32, 32); fl = f_;
+                eax = r_;
+                // b9f7d1 je 0xb9f7e1
+                pc = if fl.zf { 0xb9f7e1 } else { 0xb9f7d3 };
+            }
+            0xb9f7d3 => {
+                // b9f7d3 sub eax, 1
+                let (r_, f_) = fl_sub(eax, 0x1u32, 32); fl = f_;
+                eax = r_;
+                // b9f7d6 je 0xb9f7dc
+                pc = if fl.zf { 0xb9f7dc } else { 0xb9f7d8 };
+            }
+            0xb9f7d8 => {
+                // b9f7d8 fldz 
+                f[0] = 0.0;
+                // b9f7da jmp 0xb9f7f6
+                pc = 0xb9f7f6;
+            }
+            0xb9f7dc => {
+                // b9f7dc fld dword ptr [ecx + 4]
+                f[0] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
+                // b9f7df jmp 0xb9f7f6
+                pc = 0xb9f7f6;
+            }
+            0xb9f7e1 => {
+                // b9f7e1 mov eax, dword ptr [ecx + 4]
+                eax = rd((ecx.wrapping_add(0x4)) as usize);
+                // b9f7e4 fild dword ptr [ecx + 4]
+                f[0] = (((rd((ecx.wrapping_add(0x4)) as usize)) as i32) as f64);
+                // b9f7e7 test eax, eax
+                let r_ = (eax) & (eax);
+                fl = fl_logic(r_, 32);
+                // b9f7e9 jge 0xb9f7f6
+                pc = if (fl.sf == fl.of) { 0xb9f7f6 } else { 0xb9f7eb };
+            }
+            0xb9f7eb => {
+                // b9f7eb fadd dword ptr [0xe5bfd8]
+                f[0] = xn3(f[0], ldr32(rd((0xe5bfd8u32) as usize)), f[0] + ldr32(rd((0xe5bfd8u32) as usize)));
+                // b9f7f1 jmp 0xb9f7f6
+                pc = 0xb9f7f6;
+            }
+            0xb9f7f3 => {
+                // b9f7f3 fild dword ptr [ecx + 4]
+                f[0] = (((rd((ecx.wrapping_add(0x4)) as usize)) as i32) as f64);
+                pc = 0xb9f7f6;
+            }
+            0xb9f7f6 => {
+                // b9f7f6 fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // b9f7fa fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // b9f7fe fst dword ptr [esi + 0x74]
+                w.d((esi.wrapping_add(0x74)) as usize, (f[0] as f32).to_bits());
+                // b9f801 fadd dword ptr [esi + 0x7c]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x7c)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x7c)) as usize)));
+                // b9f804 fmul qword ptr [0xe5c0c8]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5c0c8u32) as usize)), f[0] * f64::from_bits(rq((0xe5c0c8u32) as usize)));
+                // b9f80a call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                // b9f80f mov dword ptr [esi + 0x78], eax
+                w.d((esi.wrapping_add(0x78)) as usize, eax);
+                // b9f812 mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // b9f814 pop esi
+                esi = s[8];
+                // b9f815 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_ba1160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 26];
+    s[13] = unsafe { *a.add(0) };
+    s[14] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xba1160u32;
+    loop {
+        match pc {
+            0xba1160 => {
+                // ba1160 sub esp, 8
+                // ba1163 fldz 
+                f[0] = 0.0;
+                // ba1165 mov eax, dword ptr [esp + 0xc]
+                eax = s[13];
+                // ba1169 cmp dword ptr [eax], 7
+                fl = fl_sub(rd((eax) as usize), 0x7u32, 32).1;
+                // ba116c fst dword ptr [esp]
+                s[10] = (f[0] as f32).to_bits();
+                // ba116f push esi
+                s[9] = esi;
+                // ba1170 fst dword ptr [esp + 8]
+                s[11] = (f[0] as f32).to_bits();
+                // ba1174 push edi
+                s[8] = edi;
+                // ba1175 mov esi, ecx
+                esi = ecx;
+                // ba1177 jne 0xba11be
+                pc = if !fl.zf { 0xba11be } else { 0xba1179 };
+            }
+            0xba1179 => {
+                // ba1179 fld dword ptr [eax + 4]
+                f[1] = ldq(rd((eax.wrapping_add(0x4)) as usize));
+                // ba117c fstp dword ptr [esp + 8]
+                s[10] = (f[1] as f32).to_bits();
+                // ba1180 fld dword ptr [eax + 8]
+                f[1] = ldq(rd((eax.wrapping_add(0x8)) as usize));
+                // ba1183 fstp dword ptr [esp + 0xc]
+                s[11] = (f[1] as f32).to_bits();
+                // ba1187 fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                // ba118b fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // ba118d fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // ba118f test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // ba1192 je 0xba11c2
+                pc = if fl.zf { 0xba11c2 } else { 0xba1194 };
+            }
+            0xba1194 => {
+                // ba1194 fld qword ptr [0xe5bf70]
+                f[2] = f64::from_bits(q64(rq((0xe5bf70u32) as usize)));
+                // ba119a fsub st(1), st(0)
+                f[1] = xn3(f[1], f[2], f[1] - f[2]);
+                pc = 0xba119c;
+            }
+            0xba119c => {
+                // ba119c fxch st(1)
+                f.swap(2, 1);
+                // ba119e call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2]); eax = ra; ecx = rc; edx = rd_; }
+                // ba11a3 fld dword ptr [esp + 0xc]
+                f[2] = ldq(s[11]);
+                // ba11a7 fcom st(2)
+                cc87 = cc(f[2], f[0]);
+                // ba11a9 mov edi, eax
+                edi = eax;
+                // ba11ab mov dword ptr [esi + 0xa8], edi
+                w.d((esi.wrapping_add(0xa8)) as usize, edi);
+                // ba11b1 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 3);
+                // ba11b3 fstp st(2)
+                f[0] = f[2];
+                // ba11b5 test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // ba11b8 jne 0xba11cc
+                pc = if !fl.zf { 0xba11cc } else { 0xba11ba };
+            }
+            0xba11ba => {
+                // ba11ba faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // ba11bc jmp 0xba11ce
+                pc = 0xba11ce;
+            }
+            0xba11be => {
+                // ba11be fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                pc = 0xba11c2;
+            }
+            0xba11c2 => {
+                // ba11c2 fld qword ptr [0xe5bf70]
+                f[2] = f64::from_bits(q64(rq((0xe5bf70u32) as usize)));
+                // ba11c8 fadd st(1), st(0)
+                f[1] = xn3(f[1], f[2], f[1] + f[2]);
+                // ba11ca jmp 0xba119c
+                pc = 0xba119c;
+            }
+            0xba11cc => {
+                // ba11cc fsubp st(1)
+                f[0] = xn3(f[0], f[1], f[0] - f[1]);
+                pc = 0xba11ce;
+            }
+            0xba11ce => {
+                // ba11ce call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                // ba11d3 mov dword ptr [esi + 0xac], eax
+                w.d((esi.wrapping_add(0xac)) as usize, eax);
+                // ba11d9 cmp dword ptr [esi + 0x98], 9
+                fl = fl_sub(rd((esi.wrapping_add(0x98)) as usize), 0x9u32, 32).1;
+                // ba11e0 jne 0xba122e
+                pc = if !fl.zf { 0xba122e } else { 0xba11e2 };
+            }
+            0xba11e2 => {
+                // ba11e2 mov edx, dword ptr [esi + 0x9c]
+                edx = rd((esi.wrapping_add(0x9c)) as usize);
+                // ba11e8 test edx, edx
+                let r_ = (edx) & (edx);
+                fl = fl_logic(r_, 32);
+                // ba11ea je 0xba122e
+                pc = if fl.zf { 0xba122e } else { 0xba11ec };
+            }
+            0xba11ec => {
+                // ba11ec movzx ecx, dx
+                ecx = (edx & 0xffff);
+                // ba11ef cmp ecx, 0xf0
+                fl = fl_sub(ecx, 0xf0u32, 32).1;
+                // ba11f5 jae 0xba122e
+                pc = if !fl.cf { 0xba122e } else { 0xba11f7 };
+            }
+            0xba11f7 => {
+                // ba11f7 lea ecx, [ecx + ecx*8]
+                ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                // ba11fa cmp dword ptr [ecx*4 + 0x31bc52c], edx
+                fl = fl_sub(rd((ecx.wrapping_mul(4).wrapping_add(0x31bc52c)) as usize), edx, 32).1;
+                // ba1201 lea ecx, [ecx*4 + 0x31bc518]
+                ecx = ecx.wrapping_mul(4).wrapping_add(0x31bc518);
+                // ba1208 jne 0xba122e
+                pc = if !fl.zf { 0xba122e } else { 0xba120a };
+            }
+            0xba120a => {
+                // ba120a mov ecx, dword ptr [esi + 0xbc]
+                ecx = rd((esi.wrapping_add(0xbc)) as usize);
+                // ba1210 cmp eax, ecx
+                fl = fl_sub(eax, ecx, 32).1;
+                // ba1212 jge 0xba1216
+                pc = if (fl.sf == fl.of) { 0xba1216 } else { 0xba1214 };
+            }
+            0xba1214 => {
+                // ba1214 mov ecx, eax
+                ecx = eax;
+                pc = 0xba1216;
+            }
+            0xba1216 => {
+                // ba1216 mov eax, dword ptr [esi + 0xb8]
+                eax = rd((esi.wrapping_add(0xb8)) as usize);
+                // ba121c cmp edi, eax
+                fl = fl_sub(edi, eax, 32).1;
+                // ba121e jge 0xba1222
+                pc = if (fl.sf == fl.of) { 0xba1222 } else { 0xba1220 };
+            }
+            0xba1220 => {
+                // ba1220 mov eax, edi
+                eax = edi;
+                pc = 0xba1222;
+            }
+            0xba1222 => {
+                // ba1222 mov dword ptr [esi + 0xa8], eax
+                w.d((esi.wrapping_add(0xa8)) as usize, eax);
+                // ba1228 mov dword ptr [esi + 0xac], ecx
+                w.d((esi.wrapping_add(0xac)) as usize, ecx);
+                pc = 0xba122e;
+            }
+            0xba122e => {
+                // ba122e pop edi
+                edi = s[8];
+                // ba122f mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // ba1231 pop esi
+                esi = s[9];
+                // ba1232 add esp, 8
+                // ba1235 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_ba12c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 26];
+    s[13] = unsafe { *a.add(0) };
+    s[14] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xba12c0u32;
+    loop {
+        match pc {
+            0xba12c0 => {
+                // ba12c0 sub esp, 8
+                // ba12c3 fldz 
+                f[0] = 0.0;
+                // ba12c5 mov eax, dword ptr [esp + 0xc]
+                eax = s[13];
+                // ba12c9 cmp dword ptr [eax], 7
+                fl = fl_sub(rd((eax) as usize), 0x7u32, 32).1;
+                // ba12cc fst dword ptr [esp]
+                s[10] = (f[0] as f32).to_bits();
+                // ba12cf push esi
+                s[9] = esi;
+                // ba12d0 fst dword ptr [esp + 8]
+                s[11] = (f[0] as f32).to_bits();
+                // ba12d4 push edi
+                s[8] = edi;
+                // ba12d5 mov esi, ecx
+                esi = ecx;
+                // ba12d7 jne 0xba131e
+                pc = if !fl.zf { 0xba131e } else { 0xba12d9 };
+            }
+            0xba12d9 => {
+                // ba12d9 fld dword ptr [eax + 4]
+                f[1] = ldq(rd((eax.wrapping_add(0x4)) as usize));
+                // ba12dc fstp dword ptr [esp + 8]
+                s[10] = (f[1] as f32).to_bits();
+                // ba12e0 fld dword ptr [eax + 8]
+                f[1] = ldq(rd((eax.wrapping_add(0x8)) as usize));
+                // ba12e3 fstp dword ptr [esp + 0xc]
+                s[11] = (f[1] as f32).to_bits();
+                // ba12e7 fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                // ba12eb fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // ba12ed fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // ba12ef test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // ba12f2 je 0xba1322
+                pc = if fl.zf { 0xba1322 } else { 0xba12f4 };
+            }
+            0xba12f4 => {
+                // ba12f4 fld qword ptr [0xe5bf70]
+                f[2] = f64::from_bits(q64(rq((0xe5bf70u32) as usize)));
+                // ba12fa fsub st(1), st(0)
+                f[1] = xn3(f[1], f[2], f[1] - f[2]);
+                pc = 0xba12fc;
+            }
+            0xba12fc => {
+                // ba12fc fxch st(1)
+                f.swap(2, 1);
+                // ba12fe call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2]); eax = ra; ecx = rc; edx = rd_; }
+                // ba1303 fld dword ptr [esp + 0xc]
+                f[2] = ldq(s[11]);
+                // ba1307 fcom st(2)
+                cc87 = cc(f[2], f[0]);
+                // ba1309 mov edi, eax
+                edi = eax;
+                // ba130b mov dword ptr [esi + 0xb0], edi
+                w.d((esi.wrapping_add(0xb0)) as usize, edi);
+                // ba1311 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 3);
+                // ba1313 fstp st(2)
+                f[0] = f[2];
+                // ba1315 test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // ba1318 jne 0xba132c
+                pc = if !fl.zf { 0xba132c } else { 0xba131a };
+            }
+            0xba131a => {
+                // ba131a faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // ba131c jmp 0xba132e
+                pc = 0xba132e;
+            }
+            0xba131e => {
+                // ba131e fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                pc = 0xba1322;
+            }
+            0xba1322 => {
+                // ba1322 fld qword ptr [0xe5bf70]
+                f[2] = f64::from_bits(q64(rq((0xe5bf70u32) as usize)));
+                // ba1328 fadd st(1), st(0)
+                f[1] = xn3(f[1], f[2], f[1] + f[2]);
+                // ba132a jmp 0xba12fc
+                pc = 0xba12fc;
+            }
+            0xba132c => {
+                // ba132c fsubp st(1)
+                f[0] = xn3(f[0], f[1], f[0] - f[1]);
+                pc = 0xba132e;
+            }
+            0xba132e => {
+                // ba132e call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                // ba1333 mov dword ptr [esi + 0xb4], eax
+                w.d((esi.wrapping_add(0xb4)) as usize, eax);
+                // ba1339 cmp dword ptr [esi + 0x98], 9
+                fl = fl_sub(rd((esi.wrapping_add(0x98)) as usize), 0x9u32, 32).1;
+                // ba1340 jne 0xba138e
+                pc = if !fl.zf { 0xba138e } else { 0xba1342 };
+            }
+            0xba1342 => {
+                // ba1342 mov edx, dword ptr [esi + 0x9c]
+                edx = rd((esi.wrapping_add(0x9c)) as usize);
+                // ba1348 test edx, edx
+                let r_ = (edx) & (edx);
+                fl = fl_logic(r_, 32);
+                // ba134a je 0xba138e
+                pc = if fl.zf { 0xba138e } else { 0xba134c };
+            }
+            0xba134c => {
+                // ba134c movzx ecx, dx
+                ecx = (edx & 0xffff);
+                // ba134f cmp ecx, 0xf0
+                fl = fl_sub(ecx, 0xf0u32, 32).1;
+                // ba1355 jae 0xba138e
+                pc = if !fl.cf { 0xba138e } else { 0xba1357 };
+            }
+            0xba1357 => {
+                // ba1357 lea ecx, [ecx + ecx*8]
+                ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                // ba135a cmp dword ptr [ecx*4 + 0x31bc52c], edx
+                fl = fl_sub(rd((ecx.wrapping_mul(4).wrapping_add(0x31bc52c)) as usize), edx, 32).1;
+                // ba1361 lea ecx, [ecx*4 + 0x31bc518]
+                ecx = ecx.wrapping_mul(4).wrapping_add(0x31bc518);
+                // ba1368 jne 0xba138e
+                pc = if !fl.zf { 0xba138e } else { 0xba136a };
+            }
+            0xba136a => {
+                // ba136a mov ecx, dword ptr [esi + 0xbc]
+                ecx = rd((esi.wrapping_add(0xbc)) as usize);
+                // ba1370 cmp eax, ecx
+                fl = fl_sub(eax, ecx, 32).1;
+                // ba1372 jge 0xba1376
+                pc = if (fl.sf == fl.of) { 0xba1376 } else { 0xba1374 };
+            }
+            0xba1374 => {
+                // ba1374 mov ecx, eax
+                ecx = eax;
+                pc = 0xba1376;
+            }
+            0xba1376 => {
+                // ba1376 mov eax, dword ptr [esi + 0xb8]
+                eax = rd((esi.wrapping_add(0xb8)) as usize);
+                // ba137c cmp edi, eax
+                fl = fl_sub(edi, eax, 32).1;
+                // ba137e jge 0xba1382
+                pc = if (fl.sf == fl.of) { 0xba1382 } else { 0xba1380 };
+            }
+            0xba1380 => {
+                // ba1380 mov eax, edi
+                eax = edi;
+                pc = 0xba1382;
+            }
+            0xba1382 => {
+                // ba1382 mov dword ptr [esi + 0xb0], eax
+                w.d((esi.wrapping_add(0xb0)) as usize, eax);
+                // ba1388 mov dword ptr [esi + 0xb4], ecx
+                w.d((esi.wrapping_add(0xb4)) as usize, ecx);
+                pc = 0xba138e;
+            }
+            0xba138e => {
+                // ba138e pop edi
+                edi = s[8];
+                // ba138f xor al, al
+                eax = set_part(eax, 0, 0xff, 0);
+                fl = fl_logic(0, 32);
+                // ba1391 pop esi
+                esi = s[9];
+                // ba1392 add esp, 8
+                // ba1395 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_ba58f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 26];
+    s[13] = unsafe { *a.add(0) };
+    s[14] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xba58f0u32;
+    loop {
+        match pc {
+            0xba58f0 => {
+                // ba58f0 sub esp, 8
+                // ba58f3 fldz 
+                f[0] = 0.0;
+                // ba58f5 mov eax, dword ptr [esp + 0xc]
+                eax = s[13];
+                // ba58f9 cmp dword ptr [eax], 7
+                fl = fl_sub(rd((eax) as usize), 0x7u32, 32).1;
+                // ba58fc fst dword ptr [esp]
+                s[10] = (f[0] as f32).to_bits();
+                // ba58ff push esi
+                s[9] = esi;
+                // ba5900 fst dword ptr [esp + 8]
+                s[11] = (f[0] as f32).to_bits();
+                // ba5904 push edi
+                s[8] = edi;
+                // ba5905 mov esi, ecx
+                esi = ecx;
+                // ba5907 jne 0xba594e
+                pc = if !fl.zf { 0xba594e } else { 0xba5909 };
+            }
+            0xba5909 => {
+                // ba5909 fld dword ptr [eax + 4]
+                f[1] = ldq(rd((eax.wrapping_add(0x4)) as usize));
+                // ba590c fstp dword ptr [esp + 8]
+                s[10] = (f[1] as f32).to_bits();
+                // ba5910 fld dword ptr [eax + 8]
+                f[1] = ldq(rd((eax.wrapping_add(0x8)) as usize));
+                // ba5913 fstp dword ptr [esp + 0xc]
+                s[11] = (f[1] as f32).to_bits();
+                // ba5917 fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                // ba591b fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // ba591d fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // ba591f test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // ba5922 je 0xba5952
+                pc = if fl.zf { 0xba5952 } else { 0xba5924 };
+            }
+            0xba5924 => {
+                // ba5924 fld qword ptr [0xe5bf70]
+                f[2] = f64::from_bits(q64(rq((0xe5bf70u32) as usize)));
+                // ba592a fsub st(1), st(0)
+                f[1] = xn3(f[1], f[2], f[1] - f[2]);
+                pc = 0xba592c;
+            }
+            0xba592c => {
+                // ba592c fxch st(1)
+                f.swap(2, 1);
+                // ba592e call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2]); eax = ra; ecx = rc; edx = rd_; }
+                // ba5933 fld dword ptr [esp + 0xc]
+                f[2] = ldq(s[11]);
+                // ba5937 fcom st(2)
+                cc87 = cc(f[2], f[0]);
+                // ba5939 mov edi, eax
+                edi = eax;
+                // ba593b mov dword ptr [esi + 0xa8], edi
+                w.d((esi.wrapping_add(0xa8)) as usize, edi);
+                // ba5941 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 3);
+                // ba5943 fstp st(2)
+                f[0] = f[2];
+                // ba5945 test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // ba5948 jne 0xba595c
+                pc = if !fl.zf { 0xba595c } else { 0xba594a };
+            }
+            0xba594a => {
+                // ba594a faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // ba594c jmp 0xba595e
+                pc = 0xba595e;
+            }
+            0xba594e => {
+                // ba594e fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                pc = 0xba5952;
+            }
+            0xba5952 => {
+                // ba5952 fld qword ptr [0xe5bf70]
+                f[2] = f64::from_bits(q64(rq((0xe5bf70u32) as usize)));
+                // ba5958 fadd st(1), st(0)
+                f[1] = xn3(f[1], f[2], f[1] + f[2]);
+                // ba595a jmp 0xba592c
+                pc = 0xba592c;
+            }
+            0xba595c => {
+                // ba595c fsubp st(1)
+                f[0] = xn3(f[0], f[1], f[0] - f[1]);
+                pc = 0xba595e;
+            }
+            0xba595e => {
+                // ba595e call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                // ba5963 mov dword ptr [esi + 0xac], eax
+                w.d((esi.wrapping_add(0xac)) as usize, eax);
+                // ba5969 cmp dword ptr [esi + 0x98], 9
+                fl = fl_sub(rd((esi.wrapping_add(0x98)) as usize), 0x9u32, 32).1;
+                // ba5970 jne 0xba59be
+                pc = if !fl.zf { 0xba59be } else { 0xba5972 };
+            }
+            0xba5972 => {
+                // ba5972 mov edx, dword ptr [esi + 0x9c]
+                edx = rd((esi.wrapping_add(0x9c)) as usize);
+                // ba5978 test edx, edx
+                let r_ = (edx) & (edx);
+                fl = fl_logic(r_, 32);
+                // ba597a je 0xba59be
+                pc = if fl.zf { 0xba59be } else { 0xba597c };
+            }
+            0xba597c => {
+                // ba597c movzx ecx, dx
+                ecx = (edx & 0xffff);
+                // ba597f cmp ecx, 0xf0
+                fl = fl_sub(ecx, 0xf0u32, 32).1;
+                // ba5985 jae 0xba59be
+                pc = if !fl.cf { 0xba59be } else { 0xba5987 };
+            }
+            0xba5987 => {
+                // ba5987 lea ecx, [ecx + ecx*8]
+                ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                // ba598a cmp dword ptr [ecx*4 + 0x31bc52c], edx
+                fl = fl_sub(rd((ecx.wrapping_mul(4).wrapping_add(0x31bc52c)) as usize), edx, 32).1;
+                // ba5991 lea ecx, [ecx*4 + 0x31bc518]
+                ecx = ecx.wrapping_mul(4).wrapping_add(0x31bc518);
+                // ba5998 jne 0xba59be
+                pc = if !fl.zf { 0xba59be } else { 0xba599a };
+            }
+            0xba599a => {
+                // ba599a mov ecx, dword ptr [esi + 0xbc]
+                ecx = rd((esi.wrapping_add(0xbc)) as usize);
+                // ba59a0 cmp eax, ecx
+                fl = fl_sub(eax, ecx, 32).1;
+                // ba59a2 jge 0xba59a6
+                pc = if (fl.sf == fl.of) { 0xba59a6 } else { 0xba59a4 };
+            }
+            0xba59a4 => {
+                // ba59a4 mov ecx, eax
+                ecx = eax;
+                pc = 0xba59a6;
+            }
+            0xba59a6 => {
+                // ba59a6 mov eax, dword ptr [esi + 0xb8]
+                eax = rd((esi.wrapping_add(0xb8)) as usize);
+                // ba59ac cmp edi, eax
+                fl = fl_sub(edi, eax, 32).1;
+                // ba59ae jge 0xba59b2
+                pc = if (fl.sf == fl.of) { 0xba59b2 } else { 0xba59b0 };
+            }
+            0xba59b0 => {
+                // ba59b0 mov eax, edi
+                eax = edi;
+                pc = 0xba59b2;
+            }
+            0xba59b2 => {
+                // ba59b2 mov dword ptr [esi + 0xa8], eax
+                w.d((esi.wrapping_add(0xa8)) as usize, eax);
+                // ba59b8 mov dword ptr [esi + 0xac], ecx
+                w.d((esi.wrapping_add(0xac)) as usize, ecx);
+                pc = 0xba59be;
+            }
+            0xba59be => {
+                // ba59be pop edi
+                edi = s[8];
+                // ba59bf mov al, 1
+                eax = set_part(eax, 0, 0xff, 0x1u32);
+                // ba59c1 pop esi
+                esi = s[9];
+                // ba59c2 add esp, 8
+                // ba59c5 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_ba5a50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 26];
+    s[13] = unsafe { *a.add(0) };
+    s[14] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xba5a50u32;
+    loop {
+        match pc {
+            0xba5a50 => {
+                // ba5a50 sub esp, 8
+                // ba5a53 fldz 
+                f[0] = 0.0;
+                // ba5a55 mov eax, dword ptr [esp + 0xc]
+                eax = s[13];
+                // ba5a59 cmp dword ptr [eax], 7
+                fl = fl_sub(rd((eax) as usize), 0x7u32, 32).1;
+                // ba5a5c fst dword ptr [esp]
+                s[10] = (f[0] as f32).to_bits();
+                // ba5a5f push esi
+                s[9] = esi;
+                // ba5a60 fst dword ptr [esp + 8]
+                s[11] = (f[0] as f32).to_bits();
+                // ba5a64 push edi
+                s[8] = edi;
+                // ba5a65 mov esi, ecx
+                esi = ecx;
+                // ba5a67 jne 0xba5aae
+                pc = if !fl.zf { 0xba5aae } else { 0xba5a69 };
+            }
+            0xba5a69 => {
+                // ba5a69 fld dword ptr [eax + 4]
+                f[1] = ldq(rd((eax.wrapping_add(0x4)) as usize));
+                // ba5a6c fstp dword ptr [esp + 8]
+                s[10] = (f[1] as f32).to_bits();
+                // ba5a70 fld dword ptr [eax + 8]
+                f[1] = ldq(rd((eax.wrapping_add(0x8)) as usize));
+                // ba5a73 fstp dword ptr [esp + 0xc]
+                s[11] = (f[1] as f32).to_bits();
+                // ba5a77 fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                // ba5a7b fcom st(1)
+                cc87 = cc(f[1], f[0]);
+                // ba5a7d fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 2);
+                // ba5a7f test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // ba5a82 je 0xba5ab2
+                pc = if fl.zf { 0xba5ab2 } else { 0xba5a84 };
+            }
+            0xba5a84 => {
+                // ba5a84 fld qword ptr [0xe5bf70]
+                f[2] = f64::from_bits(q64(rq((0xe5bf70u32) as usize)));
+                // ba5a8a fsub st(1), st(0)
+                f[1] = xn3(f[1], f[2], f[1] - f[2]);
+                pc = 0xba5a8c;
+            }
+            0xba5a8c => {
+                // ba5a8c fxch st(1)
+                f.swap(2, 1);
+                // ba5a8e call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2]); eax = ra; ecx = rc; edx = rd_; }
+                // ba5a93 fld dword ptr [esp + 0xc]
+                f[2] = ldq(s[11]);
+                // ba5a97 fcom st(2)
+                cc87 = cc(f[2], f[0]);
+                // ba5a99 mov edi, eax
+                edi = eax;
+                // ba5a9b mov dword ptr [esi + 0xb0], edi
+                w.d((esi.wrapping_add(0xb0)) as usize, edi);
+                // ba5aa1 fnstsw ax
+                eax = (eax & 0xffff0000) | sw_ax(cc87, 3);
+                // ba5aa3 fstp st(2)
+                f[0] = f[2];
+                // ba5aa5 test ah, 1
+                let r_ = (((eax >> 8) & 0xff)) & (0x1u32);
+                fl = fl_logic(r_, 8);
+                // ba5aa8 jne 0xba5abc
+                pc = if !fl.zf { 0xba5abc } else { 0xba5aaa };
+            }
+            0xba5aaa => {
+                // ba5aaa faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // ba5aac jmp 0xba5abe
+                pc = 0xba5abe;
+            }
+            0xba5aae => {
+                // ba5aae fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                pc = 0xba5ab2;
+            }
+            0xba5ab2 => {
+                // ba5ab2 fld qword ptr [0xe5bf70]
+                f[2] = f64::from_bits(q64(rq((0xe5bf70u32) as usize)));
+                // ba5ab8 fadd st(1), st(0)
+                f[1] = xn3(f[1], f[2], f[1] + f[2]);
+                // ba5aba jmp 0xba5a8c
+                pc = 0xba5a8c;
+            }
+            0xba5abc => {
+                // ba5abc fsubp st(1)
+                f[0] = xn3(f[0], f[1], f[0] - f[1]);
+                pc = 0xba5abe;
+            }
+            0xba5abe => {
+                // ba5abe call 0xda0140
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                // ba5ac3 mov dword ptr [esi + 0xb4], eax
+                w.d((esi.wrapping_add(0xb4)) as usize, eax);
+                // ba5ac9 cmp dword ptr [esi + 0x98], 9
+                fl = fl_sub(rd((esi.wrapping_add(0x98)) as usize), 0x9u32, 32).1;
+                // ba5ad0 jne 0xba5b1e
+                pc = if !fl.zf { 0xba5b1e } else { 0xba5ad2 };
+            }
+            0xba5ad2 => {
+                // ba5ad2 mov edx, dword ptr [esi + 0x9c]
+                edx = rd((esi.wrapping_add(0x9c)) as usize);
+                // ba5ad8 test edx, edx
+                let r_ = (edx) & (edx);
+                fl = fl_logic(r_, 32);
+                // ba5ada je 0xba5b1e
+                pc = if fl.zf { 0xba5b1e } else { 0xba5adc };
+            }
+            0xba5adc => {
+                // ba5adc movzx ecx, dx
+                ecx = (edx & 0xffff);
+                // ba5adf cmp ecx, 0xf0
+                fl = fl_sub(ecx, 0xf0u32, 32).1;
+                // ba5ae5 jae 0xba5b1e
+                pc = if !fl.cf { 0xba5b1e } else { 0xba5ae7 };
+            }
+            0xba5ae7 => {
+                // ba5ae7 lea ecx, [ecx + ecx*8]
+                ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                // ba5aea cmp dword ptr [ecx*4 + 0x31bc52c], edx
+                fl = fl_sub(rd((ecx.wrapping_mul(4).wrapping_add(0x31bc52c)) as usize), edx, 32).1;
+                // ba5af1 lea ecx, [ecx*4 + 0x31bc518]
+                ecx = ecx.wrapping_mul(4).wrapping_add(0x31bc518);
+                // ba5af8 jne 0xba5b1e
+                pc = if !fl.zf { 0xba5b1e } else { 0xba5afa };
+            }
+            0xba5afa => {
+                // ba5afa mov ecx, dword ptr [esi + 0xbc]
+                ecx = rd((esi.wrapping_add(0xbc)) as usize);
+                // ba5b00 cmp eax, ecx
+                fl = fl_sub(eax, ecx, 32).1;
+                // ba5b02 jge 0xba5b06
+                pc = if (fl.sf == fl.of) { 0xba5b06 } else { 0xba5b04 };
+            }
+            0xba5b04 => {
+                // ba5b04 mov ecx, eax
+                ecx = eax;
+                pc = 0xba5b06;
+            }
+            0xba5b06 => {
+                // ba5b06 mov eax, dword ptr [esi + 0xb8]
+                eax = rd((esi.wrapping_add(0xb8)) as usize);
+                // ba5b0c cmp edi, eax
+                fl = fl_sub(edi, eax, 32).1;
+                // ba5b0e jge 0xba5b12
+                pc = if (fl.sf == fl.of) { 0xba5b12 } else { 0xba5b10 };
+            }
+            0xba5b10 => {
+                // ba5b10 mov eax, edi
+                eax = edi;
+                pc = 0xba5b12;
+            }
+            0xba5b12 => {
+                // ba5b12 mov dword ptr [esi + 0xb0], eax
+                w.d((esi.wrapping_add(0xb0)) as usize, eax);
+                // ba5b18 mov dword ptr [esi + 0xb4], ecx
+                w.d((esi.wrapping_add(0xb4)) as usize, ecx);
+                pc = 0xba5b1e;
+            }
+            0xba5b1e => {
+                // ba5b1e pop edi
+                edi = s[8];
+                // ba5b1f xor al, al
+                eax = set_part(eax, 0, 0xff, 0);
+                fl = fl_logic(0, 32);
+                // ba5b21 pop esi
+                esi = s[9];
+                // ba5b22 add esp, 8
+                // ba5b25 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_bde340(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 26];
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xbde340u32;
+    loop {
+        match pc {
+            0xbde340 => {
+                // bde340 sub esp, 0x14
+                // bde343 fld dword ptr [esi + 4]
+                f[0] = ldq(rd((esi.wrapping_add(0x4)) as usize));
+                // bde346 push ecx
+                s[8] = ecx;
+                // bde347 fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // bde34b fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // bde34f fld dword ptr [esi]
+                f[1] = ldq(rd((esi) as usize));
+                // bde351 fstp dword ptr [esp + 4]
+                s[9] = (f[1] as f32).to_bits();
+                // bde355 fld dword ptr [esp + 4]
+                f[1] = ldq(s[9]);
+                // bde359 fld dword ptr [esi + 8]
+                f[2] = ldq(rd((esi.wrapping_add(0x8)) as usize));
+                // bde35c fstp dword ptr [esp + 0xc]
+                s[11] = (f[2] as f32).to_bits();
+                // bde360 fld dword ptr [esp + 0xc]
+                f[2] = ldq(s[11]);
+                // bde364 fld st(1)
+                f[3] = f[1];
+                // bde366 fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // bde368 fld st(2)
+                f[3] = f[0];
+                // bde36a fmulp st(3)
+                f[0] = xn3(f[0], f[3], f[0] * f[3]);
+                // bde36c fxch st(1)
+                f.swap(2, 1);
+                // bde36e faddp st(2)
+                f[0] = xn3(f[0], f[2], f[0] + f[2]);
+                // bde370 fmul st(0), st(0)
+                f[1] = xn3(f[1], f[1], f[1] * f[1]);
+                // bde372 faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // bde374 fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // bde378 fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[12]);
+                // bde37c fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // bde37f call 0x40ea20
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde384 fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // bde388 add esp, 4
+                // bde38b fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[12]);
+                // bde38f fld qword ptr [0xe5bfa0]
+                f[1] = f64::from_bits(q64(rq((0xe5bfa0u32) as usize)));
+                // bde395 fsubr st(1)
+                f[1] = xn3(f[1], f[0], f[0] - f[1]);
+                // bde397 fstp dword ptr [esp + 0x10]
+                s[13] = (f[1] as f32).to_bits();
+                // bde39b fld dword ptr [esp + 0x10]
+                f[1] = ldq(s[13]);
+                // bde39f fld qword ptr [0xe5bfb8]
+                f[2] = f64::from_bits(q64(rq((0xe5bfb8u32) as usize)));
+                // bde3a5 fcomi st(1)
+                fl = fl_fcomi(f[2], f[1]);
+                // bde3a7 jbe 0xbde3d4
+                pc = if (fl.cf || fl.zf) { 0xbde3d4 } else { 0xbde3a9 };
+            }
+            0xbde3a9 => {
+                // bde3a9 fxch st(1)
+                f.swap(2, 1);
+                // bde3ab fchs 
+                f[2] = -f[2];
+                // bde3ad fxch st(1)
+                f.swap(2, 1);
+                // bde3af fcompi st(1)
+                fl = fl_fcomi(f[2], f[1]);
+                // bde3b1 fstp st(0)
+                // bde3b3 jbe 0xbde3d8
+                pc = if (fl.cf || fl.zf) { 0xbde3d8 } else { 0xbde3b5 };
+            }
+            0xbde3b5 => {
+                // bde3b5 movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // bde3bd fstp st(0)
+                // bde3bf movss dword ptr [esi], xmm0
+                w.d((esi) as usize, x[0][0]);
+                // bde3c3 xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // bde3c6 movss dword ptr [esi + 4], xmm0
+                w.d((esi.wrapping_add(0x4)) as usize, x[0][0]);
+                // bde3cb movss dword ptr [esi + 8], xmm0
+                w.d((esi.wrapping_add(0x8)) as usize, x[0][0]);
+                // bde3d0 add esp, 0x14
+                // bde3d3 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            0xbde3d4 => {
+                // bde3d4 fstp st(1)
+                f[1] = f[2];
+                // bde3d6 fstp st(0)
+                pc = 0xbde3d8;
+            }
+            0xbde3d8 => {
+                // bde3d8 fld1 
+                f[1] = 1.0;
+                // bde3da movss xmm0, dword ptr [esp + 0xc]
+                x[0] = [s[12], 0, 0, 0];
+                // bde3e0 fdivrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] / f[0]);
+                // bde3e2 fstp dword ptr [esp + 0x10]
+                s[13] = (f[0] as f32).to_bits();
+                // bde3e6 fld dword ptr [esp]
+                f[0] = ldq(s[9]);
+                // bde3e9 fld dword ptr [esp + 0x10]
+                f[1] = ldq(s[13]);
+                // bde3ed fld st(0)
+                f[2] = f[1];
+                // bde3ef fmulp st(2)
+                f[0] = xn3(f[0], f[2], f[0] * f[2]);
+                // bde3f1 fxch st(1)
+                f.swap(1, 0);
+                // bde3f3 fstp dword ptr [esi]
+                w.d((esi) as usize, (f[1] as f32).to_bits());
+                // bde3f5 fld dword ptr [esp + 4]
+                f[1] = ldq(s[10]);
+                // bde3f9 fmul st(1)
+                f[1] = xn3(f[1], f[0], f[1] * f[0]);
+                // bde3fb fstp dword ptr [esi + 4]
+                w.d((esi.wrapping_add(0x4)) as usize, (f[1] as f32).to_bits());
+                // bde3fe fmul dword ptr [esp + 8]
+                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                // bde402 fstp dword ptr [esi + 8]
+                w.d((esi.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // bde405 add esp, 0x14
+                // bde408 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+static H205: [AtomicU32; 1] = [const { AtomicU32::new(0) }; 1];
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_bde750(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 24];
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xbde750u32;
+    loop {
+        match pc {
+            0xbde750 => {
+                H205[0].fetch_add(1, Ordering::Relaxed);
+                // bde750 sub esp, 0xc
+                // bde753 mov eax, 0xec30f8
+                eax = 0xec30f8u32;
+                // bde758 call 0xbdce30
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xbdce30, &mut r_, s[9..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde75d fadd st(0), st(0)
+                f[0] = xn3(f[0], f[0], f[0] + f[0]);
+                // bde75f fsub qword ptr [0xe5bf40]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf40u32) as usize)), f[0] - f64::from_bits(rq((0xe5bf40u32) as usize)));
+                // bde765 fstp dword ptr [esi + 8]
+                w.d((esi.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // bde768 call 0xbdce30
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xbdce30, &mut r_, s[9..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde76d fmul qword ptr [0xe5bf78]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf78u32) as usize)), f[0] * f64::from_bits(rq((0xe5bf78u32) as usize)));
+                // bde773 push ecx
+                s[8] = ecx;
+                // bde774 fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // bde778 fld dword ptr [esi + 8]
+                f[0] = ldq(rd((esi.wrapping_add(0x8)) as usize));
+                // bde77b fmul st(0), st(0)
+                f[0] = xn3(f[0], f[0], f[0] * f[0]);
+                // bde77d fld1 
+                f[1] = 1.0;
+                // bde77f fsubrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] - f[0]);
+                // bde781 fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // bde785 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[11]);
+                // bde789 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // bde78c call 0x40ea20
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde791 fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // bde795 fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // bde799 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // bde79c call 0x40b820
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40b820, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde7a1 fmul dword ptr [esp + 0xc]
+                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                // bde7a5 fstp dword ptr [esi]
+                w.d((esi) as usize, (f[0] as f32).to_bits());
+                // bde7a7 fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // bde7ab fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // bde7ae call 0x428cd0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x428cd0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde7b3 fmul dword ptr [esp + 0xc]
+                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                // bde7b7 fstp dword ptr [esi + 4]
+                w.d((esi.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // bde7ba add esp, 0x10
+                // bde7bd ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+static H206: [AtomicU32; 1] = [const { AtomicU32::new(0) }; 1];
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_bde7c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 24];
+    s[11] = unsafe { *a.add(0) };
+    s[12] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xbde7c0u32;
+    loop {
+        match pc {
+            0xbde7c0 => {
+                H206[0].fetch_add(1, Ordering::Relaxed);
+                // bde7c0 push ecx
+                s[9] = ecx;
+                // bde7c1 mov eax, 0xec30f8
+                eax = 0xec30f8u32;
+                // bde7c6 call 0xbdce30
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xbdce30, &mut r_, s[9..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde7cb fld dword ptr [esp + 0xc]
+                f[1] = ldq(s[12]);
+                // bde7cf fld dword ptr [esp + 8]
+                f[2] = ldq(s[11]);
+                // bde7d3 fld st(0)
+                f[3] = f[2];
+                // bde7d5 fsubp st(2)
+                f[1] = xn3(f[1], f[3], f[1] - f[3]);
+                // bde7d7 fxch st(2)
+                f.swap(2, 0);
+                // bde7d9 fmulp st(1)
+                f[1] = xn3(f[1], f[2], f[1] * f[2]);
+                // bde7db faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // bde7dd fstp dword ptr [esi + 8]
+                w.d((esi.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                // bde7e0 call 0xbdce30
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xbdce30, &mut r_, s[9..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde7e5 fmul qword ptr [0xe5bf78]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf78u32) as usize)), f[0] * f64::from_bits(rq((0xe5bf78u32) as usize)));
+                // bde7eb push ecx
+                s[8] = ecx;
+                // bde7ec fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // bde7f0 fld dword ptr [esi + 8]
+                f[0] = ldq(rd((esi.wrapping_add(0x8)) as usize));
+                // bde7f3 fmul st(0), st(0)
+                f[0] = xn3(f[0], f[0], f[0] * f[0]);
+                // bde7f5 fld1 
+                f[1] = 1.0;
+                // bde7f7 fsubrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] - f[0]);
+                // bde7f9 fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // bde7fd fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[11]);
+                // bde801 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // bde804 call 0x40ea20
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde809 fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // bde80d fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[12]);
+                // bde811 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // bde814 call 0x40b820
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40b820, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde819 fmul dword ptr [esp + 0xc]
+                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                // bde81d fstp dword ptr [esi]
+                w.d((esi) as usize, (f[0] as f32).to_bits());
+                // bde81f fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[12]);
+                // bde823 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // bde826 call 0x428cd0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x428cd0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // bde82b fmul dword ptr [esp + 0xc]
+                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                // bde82f add esp, 4
+                // bde832 fstp dword ptr [esi + 4]
+                w.d((esi.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                // bde835 pop ecx
+                ecx = s[9];
+                // bde836 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 30];
+    s[18] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xbe2e10u32;
+    loop {
+        match pc {
+            0xbe2e10 => {
+                // be2e10 sub esp, 0x20
+                // be2e13 fld dword ptr [esp + 0x24]
+                f[0] = ldq(s[18]);
+                // be2e17 push ecx
+                s[8] = ecx;
+                // be2e18 fmul qword ptr [0xe5bf70]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf70u32) as usize)), f[0] * f64::from_bits(rq((0xe5bf70u32) as usize)));
+                // be2e1e fstp dword ptr [esp + 0x28]
+                s[18] = (f[0] as f32).to_bits();
+                // be2e22 fld dword ptr [esp + 0x28]
+                f[0] = ldq(s[18]);
+                // be2e26 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // be2e29 call 0x428cd0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x428cd0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // be2e2e fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // be2e32 fld dword ptr [edi]
+                f[0] = ldq(rd((edi) as usize));
+                // be2e34 fld dword ptr [esp + 4]
+                f[1] = ldq(s[9]);
+                // be2e38 fld st(0)
+                f[2] = f[1];
+                // be2e3a fmulp st(2)
+                f[0] = xn3(f[0], f[2], f[0] * f[2]);
+                // be2e3c fxch st(1)
+                f.swap(1, 0);
+                // be2e3e fstp dword ptr [esp + 4]
+                s[9] = (f[1] as f32).to_bits();
+                // be2e42 fld dword ptr [edi + 4]
+                f[1] = ldq(rd((edi.wrapping_add(0x4)) as usize));
+                // be2e45 fmul st(1)
+                f[1] = xn3(f[1], f[0], f[1] * f[0]);
+                // be2e47 fstp dword ptr [esp + 8]
+                s[10] = (f[1] as f32).to_bits();
+                // be2e4b fmul dword ptr [edi + 8]
+                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x8)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x8)) as usize)));
+                // be2e4e fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // be2e52 fld dword ptr [esp + 0x28]
+                f[0] = ldq(s[18]);
+                // be2e56 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // be2e59 call 0x40b820
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40b820, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // be2e5e fstp dword ptr [esp + 0x28]
+                s[18] = (f[0] as f32).to_bits();
+                // be2e62 fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // be2e66 fld st(0)
+                f[1] = f[0];
+                // be2e68 fmul st(0), st(0)
+                f[1] = xn3(f[1], f[1], f[1] * f[1]);
+                // be2e6a fstp dword ptr [esp + 0x18]
+                s[14] = (f[1] as f32).to_bits();
+                // be2e6e fld dword ptr [esp + 8]
+                f[1] = ldq(s[10]);
+                // be2e72 fld st(0)
+                f[2] = f[1];
+                // be2e74 fmul st(0), st(0)
+                f[2] = xn3(f[2], f[2], f[2] * f[2]);
+                // be2e76 fstp dword ptr [esp + 8]
+                s[10] = (f[2] as f32).to_bits();
+                // be2e7a fld dword ptr [esp + 0xc]
+                f[2] = ldq(s[11]);
+                // be2e7e fld st(0)
+                f[3] = f[2];
+                // be2e80 fmul st(0), st(0)
+                f[3] = xn3(f[3], f[3], f[3] * f[3]);
+                // be2e82 fstp dword ptr [esp + 0xc]
+                s[11] = (f[3] as f32).to_bits();
+                // be2e86 fld st(1)
+                f[3] = f[1];
+                // be2e88 fmul st(3)
+                f[3] = xn3(f[3], f[0], f[3] * f[0]);
+                // be2e8a fstp dword ptr [esp + 4]
+                s[9] = (f[3] as f32).to_bits();
+                // be2e8e fld st(0)
+                f[3] = f[2];
+                // be2e90 fmul st(3)
+                f[3] = xn3(f[3], f[0], f[3] * f[0]);
+                // be2e92 fstp dword ptr [esp + 0x10]
+                s[12] = (f[3] as f32).to_bits();
+                // be2e96 fld st(0)
+                f[3] = f[2];
+                // be2e98 fmul st(2)
+                f[3] = xn3(f[3], f[1], f[3] * f[1]);
+                // be2e9a fstp dword ptr [esp + 0x20]
+                s[16] = (f[3] as f32).to_bits();
+                // be2e9e fld dword ptr [esp + 0x28]
+                f[3] = ldq(s[18]);
+                // be2ea2 fld st(0)
+                f[4] = f[3];
+                // be2ea4 fmulp st(4)
+                f[0] = xn3(f[0], f[4], f[0] * f[4]);
+                // be2ea6 fxch st(3)
+                f.swap(3, 0);
+                // be2ea8 fstp dword ptr [esp + 0x1c]
+                s[15] = (f[3] as f32).to_bits();
+                // be2eac fld st(2)
+                f[3] = f[0];
+                // be2eae fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // be2eb0 fxch st(1)
+                f.swap(2, 1);
+                // be2eb2 fstp dword ptr [esp + 0x14]
+                s[13] = (f[2] as f32).to_bits();
+                // be2eb6 fmulp st(1)
+                f[0] = xn3(f[0], f[1], f[0] * f[1]);
+                // be2eb8 fstp dword ptr [esp + 0x28]
+                s[18] = (f[0] as f32).to_bits();
+                // be2ebc fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // be2ec0 fld qword ptr [0xe5bfe8]
+                f[1] = f64::from_bits(q64(rq((0xe5bfe8u32) as usize)));
+                // be2ec6 fmul st(1), st(0)
+                f[0] = xn3(f[0], f[1], f[0] * f[1]);
+                // be2ec8 fld dword ptr [esp + 0xc]
+                f[2] = ldq(s[11]);
+                // be2ecc fmul st(1)
+                f[2] = xn3(f[2], f[1], f[2] * f[1]);
+                // be2ece fld1 
+                f[3] = 1.0;
+                // be2ed0 fsub st(3)
+                f[3] = xn3(f[3], f[0], f[3] - f[0]);
+                // be2ed2 fsub st(1)
+                f[3] = xn3(f[3], f[2], f[3] - f[2]);
+                // be2ed4 fstp dword ptr [esi]
+                w.d((esi) as usize, (f[3] as f32).to_bits());
+                // be2ed6 fld dword ptr [esp + 0x28]
+                f[3] = ldq(s[18]);
+                // be2eda fmul st(2)
+                f[3] = xn3(f[3], f[1], f[3] * f[1]);
+                // be2edc fld dword ptr [esp + 4]
+                f[4] = ldq(s[9]);
+                // be2ee0 fmul st(3)
+                f[4] = xn3(f[4], f[1], f[4] * f[1]);
+                // be2ee2 fld st(0)
+                f[5] = f[4];
+                // be2ee4 fadd st(2)
+                f[5] = xn3(f[5], f[3], f[5] + f[3]);
+                // be2ee6 fstp dword ptr [esi + 4]
+                w.d((esi.wrapping_add(0x4)) as usize, (f[5] as f32).to_bits());
+                // be2ee9 fld dword ptr [esp + 0x10]
+                f[5] = ldq(s[12]);
+                // be2eed fmul st(4)
+                f[5] = xn3(f[5], f[1], f[5] * f[1]);
+                // be2eef fld dword ptr [esp + 0x14]
+                f[6] = ldq(s[13]);
+                // be2ef3 fmul st(5)
+                f[6] = xn3(f[6], f[1], f[6] * f[1]);
+                // be2ef5 fld st(1)
+                f[7] = f[5];
+                // be2ef7 fsub st(1)
+                f[7] = xn3(f[7], f[6], f[7] - f[6]);
+                // be2ef9 fstp dword ptr [esi + 8]
+                w.d((esi.wrapping_add(0x8)) as usize, (f[7] as f32).to_bits());
+                // be2efc fxch st(2)
+                f.swap(6, 4);
+                // be2efe fsubrp st(3)
+                f[3] = xn3(f[3], f[6], f[6] - f[3]);
+                // be2f00 fxch st(2)
+                f.swap(5, 3);
+                // be2f02 fstp dword ptr [esi + 0xc]
+                w.d((esi.wrapping_add(0xc)) as usize, (f[5] as f32).to_bits());
+                // be2f05 fld dword ptr [esp + 0x18]
+                f[5] = ldq(s[14]);
+                // be2f09 fmul st(4)
+                f[5] = xn3(f[5], f[1], f[5] * f[1]);
+                // be2f0b fld1 
+                f[6] = 1.0;
+                // be2f0d fsubrp st(1)
+                f[5] = xn3(f[5], f[6], f[6] - f[5]);
+                // be2f0f fld st(0)
+                f[6] = f[5];
+                // be2f11 fsubrp st(4)
+                f[2] = xn3(f[2], f[6], f[6] - f[2]);
+                // be2f13 fxch st(3)
+                f.swap(5, 2);
+                // be2f15 fstp dword ptr [esi + 0x10]
+                w.d((esi.wrapping_add(0x10)) as usize, (f[5] as f32).to_bits());
+                // be2f18 fld dword ptr [esp + 0x1c]
+                f[5] = ldq(s[15]);
+                // be2f1c fmul st(4)
+                f[5] = xn3(f[5], f[1], f[5] * f[1]);
+                // be2f1e fld dword ptr [esp + 0x20]
+                f[6] = ldq(s[16]);
+                // be2f22 fmulp st(5)
+                f[1] = xn3(f[1], f[6], f[1] * f[6]);
+                // be2f24 fld st(4)
+                f[6] = f[1];
+                // be2f26 fadd st(1)
+                f[6] = xn3(f[6], f[5], f[6] + f[5]);
+                // be2f28 fstp dword ptr [esi + 0x14]
+                w.d((esi.wrapping_add(0x14)) as usize, (f[6] as f32).to_bits());
+                // be2f2b fxch st(1)
+                f.swap(5, 4);
+                // be2f2d faddp st(2)
+                f[3] = xn3(f[3], f[5], f[3] + f[5]);
+                // be2f2f fxch st(1)
+                f.swap(4, 3);
+                // be2f31 fstp dword ptr [esi + 0x18]
+                w.d((esi.wrapping_add(0x18)) as usize, (f[4] as f32).to_bits());
+                // be2f34 fsubp st(2)
+                f[1] = xn3(f[1], f[3], f[1] - f[3]);
+                // be2f36 fxch st(1)
+                f.swap(2, 1);
+                // be2f38 fstp dword ptr [esi + 0x1c]
+                w.d((esi.wrapping_add(0x1c)) as usize, (f[2] as f32).to_bits());
+                // be2f3b fsubrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] - f[0]);
+                // be2f3d fstp dword ptr [esi + 0x20]
+                w.d((esi.wrapping_add(0x20)) as usize, (f[0] as f32).to_bits());
+                // be2f40 add esp, 0x24
+                // be2f43 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+static H208: [AtomicU32; 10] = [const { AtomicU32::new(0) }; 10];
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 31];
+    s[19] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xbe4170u32;
+    loop {
+        match pc {
+            0xbe4170 => {
+                H208[0].fetch_add(1, Ordering::Relaxed);
+                // be4170 sub esp, 0x1c
+                // be4173 push ebx
+                s[10] = ebx;
+                // be4174 mov ebx, dword ptr [esp + 0x24]
+                ebx = s[19];
+                // be4178 push esi
+                s[9] = esi;
+                // be4179 push edi
+                s[8] = edi;
+                // be417a lea edi, [ebx + 0x18]
+                edi = ebx.wrapping_add(0x18);
+                // be417d mov esi, edi
+                esi = edi;
+                // be417f call 0xbddff0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0xbddff0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // be4184 fld dword ptr [ebx + 0x10]
+                f[0] = ldq(rd((ebx.wrapping_add(0x10)) as usize));
+                // be4187 fld dword ptr [ebx + 0xc]
+                f[1] = ldq(rd((ebx.wrapping_add(0xc)) as usize));
+                // be418a lea esi, [ebx + 0xc]
+                esi = ebx.wrapping_add(0xc);
+                // be418d fld dword ptr [esi + 8]
+                f[2] = ldq(rd((esi.wrapping_add(0x8)) as usize));
+                // be4190 fld st(1)
+                f[3] = f[1];
+                // be4192 fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // be4194 fld st(2)
+                f[3] = f[0];
+                // be4196 fmulp st(3)
+                f[0] = xn3(f[0], f[3], f[0] * f[3]);
+                // be4198 fxch st(1)
+                f.swap(2, 1);
+                // be419a faddp st(2)
+                f[0] = xn3(f[0], f[2], f[0] + f[2]);
+                // be419c fmul st(0), st(0)
+                f[1] = xn3(f[1], f[1], f[1] * f[1]);
+                // be419e faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // be41a0 fstp dword ptr [esp + 0x2c]
+                s[19] = (f[0] as f32).to_bits();
+                // be41a4 fld dword ptr [esp + 0x2c]
+                f[0] = ldq(s[19]);
+                // be41a8 fldz 
+                f[1] = 0.0;
+                // be41aa fcomi st(1)
+                fl = fl_fcomi(f[1], f[0]);
+                // be41ac fstp st(1)
+                f[0] = f[1];
+                // be41ae jb 0xbe42c5
+                pc = if fl.cf { 0xbe42c5 } else { 0xbe41b4 };
+            }
+            0xbe41b4 => {
+                H208[1].fetch_add(1, Ordering::Relaxed);
+                // be41b4 fld dword ptr [ebx + 4]
+                f[1] = ldq(rd((ebx.wrapping_add(0x4)) as usize));
+                // be41b7 fstp dword ptr [esp + 0x10]
+                s[12] = (f[1] as f32).to_bits();
+                // be41bb fld dword ptr [esp + 0x10]
+                f[1] = ldq(s[12]);
+                // be41bf fld st(0)
+                f[2] = f[1];
+                // be41c1 fld dword ptr [ebx]
+                f[3] = ldq(rd((ebx) as usize));
+                // be41c3 fstp dword ptr [esp + 0x2c]
+                s[19] = (f[3] as f32).to_bits();
+                // be41c7 fld dword ptr [esp + 0x2c]
+                f[3] = ldq(s[19]);
+                // be41cb fld st(0)
+                f[4] = f[3];
+                // be41cd fld dword ptr [ebx + 8]
+                f[5] = ldq(rd((ebx.wrapping_add(0x8)) as usize));
+                // be41d0 fstp dword ptr [esp + 0x2c]
+                s[19] = (f[5] as f32).to_bits();
+                // be41d4 fld dword ptr [esp + 0x2c]
+                f[5] = ldq(s[19]);
+                // be41d8 fld st(0)
+                f[6] = f[5];
+                // be41da fld st(2)
+                f[7] = f[4];
+                // be41dc fmulp st(3)
+                f[4] = xn3(f[4], f[7], f[4] * f[7]);
+                // be41de fld st(4)
+                f[7] = f[2];
+                // be41e0 fmulp st(5)
+                f[2] = xn3(f[2], f[7], f[2] * f[7]);
+                // be41e2 fxch st(2)
+                f.swap(6, 4);
+                // be41e4 faddp st(4)
+                f[2] = xn3(f[2], f[6], f[2] + f[6]);
+                // be41e6 fld st(1)
+                f[6] = f[4];
+                // be41e8 fmulp st(2)
+                f[4] = xn3(f[4], f[6], f[4] * f[6]);
+                // be41ea fxch st(3)
+                f.swap(5, 2);
+                // be41ec faddp st(1)
+                f[4] = xn3(f[4], f[5], f[4] + f[5]);
+                // be41ee fstp dword ptr [esp + 0x2c]
+                s[19] = (f[4] as f32).to_bits();
+                // be41f2 fld dword ptr [esp + 0x2c]
+                f[4] = ldq(s[19]);
+                // be41f6 fxch st(4)
+                f.swap(4, 0);
+                // be41f8 fcompi st(4)
+                fl = fl_fcomi(f[4], f[0]);
+                // be41fa fstp st(3)
+                f[0] = f[3];
+                // be41fc jb 0xbe4263
+                pc = if fl.cf { 0xbe4263 } else { 0xbe41fe };
+            }
+            0xbe41fe => {
+                H208[2].fetch_add(1, Ordering::Relaxed);
+                // be41fe movss xmm1, dword ptr [edi]
+                x[1] = [rd((edi) as usize), 0, 0, 0];
+                // be4202 fstp st(1)
+                f[1] = f[2];
+                // be4204 xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // be4207 fstp st(1)
+                f[0] = f[1];
+                // be4209 ucomiss xmm1, xmm0
+                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // be420c fstp st(0)
+                // be420e lahf 
+                eax = set_part(eax, 8, 0xff, ((fl.sf as u32) << 7) | ((fl.zf as u32) << 6) | ((fl.pf as u32) << 2) | 2 | (fl.cf as u32));
+                // be420f test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // be4212 jp 0xbe424b
+                pc = if fl.pf { 0xbe424b } else { 0xbe4214 };
+            }
+            0xbe4214 => {
+                H208[3].fetch_add(1, Ordering::Relaxed);
+                // be4214 movss xmm1, dword ptr [ebx + 0x20]
+                x[1] = [rd((ebx.wrapping_add(0x20)) as usize), 0, 0, 0];
+                // be4219 ucomiss xmm1, xmm0
+                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // be421c lahf 
+                eax = set_part(eax, 8, 0xff, ((fl.sf as u32) << 7) | ((fl.zf as u32) << 6) | ((fl.pf as u32) << 2) | 2 | (fl.cf as u32));
+                // be421d test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // be4220 jp 0xbe424b
+                pc = if fl.pf { 0xbe424b } else { 0xbe4222 };
+            }
+            0xbe4222 => {
+                H208[4].fetch_add(1, Ordering::Relaxed);
+                // be4222 movss xmm1, dword ptr [ebx + 0x1c]
+                x[1] = [rd((ebx.wrapping_add(0x1c)) as usize), 0, 0, 0];
+                // be4227 ucomiss xmm1, xmm0
+                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // be422a lahf 
+                eax = set_part(eax, 8, 0xff, ((fl.sf as u32) << 7) | ((fl.zf as u32) << 6) | ((fl.pf as u32) << 2) | 2 | (fl.cf as u32));
+                // be422b test ah, 0x44
+                let r_ = (((eax >> 8) & 0xff)) & (0x44u32);
+                fl = fl_logic(r_, 8);
+                // be422e jnp 0xbe424b
+                pc = if !fl.pf { 0xbe424b } else { 0xbe4230 };
+            }
+            0xbe4230 => {
+                H208[5].fetch_add(1, Ordering::Relaxed);
+                // be4230 movss dword ptr [esi], xmm0
+                w.d((esi) as usize, x[0][0]);
+                // be4234 movss dword ptr [esi + 4], xmm0
+                w.d((esi.wrapping_add(0x4)) as usize, x[0][0]);
+                // be4239 movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // be4241 movss dword ptr [esi + 8], xmm0
+                w.d((esi.wrapping_add(0x8)) as usize, x[0][0]);
+                // be4246 jmp 0xbe42cc
+                pc = 0xbe42cc;
+            }
+            0xbe424b => {
+                H208[6].fetch_add(1, Ordering::Relaxed);
+                // be424b movss xmm1, dword ptr [0xdd518c]
+                x[1] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // be4253 movss dword ptr [esi], xmm0
+                w.d((esi) as usize, x[0][0]);
+                // be4257 movss dword ptr [esi + 4], xmm1
+                w.d((esi.wrapping_add(0x4)) as usize, x[1][0]);
+                // be425c movss dword ptr [esi + 8], xmm0
+                w.d((esi.wrapping_add(0x8)) as usize, x[0][0]);
+                // be4261 jmp 0xbe42cc
+                pc = 0xbe42cc;
+            }
+            0xbe4263 => {
+                H208[7].fetch_add(1, Ordering::Relaxed);
+                // be4263 fld dword ptr [edi + 4]
+                f[3] = ldq(rd((edi.wrapping_add(0x4)) as usize));
+                // be4266 fstp dword ptr [esp + 0x2c]
+                s[19] = (f[3] as f32).to_bits();
+                // be426a fld dword ptr [edi + 8]
+                f[3] = ldq(rd((edi.wrapping_add(0x8)) as usize));
+                // be426d fstp dword ptr [esp + 0x10]
+                s[12] = (f[3] as f32).to_bits();
+                // be4271 fld dword ptr [esp + 0x2c]
+                f[3] = ldq(s[19]);
+                // be4275 fld st(0)
+                f[4] = f[3];
+                // be4277 fmul st(2)
+                f[4] = xn3(f[4], f[2], f[4] * f[2]);
+                // be4279 fld dword ptr [esp + 0x10]
+                f[5] = ldq(s[12]);
+                // be427d fld st(0)
+                f[6] = f[5];
+                // be427f fmul st(5)
+                f[6] = xn3(f[6], f[1], f[6] * f[1]);
+                // be4281 fsubp st(2)
+                f[4] = xn3(f[4], f[6], f[4] - f[6]);
+                // be4283 fxch st(1)
+                f.swap(5, 4);
+                // be4285 fstp dword ptr [esp + 0x1c]
+                s[15] = (f[5] as f32).to_bits();
+                // be4289 mov eax, dword ptr [esp + 0x1c]
+                eax = s[15];
+                // be428d fld dword ptr [edi]
+                f[5] = ldq(rd((edi) as usize));
+                // be428f mov dword ptr [esi], eax
+                w.d((esi) as usize, eax);
+                // be4291 fstp dword ptr [esp + 0x2c]
+                s[19] = (f[5] as f32).to_bits();
+                // be4295 fmul st(4)
+                f[4] = xn3(f[4], f[0], f[4] * f[0]);
+                // be4297 fld dword ptr [esp + 0x2c]
+                f[5] = ldq(s[19]);
+                // be429b fld st(0)
+                f[6] = f[5];
+                // be429d fmulp st(4)
+                f[2] = xn3(f[2], f[6], f[2] * f[6]);
+                // be429f fxch st(1)
+                f.swap(5, 4);
+                // be42a1 fsubrp st(3)
+                f[2] = xn3(f[2], f[5], f[5] - f[2]);
+                // be42a3 fxch st(2)
+                f.swap(4, 2);
+                // be42a5 fstp dword ptr [esp + 0x20]
+                s[16] = (f[4] as f32).to_bits();
+                // be42a9 mov ecx, dword ptr [esp + 0x20]
+                ecx = s[16];
+                // be42ad fxch st(1)
+                f.swap(3, 2);
+                // be42af mov dword ptr [esi + 4], ecx
+                w.d((esi.wrapping_add(0x4)) as usize, ecx);
+                // be42b2 fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // be42b4 fmulp st(2)
+                f[0] = xn3(f[0], f[2], f[0] * f[2]);
+                // be42b6 fsubrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] - f[0]);
+                // be42b8 fstp dword ptr [esp + 0x24]
+                s[17] = (f[0] as f32).to_bits();
+                // be42bc mov edx, dword ptr [esp + 0x24]
+                edx = s[17];
+                // be42c0 mov dword ptr [esi + 8], edx
+                w.d((esi.wrapping_add(0x8)) as usize, edx);
+                // be42c3 jmp 0xbe42cc
+                pc = 0xbe42cc;
+            }
+            0xbe42c5 => {
+                H208[8].fetch_add(1, Ordering::Relaxed);
+                // be42c5 fstp st(0)
+                // be42c7 call 0xbddff0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0xbddff0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                pc = 0xbe42cc;
+            }
+            0xbe42cc => {
+                H208[9].fetch_add(1, Ordering::Relaxed);
+                // be42cc fld dword ptr [edi + 8]
+                f[0] = ldq(rd((edi.wrapping_add(0x8)) as usize));
+                // be42cf fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // be42d3 fld dword ptr [esi + 4]
+                f[0] = ldq(rd((esi.wrapping_add(0x4)) as usize));
+                // be42d6 fstp dword ptr [esp + 0x2c]
+                s[19] = (f[0] as f32).to_bits();
+                // be42da fld dword ptr [edi + 4]
+                f[0] = ldq(rd((edi.wrapping_add(0x4)) as usize));
+                // be42dd fstp dword ptr [esp + 0x18]
+                s[14] = (f[0] as f32).to_bits();
+                // be42e1 fld dword ptr [esi + 8]
+                f[0] = ldq(rd((esi.wrapping_add(0x8)) as usize));
+                // be42e4 fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // be42e8 fld dword ptr [esp + 0x2c]
+                f[0] = ldq(s[19]);
+                // be42ec fld st(0)
+                f[1] = f[0];
+                // be42ee fld dword ptr [esp + 0x10]
+                f[2] = ldq(s[12]);
+                // be42f2 fld st(0)
+                f[3] = f[2];
+                // be42f4 fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // be42f6 fld dword ptr [esp + 0x14]
+                f[3] = ldq(s[13]);
+                // be42fa fld st(0)
+                f[4] = f[3];
+                // be42fc fld dword ptr [esp + 0x18]
+                f[5] = ldq(s[14]);
+                // be4300 fld st(0)
+                f[6] = f[5];
+                // be4302 fmulp st(2)
+                f[4] = xn3(f[4], f[6], f[4] * f[6]);
+                // be4304 fxch st(4)
+                f.swap(5, 1);
+                // be4306 fsubrp st(1)
+                f[4] = xn3(f[4], f[5], f[5] - f[4]);
+                // be4308 fstp dword ptr [esp + 0x1c]
+                s[15] = (f[4] as f32).to_bits();
+                // be430c mov eax, dword ptr [esp + 0x1c]
+                eax = s[15];
+                // be4310 fld dword ptr [edi]
+                f[4] = ldq(rd((edi) as usize));
+                // be4312 fstp dword ptr [esp + 0x2c]
+                s[19] = (f[4] as f32).to_bits();
+                // be4316 fld dword ptr [esi]
+                f[4] = ldq(rd((esi) as usize));
+                // be4318 mov dword ptr [ebx], eax
+                w.d((ebx) as usize, eax);
+                // be431a fstp dword ptr [esp + 0x18]
+                s[14] = (f[4] as f32).to_bits();
+                // be431e fld dword ptr [esp + 0x2c]
+                f[4] = ldq(s[19]);
+                // be4322 fld st(0)
+                f[5] = f[4];
+                // be4324 fmulp st(2)
+                f[3] = xn3(f[3], f[5], f[3] * f[5]);
+                // be4326 fld dword ptr [esp + 0x18]
+                f[5] = ldq(s[14]);
+                // be432a fld st(0)
+                f[6] = f[5];
+                // be432c fmulp st(4)
+                f[2] = xn3(f[2], f[6], f[2] * f[6]);
+                // be432e fxch st(2)
+                f.swap(5, 3);
+                // be4330 fsubrp st(3)
+                f[2] = xn3(f[2], f[5], f[5] - f[2]);
+                // be4332 fxch st(2)
+                f.swap(4, 2);
+                // be4334 fstp dword ptr [esp + 0x20]
+                s[16] = (f[4] as f32).to_bits();
+                // be4338 mov ecx, dword ptr [esp + 0x20]
+                ecx = s[16];
+                // be433c mov dword ptr [ebx + 4], ecx
+                w.d((ebx.wrapping_add(0x4)) as usize, ecx);
+                // be433f fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // be4341 fmulp st(2)
+                f[0] = xn3(f[0], f[2], f[0] * f[2]);
+                // be4343 fsubrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] - f[0]);
+                // be4345 fstp dword ptr [esp + 0x24]
+                s[17] = (f[0] as f32).to_bits();
+                // be4349 mov edx, dword ptr [esp + 0x24]
+                edx = s[17];
+                // be434d mov dword ptr [ebx + 8], edx
+                w.d((ebx.wrapping_add(0x8)) as usize, edx);
+                // be4350 fld dword ptr [edi + 4]
+                f[0] = ldq(rd((edi.wrapping_add(0x4)) as usize));
+                // be4353 fstp dword ptr [esp + 0x18]
+                s[14] = (f[0] as f32).to_bits();
+                // be4357 fld dword ptr [ebx + 8]
+                f[0] = ldq(rd((ebx.wrapping_add(0x8)) as usize));
+                // be435a fstp dword ptr [esp + 0x2c]
+                s[19] = (f[0] as f32).to_bits();
+                // be435e fld dword ptr [edi + 8]
+                f[0] = ldq(rd((edi.wrapping_add(0x8)) as usize));
+                // be4361 fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // be4365 fld dword ptr [ebx + 4]
+                f[0] = ldq(rd((ebx.wrapping_add(0x4)) as usize));
+                // be4368 fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // be436c fld dword ptr [esp + 0x18]
+                f[0] = ldq(s[14]);
+                // be4370 fld st(0)
+                f[1] = f[0];
+                // be4372 fld dword ptr [esp + 0x2c]
+                f[2] = ldq(s[19]);
+                // be4376 fld st(0)
+                f[3] = f[2];
+                // be4378 fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // be437a fld dword ptr [esp + 0x14]
+                f[3] = ldq(s[13]);
+                // be437e fld st(0)
+                f[4] = f[3];
+                // be4380 fld dword ptr [esp + 0x10]
+                f[5] = ldq(s[12]);
+                // be4384 fld st(0)
+                f[6] = f[5];
+                // be4386 fmulp st(2)
+                f[4] = xn3(f[4], f[6], f[4] * f[6]);
+                // be4388 fxch st(4)
+                f.swap(5, 1);
+                // be438a fsubrp st(1)
+                f[4] = xn3(f[4], f[5], f[5] - f[4]);
+                // be438c fstp dword ptr [esp + 0x1c]
+                s[15] = (f[4] as f32).to_bits();
+                // be4390 fld dword ptr [ebx]
+                f[4] = ldq(rd((ebx) as usize));
+                // be4392 fstp dword ptr [esp + 0x2c]
+                s[19] = (f[4] as f32).to_bits();
+                // be4396 fld dword ptr [edi]
+                f[4] = ldq(rd((edi) as usize));
+                // be4398 fstp dword ptr [esp + 0x18]
+                s[14] = (f[4] as f32).to_bits();
+                // be439c fld dword ptr [esp + 0x2c]
+                f[4] = ldq(s[19]);
+                // be43a0 fld st(0)
+                f[5] = f[4];
+                // be43a2 fmulp st(2)
+                f[3] = xn3(f[3], f[5], f[3] * f[5]);
+                // be43a4 fld dword ptr [esp + 0x18]
+                f[5] = ldq(s[14]);
+                // be43a8 fld st(0)
+                f[6] = f[5];
+                // be43aa fmulp st(4)
+                f[2] = xn3(f[2], f[6], f[2] * f[6]);
+                // be43ac fxch st(2)
+                f.swap(5, 3);
+                // be43ae fsubrp st(3)
+                f[2] = xn3(f[2], f[5], f[5] - f[2]);
+                // be43b0 fxch st(2)
+                f.swap(4, 2);
+                // be43b2 fstp dword ptr [esp + 0x20]
+                s[16] = (f[4] as f32).to_bits();
+                // be43b6 fmulp st(2)
+                f[1] = xn3(f[1], f[3], f[1] * f[3]);
+                // be43b8 mov eax, dword ptr [esp + 0x1c]
+                eax = s[15];
+                // be43bc fmulp st(2)
+                f[0] = xn3(f[0], f[2], f[0] * f[2]);
+                // be43be mov ecx, dword ptr [esp + 0x20]
+                ecx = s[16];
+                // be43c2 mov dword ptr [esi], eax
+                w.d((esi) as usize, eax);
+                // be43c4 fsubrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] - f[0]);
+                // be43c6 mov dword ptr [esi + 4], ecx
+                w.d((esi.wrapping_add(0x4)) as usize, ecx);
+                // be43c9 pop edi
+                edi = s[8];
+                // be43ca fstp dword ptr [esp + 0x20]
+                s[17] = (f[0] as f32).to_bits();
+                // be43ce mov edx, dword ptr [esp + 0x20]
+                edx = s[17];
+                // be43d2 mov dword ptr [esi + 8], edx
+                w.d((esi.wrapping_add(0x8)) as usize, edx);
+                // be43d5 pop esi
+                esi = s[9];
+                // be43d6 pop ebx
+                ebx = s[10];
+                // be43d7 add esp, 0x1c
+                // be43da ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_cee660(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[11] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xcee660u32;
+    loop {
+        match pc {
+            0xcee660 => {
+                // cee660 fld dword ptr [esp + 4]
+                f[0] = ldq(s[11]);
+                // cee664 push esi
+                s[9] = esi;
+                // cee665 push ecx
+                s[8] = ecx;
+                // cee666 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // cee669 mov esi, ecx
+                esi = ecx;
+                // cee66b call 0x49ee60
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x49ee60, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // cee670 fld dword ptr [esi + 8]
+                f[1] = ldq(rd((esi.wrapping_add(0x8)) as usize));
+                // cee673 fmul qword ptr [0xe5c478]
+                f[1] = xn3(f[1], f64::from_bits(rq((0xe5c478u32) as usize)), f[1] * f64::from_bits(rq((0xe5c478u32) as usize)));
+                // cee679 add esp, 4
+                // cee67c fmul dword ptr [esi + 0x10]
+                f[1] = xn3(f[1], ldr32(rd((esi.wrapping_add(0x10)) as usize)), f[1] * ldr32(rd((esi.wrapping_add(0x10)) as usize)));
+                // cee67f fmul dword ptr [esi + 0xc]
+                f[1] = xn3(f[1], ldr32(rd((esi.wrapping_add(0xc)) as usize)), f[1] * ldr32(rd((esi.wrapping_add(0xc)) as usize)));
+                // cee682 pop esi
+                esi = s[9];
+                // cee683 fmulp st(1)
+                f[0] = xn3(f[0], f[1], f[0] * f[1]);
+                // cee685 fmul dword ptr [esp + 4]
+                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                // cee689 fstp dword ptr [esp + 4]
+                s[11] = (f[0] as f32).to_bits();
+                // cee68d fld dword ptr [esp + 4]
+                f[0] = ldq(s[11]);
+                // cee691 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_ceec00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 28];
+    s[13] = unsafe { *a.add(0) };
+    s[14] = unsafe { *a.add(1) };
+    s[15] = unsafe { *a.add(2) };
+    s[16] = unsafe { *a.add(3) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xceec00u32;
+    loop {
+        match pc {
+            0xceec00 => {
+                // ceec00 sub esp, 8
+                // ceec03 mov eax, dword ptr [esp + 0x14]
+                eax = s[15];
+                // ceec07 fld dword ptr [eax + 8]
+                f[0] = ldq(rd((eax.wrapping_add(0x8)) as usize));
+                // ceec0a push esi
+                s[9] = esi;
+                // ceec0b fstp dword ptr [esp + 0x18]
+                s[15] = (f[0] as f32).to_bits();
+                // ceec0f push ecx
+                s[8] = ecx;
+                // ceec10 fld dword ptr [esp + 0x1c]
+                f[0] = ldq(s[15]);
+                // ceec14 mov esi, ecx
+                esi = ecx;
+                // ceec16 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // ceec19 call 0x49ee60
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x49ee60, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // ceec1e fstp dword ptr [esp + 8]
+                s[10] = (f[0] as f32).to_bits();
+                // ceec22 add esp, 4
+                // ceec25 fld dword ptr [esi + 0x10]
+                f[0] = ldq(rd((esi.wrapping_add(0x10)) as usize));
+                // ceec28 fstp dword ptr [esp + 8]
+                s[11] = (f[0] as f32).to_bits();
+                // ceec2c fld dword ptr [esp + 4]
+                f[0] = ldq(s[10]);
+                // ceec30 fld dword ptr [esp + 8]
+                f[1] = ldq(s[11]);
+                // ceec34 fcomi st(1)
+                fl = fl_fcomi(f[1], f[0]);
+                // ceec36 jbe 0xceec45
+                pc = if (fl.cf || fl.zf) { 0xceec45 } else { 0xceec38 };
+            }
+            0xceec38 => {
+                // ceec38 fstp st(0)
+                // ceec3a pop esi
+                esi = s[9];
+                // ceec3b fstp st(0)
+                // ceec3d fldz 
+                f[0] = 0.0;
+                // ceec3f add esp, 8
+                // ceec42 ret 0x10
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xceec45 => {
+                // ceec45 movss xmm0, dword ptr [esp + 0x18]
+                x[0] = [s[15], 0, 0, 0];
+                // ceec4b comiss xmm0, dword ptr [0xdd32c0]
+                { let b_ = [rd((0xdd32c0u32) as usize), 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // ceec52 jbe 0xceec5e
+                pc = if (fl.cf || fl.zf) { 0xceec5e } else { 0xceec54 };
+            }
+            0xceec54 => {
+                // ceec54 movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // ceec5c jmp 0xceec66
+                pc = 0xceec66;
+            }
+            0xceec5e => {
+                // ceec5e movss xmm0, dword ptr [0xe87998]
+                x[0] = [rd((0xe87998u32) as usize), 0, 0, 0];
+                pc = 0xceec66;
+            }
+            0xceec66 => {
+                // ceec66 fld dword ptr [esi + 8]
+                f[2] = ldq(rd((esi.wrapping_add(0x8)) as usize));
+                // ceec69 movss dword ptr [esp + 0x18], xmm0
+                s[15] = x[0][0];
+                // ceec6f fcompi st(2)
+                fl = fl_fcomi(f[2], f[0]);
+                // ceec71 jbe 0xceec93
+                pc = if (fl.cf || fl.zf) { 0xceec93 } else { 0xceec73 };
+            }
+            0xceec73 => {
+                // ceec73 fsubp st(1)
+                f[0] = xn3(f[0], f[1], f[0] - f[1]);
+                // ceec75 fmul dword ptr [esi + 0xc]
+                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0xc)) as usize)), f[0] * ldr32(rd((esi.wrapping_add(0xc)) as usize)));
+                // ceec78 pop esi
+                esi = s[9];
+                // ceec79 fstp dword ptr [esp + 4]
+                s[11] = (f[0] as f32).to_bits();
+                // ceec7d fld dword ptr [esp + 4]
+                f[0] = ldq(s[11]);
+                // ceec81 fmul dword ptr [esp + 0x14]
+                f[0] = xn3(f[0], ldr32(s[15]), f[0] * ldr32(s[15]));
+                // ceec85 fstp dword ptr [esp + 0x14]
+                s[15] = (f[0] as f32).to_bits();
+                // ceec89 fld dword ptr [esp + 0x14]
+                f[0] = ldq(s[15]);
+                // ceec8d add esp, 8
+                // ceec90 ret 0x10
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            0xceec93 => {
+                // ceec93 fstp st(0)
+                // ceec95 fld dword ptr [esi + 8]
+                f[1] = ldq(rd((esi.wrapping_add(0x8)) as usize));
+                // ceec98 fstp dword ptr [esp + 8]
+                s[11] = (f[1] as f32).to_bits();
+                // ceec9c fld dword ptr [esi + 0x10]
+                f[1] = ldq(rd((esi.wrapping_add(0x10)) as usize));
+                // ceec9f fstp dword ptr [esp + 4]
+                s[10] = (f[1] as f32).to_bits();
+                // ceeca3 fld dword ptr [esp + 8]
+                f[1] = ldq(s[11]);
+                // ceeca7 fld st(0)
+                f[2] = f[1];
+                // ceeca9 fld dword ptr [esp + 4]
+                f[3] = ldq(s[10]);
+                // ceecad fld st(0)
+                f[4] = f[3];
+                // ceecaf fsubp st(2)
+                f[2] = xn3(f[2], f[4], f[2] - f[4]);
+                // ceecb1 fld dword ptr [esi + 0xc]
+                f[4] = ldq(rd((esi.wrapping_add(0xc)) as usize));
+                // ceecb4 pop esi
+                esi = s[9];
+                // ceecb5 fmul st(2)
+                f[4] = xn3(f[4], f[2], f[4] * f[2]);
+                // ceecb7 fstp dword ptr [esp + 4]
+                s[11] = (f[4] as f32).to_bits();
+                // ceecbb fld dword ptr [esp + 4]
+                f[4] = ldq(s[11]);
+                // ceecbf fld st(0)
+                f[5] = f[4];
+                // ceecc1 fld1 
+                f[6] = 1.0;
+                // ceecc3 fld st(0)
+                f[7] = f[6];
+                // ceecc5 fsubrp st(2)
+                f[5] = xn3(f[5], f[7], f[7] - f[5]);
+                // ceecc7 fsubrp st(3)
+                f[3] = xn3(f[3], f[6], f[6] - f[3]);
+                // ceecc9 fxch st(2)
+                f.swap(5, 3);
+                // ceeccb fsubrp st(3)
+                f[2] = xn3(f[2], f[5], f[5] - f[2]);
+                // ceeccd fxch st(1)
+                f.swap(4, 3);
+                // ceeccf fdivrp st(2)
+                f[2] = xn3(f[2], f[4], f[4] / f[2]);
+                // ceecd1 fxch st(1)
+                f.swap(3, 2);
+                // ceecd3 fstp dword ptr [esp + 4]
+                s[11] = (f[3] as f32).to_bits();
+                // ceecd7 fxch st(2)
+                f.swap(2, 0);
+                // ceecd9 fsubrp st(1)
+                f[1] = xn3(f[1], f[2], f[2] - f[1]);
+                // ceecdb fmul dword ptr [esp + 4]
+                f[1] = xn3(f[1], ldr32(s[11]), f[1] * ldr32(s[11]));
+                // ceecdf faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // ceece1 fstp dword ptr [esp + 4]
+                s[11] = (f[0] as f32).to_bits();
+                // ceece5 fld dword ptr [esp + 4]
+                f[0] = ldq(s[11]);
+                // ceece9 fmul dword ptr [esp + 0x14]
+                f[0] = xn3(f[0], ldr32(s[15]), f[0] * ldr32(s[15]));
+                // ceeced fstp dword ptr [esp + 0x14]
+                s[15] = (f[0] as f32).to_bits();
+                // ceecf1 fld dword ptr [esp + 0x14]
+                f[0] = ldq(s[15]);
+                // ceecf5 add esp, 8
+                // ceecf8 ret 0x10
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return f[0];
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 33];
+    s[19] = unsafe { *a.add(0) };
+    s[20] = unsafe { *a.add(1) };
+    s[21] = unsafe { *a.add(2) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd3c880u32;
+    loop {
+        match pc {
+            0xd3c880 => {
+                // d3c880 push ebp
+                s[17] = ebp;
+                // d3c881 mov ebp, esp
+                // mov ebp, esp (frame)
+                // d3c883 and esp, 0xfffffff0
+                // and esp, -N (alignment is not modelled)
+                // d3c886 sub esp, 0x14
+                // d3c889 mov eax, dword ptr [ebp + 0xc]
+                eax = s[20];
+                // d3c88c push ebx
+                s[11] = ebx;
+                // d3c88d push esi
+                s[10] = esi;
+                // d3c88e add eax, -1
+                let (r_, f_) = fl_add(eax, 0xffffffffu32, 32); fl = f_;
+                eax = r_;
+                // d3c891 push edi
+                s[9] = edi;
+                // d3c892 mov ebx, ecx
+                ebx = ecx;
+                // d3c894 mov dword ptr [esp + 0x14], eax
+                s[14] = eax;
+                // d3c898 js 0xd3c9d2
+                pc = if fl.sf { 0xd3c9d2 } else { 0xd3c89e };
+            }
+            0xd3c89e => {
+                // d3c89e mov eax, dword ptr [ebp + 8]
+                eax = s[19];
+                // d3c8a1 movzx ecx, word ptr [eax]
+                ecx = (rw((eax) as usize) as u32);
+                // d3c8a4 movzx esi, cx
+                esi = (ecx & 0xffff);
+                // d3c8a7 and ecx, 0xf
+                let r_ = (ecx) & (0xfu32);
+                fl = fl_logic(r_, 32);
+                ecx = r_;
+                // d3c8aa mov dword ptr [esp + 0x10], ecx
+                s[13] = ecx;
+                // d3c8ae mov eax, esi
+                eax = esi;
+                // d3c8b0 shr eax, 6
+                let (r_, f_) = fl_shift("shr", eax, 6, 32); fl = f_;
+                eax = r_;
+                // d3c8b3 fild dword ptr [esp + 0x10]
+                f[0] = (((s[13]) as i32) as f64);
+                // d3c8b7 and eax, 1
+                let r_ = (eax) & (0x1u32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // d3c8ba mov dword ptr [esp + 0x18], eax
+                s[15] = eax;
+                // d3c8be mov eax, esi
+                eax = esi;
+                // d3c8c0 fadd qword ptr [0xe5bf70]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf70u32) as usize)), f[0] + f64::from_bits(rq((0xe5bf70u32) as usize)));
+                // d3c8c6 shr eax, 5
+                let (r_, f_) = fl_shift("shr", eax, 5, 32); fl = f_;
+                eax = r_;
+                // d3c8c9 mov edi, esi
+                edi = esi;
+                // d3c8cb and eax, 1
+                let r_ = (eax) & (0x1u32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // d3c8ce fstp dword ptr [esp + 0x10]
+                s[13] = (f[0] as f32).to_bits();
+                // d3c8d2 push ecx
+                s[8] = ecx;
+                // d3c8d3 fld dword ptr [esp + 0x14]
+                f[0] = ldq(s[13]);
+                // d3c8d7 shr edi, 7
+                let (r_, f_) = fl_shift("shr", edi, 7, 32); fl = f_;
+                edi = r_;
+                // d3c8da fmul dword ptr [0xe86870]
+                f[0] = xn3(f[0], ldr32(rd((0xe86870u32) as usize)), f[0] * ldr32(rd((0xe86870u32) as usize)));
+                // d3c8e0 and edi, 1
+                let r_ = (edi) & (0x1u32);
+                fl = fl_logic(r_, 32);
+                edi = r_;
+                // d3c8e3 mov dword ptr [esp + 0x20], eax
+                s[16] = eax;
+                // d3c8e7 fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // d3c8eb fld dword ptr [esp + 0x10]
+                f[0] = ldq(s[12]);
+                // d3c8ef fmul st(0), st(0)
+                f[0] = xn3(f[0], f[0], f[0] * f[0]);
+                // d3c8f1 fld1 
+                f[1] = 1.0;
+                // d3c8f3 fsubrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] - f[0]);
+                // d3c8f5 fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // d3c8f9 fld dword ptr [esp + 0x14]
+                f[0] = ldq(s[13]);
+                // d3c8fd fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // d3c900 call 0x40ea20
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // d3c905 mov ecx, dword ptr [ebp + 8]
+                ecx = s[19];
+                // d3c908 fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // d3c90c movzx eax, word ptr [ecx]
+                eax = (rw((ecx) as usize) as u32);
+                // d3c90f add esp, 4
+                // d3c912 test al, 0x10
+                let r_ = ((eax & 0xff)) & (0x10u32);
+                fl = fl_logic(r_, 8);
+                // d3c914 je 0xd3c924
+                pc = if fl.zf { 0xd3c924 } else { 0xd3c916 };
+            }
+            0xd3c916 => {
+                // d3c916 movss xmm2, dword ptr [esp + 0xc]
+                x[2] = [s[12], 0, 0, 0];
+                // d3c91c movss xmm0, dword ptr [esp + 0x10]
+                x[0] = [s[13], 0, 0, 0];
+                // d3c922 jmp 0xd3c930
+                pc = 0xd3c930;
+            }
+            0xd3c924 => {
+                // d3c924 movss xmm0, dword ptr [esp + 0xc]
+                x[0] = [s[12], 0, 0, 0];
+                // d3c92a movss xmm2, dword ptr [esp + 0x10]
+                x[2] = [s[13], 0, 0, 0];
+                pc = 0xd3c930;
+            }
+            0xd3c930 => {
+                // d3c930 cmp dword ptr [esp + 0x18], 0
+                fl = fl_sub(s[15], 0x0u32, 32).1;
+                // d3c935 jne 0xd3c946
+                pc = if !fl.zf { 0xd3c946 } else { 0xd3c937 };
+            }
+            0xd3c937 => {
+                // d3c937 movss xmm1, dword ptr [0xe5bfb0]
+                x[1] = [rd((0xe5bfb0u32) as usize), 0, 0, 0];
+                // d3c93f subss xmm1, xmm2
+                { let b_ = x[2]; x[1] = sse_arith(1, x[1], b_); }
+                // d3c943 movaps xmm2, xmm1
+                x[2] = x[1];
+                pc = 0xd3c946;
+            }
+            0xd3c946 => {
+                // d3c946 cmp dword ptr [esp + 0x1c], 0
+                fl = fl_sub(s[16], 0x0u32, 32).1;
+                // d3c94b jne 0xd3c95c
+                pc = if !fl.zf { 0xd3c95c } else { 0xd3c94d };
+            }
+            0xd3c94d => {
+                // d3c94d movss xmm1, dword ptr [0xe5bfb0]
+                x[1] = [rd((0xe5bfb0u32) as usize), 0, 0, 0];
+                // d3c955 subss xmm1, xmm0
+                { let b_ = x[0]; x[1] = sse_arith(1, x[1], b_); }
+                // d3c959 movaps xmm0, xmm1
+                x[0] = x[1];
+                pc = 0xd3c95c;
+            }
+            0xd3c95c => {
+                // d3c95c mov eax, dword ptr [ebp + 0x10]
+                eax = s[21];
+                // d3c95f mov ecx, dword ptr [esp + 0x14]
+                ecx = s[14];
+                // d3c963 add dword ptr [ebp + 8], 2
+                let (r_, f_) = fl_add(s[19], 0x2u32, 32); fl = f_;
+                s[19] = r_;
+                // d3c967 movss xmm0, xmm0
+                x[0][0] = x[0][0];
+                // d3c96b movaps xmm1, xmm0
+                x[1] = x[0];
+                // d3c96e movss xmm0, xmm2
+                x[0][0] = x[2][0];
+                // d3c972 movaps xmm2, xmm0
+                x[2] = x[0];
+                // d3c975 movss xmm0, dword ptr [ebx + 0x14]
+                x[0] = [rd((ebx.wrapping_add(0x14)) as usize), 0, 0, 0];
+                // d3c97a movaps xmm3, xmm2
+                x[3] = x[2];
+                // d3c97d shufps xmm3, xmm2, 0
+                { let b_ = x[2]; let a_ = x[3]; x[3] = shufps(a_, b_, 0); }
+                // d3c981 movaps xmm2, xmmword ptr [ebx + 0x50]
+                x[2] = rx((ebx.wrapping_add(0x50)) as usize);
+                // d3c985 mulps xmm3, xmm2
+                { let b_ = x[2]; x[3] = sse_arith(10, x[3], b_); }
+                // d3c988 movaps xmm2, xmm1
+                x[2] = x[1];
+                // d3c98b shufps xmm2, xmm1, 0
+                { let b_ = x[1]; let a_ = x[2]; x[2] = shufps(a_, b_, 0); }
+                // d3c98f movaps xmm1, xmmword ptr [ebx + 0x40]
+                x[1] = rx((ebx.wrapping_add(0x40)) as usize);
+                // d3c993 mov edx, 3
+                edx = 0x3u32;
+                // d3c998 sub edx, edi
+                let (r_, f_) = fl_sub(edx, edi, 32); fl = f_;
+                edx = r_;
+                // d3c99a mulps xmm2, xmm1
+                { let b_ = x[1]; x[2] = sse_arith(10, x[2], b_); }
+                // d3c99d addps xmm3, xmm2
+                { let b_ = x[2]; x[3] = sse_arith(8, x[3], b_); }
+                // d3c9a0 shufps xmm0, xmm0, 0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = shufps(a_, b_, 0); }
+                // d3c9a4 shl edx, 4
+                let (r_, f_) = fl_shift("shl", edx, 4, 32); fl = f_;
+                edx = r_;
+                // d3c9a7 mulps xmm3, xmm0
+                { let b_ = x[0]; x[3] = sse_arith(10, x[3], b_); }
+                // d3c9aa movaps xmm0, xmmword ptr [edx + ebx]
+                x[0] = rx((edx.wrapping_add(ebx)) as usize);
+                // d3c9ae or esi, 0x3f000000
+                let r_ = (esi) | (0x3f000000u32);
+                fl = fl_logic(r_, 32);
+                esi = r_;
+                // d3c9b4 addps xmm3, xmm0
+                { let b_ = x[0]; x[3] = sse_arith(8, x[3], b_); }
+                // d3c9b7 movaps xmmword ptr [eax], xmm3
+                { let v_: [u32; 4] = x[3]; let a_ = (eax) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                // d3c9ba sub ecx, 1
+                let (r_, f_) = fl_sub(ecx, 0x1u32, 32); fl = f_;
+                ecx = r_;
+                // d3c9bd mov dword ptr [eax + 0xc], esi
+                w.d((eax.wrapping_add(0xc)) as usize, esi);
+                // d3c9c0 add eax, 0x10
+                let (r_, f_) = fl_add(eax, 0x10u32, 32); fl = f_;
+                eax = r_;
+                // d3c9c3 test ecx, ecx
+                let r_ = (ecx) & (ecx);
+                fl = fl_logic(r_, 32);
+                // d3c9c5 mov dword ptr [esp + 0x14], ecx
+                s[14] = ecx;
+                // d3c9c9 mov dword ptr [ebp + 0x10], eax
+                s[21] = eax;
+                // d3c9cc jge 0xd3c89e
+                pc = if (fl.sf == fl.of) { 0xd3c89e } else { 0xd3c9d2 };
+            }
+            0xd3c9d2 => {
+                // d3c9d2 pop edi
+                edi = s[9];
+                // d3c9d3 pop esi
+                esi = s[10];
+                // d3c9d4 pop ebx
+                ebx = s[11];
+                // d3c9d5 mov esp, ebp
+                // mov esp, ebp
+                // d3c9d7 pop ebp
+                ebp = s[17];
+                // d3c9d8 ret 0xc
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 48];
+    s[35] = unsafe { *a.add(0) };
+    s[36] = unsafe { *a.add(1) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd3c9e0u32;
+    loop {
+        match pc {
+            0xd3c9e0 => {
+                // d3c9e0 push ebp
+                s[33] = ebp;
+                // d3c9e1 mov ebp, esp
+                // mov ebp, esp (frame)
+                // d3c9e3 and esp, 0xfffffff0
+                // and esp, -N (alignment is not modelled)
+                // d3c9e6 sub esp, 0x54
+                // d3c9e9 push ebx
+                s[11] = ebx;
+                // d3c9ea push esi
+                s[10] = esi;
+                // d3c9eb push edi
+                s[9] = edi;
+                // d3c9ec mov dword ptr [esp + 0x1c], ecx
+                s[16] = ecx;
+                // d3c9f0 movaps xmm1, xmmword ptr [ecx + 0x20]
+                x[1] = rx((ecx.wrapping_add(0x20)) as usize);
+                // d3c9f4 movaps xmm0, xmmword ptr [ecx + 0x30]
+                x[0] = rx((ecx.wrapping_add(0x30)) as usize);
+                // d3c9f8 mov eax, dword ptr [ebp + 8]
+                eax = s[35];
+                // d3c9fb movaps xmm2, xmmword ptr [ecx + 0x40]
+                x[2] = rx((ecx.wrapping_add(0x40)) as usize);
+                // d3c9ff subps xmm0, xmm1
+                { let b_ = x[1]; x[0] = sse_arith(9, x[0], b_); }
+                // d3ca02 movaps xmm1, xmmword ptr [eax]
+                x[1] = rx((eax) as usize);
+                // d3ca05 movaps xmmword ptr [esp + 0x50], xmm0
+                { let v_: [u32; 4] = x[0]; s[29] = v_[0]; s[30] = v_[1]; s[31] = v_[2]; s[32] = v_[3]; }
+                // d3ca0a movaps xmm0, xmm1
+                x[0] = x[1];
+                // d3ca0d mulps xmm0, xmm2
+                { let b_ = x[2]; x[0] = sse_arith(10, x[0], b_); }
+                // d3ca10 movaps xmm2, xmm0
+                x[2] = x[0];
+                // d3ca13 shufps xmm2, xmm0, 0x55
+                { let b_ = x[0]; let a_ = x[2]; x[2] = shufps(a_, b_, 85); }
+                // d3ca17 addss xmm2, xmm0
+                { let b_ = x[0]; x[2] = sse_arith(0, x[2], b_); }
+                // d3ca1b movaps xmm3, xmm0
+                x[3] = x[0];
+                // d3ca1e movaps xmmword ptr [esp + 0x40], xmm1
+                { let v_: [u32; 4] = x[1]; s[25] = v_[0]; s[26] = v_[1]; s[27] = v_[2]; s[28] = v_[3]; }
+                // d3ca23 shufps xmm3, xmm0, 0xaa
+                { let b_ = x[0]; let a_ = x[3]; x[3] = shufps(a_, b_, 170); }
+                // d3ca27 movaps xmm0, xmm1
+                x[0] = x[1];
+                // d3ca2a movaps xmm1, xmmword ptr [ecx + 0x50]
+                x[1] = rx((ecx.wrapping_add(0x50)) as usize);
+                // d3ca2e mulps xmm0, xmm1
+                { let b_ = x[1]; x[0] = sse_arith(10, x[0], b_); }
+                // d3ca31 addss xmm3, xmm2
+                { let b_ = x[2]; x[3] = sse_arith(0, x[3], b_); }
+                // d3ca35 movaps xmm1, xmm0
+                x[1] = x[0];
+                // d3ca38 shufps xmm1, xmm0, 0x55
+                { let b_ = x[0]; let a_ = x[1]; x[1] = shufps(a_, b_, 85); }
+                // d3ca3c movaps xmm2, xmm0
+                x[2] = x[0];
+                // d3ca3f addss xmm1, xmm0
+                { let b_ = x[0]; x[1] = sse_arith(0, x[1], b_); }
+                // d3ca43 shufps xmm2, xmm0, 0xaa
+                { let b_ = x[0]; let a_ = x[2]; x[2] = shufps(a_, b_, 170); }
+                // d3ca47 addss xmm2, xmm1
+                { let b_ = x[1]; x[2] = sse_arith(0, x[2], b_); }
+                // d3ca4b movss dword ptr [esp + 0x20], xmm2
+                s[17] = x[2][0];
+                // d3ca51 fld dword ptr [esp + 0x20]
+                f[0] = ldq(s[17]);
+                // d3ca55 movss dword ptr [esp + 0x30], xmm3
+                s[21] = x[3][0];
+                // d3ca5b fld dword ptr [esp + 0x30]
+                f[1] = ldq(s[21]);
+                // d3ca5f fmul st(0), st(0)
+                f[1] = xn3(f[1], f[1], f[1] * f[1]);
+                // d3ca61 fld st(1)
+                f[2] = f[0];
+                // d3ca63 fmulp st(2)
+                f[0] = xn3(f[0], f[2], f[0] * f[2]);
+                // d3ca65 faddp st(1)
+                f[0] = xn3(f[0], f[1], f[0] + f[1]);
+                // d3ca67 fstp dword ptr [esp + 0x14]
+                s[14] = (f[0] as f32).to_bits();
+                // d3ca6b fld dword ptr [0xe5cd18]
+                f[0] = ldq(rd((0xe5cd18u32) as usize));
+                // d3ca71 fld dword ptr [esp + 0x14]
+                f[1] = ldq(s[14]);
+                // d3ca75 fcomi st(1)
+                fl = fl_fcomi(f[1], f[0]);
+                // d3ca77 fstp st(1)
+                f[0] = f[1];
+                // d3ca79 jb 0xd3cabe
+                pc = if fl.cf { 0xd3cabe } else { 0xd3ca7b };
+            }
+            0xd3ca7b => {
+                // d3ca7b push ecx
+                s[8] = ecx;
+                // d3ca7c fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // d3ca7f call 0x40ea20
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // d3ca84 fld1 
+                f[1] = 1.0;
+                // d3ca86 xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // d3ca89 fdivrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] / f[0]);
+                // d3ca8b add esp, 4
+                // d3ca8e fstp dword ptr [esp + 0x14]
+                s[14] = (f[0] as f32).to_bits();
+                // d3ca92 fld dword ptr [esp + 0x20]
+                f[0] = ldq(s[17]);
+                // d3ca96 fld dword ptr [esp + 0x14]
+                f[1] = ldq(s[14]);
+                // d3ca9a fld st(0)
+                f[2] = f[1];
+                // d3ca9c fmulp st(2)
+                f[0] = xn3(f[0], f[2], f[0] * f[2]);
+                // d3ca9e fxch st(1)
+                f.swap(1, 0);
+                // d3caa0 fstp dword ptr [esp + 0xc]
+                s[12] = (f[1] as f32).to_bits();
+                // d3caa4 movss xmm1, dword ptr [esp + 0xc]
+                x[1] = [s[12], 0, 0, 0];
+                // d3caaa comiss xmm1, xmm0
+                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d3caad fmul dword ptr [esp + 0x30]
+                f[0] = xn3(f[0], ldr32(s[21]), f[0] * ldr32(s[21]));
+                // d3cab1 fstp dword ptr [esp + 0x10]
+                s[13] = (f[0] as f32).to_bits();
+                // d3cab5 jb 0xd3cade
+                pc = if fl.cf { 0xd3cade } else { 0xd3cab7 };
+            }
+            0xd3cab7 => {
+                // d3cab7 mov edi, 1
+                edi = 0x1u32;
+                // d3cabc jmp 0xd3cae0
+                pc = 0xd3cae0;
+            }
+            0xd3cabe => {
+                // d3cabe xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // d3cac1 fstp st(0)
+                // d3cac3 movss xmm1, dword ptr [0xdd518c]
+                x[1] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // d3cacb movss dword ptr [esp + 0xc], xmm0
+                s[12] = x[0][0];
+                // d3cad1 movss dword ptr [esp + 0x10], xmm1
+                s[13] = x[1][0];
+                // d3cad7 mov edi, 1
+                edi = 0x1u32;
+                // d3cadc jmp 0xd3cae0
+                pc = 0xd3cae0;
+            }
+            0xd3cade => {
+                // d3cade xor edi, edi
+                edi = 0;
+                fl = fl_logic(0, 32);
+                pc = 0xd3cae0;
+            }
+            0xd3cae0 => {
+                // d3cae0 movss xmm1, dword ptr [esp + 0x10]
+                x[1] = [s[13], 0, 0, 0];
+                // d3cae6 comiss xmm1, xmm0
+                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d3cae9 jb 0xd3caf2
+                pc = if fl.cf { 0xd3caf2 } else { 0xd3caeb };
+            }
+            0xd3caeb => {
+                // d3caeb mov esi, 1
+                esi = 0x1u32;
+                // d3caf0 jmp 0xd3caf4
+                pc = 0xd3caf4;
+            }
+            0xd3caf2 => {
+                // d3caf2 xor esi, esi
+                esi = 0;
+                fl = fl_logic(0, 32);
+                pc = 0xd3caf4;
+            }
+            0xd3caf4 => {
+                // d3caf4 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[12]);
+                // d3caf8 push ecx
+                s[8] = ecx;
+                // d3caf9 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // d3cafc call 0x49ee60
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x49ee60, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // d3cb01 fstp dword ptr [esp + 0x10]
+                s[12] = (f[0] as f32).to_bits();
+                // d3cb05 fld dword ptr [esp + 0x14]
+                f[0] = ldq(s[13]);
+                // d3cb09 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // d3cb0c call 0x49ee60
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x49ee60, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // d3cb11 fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // d3cb15 add esp, 4
+                // d3cb18 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[12]);
+                // d3cb1c fld dword ptr [esp + 0x10]
+                f[1] = ldq(s[13]);
+                // d3cb20 fcompi st(1)
+                fl = fl_fcomi(f[1], f[0]);
+                // d3cb22 fstp st(0)
+                // d3cb24 jb 0xd3cb33
+                pc = if fl.cf { 0xd3cb33 } else { 0xd3cb26 };
+            }
+            0xd3cb26 => {
+                // d3cb26 movss xmm0, dword ptr [esp + 0xc]
+                x[0] = [s[12], 0, 0, 0];
+                // d3cb2c mov ebx, 1
+                ebx = 0x1u32;
+                // d3cb31 jmp 0xd3cb3b
+                pc = 0xd3cb3b;
+            }
+            0xd3cb33 => {
+                // d3cb33 movss xmm0, dword ptr [esp + 0x10]
+                x[0] = [s[13], 0, 0, 0];
+                // d3cb39 xor ebx, ebx
+                ebx = 0;
+                fl = fl_logic(0, 32);
+                pc = 0xd3cb3b;
+            }
+            0xd3cb3b => {
+                // d3cb3b movss dword ptr [esp + 0x10], xmm0
+                s[13] = x[0][0];
+                // d3cb41 movaps xmm0, xmmword ptr [esp + 0x40]
+                x[0] = [s[25], s[26], s[27], s[28]];
+                // d3cb46 mulps xmm0, xmmword ptr [esp + 0x50]
+                { let b_ = [s[29], s[30], s[31], s[32]]; x[0] = sse_arith(10, x[0], b_); }
+                // d3cb4b movaps xmm1, xmm0
+                x[1] = x[0];
+                // d3cb4e shufps xmm1, xmm0, 0x55
+                { let b_ = x[0]; let a_ = x[1]; x[1] = shufps(a_, b_, 85); }
+                // d3cb52 movaps xmm2, xmm0
+                x[2] = x[0];
+                // d3cb55 addss xmm1, xmm0
+                { let b_ = x[0]; x[1] = sse_arith(0, x[1], b_); }
+                // d3cb59 shufps xmm2, xmm0, 0xaa
+                { let b_ = x[0]; let a_ = x[2]; x[2] = shufps(a_, b_, 170); }
+                // d3cb5d xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // d3cb60 addss xmm2, xmm1
+                { let b_ = x[1]; x[2] = sse_arith(0, x[2], b_); }
+                // d3cb64 movss dword ptr [esp + 0x50], xmm2
+                s[29] = x[2][0];
+                // d3cb6a comiss xmm0, dword ptr [esp + 0x50]
+                { let b_ = [s[29], 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                // d3cb6f jb 0xd3cb78
+                pc = if fl.cf { 0xd3cb78 } else { 0xd3cb71 };
+            }
+            0xd3cb71 => {
+                // d3cb71 mov eax, 1
+                eax = 0x1u32;
+                // d3cb76 jmp 0xd3cb7a
+                pc = 0xd3cb7a;
+            }
+            0xd3cb78 => {
+                // d3cb78 xor eax, eax
+                eax = 0;
+                fl = fl_logic(0, 32);
+                pc = 0xd3cb7a;
+            }
+            0xd3cb7a => {
+                // d3cb7a fld dword ptr [0xe866bc]
+                f[0] = ldq(rd((0xe866bcu32) as usize));
+                // d3cb80 fmul dword ptr [esp + 0x10]
+                f[0] = xn3(f[0], ldr32(s[13]), f[0] * ldr32(s[13]));
+                // d3cb84 fsub dword ptr [0xe86874]
+                f[0] = xn3(f[0], ldr32(rd((0xe86874u32) as usize)), f[0] - ldr32(rd((0xe86874u32) as usize)));
+                // d3cb8a fadd qword ptr [0xe5c368]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5c368u32) as usize)), f[0] + f64::from_bits(rq((0xe5c368u32) as usize)));
+                // d3cb90 fstp dword ptr [esp + 0x14]
+                s[14] = (f[0] as f32).to_bits();
+                // d3cb94 fld dword ptr [esp + 0x14]
+                f[0] = ldq(s[14]);
+                // d3cb98 fistp dword ptr [esp + 0xc]
+                s[12] = fist32(f[0]);
+                // d3cb9c lea ecx, [edi + eax*2]
+                ecx = edi.wrapping_add(eax.wrapping_mul(2));
+                // d3cb9f lea edx, [esi + ecx*2]
+                edx = esi.wrapping_add(ecx.wrapping_mul(2));
+                // d3cba2 lea ebx, [ebx + edx*2]
+                ebx = ebx.wrapping_add(edx.wrapping_mul(2));
+                // d3cba5 shl ebx, 4
+                let (r_, f_) = fl_shift("shl", ebx, 4, 32); fl = f_;
+                ebx = r_;
+                // d3cba8 add ebx, dword ptr [esp + 0xc]
+                let (r_, f_) = fl_add(ebx, s[12], 32); fl = f_;
+                ebx = r_;
+                // d3cbac push ecx
+                s[8] = ecx;
+                // d3cbad movzx eax, bx
+                eax = (ebx & 0xffff);
+                // d3cbb0 mov esi, eax
+                esi = eax;
+                // d3cbb2 mov edi, eax
+                edi = eax;
+                // d3cbb4 shr eax, 5
+                let (r_, f_) = fl_shift("shr", eax, 5, 32); fl = f_;
+                eax = r_;
+                // d3cbb7 and eax, 1
+                let r_ = (eax) & (0x1u32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // d3cbba mov dword ptr [esp + 0x1c], eax
+                s[15] = eax;
+                // d3cbbe movzx eax, bl
+                eax = (ebx & 0xff);
+                // d3cbc1 and eax, 0xf
+                let r_ = (eax) & (0xfu32);
+                fl = fl_logic(r_, 32);
+                eax = r_;
+                // d3cbc4 mov dword ptr [esp + 0x18], eax
+                s[14] = eax;
+                // d3cbc8 shr esi, 7
+                let (r_, f_) = fl_shift("shr", esi, 7, 32); fl = f_;
+                esi = r_;
+                // d3cbcb fild dword ptr [esp + 0x18]
+                f[0] = (((s[14]) as i32) as f64);
+                // d3cbcf shr edi, 6
+                let (r_, f_) = fl_shift("shr", edi, 6, 32); fl = f_;
+                edi = r_;
+                // d3cbd2 and esi, 1
+                let r_ = (esi) & (0x1u32);
+                fl = fl_logic(r_, 32);
+                esi = r_;
+                // d3cbd5 and edi, 1
+                let r_ = (edi) & (0x1u32);
+                fl = fl_logic(r_, 32);
+                edi = r_;
+                // d3cbd8 fadd qword ptr [0xe5bf70]
+                f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf70u32) as usize)), f[0] + f64::from_bits(rq((0xe5bf70u32) as usize)));
+                // d3cbde fstp dword ptr [esp + 0x18]
+                s[14] = (f[0] as f32).to_bits();
+                // d3cbe2 fld dword ptr [esp + 0x18]
+                f[0] = ldq(s[14]);
+                // d3cbe6 fmul dword ptr [0xe86870]
+                f[0] = xn3(f[0], ldr32(rd((0xe86870u32) as usize)), f[0] * ldr32(rd((0xe86870u32) as usize)));
+                // d3cbec fstp dword ptr [esp + 0x14]
+                s[13] = (f[0] as f32).to_bits();
+                // d3cbf0 fld dword ptr [esp + 0x14]
+                f[0] = ldq(s[13]);
+                // d3cbf4 fmul st(0), st(0)
+                f[0] = xn3(f[0], f[0], f[0] * f[0]);
+                // d3cbf6 fld1 
+                f[1] = 1.0;
+                // d3cbf8 fsubrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] - f[0]);
+                // d3cbfa fstp dword ptr [esp + 0x18]
+                s[14] = (f[0] as f32).to_bits();
+                // d3cbfe fld dword ptr [esp + 0x18]
+                f[0] = ldq(s[14]);
+                // d3cc02 fstp dword ptr [esp]
+                s[8] = (f[0] as f32).to_bits();
+                // d3cc05 call 0x40ea20
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
+                // d3cc0a add esp, 4
+                // d3cc0d fstp dword ptr [esp + 0x14]
+                s[14] = (f[0] as f32).to_bits();
+                // d3cc11 test bl, 0x10
+                let r_ = ((ebx & 0xff)) & (0x10u32);
+                fl = fl_logic(r_, 8);
+                // d3cc14 je 0xd3cc24
+                pc = if fl.zf { 0xd3cc24 } else { 0xd3cc16 };
+            }
+            0xd3cc16 => {
+                // d3cc16 movss xmm2, dword ptr [esp + 0x10]
+                x[2] = [s[13], 0, 0, 0];
+                // d3cc1c movss xmm0, dword ptr [esp + 0x14]
+                x[0] = [s[14], 0, 0, 0];
+                // d3cc22 jmp 0xd3cc30
+                pc = 0xd3cc30;
+            }
+            0xd3cc24 => {
+                // d3cc24 movss xmm0, dword ptr [esp + 0x10]
+                x[0] = [s[13], 0, 0, 0];
+                // d3cc2a movss xmm2, dword ptr [esp + 0x14]
+                x[2] = [s[14], 0, 0, 0];
+                pc = 0xd3cc30;
+            }
+            0xd3cc30 => {
+                // d3cc30 test edi, edi
+                let r_ = (edi) & (edi);
+                fl = fl_logic(r_, 32);
+                // d3cc32 movss xmm1, dword ptr [0xe5bfb0]
+                x[1] = [rd((0xe5bfb0u32) as usize), 0, 0, 0];
+                // d3cc3a jne 0xd3cc46
+                pc = if !fl.zf { 0xd3cc46 } else { 0xd3cc3c };
+            }
+            0xd3cc3c => {
+                // d3cc3c movaps xmm3, xmm1
+                x[3] = x[1];
+                // d3cc3f subss xmm3, xmm2
+                { let b_ = x[2]; x[3] = sse_arith(1, x[3], b_); }
+                // d3cc43 movaps xmm2, xmm3
+                x[2] = x[3];
+                pc = 0xd3cc46;
+            }
+            0xd3cc46 => {
+                // d3cc46 cmp dword ptr [esp + 0x18], 0
+                fl = fl_sub(s[15], 0x0u32, 32).1;
+                // d3cc4b jne 0xd3cc54
+                pc = if !fl.zf { 0xd3cc54 } else { 0xd3cc4d };
+            }
+            0xd3cc4d => {
+                // d3cc4d subss xmm1, xmm0
+                { let b_ = x[0]; x[1] = sse_arith(1, x[1], b_); }
+                // d3cc51 movaps xmm0, xmm1
+                x[0] = x[1];
+                pc = 0xd3cc54;
+            }
+            0xd3cc54 => {
+                // d3cc54 mov eax, dword ptr [esp + 0x1c]
+                eax = s[16];
+                // d3cc58 movss xmm0, xmm0
+                x[0][0] = x[0][0];
+                // d3cc5c movaps xmm1, xmm0
+                x[1] = x[0];
+                // d3cc5f movss xmm0, xmm2
+                x[0][0] = x[2][0];
+                // d3cc63 movaps xmm2, xmm0
+                x[2] = x[0];
+                // d3cc66 movss xmm0, dword ptr [eax + 0x14]
+                x[0] = [rd((eax.wrapping_add(0x14)) as usize), 0, 0, 0];
+                // d3cc6b movaps xmm3, xmm2
+                x[3] = x[2];
+                // d3cc6e shufps xmm3, xmm2, 0
+                { let b_ = x[2]; let a_ = x[3]; x[3] = shufps(a_, b_, 0); }
+                // d3cc72 movaps xmm2, xmmword ptr [eax + 0x50]
+                x[2] = rx((eax.wrapping_add(0x50)) as usize);
+                // d3cc76 mulps xmm3, xmm2
+                { let b_ = x[2]; x[3] = sse_arith(10, x[3], b_); }
+                // d3cc79 movaps xmm2, xmm1
+                x[2] = x[1];
+                // d3cc7c shufps xmm2, xmm1, 0
+                { let b_ = x[1]; let a_ = x[2]; x[2] = shufps(a_, b_, 0); }
+                // d3cc80 movaps xmm1, xmmword ptr [eax + 0x40]
+                x[1] = rx((eax.wrapping_add(0x40)) as usize);
+                // d3cc84 mov ecx, 3
+                ecx = 0x3u32;
+                // d3cc89 sub ecx, esi
+                let (r_, f_) = fl_sub(ecx, esi, 32); fl = f_;
+                ecx = r_;
+                // d3cc8b mulps xmm2, xmm1
+                { let b_ = x[1]; x[2] = sse_arith(10, x[2], b_); }
+                // d3cc8e addps xmm3, xmm2
+                { let b_ = x[2]; x[3] = sse_arith(8, x[3], b_); }
+                // d3cc91 shufps xmm0, xmm0, 0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = shufps(a_, b_, 0); }
+                // d3cc95 shl ecx, 4
+                let (r_, f_) = fl_shift("shl", ecx, 4, 32); fl = f_;
+                ecx = r_;
+                // d3cc98 mulps xmm3, xmm0
+                { let b_ = x[0]; x[3] = sse_arith(10, x[3], b_); }
+                // d3cc9b movaps xmm0, xmmword ptr [ecx + eax]
+                x[0] = rx((ecx.wrapping_add(eax)) as usize);
+                // d3cc9f mov eax, dword ptr [ebp + 0xc]
+                eax = s[36];
+                // d3cca2 pop edi
+                edi = s[9];
+                // d3cca3 or ebx, 0x3f000000
+                let r_ = (ebx) | (0x3f000000u32);
+                fl = fl_logic(r_, 32);
+                ebx = r_;
+                // d3cca9 addps xmm3, xmm0
+                { let b_ = x[0]; x[3] = sse_arith(8, x[3], b_); }
+                // d3ccac movaps xmmword ptr [eax], xmm3
+                { let v_: [u32; 4] = x[3]; let a_ = (eax) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                // d3ccaf pop esi
+                esi = s[10];
+                // d3ccb0 mov dword ptr [eax + 0xc], ebx
+                w.d((eax.wrapping_add(0xc)) as usize, ebx);
+                // d3ccb3 pop ebx
+                ebx = s[11];
+                // d3ccb4 mov esp, ebp
+                // mov esp, ebp
+                // d3ccb6 pop ebp
+                ebp = s[33];
+                // d3ccb7 ret 8
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d4c420(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 25];
+    s[13] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd4c420u32;
+    loop {
+        match pc {
+            0xd4c420 => {
+                // d4c420 sub esp, 0xc
+                // d4c423 movss xmm0, dword ptr [ecx + 0xc0]
+                x[0] = [rd((ecx.wrapping_add(0xc0)) as usize), 0, 0, 0];
+                // d4c42b movss dword ptr [esp], xmm0
+                s[9] = x[0][0];
+                // d4c430 movss xmm0, dword ptr [ecx + 0xc4]
+                x[0] = [rd((ecx.wrapping_add(0xc4)) as usize), 0, 0, 0];
+                // d4c438 push esi
+                s[8] = esi;
+                // d4c439 mov esi, dword ptr [esp + 0x14]
+                esi = s[13];
+                // d4c43d movss dword ptr [esp + 8], xmm0
+                s[10] = x[0][0];
+                // d4c443 movss xmm0, dword ptr [ecx + 0xc8]
+                x[0] = [rd((ecx.wrapping_add(0xc8)) as usize), 0, 0, 0];
+                // d4c44b mov ecx, esi
+                ecx = esi;
+                // d4c44d movss dword ptr [esp + 0xc], xmm0
+                s[11] = x[0][0];
+                // d4c453 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d4c458 movss xmm0, dword ptr [esp + 4]
+                x[0] = [s[9], 0, 0, 0];
+                // d4c45e movss dword ptr [esi], xmm0
+                w.d((esi) as usize, x[0][0]);
+                // d4c462 movss xmm0, dword ptr [esp + 8]
+                x[0] = [s[10], 0, 0, 0];
+                // d4c468 movss dword ptr [esi + 0x14], xmm0
+                w.d((esi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d4c46d movss xmm0, dword ptr [esp + 0xc]
+                x[0] = [s[11], 0, 0, 0];
+                // d4c473 movss dword ptr [esi + 0x28], xmm0
+                w.d((esi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d4c478 pop esi
+                esi = s[8];
+                // d4c479 add esp, 0xc
+                // d4c47c ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d4c480(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 25];
+    s[13] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd4c480u32;
+    loop {
+        match pc {
+            0xd4c480 => {
+                // d4c480 sub esp, 0xc
+                // d4c483 fld dword ptr [ecx + 0xc0]
+                f[0] = ldq(rd((ecx.wrapping_add(0xc0)) as usize));
+                // d4c489 push esi
+                s[8] = esi;
+                // d4c48a fld1 
+                f[1] = 1.0;
+                // d4c48c mov esi, dword ptr [esp + 0x14]
+                esi = s[13];
+                // d4c490 fld st(0)
+                f[2] = f[1];
+                // d4c492 fdivrp st(2)
+                f[0] = xn3(f[0], f[2], f[2] / f[0]);
+                // d4c494 fxch st(1)
+                f.swap(1, 0);
+                // d4c496 fstp dword ptr [esp + 4]
+                s[9] = (f[1] as f32).to_bits();
+                // d4c49a fld dword ptr [ecx + 0xc4]
+                f[1] = ldq(rd((ecx.wrapping_add(0xc4)) as usize));
+                // d4c4a0 fdivr st(1)
+                f[1] = xn3(f[1], f[0], f[0] / f[1]);
+                // d4c4a2 fstp dword ptr [esp + 8]
+                s[10] = (f[1] as f32).to_bits();
+                // d4c4a6 fdiv dword ptr [ecx + 0xc8]
+                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0xc8)) as usize)), f[0] / ldr32(rd((ecx.wrapping_add(0xc8)) as usize)));
+                // d4c4ac mov ecx, esi
+                ecx = esi;
+                // d4c4ae fstp dword ptr [esp + 0xc]
+                s[11] = (f[0] as f32).to_bits();
+                // d4c4b2 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d4c4b7 fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // d4c4bb fstp dword ptr [esi]
+                w.d((esi) as usize, (f[0] as f32).to_bits());
+                // d4c4bd fld dword ptr [esp + 8]
+                f[0] = ldq(s[10]);
+                // d4c4c1 fstp dword ptr [esi + 0x14]
+                w.d((esi.wrapping_add(0x14)) as usize, (f[0] as f32).to_bits());
+                // d4c4c4 fld dword ptr [esp + 0xc]
+                f[0] = ldq(s[11]);
+                // d4c4c8 fstp dword ptr [esi + 0x28]
+                w.d((esi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                // d4c4cb pop esi
+                esi = s[8];
+                // d4c4cc add esp, 0xc
+                // d4c4cf ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d4e570(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 22];
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd4e570u32;
+    loop {
+        match pc {
+            0xd4e570 => {
+                // d4e570 mov word ptr [esi + 6], 1
+                w.h((esi.wrapping_add(0x6)) as usize, (0x1u32) as u16);
+                // d4e576 mov dword ptr [esi], 0xe52470
+                w.d((esi) as usize, 0xe52470u32);
+                // d4e57c push ebx
+                s[9] = ebx;
+                // d4e57d xor ebx, ebx
+                ebx = 0;
+                fl = fl_logic(0, 32);
+                // d4e57f mov dword ptr [esi + 8], ebx
+                w.d((esi.wrapping_add(0x8)) as usize, ebx);
+                // d4e582 mov word ptr [esi + 0x10], 4
+                w.h((esi.wrapping_add(0x10)) as usize, (0x4u32) as u16);
+                // d4e588 mov word ptr [esi + 0x80], 0xf
+                w.h((esi.wrapping_add(0x80)) as usize, (0xfu32) as u16);
+                // d4e591 mov byte ptr [esi + 0x82], 1
+                w.b((esi.wrapping_add(0x82)) as usize, (0x1u32) as u8);
+                // d4e598 push edi
+                s[8] = edi;
+                // d4e599 mov eax, 0x10
+                eax = 0x10u32;
+                // d4e59e mov word ptr [esi + 0x94], ax
+                w.h((esi.wrapping_add(0x94)) as usize, ((eax & 0xffff)) as u16);
+                // d4e5a5 mov byte ptr [esi + 0x96], 1
+                w.b((esi.wrapping_add(0x96)) as usize, (0x1u32) as u8);
+                // d4e5ac lea edi, [esi + 0x20]
+                edi = esi.wrapping_add(0x20);
+                // d4e5af mov ecx, edi
+                ecx = edi;
+                // d4e5b1 mov word ptr [esi + 0xa8], ax
+                w.h((esi.wrapping_add(0xa8)) as usize, ((eax & 0xffff)) as u16);
+                // d4e5b8 mov byte ptr [esi + 0xaa], 1
+                w.b((esi.wrapping_add(0xaa)) as usize, (0x1u32) as u8);
+                // d4e5bf mov byte ptr [esi + 0xae], bl
+                w.b((esi.wrapping_add(0xae)) as usize, ((ebx & 0xff)) as u8);
+                // d4e5c5 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d4e5ca movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // d4e5d2 movss dword ptr [edi], xmm0
+                w.d((edi) as usize, x[0][0]);
+                // d4e5d6 movss dword ptr [edi + 0x14], xmm0
+                w.d((edi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d4e5db movss dword ptr [edi + 0x28], xmm0
+                w.d((edi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d4e5e0 lea edi, [esi + 0x50]
+                edi = esi.wrapping_add(0x50);
+                // d4e5e3 mov ecx, edi
+                ecx = edi;
+                // d4e5e5 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d4e5ea movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // d4e5f2 movss xmm1, dword ptr [0xe5cfa0]
+                x[1] = [rd((0xe5cfa0u32) as usize), 0, 0, 0];
+                // d4e5fa movss xmm2, dword ptr [0xe5cf9c]
+                x[2] = [rd((0xe5cf9cu32) as usize), 0, 0, 0];
+                // d4e602 movss dword ptr [edi], xmm0
+                w.d((edi) as usize, x[0][0]);
+                // d4e606 movss dword ptr [edi + 0x14], xmm0
+                w.d((edi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d4e60b movss dword ptr [edi + 0x28], xmm0
+                w.d((edi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d4e610 movss dword ptr [esi + 0x88], xmm1
+                w.d((esi.wrapping_add(0x88)) as usize, x[1][0]);
+                // d4e618 movss xmm1, dword ptr [0xe5cf98]
+                x[1] = [rd((0xe5cf98u32) as usize), 0, 0, 0];
+                // d4e620 movss dword ptr [esi + 0xa0], xmm0
+                w.d((esi.wrapping_add(0xa0)) as usize, x[0][0]);
+                // d4e628 movss xmm0, dword ptr [0xe5cf94]
+                x[0] = [rd((0xe5cf94u32) as usize), 0, 0, 0];
+                // d4e630 movss dword ptr [esi + 0x8c], xmm1
+                w.d((esi.wrapping_add(0x8c)) as usize, x[1][0]);
+                // d4e638 movss xmm1, dword ptr [0xdd5190]
+                x[1] = [rd((0xdd5190u32) as usize), 0, 0, 0];
+                // d4e640 movss dword ptr [esi + 0xb0], xmm0
+                w.d((esi.wrapping_add(0xb0)) as usize, x[0][0]);
+                // d4e648 movss xmm0, dword ptr [0xedbafc]
+                x[0] = [rd((0xedbafcu32) as usize), 0, 0, 0];
+                // d4e650 pop edi
+                edi = s[8];
+                // d4e651 mov byte ptr [esi + 0x83], bl
+                w.b((esi.wrapping_add(0x83)) as usize, ((ebx & 0xff)) as u8);
+                // d4e657 mov byte ptr [esi + 0x97], bl
+                w.b((esi.wrapping_add(0x97)) as usize, ((ebx & 0xff)) as u8);
+                // d4e65d mov byte ptr [esi + 0x98], bl
+                w.b((esi.wrapping_add(0x98)) as usize, ((ebx & 0xff)) as u8);
+                // d4e663 mov byte ptr [esi + 0x99], bl
+                w.b((esi.wrapping_add(0x99)) as usize, ((ebx & 0xff)) as u8);
+                // d4e669 mov byte ptr [esi + 0xab], bl
+                w.b((esi.wrapping_add(0xab)) as usize, ((ebx & 0xff)) as u8);
+                // d4e66f mov byte ptr [esi + 0x84], 1
+                w.b((esi.wrapping_add(0x84)) as usize, (0x1u32) as u8);
+                // d4e676 movss dword ptr [esi + 0x90], xmm1
+                w.d((esi.wrapping_add(0x90)) as usize, x[1][0]);
+                // d4e67e movss dword ptr [esi + 0x9c], xmm2
+                w.d((esi.wrapping_add(0x9c)) as usize, x[2][0]);
+                // d4e686 movss dword ptr [esi + 0xa4], xmm1
+                w.d((esi.wrapping_add(0xa4)) as usize, x[1][0]);
+                // d4e68e mov byte ptr [esi + 0x9a], 0x10
+                w.b((esi.wrapping_add(0x9a)) as usize, (0x10u32) as u8);
+                // d4e695 mov byte ptr [esi + 0xac], 1
+                w.b((esi.wrapping_add(0xac)) as usize, (0x1u32) as u8);
+                // d4e69c mov byte ptr [esi + 0xad], 1
+                w.b((esi.wrapping_add(0xad)) as usize, (0x1u32) as u8);
+                // d4e6a3 movss dword ptr [esi + 0xb4], xmm0
+                w.d((esi.wrapping_add(0xb4)) as usize, x[0][0]);
+                // d4e6ab movss dword ptr [esi + 0xb8], xmm1
+                w.d((esi.wrapping_add(0xb8)) as usize, x[1][0]);
+                // d4e6b3 mov eax, esi
+                eax = esi;
+                // d4e6b5 pop ebx
+                ebx = s[9];
+                // d4e6b6 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d4eb00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd4eb00u32;
+    loop {
+        match pc {
+            0xd4eb00 => {
+                // d4eb00 mov eax, 1
+                eax = 0x1u32;
+                // d4eb05 mov word ptr [esi + 6], ax
+                w.h((esi.wrapping_add(0x6)) as usize, ((eax & 0xffff)) as u16);
+                // d4eb09 mov dword ptr [esi + 8], 0
+                w.d((esi.wrapping_add(0x8)) as usize, 0x0u32);
+                // d4eb10 mov dword ptr [esi], 0xe52a98
+                w.d((esi) as usize, 0xe52a98u32);
+                // d4eb16 push edi
+                s[8] = edi;
+                // d4eb17 mov word ptr [esi + 0x10], 4
+                w.h((esi.wrapping_add(0x10)) as usize, (0x4u32) as u16);
+                // d4eb1d lea edi, [esi + 0x20]
+                edi = esi.wrapping_add(0x20);
+                // d4eb20 mov word ptr [esi + 0x80], 0xe
+                w.h((esi.wrapping_add(0x80)) as usize, (0xeu32) as u16);
+                // d4eb29 mov byte ptr [esi + 0x82], al
+                w.b((esi.wrapping_add(0x82)) as usize, ((eax & 0xff)) as u8);
+                // d4eb2f mov ecx, edi
+                ecx = edi;
+                // d4eb31 mov word ptr [esi + 0x90], 0xc
+                w.h((esi.wrapping_add(0x90)) as usize, (0xcu32) as u16);
+                // d4eb3a call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d4eb3f movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // d4eb47 movss dword ptr [edi], xmm0
+                w.d((edi) as usize, x[0][0]);
+                // d4eb4b movss dword ptr [edi + 0x14], xmm0
+                w.d((edi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d4eb50 movss dword ptr [edi + 0x28], xmm0
+                w.d((edi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d4eb55 lea edi, [esi + 0x50]
+                edi = esi.wrapping_add(0x50);
+                // d4eb58 mov ecx, edi
+                ecx = edi;
+                // d4eb5a call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d4eb5f movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // d4eb67 movss xmm1, dword ptr [0xe5c168]
+                x[1] = [rd((0xe5c168u32) as usize), 0, 0, 0];
+                // d4eb6f movss dword ptr [edi], xmm0
+                w.d((edi) as usize, x[0][0]);
+                // d4eb73 movss dword ptr [edi + 0x14], xmm0
+                w.d((edi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d4eb78 movss dword ptr [edi + 0x28], xmm0
+                w.d((edi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d4eb7d movss dword ptr [esi + 0x84], xmm1
+                w.d((esi.wrapping_add(0x84)) as usize, x[1][0]);
+                // d4eb85 movss xmm1, dword ptr [0xdd50e4]
+                x[1] = [rd((0xdd50e4u32) as usize), 0, 0, 0];
+                // d4eb8d mov byte ptr [esi + 0x92], 0
+                w.b((esi.wrapping_add(0x92)) as usize, (0x0u32) as u8);
+                // d4eb94 mov byte ptr [esi + 0x83], 0
+                w.b((esi.wrapping_add(0x83)) as usize, (0x0u32) as u8);
+                // d4eb9b movss dword ptr [esi + 0x88], xmm1
+                w.d((esi.wrapping_add(0x88)) as usize, x[1][0]);
+                // d4eba3 movss dword ptr [esi + 0x8c], xmm0
+                w.d((esi.wrapping_add(0x8c)) as usize, x[0][0]);
+                // d4ebab mov eax, esi
+                eax = esi;
+                // d4ebad pop edi
+                edi = s[8];
+                // d4ebae ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d51f60(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd51f60u32;
+    loop {
+        match pc {
+            0xd51f60 => {
+                // d51f60 xorps xmm0, xmm0
+                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
+                // d51f63 mov eax, 1
+                eax = 0x1u32;
+                // d51f68 xor ecx, ecx
+                ecx = 0;
+                fl = fl_logic(0, 32);
+                // d51f6a mov dword ptr [esi + 8], ecx
+                w.d((esi.wrapping_add(0x8)) as usize, ecx);
+                // d51f6d mov word ptr [esi + 6], ax
+                w.h((esi.wrapping_add(0x6)) as usize, ((eax & 0xffff)) as u16);
+                // d51f71 mov dword ptr [esi], 0xe52cfc
+                w.d((esi) as usize, 0xe52cfcu32);
+                // d51f77 mov word ptr [esi + 0xc], ax
+                w.h((esi.wrapping_add(0xc)) as usize, ((eax & 0xffff)) as u16);
+                // d51f7b push edi
+                s[8] = edi;
+                // d51f7c mov dword ptr [esi + 0x18], ecx
+                w.d((esi.wrapping_add(0x18)) as usize, ecx);
+                // d51f7f lea edi, [esi + 0x30]
+                edi = esi.wrapping_add(0x30);
+                // d51f82 movss dword ptr [esi + 0x1c], xmm0
+                w.d((esi.wrapping_add(0x1c)) as usize, x[0][0]);
+                // d51f87 mov ecx, edi
+                ecx = edi;
+                // d51f89 mov byte ptr [esi + 0x20], al
+                w.b((esi.wrapping_add(0x20)) as usize, ((eax & 0xff)) as u8);
+                // d51f8c call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d51f91 movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // d51f99 lea ecx, [edi + 0x30]
+                ecx = edi.wrapping_add(0x30);
+                // d51f9c movss dword ptr [edi], xmm0
+                w.d((edi) as usize, x[0][0]);
+                // d51fa0 movss dword ptr [edi + 0x14], xmm0
+                w.d((edi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d51fa5 movss dword ptr [edi + 0x28], xmm0
+                w.d((edi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d51faa call 0x7034a0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x7034a0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d51faf lea edi, [esi + 0x70]
+                edi = esi.wrapping_add(0x70);
+                // d51fb2 mov ecx, edi
+                ecx = edi;
+                // d51fb4 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d51fb9 movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // d51fc1 lea ecx, [edi + 0x30]
+                ecx = edi.wrapping_add(0x30);
+                // d51fc4 movss dword ptr [edi], xmm0
+                w.d((edi) as usize, x[0][0]);
+                // d51fc8 movss dword ptr [edi + 0x14], xmm0
+                w.d((edi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d51fcd movss dword ptr [edi + 0x28], xmm0
+                w.d((edi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d51fd2 call 0x7034a0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x7034a0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d51fd7 mov dword ptr [esi + 0x14], esi
+                w.d((esi.wrapping_add(0x14)) as usize, esi);
+                // d51fda mov dword ptr [esi + 0x10], 0xd508e0
+                w.d((esi.wrapping_add(0x10)) as usize, 0xd508e0u32);
+                // d51fe1 mov eax, esi
+                eax = esi;
+                // d51fe3 pop edi
+                edi = s[8];
+                // d51fe4 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d550e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 21];
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd550e0u32;
+    loop {
+        match pc {
+            0xd550e0 => {
+                // d550e0 mov word ptr [esi + 6], 1
+                w.h((esi.wrapping_add(0x6)) as usize, (0x1u32) as u16);
+                // d550e6 mov dword ptr [esi + 8], 0
+                w.d((esi.wrapping_add(0x8)) as usize, 0x0u32);
+                // d550ed mov dword ptr [esi], 0xe52a38
+                w.d((esi) as usize, 0xe52a38u32);
+                // d550f3 push edi
+                s[8] = edi;
+                // d550f4 mov word ptr [esi + 0x10], 2
+                w.h((esi.wrapping_add(0x10)) as usize, (0x2u32) as u16);
+                // d550fa lea edi, [esi + 0x20]
+                edi = esi.wrapping_add(0x20);
+                // d550fd mov word ptr [esi + 0xa0], 0xc
+                w.h((esi.wrapping_add(0xa0)) as usize, (0xcu32) as u16);
+                // d55106 mov ecx, edi
+                ecx = edi;
+                // d55108 mov word ptr [esi + 0xa4], 5
+                w.h((esi.wrapping_add(0xa4)) as usize, (0x5u32) as u16);
+                // d55111 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d55116 movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // d5511e lea ecx, [edi + 0x30]
+                ecx = edi.wrapping_add(0x30);
+                // d55121 movss dword ptr [edi], xmm0
+                w.d((edi) as usize, x[0][0]);
+                // d55125 movss dword ptr [edi + 0x14], xmm0
+                w.d((edi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d5512a movss dword ptr [edi + 0x28], xmm0
+                w.d((edi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d5512f call 0x7034a0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x7034a0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d55134 lea edi, [esi + 0x60]
+                edi = esi.wrapping_add(0x60);
+                // d55137 mov ecx, edi
+                ecx = edi;
+                // d55139 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d5513e movss xmm0, dword ptr [0xdd518c]
+                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
+                // d55146 lea ecx, [edi + 0x30]
+                ecx = edi.wrapping_add(0x30);
+                // d55149 movss dword ptr [edi], xmm0
+                w.d((edi) as usize, x[0][0]);
+                // d5514d movss dword ptr [edi + 0x14], xmm0
+                w.d((edi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d55152 movss dword ptr [edi + 0x28], xmm0
+                w.d((edi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d55157 call 0x7034a0
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x7034a0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d5515c mov byte ptr [esi + 0xa2], 0
+                w.b((esi.wrapping_add(0xa2)) as usize, (0x0u32) as u8);
+                // d55163 mov eax, esi
+                eax = esi;
+                // d55165 pop edi
+                edi = s[8];
+                // d55166 ret 
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d835a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[11] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd835a0u32;
+    loop {
+        match pc {
+            0xd835a0 => {
+                // d835a0 push ecx
+                s[9] = ecx;
+                // d835a1 movss xmm0, dword ptr [ecx + 0xc0]
+                x[0] = [rd((ecx.wrapping_add(0xc0)) as usize), 0, 0, 0];
+                // d835a9 push esi
+                s[8] = esi;
+                // d835aa mov esi, dword ptr [esp + 0xc]
+                esi = s[11];
+                // d835ae mov ecx, esi
+                ecx = esi;
+                // d835b0 movss dword ptr [esp + 4], xmm0
+                s[9] = x[0][0];
+                // d835b6 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d835bb movss xmm0, dword ptr [esp + 4]
+                x[0] = [s[9], 0, 0, 0];
+                // d835c1 movss dword ptr [esi], xmm0
+                w.d((esi) as usize, x[0][0]);
+                // d835c5 movss dword ptr [esi + 0x14], xmm0
+                w.d((esi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d835ca movss dword ptr [esi + 0x28], xmm0
+                w.d((esi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d835cf pop esi
+                esi = s[8];
+                // d835d0 pop ecx
+                ecx = s[9];
+                // d835d1 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d835e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[11] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd835e0u32;
+    loop {
+        match pc {
+            0xd835e0 => {
+                // d835e0 push ecx
+                s[9] = ecx;
+                // d835e1 movss xmm0, dword ptr [ecx + 0xc0]
+                x[0] = [rd((ecx.wrapping_add(0xc0)) as usize), 0, 0, 0];
+                // d835e9 push esi
+                s[8] = esi;
+                // d835ea mov esi, dword ptr [esp + 0xc]
+                esi = s[11];
+                // d835ee mov ecx, esi
+                ecx = esi;
+                // d835f0 movss dword ptr [esp + 4], xmm0
+                s[9] = x[0][0];
+                // d835f6 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d835fb movss xmm0, dword ptr [esp + 4]
+                x[0] = [s[9], 0, 0, 0];
+                // d83601 movss dword ptr [esi], xmm0
+                w.d((esi) as usize, x[0][0]);
+                // d83605 movss dword ptr [esi + 0x14], xmm0
+                w.d((esi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d8360a movss dword ptr [esi + 0x28], xmm0
+                w.d((esi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d8360f pop esi
+                esi = s[8];
+                // d83610 pop ecx
+                ecx = s[9];
+                // d83611 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d83620(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[11] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd83620u32;
+    loop {
+        match pc {
+            0xd83620 => {
+                // d83620 push ecx
+                s[9] = ecx;
+                // d83621 fld dword ptr [ecx + 0xc0]
+                f[0] = ldq(rd((ecx.wrapping_add(0xc0)) as usize));
+                // d83627 push esi
+                s[8] = esi;
+                // d83628 fld1 
+                f[1] = 1.0;
+                // d8362a mov esi, dword ptr [esp + 0xc]
+                esi = s[11];
+                // d8362e fdivrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] / f[0]);
+                // d83630 mov ecx, esi
+                ecx = esi;
+                // d83632 fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // d83636 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d8363b fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // d8363f fst dword ptr [esi]
+                w.d((esi) as usize, (f[0] as f32).to_bits());
+                // d83641 fst dword ptr [esi + 0x14]
+                w.d((esi.wrapping_add(0x14)) as usize, (f[0] as f32).to_bits());
+                // d83644 fstp dword ptr [esi + 0x28]
+                w.d((esi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                // d83647 pop esi
+                esi = s[8];
+                // d83648 pop ecx
+                ecx = s[9];
+                // d83649 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d83650(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[11] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd83650u32;
+    loop {
+        match pc {
+            0xd83650 => {
+                // d83650 push ecx
+                s[9] = ecx;
+                // d83651 fld dword ptr [ecx + 0xc0]
+                f[0] = ldq(rd((ecx.wrapping_add(0xc0)) as usize));
+                // d83657 push esi
+                s[8] = esi;
+                // d83658 fld1 
+                f[1] = 1.0;
+                // d8365a mov esi, dword ptr [esp + 0xc]
+                esi = s[11];
+                // d8365e fdivrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] / f[0]);
+                // d83660 mov ecx, esi
+                ecx = esi;
+                // d83662 fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // d83666 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d8366b fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // d8366f fst dword ptr [esi]
+                w.d((esi) as usize, (f[0] as f32).to_bits());
+                // d83671 fst dword ptr [esi + 0x14]
+                w.d((esi.wrapping_add(0x14)) as usize, (f[0] as f32).to_bits());
+                // d83674 fstp dword ptr [esi + 0x28]
+                w.d((esi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                // d83677 pop esi
+                esi = s[8];
+                // d83678 pop ecx
+                ecx = s[9];
+                // d83679 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d83920(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[11] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd83920u32;
+    loop {
+        match pc {
+            0xd83920 => {
+                // d83920 push ecx
+                s[9] = ecx;
+                // d83921 movss xmm0, dword ptr [ecx + 0xc0]
+                x[0] = [rd((ecx.wrapping_add(0xc0)) as usize), 0, 0, 0];
+                // d83929 push esi
+                s[8] = esi;
+                // d8392a mov esi, dword ptr [esp + 0xc]
+                esi = s[11];
+                // d8392e mov ecx, esi
+                ecx = esi;
+                // d83930 movss dword ptr [esp + 4], xmm0
+                s[9] = x[0][0];
+                // d83936 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d8393b movss xmm0, dword ptr [esp + 4]
+                x[0] = [s[9], 0, 0, 0];
+                // d83941 movss dword ptr [esi], xmm0
+                w.d((esi) as usize, x[0][0]);
+                // d83945 movss dword ptr [esi + 0x14], xmm0
+                w.d((esi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d8394a movss dword ptr [esi + 0x28], xmm0
+                w.d((esi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d8394f pop esi
+                esi = s[8];
+                // d83950 pop ecx
+                ecx = s[9];
+                // d83951 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d83960(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[11] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut x = [[0u32; 4]; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd83960u32;
+    loop {
+        match pc {
+            0xd83960 => {
+                // d83960 push ecx
+                s[9] = ecx;
+                // d83961 movss xmm0, dword ptr [ecx + 0xc0]
+                x[0] = [rd((ecx.wrapping_add(0xc0)) as usize), 0, 0, 0];
+                // d83969 push esi
+                s[8] = esi;
+                // d8396a mov esi, dword ptr [esp + 0xc]
+                esi = s[11];
+                // d8396e mov ecx, esi
+                ecx = esi;
+                // d83970 movss dword ptr [esp + 4], xmm0
+                s[9] = x[0][0];
+                // d83976 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d8397b movss xmm0, dword ptr [esp + 4]
+                x[0] = [s[9], 0, 0, 0];
+                // d83981 movss dword ptr [esi], xmm0
+                w.d((esi) as usize, x[0][0]);
+                // d83985 movss dword ptr [esi + 0x14], xmm0
+                w.d((esi.wrapping_add(0x14)) as usize, x[0][0]);
+                // d8398a movss dword ptr [esi + 0x28], xmm0
+                w.d((esi.wrapping_add(0x28)) as usize, x[0][0]);
+                // d8398f pop esi
+                esi = s[8];
+                // d83990 pop ecx
+                ecx = s[9];
+                // d83991 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d839a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[11] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd839a0u32;
+    loop {
+        match pc {
+            0xd839a0 => {
+                // d839a0 push ecx
+                s[9] = ecx;
+                // d839a1 fld dword ptr [ecx + 0xc0]
+                f[0] = ldq(rd((ecx.wrapping_add(0xc0)) as usize));
+                // d839a7 push esi
+                s[8] = esi;
+                // d839a8 fld1 
+                f[1] = 1.0;
+                // d839aa mov esi, dword ptr [esp + 0xc]
+                esi = s[11];
+                // d839ae fdivrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] / f[0]);
+                // d839b0 mov ecx, esi
+                ecx = esi;
+                // d839b2 fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // d839b6 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d839bb fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // d839bf fst dword ptr [esi]
+                w.d((esi) as usize, (f[0] as f32).to_bits());
+                // d839c1 fst dword ptr [esi + 0x14]
+                w.d((esi.wrapping_add(0x14)) as usize, (f[0] as f32).to_bits());
+                // d839c4 fstp dword ptr [esi + 0x28]
+                w.d((esi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                // d839c7 pop esi
+                esi = s[8];
+                // d839c8 pop ecx
+                ecx = s[9];
+                // d839c9 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
+fn g3_d839d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
+    let mut s = [0u32; 23];
+    s[11] = unsafe { *a.add(0) };
+    let mut f = [0f64; 8];
+    let mut fl = Fl::default();
+    let mut cc87 = 0u32;
+    let mut pc = 0xd839d0u32;
+    loop {
+        match pc {
+            0xd839d0 => {
+                // d839d0 push ecx
+                s[9] = ecx;
+                // d839d1 fld dword ptr [ecx + 0xc0]
+                f[0] = ldq(rd((ecx.wrapping_add(0xc0)) as usize));
+                // d839d7 push esi
+                s[8] = esi;
+                // d839d8 fld1 
+                f[1] = 1.0;
+                // d839da mov esi, dword ptr [esp + 0xc]
+                esi = s[11];
+                // d839de fdivrp st(1)
+                f[0] = xn3(f[0], f[1], f[1] / f[0]);
+                // d839e0 mov ecx, esi
+                ecx = esi;
+                // d839e2 fstp dword ptr [esp + 4]
+                s[9] = (f[0] as f32).to_bits();
+                // d839e6 call 0x703480
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
+                // d839eb fld dword ptr [esp + 4]
+                f[0] = ldq(s[9]);
+                // d839ef fst dword ptr [esi]
+                w.d((esi) as usize, (f[0] as f32).to_bits());
+                // d839f1 fst dword ptr [esi + 0x14]
+                w.d((esi.wrapping_add(0x14)) as usize, (f[0] as f32).to_bits());
+                // d839f4 fstp dword ptr [esi + 0x28]
+                w.d((esi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                // d839f7 pop esi
+                esi = s[8];
+                // d839f8 pop ecx
+                ecx = s[9];
+                // d839f9 ret 4
+                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
+                return 0.0;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 // --- thunks -------------------------------------------------------------------------------------
 
 thunk!(t0, 0, "ret", "nop");
@@ -7596,10 +19771,100 @@ thunk!(t133, 133, "ret", "fld qword ptr [esp]");
 thunk!(t134, 134, "ret", "fld qword ptr [esp]");
 thunk!(t135, 135, "ret", "fld qword ptr [esp]");
 thunk!(t136, 136, "ret", "fld qword ptr [esp]");
+thunk!(t137, 137, "ret", "nop");
+thunk!(t138, 138, "ret", "nop");
+thunk!(t139, 139, "ret", "nop");
+thunk!(t140, 140, "ret", "fld qword ptr [esp]");
+thunk!(t141, 141, "ret", "nop");
+thunk!(t142, 142, "ret", "nop");
+thunk!(t143, 143, "ret", "nop");
+thunk!(t144, 144, "ret", "nop");
+thunk!(t145, 145, "ret", "nop");
+thunk!(t146, 146, "ret", "nop");
+thunk!(t147, 147, "ret", "nop");
+thunk!(t148, 148, "ret", "nop");
+thunk!(t149, 149, "ret", "fld qword ptr [esp]");
+thunk!(t150, 150, "ret", "nop");
+thunk!(t151, 151, "ret", "fld qword ptr [esp]");
+thunk!(t152, 152, "ret", "nop");
+thunk!(t153, 153, "ret", "nop");
+thunk!(t154, 154, "ret", "nop");
+thunk!(t155, 155, "ret", "nop");
+thunk!(t156, 156, "ret", "nop");
+thunk!(t157, 157, "ret", "nop");
+thunk!(t158, 158, "ret", "nop");
+thunk!(t159, 159, "ret 8", "nop");
+thunk!(t160, 160, "ret", "nop");
+thunk!(t161, 161, "ret 8", "nop");
+thunk!(t162, 162, "ret 8", "nop");
+thunk!(t163, 163, "ret 8", "nop");
+thunk!(t164, 164, "ret", "fld qword ptr [esp]");
+thunk!(t165, 165, "ret 8", "nop");
+thunk!(t166, 166, "ret", "nop");
+thunk!(t167, 167, "ret", "fld qword ptr [esp]");
+thunk!(t168, 168, "ret 16", "fld qword ptr [esp]");
+thunk!(t169, 169, "ret", "fld qword ptr [esp]");
+thunk!(t170, 170, "ret", "fld qword ptr [esp]");
+thunk!(t171, 171, "ret", "nop");
+thunk!(t172, 172, "ret", "nop");
+thunk!(t173, 173, "ret 4", "nop");
+thunk!(t174, 174, "ret 20", "nop");
+thunk!(t175, 175, "ret 16", "fld qword ptr [esp]");
+thunk!(t176, 176, "ret 16", "fld qword ptr [esp]");
+thunk!(t177, 177, "ret 8", "fld qword ptr [esp]");
+thunk!(t178, 178, "ret", "nop");
+thunk!(t179, 179, "ret", "nop");
+thunk!(t180, 180, "ret", "nop");
+thunk!(t181, 181, "ret 12", "nop");
+thunk!(t182, 182, "ret 12", "nop");
+thunk!(t183, 183, "ret 12", "nop");
+thunk!(t184, 184, "ret 8", "nop");
+thunk!(t185, 185, "ret 4", "nop");
+thunk!(t186, 186, "ret 4", "nop");
+thunk!(t187, 187, "ret", "nop");
+thunk!(t188, 188, "ret", "nop");
+thunk!(t189, 189, "ret", "nop");
+thunk!(t190, 190, "ret 4", "nop");
+thunk!(t191, 191, "ret", "nop");
+thunk!(t192, 192, "ret", "fld qword ptr [esp]");
+thunk!(t193, 193, "ret 4", "nop");
+thunk!(t194, 194, "ret", "fld qword ptr [esp]");
+thunk!(t195, 195, "ret", "nop");
+thunk!(t196, 196, "ret 12", "nop");
+thunk!(t197, 197, "ret 4", "nop");
+thunk!(t198, 198, "ret 8", "nop");
+thunk!(t199, 199, "ret 8", "nop");
+thunk!(t200, 200, "ret 8", "nop");
+thunk!(t201, 201, "ret 8", "nop");
+thunk!(t202, 202, "ret 8", "nop");
+thunk!(t203, 203, "ret 8", "nop");
+thunk!(t204, 204, "ret", "nop");
+thunk!(t205, 205, "ret", "nop");
+thunk!(t206, 206, "ret 8", "nop");
+thunk!(t207, 207, "ret 4", "nop");
+thunk!(t208, 208, "ret 4", "nop");
+thunk!(t209, 209, "ret 4", "fld qword ptr [esp]");
+thunk!(t210, 210, "ret 16", "fld qword ptr [esp]");
+thunk!(t211, 211, "ret 12", "nop");
+thunk!(t212, 212, "ret 8", "nop");
+thunk!(t213, 213, "ret 4", "nop");
+thunk!(t214, 214, "ret 4", "nop");
+thunk!(t215, 215, "ret", "nop");
+thunk!(t216, 216, "ret", "nop");
+thunk!(t217, 217, "ret", "nop");
+thunk!(t218, 218, "ret", "nop");
+thunk!(t219, 219, "ret 4", "nop");
+thunk!(t220, 220, "ret 4", "nop");
+thunk!(t221, 221, "ret 4", "nop");
+thunk!(t222, 222, "ret 4", "nop");
+thunk!(t223, 223, "ret 4", "nop");
+thunk!(t224, 224, "ret 4", "nop");
+thunk!(t225, 225, "ret 4", "nop");
+thunk!(t226, 226, "ret 4", "nop");
 
 // --- the table ------------------------------------------------------------------------------------
 
-const COUNT: usize = 137;
+const COUNT: usize = 227;
 
 static PORTS: [Port; COUNT] = [
     port("luafn_menu_open_enter_name_result", 0x00753410, &B0, 1, 0, false, 0xffffffff, g_753410 as Run, t0),
@@ -7739,6 +20004,96 @@ static PORTS: [Port; COUNT] = [
     port_c("vint_ease_in_bounce", 0x00b9e4a0, &B134, &C134, 3, 0, true, 0xffffffff, 0, g2_b9e4a0 as Run, t134),
     port_c("vint_ease_out_bounce", 0x00b9e4f0, &B135, &C135, 3, 0, true, 0xffffffff, 0, g2_b9e4f0 as Run, t135),
     port_c("vint_ease_in_out_bounce", 0x00b9e5f0, &B136, &C136, 3, 0, true, 0xffffffff, 0, g2_b9e5f0 as Run, t136),
+    port_x("vec3_ne_exact", 0x0040b6a0, &B137, &C137, 0, 0, false, 0xffffff00, 0, false, &[], g3_40b6a0 as Run, t137),
+    port_x("float_clamp_in_place", 0x00417120, &B138, &C138, 2, 0, false, 0xffffff00, 0, false, &[], g3_417120 as Run, t138),
+    port_x("audio_ramp_toward", 0x0046fe30, &B139, &C139, 1, 0, false, 0xffffff00, 0, false, &[], g3_46fe30 as Run, t139),
+    port_x("audio_foley_max_distance", 0x00479a80, &B140, &C140, 0, 0, true, 0xffffffff, 0, false, &[], g3_479a80 as Run, t140),
+    port_x("audio_distance_profile_set", 0x0047bc90, &B141, &C141, 3, 0, false, 0xffffff00, 0, false, &[], g3_47bc90 as Run, t141),
+    port_x("audio_voice_position_check", 0x0047ffc0, &B142, &C142, 0, 0, false, 0xffffffff, 0, false, &[], g3_47ffc0 as Run, t142),
+    port_x("camera_follow_request_equals_current", 0x00499af0, &B143, &C143, 0, 0, false, 0xffffff00, 0, false, &[], g3_499af0 as Run, t143),
+    port_x("camera_set_fov_limit", 0x0049e210, &B144, &C144, 1, 0, false, 0xffffff00, 0, false, &[], g3_49e210 as Run, t144),
+    port_x("camera_script_is_finished_check", 0x0049fca0, &B145, &C145, 0, 0, false, 0xffffff00, 0, false, &[], g3_49fca0 as Run, t145),
+    port_x("screen_fade_is_clear", 0x004d1900, &B146, &C146, 0, 0, false, 0xffffff00, 0, false, &[], g3_4d1900 as Run, t146),
+    port_x("screen_fade_is_full", 0x004d1920, &B147, &C147, 0, 0, false, 0xffffff00, 0, false, &[], g3_4d1920 as Run, t147),
+    port_x("effect_object_part_pick_cue", 0x00503fe0, &B148, &C148, 2, 0, false, 0xffffff00, 0, false, &[], g3_503fe0 as Run, t148),
+    port_x("curve_eval_scalar", 0x00514f80, &B149, &C149, 2, 0, true, 0xffffff00, 0, false, &[], g3_514f80 as Run, t149),
+    port_x("curve_eval_vec3", 0x005151e0, &B150, &C150, 3, 0, false, 0xffffff00, 0, false, &[], g3_5151e0 as Run, t150),
+    port_x("cmd_waterspray_circles", 0x00569ec0, &B151, &C151, 0, 0, true, 0xffffff00, 0, false, &[], g3_569ec0 as Run, t151),
+    port_x("cutscene_playing_time_check", 0x006c6e00, &B152, &C152, 0, 0, false, 0xffffff00, 0, false, &[], g3_6c6e00 as Run, t152),
+    port_x("cutscene_action_cam_slide_to_update", 0x006cb590, &B153, &C153, 0, 0, false, 0xffffff00, 0, false, &[], g3_6cb590 as Run, t153),
+    port_x("cutscene_action_fade_in_fade_out_update", 0x006cc4c0, &B154, &C154, 0, 0, false, 0xffffff00, 0, false, &[], g3_6cc4c0 as Run, t154),
+    port_x("cutscene_shotfn_shot_cut_out_midway", 0x006d7840, &B155, &C155, 1, 0, false, 0xffffff00, 0, false, &[], g3_6d7840 as Run, t155),
+    port_x("cutscene_shotfn_fog_distance", 0x006d8170, &B156, &C156, 1, 0, false, 0xffffff00, 0, false, &[], g3_6d8170 as Run, t156),
+    port_x("cutscene_shotfn_rain_override", 0x006d8240, &B157, &C157, 1, 0, false, 0xffffff00, 0, false, &[], g3_6d8240 as Run, t157),
+    port_x("misc_packet_sub_21", 0x007277f0, &B158, &C158, 1, 0, false, 0xffffff00, 0, false, &[], g3_7277f0 as Run, t158),
+    port_x("object_debris::get_local_bbox", 0x0092a8e0, &B159, &C159, 2, 8, false, 0xffffffff, 0, false, &[], g3_92a8e0 as Run, t159),
+    port_x("ai_gaze_set_target", 0x009b5c80, &B160, &C160, 2, 0, false, 0xffffffff, 0, false, &[], g3_9b5c80 as Run, t160),
+    port_x("object_mover::get_world_bbox", 0x00a00230, &B161, &C161, 2, 8, false, 0xffffffff, 0, false, &[], g3_a00230 as Run, t161),
+    port_x("object_mover::get_local_bbox", 0x00a002b0, &B162, &C162, 2, 8, false, 0xffffffff, 0, false, &[], g3_a002b0 as Run, t162),
+    port_x("script_trigger::get_local_bbox", 0x00a6be10, &B163, &C163, 2, 8, false, 0xffffffff, 0, false, &[], g3_a6be10 as Run, t163),
+    port_x("cmd_vehicle_ejection_thresholds", 0x00a97a90, &B164, &C164, 0, 0, true, 0xffffffff, 0, false, &[], g3_a97a90 as Run, t164),
+    port_x("vehicle::get_local_bbox", 0x00aa4400, &B165, &C165, 2, 8, false, 0xffffffff, 0, false, &[], g3_aa4400 as Run, t165),
+    port_x("vehicle_part_is_closed", 0x00ac0290, &B166, &C166, 0, 0, false, 0xffffff00, 0, false, &[], g3_ac0290 as Run, t166),
+    port_x("hkSplineParametricCurve::vf7", 0x00af2a00, &B167, &C167, 0, 0, true, 0xffffffff, 0, false, &[], g3_af2a00 as Run, t167),
+    port_x("hk_custom_vehicle_engine::vf4", 0x00af9950, &B168, &C168, 4, 16, true, 0xffffff00, 0, false, &[], g3_af9950 as Run, t168),
+    port_x("vehicle_handling_bonus_speed", 0x00afe2c0, &B169, &C169, 0, 0, true, 0xffffffff, 0, false, &[], g3_afe2c0 as Run, t169),
+    port_x("vint_subscription_value", 0x00b8d150, &B170, &C170, 0, 0, true, 0xffffffff, 0, false, &[], g3_b8d150 as Run, t170),
+    port_x("vint_vec2_equal", 0x00b92cc0, &B171, &C171, 0, 0, false, 0xffffff00, 0, false, &[], g3_b92cc0 as Run, t171),
+    port_x("vint_vec3_equal", 0x00b92cf0, &B172, &C172, 0, 0, false, 0xffffff00, 0, false, &[], g3_b92cf0 as Run, t172),
+    port_x("vint_input_repeat_next", 0x00b99980, &B173, &C173, 1, 4, false, 0xffffff00, 0, false, &[], g3_b99980 as Run, t173),
+    port_x("hkpVehicleDefaultEngine::vf3", 0x00cee7e0, &B174, &C174, 5, 20, false, 0xffffffff, 0, false, &[], g3_cee7e0 as Run, t174),
+    port_x("hkpVehicleDefaultAnalogDriverInput::vf5", 0x00ceeb40, &B175, &C175, 4, 16, true, 0xffffffff, 0, false, &[], g3_ceeb40 as Run, t175),
+    port_x("hkpVehicleDefaultAnalogDriverInput::vf4", 0x00ceeb90, &B176, &C176, 4, 16, true, 0xffffffff, 0, false, &[], g3_ceeb90 as Run, t176),
+    port_x("hkpVehicleDefaultTransmission::vf8", 0x00cf20a0, &B177, &C177, 2, 8, true, 0xffffffff, 0, false, &[], g3_cf20a0 as Run, t177),
+    port_x("render_light_add_spot", 0x00cfdd80, &B178, &C178, 8, 0, false, 0xffffffff, 0, false, &[], g3_cfdd80 as Run, t178),
+    port_x("render_light_add_point", 0x00cfde50, &B179, &C179, 5, 0, false, 0xffffffff, 0, false, &[], g3_cfde50 as Run, t179),
+    port_x("rl_lod_mesh_inst::select_lod", 0x00d09830, &B180, &C180, 0, 0, false, 0xffffff00, 0, false, &[], g3_d09830 as Run, t180),
+    port_x("hkpGskBaseAgent::vf10", 0x00d2bad0, &B181, &C181, 3, 12, false, 0xffffffff, 0, false, &[], g3_d2bad0 as Run, t181),
+    port_x("hkpPlaneShape::vf8", 0x00d38770, &B182, &C182, 3, 12, false, 0xffffffff, 0, false, &[], g3_d38770 as Run, t182),
+    port_x("hkpConvexVerticesShape::vf8", 0x00d3e470, &B183, &C183, 3, 12, false, 0xffffffff, 0, false, &[], g3_d3e470 as Run, t183),
+    port_x("hkpCapsuleShape::vf12", 0x00d3f650, &B184, &C184, 2, 8, false, 0xffffffff, 0, false, &[], g3_d3f650 as Run, t184),
+    port_x("hkpPulleyConstraintData::vf3", 0x00d47dc0, &B185, &C185, 1, 4, false, 0xffffffff, 0, false, &[], g3_d47dc0 as Run, t185),
+    port_x("hkpStiffSpringConstraintData::vf3", 0x00d489c0, &B186, &C186, 1, 4, false, 0xffffffff, 0, false, &[], g3_d489c0 as Run, t186),
+    port_x("camera_set_position_track_move", 0x00493b80, &B187, &C187, 0, 0, false, 0xffffff00, 0, false, &[], g3_493b80 as Run, t187),
+    port_x("camera_mode7_enter", 0x00495590, &B188, &C188, 0, 0, false, 0xffffffff, 0, true, &H188, g3_495590 as Run, t188),
+    port_x("camera_effect_sway_start", 0x004a0ca0, &B189, &C189, 1, 0, false, 0xffffff00, 0, true, &H189, g3_4a0ca0 as Run, t189),
+    port_x("cash_from_dollars", 0x004b2680, &B190, &C190, 1, 4, false, 0xffffff00, 0, false, &[], g3_4b2680 as Run, t190),
+    port_x("occluder_cmp_nearest", 0x00523b10, &B191, &C191, 2, 0, false, 0xffffff00, 0, false, &[], g3_523b10 as Run, t191),
+    port_x("render_shader_time_seconds", 0x00523fa0, &B192, &C192, 0, 0, true, 0xffffffff, 0, true, &H192, g3_523fa0 as Run, t192),
+    port_x("fuzz_crime_riot::any_participant_near_player", 0x005ce2b0, &B193, &C193, 1, 4, false, 0xffffff00, 0, true, &H193, g3_5ce2b0 as Run, t193),
+    port_x("fuzz_crime_car_bomb::get_bar_progress", 0x005d03d0, &B194, &C194, 0, 0, true, 0xffffff00, 0, true, &H194, g3_5d03d0 as Run, t194),
+    port_x("confessionals_get_nearest_trigger_impl", 0x007a9730, &B195, &C195, 1, 0, false, 0xffffff00, 0, false, &[], g3_7a9730 as Run, t195),
+    port_x("hk_custom_vehicle_transmission::vf7", 0x00b00ce0, &B196, &C196, 3, 12, false, 0xffffff00, 0, true, &H196, g3_b00ce0 as Run, t196),
+    port_x("vint_state_combine", 0x00b957b0, &B197, &C197, 1, 4, false, 0xffffffff, 0, false, &[], g3_b957b0 as Run, t197),
+    port_x("vint_object_tween::set_duration", 0x00b9f6d0, &B198, &C198, 2, 8, false, 0xffffff00, 0, false, &[], g3_b9f6d0 as Run, t198),
+    port_x("vint_object_tween::set_start_time", 0x00b9f7c0, &B199, &C199, 2, 8, false, 0xffffffff, 0, false, &[], g3_b9f7c0 as Run, t199),
+    port_x("vint_element_bitmap::set_source_nw", 0x00ba1160, &B200, &C200, 2, 8, false, 0xffffff00, 0, false, &[], g3_ba1160 as Run, t200),
+    port_x("vint_element_bitmap::set_source_se", 0x00ba12c0, &B201, &C201, 2, 8, false, 0xffffff00, 0, false, &[], g3_ba12c0 as Run, t201),
+    port_x("vint_element_bitmap_circle::set_source_nw", 0x00ba58f0, &B202, &C202, 2, 8, false, 0xffffff00, 0, false, &[], g3_ba58f0 as Run, t202),
+    port_x("vint_element_bitmap_circle::set_source_se", 0x00ba5a50, &B203, &C203, 2, 8, false, 0xffffff00, 0, false, &[], g3_ba5a50 as Run, t203),
+    port_x("vec3_normalize_safe_len", 0x00bde340, &B204, &C204, 0, 0, false, 0xffffffff, 0, false, &[], g3_bde340 as Run, t204),
+    port_x("vec3_random_unit", 0x00bde750, &B205, &C205, 0, 0, false, 0xffffffff, 0, true, &H205, g3_bde750 as Run, t205),
+    port_x("vec3_random_cone", 0x00bde7c0, &B206, &C206, 2, 8, false, 0xffffffff, 0, true, &H206, g3_bde7c0 as Run, t206),
+    port_x("mat33_from_axis_angle", 0x00be2e10, &B207, &C207, 1, 4, false, 0xffffffff, 0, false, &[], g3_be2e10 as Run, t207),
+    port_x("matrix_orthonormalize", 0x00be4170, &B208, &C208, 1, 4, false, 0xffffffff, 0, true, &H208, g3_be4170 as Run, t208),
+    port_x("hkpVehicleDefaultAerodynamics::vf4", 0x00cee660, &B209, &C209, 1, 4, true, 0xffffffff, 0, false, &[], g3_cee660 as Run, t209),
+    port_x("hkpVehicleDefaultAnalogDriverInput::vf7", 0x00ceec00, &B210, &C210, 4, 16, true, 0xffffffff, 0, false, &[], g3_ceec00 as Run, t210),
+    port_x("hkpCylinderShape::vf13", 0x00d3c880, &B211, &C211, 3, 12, false, 0xffffffff, 0, false, &[], g3_d3c880 as Run, t211),
+    port_x("hkpCylinderShape::vf12", 0x00d3c9e0, &B212, &C212, 2, 8, false, 0xffffffff, 0, false, &[], g3_d3c9e0 as Run, t212),
+    port_x("hkpBoxMotion::vf9", 0x00d4c420, &B213, &C213, 1, 4, false, 0xffffffff, 0, false, &[], g3_d4c420 as Run, t213),
+    port_x("hkpBoxMotion::vf5", 0x00d4c480, &B214, &C214, 1, 4, false, 0xffffffff, 0, false, &[], g3_d4c480 as Run, t214),
+    port_x("hkpRagdollLimitsData::ctor", 0x00d4e570, &B215, &C215, 0, 0, false, 0xffffffff, 0, false, &[], g3_d4e570 as Run, t215),
+    port_x("hkpHingeLimitsData::ctor", 0x00d4eb00, &B216, &C216, 0, 0, false, 0xffffffff, 0, false, &[], g3_d4eb00 as Run, t216),
+    port_x("hkpPointToPathConstraintData::ctor", 0x00d51f60, &B217, &C217, 0, 0, false, 0xffffffff, 0, false, &[], g3_d51f60 as Run, t217),
+    port_x("hkpHingeConstraintData::ctor", 0x00d550e0, &B218, &C218, 0, 0, false, 0xffffffff, 0, false, &[], g3_d550e0 as Run, t218),
+    port_x("hkpSphereMotion::vf10", 0x00d835a0, &B219, &C219, 1, 4, false, 0xffffffff, 0, false, &[], g3_d835a0 as Run, t219),
+    port_x("hkpSphereMotion::vf9", 0x00d835e0, &B220, &C220, 1, 4, false, 0xffffffff, 0, false, &[], g3_d835e0 as Run, t220),
+    port_x("hkpSphereMotion::vf6", 0x00d83620, &B221, &C221, 1, 4, false, 0xffffffff, 0, false, &[], g3_d83620 as Run, t221),
+    port_x("hkpSphereMotion::vf5", 0x00d83650, &B222, &C222, 1, 4, false, 0xffffffff, 0, false, &[], g3_d83650 as Run, t222),
+    port_x("hkpCharacterMotion::vf10", 0x00d83920, &B223, &C223, 1, 4, false, 0xffffffff, 0, false, &[], g3_d83920 as Run, t223),
+    port_x("hkpCharacterMotion::vf9", 0x00d83960, &B224, &C224, 1, 4, false, 0xffffffff, 0, false, &[], g3_d83960 as Run, t224),
+    port_x("hkpCharacterMotion::vf6", 0x00d839a0, &B225, &C225, 1, 4, false, 0xffffffff, 0, false, &[], g3_d839a0 as Run, t225),
+    port_x("hkpCharacterMotion::vf5", 0x00d839d0, &B226, &C226, 1, 4, false, 0xffffffff, 0, false, &[], g3_d839d0 as Run, t226),
 ];
 
 // --- install ------------------------------------------------------------------------------------
@@ -7748,9 +20103,13 @@ pub fn install() {
     let mut ok = 0;
     for port in PORTS.iter() {
         // The shadow copy first: replacing patches the entry.
-        match unsafe { detour::relocate(port.addr, port.body, port.call_offsets) } {
-            Ok(copy) => port.original.store(copy, Ordering::Relaxed),
-            Err(e) => log(&format!("port_leaves_fp: {}: no shadow copy: {e:?}", port.name)),
+        if port.no_shadow {
+            // no shadow copy
+        } else {
+            match unsafe { detour::relocate(port.addr, port.body, port.call_offsets) } {
+                Ok(copy) => port.original.store(copy, Ordering::Relaxed),
+                Err(e) => log(&format!("port_leaves_fp: {}: no shadow copy: {e:?}", port.name)),
+            }
         }
         if replace_pinned(port.name, port.addr, port.body, port.thunk as usize) {
             ok += 1;
@@ -7765,7 +20124,14 @@ pub fn summary() -> String {
         .iter()
         .filter_map(|p| {
             let c = p.calls.load(Ordering::Relaxed);
-            (c > 0).then(|| format!("{} {c} ({})", p.name, p.mismatches.load(Ordering::Relaxed)))
+            (c > 0).then(|| {
+                if p.hits.is_empty() {
+                    format!("{} {c} ({})", p.name, p.mismatches.load(Ordering::Relaxed))
+                } else {
+                    let h: Vec<String> = p.hits.iter().map(|h| h.load(Ordering::Relaxed).to_string()).collect();
+                    format!("{} {c} (no shadow; blocks {})", p.name, h.join("/"))
+                }
+            })
         })
         .collect();
     if parts.is_empty() { String::new() } else { format!("port_leaves_fp: {}", parts.join(", ")) }
@@ -8909,3 +21275,1442 @@ const B136: [u8; 191] = [
     0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C, 0x83, 0xC4, 0x08, 0xC3,
 ];
 const C136: [usize; 2] = [0x4c, 0x99];
+const B137: [u8; 49] = [
+    0xD9, 0x02, 0xD9, 0x01, 0xDA, 0xE9, 0xDF, 0xE0, 0xF6, 0xC4, 0x44, 0x7A,
+    0x21, 0xD9, 0x42, 0x04, 0xD9, 0x41, 0x04, 0xDA, 0xE9, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x44, 0x7A, 0x12, 0xD9, 0x42, 0x08, 0xD9, 0x41, 0x08, 0xDA, 0xE9,
+    0xDF, 0xE0, 0xF6, 0xC4, 0x44, 0x7A, 0x03, 0x32, 0xC0, 0xC3, 0xB0, 0x01,
+    0xC3,
+];
+const C137: [usize; 0] = [];
+const B138: [u8; 89] = [
+    0xD9, 0x01, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9,
+    0xF6, 0xC4, 0x05, 0x7A, 0x08, 0xD9, 0x01, 0xD9, 0x5C, 0x24, 0x04, 0xEB,
+    0x04, 0xD9, 0x54, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x44, 0x24,
+    0x08, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0x75, 0x1C,
+    0xDD, 0xD8, 0xD9, 0x01, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75,
+    0x11, 0xDD, 0xD8, 0xD9, 0x01, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24,
+    0x04, 0xD9, 0x19, 0xC3, 0xDD, 0xD9, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44,
+    0x24, 0x04, 0xD9, 0x19, 0xC3,
+];
+const C138: [usize; 0] = [];
+const B139: [u8; 106] = [
+    0x51, 0xD9, 0x01, 0xD9, 0x02, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41,
+    0x75, 0x2F, 0xD9, 0x02, 0xD9, 0x05, 0x44, 0x9C, 0xE9, 0x00, 0xD8, 0x4C,
+    0x24, 0x08, 0xDE, 0xE9, 0xD9, 0x1C, 0x24, 0xD9, 0x01, 0xD9, 0x04, 0x24,
+    0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x05, 0x7A, 0x04, 0xDD,
+    0xD8, 0xD9, 0x01, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0xD9, 0x1A, 0x59,
+    0xC3, 0xD9, 0x05, 0x44, 0x9C, 0xE9, 0x00, 0xD8, 0x4C, 0x24, 0x08, 0xD8,
+    0x02, 0xD9, 0x1C, 0x24, 0xD9, 0x01, 0xD9, 0x04, 0x24, 0xD8, 0xD1, 0xDF,
+    0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0x75, 0x04, 0xDD, 0xD8, 0xD9, 0x01,
+    0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0xD9, 0x1A, 0x59, 0xC3,
+];
+const C139: [usize; 0] = [];
+const B140: [u8; 54] = [
+    0x51, 0x66, 0x3D, 0xFF, 0xFF, 0x75, 0x04, 0xD9, 0xEE, 0x59, 0xC3, 0x0F,
+    0xB7, 0xC0, 0x8B, 0x0C, 0x85, 0x58, 0x55, 0xEE, 0x00, 0x8B, 0x51, 0x10,
+    0x81, 0xE2, 0xFF, 0x0F, 0x00, 0x00, 0x8B, 0x04, 0x95, 0x78, 0x91, 0xEE,
+    0x00, 0xD9, 0x40, 0x28, 0xDC, 0x0D, 0x00, 0xC4, 0xE5, 0x00, 0xD9, 0x1C,
+    0x24, 0xD9, 0x04, 0x24, 0x59, 0xC3,
+];
+const C140: [usize; 0] = [];
+const B141: [u8; 139] = [
+    0xD9, 0x44, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xD1, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x41, 0x7B, 0x73, 0x8B, 0x44, 0x24, 0x04, 0x8B, 0x0C, 0x85,
+    0x78, 0x91, 0xEE, 0x00, 0xF6, 0x41, 0x2C, 0x02, 0x74, 0x62, 0xD9, 0xC9,
+    0xD9, 0x11, 0xD9, 0xC9, 0xD9, 0x51, 0x04, 0xD9, 0x51, 0x28, 0xD9, 0xEE,
+    0xD9, 0x51, 0x10, 0xD9, 0xE8, 0xD9, 0x51, 0x14, 0xD9, 0xCB, 0xDE, 0xF2,
+    0xDD, 0x05, 0xE0, 0xBF, 0xE5, 0x00, 0xD8, 0xD2, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x05, 0x7A, 0x15, 0xD9, 0xC2, 0xDD, 0x05, 0xF8, 0xC3, 0xE5, 0x00, 0xD8,
+    0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0x75, 0x0F, 0xDD, 0xD8,
+    0xD8, 0xD2, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7B, 0x06, 0xDD, 0xDA, 0xEB,
+    0x04, 0xDD, 0xDB, 0xDD, 0xD8, 0xD9, 0xC9, 0xB0, 0x01, 0xD9, 0x59, 0x18,
+    0xD9, 0xC9, 0xD9, 0x51, 0x1C, 0xD9, 0x59, 0x20, 0xD9, 0x59, 0x24, 0xC3,
+    0xDD, 0xD8, 0x32, 0xC0, 0xDD, 0xD8, 0xC3,
+];
+const C141: [usize; 0] = [];
+const B142: [u8; 170] = [
+    0x8A, 0x02, 0x83, 0xEC, 0x18, 0x3C, 0xFF, 0x74, 0x21, 0x8B, 0x12, 0xC1,
+    0xEA, 0x08, 0x74, 0x1A, 0x0F, 0xB6, 0xC0, 0x69, 0xC0, 0x9C, 0x01, 0x00,
+    0x00, 0x3B, 0x90, 0xAC, 0xB9, 0xEE, 0x00, 0x75, 0x09, 0x83, 0xB8, 0xF8,
+    0xB8, 0xEE, 0x00, 0xFF, 0x75, 0x06, 0x32, 0xC0, 0x83, 0xC4, 0x18, 0xC3,
+    0x8B, 0x90, 0x54, 0xB9, 0xEE, 0x00, 0xD9, 0x01, 0x89, 0x14, 0x24, 0xD8,
+    0x24, 0x24, 0x8B, 0x90, 0x58, 0xB9, 0xEE, 0x00, 0x89, 0x54, 0x24, 0x04,
+    0x8B, 0x90, 0x5C, 0xB9, 0xEE, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x41,
+    0x04, 0x89, 0x54, 0x24, 0x08, 0xD8, 0x64, 0x24, 0x04, 0xD9, 0x5C, 0x24,
+    0x10, 0xD9, 0x41, 0x08, 0xD8, 0x64, 0x24, 0x08, 0xD9, 0x5C, 0x24, 0x14,
+    0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x98, 0x60, 0xB9, 0xEE, 0x00, 0xD9, 0x44,
+    0x24, 0x10, 0xD9, 0x98, 0x64, 0xB9, 0xEE, 0x00, 0xD9, 0x44, 0x24, 0x14,
+    0xD9, 0x98, 0x68, 0xB9, 0xEE, 0x00, 0xD9, 0x01, 0xD9, 0x98, 0x54, 0xB9,
+    0xEE, 0x00, 0xD9, 0x41, 0x04, 0xD9, 0x98, 0x58, 0xB9, 0xEE, 0x00, 0xD9,
+    0x41, 0x08, 0xD9, 0x98, 0x5C, 0xB9, 0xEE, 0x00, 0xB0, 0x01, 0x83, 0xC4,
+    0x18, 0xC3,
+];
+const C142: [usize; 0] = [];
+const B143: [u8; 72] = [
+    0xA1, 0xB8, 0xA5, 0xE9, 0x00, 0x3B, 0x01, 0x74, 0x03, 0x32, 0xC0, 0xC3,
+    0x8B, 0x15, 0xBC, 0xA5, 0xE9, 0x00, 0x3B, 0x51, 0x04, 0x75, 0xF2, 0xA1,
+    0xC0, 0xA5, 0xE9, 0x00, 0x3B, 0x41, 0x08, 0x75, 0xE8, 0xD9, 0x05, 0xC4,
+    0xA5, 0xE9, 0x00, 0xD9, 0x41, 0x0C, 0xDA, 0xE9, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x44, 0x7A, 0xD6, 0xD9, 0x05, 0xC8, 0xA5, 0xE9, 0x00, 0xD9, 0x41, 0x10,
+    0xDA, 0xE9, 0xDF, 0xE0, 0xF6, 0xC4, 0x44, 0x7A, 0xC4, 0xB0, 0x01, 0xC3,
+];
+const C143: [usize; 0] = [];
+const B144: [u8; 96] = [
+    0x80, 0x3D, 0xA3, 0x6B, 0x52, 0x02, 0x00, 0x74, 0x04, 0x84, 0xC9, 0x74,
+    0x52, 0xD9, 0x44, 0x24, 0x04, 0xDD, 0x05, 0xE8, 0x50, 0xDD, 0x00, 0xD8,
+    0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x11, 0xD9, 0x05, 0xD4, 0xC3,
+    0xE5, 0x00, 0xD8, 0xD2, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x20, 0xDD,
+    0xD8, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7B, 0x19, 0xDD, 0xD8,
+    0x88, 0x0D, 0xA3, 0x6B, 0x52, 0x02, 0xD9, 0x05, 0x88, 0x1C, 0xDD, 0x00,
+    0xD9, 0x1D, 0x38, 0x5D, 0x5F, 0x02, 0xC3, 0xDD, 0xDA, 0xDD, 0xD8, 0xD9,
+    0x1D, 0x38, 0x5D, 0x5F, 0x02, 0x88, 0x0D, 0xA3, 0x6B, 0x52, 0x02, 0xC3,
+];
+const C144: [usize; 0] = [];
+const B145: [u8; 66] = [
+    0x51, 0x83, 0x3D, 0xE8, 0x5A, 0x5F, 0x02, 0x04, 0x74, 0x04, 0xB0, 0x01,
+    0x59, 0xC3, 0xD9, 0x05, 0x44, 0x62, 0x5F, 0x02, 0xA1, 0x98, 0x5D, 0x5F,
+    0x02, 0xD8, 0x35, 0x9C, 0x5D, 0x5F, 0x02, 0x83, 0xC0, 0xFF, 0xD9, 0x1C,
+    0x24, 0xD9, 0x04, 0x24, 0x89, 0x04, 0x24, 0xDB, 0x04, 0x24, 0xDE, 0xD9,
+    0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x7A, 0x07, 0xB8, 0x01, 0x00, 0x00, 0x00,
+    0x59, 0xC3, 0x33, 0xC0, 0x59, 0xC3,
+];
+const C145: [usize; 0] = [];
+const B146: [u8; 24] = [
+    0xD9, 0xEE, 0xD8, 0x1D, 0xA0, 0x6D, 0x52, 0x02, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x44, 0x7A, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x33, 0xC0, 0xC3,
+];
+const C146: [usize; 0] = [];
+const B147: [u8; 24] = [
+    0xD9, 0xE8, 0xD8, 0x1D, 0xA0, 0x6D, 0x52, 0x02, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x44, 0x7A, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x33, 0xC0, 0xC3,
+];
+const C147: [usize; 0] = [];
+const B148: [u8; 177] = [
+    0x80, 0x7C, 0x24, 0x08, 0x00, 0x53, 0x8B, 0x5C, 0x24, 0x08, 0xD9, 0x43,
+    0x1C, 0x56, 0xD9, 0x5C, 0x24, 0x0C, 0x57, 0x74, 0x0C, 0xD9, 0x05, 0x98,
+    0x79, 0xE8, 0x00, 0xD9, 0x9B, 0x00, 0x02, 0x00, 0x00, 0x0F, 0xB7, 0x50,
+    0x24, 0x8B, 0x35, 0x9C, 0x38, 0xF5, 0x00, 0x0F, 0xB7, 0xC2, 0x66, 0x3B,
+    0x05, 0xD0, 0x6B, 0x52, 0x02, 0x72, 0x04, 0x33, 0xFF, 0xEB, 0x0B, 0x0F,
+    0xB7, 0xC0, 0x8D, 0x0C, 0x40, 0x0F, 0xB7, 0x7C, 0x8E, 0x08, 0x8D, 0x47,
+    0xFF, 0x0F, 0xB7, 0xC8, 0x66, 0x3B, 0xCF, 0x73, 0x58, 0xD9, 0x44, 0x24,
+    0x10, 0x0F, 0xB7, 0xC2, 0x8D, 0x14, 0x40, 0x8B, 0x74, 0x96, 0x04, 0x0F,
+    0xB7, 0xC1, 0xD9, 0x04, 0xC6, 0x0F, 0xB7, 0x54, 0xC6, 0x04, 0xD9, 0x5C,
+    0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0x83, 0x00, 0x02, 0x00, 0x00,
+    0x8D, 0x04, 0xC6, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x16,
+    0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x7A, 0x0F, 0x5F, 0xD9, 0x9B,
+    0x00, 0x02, 0x00, 0x00, 0x5E, 0x66, 0x8B, 0xC2, 0x5B, 0xC3, 0xDD, 0xD8,
+    0x81, 0xC1, 0xFF, 0xFF, 0x00, 0x00, 0x66, 0x3B, 0xCF, 0x72, 0xB8, 0xDD,
+    0xD8, 0x5F, 0x5E, 0x66, 0x0D, 0xFF, 0xFF, 0x5B, 0xC3,
+];
+const C148: [usize; 0] = [];
+const B149: [u8; 147] = [
+    0x51, 0x83, 0xFE, 0x01, 0x53, 0x8B, 0x5C, 0x24, 0x10, 0x75, 0x06, 0xD9,
+    0x43, 0x04, 0x5B, 0x59, 0xC3, 0x57, 0x33, 0xFF, 0x33, 0xC9, 0x85, 0xF6,
+    0x7E, 0x48, 0xD9, 0x44, 0x24, 0x10, 0x8B, 0xD3, 0xD9, 0x02, 0xD9, 0xC1,
+    0xDA, 0xE9, 0xDF, 0xE0, 0xF6, 0xC4, 0x44, 0x7B, 0x14, 0xD9, 0x02, 0xD8,
+    0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x13, 0x8D, 0x46, 0xFF, 0x3B,
+    0xC8, 0x8B, 0xFA, 0x7C, 0x15, 0xDD, 0xD8, 0x5F, 0xD9, 0x44, 0xCB, 0x04,
+    0x5B, 0x59, 0xC3, 0xD9, 0x02, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41,
+    0x74, 0x12, 0x83, 0xC1, 0x01, 0x83, 0xC2, 0x08, 0x3B, 0xCE, 0x7C, 0xC0,
+    0xDD, 0xD8, 0xD9, 0xEE, 0x5F, 0x5B, 0x59, 0xC3, 0x85, 0xFF, 0x74, 0xD5,
+    0xD8, 0x27, 0xD9, 0x04, 0xCB, 0xD8, 0x27, 0xDE, 0xF9, 0xD9, 0x5C, 0x24,
+    0x08, 0xD9, 0x44, 0x24, 0x08, 0xD9, 0x44, 0xCB, 0x04, 0xD8, 0x67, 0x04,
+    0xDE, 0xC9, 0xD8, 0x47, 0x04, 0x5F, 0x5B, 0xD9, 0x1C, 0x24, 0xD9, 0x04,
+    0x24, 0x59, 0xC3,
+];
+const C149: [usize; 0] = [];
+const B150: [u8; 344] = [
+    0x83, 0xEC, 0x18, 0x53, 0x8B, 0x5C, 0x24, 0x24, 0x83, 0xFB, 0x01, 0x55,
+    0x8B, 0x6C, 0x24, 0x2C, 0x75, 0x19, 0xD9, 0x45, 0x04, 0x8B, 0xC2, 0xD9,
+    0x1A, 0xD9, 0x45, 0x08, 0xD9, 0x5A, 0x04, 0xD9, 0x45, 0x0C, 0x5D, 0xD9,
+    0x5A, 0x08, 0x5B, 0x83, 0xC4, 0x18, 0xC3, 0x56, 0x33, 0xF6, 0x33, 0xC9,
+    0x85, 0xDB, 0x57, 0x7E, 0x63, 0xD9, 0x44, 0x24, 0x2C, 0x8B, 0xFD, 0xD9,
+    0x07, 0xD9, 0xC1, 0xDA, 0xE9, 0xDF, 0xE0, 0xF6, 0xC4, 0x44, 0x7B, 0x14,
+    0xD9, 0x07, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x2E, 0x8D,
+    0x43, 0xFF, 0x3B, 0xC8, 0x8B, 0xF7, 0x7C, 0x30, 0xDD, 0xD8, 0xC1, 0xE1,
+    0x04, 0xD9, 0x44, 0x29, 0x04, 0x8D, 0x44, 0x29, 0x04, 0xD9, 0x1A, 0x5F,
+    0xD9, 0x40, 0x04, 0x5E, 0xD9, 0x5A, 0x04, 0x5D, 0xD9, 0x40, 0x08, 0x8B,
+    0xC2, 0xD9, 0x5A, 0x08, 0x5B, 0x83, 0xC4, 0x18, 0xC3, 0xD9, 0x07, 0xD8,
+    0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x74, 0x30, 0x83, 0xC1, 0x01, 0x83,
+    0xC7, 0x10, 0x3B, 0xCB, 0x7C, 0xA5, 0xDD, 0xD8, 0xD9, 0x05, 0xD0, 0xA6,
+    0x52, 0x02, 0x5F, 0xD9, 0x1A, 0x5E, 0xD9, 0x05, 0xD4, 0xA6, 0x52, 0x02,
+    0x5D, 0xD9, 0x5A, 0x04, 0x8B, 0xC2, 0xD9, 0x05, 0xD8, 0xA6, 0x52, 0x02,
+    0x5B, 0xD9, 0x5A, 0x08, 0x83, 0xC4, 0x18, 0xC3, 0xC1, 0xE1, 0x04, 0x85,
+    0xF6, 0x8D, 0x04, 0x29, 0x74, 0x75, 0xD8, 0x26, 0x5F, 0xD9, 0x00, 0xD8,
+    0x26, 0xDE, 0xF9, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x40, 0x04, 0xD8, 0x66,
+    0x04, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x40, 0x08, 0xD8, 0x66, 0x08, 0xD9,
+    0x5C, 0x24, 0x10, 0xD9, 0x40, 0x0C, 0x8B, 0xC2, 0xD8, 0x66, 0x0C, 0xD9,
+    0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x2C, 0xD9,
+    0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24,
+    0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD8, 0x4C, 0x24, 0x14, 0xD9,
+    0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0x46, 0x04, 0xD9, 0x1A,
+    0xD9, 0x46, 0x08, 0xD8, 0x44, 0x24, 0x1C, 0xD9, 0x5A, 0x04, 0xD9, 0x46,
+    0x0C, 0x5E, 0xD8, 0x44, 0x24, 0x1C, 0x5D, 0x5B, 0xD9, 0x5A, 0x08, 0x83,
+    0xC4, 0x18, 0xC3, 0xDD, 0xD8, 0x5F, 0xD9, 0x40, 0x04, 0x5E, 0xD9, 0x1A,
+    0x5D, 0xD9, 0x40, 0x08, 0x5B, 0xD9, 0x5A, 0x04, 0xD9, 0x40, 0x0C, 0x8B,
+    0xC2, 0xD9, 0x5A, 0x08, 0x83, 0xC4, 0x18, 0xC3,
+];
+const C150: [usize; 0] = [];
+const B151: [u8; 85] = [
+    0x51, 0x83, 0x3D, 0xCC, 0xE6, 0xE9, 0x00, 0x02, 0x75, 0x47, 0xDB, 0x05,
+    0xF0, 0xE6, 0xE9, 0x00, 0xDA, 0x35, 0xF4, 0xE6, 0xE9, 0x00, 0xD9, 0xEE,
+    0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x11, 0xD9, 0xC1, 0xD9,
+    0xE8, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0x75, 0x15,
+    0xDD, 0xD8, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7B, 0x0C, 0xDD,
+    0xD9, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC3, 0xDD, 0xDA, 0xDD,
+    0xD8, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC3, 0xD9, 0xE8, 0x59,
+    0xC3,
+];
+const C151: [usize; 0] = [];
+const B152: [u8; 36] = [
+    0x80, 0x3D, 0x14, 0x7D, 0x52, 0x02, 0x00, 0x74, 0x18, 0xD9, 0x05, 0xFC,
+    0x66, 0x7E, 0x02, 0xD9, 0x05, 0x00, 0x67, 0x7E, 0x02, 0xDE, 0xD9, 0xDF,
+    0xE0, 0xF6, 0xC4, 0x41, 0x7A, 0x03, 0xB0, 0x01, 0xC3, 0x32, 0xC0, 0xC3,
+];
+const C152: [usize; 0] = [];
+const B153: [u8; 71] = [
+    0xA1, 0x10, 0x7D, 0x52, 0x02, 0x85, 0xC0, 0x75, 0x03, 0xB0, 0x01, 0xC3,
+    0x8B, 0x80, 0x40, 0x15, 0x00, 0x00, 0x83, 0xC0, 0x1C, 0x80, 0x38, 0x00,
+    0x74, 0x1E, 0xD9, 0x05, 0x10, 0x67, 0x7E, 0x02, 0xD9, 0x40, 0x18, 0xDE,
+    0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x7B, 0x0C, 0x33, 0xC0, 0x33, 0xC9,
+    0x3C, 0x01, 0x0F, 0x94, 0xC1, 0x8A, 0xC1, 0xC3, 0xB8, 0x01, 0x00, 0x00,
+    0x00, 0x33, 0xC9, 0x3A, 0xC0, 0x0F, 0x94, 0xC1, 0x8A, 0xC1, 0xC3,
+];
+const C153: [usize; 0] = [];
+const B154: [u8; 47] = [
+    0xA1, 0x9C, 0x6D, 0x52, 0x02, 0x85, 0xC0, 0x74, 0x20, 0x83, 0xF8, 0x02,
+    0x75, 0x04, 0xD9, 0xEE, 0xEB, 0x07, 0x83, 0xF8, 0x01, 0x75, 0x0F, 0xD9,
+    0xE8, 0xD8, 0x1D, 0xA0, 0x6D, 0x52, 0x02, 0xDF, 0xE0, 0xF6, 0xC4, 0x44,
+    0x7B, 0x03, 0x33, 0xC0, 0xC3, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3,
+];
+const C154: [usize; 0] = [];
+const B155: [u8; 80] = [
+    0xD9, 0xEE, 0x8B, 0x4C, 0x24, 0x04, 0xD8, 0x51, 0x08, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x05, 0x7A, 0x3D, 0xD9, 0x05, 0x14, 0x67, 0x7E, 0x02, 0xA1, 0x10,
+    0x7D, 0x52, 0x02, 0xD8, 0x25, 0x10, 0x67, 0x7E, 0x02, 0xD9, 0x5C, 0x24,
+    0x04, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0x61, 0x08, 0x8B, 0x88, 0x40, 0x15,
+    0x00, 0x00, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x99,
+    0x64, 0x01, 0x00, 0x00, 0x8B, 0x90, 0x40, 0x15, 0x00, 0x00, 0xD9, 0x9A,
+    0x68, 0x01, 0x00, 0x00, 0xC3, 0xDD, 0xD8, 0xC3,
+];
+const C155: [usize; 0] = [];
+const B156: [u8; 112] = [
+    0x8B, 0x44, 0x24, 0x04, 0xD9, 0xEE, 0x8B, 0x48, 0x08, 0xD8, 0x11, 0x83,
+    0xEC, 0x0C, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x7A, 0x4E, 0xD8, 0x51, 0x04,
+    0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x7A, 0x44, 0xD8, 0x59, 0x08, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x41, 0x7A, 0x3C, 0xD9, 0x01, 0xD9, 0x1C, 0x24, 0xD9, 0x41,
+    0x04, 0xD9, 0x5C, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x04, 0xD9, 0x41, 0x08,
+    0x8B, 0x0C, 0x24, 0xD9, 0x5C, 0x24, 0x08, 0x8B, 0x44, 0x24, 0x08, 0xC6,
+    0x05, 0xA4, 0x8C, 0x65, 0x02, 0x01, 0x89, 0x0D, 0xA8, 0x8C, 0x65, 0x02,
+    0x89, 0x15, 0xAC, 0x8C, 0x65, 0x02, 0xA3, 0xB0, 0x8C, 0x65, 0x02, 0x83,
+    0xC4, 0x0C, 0xC3, 0xDD, 0xD8, 0xC6, 0x05, 0xA4, 0x8C, 0x65, 0x02, 0x00,
+    0x83, 0xC4, 0x0C, 0xC3,
+];
+const C156: [usize; 0] = [];
+const B157: [u8; 58] = [
+    0x8B, 0x44, 0x24, 0x04, 0xD9, 0x40, 0x08, 0xD9, 0x5C, 0x24, 0x04, 0xD9,
+    0xEE, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x01,
+    0x75, 0x10, 0xDD, 0xD9, 0xC6, 0x05, 0x78, 0x6D, 0x52, 0x02, 0x01, 0xD9,
+    0x1D, 0x7C, 0x6D, 0x52, 0x02, 0xC3, 0xDD, 0xD8, 0xC6, 0x05, 0x78, 0x6D,
+    0x52, 0x02, 0x00, 0xD9, 0x1D, 0x7C, 0x6D, 0x52, 0x02, 0xC3,
+];
+const C157: [usize; 0] = [];
+const B158: [u8; 159] = [
+    0x8B, 0x44, 0x24, 0x04, 0x0F, 0xB7, 0x00, 0x0F, 0xB7, 0xC0, 0x8B, 0xC8,
+    0x8B, 0xD0, 0x81, 0xE1, 0x00, 0x80, 0xFF, 0xFF, 0xC1, 0xE8, 0x0B, 0xC1,
+    0xE1, 0x04, 0x83, 0xE0, 0x0F, 0x81, 0xE2, 0xFF, 0x07, 0x00, 0x00, 0x0B,
+    0xCA, 0x83, 0xC0, 0x78, 0xC1, 0xE0, 0x17, 0xC1, 0xE1, 0x0C, 0x0B, 0xC8,
+    0x89, 0x4C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x05, 0x14, 0xBE,
+    0x76, 0x01, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x2D, 0xD9,
+    0xC1, 0xDC, 0x05, 0x00, 0xC7, 0xE5, 0x00, 0xD8, 0xE1, 0xD9, 0xC1, 0xD8,
+    0xE3, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x0B, 0xDD, 0xDA,
+    0xDD, 0xD8, 0xD9, 0x1D, 0x3C, 0x7E, 0x52, 0x02, 0xC3, 0xDD, 0xD8, 0xDE,
+    0xE9, 0xD9, 0x1D, 0x3C, 0x7E, 0x52, 0x02, 0xC3, 0xDD, 0x05, 0x00, 0xC7,
+    0xE5, 0x00, 0xD8, 0xC1, 0xD8, 0xE2, 0xD9, 0xCA, 0xDE, 0xE1, 0xD8, 0xD1,
+    0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x0B, 0xDD, 0xD8, 0xD9, 0xE0, 0xD9,
+    0x1D, 0x3C, 0x7E, 0x52, 0x02, 0xC3, 0xDD, 0xD9, 0xD9, 0x1D, 0x3C, 0x7E,
+    0x52, 0x02, 0xC3,
+];
+const C158: [usize; 0] = [];
+const B159: [u8; 174] = [
+    0x80, 0xB9, 0x44, 0x02, 0x00, 0x00, 0x01, 0x74, 0x1D, 0xD9, 0xEE, 0x8B,
+    0x44, 0x24, 0x04, 0xD9, 0x10, 0xD9, 0x50, 0x04, 0xD9, 0x50, 0x08, 0x8B,
+    0x44, 0x24, 0x08, 0xD9, 0x10, 0xD9, 0x50, 0x04, 0xD9, 0x58, 0x08, 0xC2,
+    0x08, 0x00, 0x8B, 0x81, 0xE8, 0x01, 0x00, 0x00, 0x8B, 0x50, 0x30, 0x8B,
+    0x44, 0x24, 0x04, 0x56, 0x8B, 0x32, 0x89, 0x30, 0x8B, 0x72, 0x04, 0x89,
+    0x70, 0x04, 0x8B, 0x52, 0x08, 0x89, 0x50, 0x08, 0x8B, 0x91, 0xE8, 0x01,
+    0x00, 0x00, 0x8B, 0x72, 0x30, 0x8B, 0x54, 0x24, 0x0C, 0x83, 0xC6, 0x0C,
+    0x57, 0x8B, 0x3E, 0x89, 0x3A, 0x8B, 0x7E, 0x04, 0x89, 0x7A, 0x04, 0x8B,
+    0x76, 0x08, 0x89, 0x72, 0x08, 0xD9, 0x81, 0xEC, 0x01, 0x00, 0x00, 0xD8,
+    0x08, 0x5F, 0x5E, 0xD9, 0x18, 0xD9, 0x81, 0xF0, 0x01, 0x00, 0x00, 0xD8,
+    0x48, 0x04, 0xD9, 0x58, 0x04, 0xD9, 0x81, 0xF4, 0x01, 0x00, 0x00, 0xD8,
+    0x48, 0x08, 0xD9, 0x58, 0x08, 0xD9, 0x02, 0xD8, 0x89, 0xEC, 0x01, 0x00,
+    0x00, 0xD9, 0x1A, 0xD9, 0x81, 0xF0, 0x01, 0x00, 0x00, 0xD8, 0x4A, 0x04,
+    0xD9, 0x5A, 0x04, 0xD9, 0x81, 0xF4, 0x01, 0x00, 0x00, 0xD8, 0x4A, 0x08,
+    0xD9, 0x5A, 0x08, 0xC2, 0x08, 0x00,
+];
+const C159: [usize; 0] = [];
+const B160: [u8; 91] = [
+    0x8B, 0x44, 0x24, 0x04, 0x05, 0x30, 0x07, 0x00, 0x00, 0x74, 0x4F, 0x33,
+    0x48, 0x30, 0xD9, 0xEE, 0xD9, 0x10, 0x83, 0xE1, 0x01, 0xD9, 0x50, 0x04,
+    0x31, 0x48, 0x30, 0xD9, 0x58, 0x08, 0x8B, 0x4C, 0x24, 0x08, 0x89, 0x48,
+    0x0C, 0xD9, 0x05, 0x54, 0x0C, 0xDD, 0x00, 0x80, 0x48, 0x2C, 0x01, 0xD9,
+    0x58, 0x1C, 0x85, 0xD2, 0x7E, 0x1D, 0x8B, 0x0D, 0xAC, 0x43, 0xE8, 0x00,
+    0x03, 0xCA, 0x81, 0xF9, 0x00, 0xD2, 0x49, 0x6B, 0x89, 0x48, 0x18, 0x7E,
+    0x11, 0x81, 0xC1, 0x00, 0x2E, 0xB6, 0x94, 0x89, 0x48, 0x18, 0xC3, 0xC7,
+    0x40, 0x18, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3,
+];
+const C160: [usize; 0] = [];
+const B161: [u8; 121] = [
+    0x0F, 0xB7, 0x41, 0x48, 0x66, 0x3D, 0xEF, 0xBE, 0x74, 0x26, 0x0F, 0xB7,
+    0xC0, 0x3D, 0xFF, 0xFF, 0x00, 0x00, 0x74, 0x1C, 0x3D, 0x66, 0x08, 0x00,
+    0x00, 0x73, 0x15, 0x8B, 0x04, 0x85, 0xE8, 0xAA, 0xF7, 0x00, 0x85, 0xC0,
+    0x74, 0x0A, 0x8B, 0x81, 0x3C, 0x01, 0x00, 0x00, 0x85, 0xC0, 0x75, 0x1D,
+    0xD9, 0xEE, 0x8B, 0x44, 0x24, 0x04, 0xD9, 0x10, 0xD9, 0x50, 0x04, 0xD9,
+    0x50, 0x08, 0x8B, 0x44, 0x24, 0x08, 0xD9, 0x10, 0xD9, 0x50, 0x04, 0xD9,
+    0x58, 0x08, 0xC2, 0x08, 0x00, 0x8B, 0x10, 0x8B, 0x4C, 0x24, 0x04, 0x89,
+    0x11, 0x8B, 0x50, 0x04, 0x89, 0x51, 0x04, 0x8B, 0x50, 0x08, 0x89, 0x51,
+    0x08, 0x8B, 0x50, 0x10, 0x8B, 0x4C, 0x24, 0x08, 0x89, 0x11, 0x8B, 0x50,
+    0x14, 0x89, 0x51, 0x04, 0x8B, 0x40, 0x18, 0x89, 0x41, 0x08, 0xC2, 0x08,
+    0x00,
+];
+const C161: [usize; 0] = [];
+const B162: [u8; 161] = [
+    0x0F, 0xB7, 0x41, 0x48, 0x66, 0x3D, 0xEF, 0xBE, 0x74, 0x26, 0x0F, 0xB7,
+    0xC0, 0x3D, 0xFF, 0xFF, 0x00, 0x00, 0x74, 0x1C, 0x3D, 0x66, 0x08, 0x00,
+    0x00, 0x73, 0x15, 0x8B, 0x04, 0x85, 0xE8, 0xAA, 0xF7, 0x00, 0x85, 0xC0,
+    0x74, 0x0A, 0x8B, 0x89, 0x3C, 0x01, 0x00, 0x00, 0x85, 0xC9, 0x75, 0x1D,
+    0xD9, 0xEE, 0x8B, 0x44, 0x24, 0x04, 0xD9, 0x10, 0xD9, 0x50, 0x04, 0xD9,
+    0x50, 0x08, 0x8B, 0x44, 0x24, 0x08, 0xD9, 0x10, 0xD9, 0x50, 0x04, 0xD9,
+    0x58, 0x08, 0xC2, 0x08, 0x00, 0x56, 0x8B, 0x71, 0x48, 0x85, 0xF6, 0x74,
+    0x12, 0x8B, 0x41, 0x30, 0x25, 0x00, 0x00, 0x01, 0x00, 0x33, 0xD2, 0x0B,
+    0xC2, 0x74, 0x04, 0x8B, 0xCE, 0xEB, 0x03, 0x8B, 0x49, 0x40, 0x8B, 0x49,
+    0x58, 0x8B, 0x01, 0x8B, 0x30, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x32, 0x8B,
+    0x70, 0x04, 0x89, 0x72, 0x04, 0x8B, 0x40, 0x08, 0x89, 0x42, 0x08, 0x8B,
+    0x01, 0x8B, 0x50, 0x0C, 0x8B, 0x4C, 0x24, 0x0C, 0x83, 0xC0, 0x0C, 0x89,
+    0x11, 0x8B, 0x50, 0x04, 0x89, 0x51, 0x04, 0x8B, 0x40, 0x08, 0x89, 0x41,
+    0x08, 0x5E, 0xC2, 0x08, 0x00,
+];
+const C162: [usize; 0] = [];
+const B163: [u8; 304] = [
+    0x8B, 0x81, 0x20, 0x01, 0x00, 0x00, 0x83, 0xEC, 0x08, 0x83, 0xE8, 0x00,
+    0x0F, 0x84, 0xBE, 0x00, 0x00, 0x00, 0x83, 0xE8, 0x01, 0x74, 0x75, 0x83,
+    0xE8, 0x01, 0x8B, 0x44, 0x24, 0x0C, 0x74, 0x1C, 0xD9, 0xEE, 0xD9, 0x10,
+    0xD9, 0x50, 0x04, 0xD9, 0x50, 0x08, 0x8B, 0x44, 0x24, 0x10, 0xD9, 0x10,
+    0xD9, 0x50, 0x04, 0xD9, 0x58, 0x08, 0x83, 0xC4, 0x08, 0xC2, 0x08, 0x00,
+    0xD9, 0x81, 0x28, 0x01, 0x00, 0x00, 0xD9, 0xE0, 0xD9, 0x1C, 0x24, 0xD9,
+    0x04, 0x24, 0xD9, 0x14, 0x24, 0xD9, 0x18, 0xD9, 0xEE, 0xD9, 0x58, 0x04,
+    0xD9, 0x04, 0x24, 0xD9, 0x58, 0x08, 0xD9, 0x81, 0x24, 0x01, 0x00, 0x00,
+    0x8B, 0x44, 0x24, 0x10, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x81, 0x28, 0x01,
+    0x00, 0x00, 0xD9, 0x1C, 0x24, 0xD9, 0x81, 0x28, 0x01, 0x00, 0x00, 0xD9,
+    0x18, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x58, 0x04, 0xD9, 0x04, 0x24, 0xD9,
+    0x58, 0x08, 0x83, 0xC4, 0x08, 0xC2, 0x08, 0x00, 0xD9, 0x81, 0x24, 0x01,
+    0x00, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0xD9, 0xE0, 0xD9, 0x1C, 0x24, 0xD9,
+    0x04, 0x24, 0xD9, 0x14, 0x24, 0xD9, 0x54, 0x24, 0x04, 0xD9, 0x18, 0xD9,
+    0x04, 0x24, 0xD9, 0x58, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x58, 0x08,
+    0xD9, 0x81, 0x24, 0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x81,
+    0x24, 0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x81, 0x24, 0x01,
+    0x00, 0x00, 0xEB, 0x46, 0xD9, 0x81, 0x28, 0x01, 0x00, 0x00, 0x8B, 0x44,
+    0x24, 0x0C, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x81, 0x2C, 0x01, 0x00, 0x00,
+    0xD9, 0x1C, 0x24, 0xD9, 0x81, 0x24, 0x01, 0x00, 0x00, 0xD9, 0x18, 0xD9,
+    0x44, 0x24, 0x04, 0xD9, 0x58, 0x04, 0xD9, 0x04, 0x24, 0xD9, 0x58, 0x08,
+    0xD9, 0x81, 0x34, 0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x81,
+    0x38, 0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x81, 0x30, 0x01,
+    0x00, 0x00, 0x8B, 0x44, 0x24, 0x10, 0xD9, 0x18, 0xD9, 0x44, 0x24, 0x0C,
+    0xD9, 0x58, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x58, 0x08, 0x83, 0xC4,
+    0x08, 0xC2, 0x08, 0x00,
+];
+const C163: [usize; 0] = [];
+const B164: [u8; 31] = [
+    0x51, 0xF6, 0x80, 0xCC, 0x00, 0x00, 0x00, 0x02, 0x74, 0x0B, 0xD9, 0x40,
+    0x7C, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC3, 0xD9, 0xEE, 0xD9,
+    0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC3,
+];
+const C164: [usize; 0] = [];
+const B165: [u8; 89] = [
+    0x8B, 0x81, 0xE4, 0x84, 0x00, 0x00, 0x83, 0xC0, 0x04, 0x80, 0x78, 0x78,
+    0x01, 0x74, 0x1D, 0xD9, 0xEE, 0x8B, 0x44, 0x24, 0x04, 0xD9, 0x10, 0xD9,
+    0x50, 0x04, 0xD9, 0x50, 0x08, 0x8B, 0x44, 0x24, 0x08, 0xD9, 0x10, 0xD9,
+    0x50, 0x04, 0xD9, 0x58, 0x08, 0xC2, 0x08, 0x00, 0x8B, 0x50, 0x34, 0x8B,
+    0x4C, 0x24, 0x04, 0x89, 0x11, 0x8B, 0x50, 0x38, 0x89, 0x51, 0x04, 0x8B,
+    0x50, 0x3C, 0x89, 0x51, 0x08, 0x8B, 0x50, 0x40, 0x8B, 0x4C, 0x24, 0x08,
+    0x89, 0x11, 0x8B, 0x50, 0x44, 0x89, 0x51, 0x04, 0x8B, 0x40, 0x48, 0x89,
+    0x41, 0x08, 0xC2, 0x08, 0x00,
+];
+const C165: [usize; 0] = [];
+const B166: [u8; 56] = [
+    0x51, 0xD9, 0x40, 0x30, 0xDC, 0x25, 0xA0, 0xBF, 0xE5, 0x00, 0xD9, 0x1C,
+    0x24, 0xD9, 0x04, 0x24, 0xDD, 0x05, 0x88, 0xC1, 0xE5, 0x00, 0xD8, 0xD1,
+    0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x11, 0xD9, 0xC9, 0xD9, 0xE0, 0xDE,
+    0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x08, 0xB0, 0x01, 0x59, 0xC3,
+    0xDD, 0xD9, 0xDD, 0xD8, 0x32, 0xC0, 0x59, 0xC3,
+];
+const C166: [usize; 0] = [];
+const B167: [u8; 16] = [
+    0x83, 0x79, 0x0C, 0x00, 0x74, 0x07, 0xD9, 0x05, 0x90, 0x1C, 0xDD, 0x00,
+    0xC3, 0xD9, 0xE8, 0xC3,
+];
+const C167: [usize; 0] = [];
+const B168: [u8; 243] = [
+    0x51, 0xD9, 0x41, 0x2C, 0x8B, 0x44, 0x24, 0x10, 0xD8, 0x61, 0x08, 0xD9,
+    0x1C, 0x24, 0xD9, 0x04, 0x24, 0xD8, 0x08, 0xD8, 0x41, 0x08, 0x8B, 0x4C,
+    0x24, 0x14, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x01, 0xD9, 0x44, 0x24, 0x10,
+    0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0x7A, 0x08, 0xDD,
+    0xD8, 0xD9, 0x01, 0x59, 0xC2, 0x10, 0x00, 0x8B, 0x4C, 0x24, 0x0C, 0xD8,
+    0xA1, 0xB8, 0x00, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0xEE, 0xD9,
+    0x44, 0x24, 0x08, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41,
+    0x75, 0x08, 0xD9, 0xC0, 0xD9, 0xE8, 0xDE, 0xF1, 0xEB, 0x02, 0xD9, 0xEE,
+    0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x14,
+    0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x05,
+    0x54, 0xC1, 0xE5, 0x00, 0xD9, 0x44, 0x24, 0x10, 0xD8, 0xD1, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x41, 0x75, 0x11, 0xDD, 0xD9, 0xD9, 0x05, 0x2C, 0x80, 0xE9,
+    0x00, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x04, 0xDD, 0xD8,
+    0xEB, 0x02, 0xDD, 0xD9, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0xE1, 0xD9, 0x5C,
+    0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x05,
+    0x50, 0xC1, 0xE5, 0x00, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0xD1, 0xDF, 0xE0,
+    0xDD, 0xD9, 0xF6, 0xC4, 0x05, 0x7A, 0x08, 0xDC, 0x35, 0x48, 0xC1, 0xE5,
+    0x00, 0xEB, 0x04, 0xDD, 0xD8, 0xD9, 0xE8, 0xD9, 0x5C, 0x24, 0x14, 0xD9,
+    0x44, 0x24, 0x14, 0xD8, 0x4C, 0x24, 0x10, 0xDE, 0xC9, 0xD8, 0x81, 0xB8,
+    0x00, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x10, 0x59,
+    0xC2, 0x10, 0x00,
+];
+const C168: [usize; 0] = [];
+const B169: [u8; 34] = [
+    0x51, 0xF6, 0x80, 0x58, 0x01, 0x00, 0x00, 0x02, 0x74, 0x0E, 0xD9, 0x80,
+    0x20, 0x01, 0x00, 0x00, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC3,
+    0xD9, 0xEE, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC3,
+];
+const C169: [usize; 0] = [];
+const B170: [u8; 19] = [
+    0x8B, 0x41, 0x24, 0x83, 0xE8, 0x01, 0x74, 0x07, 0xD9, 0x05, 0x98, 0x79,
+    0xE8, 0x00, 0xC3, 0xD9, 0x41, 0x2C, 0xC3,
+];
+const C170: [usize; 0] = [];
+const B171: [u8; 37] = [
+    0xD9, 0x02, 0xD9, 0x01, 0xDA, 0xE9, 0xDF, 0xE0, 0xF6, 0xC4, 0x44, 0x7A,
+    0x15, 0xD9, 0x42, 0x04, 0xD9, 0x41, 0x04, 0xDA, 0xE9, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x44, 0x7A, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x33, 0xC0,
+    0xC3,
+];
+const C171: [usize; 0] = [];
+const B172: [u8; 52] = [
+    0xD9, 0x02, 0xD9, 0x01, 0xDA, 0xE9, 0xDF, 0xE0, 0xF6, 0xC4, 0x44, 0x7A,
+    0x24, 0xD9, 0x42, 0x04, 0xD9, 0x41, 0x04, 0xDA, 0xE9, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x44, 0x7A, 0x15, 0xD9, 0x42, 0x08, 0xD9, 0x41, 0x08, 0xDA, 0xE9,
+    0xDF, 0xE0, 0xF6, 0xC4, 0x44, 0x7A, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00,
+    0xC3, 0x33, 0xC0, 0xC3,
+];
+const C172: [usize; 0] = [];
+const B173: [u8; 218] = [
+    0x83, 0xEC, 0x08, 0x80, 0x7C, 0x24, 0x0C, 0x01, 0x75, 0x05, 0xD9, 0x41,
+    0x48, 0xEB, 0x06, 0xD9, 0x05, 0xD0, 0xC0, 0xE5, 0x00, 0xD9, 0x5C, 0x24,
+    0x0C, 0x53, 0x8A, 0x59, 0x3C, 0xD9, 0xE8, 0x80, 0xFB, 0x01, 0xD9, 0x44,
+    0x24, 0x10, 0xD9, 0xE8, 0x75, 0x07, 0xD9, 0xCA, 0xD9, 0x51, 0x34, 0xEB,
+    0x20, 0x80, 0x79, 0x3D, 0x01, 0x75, 0x0F, 0xD9, 0x05, 0x80, 0x43, 0xE8,
+    0x00, 0xD8, 0xCA, 0xD8, 0xC1, 0xD8, 0x49, 0x40, 0xEB, 0x03, 0xD9, 0x41,
+    0x40, 0xD8, 0x49, 0x34, 0xD9, 0x59, 0x34, 0xD9, 0xCA, 0xD9, 0x41, 0x34,
+    0xD9, 0x41, 0x44, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x05,
+    0xD9, 0x41, 0x34, 0xEB, 0x03, 0xD9, 0x41, 0x44, 0xD9, 0x5C, 0x24, 0x10,
+    0x33, 0xD2, 0x80, 0x79, 0x3D, 0x01, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0x51,
+    0x34, 0x75, 0x25, 0x3A, 0xDA, 0x75, 0x21, 0xDD, 0xDA, 0x5B, 0xDD, 0xDA,
+    0xDD, 0xD9, 0xD9, 0x41, 0x48, 0xD8, 0x0D, 0x80, 0x43, 0xE8, 0x00, 0xDE,
+    0xC9, 0xD9, 0x59, 0x38, 0x89, 0x56, 0x04, 0x88, 0x51, 0x3C, 0x83, 0xC4,
+    0x08, 0xC2, 0x04, 0x00, 0xD9, 0xC9, 0x5B, 0xD9, 0x59, 0x38, 0xD9, 0x7C,
+    0x24, 0x0C, 0xDE, 0xFA, 0x0F, 0xB7, 0x44, 0x24, 0x0C, 0x0D, 0x00, 0x0C,
+    0x00, 0x00, 0x89, 0x04, 0x24, 0xDC, 0x0D, 0xD8, 0xC0, 0xE5, 0x00, 0xDE,
+    0xC9, 0xD9, 0x2C, 0x24, 0xDF, 0x3C, 0x24, 0x8B, 0x04, 0x24, 0x89, 0x46,
+    0x04, 0x88, 0x51, 0x3C, 0xD9, 0x6C, 0x24, 0x0C, 0x83, 0xC4, 0x08, 0xC2,
+    0x04, 0x00,
+];
+const C173: [usize; 0] = [];
+const B174: [u8; 580] = [
+    0x8B, 0x54, 0x24, 0x14, 0x8B, 0x44, 0x24, 0x0C, 0x56, 0x8B, 0x74, 0x24,
+    0x14, 0xF3, 0x0F, 0x10, 0x06, 0xF3, 0x0F, 0x11, 0x42, 0x04, 0xD9, 0x41,
+    0x08, 0xD9, 0x5C, 0x24, 0x14, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x18, 0xD9,
+    0x44, 0x24, 0x18, 0xF3, 0x0F, 0x10, 0x00, 0xD9, 0x44, 0x24, 0x14, 0xF3,
+    0x0F, 0x11, 0x44, 0x24, 0x10, 0xDB, 0xF1, 0xD9, 0x44, 0x24, 0x10, 0x76,
+    0x54, 0xD9, 0x41, 0x2C, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0xC1,
+    0xDC, 0x0D, 0x70, 0xBF, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44,
+    0x24, 0x14, 0xDB, 0xF3, 0x76, 0x0D, 0xDD, 0xD8, 0xDD, 0xDA, 0xD8, 0x44,
+    0x24, 0x18, 0xD9, 0x5A, 0x04, 0xEB, 0x2E, 0xDD, 0xDA, 0xD9, 0x41, 0x08,
+    0xD9, 0x5C, 0x24, 0x14, 0xD9, 0xC1, 0xDE, 0xEB, 0xD9, 0x44, 0x24, 0x18,
+    0xDE, 0xCB, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xC0, 0xDE, 0xE3, 0xD9, 0xCB,
+    0xDE, 0xF2, 0xD9, 0xC9, 0xDE, 0xC2, 0xD9, 0xC9, 0xD9, 0x5A, 0x04, 0xEB,
+    0x04, 0xDD, 0xDA, 0xDD, 0xD8, 0xD9, 0x42, 0x04, 0xD9, 0x5C, 0x24, 0x18,
+    0xD9, 0x41, 0x0C, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x18, 0xD9,
+    0xC0, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9,
+    0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0xEE, 0xDF, 0xF1, 0x0F,
+    0x86, 0xAE, 0x00, 0x00, 0x00, 0xDD, 0xDA, 0xD9, 0x41, 0x08, 0xD9, 0x5C,
+    0x24, 0x18, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0xC0, 0xDE, 0xE2, 0xD9, 0xE8,
+    0xD9, 0xC0, 0xDE, 0xF3, 0xD9, 0xCA, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x41,
+    0x24, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x41, 0x14, 0xD9, 0x5C, 0x24, 0x10,
+    0xD9, 0x41, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9,
+    0x44, 0x24, 0x14, 0xD9, 0xC0, 0xDE, 0xCB, 0xD9, 0xCA, 0xD9, 0x5C, 0x24,
+    0x18, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0xCD, 0xDE, 0xC1, 0xD9, 0x44, 0x24,
+    0x10, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9,
+    0x41, 0x18, 0xD8, 0xE4, 0xD8, 0xCA, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C,
+    0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xC4, 0xDE, 0xCD, 0xDE, 0xCC,
+    0xD9, 0xCB, 0xDE, 0xC2, 0xD9, 0xC9, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C,
+    0x24, 0x14, 0xD9, 0x06, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x10,
+    0xD9, 0xC9, 0xDF, 0xF1, 0x0F, 0x86, 0xDA, 0x00, 0x00, 0x00, 0xD8, 0x71,
+    0x08, 0x5E, 0xD8, 0x4C, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x14, 0xD8, 0x4C,
+    0x24, 0x10, 0xD8, 0x64, 0x24, 0x14, 0xD9, 0x1A, 0xC2, 0x14, 0x00, 0xD9,
+    0x41, 0x10, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x18, 0xDB, 0xF3,
+    0xDD, 0xDB, 0x76, 0x7E, 0xD9, 0xCA, 0x5E, 0xDE, 0xE1, 0xD9, 0xE8, 0xD9,
+    0xC0, 0xDE, 0xF2, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x41, 0x24,
+    0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x41, 0x14, 0xD9, 0x5C, 0x24, 0x0C, 0xD9,
+    0x41, 0x28, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0x44,
+    0x24, 0x10, 0xD9, 0xC0, 0xDE, 0xCB, 0xD9, 0xCA, 0xD9, 0x5C, 0x24, 0x14,
+    0xD9, 0x44, 0x24, 0x14, 0xD8, 0xCC, 0xDE, 0xC1, 0xD9, 0x44, 0x24, 0x0C,
+    0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x41,
+    0x1C, 0xD8, 0xE3, 0xD8, 0xCA, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24,
+    0x10, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC3, 0xDE, 0xCC, 0xDE, 0xCB, 0xD9,
+    0xCA, 0xDE, 0xC1, 0xDE, 0xC9, 0xD9, 0x5C, 0x24, 0x10, 0xD8, 0x4C, 0x24,
+    0x10, 0xD8, 0x64, 0x24, 0x14, 0xD9, 0x1A, 0xC2, 0x14, 0x00, 0xF3, 0x0F,
+    0x10, 0x44, 0x24, 0x18, 0xDD, 0xD8, 0xDD, 0xD8, 0xF3, 0x0F, 0x11, 0x42,
+    0x04, 0x0F, 0x57, 0xC0, 0xDD, 0xD8, 0xD9, 0x41, 0x28, 0xF3, 0x0F, 0x11,
+    0x44, 0x24, 0x14, 0xD8, 0x49, 0x14, 0x5E, 0xD9, 0x5C, 0x24, 0x14, 0xD8,
+    0x4C, 0x24, 0x10, 0xD8, 0x64, 0x24, 0x14, 0xD9, 0x1A, 0xC2, 0x14, 0x00,
+    0xDD, 0xD8, 0x5E, 0xD8, 0x4C, 0x24, 0x10, 0xD8, 0x64, 0x24, 0x14, 0xD9,
+    0x1A, 0xC2, 0x14, 0x00,
+];
+const C174: [usize; 0] = [];
+const B175: [u8; 74] = [
+    0x8B, 0x44, 0x24, 0x08, 0x8A, 0x80, 0xCC, 0x00, 0x00, 0x00, 0x84, 0xC0,
+    0x74, 0x19, 0x80, 0x79, 0x14, 0x00, 0x74, 0x13, 0x8B, 0x4C, 0x24, 0x0C,
+    0xF3, 0x0F, 0x10, 0x05, 0xB0, 0xBF, 0xE5, 0x00, 0xF3, 0x0F, 0x5C, 0x41,
+    0x0C, 0xEB, 0x09, 0x8B, 0x54, 0x24, 0x0C, 0xF3, 0x0F, 0x10, 0x42, 0x0C,
+    0x0F, 0x57, 0xC9, 0x0F, 0x2F, 0xC8, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x0C,
+    0x76, 0x05, 0xD9, 0xEE, 0xC2, 0x10, 0x00, 0xD9, 0x44, 0x24, 0x0C, 0xC2,
+    0x10, 0x00,
+];
+const C175: [usize; 0] = [];
+const B176: [u8; 104] = [
+    0x8B, 0x44, 0x24, 0x08, 0x8A, 0x80, 0xCC, 0x00, 0x00, 0x00, 0x84, 0xC0,
+    0x74, 0x19, 0x80, 0x79, 0x14, 0x00, 0x74, 0x13, 0x8B, 0x54, 0x24, 0x0C,
+    0xF3, 0x0F, 0x10, 0x05, 0xB0, 0xBF, 0xE5, 0x00, 0xF3, 0x0F, 0x5C, 0x42,
+    0x0C, 0xEB, 0x09, 0x8B, 0x54, 0x24, 0x0C, 0xF3, 0x0F, 0x10, 0x42, 0x0C,
+    0x80, 0x79, 0x14, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x0C, 0x75, 0x09,
+    0x84, 0xC0, 0x74, 0x05, 0xD9, 0xE8, 0xC2, 0x10, 0x00, 0x0F, 0x2F, 0x05,
+    0xC0, 0x32, 0xDD, 0x00, 0x76, 0x05, 0xD9, 0xEE, 0xC2, 0x10, 0x00, 0xD9,
+    0x44, 0x24, 0x0C, 0xDC, 0x0D, 0x80, 0xC1, 0xE5, 0x00, 0xD9, 0x5C, 0x24,
+    0x0C, 0xD9, 0x44, 0x24, 0x0C, 0xC2, 0x10, 0x00,
+];
+const C176: [usize; 0] = [];
+const B177: [u8; 83] = [
+    0x8B, 0x44, 0x24, 0x08, 0x80, 0x78, 0x0D, 0x00, 0x74, 0x25, 0xF3, 0x0F,
+    0x10, 0x05, 0xB0, 0xBF, 0xE5, 0x00, 0xD9, 0x41, 0x10, 0xF3, 0x0F, 0x5C,
+    0x41, 0x18, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x08, 0xD8, 0x4C, 0x24, 0x08,
+    0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x08, 0xC2, 0x08, 0x00, 0x0F,
+    0xBE, 0x40, 0x0E, 0xD9, 0x41, 0x10, 0x8B, 0x51, 0x1C, 0xF3, 0x0F, 0x10,
+    0x04, 0x82, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x08, 0xD8, 0x4C, 0x24, 0x08,
+    0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x08, 0xC2, 0x08, 0x00,
+];
+const C177: [usize; 0] = [];
+const B178: [u8; 193] = [
+    0x8B, 0x0D, 0x64, 0xA3, 0x52, 0x02, 0x83, 0xF9, 0x40, 0x53, 0x8B, 0x5C,
+    0x24, 0x1C, 0x56, 0x57, 0x8B, 0x7C, 0x24, 0x10, 0x8B, 0xF0, 0x0F, 0x8D,
+    0x9E, 0x00, 0x00, 0x00, 0x8B, 0xC1, 0x6B, 0xC0, 0x54, 0x05, 0xD0, 0x4D,
+    0x3D, 0x03, 0x80, 0x7C, 0x24, 0x2C, 0x00, 0xC7, 0x00, 0x02, 0x00, 0x00,
+    0x00, 0x89, 0x58, 0x08, 0x75, 0x09, 0x81, 0xCB, 0x00, 0x00, 0x01, 0x00,
+    0x89, 0x58, 0x08, 0x8B, 0x1F, 0xD9, 0xEE, 0x89, 0x58, 0x10, 0x8B, 0x5F,
+    0x04, 0x89, 0x58, 0x14, 0x8B, 0x7F, 0x08, 0x89, 0x78, 0x18, 0xD9, 0x50,
+    0x34, 0xD9, 0x50, 0x38, 0xD9, 0x58, 0x3C, 0x8B, 0x3E, 0xD9, 0x44, 0x24,
+    0x14, 0x89, 0x78, 0x1C, 0x8B, 0x7E, 0x04, 0x89, 0x78, 0x20, 0x8B, 0x76,
+    0x08, 0x89, 0x70, 0x24, 0x8B, 0x32, 0x89, 0x70, 0x28, 0x8B, 0x72, 0x04,
+    0x89, 0x70, 0x2C, 0x8B, 0x52, 0x08, 0xD9, 0x58, 0x44, 0xD9, 0x44, 0x24,
+    0x18, 0x89, 0x50, 0x30, 0x8B, 0x54, 0x24, 0x28, 0xD9, 0x58, 0x48, 0xD9,
+    0x44, 0x24, 0x1C, 0x89, 0x50, 0x0C, 0xD9, 0x58, 0x4C, 0x8B, 0xD1, 0xD9,
+    0x44, 0x24, 0x20, 0x81, 0xCA, 0x00, 0x00, 0x00, 0xC0, 0x5F, 0xD9, 0x58,
+    0x50, 0x83, 0xC1, 0x01, 0x5E, 0x89, 0x50, 0x04, 0x89, 0x0D, 0x64, 0xA3,
+    0x52, 0x02, 0x8B, 0xC2, 0x5B, 0xC3, 0x5F, 0x5E, 0x83, 0xC8, 0xFF, 0x5B,
+    0xC3,
+];
+const C178: [usize; 0] = [];
+const B179: [u8; 164] = [
+    0x8B, 0x0D, 0x64, 0xA3, 0x52, 0x02, 0x83, 0xF9, 0x40, 0x56, 0x8B, 0x74,
+    0x24, 0x08, 0x57, 0x8B, 0xF8, 0x0F, 0x8D, 0x87, 0x00, 0x00, 0x00, 0x8B,
+    0xC1, 0x6B, 0xC0, 0x54, 0x05, 0xD0, 0x4D, 0x3D, 0x03, 0x80, 0x7C, 0x24,
+    0x1C, 0x00, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x89, 0x78, 0x08, 0x75,
+    0x09, 0x81, 0xCF, 0x00, 0x00, 0x01, 0x00, 0x89, 0x78, 0x08, 0x8B, 0x3E,
+    0xD9, 0xEE, 0x89, 0x78, 0x10, 0x8B, 0x7E, 0x04, 0x89, 0x78, 0x14, 0x8B,
+    0x76, 0x08, 0x89, 0x70, 0x18, 0xD9, 0x50, 0x1C, 0xD9, 0x50, 0x20, 0x5F,
+    0xD9, 0x50, 0x24, 0x8B, 0x32, 0x89, 0x70, 0x28, 0x8B, 0x72, 0x04, 0x89,
+    0x70, 0x2C, 0x8B, 0x52, 0x08, 0x89, 0x50, 0x30, 0xD9, 0x50, 0x34, 0x8B,
+    0x54, 0x24, 0x14, 0xD9, 0x50, 0x38, 0xD9, 0x58, 0x3C, 0x89, 0x50, 0x0C,
+    0xD9, 0x44, 0x24, 0x0C, 0x8B, 0xD1, 0xD9, 0x58, 0x44, 0x81, 0xCA, 0x00,
+    0x00, 0x00, 0xC0, 0xD9, 0x44, 0x24, 0x10, 0x83, 0xC1, 0x01, 0xD9, 0x58,
+    0x48, 0x89, 0x50, 0x04, 0x89, 0x0D, 0x64, 0xA3, 0x52, 0x02, 0x8B, 0xC2,
+    0x5E, 0xC3, 0x5F, 0x83, 0xC8, 0xFF, 0x5E, 0xC3,
+];
+const C179: [usize; 0] = [];
+const B180: [u8; 123] = [
+    0x80, 0xB9, 0x48, 0x03, 0x00, 0x00, 0xFF, 0x75, 0x6A, 0x8A, 0x81, 0x49,
+    0x03, 0x00, 0x00, 0x3C, 0xFF, 0x74, 0x0A, 0x88, 0x81, 0x48, 0x03, 0x00,
+    0x00, 0x0F, 0xB6, 0xC0, 0xC3, 0x56, 0x8D, 0xB1, 0x38, 0x03, 0x00, 0x00,
+    0x33, 0xD2, 0x3B, 0xF2, 0x74, 0x42, 0x39, 0x91, 0x34, 0x03, 0x00, 0x00,
+    0x7E, 0x1F, 0xD9, 0x81, 0x30, 0x03, 0x00, 0x00, 0xD9, 0x06, 0xDE, 0xD9,
+    0xDF, 0xE0, 0xF6, 0xC4, 0x01, 0x74, 0x0E, 0x83, 0xC2, 0x01, 0x83, 0xC6,
+    0x04, 0x3B, 0x91, 0x34, 0x03, 0x00, 0x00, 0x7C, 0xE1, 0x8B, 0x41, 0x70,
+    0x0F, 0xBF, 0x40, 0x1C, 0x83, 0xC0, 0xFF, 0x3B, 0xD0, 0x7D, 0x02, 0x8B,
+    0xC2, 0x88, 0x81, 0x48, 0x03, 0x00, 0x00, 0x5E, 0x0F, 0xB6, 0xC0, 0xC3,
+    0x88, 0x91, 0x48, 0x03, 0x00, 0x00, 0x5E, 0x0F, 0xB6, 0x81, 0x48, 0x03,
+    0x00, 0x00, 0xC3,
+];
+const C180: [usize; 0] = [];
+const B181: [u8; 64] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0xD9, 0x45, 0x08, 0xD9, 0x41, 0x18,
+    0xDF, 0xE9, 0xDD, 0xD8, 0x9F, 0xF6, 0xC4, 0x44, 0x7A, 0x10, 0xF3, 0x0F,
+    0x10, 0x45, 0x0C, 0xF3, 0x0F, 0x11, 0x41, 0x18, 0x8B, 0xE5, 0x5D, 0xC2,
+    0x0C, 0x00, 0xF3, 0x0F, 0x10, 0x05, 0x98, 0x79, 0xE8, 0x00, 0xF3, 0x0F,
+    0x11, 0x41, 0x18, 0x0F, 0x57, 0xC0, 0x0F, 0x29, 0x41, 0x20, 0x8B, 0xE5,
+    0x5D, 0xC2, 0x0C, 0x00,
+];
+const C181: [usize; 0] = [];
+const B182: [u8; 268] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x83, 0xEC, 0x30, 0x8B, 0x45, 0x0C,
+    0x0F, 0x28, 0x49, 0x10, 0x0F, 0x28, 0x18, 0x0F, 0x28, 0xC3, 0x0F, 0x59,
+    0xC1, 0x0F, 0xC6, 0xC9, 0xFF, 0x0F, 0x28, 0xD0, 0x0F, 0xC6, 0xD0, 0xAA,
+    0xF3, 0x0F, 0x58, 0xD1, 0x0F, 0x28, 0xC8, 0x0F, 0xC6, 0xC8, 0x55, 0xF3,
+    0x0F, 0x58, 0xC8, 0x0F, 0x58, 0xD1, 0x0F, 0x28, 0x49, 0x10, 0x0F, 0x28,
+    0xC1, 0xF3, 0x0F, 0x11, 0x54, 0x24, 0x10, 0x0F, 0x28, 0x50, 0x10, 0x0F,
+    0x59, 0xC2, 0x0F, 0xC6, 0xC9, 0xFF, 0x0F, 0x28, 0xE0, 0x0F, 0xC6, 0xE0,
+    0xAA, 0xF3, 0x0F, 0x58, 0xE1, 0x0F, 0x28, 0xC8, 0x0F, 0xC6, 0xC8, 0x55,
+    0xF3, 0x0F, 0x58, 0xC8, 0x0F, 0x57, 0xC0, 0x0F, 0x58, 0xE1, 0xF3, 0x0F,
+    0x10, 0x4C, 0x24, 0x10, 0x0F, 0x2F, 0xC8, 0xF3, 0x0F, 0x11, 0x64, 0x24,
+    0x20, 0x0F, 0x82, 0x81, 0x00, 0x00, 0x00, 0x0F, 0x2F, 0x44, 0x24, 0x20,
+    0x76, 0x7A, 0xD9, 0x44, 0x24, 0x10, 0x0F, 0x28, 0x25, 0xB0, 0x8A, 0xE1,
+    0x00, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0xE9, 0xDE, 0xF9, 0xD9, 0x5C, 0x24,
+    0x0C, 0xF3, 0x0F, 0x10, 0x4C, 0x24, 0x0C, 0xF3, 0x0F, 0x10, 0xC1, 0x0F,
+    0xC6, 0xC0, 0x00, 0x0F, 0x5C, 0xE0, 0x0F, 0x59, 0xE3, 0x0F, 0x59, 0xD0,
+    0x0F, 0x28, 0x41, 0x20, 0x0F, 0x58, 0xE2, 0x0F, 0x5C, 0xE0, 0x0F, 0x28,
+    0x05, 0x90, 0x8C, 0xE1, 0x00, 0x0F, 0x54, 0xE0, 0x0F, 0x28, 0x41, 0x30,
+    0x0F, 0xC2, 0xE0, 0x02, 0x0F, 0x50, 0xC4, 0x83, 0xE0, 0x07, 0x3C, 0x07,
+    0x75, 0x26, 0x8B, 0x45, 0x10, 0xF3, 0x0F, 0x11, 0x48, 0x10, 0x0F, 0x28,
+    0x41, 0x10, 0x8B, 0x48, 0x40, 0x0F, 0x29, 0x00, 0xC7, 0x44, 0x88, 0x20,
+    0xFF, 0xFF, 0xFF, 0xFF, 0x8B, 0x45, 0x08, 0xC6, 0x00, 0x01, 0x8B, 0xE5,
+    0x5D, 0xC2, 0x0C, 0x00, 0x8B, 0x45, 0x08, 0xC6, 0x00, 0x00, 0x8B, 0xE5,
+    0x5D, 0xC2, 0x0C, 0x00,
+];
+const C182: [usize; 0] = [];
+const B183: [u8; 409] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x83, 0xEC, 0x48, 0xF3, 0x0F, 0x10,
+    0x05, 0x98, 0x79, 0xE8, 0x00, 0x8B, 0x51, 0x54, 0x83, 0xEA, 0x01, 0x56,
+    0x57, 0x8B, 0x7D, 0x10, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x14, 0xF3, 0x0F,
+    0x10, 0x47, 0x10, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x18, 0x0F, 0x57, 0xC0,
+    0x0F, 0x29, 0x44, 0x24, 0x40, 0x0F, 0x88, 0x50, 0x01, 0x00, 0x00, 0x8B,
+    0x45, 0x0C, 0xD9, 0x44, 0x24, 0x14, 0x0F, 0x28, 0x20, 0xD9, 0x44, 0x24,
+    0x18, 0x0F, 0x28, 0x68, 0x10, 0x0F, 0x57, 0xDB, 0x8B, 0xF2, 0xC1, 0xE6,
+    0x04, 0x03, 0x71, 0x50, 0xEB, 0x02, 0xD9, 0xC9, 0x0F, 0x28, 0x0E, 0x0F,
+    0x28, 0xC1, 0x0F, 0x59, 0xC4, 0x0F, 0x28, 0xF0, 0x0F, 0xC6, 0xF0, 0xAA,
+    0x0F, 0x28, 0xF8, 0x0F, 0xC6, 0xF8, 0x55, 0xF3, 0x0F, 0x58, 0xF8, 0x0F,
+    0x28, 0xD1, 0x0F, 0xC6, 0xD1, 0xFF, 0xF3, 0x0F, 0x58, 0xF2, 0x0F, 0x58,
+    0xF7, 0xF3, 0x0F, 0x11, 0x74, 0x24, 0x30, 0x0F, 0x28, 0xC1, 0x0F, 0x59,
+    0xC5, 0x0F, 0x28, 0xF0, 0x0F, 0xC6, 0xF0, 0x55, 0x0F, 0x28, 0xF8, 0x0F,
+    0xC6, 0xF8, 0xAA, 0xF3, 0x0F, 0x58, 0xF0, 0xF3, 0x0F, 0x10, 0x44, 0x24,
+    0x30, 0xF3, 0x0F, 0x58, 0xFA, 0x0F, 0x58, 0xF7, 0xF3, 0x0F, 0x11, 0x74,
+    0x24, 0x20, 0x0F, 0x2F, 0xC3, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x20, 0x72,
+    0x3A, 0x0F, 0x2F, 0xC3, 0x0F, 0x83, 0xBD, 0x00, 0x00, 0x00, 0xD9, 0x44,
+    0x24, 0x30, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0xE9, 0xDE, 0xF9, 0xD9, 0x5C,
+    0x24, 0x1C, 0xD9, 0x44, 0x24, 0x1C, 0xDF, 0xF2, 0x72, 0x48, 0xF3, 0x0F,
+    0x10, 0x44, 0x24, 0x1C, 0xDD, 0xD9, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x14,
+    0xD9, 0x44, 0x24, 0x14, 0x0F, 0x29, 0x4C, 0x24, 0x40, 0xEB, 0x31, 0x0F,
+    0x2F, 0xC3, 0x72, 0x42, 0xD9, 0x44, 0x24, 0x30, 0xD9, 0x44, 0x24, 0x20,
+    0xD8, 0xE9, 0xDE, 0xF9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x1C,
+    0xDF, 0xF1, 0x77, 0x12, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x1C, 0xDD, 0xD8,
+    0xF3, 0x0F, 0x11, 0x44, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0xC9,
+    0xDB, 0xF1, 0x76, 0x14, 0x8B, 0x45, 0x08, 0xDD, 0xD9, 0xDD, 0xD8, 0xC6,
+    0x00, 0x00, 0x5F, 0x5E, 0x8B, 0xE5, 0x5D, 0xC2, 0x0C, 0x00, 0xD9, 0xC9,
+    0x83, 0xEA, 0x01, 0x83, 0xEE, 0x10, 0x85, 0xD2, 0x0F, 0x8D, 0x08, 0xFF,
+    0xFF, 0xFF, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x14, 0xDD, 0xD9, 0x0F, 0x2F,
+    0xD8, 0xDD, 0xD8, 0x77, 0x2A, 0x8B, 0x47, 0x40, 0x0F, 0x28, 0x4C, 0x24,
+    0x40, 0x0F, 0x29, 0x0F, 0xF3, 0x0F, 0x11, 0x47, 0x10, 0xC7, 0x44, 0x87,
+    0x20, 0xFF, 0xFF, 0xFF, 0xFF, 0x8B, 0x45, 0x08, 0xC6, 0x00, 0x01, 0x5F,
+    0x5E, 0x8B, 0xE5, 0x5D, 0xC2, 0x0C, 0x00, 0xDD, 0xD8, 0xDD, 0xD8, 0x8B,
+    0x45, 0x08, 0x5F, 0xC6, 0x00, 0x00, 0x5E, 0x8B, 0xE5, 0x5D, 0xC2, 0x0C,
+    0x00,
+];
+const C183: [usize; 0] = [];
+const B184: [u8; 112] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x83, 0xEC, 0x10, 0x0F, 0x28, 0x49,
+    0x30, 0x0F, 0x28, 0x51, 0x20, 0x8B, 0x45, 0x08, 0x0F, 0x28, 0x18, 0x8B,
+    0x4D, 0x0C, 0x0F, 0x28, 0xC1, 0x0F, 0x5C, 0xC2, 0x0F, 0x59, 0xC3, 0x0F,
+    0x28, 0xD8, 0x0F, 0xC6, 0xD8, 0x55, 0x0F, 0x28, 0xE0, 0xF3, 0x0F, 0x58,
+    0xD8, 0x0F, 0xC6, 0xE0, 0xAA, 0x0F, 0x57, 0xC0, 0xF3, 0x0F, 0x58, 0xE3,
+    0xF3, 0x0F, 0x11, 0x24, 0x24, 0x0F, 0x2F, 0x04, 0x24, 0x76, 0x13, 0x33,
+    0xC0, 0x0D, 0x00, 0x00, 0x00, 0x3F, 0x0F, 0x29, 0x11, 0x89, 0x41, 0x0C,
+    0x8B, 0xE5, 0x5D, 0xC2, 0x08, 0x00, 0xB8, 0x10, 0x00, 0x00, 0x00, 0x0D,
+    0x00, 0x00, 0x00, 0x3F, 0x0F, 0x29, 0x09, 0x89, 0x41, 0x0C, 0x8B, 0xE5,
+    0x5D, 0xC2, 0x08, 0x00,
+];
+const C184: [usize; 0] = [];
+const B185: [u8; 45] = [
+    0xF3, 0x0F, 0x10, 0x49, 0x70, 0x0F, 0x57, 0xC0, 0x0F, 0x2F, 0xC8, 0x76,
+    0x15, 0xF3, 0x0F, 0x10, 0x49, 0x74, 0x0F, 0x2F, 0xC8, 0x76, 0x0B, 0x8B,
+    0x44, 0x24, 0x04, 0xB1, 0x01, 0x88, 0x08, 0xC2, 0x04, 0x00, 0x8B, 0x44,
+    0x24, 0x04, 0x32, 0xC9, 0x88, 0x08, 0xC2, 0x04, 0x00,
+];
+const C185: [usize; 0] = [];
+const B186: [u8; 32] = [
+    0xF3, 0x0F, 0x10, 0x41, 0x44, 0x0F, 0x2F, 0x05, 0xC0, 0x32, 0xDD, 0x00,
+    0x8B, 0x44, 0x24, 0x04, 0x76, 0x07, 0xB1, 0x01, 0x88, 0x08, 0xC2, 0x04,
+    0x00, 0x32, 0xC9, 0x88, 0x08, 0xC2, 0x04, 0x00,
+];
+const C186: [usize; 0] = [];
+const B187: [u8; 142] = [
+    0x83, 0xEC, 0x10, 0x8B, 0x08, 0xD9, 0x05, 0x14, 0x5B, 0x5F, 0x02, 0x89,
+    0x0D, 0x20, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x04, 0x8B, 0x50, 0x04,
+    0xD9, 0x05, 0x18, 0x5B, 0x5F, 0x02, 0x89, 0x15, 0x24, 0x5B, 0x5F, 0x02,
+    0xD9, 0x5C, 0x24, 0x08, 0x8B, 0x48, 0x08, 0xD9, 0x05, 0x1C, 0x5B, 0x5F,
+    0x02, 0x89, 0x0D, 0x28, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x0C, 0x8B,
+    0x10, 0x89, 0x15, 0x14, 0x5B, 0x5F, 0x02, 0x8B, 0x48, 0x04, 0x89, 0x0D,
+    0x18, 0x5B, 0x5F, 0x02, 0x8B, 0x50, 0x08, 0x8D, 0x44, 0x24, 0x04, 0x68,
+    0x14, 0x5B, 0x5F, 0x02, 0x50, 0x89, 0x15, 0x1C, 0x5B, 0x5F, 0x02, 0xE8,
+    0x9C, 0xAD, 0x74, 0x00, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x08,
+    0x83, 0xC4, 0x08, 0xD9, 0x05, 0xE8, 0x6B, 0x52, 0x02, 0xD8, 0xD9, 0xDF,
+    0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x0A, 0xD9, 0x1D, 0xE8, 0x6B, 0x52, 0x02,
+    0x83, 0xC4, 0x10, 0xC3, 0xDD, 0xD8, 0x83, 0xC4, 0x10, 0xC3,
+];
+const C187: [usize; 1] = [0x5f];
+const B188: [u8; 289] = [
+    0x83, 0xEC, 0x10, 0xD9, 0x05, 0x2C, 0x5B, 0x5F, 0x02, 0x56, 0x57, 0x8B,
+    0x3D, 0xD4, 0x03, 0x17, 0x02, 0xD8, 0x67, 0x14, 0xBE, 0xE8, 0x62, 0x5F,
+    0x02, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x44, 0x24, 0x0C, 0xD9, 0x05, 0x30,
+    0x5B, 0x5F, 0x02, 0xD8, 0x67, 0x18, 0xD9, 0x5C, 0x24, 0x10, 0x8B, 0x4C,
+    0x24, 0x10, 0xD9, 0x05, 0x34, 0x5B, 0x5F, 0x02, 0xD8, 0x67, 0x1C, 0x89,
+    0x0D, 0xEC, 0x62, 0x5F, 0x02, 0xA3, 0xE8, 0x62, 0x5F, 0x02, 0xD9, 0x5C,
+    0x24, 0x14, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0xEE, 0x89, 0x15, 0xF0, 0x62,
+    0x5F, 0x02, 0xD9, 0x1D, 0xEC, 0x62, 0x5F, 0x02, 0xE8, 0x5F, 0x8B, 0x74,
+    0x00, 0xD9, 0x05, 0x2C, 0x5B, 0x5F, 0x02, 0xD8, 0x67, 0x14, 0xD9, 0x5C,
+    0x24, 0x0C, 0x8B, 0x44, 0x24, 0x0C, 0xD9, 0x05, 0x30, 0x5B, 0x5F, 0x02,
+    0xD8, 0x67, 0x18, 0xD9, 0x5C, 0x24, 0x10, 0x8B, 0x4C, 0x24, 0x10, 0xD9,
+    0x05, 0x34, 0x5B, 0x5F, 0x02, 0xD8, 0x67, 0x1C, 0xA3, 0xF4, 0x62, 0x5F,
+    0x02, 0xA0, 0x48, 0x8B, 0x52, 0x02, 0x3C, 0x01, 0xD9, 0x5C, 0x24, 0x14,
+    0x8B, 0x54, 0x24, 0x14, 0xD9, 0xEE, 0x5F, 0xD9, 0x1D, 0x30, 0x39, 0xF5,
+    0x00, 0x89, 0x0D, 0xF8, 0x62, 0x5F, 0x02, 0x89, 0x15, 0xFC, 0x62, 0x5F,
+    0x02, 0x5E, 0x75, 0x12, 0x8A, 0x0D, 0x49, 0x8B, 0x52, 0x02, 0x84, 0xC9,
+    0x75, 0x08, 0xD9, 0x05, 0x94, 0x07, 0xDD, 0x00, 0xEB, 0x06, 0xD9, 0x05,
+    0x1C, 0x07, 0xDD, 0x00, 0xD9, 0x1C, 0x24, 0x51, 0xD9, 0x44, 0x24, 0x04,
+    0xDC, 0x35, 0xD8, 0xC3, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44,
+    0x24, 0x04, 0xD9, 0x1C, 0x24, 0xE8, 0xA2, 0x93, 0xF7, 0xFF, 0xD9, 0x1D,
+    0x2C, 0x39, 0xF5, 0x00, 0x8B, 0x15, 0x64, 0xA6, 0xE9, 0x00, 0xA1, 0x68,
+    0xA6, 0xE9, 0x00, 0x8B, 0x0D, 0x6C, 0xA6, 0xE9, 0x00, 0x89, 0x15, 0x00,
+    0x63, 0x5F, 0x02, 0xA3, 0x04, 0x63, 0x5F, 0x02, 0x89, 0x0D, 0x08, 0x63,
+    0x5F, 0x02, 0xC6, 0x05, 0x28, 0x39, 0xF5, 0x00, 0x00, 0x83, 0xC4, 0x14,
+    0xC3,
+];
+const C188: [usize; 2] = [0x5c, 0xe9];
+const B189: [u8; 315] = [
+    0x51, 0xA1, 0xC0, 0xA6, 0xE9, 0x00, 0x85, 0xC0, 0x56, 0x8B, 0x35, 0xAC,
+    0x43, 0xE8, 0x00, 0x7C, 0x0D, 0x3B, 0xC6, 0x7E, 0x41, 0x2B, 0xC6, 0x3D,
+    0x00, 0xE9, 0xA4, 0x35, 0x7C, 0x44, 0x85, 0xFF, 0xD9, 0x44, 0x24, 0x0C,
+    0x8D, 0x04, 0x3E, 0xD9, 0x1D, 0xA8, 0x3A, 0xF5, 0x00, 0xA3, 0xC0, 0xA6,
+    0xE9, 0x00, 0x0F, 0x8C, 0xEC, 0x00, 0x00, 0x00, 0x3D, 0x00, 0xD2, 0x49,
+    0x6B, 0x0F, 0x8E, 0xEF, 0x00, 0x00, 0x00, 0x2D, 0x00, 0xD2, 0x49, 0x6B,
+    0xA3, 0xC0, 0xA6, 0xE9, 0x00, 0x89, 0x3D, 0xB0, 0x3A, 0xF5, 0x00, 0x5E,
+    0x59, 0xC3, 0x8B, 0xCE, 0x2B, 0xC8, 0x81, 0xF9, 0x00, 0xE9, 0xA4, 0x35,
+    0x7C, 0xBC, 0xB8, 0xC0, 0xA6, 0xE9, 0x00, 0xE8, 0x54, 0xC5, 0x73, 0x00,
+    0x8B, 0xC8, 0x89, 0x4C, 0x24, 0x04, 0xDB, 0x44, 0x24, 0x04, 0xDA, 0x35,
+    0xB0, 0x3A, 0xF5, 0x00, 0xD9, 0xE8, 0xDE, 0xE1, 0xD9, 0x5C, 0x24, 0x04,
+    0xD9, 0x05, 0x50, 0x48, 0xE4, 0x00, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0xD1,
+    0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x05, 0x7A, 0x18, 0xDC, 0x0D, 0x70,
+    0xC2, 0xE5, 0x00, 0xD9, 0x05, 0xA8, 0x3A, 0xF5, 0x00, 0xD9, 0xEE, 0xDC,
+    0xE9, 0xD9, 0xCA, 0xDE, 0xC9, 0xDE, 0xC1, 0xEB, 0x1C, 0xDC, 0x25, 0xC8,
+    0xBF, 0xE5, 0x00, 0xDC, 0x35, 0x70, 0xC3, 0xE5, 0x00, 0xD9, 0x05, 0xA8,
+    0x3A, 0xF5, 0x00, 0xD9, 0xC0, 0xD9, 0xEE, 0xDE, 0xE1, 0xDE, 0xCA, 0xDE,
+    0xC1, 0x8B, 0xC1, 0xD9, 0x1D, 0xA8, 0x3A, 0xF5, 0x00, 0xD9, 0x05, 0xA8,
+    0x3A, 0xF5, 0x00, 0x99, 0xD8, 0x44, 0x24, 0x0C, 0x2B, 0xC2, 0xD1, 0xF8,
+    0x03, 0xC7, 0xD9, 0x1D, 0xA8, 0x3A, 0xF5, 0x00, 0xA3, 0xB0, 0x3A, 0xF5,
+    0x00, 0x78, 0x1B, 0x03, 0xC6, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0xC0,
+    0xA6, 0xE9, 0x00, 0x7E, 0x37, 0x2D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0xC0,
+    0xA6, 0xE9, 0x00, 0x5E, 0x59, 0xC3, 0x03, 0xC6, 0xA3, 0xC0, 0xA6, 0xE9,
+    0x00, 0x79, 0x21, 0x05, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0xC0, 0xA6, 0xE9,
+    0x00, 0x5E, 0x59, 0xC3, 0x85, 0xC0, 0x7D, 0x0A, 0x05, 0x00, 0xD2, 0x49,
+    0x6B, 0xA3, 0xC0, 0xA6, 0xE9, 0x00, 0x89, 0x3D, 0xB0, 0x3A, 0xF5, 0x00,
+    0x5E, 0x59, 0xC3,
+];
+const C189: [usize; 1] = [0x67];
+const B190: [u8; 93] = [
+    0xD9, 0x44, 0x24, 0x04, 0xDC, 0x0D, 0x90, 0xC1, 0xE5, 0x00, 0xD9, 0x5C,
+    0x24, 0x04, 0xD9, 0xEE, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0xD1, 0xDF, 0xE0,
+    0xDD, 0xD9, 0xF6, 0xC4, 0x01, 0x75, 0x08, 0xDC, 0x05, 0x70, 0xBF, 0xE5,
+    0x00, 0xEB, 0x06, 0xDC, 0x25, 0x70, 0xBF, 0xE5, 0x00, 0xE8, 0x8E, 0xDA,
+    0x8E, 0x00, 0x3D, 0x00, 0x94, 0x35, 0x77, 0x7E, 0x0B, 0xC7, 0x06, 0x00,
+    0x94, 0x35, 0x77, 0x8B, 0xC6, 0xC2, 0x04, 0x00, 0x3D, 0x00, 0x6C, 0xCA,
+    0x88, 0x7D, 0x0B, 0xC7, 0x06, 0x00, 0x6C, 0xCA, 0x88, 0x8B, 0xC6, 0xC2,
+    0x04, 0x00, 0x89, 0x06, 0x8B, 0xC6, 0xC2, 0x04, 0x00,
+];
+const C190: [usize; 1] = [0x2d];
+const B191: [u8; 104] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x08, 0x83, 0xEC, 0x08, 0x85, 0xC9, 0x75,
+    0x0F, 0x8B, 0x4C, 0x24, 0x10, 0x33, 0xC0, 0x39, 0x01, 0x0F, 0x94, 0xC0,
+    0x83, 0xC4, 0x08, 0xC3, 0x8B, 0x54, 0x24, 0x10, 0x8B, 0x12, 0x85, 0xD2,
+    0x75, 0x06, 0xB0, 0x01, 0x83, 0xC4, 0x08, 0xC3, 0x64, 0xA1, 0x2C, 0x00,
+    0x00, 0x00, 0x8B, 0x00, 0x8B, 0x40, 0x58, 0x05, 0x10, 0x07, 0x00, 0x00,
+    0x83, 0xC1, 0x04, 0xE8, 0xDC, 0xAE, 0x6B, 0x00, 0xDD, 0x1C, 0x24, 0x8D,
+    0x4A, 0x04, 0xE8, 0xD1, 0xAE, 0x6B, 0x00, 0xDC, 0x1C, 0x24, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x41, 0x75, 0x09, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x83, 0xC4,
+    0x08, 0xC3, 0x33, 0xC0, 0x83, 0xC4, 0x08, 0xC3,
+];
+const C191: [usize; 2] = [0x3f, 0x4a];
+const B192: [u8; 67] = [
+    0x51, 0x83, 0x3D, 0xF8, 0xD7, 0xE9, 0x00, 0x00, 0x7D, 0x1B, 0xA1, 0xAC,
+    0x43, 0xE8, 0x00, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0xF8, 0xD7, 0xE9,
+    0x00, 0x7E, 0x0A, 0x05, 0x00, 0x2E, 0xB6, 0x94, 0xA3, 0xF8, 0xD7, 0xE9,
+    0x00, 0xB8, 0xF8, 0xD7, 0xE9, 0x00, 0xE8, 0xD1, 0x92, 0x6B, 0x00, 0x89,
+    0x04, 0x24, 0xDB, 0x04, 0x24, 0xDC, 0x0D, 0xE0, 0xBF, 0xE5, 0x00, 0xD9,
+    0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC3,
+];
+const C192: [usize; 1] = [0x2a];
+const B193: [u8; 195] = [
+    0x83, 0xEC, 0x0C, 0x56, 0x57, 0x8B, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x8B,
+    0xF1, 0xE8, 0x0E, 0x99, 0x40, 0x00, 0xD9, 0x47, 0x14, 0xD8, 0xA6, 0x08,
+    0x01, 0x00, 0x00, 0x81, 0xC6, 0x08, 0x01, 0x00, 0x00, 0x85, 0xC0, 0xD9,
+    0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x08, 0xDC, 0xC8, 0xD9, 0x5C, 0x24,
+    0x10, 0xD9, 0x47, 0x18, 0xD8, 0x66, 0x04, 0xD9, 0x5C, 0x24, 0x08, 0xD9,
+    0x44, 0x24, 0x08, 0xDC, 0xC8, 0xD8, 0x44, 0x24, 0x10, 0xD9, 0x5C, 0x24,
+    0x10, 0xD9, 0x47, 0x1C, 0xD8, 0x66, 0x08, 0xD9, 0x5C, 0x24, 0x08, 0xD9,
+    0x44, 0x24, 0x08, 0xDC, 0xC8, 0xD8, 0x44, 0x24, 0x10, 0xD9, 0x5C, 0x24,
+    0x10, 0x74, 0x2C, 0xD9, 0x44, 0x24, 0x10, 0x8D, 0x78, 0x14, 0x8B, 0xC6,
+    0xDD, 0x5C, 0x24, 0x08, 0x8B, 0xCF, 0xE8, 0xF9, 0x66, 0xE3, 0xFF, 0xDC,
+    0x5C, 0x24, 0x08, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x74, 0x0D, 0x8B, 0xC6,
+    0x8B, 0xCF, 0xE8, 0xE5, 0x66, 0xE3, 0xFF, 0xD9, 0x5C, 0x24, 0x10, 0xD9,
+    0x44, 0x24, 0x18, 0x5F, 0xD9, 0x44, 0x24, 0x0C, 0x5E, 0xD9, 0xC1, 0xDE,
+    0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x10, 0xDE,
+    0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x0B, 0xB8, 0x01, 0x00, 0x00,
+    0x00, 0x83, 0xC4, 0x0C, 0xC2, 0x04, 0x00, 0x33, 0xC0, 0x83, 0xC4, 0x0C,
+    0xC2, 0x04, 0x00,
+];
+const C193: [usize; 3] = [0xd, 0x72, 0x86];
+const B194: [u8; 185] = [
+    0x83, 0xEC, 0x08, 0x56, 0x8B, 0xF1, 0x83, 0xBE, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x8D, 0x86, 0x00, 0x01, 0x00, 0x00, 0x7D, 0x07, 0xD9, 0xE8, 0x5E,
+    0x83, 0xC4, 0x08, 0xC3, 0xE8, 0x6F, 0xCE, 0x60, 0x00, 0x89, 0x44, 0x24,
+    0x04, 0xDB, 0x44, 0x24, 0x04, 0xD9, 0x5C, 0x24, 0x04, 0xDB, 0x86, 0x04,
+    0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0xEE, 0xD9, 0x44, 0x24,
+    0x04, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x06, 0xD9, 0x54,
+    0x24, 0x04, 0xEB, 0x08, 0xD9, 0xC9, 0xD9, 0x54, 0x24, 0x04, 0xD9, 0xC9,
+    0xD9, 0x44, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x08, 0xD8, 0xD1, 0xDF, 0xE0,
+    0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0x75, 0x26, 0xD9, 0xC9, 0xD8, 0xD2, 0xDF,
+    0xE0, 0xF6, 0xC4, 0x41, 0x74, 0x36, 0xDD, 0xD8, 0x5E, 0xD9, 0xC9, 0xD9,
+    0x1C, 0x24, 0xD9, 0x04, 0x24, 0xD9, 0xC9, 0xDE, 0xF9, 0xD9, 0x5C, 0x24,
+    0x04, 0xD9, 0x44, 0x24, 0x04, 0x83, 0xC4, 0x08, 0xC3, 0xDD, 0xD9, 0x5E,
+    0xDD, 0xD9, 0xD9, 0x14, 0x24, 0xD9, 0x04, 0x24, 0xD9, 0xC9, 0xDE, 0xF9,
+    0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0x83, 0xC4, 0x08, 0xC3,
+    0xDD, 0xDA, 0x5E, 0xDE, 0xF9, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24,
+    0x04, 0x83, 0xC4, 0x08, 0xC3,
+];
+const C194: [usize; 1] = [0x1c];
+const B195: [u8; 178] = [
+    0x83, 0xEC, 0x18, 0xD9, 0xEE, 0x53, 0x8B, 0x5C, 0x24, 0x20, 0xD9, 0x5C,
+    0x24, 0x08, 0x55, 0x56, 0x57, 0x33, 0xFF, 0x33, 0xED, 0x39, 0x3D, 0x6C,
+    0x86, 0x52, 0x02, 0x0F, 0x8E, 0x87, 0x00, 0x00, 0x00, 0x8B, 0x34, 0xBD,
+    0x70, 0x16, 0xF9, 0x01, 0xD9, 0x43, 0x14, 0xD8, 0x66, 0x14, 0x51, 0xD9,
+    0x5C, 0x24, 0x20, 0xD9, 0x43, 0x18, 0xD8, 0x66, 0x18, 0xD9, 0x5C, 0x24,
+    0x24, 0xD9, 0x43, 0x1C, 0xD8, 0x66, 0x1C, 0xD9, 0x5C, 0x24, 0x28, 0xD9,
+    0x44, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x24, 0xD9, 0x44, 0x24, 0x28, 0xD9,
+    0xC1, 0xDE, 0xCA, 0xD9, 0xC2, 0xDE, 0xCB, 0xD9, 0xC9, 0xDE, 0xC2, 0xDC,
+    0xC8, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x1C, 0xD9,
+    0x1C, 0x24, 0xE8, 0x7D, 0x52, 0xC6, 0xFF, 0xD9, 0x5C, 0x24, 0x1C, 0x83,
+    0xC4, 0x04, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0xD9,
+    0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x74, 0x04, 0x85, 0xED, 0x75, 0x08, 0xD9,
+    0x5C, 0x24, 0x14, 0x8B, 0xEE, 0xEB, 0x02, 0xDD, 0xD8, 0x83, 0xC7, 0x01,
+    0x3B, 0x3D, 0x6C, 0x86, 0x52, 0x02, 0x0F, 0x8C, 0x79, 0xFF, 0xFF, 0xFF,
+    0x5F, 0x5E, 0x8B, 0xC5, 0x5D, 0x5B, 0x83, 0xC4, 0x18, 0xC3,
+];
+const C195: [usize; 1] = [0x6e];
+const B196: [u8; 237] = [
+    0x53, 0x56, 0x8B, 0x74, 0x24, 0x14, 0xD9, 0x46, 0x10, 0xBB, 0x01, 0x00,
+    0x00, 0x00, 0x38, 0x5E, 0x0F, 0xD8, 0x64, 0x24, 0x0C, 0x57, 0x8B, 0xF9,
+    0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0x56, 0x10, 0x75,
+    0x10, 0xD9, 0xEE, 0xDE, 0xD9, 0xDF, 0xE0, 0x84, 0xE3, 0x75, 0x08, 0xC6,
+    0x46, 0x0F, 0x00, 0xEB, 0x02, 0xDD, 0xD8, 0x38, 0x5E, 0x0D, 0x0F, 0x84,
+    0xA7, 0x00, 0x00, 0x00, 0x55, 0x8B, 0x6C, 0x24, 0x18, 0x83, 0xBD, 0x50,
+    0x01, 0x00, 0x00, 0x00, 0x8D, 0x85, 0x50, 0x01, 0x00, 0x00, 0x7C, 0x15,
+    0xE8, 0x67, 0xC5, 0x0D, 0x00, 0x85, 0xC0, 0x7C, 0x0C, 0x3D, 0xF4, 0x01,
+    0x00, 0x00, 0x0F, 0x97, 0xC0, 0x84, 0xC0, 0x74, 0x7D, 0x8A, 0x4E, 0x0E,
+    0x84, 0xC9, 0x7E, 0x23, 0xD9, 0x06, 0x8B, 0x57, 0x34, 0x0F, 0xBE, 0xC1,
+    0xD9, 0x44, 0x82, 0xFC, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75,
+    0x0E, 0x2A, 0xCB, 0x88, 0x4E, 0x0E, 0xD9, 0x47, 0x14, 0xD9, 0x5E, 0x10,
+    0x88, 0x5E, 0x0F, 0xF6, 0x85, 0x80, 0x01, 0x00, 0x00, 0x02, 0x75, 0x4A,
+    0x83, 0xBD, 0x7C, 0x01, 0x00, 0x00, 0x00, 0x8D, 0x85, 0x7C, 0x01, 0x00,
+    0x00, 0x7C, 0x12, 0xE8, 0xD0, 0xC4, 0x0D, 0x00, 0x33, 0xC9, 0x85, 0xC0,
+    0x0F, 0x9C, 0xC1, 0x2B, 0xCB, 0x23, 0xC8, 0x77, 0x29, 0xD9, 0x06, 0xD9,
+    0x47, 0x0C, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x1B, 0x8A,
+    0x46, 0x0E, 0x0F, 0xBE, 0xD0, 0x03, 0xD3, 0x3B, 0x57, 0x20, 0x7D, 0x0E,
+    0x02, 0xC3, 0x88, 0x46, 0x0E, 0xD9, 0x47, 0x14, 0xD9, 0x5E, 0x10, 0x88,
+    0x5E, 0x0F, 0x5D, 0x5F, 0x5E, 0x5B, 0xC2, 0x0C, 0x00,
+];
+const C196: [usize; 2] = [0x54, 0xab];
+const B197: [u8; 488] = [
+    0x83, 0xEC, 0x58, 0x53, 0x8B, 0x5C, 0x24, 0x60, 0x8B, 0x83, 0x8C, 0x00,
+    0x00, 0x00, 0x85, 0xC0, 0x56, 0x74, 0x02, 0x89, 0x07, 0x80, 0x7F, 0x14,
+    0x00, 0x75, 0x0A, 0x80, 0x7B, 0x58, 0x00, 0x75, 0x04, 0x33, 0xC0, 0xEB,
+    0x05, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x88, 0x47, 0x14, 0xD9, 0x43, 0x7C,
+    0xD8, 0x4F, 0x04, 0x51, 0xD9, 0x5F, 0x04, 0xD9, 0x83, 0x80, 0x00, 0x00,
+    0x00, 0xD8, 0x4F, 0x08, 0xD9, 0x5F, 0x08, 0xD9, 0x83, 0x84, 0x00, 0x00,
+    0x00, 0xD8, 0x4F, 0x0C, 0xD9, 0x5F, 0x0C, 0xD9, 0x83, 0x88, 0x00, 0x00,
+    0x00, 0xD8, 0x4F, 0x10, 0xD9, 0x5F, 0x10, 0xD9, 0x43, 0x78, 0xD9, 0x5C,
+    0x24, 0x68, 0xD9, 0x44, 0x24, 0x68, 0xD9, 0x1C, 0x24, 0xE8, 0xB2, 0x34,
+    0x89, 0xFF, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x68, 0xD9, 0x1C,
+    0x24, 0xE8, 0xF2, 0x5F, 0x87, 0xFF, 0xD9, 0x5C, 0x24, 0x68, 0x8D, 0x77,
+    0x34, 0xD9, 0x44, 0x24, 0x68, 0x83, 0xC4, 0x04, 0xD9, 0x54, 0x24, 0x18,
+    0x56, 0xD9, 0x44, 0x24, 0x0C, 0x8D, 0x54, 0x24, 0x1C, 0xD9, 0xC0, 0x8D,
+    0x44, 0x24, 0x4C, 0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0xEE, 0xD9,
+    0x54, 0x24, 0x24, 0xD9, 0x54, 0x24, 0x30, 0xD9, 0xC9, 0xD9, 0x5C, 0x24,
+    0x28, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x83, 0x90, 0x00, 0x00,
+    0x00, 0xD9, 0x5C, 0x24, 0x34, 0xD9, 0x54, 0x24, 0x38, 0xD9, 0x54, 0x24,
+    0x3C, 0xD9, 0x54, 0x24, 0x40, 0xD9, 0x83, 0x94, 0x00, 0x00, 0x00, 0xD9,
+    0x5C, 0x24, 0x44, 0xD9, 0x5C, 0x24, 0x48, 0xD9, 0x46, 0x04, 0xD8, 0x4B,
+    0x60, 0xD9, 0x06, 0xD8, 0x4B, 0x5C, 0xDE, 0xC1, 0xD8, 0x46, 0x08, 0xD9,
+    0x5C, 0x24, 0x0C, 0xD9, 0x46, 0x10, 0xD8, 0x4B, 0x60, 0xD9, 0x46, 0x0C,
+    0xD8, 0x4B, 0x5C, 0xDE, 0xC1, 0xD8, 0x46, 0x14, 0xD9, 0x5C, 0x24, 0x10,
+    0xD9, 0x47, 0x2C, 0xD8, 0x44, 0x24, 0x0C, 0xD9, 0x5F, 0x2C, 0xD9, 0x47,
+    0x30, 0xD8, 0x44, 0x24, 0x10, 0xD9, 0x5F, 0x30, 0xE8, 0x5F, 0x46, 0xB9,
+    0xFF, 0x8B, 0x08, 0x89, 0x0E, 0x8B, 0x50, 0x04, 0x89, 0x56, 0x04, 0x8B,
+    0x48, 0x08, 0x89, 0x4E, 0x08, 0x8B, 0x50, 0x0C, 0x89, 0x56, 0x0C, 0x8B,
+    0x48, 0x10, 0x89, 0x4E, 0x10, 0x8B, 0x50, 0x14, 0x89, 0x56, 0x14, 0x56,
+    0x8D, 0x54, 0x24, 0x34, 0x8D, 0x44, 0x24, 0x4C, 0xE8, 0x2F, 0x46, 0xB9,
+    0xFF, 0x8B, 0x08, 0x89, 0x0E, 0x8B, 0x50, 0x04, 0x89, 0x56, 0x04, 0x8B,
+    0x48, 0x08, 0x89, 0x4E, 0x08, 0x8B, 0x50, 0x0C, 0x89, 0x56, 0x0C, 0x8B,
+    0x48, 0x10, 0x89, 0x4E, 0x10, 0x8B, 0x50, 0x14, 0x89, 0x56, 0x14, 0xD9,
+    0x46, 0x04, 0xD8, 0x4B, 0x68, 0xD9, 0x43, 0x64, 0xD8, 0x0E, 0xDE, 0xC1,
+    0xD8, 0x46, 0x08, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x46, 0x10, 0xD8, 0x4B,
+    0x68, 0xD9, 0x46, 0x0C, 0xD8, 0x4B, 0x64, 0xDE, 0xC1, 0xD8, 0x46, 0x14,
+    0x5E, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x47, 0x2C, 0xD8, 0x44, 0x24, 0x04,
+    0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x44, 0x24, 0x0C, 0xD9, 0x47, 0x30, 0x89,
+    0x47, 0x4C, 0xD8, 0x44, 0x24, 0x08, 0xD9, 0x5C, 0x24, 0x10, 0x8B, 0x4C,
+    0x24, 0x10, 0x89, 0x4F, 0x50, 0xD9, 0x83, 0x94, 0x00, 0x00, 0x00, 0xD8,
+    0x4F, 0x28, 0xD9, 0x5C, 0x24, 0x60, 0xD9, 0x83, 0x90, 0x00, 0x00, 0x00,
+    0x5B, 0xD8, 0x4F, 0x24, 0xD9, 0x5F, 0x24, 0xD9, 0x44, 0x24, 0x5C, 0xD9,
+    0x5F, 0x28, 0x83, 0xC4, 0x58, 0xC2, 0x04, 0x00,
+];
+const C197: [usize; 4] = [0x69, 0x79, 0x11c, 0x14c];
+const B198: [u8; 111] = [
+    0xD9, 0xEE, 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x08, 0x8B, 0x01, 0x83,
+    0xE8, 0x01, 0x74, 0x27, 0x83, 0xE8, 0x01, 0x74, 0x10, 0x83, 0xE8, 0x01,
+    0x74, 0x06, 0xD9, 0x54, 0x24, 0x08, 0xEB, 0x1E, 0xD9, 0x41, 0x04, 0xEB,
+    0x15, 0x8B, 0x41, 0x04, 0xDB, 0x41, 0x04, 0x85, 0xC0, 0x7D, 0x0B, 0xD8,
+    0x05, 0xD8, 0xBF, 0xE5, 0x00, 0xEB, 0x03, 0xDB, 0x41, 0x04, 0xD9, 0x5C,
+    0x24, 0x08, 0xD9, 0x44, 0x24, 0x08, 0xD9, 0x56, 0x7C, 0xD8, 0xD9, 0xDF,
+    0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x05, 0xD9, 0x5E, 0x7C, 0xEB, 0x02, 0xDD,
+    0xD8, 0xD9, 0x46, 0x74, 0xD8, 0x46, 0x7C, 0xDC, 0x0D, 0xC8, 0xC0, 0xE5,
+    0x00, 0xE8, 0x0A, 0x0A, 0x20, 0x00, 0x89, 0x46, 0x78, 0xB0, 0x01, 0x5E,
+    0xC2, 0x08, 0x00,
+];
+const C198: [usize; 1] = [0x61];
+const B199: [u8; 88] = [
+    0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x08, 0x8B, 0x01, 0x83, 0xE8, 0x01,
+    0x74, 0x25, 0x83, 0xE8, 0x01, 0x74, 0x0E, 0x83, 0xE8, 0x01, 0x74, 0x04,
+    0xD9, 0xEE, 0xEB, 0x1A, 0xD9, 0x41, 0x04, 0xEB, 0x15, 0x8B, 0x41, 0x04,
+    0xDB, 0x41, 0x04, 0x85, 0xC0, 0x7D, 0x0B, 0xD8, 0x05, 0xD8, 0xBF, 0xE5,
+    0x00, 0xEB, 0x03, 0xDB, 0x41, 0x04, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44,
+    0x24, 0x08, 0xD9, 0x56, 0x74, 0xD8, 0x46, 0x7C, 0xDC, 0x0D, 0xC8, 0xC0,
+    0xE5, 0x00, 0xE8, 0x31, 0x09, 0x20, 0x00, 0x89, 0x46, 0x78, 0xB0, 0x01,
+    0x5E, 0xC2, 0x08, 0x00,
+];
+const C199: [usize; 1] = [0x4a];
+const B200: [u8; 216] = [
+    0x83, 0xEC, 0x08, 0xD9, 0xEE, 0x8B, 0x44, 0x24, 0x0C, 0x83, 0x38, 0x07,
+    0xD9, 0x14, 0x24, 0x56, 0xD9, 0x54, 0x24, 0x08, 0x57, 0x8B, 0xF1, 0x75,
+    0x45, 0xD9, 0x40, 0x04, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x40, 0x08, 0xD9,
+    0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x08, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x01, 0x74, 0x2E, 0xDD, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0xDC, 0xE9,
+    0xD9, 0xC9, 0xE8, 0x9D, 0xEF, 0x1F, 0x00, 0xD9, 0x44, 0x24, 0x0C, 0xD8,
+    0xD2, 0x8B, 0xF8, 0x89, 0xBE, 0xA8, 0x00, 0x00, 0x00, 0xDF, 0xE0, 0xDD,
+    0xDA, 0xF6, 0xC4, 0x01, 0x75, 0x12, 0xDE, 0xC1, 0xEB, 0x10, 0xD9, 0x44,
+    0x24, 0x08, 0xDD, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0xDC, 0xC1, 0xEB, 0xD0,
+    0xDE, 0xE9, 0xE8, 0x6D, 0xEF, 0x1F, 0x00, 0x89, 0x86, 0xAC, 0x00, 0x00,
+    0x00, 0x83, 0xBE, 0x98, 0x00, 0x00, 0x00, 0x09, 0x75, 0x4C, 0x8B, 0x96,
+    0x9C, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x74, 0x42, 0x0F, 0xB7, 0xCA, 0x81,
+    0xF9, 0xF0, 0x00, 0x00, 0x00, 0x73, 0x37, 0x8D, 0x0C, 0xC9, 0x39, 0x14,
+    0x8D, 0x2C, 0xC5, 0x1B, 0x03, 0x8D, 0x0C, 0x8D, 0x18, 0xC5, 0x1B, 0x03,
+    0x75, 0x24, 0x8B, 0x8E, 0xBC, 0x00, 0x00, 0x00, 0x3B, 0xC1, 0x7D, 0x02,
+    0x8B, 0xC8, 0x8B, 0x86, 0xB8, 0x00, 0x00, 0x00, 0x3B, 0xF8, 0x7D, 0x02,
+    0x8B, 0xC7, 0x89, 0x86, 0xA8, 0x00, 0x00, 0x00, 0x89, 0x8E, 0xAC, 0x00,
+    0x00, 0x00, 0x5F, 0xB0, 0x01, 0x5E, 0x83, 0xC4, 0x08, 0xC2, 0x08, 0x00,
+];
+const C200: [usize; 2] = [0x3e, 0x6e];
+const B201: [u8; 216] = [
+    0x83, 0xEC, 0x08, 0xD9, 0xEE, 0x8B, 0x44, 0x24, 0x0C, 0x83, 0x38, 0x07,
+    0xD9, 0x14, 0x24, 0x56, 0xD9, 0x54, 0x24, 0x08, 0x57, 0x8B, 0xF1, 0x75,
+    0x45, 0xD9, 0x40, 0x04, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x40, 0x08, 0xD9,
+    0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x08, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x01, 0x74, 0x2E, 0xDD, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0xDC, 0xE9,
+    0xD9, 0xC9, 0xE8, 0x3D, 0xEE, 0x1F, 0x00, 0xD9, 0x44, 0x24, 0x0C, 0xD8,
+    0xD2, 0x8B, 0xF8, 0x89, 0xBE, 0xB0, 0x00, 0x00, 0x00, 0xDF, 0xE0, 0xDD,
+    0xDA, 0xF6, 0xC4, 0x01, 0x75, 0x12, 0xDE, 0xC1, 0xEB, 0x10, 0xD9, 0x44,
+    0x24, 0x08, 0xDD, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0xDC, 0xC1, 0xEB, 0xD0,
+    0xDE, 0xE9, 0xE8, 0x0D, 0xEE, 0x1F, 0x00, 0x89, 0x86, 0xB4, 0x00, 0x00,
+    0x00, 0x83, 0xBE, 0x98, 0x00, 0x00, 0x00, 0x09, 0x75, 0x4C, 0x8B, 0x96,
+    0x9C, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x74, 0x42, 0x0F, 0xB7, 0xCA, 0x81,
+    0xF9, 0xF0, 0x00, 0x00, 0x00, 0x73, 0x37, 0x8D, 0x0C, 0xC9, 0x39, 0x14,
+    0x8D, 0x2C, 0xC5, 0x1B, 0x03, 0x8D, 0x0C, 0x8D, 0x18, 0xC5, 0x1B, 0x03,
+    0x75, 0x24, 0x8B, 0x8E, 0xBC, 0x00, 0x00, 0x00, 0x3B, 0xC1, 0x7D, 0x02,
+    0x8B, 0xC8, 0x8B, 0x86, 0xB8, 0x00, 0x00, 0x00, 0x3B, 0xF8, 0x7D, 0x02,
+    0x8B, 0xC7, 0x89, 0x86, 0xB0, 0x00, 0x00, 0x00, 0x89, 0x8E, 0xB4, 0x00,
+    0x00, 0x00, 0x5F, 0x32, 0xC0, 0x5E, 0x83, 0xC4, 0x08, 0xC2, 0x08, 0x00,
+];
+const C201: [usize; 2] = [0x3e, 0x6e];
+const B202: [u8; 216] = [
+    0x83, 0xEC, 0x08, 0xD9, 0xEE, 0x8B, 0x44, 0x24, 0x0C, 0x83, 0x38, 0x07,
+    0xD9, 0x14, 0x24, 0x56, 0xD9, 0x54, 0x24, 0x08, 0x57, 0x8B, 0xF1, 0x75,
+    0x45, 0xD9, 0x40, 0x04, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x40, 0x08, 0xD9,
+    0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x08, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x01, 0x74, 0x2E, 0xDD, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0xDC, 0xE9,
+    0xD9, 0xC9, 0xE8, 0x0D, 0xA8, 0x1F, 0x00, 0xD9, 0x44, 0x24, 0x0C, 0xD8,
+    0xD2, 0x8B, 0xF8, 0x89, 0xBE, 0xA8, 0x00, 0x00, 0x00, 0xDF, 0xE0, 0xDD,
+    0xDA, 0xF6, 0xC4, 0x01, 0x75, 0x12, 0xDE, 0xC1, 0xEB, 0x10, 0xD9, 0x44,
+    0x24, 0x08, 0xDD, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0xDC, 0xC1, 0xEB, 0xD0,
+    0xDE, 0xE9, 0xE8, 0xDD, 0xA7, 0x1F, 0x00, 0x89, 0x86, 0xAC, 0x00, 0x00,
+    0x00, 0x83, 0xBE, 0x98, 0x00, 0x00, 0x00, 0x09, 0x75, 0x4C, 0x8B, 0x96,
+    0x9C, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x74, 0x42, 0x0F, 0xB7, 0xCA, 0x81,
+    0xF9, 0xF0, 0x00, 0x00, 0x00, 0x73, 0x37, 0x8D, 0x0C, 0xC9, 0x39, 0x14,
+    0x8D, 0x2C, 0xC5, 0x1B, 0x03, 0x8D, 0x0C, 0x8D, 0x18, 0xC5, 0x1B, 0x03,
+    0x75, 0x24, 0x8B, 0x8E, 0xBC, 0x00, 0x00, 0x00, 0x3B, 0xC1, 0x7D, 0x02,
+    0x8B, 0xC8, 0x8B, 0x86, 0xB8, 0x00, 0x00, 0x00, 0x3B, 0xF8, 0x7D, 0x02,
+    0x8B, 0xC7, 0x89, 0x86, 0xA8, 0x00, 0x00, 0x00, 0x89, 0x8E, 0xAC, 0x00,
+    0x00, 0x00, 0x5F, 0xB0, 0x01, 0x5E, 0x83, 0xC4, 0x08, 0xC2, 0x08, 0x00,
+];
+const C202: [usize; 2] = [0x3e, 0x6e];
+const B203: [u8; 216] = [
+    0x83, 0xEC, 0x08, 0xD9, 0xEE, 0x8B, 0x44, 0x24, 0x0C, 0x83, 0x38, 0x07,
+    0xD9, 0x14, 0x24, 0x56, 0xD9, 0x54, 0x24, 0x08, 0x57, 0x8B, 0xF1, 0x75,
+    0x45, 0xD9, 0x40, 0x04, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x40, 0x08, 0xD9,
+    0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x08, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x01, 0x74, 0x2E, 0xDD, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0xDC, 0xE9,
+    0xD9, 0xC9, 0xE8, 0xAD, 0xA6, 0x1F, 0x00, 0xD9, 0x44, 0x24, 0x0C, 0xD8,
+    0xD2, 0x8B, 0xF8, 0x89, 0xBE, 0xB0, 0x00, 0x00, 0x00, 0xDF, 0xE0, 0xDD,
+    0xDA, 0xF6, 0xC4, 0x01, 0x75, 0x12, 0xDE, 0xC1, 0xEB, 0x10, 0xD9, 0x44,
+    0x24, 0x08, 0xDD, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0xDC, 0xC1, 0xEB, 0xD0,
+    0xDE, 0xE9, 0xE8, 0x7D, 0xA6, 0x1F, 0x00, 0x89, 0x86, 0xB4, 0x00, 0x00,
+    0x00, 0x83, 0xBE, 0x98, 0x00, 0x00, 0x00, 0x09, 0x75, 0x4C, 0x8B, 0x96,
+    0x9C, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x74, 0x42, 0x0F, 0xB7, 0xCA, 0x81,
+    0xF9, 0xF0, 0x00, 0x00, 0x00, 0x73, 0x37, 0x8D, 0x0C, 0xC9, 0x39, 0x14,
+    0x8D, 0x2C, 0xC5, 0x1B, 0x03, 0x8D, 0x0C, 0x8D, 0x18, 0xC5, 0x1B, 0x03,
+    0x75, 0x24, 0x8B, 0x8E, 0xBC, 0x00, 0x00, 0x00, 0x3B, 0xC1, 0x7D, 0x02,
+    0x8B, 0xC8, 0x8B, 0x86, 0xB8, 0x00, 0x00, 0x00, 0x3B, 0xF8, 0x7D, 0x02,
+    0x8B, 0xC7, 0x89, 0x86, 0xB0, 0x00, 0x00, 0x00, 0x89, 0x8E, 0xB4, 0x00,
+    0x00, 0x00, 0x5F, 0x32, 0xC0, 0x5E, 0x83, 0xC4, 0x08, 0xC2, 0x08, 0x00,
+];
+const C203: [usize; 2] = [0x3e, 0x6e];
+const B204: [u8; 201] = [
+    0x83, 0xEC, 0x14, 0xD9, 0x46, 0x04, 0x51, 0xD9, 0x5C, 0x24, 0x08, 0xD9,
+    0x44, 0x24, 0x08, 0xD9, 0x06, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24,
+    0x04, 0xD9, 0x46, 0x08, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C,
+    0xD9, 0xC1, 0xDE, 0xCA, 0xD9, 0xC2, 0xDE, 0xCB, 0xD9, 0xC9, 0xDE, 0xC2,
+    0xDC, 0xC8, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x10,
+    0xD9, 0x1C, 0x24, 0xE8, 0x9C, 0x06, 0x83, 0xFF, 0xD9, 0x5C, 0x24, 0x10,
+    0x83, 0xC4, 0x04, 0xD9, 0x44, 0x24, 0x0C, 0xDD, 0x05, 0xA0, 0xBF, 0xE5,
+    0x00, 0xD8, 0xE9, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x10, 0xDD,
+    0x05, 0xB8, 0xBF, 0xE5, 0x00, 0xDB, 0xF1, 0x76, 0x2B, 0xD9, 0xC9, 0xD9,
+    0xE0, 0xD9, 0xC9, 0xDF, 0xF1, 0xDD, 0xD8, 0x76, 0x23, 0xF3, 0x0F, 0x10,
+    0x05, 0x8C, 0x51, 0xDD, 0x00, 0xDD, 0xD8, 0xF3, 0x0F, 0x11, 0x06, 0x0F,
+    0x57, 0xC0, 0xF3, 0x0F, 0x11, 0x46, 0x04, 0xF3, 0x0F, 0x11, 0x46, 0x08,
+    0x83, 0xC4, 0x14, 0xC3, 0xDD, 0xD9, 0xDD, 0xD8, 0xD9, 0xE8, 0xF3, 0x0F,
+    0x10, 0x44, 0x24, 0x0C, 0xDE, 0xF1, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x04,
+    0x24, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9,
+    0x1E, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0xC9, 0xD9, 0x5E, 0x04, 0xD8, 0x4C,
+    0x24, 0x08, 0xD9, 0x5E, 0x08, 0x83, 0xC4, 0x14, 0xC3,
+];
+const C204: [usize; 1] = [0x3f];
+const B205: [u8; 110] = [
+    0x83, 0xEC, 0x0C, 0xB8, 0xF8, 0x30, 0xEC, 0x00, 0xE8, 0xD3, 0xE6, 0xFF,
+    0xFF, 0xDC, 0xC0, 0xDC, 0x25, 0x40, 0xBF, 0xE5, 0x00, 0xD9, 0x5E, 0x08,
+    0xE8, 0xC3, 0xE6, 0xFF, 0xFF, 0xDC, 0x0D, 0x78, 0xBF, 0xE5, 0x00, 0x51,
+    0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x46, 0x08, 0xDC, 0xC8, 0xD9, 0xE8, 0xDE,
+    0xE1, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x1C, 0x24,
+    0xE8, 0x8F, 0x02, 0x83, 0xFF, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24,
+    0x08, 0xD9, 0x1C, 0x24, 0xE8, 0x7F, 0xD0, 0x82, 0xFF, 0xD8, 0x4C, 0x24,
+    0x0C, 0xD9, 0x1E, 0xD9, 0x44, 0x24, 0x08, 0xD9, 0x1C, 0x24, 0xE8, 0x1D,
+    0xA5, 0x84, 0xFF, 0xD8, 0x4C, 0x24, 0x0C, 0xD9, 0x5E, 0x04, 0x83, 0xC4,
+    0x10, 0xC3,
+];
+const C205: [usize; 5] = [0x8, 0x18, 0x3c, 0x4c, 0x5e];
+const B206: [u8; 121] = [
+    0x51, 0xB8, 0xF8, 0x30, 0xEC, 0x00, 0xE8, 0x65, 0xE6, 0xFF, 0xFF, 0xD9,
+    0x44, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x08, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9,
+    0xCA, 0xDE, 0xC9, 0xDE, 0xC1, 0xD9, 0x5E, 0x08, 0xE8, 0x4B, 0xE6, 0xFF,
+    0xFF, 0xDC, 0x0D, 0x78, 0xBF, 0xE5, 0x00, 0x51, 0xD9, 0x5C, 0x24, 0x10,
+    0xD9, 0x46, 0x08, 0xDC, 0xC8, 0xD9, 0xE8, 0xDE, 0xE1, 0xD9, 0x5C, 0x24,
+    0x0C, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x1C, 0x24, 0xE8, 0x17, 0x02, 0x83,
+    0xFF, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0x1C, 0x24,
+    0xE8, 0x07, 0xD0, 0x82, 0xFF, 0xD8, 0x4C, 0x24, 0x0C, 0xD9, 0x1E, 0xD9,
+    0x44, 0x24, 0x10, 0xD9, 0x1C, 0x24, 0xE8, 0xA5, 0xA4, 0x84, 0xFF, 0xD8,
+    0x4C, 0x24, 0x0C, 0x83, 0xC4, 0x04, 0xD9, 0x5E, 0x04, 0x59, 0xC2, 0x08,
+    0x00,
+];
+const C206: [usize; 5] = [0x6, 0x20, 0x44, 0x54, 0x66];
+const B207: [u8; 310] = [
+    0x83, 0xEC, 0x20, 0xD9, 0x44, 0x24, 0x24, 0x51, 0xDC, 0x0D, 0x70, 0xBF,
+    0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x28, 0xD9, 0x1C,
+    0x24, 0xE8, 0xA2, 0x5E, 0x84, 0xFF, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x07,
+    0xD9, 0x44, 0x24, 0x04, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C,
+    0x24, 0x04, 0xD9, 0x47, 0x04, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x08, 0xD8,
+    0x4F, 0x08, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x28, 0xD9, 0x1C,
+    0x24, 0xE8, 0xC2, 0x89, 0x82, 0xFF, 0xD9, 0x5C, 0x24, 0x28, 0xD9, 0x44,
+    0x24, 0x04, 0xD9, 0xC0, 0xDC, 0xC8, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44,
+    0x24, 0x08, 0xD9, 0xC0, 0xDC, 0xC8, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44,
+    0x24, 0x0C, 0xD9, 0xC0, 0xDC, 0xC8, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0xC1,
+    0xD8, 0xCB, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0xC0, 0xD8, 0xCB, 0xD9, 0x5C,
+    0x24, 0x10, 0xD9, 0xC0, 0xD8, 0xCA, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44,
+    0x24, 0x28, 0xD9, 0xC0, 0xDE, 0xCC, 0xD9, 0xCB, 0xD9, 0x5C, 0x24, 0x1C,
+    0xD9, 0xC2, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x14, 0xDE, 0xC9,
+    0xD9, 0x5C, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x08, 0xDD, 0x05, 0xE8, 0xBF,
+    0xE5, 0x00, 0xDC, 0xC9, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xC9, 0xD9, 0xE8,
+    0xD8, 0xE3, 0xD8, 0xE1, 0xD9, 0x1E, 0xD9, 0x44, 0x24, 0x28, 0xD8, 0xCA,
+    0xD9, 0x44, 0x24, 0x04, 0xD8, 0xCB, 0xD9, 0xC0, 0xD8, 0xC2, 0xD9, 0x5E,
+    0x04, 0xD9, 0x44, 0x24, 0x10, 0xD8, 0xCC, 0xD9, 0x44, 0x24, 0x14, 0xD8,
+    0xCD, 0xD9, 0xC1, 0xD8, 0xE1, 0xD9, 0x5E, 0x08, 0xD9, 0xCA, 0xDE, 0xE3,
+    0xD9, 0xCA, 0xD9, 0x5E, 0x0C, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0xCC, 0xD9,
+    0xE8, 0xDE, 0xE1, 0xD9, 0xC0, 0xDE, 0xE4, 0xD9, 0xCB, 0xD9, 0x5E, 0x10,
+    0xD9, 0x44, 0x24, 0x1C, 0xD8, 0xCC, 0xD9, 0x44, 0x24, 0x20, 0xDE, 0xCD,
+    0xD9, 0xC4, 0xD8, 0xC1, 0xD9, 0x5E, 0x14, 0xD9, 0xC9, 0xDE, 0xC2, 0xD9,
+    0xC9, 0xD9, 0x5E, 0x18, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9, 0x5E, 0x1C, 0xDE,
+    0xE1, 0xD9, 0x5E, 0x20, 0x83, 0xC4, 0x24, 0xC2, 0x04, 0x00,
+];
+const C207: [usize; 2] = [0x19, 0x49];
+const B208: [u8; 621] = [
+    0x83, 0xEC, 0x1C, 0x53, 0x8B, 0x5C, 0x24, 0x24, 0x56, 0x57, 0x8D, 0x7B,
+    0x18, 0x8B, 0xF7, 0xE8, 0x6C, 0x9E, 0xFF, 0xFF, 0xD9, 0x43, 0x10, 0xD9,
+    0x43, 0x0C, 0x8D, 0x73, 0x0C, 0xD9, 0x46, 0x08, 0xD9, 0xC1, 0xDE, 0xCA,
+    0xD9, 0xC2, 0xDE, 0xCB, 0xD9, 0xC9, 0xDE, 0xC2, 0xDC, 0xC8, 0xDE, 0xC1,
+    0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0xEE, 0xDB, 0xF1,
+    0xDD, 0xD9, 0x0F, 0x82, 0x11, 0x01, 0x00, 0x00, 0xD9, 0x43, 0x04, 0xD9,
+    0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC0, 0xD9, 0x03, 0xD9,
+    0x5C, 0x24, 0x2C, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0xC0, 0xD9, 0x43, 0x08,
+    0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0xC0, 0xD9, 0xC2,
+    0xDE, 0xCB, 0xD9, 0xC4, 0xDE, 0xCD, 0xD9, 0xCA, 0xDE, 0xC4, 0xD9, 0xC1,
+    0xDE, 0xCA, 0xD9, 0xCB, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x44,
+    0x24, 0x2C, 0xD9, 0xCC, 0xDF, 0xF4, 0xDD, 0xDB, 0x72, 0x65, 0xF3, 0x0F,
+    0x10, 0x0F, 0xDD, 0xD9, 0x0F, 0x57, 0xC0, 0xDD, 0xD9, 0x0F, 0x2E, 0xC8,
+    0xDD, 0xD8, 0x9F, 0xF6, 0xC4, 0x44, 0x7A, 0x37, 0xF3, 0x0F, 0x10, 0x4B,
+    0x20, 0x0F, 0x2E, 0xC8, 0x9F, 0xF6, 0xC4, 0x44, 0x7A, 0x29, 0xF3, 0x0F,
+    0x10, 0x4B, 0x1C, 0x0F, 0x2E, 0xC8, 0x9F, 0xF6, 0xC4, 0x44, 0x7B, 0x1B,
+    0xF3, 0x0F, 0x11, 0x06, 0xF3, 0x0F, 0x11, 0x46, 0x04, 0xF3, 0x0F, 0x10,
+    0x05, 0x8C, 0x51, 0xDD, 0x00, 0xF3, 0x0F, 0x11, 0x46, 0x08, 0xE9, 0x81,
+    0x00, 0x00, 0x00, 0xF3, 0x0F, 0x10, 0x0D, 0x8C, 0x51, 0xDD, 0x00, 0xF3,
+    0x0F, 0x11, 0x06, 0xF3, 0x0F, 0x11, 0x4E, 0x04, 0xF3, 0x0F, 0x11, 0x46,
+    0x08, 0xEB, 0x69, 0xD9, 0x47, 0x04, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x47,
+    0x08, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0xC0, 0xD8,
+    0xCA, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC0, 0xD8, 0xCD, 0xDE, 0xEA, 0xD9,
+    0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0x8B, 0x44, 0x24, 0x1C, 0xD9, 0x07, 0x89,
+    0x06, 0xD9, 0x5C, 0x24, 0x2C, 0xD8, 0xCC, 0xD9, 0x44, 0x24, 0x2C, 0xD9,
+    0xC0, 0xDE, 0xCC, 0xD9, 0xC9, 0xDE, 0xE3, 0xD9, 0xCA, 0xD9, 0x5C, 0x24,
+    0x20, 0x8B, 0x4C, 0x24, 0x20, 0xD9, 0xC9, 0x89, 0x4E, 0x04, 0xDE, 0xCA,
+    0xDE, 0xCA, 0xDE, 0xE1, 0xD9, 0x5C, 0x24, 0x24, 0x8B, 0x54, 0x24, 0x24,
+    0x89, 0x56, 0x08, 0xEB, 0x07, 0xDD, 0xD8, 0xE8, 0x24, 0x9D, 0xFF, 0xFF,
+    0xD9, 0x47, 0x08, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x46, 0x04, 0xD9, 0x5C,
+    0x24, 0x2C, 0xD9, 0x47, 0x04, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x46, 0x08,
+    0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0xC0, 0xD9, 0x44,
+    0x24, 0x10, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xC0,
+    0xD9, 0x44, 0x24, 0x18, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xCC, 0xDE, 0xE1,
+    0xD9, 0x5C, 0x24, 0x1C, 0x8B, 0x44, 0x24, 0x1C, 0xD9, 0x07, 0xD9, 0x5C,
+    0x24, 0x2C, 0xD9, 0x06, 0x89, 0x03, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44,
+    0x24, 0x2C, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0xC0,
+    0xDE, 0xCC, 0xD9, 0xCA, 0xDE, 0xE3, 0xD9, 0xCA, 0xD9, 0x5C, 0x24, 0x20,
+    0x8B, 0x4C, 0x24, 0x20, 0x89, 0x4B, 0x04, 0xDE, 0xCA, 0xDE, 0xCA, 0xDE,
+    0xE1, 0xD9, 0x5C, 0x24, 0x24, 0x8B, 0x54, 0x24, 0x24, 0x89, 0x53, 0x08,
+    0xD9, 0x47, 0x04, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x43, 0x08, 0xD9, 0x5C,
+    0x24, 0x2C, 0xD9, 0x47, 0x08, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x43, 0x04,
+    0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0xC0, 0xD9, 0x44,
+    0x24, 0x2C, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xC0,
+    0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xCC, 0xDE, 0xE1,
+    0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x03, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x07,
+    0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0xC0, 0xDE, 0xCA,
+    0xD9, 0x44, 0x24, 0x18, 0xD9, 0xC0, 0xDE, 0xCC, 0xD9, 0xCA, 0xDE, 0xE3,
+    0xD9, 0xCA, 0xD9, 0x5C, 0x24, 0x20, 0xDE, 0xCA, 0x8B, 0x44, 0x24, 0x1C,
+    0xDE, 0xCA, 0x8B, 0x4C, 0x24, 0x20, 0x89, 0x06, 0xDE, 0xE1, 0x89, 0x4E,
+    0x04, 0x5F, 0xD9, 0x5C, 0x24, 0x20, 0x8B, 0x54, 0x24, 0x20, 0x89, 0x56,
+    0x08, 0x5E, 0x5B, 0x83, 0xC4, 0x1C, 0xC2, 0x04, 0x00,
+];
+const C208: [usize; 2] = [0xf, 0x157];
+const B209: [u8; 52] = [
+    0xD9, 0x44, 0x24, 0x04, 0x56, 0x51, 0xD9, 0x1C, 0x24, 0x8B, 0xF1, 0xE8,
+    0xF0, 0x07, 0x7B, 0xFF, 0xD9, 0x46, 0x08, 0xDC, 0x0D, 0x78, 0xC4, 0xE5,
+    0x00, 0x83, 0xC4, 0x04, 0xD8, 0x4E, 0x10, 0xD8, 0x4E, 0x0C, 0x5E, 0xDE,
+    0xC9, 0xD8, 0x4C, 0x24, 0x04, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24,
+    0x04, 0xC2, 0x04, 0x00,
+];
+const C209: [usize; 1] = [0xb];
+const B210: [u8; 251] = [
+    0x83, 0xEC, 0x08, 0x8B, 0x44, 0x24, 0x14, 0xD9, 0x40, 0x08, 0x56, 0xD9,
+    0x5C, 0x24, 0x18, 0x51, 0xD9, 0x44, 0x24, 0x1C, 0x8B, 0xF1, 0xD9, 0x1C,
+    0x24, 0xE8, 0x42, 0x02, 0x7B, 0xFF, 0xD9, 0x5C, 0x24, 0x08, 0x83, 0xC4,
+    0x04, 0xD9, 0x46, 0x10, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x04,
+    0xD9, 0x44, 0x24, 0x08, 0xDB, 0xF1, 0x76, 0x0D, 0xDD, 0xD8, 0x5E, 0xDD,
+    0xD8, 0xD9, 0xEE, 0x83, 0xC4, 0x08, 0xC2, 0x10, 0x00, 0xF3, 0x0F, 0x10,
+    0x44, 0x24, 0x18, 0x0F, 0x2F, 0x05, 0xC0, 0x32, 0xDD, 0x00, 0x76, 0x0A,
+    0xF3, 0x0F, 0x10, 0x05, 0x8C, 0x51, 0xDD, 0x00, 0xEB, 0x08, 0xF3, 0x0F,
+    0x10, 0x05, 0x98, 0x79, 0xE8, 0x00, 0xD9, 0x46, 0x08, 0xF3, 0x0F, 0x11,
+    0x44, 0x24, 0x18, 0xDF, 0xF2, 0x76, 0x20, 0xDE, 0xE9, 0xD8, 0x4E, 0x0C,
+    0x5E, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0x4C, 0x24,
+    0x14, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0x83, 0xC4, 0x08,
+    0xC2, 0x10, 0x00, 0xDD, 0xD8, 0xD9, 0x46, 0x08, 0xD9, 0x5C, 0x24, 0x08,
+    0xD9, 0x46, 0x10, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x08, 0xD9,
+    0xC0, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0x46, 0x0C,
+    0x5E, 0xD8, 0xCA, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD9,
+    0xC0, 0xD9, 0xE8, 0xD9, 0xC0, 0xDE, 0xE2, 0xDE, 0xE3, 0xD9, 0xCA, 0xDE,
+    0xE3, 0xD9, 0xC9, 0xDE, 0xF2, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x04, 0xD9,
+    0xCA, 0xDE, 0xE1, 0xD8, 0x4C, 0x24, 0x04, 0xDE, 0xC1, 0xD9, 0x5C, 0x24,
+    0x04, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0x4C, 0x24, 0x14, 0xD9, 0x5C, 0x24,
+    0x14, 0xD9, 0x44, 0x24, 0x14, 0x83, 0xC4, 0x08, 0xC2, 0x10, 0x00,
+];
+const C210: [usize; 1] = [0x19];
+const B211: [u8; 347] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x83, 0xEC, 0x14, 0x8B, 0x45, 0x0C,
+    0x53, 0x56, 0x83, 0xC0, 0xFF, 0x57, 0x8B, 0xD9, 0x89, 0x44, 0x24, 0x14,
+    0x0F, 0x88, 0x34, 0x01, 0x00, 0x00, 0x8B, 0x45, 0x08, 0x0F, 0xB7, 0x08,
+    0x0F, 0xB7, 0xF1, 0x83, 0xE1, 0x0F, 0x89, 0x4C, 0x24, 0x10, 0x8B, 0xC6,
+    0xC1, 0xE8, 0x06, 0xDB, 0x44, 0x24, 0x10, 0x83, 0xE0, 0x01, 0x89, 0x44,
+    0x24, 0x18, 0x8B, 0xC6, 0xDC, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0xC1, 0xE8,
+    0x05, 0x8B, 0xFE, 0x83, 0xE0, 0x01, 0xD9, 0x5C, 0x24, 0x10, 0x51, 0xD9,
+    0x44, 0x24, 0x14, 0xC1, 0xEF, 0x07, 0xD8, 0x0D, 0x70, 0x68, 0xE8, 0x00,
+    0x83, 0xE7, 0x01, 0x89, 0x44, 0x24, 0x20, 0xD9, 0x5C, 0x24, 0x10, 0xD9,
+    0x44, 0x24, 0x10, 0xDC, 0xC8, 0xD9, 0xE8, 0xDE, 0xE1, 0xD9, 0x5C, 0x24,
+    0x14, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0x1C, 0x24, 0xE8, 0x1B, 0x21, 0x6D,
+    0xFF, 0x8B, 0x4D, 0x08, 0xD9, 0x5C, 0x24, 0x14, 0x0F, 0xB7, 0x01, 0x83,
+    0xC4, 0x04, 0xA8, 0x10, 0x74, 0x0E, 0xF3, 0x0F, 0x10, 0x54, 0x24, 0x0C,
+    0xF3, 0x0F, 0x10, 0x44, 0x24, 0x10, 0xEB, 0x0C, 0xF3, 0x0F, 0x10, 0x44,
+    0x24, 0x0C, 0xF3, 0x0F, 0x10, 0x54, 0x24, 0x10, 0x83, 0x7C, 0x24, 0x18,
+    0x00, 0x75, 0x0F, 0xF3, 0x0F, 0x10, 0x0D, 0xB0, 0xBF, 0xE5, 0x00, 0xF3,
+    0x0F, 0x5C, 0xCA, 0x0F, 0x28, 0xD1, 0x83, 0x7C, 0x24, 0x1C, 0x00, 0x75,
+    0x0F, 0xF3, 0x0F, 0x10, 0x0D, 0xB0, 0xBF, 0xE5, 0x00, 0xF3, 0x0F, 0x5C,
+    0xC8, 0x0F, 0x28, 0xC1, 0x8B, 0x45, 0x10, 0x8B, 0x4C, 0x24, 0x14, 0x83,
+    0x45, 0x08, 0x02, 0xF3, 0x0F, 0x10, 0xC0, 0x0F, 0x28, 0xC8, 0xF3, 0x0F,
+    0x10, 0xC2, 0x0F, 0x28, 0xD0, 0xF3, 0x0F, 0x10, 0x43, 0x14, 0x0F, 0x28,
+    0xDA, 0x0F, 0xC6, 0xDA, 0x00, 0x0F, 0x28, 0x53, 0x50, 0x0F, 0x59, 0xDA,
+    0x0F, 0x28, 0xD1, 0x0F, 0xC6, 0xD1, 0x00, 0x0F, 0x28, 0x4B, 0x40, 0xBA,
+    0x03, 0x00, 0x00, 0x00, 0x2B, 0xD7, 0x0F, 0x59, 0xD1, 0x0F, 0x58, 0xDA,
+    0x0F, 0xC6, 0xC0, 0x00, 0xC1, 0xE2, 0x04, 0x0F, 0x59, 0xD8, 0x0F, 0x28,
+    0x04, 0x1A, 0x81, 0xCE, 0x00, 0x00, 0x00, 0x3F, 0x0F, 0x58, 0xD8, 0x0F,
+    0x29, 0x18, 0x83, 0xE9, 0x01, 0x89, 0x70, 0x0C, 0x83, 0xC0, 0x10, 0x85,
+    0xC9, 0x89, 0x4C, 0x24, 0x14, 0x89, 0x45, 0x10, 0x0F, 0x8D, 0xCC, 0xFE,
+    0xFF, 0xFF, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC2, 0x0C, 0x00,
+];
+const C211: [usize; 1] = [0x80];
+const B212: [u8; 730] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF0, 0x83, 0xEC, 0x54, 0x53, 0x56, 0x57,
+    0x89, 0x4C, 0x24, 0x1C, 0x0F, 0x28, 0x49, 0x20, 0x0F, 0x28, 0x41, 0x30,
+    0x8B, 0x45, 0x08, 0x0F, 0x28, 0x51, 0x40, 0x0F, 0x5C, 0xC1, 0x0F, 0x28,
+    0x08, 0x0F, 0x29, 0x44, 0x24, 0x50, 0x0F, 0x28, 0xC1, 0x0F, 0x59, 0xC2,
+    0x0F, 0x28, 0xD0, 0x0F, 0xC6, 0xD0, 0x55, 0xF3, 0x0F, 0x58, 0xD0, 0x0F,
+    0x28, 0xD8, 0x0F, 0x29, 0x4C, 0x24, 0x40, 0x0F, 0xC6, 0xD8, 0xAA, 0x0F,
+    0x28, 0xC1, 0x0F, 0x28, 0x49, 0x50, 0x0F, 0x59, 0xC1, 0xF3, 0x0F, 0x58,
+    0xDA, 0x0F, 0x28, 0xC8, 0x0F, 0xC6, 0xC8, 0x55, 0x0F, 0x28, 0xD0, 0xF3,
+    0x0F, 0x58, 0xC8, 0x0F, 0xC6, 0xD0, 0xAA, 0xF3, 0x0F, 0x58, 0xD1, 0xF3,
+    0x0F, 0x11, 0x54, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x20, 0xF3, 0x0F, 0x11,
+    0x5C, 0x24, 0x30, 0xD9, 0x44, 0x24, 0x30, 0xDC, 0xC8, 0xD9, 0xC1, 0xDE,
+    0xCA, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x05, 0x18, 0xCD, 0xE5,
+    0x00, 0xD9, 0x44, 0x24, 0x14, 0xDB, 0xF1, 0xDD, 0xD9, 0x72, 0x43, 0x51,
+    0xD9, 0x1C, 0x24, 0xE8, 0x9C, 0x1F, 0x6D, 0xFF, 0xD9, 0xE8, 0x0F, 0x57,
+    0xC0, 0xDE, 0xF1, 0x83, 0xC4, 0x04, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44,
+    0x24, 0x20, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9,
+    0xD9, 0x5C, 0x24, 0x0C, 0xF3, 0x0F, 0x10, 0x4C, 0x24, 0x0C, 0x0F, 0x2F,
+    0xC8, 0xD8, 0x4C, 0x24, 0x30, 0xD9, 0x5C, 0x24, 0x10, 0x72, 0x27, 0xBF,
+    0x01, 0x00, 0x00, 0x00, 0xEB, 0x22, 0x0F, 0x57, 0xC0, 0xDD, 0xD8, 0xF3,
+    0x0F, 0x10, 0x0D, 0x8C, 0x51, 0xDD, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24,
+    0x0C, 0xF3, 0x0F, 0x11, 0x4C, 0x24, 0x10, 0xBF, 0x01, 0x00, 0x00, 0x00,
+    0xEB, 0x02, 0x33, 0xFF, 0xF3, 0x0F, 0x10, 0x4C, 0x24, 0x10, 0x0F, 0x2F,
+    0xC8, 0x72, 0x07, 0xBE, 0x01, 0x00, 0x00, 0x00, 0xEB, 0x02, 0x33, 0xF6,
+    0xD9, 0x44, 0x24, 0x0C, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0x5F, 0x23, 0x76,
+    0xFF, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0x1C, 0x24,
+    0xE8, 0x4F, 0x23, 0x76, 0xFF, 0xD9, 0x5C, 0x24, 0x14, 0x83, 0xC4, 0x04,
+    0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x10, 0xDF, 0xF1, 0xDD, 0xD8,
+    0x72, 0x0D, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x0C, 0xBB, 0x01, 0x00, 0x00,
+    0x00, 0xEB, 0x08, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x10, 0x33, 0xDB, 0xF3,
+    0x0F, 0x11, 0x44, 0x24, 0x10, 0x0F, 0x28, 0x44, 0x24, 0x40, 0x0F, 0x59,
+    0x44, 0x24, 0x50, 0x0F, 0x28, 0xC8, 0x0F, 0xC6, 0xC8, 0x55, 0x0F, 0x28,
+    0xD0, 0xF3, 0x0F, 0x58, 0xC8, 0x0F, 0xC6, 0xD0, 0xAA, 0x0F, 0x57, 0xC0,
+    0xF3, 0x0F, 0x58, 0xD1, 0xF3, 0x0F, 0x11, 0x54, 0x24, 0x50, 0x0F, 0x2F,
+    0x44, 0x24, 0x50, 0x72, 0x07, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xEB, 0x02,
+    0x33, 0xC0, 0xD9, 0x05, 0xBC, 0x66, 0xE8, 0x00, 0xD8, 0x4C, 0x24, 0x10,
+    0xD8, 0x25, 0x74, 0x68, 0xE8, 0x00, 0xDC, 0x05, 0x68, 0xC3, 0xE5, 0x00,
+    0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0xDB, 0x5C, 0x24, 0x0C,
+    0x8D, 0x0C, 0x47, 0x8D, 0x14, 0x4E, 0x8D, 0x1C, 0x53, 0xC1, 0xE3, 0x04,
+    0x03, 0x5C, 0x24, 0x0C, 0x51, 0x0F, 0xB7, 0xC3, 0x8B, 0xF0, 0x8B, 0xF8,
+    0xC1, 0xE8, 0x05, 0x83, 0xE0, 0x01, 0x89, 0x44, 0x24, 0x1C, 0x0F, 0xB6,
+    0xC3, 0x83, 0xE0, 0x0F, 0x89, 0x44, 0x24, 0x18, 0xC1, 0xEE, 0x07, 0xDB,
+    0x44, 0x24, 0x18, 0xC1, 0xEF, 0x06, 0x83, 0xE6, 0x01, 0x83, 0xE7, 0x01,
+    0xDC, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44,
+    0x24, 0x18, 0xD8, 0x0D, 0x70, 0x68, 0xE8, 0x00, 0xD9, 0x5C, 0x24, 0x14,
+    0xD9, 0x44, 0x24, 0x14, 0xDC, 0xC8, 0xD9, 0xE8, 0xDE, 0xE1, 0xD9, 0x5C,
+    0x24, 0x18, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0x1C, 0x24, 0xE8, 0x16, 0x1E,
+    0x6D, 0xFF, 0x83, 0xC4, 0x04, 0xD9, 0x5C, 0x24, 0x14, 0xF6, 0xC3, 0x10,
+    0x74, 0x0E, 0xF3, 0x0F, 0x10, 0x54, 0x24, 0x10, 0xF3, 0x0F, 0x10, 0x44,
+    0x24, 0x14, 0xEB, 0x0C, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x10, 0xF3, 0x0F,
+    0x10, 0x54, 0x24, 0x14, 0x85, 0xFF, 0xF3, 0x0F, 0x10, 0x0D, 0xB0, 0xBF,
+    0xE5, 0x00, 0x75, 0x0A, 0x0F, 0x28, 0xD9, 0xF3, 0x0F, 0x5C, 0xDA, 0x0F,
+    0x28, 0xD3, 0x83, 0x7C, 0x24, 0x18, 0x00, 0x75, 0x07, 0xF3, 0x0F, 0x5C,
+    0xC8, 0x0F, 0x28, 0xC1, 0x8B, 0x44, 0x24, 0x1C, 0xF3, 0x0F, 0x10, 0xC0,
+    0x0F, 0x28, 0xC8, 0xF3, 0x0F, 0x10, 0xC2, 0x0F, 0x28, 0xD0, 0xF3, 0x0F,
+    0x10, 0x40, 0x14, 0x0F, 0x28, 0xDA, 0x0F, 0xC6, 0xDA, 0x00, 0x0F, 0x28,
+    0x50, 0x50, 0x0F, 0x59, 0xDA, 0x0F, 0x28, 0xD1, 0x0F, 0xC6, 0xD1, 0x00,
+    0x0F, 0x28, 0x48, 0x40, 0xB9, 0x03, 0x00, 0x00, 0x00, 0x2B, 0xCE, 0x0F,
+    0x59, 0xD1, 0x0F, 0x58, 0xDA, 0x0F, 0xC6, 0xC0, 0x00, 0xC1, 0xE1, 0x04,
+    0x0F, 0x59, 0xD8, 0x0F, 0x28, 0x04, 0x01, 0x8B, 0x45, 0x0C, 0x5F, 0x81,
+    0xCB, 0x00, 0x00, 0x00, 0x3F, 0x0F, 0x58, 0xD8, 0x0F, 0x29, 0x18, 0x5E,
+    0x89, 0x58, 0x0C, 0x5B, 0x8B, 0xE5, 0x5D, 0xC2, 0x08, 0x00,
+];
+const C212: [usize; 4] = [0x9f, 0x11c, 0x12c, 0x225];
+const B213: [u8; 95] = [
+    0x83, 0xEC, 0x0C, 0xF3, 0x0F, 0x10, 0x81, 0xC0, 0x00, 0x00, 0x00, 0xF3,
+    0x0F, 0x11, 0x04, 0x24, 0xF3, 0x0F, 0x10, 0x81, 0xC4, 0x00, 0x00, 0x00,
+    0x56, 0x8B, 0x74, 0x24, 0x14, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x08, 0xF3,
+    0x0F, 0x10, 0x81, 0xC8, 0x00, 0x00, 0x00, 0x8B, 0xCE, 0xF3, 0x0F, 0x11,
+    0x44, 0x24, 0x0C, 0xE8, 0x28, 0x70, 0x9B, 0xFF, 0xF3, 0x0F, 0x10, 0x44,
+    0x24, 0x04, 0xF3, 0x0F, 0x11, 0x06, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x08,
+    0xF3, 0x0F, 0x11, 0x46, 0x14, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x0C, 0xF3,
+    0x0F, 0x11, 0x46, 0x28, 0x5E, 0x83, 0xC4, 0x0C, 0xC2, 0x04, 0x00,
+];
+const C213: [usize; 1] = [0x33];
+const B214: [u8; 82] = [
+    0x83, 0xEC, 0x0C, 0xD9, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x56, 0xD9, 0xE8,
+    0x8B, 0x74, 0x24, 0x14, 0xD9, 0xC0, 0xDE, 0xF2, 0xD9, 0xC9, 0xD9, 0x5C,
+    0x24, 0x04, 0xD9, 0x81, 0xC4, 0x00, 0x00, 0x00, 0xD8, 0xF9, 0xD9, 0x5C,
+    0x24, 0x08, 0xD8, 0xB1, 0xC8, 0x00, 0x00, 0x00, 0x8B, 0xCE, 0xD9, 0x5C,
+    0x24, 0x0C, 0xE8, 0xC9, 0x6F, 0x9B, 0xFF, 0xD9, 0x44, 0x24, 0x04, 0xD9,
+    0x1E, 0xD9, 0x44, 0x24, 0x08, 0xD9, 0x5E, 0x14, 0xD9, 0x44, 0x24, 0x0C,
+    0xD9, 0x5E, 0x28, 0x5E, 0x83, 0xC4, 0x0C, 0xC2, 0x04, 0x00,
+];
+const C214: [usize; 1] = [0x32];
+const B215: [u8; 327] = [
+    0x66, 0xC7, 0x46, 0x06, 0x01, 0x00, 0xC7, 0x06, 0x70, 0x24, 0xE5, 0x00,
+    0x53, 0x33, 0xDB, 0x89, 0x5E, 0x08, 0x66, 0xC7, 0x46, 0x10, 0x04, 0x00,
+    0x66, 0xC7, 0x86, 0x80, 0x00, 0x00, 0x00, 0x0F, 0x00, 0xC6, 0x86, 0x82,
+    0x00, 0x00, 0x00, 0x01, 0x57, 0xB8, 0x10, 0x00, 0x00, 0x00, 0x66, 0x89,
+    0x86, 0x94, 0x00, 0x00, 0x00, 0xC6, 0x86, 0x96, 0x00, 0x00, 0x00, 0x01,
+    0x8D, 0x7E, 0x20, 0x8B, 0xCF, 0x66, 0x89, 0x86, 0xA8, 0x00, 0x00, 0x00,
+    0xC6, 0x86, 0xAA, 0x00, 0x00, 0x00, 0x01, 0x88, 0x9E, 0xAE, 0x00, 0x00,
+    0x00, 0xE8, 0xB6, 0x4E, 0x9B, 0xFF, 0xF3, 0x0F, 0x10, 0x05, 0x8C, 0x51,
+    0xDD, 0x00, 0xF3, 0x0F, 0x11, 0x07, 0xF3, 0x0F, 0x11, 0x47, 0x14, 0xF3,
+    0x0F, 0x11, 0x47, 0x28, 0x8D, 0x7E, 0x50, 0x8B, 0xCF, 0xE8, 0x96, 0x4E,
+    0x9B, 0xFF, 0xF3, 0x0F, 0x10, 0x05, 0x8C, 0x51, 0xDD, 0x00, 0xF3, 0x0F,
+    0x10, 0x0D, 0xA0, 0xCF, 0xE5, 0x00, 0xF3, 0x0F, 0x10, 0x15, 0x9C, 0xCF,
+    0xE5, 0x00, 0xF3, 0x0F, 0x11, 0x07, 0xF3, 0x0F, 0x11, 0x47, 0x14, 0xF3,
+    0x0F, 0x11, 0x47, 0x28, 0xF3, 0x0F, 0x11, 0x8E, 0x88, 0x00, 0x00, 0x00,
+    0xF3, 0x0F, 0x10, 0x0D, 0x98, 0xCF, 0xE5, 0x00, 0xF3, 0x0F, 0x11, 0x86,
+    0xA0, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x10, 0x05, 0x94, 0xCF, 0xE5, 0x00,
+    0xF3, 0x0F, 0x11, 0x8E, 0x8C, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x10, 0x0D,
+    0x90, 0x51, 0xDD, 0x00, 0xF3, 0x0F, 0x11, 0x86, 0xB0, 0x00, 0x00, 0x00,
+    0xF3, 0x0F, 0x10, 0x05, 0xFC, 0xBA, 0xED, 0x00, 0x5F, 0x88, 0x9E, 0x83,
+    0x00, 0x00, 0x00, 0x88, 0x9E, 0x97, 0x00, 0x00, 0x00, 0x88, 0x9E, 0x98,
+    0x00, 0x00, 0x00, 0x88, 0x9E, 0x99, 0x00, 0x00, 0x00, 0x88, 0x9E, 0xAB,
+    0x00, 0x00, 0x00, 0xC6, 0x86, 0x84, 0x00, 0x00, 0x00, 0x01, 0xF3, 0x0F,
+    0x11, 0x8E, 0x90, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x11, 0x96, 0x9C, 0x00,
+    0x00, 0x00, 0xF3, 0x0F, 0x11, 0x8E, 0xA4, 0x00, 0x00, 0x00, 0xC6, 0x86,
+    0x9A, 0x00, 0x00, 0x00, 0x10, 0xC6, 0x86, 0xAC, 0x00, 0x00, 0x00, 0x01,
+    0xC6, 0x86, 0xAD, 0x00, 0x00, 0x00, 0x01, 0xF3, 0x0F, 0x11, 0x86, 0xB4,
+    0x00, 0x00, 0x00, 0xF3, 0x0F, 0x11, 0x8E, 0xB8, 0x00, 0x00, 0x00, 0x8B,
+    0xC6, 0x5B, 0xC3,
+];
+const C215: [usize; 2] = [0x55, 0x75];
+const B216: [u8; 175] = [
+    0xB8, 0x01, 0x00, 0x00, 0x00, 0x66, 0x89, 0x46, 0x06, 0xC7, 0x46, 0x08,
+    0x00, 0x00, 0x00, 0x00, 0xC7, 0x06, 0x98, 0x2A, 0xE5, 0x00, 0x57, 0x66,
+    0xC7, 0x46, 0x10, 0x04, 0x00, 0x8D, 0x7E, 0x20, 0x66, 0xC7, 0x86, 0x80,
+    0x00, 0x00, 0x00, 0x0E, 0x00, 0x88, 0x86, 0x82, 0x00, 0x00, 0x00, 0x8B,
+    0xCF, 0x66, 0xC7, 0x86, 0x90, 0x00, 0x00, 0x00, 0x0C, 0x00, 0xE8, 0x41,
+    0x49, 0x9B, 0xFF, 0xF3, 0x0F, 0x10, 0x05, 0x8C, 0x51, 0xDD, 0x00, 0xF3,
+    0x0F, 0x11, 0x07, 0xF3, 0x0F, 0x11, 0x47, 0x14, 0xF3, 0x0F, 0x11, 0x47,
+    0x28, 0x8D, 0x7E, 0x50, 0x8B, 0xCF, 0xE8, 0x21, 0x49, 0x9B, 0xFF, 0xF3,
+    0x0F, 0x10, 0x05, 0x8C, 0x51, 0xDD, 0x00, 0xF3, 0x0F, 0x10, 0x0D, 0x68,
+    0xC1, 0xE5, 0x00, 0xF3, 0x0F, 0x11, 0x07, 0xF3, 0x0F, 0x11, 0x47, 0x14,
+    0xF3, 0x0F, 0x11, 0x47, 0x28, 0xF3, 0x0F, 0x11, 0x8E, 0x84, 0x00, 0x00,
+    0x00, 0xF3, 0x0F, 0x10, 0x0D, 0xE4, 0x50, 0xDD, 0x00, 0xC6, 0x86, 0x92,
+    0x00, 0x00, 0x00, 0x00, 0xC6, 0x86, 0x83, 0x00, 0x00, 0x00, 0x00, 0xF3,
+    0x0F, 0x11, 0x8E, 0x88, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x11, 0x86, 0x8C,
+    0x00, 0x00, 0x00, 0x8B, 0xC6, 0x5F, 0xC3,
+];
+const C216: [usize; 2] = [0x3a, 0x5a];
+const B217: [u8; 133] = [
+    0x0F, 0x57, 0xC0, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x33, 0xC9, 0x89, 0x4E,
+    0x08, 0x66, 0x89, 0x46, 0x06, 0xC7, 0x06, 0xFC, 0x2C, 0xE5, 0x00, 0x66,
+    0x89, 0x46, 0x0C, 0x57, 0x89, 0x4E, 0x18, 0x8D, 0x7E, 0x30, 0xF3, 0x0F,
+    0x11, 0x46, 0x1C, 0x8B, 0xCF, 0x88, 0x46, 0x20, 0xE8, 0xEF, 0x14, 0x9B,
+    0xFF, 0xF3, 0x0F, 0x10, 0x05, 0x8C, 0x51, 0xDD, 0x00, 0x8D, 0x4F, 0x30,
+    0xF3, 0x0F, 0x11, 0x07, 0xF3, 0x0F, 0x11, 0x47, 0x14, 0xF3, 0x0F, 0x11,
+    0x47, 0x28, 0xE8, 0xF1, 0x14, 0x9B, 0xFF, 0x8D, 0x7E, 0x70, 0x8B, 0xCF,
+    0xE8, 0xC7, 0x14, 0x9B, 0xFF, 0xF3, 0x0F, 0x10, 0x05, 0x8C, 0x51, 0xDD,
+    0x00, 0x8D, 0x4F, 0x30, 0xF3, 0x0F, 0x11, 0x07, 0xF3, 0x0F, 0x11, 0x47,
+    0x14, 0xF3, 0x0F, 0x11, 0x47, 0x28, 0xE8, 0xC9, 0x14, 0x9B, 0xFF, 0x89,
+    0x76, 0x14, 0xC7, 0x46, 0x10, 0xE0, 0x08, 0xD5, 0x00, 0x8B, 0xC6, 0x5F,
+    0xC3,
+];
+const C217: [usize; 4] = [0x2c, 0x4a, 0x54, 0x72];
+const B218: [u8; 135] = [
+    0x66, 0xC7, 0x46, 0x06, 0x01, 0x00, 0xC7, 0x46, 0x08, 0x00, 0x00, 0x00,
+    0x00, 0xC7, 0x06, 0x38, 0x2A, 0xE5, 0x00, 0x57, 0x66, 0xC7, 0x46, 0x10,
+    0x02, 0x00, 0x8D, 0x7E, 0x20, 0x66, 0xC7, 0x86, 0xA0, 0x00, 0x00, 0x00,
+    0x0C, 0x00, 0x8B, 0xCF, 0x66, 0xC7, 0x86, 0xA4, 0x00, 0x00, 0x00, 0x05,
+    0x00, 0xE8, 0x6A, 0xE3, 0x9A, 0xFF, 0xF3, 0x0F, 0x10, 0x05, 0x8C, 0x51,
+    0xDD, 0x00, 0x8D, 0x4F, 0x30, 0xF3, 0x0F, 0x11, 0x07, 0xF3, 0x0F, 0x11,
+    0x47, 0x14, 0xF3, 0x0F, 0x11, 0x47, 0x28, 0xE8, 0x6C, 0xE3, 0x9A, 0xFF,
+    0x8D, 0x7E, 0x60, 0x8B, 0xCF, 0xE8, 0x42, 0xE3, 0x9A, 0xFF, 0xF3, 0x0F,
+    0x10, 0x05, 0x8C, 0x51, 0xDD, 0x00, 0x8D, 0x4F, 0x30, 0xF3, 0x0F, 0x11,
+    0x07, 0xF3, 0x0F, 0x11, 0x47, 0x14, 0xF3, 0x0F, 0x11, 0x47, 0x28, 0xE8,
+    0x44, 0xE3, 0x9A, 0xFF, 0xC6, 0x86, 0xA2, 0x00, 0x00, 0x00, 0x00, 0x8B,
+    0xC6, 0x5F, 0xC3,
+];
+const C218: [usize; 4] = [0x31, 0x4f, 0x59, 0x77];
+const B219: [u8; 52] = [
+    0x51, 0xF3, 0x0F, 0x10, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x56, 0x8B, 0x74,
+    0x24, 0x0C, 0x8B, 0xCE, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x04, 0xE8, 0xC5,
+    0xFE, 0x97, 0xFF, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x04, 0xF3, 0x0F, 0x11,
+    0x06, 0xF3, 0x0F, 0x11, 0x46, 0x14, 0xF3, 0x0F, 0x11, 0x46, 0x28, 0x5E,
+    0x59, 0xC2, 0x04, 0x00,
+];
+const C219: [usize; 1] = [0x16];
+const B220: [u8; 52] = [
+    0x51, 0xF3, 0x0F, 0x10, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x56, 0x8B, 0x74,
+    0x24, 0x0C, 0x8B, 0xCE, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x04, 0xE8, 0x85,
+    0xFE, 0x97, 0xFF, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x04, 0xF3, 0x0F, 0x11,
+    0x06, 0xF3, 0x0F, 0x11, 0x46, 0x14, 0xF3, 0x0F, 0x11, 0x46, 0x28, 0x5E,
+    0x59, 0xC2, 0x04, 0x00,
+];
+const C220: [usize; 1] = [0x16];
+const B221: [u8; 44] = [
+    0x51, 0xD9, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x56, 0xD9, 0xE8, 0x8B, 0x74,
+    0x24, 0x0C, 0xDE, 0xF1, 0x8B, 0xCE, 0xD9, 0x5C, 0x24, 0x04, 0xE8, 0x45,
+    0xFE, 0x97, 0xFF, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x16, 0xD9, 0x56, 0x14,
+    0xD9, 0x5E, 0x28, 0x5E, 0x59, 0xC2, 0x04, 0x00,
+];
+const C221: [usize; 1] = [0x16];
+const B222: [u8; 44] = [
+    0x51, 0xD9, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x56, 0xD9, 0xE8, 0x8B, 0x74,
+    0x24, 0x0C, 0xDE, 0xF1, 0x8B, 0xCE, 0xD9, 0x5C, 0x24, 0x04, 0xE8, 0x15,
+    0xFE, 0x97, 0xFF, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x16, 0xD9, 0x56, 0x14,
+    0xD9, 0x5E, 0x28, 0x5E, 0x59, 0xC2, 0x04, 0x00,
+];
+const C222: [usize; 1] = [0x16];
+const B223: [u8; 52] = [
+    0x51, 0xF3, 0x0F, 0x10, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x56, 0x8B, 0x74,
+    0x24, 0x0C, 0x8B, 0xCE, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x04, 0xE8, 0x45,
+    0xFB, 0x97, 0xFF, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x04, 0xF3, 0x0F, 0x11,
+    0x06, 0xF3, 0x0F, 0x11, 0x46, 0x14, 0xF3, 0x0F, 0x11, 0x46, 0x28, 0x5E,
+    0x59, 0xC2, 0x04, 0x00,
+];
+const C223: [usize; 1] = [0x16];
+const B224: [u8; 52] = [
+    0x51, 0xF3, 0x0F, 0x10, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x56, 0x8B, 0x74,
+    0x24, 0x0C, 0x8B, 0xCE, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x04, 0xE8, 0x05,
+    0xFB, 0x97, 0xFF, 0xF3, 0x0F, 0x10, 0x44, 0x24, 0x04, 0xF3, 0x0F, 0x11,
+    0x06, 0xF3, 0x0F, 0x11, 0x46, 0x14, 0xF3, 0x0F, 0x11, 0x46, 0x28, 0x5E,
+    0x59, 0xC2, 0x04, 0x00,
+];
+const C224: [usize; 1] = [0x16];
+const B225: [u8; 44] = [
+    0x51, 0xD9, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x56, 0xD9, 0xE8, 0x8B, 0x74,
+    0x24, 0x0C, 0xDE, 0xF1, 0x8B, 0xCE, 0xD9, 0x5C, 0x24, 0x04, 0xE8, 0xC5,
+    0xFA, 0x97, 0xFF, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x16, 0xD9, 0x56, 0x14,
+    0xD9, 0x5E, 0x28, 0x5E, 0x59, 0xC2, 0x04, 0x00,
+];
+const C225: [usize; 1] = [0x16];
+const B226: [u8; 44] = [
+    0x51, 0xD9, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x56, 0xD9, 0xE8, 0x8B, 0x74,
+    0x24, 0x0C, 0xDE, 0xF1, 0x8B, 0xCE, 0xD9, 0x5C, 0x24, 0x04, 0xE8, 0x95,
+    0xFA, 0x97, 0xFF, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x16, 0xD9, 0x56, 0x14,
+    0xD9, 0x5E, 0x28, 0x5E, 0x59, 0xC2, 0x04, 0x00,
+];
+const C226: [usize; 1] = [0x16];

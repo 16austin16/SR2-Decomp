@@ -2166,7 +2166,7 @@ pub fn install_all() {
         crate::port_registrars::install();
         crate::port_big::install();
         crate::port_bindings3::install();
-        // crate::port_tables::install(); // held back until its native differential test passes
+        // crate::port_tables::install(); // held back: one lifted port passes a bad pointer into 0xA7CA70 in game (2026-11-02)
         crate::port_frame2::install();
         crate::port_vint2::install();
         crate::port_bindings4::install();
@@ -2176,6 +2176,7 @@ pub fn install_all() {
         crate::port_camanim::install();
         crate::port_weather::install();
         crate::port_bindings5::install();
+        log(&crate::portlib::installed_list());
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
         }

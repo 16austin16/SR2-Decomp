@@ -1,14 +1,1440 @@
-//! Ported functions (filled by a porting agent).
+//! Port module: small activity / diversion / HUD leaves and the game-mode callbacks (doc 50).
+//!
+//! Register ports (the first twenty) go through a `pushad` thunk: every register comes back as
+//! the caller left it except EAX, which carries the result (the whole of EAX is reproduced as the
+//! original leaves it, including the bytes above an AL result). The pure ones are shadowed for
+//! their first `SHADOW_CALLS` calls against a relocated copy of the original (the original's EAX
+//! / ST0 wins on a mismatch); the small writers run on a snapshot of the memory they write
+//! (original, save, restore, Rust, compare; the original's writes are kept on a mismatch).
+//!
+//! The forwarding callbacks (game mode 0 / 2 events, marker free, fighter clear, release player
+//! control) call virtual methods or functions with side effects, so they only have per-branch
+//! call counters.
 
-#![allow(unused_imports)]
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::portlib::*;
 use crate::{detour, log};
 
-/// Install this module's replacements (called from hooks::install_all).
-pub fn install() {}
+const SHADOW_CALLS: u32 = 3000;
 
-/// Per-function call counts for the periodic log.
-pub fn summary() -> String {
-    String::new()
+const MISSION: usize = 0x027B_3C60;
+const ACTIVITY: usize = 0x0140_8E88;
+const DIVERSION: usize = 0x0252_7888;
+const LOCAL_PLAYER: usize = 0x0217_03D4;
+const GAME_NOW: usize = 0x00E8_43AC;
+const MARKER_BASE: usize = 0x0279_C230;
+const MARKER_COUNT: usize = 0x0279_C238;
+const PROGRESS_TABLE: usize = 0x0279_6E9C;
+const PROGRESS_COUNT: usize = 0x0279_719C;
+const HALF: i32 = 0x35A4_E900;
+const NONE: u32 = u32::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct Pushad {
+    edi: u32,
+    esi: u32,
+    ebp: u32,
+    esp: u32,
+    ebx: u32,
+    edx: u32,
+    ecx: u32,
+    eax: u32,
 }
+
+/// A naked thunk: `pushad`, then `f(&mut regs, &stack args)`, then `popad`. The Rust body puts
+/// its result in `regs.eax`; an `f32` return stays on ST0.
+macro_rules! regs_thunk {
+    ($name:ident, $f:ident) => {
+        regs_thunk!($name, $f, "ret");
+    };
+    ($name:ident, $f:ident, $ret:literal) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "pushad",
+                "mov eax, esp",
+                "lea ecx, [esp + 36]",
+                "push ecx",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "popad",
+                $ret,
+                f = sym $f,
+            )
+        }
+    };
+}
+
+/// `call_regs` for a callee that returns on the x87 stack: the result is popped as a qword.
+unsafe fn call_regs_st0(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> f64 {
+    let mut out = 0f64;
+    let block: [u32; 9] =
+        [f as u32, ecx, edx, esi, edi, args.as_ptr() as u32, args.len() as u32, eax, &mut out as *mut f64 as u32];
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "mov ebp, esp",
+            "mov ebx, eax",
+            "mov ecx, [ebx + 24]",
+            "mov esi, [ebx + 20]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]", "mov esi, [ebx + 12]", "mov edi, [ebx + 16]",
+            "mov eax, [ebx + 28]",
+            "call dword ptr [ebx]",
+            "mov ecx, [ebx + 32]",
+            "fstp qword ptr [ecx]",
+            "mov esp, ebp",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("eax") block.as_ptr() => _, lateout("ecx") _, lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    out
+}
+
+// --- the shadowed register ports ------------------------------------------------------------------
+
+struct Port {
+    name: &'static str,
+    addr: usize,
+    calls: AtomicU32,
+    mismatches: AtomicU32,
+    original: AtomicUsize,
+}
+
+const fn port(name: &'static str, addr: usize) -> Port {
+    Port { name, addr, calls: AtomicU32::new(0), mismatches: AtomicU32::new(0), original: AtomicUsize::new(0) }
+}
+
+const CURRENT_TYPE: usize = 0;
+const IS_FIGHTER: usize = 1;
+const PLAYER_FLAG: usize = 2;
+const COUNTDOWN: usize = 3;
+const MARKER_FIND: usize = 4;
+const MARKER_INDEX: usize = 5;
+const MARKER_REMOVE: usize = 6;
+const LEVELS_DONE: usize = 7;
+const LEVELS_MASK: usize = 8;
+const START_BLOCKED: usize = 9;
+const DIV_TYPE_ID: usize = 10;
+const BTN_DOWN: usize = 11;
+const ROLL_CHANCE: usize = 12;
+const REMAP: usize = 13;
+const WAIT_TIMER: usize = 14;
+const BTN_PRESSED: usize = 15;
+const BTN_NAME: usize = 16;
+const HUD_OPEN: usize = 17;
+const R_LEAVE: usize = 18;
+const R_INIT: usize = 19;
+const COUNT: usize = 20;
+
+static PORTS: [Port; COUNT] = [
+    port("activity_current_type", 0x0053_C4D0),
+    port("fight_club_is_fighter_handle", 0x005D_DA00),
+    port("fight_club_get_player_flag", 0x005D_E330),
+    port("fight_club_get_countdown", 0x005D_E0C0),
+    port("activity_hud_marker_find", 0x005E_50F0),
+    port("activity_hud_marker_index", 0x005E_5130),
+    port("activity_hud_marker_remove_at", 0x005E_6A80),
+    port("activity_progress_get_levels_done", 0x0053_D610),
+    port("activity_progress_levels_done_mask", 0x0053_D650),
+    port("diversion_start_blocked", 0x0060_45E0),
+    port("diversion_current_type_id", 0x0060_3E30),
+    port("activity_button_is_down", 0x005E_1D30),
+    port("drive_complication_roll_chance", 0x0066_DC90),
+    port("complication_remap_value", 0x0066_DA90),
+    port("activity_instance_phase_wait_timer", 0x0053_F3A0),
+    port("activity_button_just_pressed", 0x005E_1DE0),
+    port("activity_button_name", 0x005E_1E90),
+    port("button_mashing_hud_is_open", 0x005E_4A90),
+    port("game_mode_racing_leave", 0x0068_29F0),
+    port("game_mode_racing_init", 0x0068_29B0),
+];
+
+/// Count a call; `Some((call number, original copy))` while it should be shadowed.
+fn shadowing(id: usize) -> Option<(u32, usize)> {
+    let p = &PORTS[id];
+    let n = p.calls.fetch_add(1, Ordering::Relaxed);
+    let orig = p.original.load(Ordering::Relaxed);
+    if n == SHADOW_CALLS && orig != 0 {
+        log(&format!("port_activities2: {}: {SHADOW_CALLS} calls shadowed, {} mismatched", p.name, p.mismatches.load(Ordering::Relaxed)));
+    }
+    (orig != 0 && n < SHADOW_CALLS).then_some((n, orig))
+}
+
+fn mismatch(id: usize, n: u32, what: String) {
+    let m = PORTS[id].mismatches.fetch_add(1, Ordering::Relaxed) + 1;
+    if m <= 10 {
+        log(&format!("port_activities2: {} mismatch (call {n}): {what}", PORTS[id].name));
+    }
+}
+
+/// Run the original copy on the caller's registers and stack arguments; its EAX.
+unsafe fn run_orig(orig: usize, p: &Pushad, args: &[u32]) -> u32 {
+    unsafe { call_regs(orig, p.eax, p.ecx, p.edx, p.esi, p.edi, args) }
+}
+
+/// The shadow for the pure register ports: the original copy's EAX wins on a mismatch.
+fn checked(id: usize, p: &Pushad, args: &[u32], ours: u32) -> u32 {
+    let Some((n, orig)) = shadowing(id) else { return ours };
+    let r = unsafe { run_orig(orig, p, args) };
+    if r != ours {
+        mismatch(id, n, format!("regs eax {:#x} ecx {:#x} edx {:#x} esi {:#x} edi {:#x} args {args:x?}: original {r:#x}, Rust {ours:#x}", p.eax, p.ecx, p.edx, p.esi, p.edi));
+        return r;
+    }
+    ours
+}
+
+unsafe fn read_regions(regions: &[(usize, usize)]) -> Vec<Vec<u8>> {
+    regions.iter().map(|&(a, l)| unsafe { std::slice::from_raw_parts(a as *const u8, l) }.to_vec()).collect()
+}
+
+unsafe fn write_regions(regions: &[(usize, usize)], data: &[Vec<u8>]) {
+    for (&(a, _), d) in regions.iter().zip(data) {
+        unsafe { std::ptr::copy_nonoverlapping(d.as_ptr(), a as *mut u8, d.len()) };
+    }
+}
+
+/// The snapshot shadow for the small writers: original on the live state, save its writes, restore,
+/// Rust, compare EAX and the written regions; the original's writes and EAX are kept on a mismatch.
+/// `regions` (the memory the call can write) is only evaluated inside the shadow window.
+fn snap_checked(
+    id: usize,
+    p: &Pushad,
+    args: &[u32],
+    regions: impl FnOnce() -> Vec<(usize, usize)>,
+    ours: impl FnOnce() -> u32,
+) -> u32 {
+    let Some((n, orig)) = shadowing(id) else { return ours() };
+    let regions = regions();
+    unsafe {
+        let before = read_regions(&regions);
+        let eo = run_orig(orig, p, args);
+        let after_o = read_regions(&regions);
+        write_regions(&regions, &before);
+        let er = ours();
+        let after_r = read_regions(&regions);
+        if er != eo || after_r != after_o {
+            mismatch(
+                id,
+                n,
+                format!(
+                    "regs eax {:#x} ecx {:#x} edx {:#x} esi {:#x} edi {:#x} args {args:x?}: original eax {eo:#x}, Rust {er:#x}; writes differ: {}",
+                    p.eax, p.ecx, p.edx, p.esi, p.edi, after_r != after_o
+                ),
+            );
+            write_regions(&regions, &after_o);
+            return eo;
+        }
+        er
+    }
+}
+
+/// `fld dword` / `fstp dword` round trip: the bits, except that a signalling NaN is quieted.
+fn q32(bits: u32) -> u32 {
+    if bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x007F_FFFF != 0 { bits | 0x0040_0000 } else { bits }
+}
+
+/// EAX with AL replaced.
+fn lo(eax: u32, al: u32) -> u32 {
+    (eax & !0xFF) | (al & 0xFF)
+}
+
+/// Virtual method `slot` of `this`, called with ECX = this and the stack arguments (the method
+/// pops them).
+unsafe fn vcall(this: u32, slot: usize, args: &[u32]) -> u32 {
+    unsafe {
+        let f = vslot(this, slot);
+        call_regs(f, 0, this, 0, 0, 0, args)
+    }
+}
+
+// --- 0x53C4D0 activity_current_type -----------------------------------------------------------------
+
+/// -1 unless the current mission is an activity (kind +0x3C == 1); else the info's get_activity_type.
+unsafe fn current_type() -> u32 {
+    unsafe {
+        let m = rd(MISSION);
+        if m == 0 || rd(m as usize + 0x3C) != 1 {
+            return NONE;
+        }
+        vcall(rd(m as usize + 0x90), 1, &[])
+    }
+}
+
+extern "C" fn current_type_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked(CURRENT_TYPE, &p, &[], unsafe { current_type() });
+}
+regs_thunk!(current_type_thunk, current_type_entry);
+
+// --- 0x5DDA00 fight_club_is_fighter_handle (ESI = handle -> AL) --------------------------------------
+
+unsafe fn is_fighter(esi: u32) -> u32 {
+    unsafe {
+        let m = rd(MISSION);
+        if m == 0 {
+            return 0;
+        }
+        if rd(m as usize + 0x3C) != 1 {
+            return lo(m, 0);
+        }
+        let t = vcall(rd(m as usize + 0x90), 1, &[]);
+        if t != 3 {
+            return lo(t, 0);
+        }
+        if esi == 0 {
+            return 0;
+        }
+        let count = rd(0x0252_76C8);
+        let mut i = 0u32;
+        while i < count {
+            if rd(0x0140_A5C0 + 4 * i as usize) == esi {
+                return lo(i, 1);
+            }
+            i += 1;
+        }
+        lo(count, 0)
+    }
+}
+
+extern "C" fn is_fighter_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked(IS_FIGHTER, &p, &[], unsafe { is_fighter(p.esi) });
+}
+regs_thunk!(is_fighter_thunk, is_fighter_entry);
+
+// --- 0x5DE330 fight_club_get_player_flag (EAX = human -> AL) -----------------------------------------
+
+unsafe fn player_flag(eax: u32) -> u32 {
+    unsafe {
+        if eax == 0 {
+            return 0;
+        }
+        let al = if eax == rd(LOCAL_PLAYER) { rb(0x0252_76C6) } else { rb(0x0252_76C7) };
+        lo(eax, al as u32)
+    }
+}
+
+extern "C" fn player_flag_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked(PLAYER_FLAG, &p, &[], unsafe { player_flag(p.eax) });
+}
+regs_thunk!(player_flag_thunk, player_flag_entry);
+
+// --- 0x5DE0C0 fight_club_get_countdown (-> ST0) -----------------------------------------------------
+
+/// The fight club countdown (info +0x1A4), or the constant at 0xDD0794 (5.0) when the current
+/// mission is not a type-3 activity.
+unsafe fn countdown() -> u32 {
+    unsafe {
+        let m = rd(MISSION);
+        if m != 0 && rd(m as usize + 0x3C) == 1 {
+            let info = rd(m as usize + 0x90);
+            if info != 0 && vcall(info, 1, &[]) == 3 {
+                return q32(rd(info as usize + 0x1A4));
+            }
+        }
+        q32(rd(0x00DD_0794))
+    }
+}
+
+extern "C" fn countdown_entry(r: &mut Pushad, _: *const u32) -> f32 {
+    let p = *r;
+    let ours = unsafe { countdown() };
+    let Some((n, orig)) = shadowing(COUNTDOWN) else { return f32::from_bits(ours) };
+    let o = (unsafe { call_regs_st0(orig, p.eax, p.ecx, p.edx, p.esi, p.edi, &[]) } as f32).to_bits();
+    if o != ours {
+        mismatch(COUNTDOWN, n, format!("original {o:#x}, Rust {ours:#x}"));
+        return f32::from_bits(o);
+    }
+    f32::from_bits(ours)
+}
+regs_thunk!(countdown_thunk, countdown_entry);
+
+// --- 0x5E50F0 / 0x5E5130 activity_hud_marker_find / index (ESI = handle) ------------------------------
+
+/// The index of the marker (stride 0x104, handle at +8) in the table, or None.
+unsafe fn marker_scan(esi: u32) -> Option<u32> {
+    unsafe {
+        let n = rd(MARKER_COUNT) as i32;
+        if n <= 0 {
+            return None;
+        }
+        let base = rd(MARKER_BASE) as usize;
+        let mut i = 0i32;
+        while i < n {
+            if rd(base.wrapping_add(i as usize * 0x104 + 8)) == esi {
+                return Some(i as u32);
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+extern "C" fn marker_find_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let ours = unsafe { marker_scan(p.esi).map_or(0, |i| rd(MARKER_BASE).wrapping_add(i.wrapping_mul(0x104))) };
+    r.eax = checked(MARKER_FIND, &p, &[], ours);
+}
+regs_thunk!(marker_find_thunk, marker_find_entry);
+
+extern "C" fn marker_index_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let ours = unsafe { marker_scan(p.esi) }.unwrap_or(NONE);
+    r.eax = checked(MARKER_INDEX, &p, &[], ours);
+}
+regs_thunk!(marker_index_thunk, marker_index_entry);
+
+// --- 0x5E6A80 activity_hud_marker_remove_at (EAX = index -> AL) --------------------------------------
+
+unsafe fn marker_remove(index: u32) -> u32 {
+    unsafe {
+        let n = rd(MARKER_COUNT);
+        let last = n.wrapping_sub(1);
+        if (index as i32) >= (last as i32) {
+            wd(MARKER_COUNT, last);
+            return lo(n, 0);
+        }
+        let base = rd(MARKER_BASE) as usize;
+        let dst = base.wrapping_add((index as usize).wrapping_mul(0x104));
+        let src = base.wrapping_add((n as usize).wrapping_mul(0x104)).wrapping_sub(0x104);
+        copy_dwords(dst, src, 0x41);
+        wd(MARKER_COUNT, rd(MARKER_COUNT).wrapping_sub(1));
+        1
+    }
+}
+
+extern "C" fn marker_remove_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let regions = || unsafe {
+        let n = rd(MARKER_COUNT);
+        let mut v = vec![(MARKER_COUNT, 4usize)];
+        if (p.eax as i32) >= 0 && (p.eax as i32) < (n.wrapping_sub(1) as i32) {
+            v.push((rd(MARKER_BASE) as usize + p.eax as usize * 0x104, 0x104));
+        }
+        v
+    };
+    r.eax = snap_checked(MARKER_REMOVE, &p, &[], regions, || unsafe { marker_remove(p.eax) });
+}
+regs_thunk!(marker_remove_thunk, marker_remove_entry);
+
+// --- 0x53D610 / 0x53D650 activity progress table (ECX = &name hash) ----------------------------------
+
+/// The 12-byte entry (key, levels done, flag byte at +8) for the hash at `ecx`.
+unsafe fn progress_entry(ecx: u32) -> Option<usize> {
+    unsafe {
+        let n = rd(PROGRESS_COUNT);
+        if n == 0 {
+            return None;
+        }
+        let key = rd(ecx as usize);
+        let mut i = 0u32;
+        while i < n {
+            let e = PROGRESS_TABLE + 12 * i as usize;
+            if rd(e) == key {
+                return Some(e);
+            }
+            i += 1;
+        }
+        None
+    }
+}
+
+extern "C" fn levels_done_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let ours = unsafe { progress_entry(p.ecx) }.map_or(NONE, |e| unsafe { rd(e + 4) });
+    r.eax = checked(LEVELS_DONE, &p, &[], ours);
+}
+regs_thunk!(levels_done_thunk, levels_done_entry);
+
+/// AL = every bit 0..=level of the entry's flag byte is set; EAX as the original leaves it.
+unsafe fn levels_mask(ecx: u32, edi: u32) -> u32 {
+    unsafe {
+        let n = rd(PROGRESS_COUNT);
+        if n == 0 {
+            return 0;
+        }
+        let Some(e) = progress_entry(ecx) else { return lo(n, 0) };
+        if (edi as i32) < 0 {
+            return lo(e as u32, 1);
+        }
+        let byte = rb(e + 8) as u32;
+        let mut cl = 0u32;
+        loop {
+            if byte & (1u32 << (cl & 31)) == 0 {
+                return 0;
+            }
+            cl += 1;
+            if (cl as i32) > (edi as i32) {
+                return 1;
+            }
+        }
+    }
+}
+
+extern "C" fn levels_mask_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked(LEVELS_MASK, &p, &[], unsafe { levels_mask(p.ecx, p.edi) });
+}
+regs_thunk!(levels_mask_thunk, levels_mask_entry);
+
+// --- 0x6045E0 diversion_start_blocked -----------------------------------------------------------------
+
+unsafe fn start_blocked() -> u32 {
+    unsafe {
+        if rd(DIVERSION) != 0 {
+            return 1;
+        }
+        if matches!(rd(0x027A_3230), 1..=5) {
+            return 1;
+        }
+        (rd(0x027A_52A4) != 0 || rd(0x00EA_1020) == 2) as u32
+    }
+}
+
+extern "C" fn start_blocked_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked(START_BLOCKED, &p, &[], unsafe { start_blocked() });
+}
+regs_thunk!(start_blocked_thunk, start_blocked_entry);
+
+// --- 0x603E30 diversion_current_type_id ---------------------------------------------------------------
+
+unsafe fn div_type_id() -> u32 {
+    unsafe {
+        let inst = rd(DIVERSION);
+        if inst == 0 {
+            return NONE;
+        }
+        vcall(rd(inst as usize + 8), 2, &[])
+    }
+}
+
+extern "C" fn div_type_id_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked(DIV_TYPE_ID, &p, &[], unsafe { div_type_id() });
+}
+regs_thunk!(div_type_id_thunk, div_type_id_entry);
+
+// --- 0x5E1D30 / 0x5E1DE0 / 0x5E1E90 activity button tables ------------------------------------------
+
+/// Button index -> input action (indices 4 and 5 have none; 6 and 7 are swapped).
+fn button_action(index: u32) -> Option<u32> {
+    match index {
+        0 => Some(0x5E),
+        1 => Some(0x5F),
+        2 => Some(0x60),
+        3 => Some(0x61),
+        6 => Some(7),
+        7 => Some(6),
+        _ => None,
+    }
+}
+
+/// `input_action_down` / `just_pressed` (ECX = action -> AL), as 0 / 1 in EAX.
+unsafe fn button_query(f: usize, eax: u32) -> u32 {
+    unsafe {
+        let Some(action) = button_action(eax) else { return lo(eax, 0) };
+        let al = call_regs(f, eax, action, 0, 0, 0, &[]) & 0xFF;
+        (al == 1) as u32
+    }
+}
+
+extern "C" fn btn_down_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked(BTN_DOWN, &p, &[], unsafe { button_query(0x004F_F640, p.eax) });
+}
+regs_thunk!(btn_down_thunk, btn_down_entry);
+
+extern "C" fn btn_pressed_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = checked(BTN_PRESSED, &p, &[], unsafe { button_query(0x004F_F700, p.eax) });
+}
+regs_thunk!(btn_pressed_thunk, btn_pressed_entry);
+
+extern "C" fn btn_name_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let ours = unsafe {
+        match button_action(p.eax) {
+            Some(action) => call_regs(0x004F_FBB0, action, 0, 0, 0, 0, &[]),
+            None => 0,
+        }
+    };
+    r.eax = checked(BTN_NAME, &p, &[], ours);
+}
+regs_thunk!(btn_name_thunk, btn_name_entry);
+
+// --- 0x66DC90 drive_complication::roll_chance (ECX = this) --------------------------------------------
+
+extern "C" fn roll_chance_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let ours = || unsafe {
+        let roll = call_regs_st0(0x00BD_CE30, 0x00EC_30F8, 0, 0, 0, 0, &[]) as f32;
+        let thr = rf(p.ecx as usize + 0x14);
+        (thr > roll) as u32
+    };
+    // The only write is the generator's index at 0xEC30F8 + 0x9C4.
+    r.eax = snap_checked(ROLL_CHANCE, &p, &[], || vec![(0x00EC_30F8 + 0x9C4, 4)], ours);
+}
+regs_thunk!(roll_chance_thunk, roll_chance_entry);
+
+// --- 0x66DA90 complication::remap_value (ECX = this, stack a, b, c; ret 0xC) -------------------------
+
+extern "C" fn remap_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let a = unsafe { [*args, *args.add(1), *args.add(2)] };
+    let ours = || unsafe {
+        let v = rf(p.ecx as usize + 4) as f64 / f32::from_bits(a[0]) as f64 * f32::from_bits(a[1]) as f64
+            + f32::from_bits(a[2]) as f64;
+        wf(p.ecx as usize + 4, v as f32);
+        p.eax
+    };
+    r.eax = snap_checked(REMAP, &p, &a, || vec![(p.ecx as usize + 4, 4)], ours);
+}
+regs_thunk!(remap_thunk, remap_entry, "ret 12");
+
+// --- 0x53F3A0 activity_instance_phase_wait_timer (EDX = activity -> AL = 1) ---------------------------
+
+unsafe fn wait_timer(this: usize) -> u32 {
+    unsafe {
+        let t = rd(this + 0x2C) as i32;
+        let now = rd(GAME_NOW) as i32;
+        if t < 0 {
+            let mut v = now.wrapping_add(0x5DC);
+            wd(this + 0x2C, v as u32);
+            if v > 0x6B49_D200 {
+                v = v.wrapping_add(0x94B6_2E00u32 as i32);
+                wd(this + 0x2C, v as u32);
+            }
+            return lo(v as u32, 1);
+        }
+        if t <= now {
+            if now.wrapping_sub(t) < HALF {
+                wd(this + 0xC, 8);
+            }
+            lo(t as u32, 1)
+        } else {
+            let d = t.wrapping_sub(now);
+            if d >= HALF {
+                wd(this + 0xC, 8);
+            }
+            lo(d as u32, 1)
+        }
+    }
+}
+
+extern "C" fn wait_timer_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let this = p.edx as usize;
+    r.eax = snap_checked(WAIT_TIMER, &p, &[], || vec![(this + 0xC, 4), (this + 0x2C, 4)], || unsafe { wait_timer(this) });
+}
+regs_thunk!(wait_timer_thunk, wait_timer_entry);
+
+// --- 0x5E4A90 button_mashing_hud_is_open ------------------------------------------------------------
+
+extern "C" fn hud_open_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let ours = unsafe { call_regs(0x00B9_51E0, 0, 0x00DF_0730, 0, 0, 0, &[]) != 0 } as u32;
+    r.eax = checked(HUD_OPEN, &p, &[], ours);
+}
+regs_thunk!(hud_open_thunk, hud_open_entry);
+
+// --- 0x6829F0 / 0x6829B0 game_mode_racing_leave / init -----------------------------------------------
+
+fn racing_regions() -> Vec<(usize, usize)> {
+    vec![(0x00EA_A860, 4), (0x0252_7B50, 4), (0x027A_64E4, 4), (0x0252_7B4E, 1), (0x027A_64EC, 4)]
+}
+
+extern "C" fn racing_leave_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = snap_checked(R_LEAVE, &p, &[], racing_regions, || unsafe {
+        let c = rd(0x033D_630C);
+        wd(0x00EA_A860, NONE);
+        wd(0x0252_7B50, 0);
+        wd(0x027A_64E4, c);
+        wb(0x0252_7B4E, 0);
+        0
+    });
+}
+regs_thunk!(racing_leave_thunk, racing_leave_entry);
+
+extern "C" fn racing_init_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    r.eax = snap_checked(R_INIT, &p, &[], racing_regions, || unsafe {
+        let c = rd(0x033D_630C);
+        wd(0x00EA_A860, NONE);
+        wd(0x0252_7B50, 0);
+        wd(0x027A_64E4, c);
+        wb(0x0252_7B4E, 0);
+        wd(0x027A_64EC, c);
+        c
+    });
+}
+regs_thunk!(racing_init_thunk, racing_init_entry);
+
+// --- the counted forwarders -------------------------------------------------------------------------
+
+const NCTR: usize = 70;
+static CTR: [AtomicU32; NCTR] = [const { AtomicU32::new(0) }; NCTR];
+static CTR_NAMES: [&str; NCTR] = {
+    let mut n = [""; NCTR];
+    n[0] = "release_control";
+    n[1] = "marker_free.null";
+    n[2] = "marker_free.missing";
+    n[3] = "marker_free.item_freed";
+    n[4] = "marker_free.removed";
+    n[5] = "fighter_clear";
+    n[6] = "fighter_clear.virtual_calls";
+    n[8] = "a_ev20.call";
+    n[9] = "a_ev20.fwd";
+    n[10] = "a_ev21.call";
+    n[11] = "a_ev21.fwd";
+    n[12] = "a_ev22.call";
+    n[13] = "a_ev22.fwd";
+    n[14] = "a_ev23.call";
+    n[15] = "a_ev23.fwd";
+    n[16] = "a_ev26.call";
+    n[17] = "a_ev26.fwd";
+    n[18] = "a_damaged.call";
+    n[19] = "a_damaged.fwd";
+    n[20] = "a_ev19.call";
+    n[21] = "a_ev19.fwd";
+    n[22] = "a_human_killed.call";
+    n[23] = "a_human_killed.info";
+    n[24] = "a_human_killed.level";
+    n[25] = "a_obj_killed.call";
+    n[26] = "a_obj_killed.info";
+    n[27] = "a_obj_killed.level";
+    n[28] = "a_veh_destroyed.call";
+    n[29] = "a_veh_destroyed.info";
+    n[30] = "a_veh_destroyed.level";
+    n[31] = "a_ev15.call";
+    n[32] = "a_ev15.info";
+    n[33] = "a_ev15.level";
+    n[34] = "a_time_step.call";
+    n[35] = "a_time_step.level";
+    n[36] = "a_time_step.zombie";
+    n[37] = "a_time_step.crash_path";
+    n[40] = "d_respawned.call";
+    n[41] = "d_respawned.fwd";
+    n[42] = "d_ev20.call";
+    n[43] = "d_ev20.fwd";
+    n[44] = "d_ev21.call";
+    n[45] = "d_ev21.fwd";
+    n[46] = "d_ev22.call";
+    n[47] = "d_ev22.fwd";
+    n[48] = "d_obj_killed.call";
+    n[49] = "d_obj_killed.fwd";
+    n[50] = "d_veh_destroyed.call";
+    n[51] = "d_veh_destroyed.fwd";
+    n[52] = "d_damaged.call";
+    n[53] = "d_damaged.fwd";
+    n[54] = "d_ev19.call";
+    n[55] = "d_ev19.fwd";
+    n[56] = "d_human_killed.call";
+    n[57] = "d_human_killed.fwd";
+    n[58] = "d_ev15.call";
+    n[59] = "d_ev15.fwd";
+    n[60] = "d_ev13.call";
+    n[61] = "d_ev13.fwd";
+    n[62] = "d_time_step.call";
+    n[63] = "d_time_step.fwd";
+    n[64] = "d_reset.call";
+    n[65] = "d_reset.types_reset";
+    n
+};
+
+fn hit(i: usize) {
+    CTR[i].fetch_add(1, Ordering::Relaxed);
+}
+
+// 0x53E830 activity_release_player_control
+extern "C" fn release_control() {
+    hit(0);
+    unsafe {
+        call_regs(0x004F_5210, 0, 0, rd(0x0252_7430), 0, 0, &[]);
+        wd(0x0252_7430, 0);
+    }
+}
+
+// 0x5E6410 activity_hud_marker_free (EAX = handle -> index or -1)
+unsafe fn marker_free(h: u32) -> u32 {
+    unsafe {
+        if h == 0 {
+            hit(1);
+            return NONE;
+        }
+        let idx = call_regs(0x005E_5130, 0, 0, 0, h, 0, &[]);
+        if idx == NONE {
+            hit(2);
+            return NONE;
+        }
+        let item_h = rd(rd(MARKER_BASE) as usize + (idx as usize).wrapping_mul(0x104) + 8);
+        if item_h != 0 {
+            let slot = item_h & 0xFFFF;
+            if slot < 0x80 {
+                let item = 0x031A_96F0 + slot as usize * 0x22C;
+                if rd(item + 0x224) == item_h {
+                    hit(3);
+                    call_regs(0x00B9_4980, item as u32, item_h, 0, 0, 0, &[item as u32]);
+                }
+            }
+        }
+        hit(4);
+        call_regs(0x005E_6A80, idx, 0, 0, 0, 0, &[]);
+        idx
+    }
+}
+
+extern "C" fn marker_free_entry(r: &mut Pushad, _: *const u32) {
+    r.eax = unsafe { marker_free(r.eax) };
+}
+regs_thunk!(marker_free_thunk, marker_free_entry);
+
+// 0x5DF120 fight_club_fighter_group_clear (stdcall group*)
+extern "system" fn fighter_clear(g: u32) {
+    hit(5);
+    unsafe {
+        let g = g as usize;
+        if (rd(g + 0x148) as i32) > 0 {
+            let mut i = 0usize;
+            loop {
+                hit(6);
+                vcall(rd(g + 0x48 + 4 * i), 3, &[]);
+                i += 1;
+                if (i as i32) >= (rd(g + 0x148) as i32) {
+                    break;
+                }
+            }
+        }
+        wb(g, 0);
+        wd(g + 0x44, 0);
+        wd(g + 0x148, 0);
+    }
+}
+
+/// The current activity's level instance, or 0.
+unsafe fn level_instance() -> u32 {
+    unsafe {
+        let act = rd(ACTIVITY);
+        if act == 0 { 0 } else { rd(act as usize + 0x10) }
+    }
+}
+
+macro_rules! activity_level_fwd {
+    ($name:ident, $c:expr, $slot:expr, ($($a:ident),*)) => {
+        extern "C" fn $name($($a: u32),*) {
+            hit($c);
+            unsafe {
+                let lv = level_instance();
+                if lv != 0 {
+                    hit($c + 1);
+                    vcall(lv, $slot / 4, &[$($a),*]);
+                }
+            }
+        }
+    };
+}
+activity_level_fwd!(a_ev20, 8, 0x30, (a0));
+activity_level_fwd!(a_ev21, 10, 0x34, (a0));
+activity_level_fwd!(a_ev22, 12, 0x38, (a0));
+activity_level_fwd!(a_ev23, 14, 0x3C, (a0));
+activity_level_fwd!(a_damaged, 18, 0x28, (a0, a1, a2, a3));
+activity_level_fwd!(a_ev19, 20, 0x40, (a0, a1, a2, a3));
+
+// 0x53C350 game_mode_activity_on_game_event_26: the activity itself, slot 0x28, three arguments
+extern "C" fn a_ev26(a0: u32, a1: u32, a2: u32) {
+    hit(16);
+    unsafe {
+        let act = rd(ACTIVITY);
+        if act != 0 {
+            hit(17);
+            vcall(act, 0x28 / 4, &[a0, a1, a2]);
+        }
+    }
+}
+
+/// The mission info object when the current mission is an activity with a valid type, as the
+/// event callbacks 10-12 and 15 check it: kind 1, `get_activity_type != -1`, kind 1 again, info != 0.
+unsafe fn activity_info_checked() -> u32 {
+    unsafe {
+        let m = rd(MISSION);
+        if m == 0 || rd(m as usize + 0x3C) != 1 {
+            return 0;
+        }
+        if vcall(rd(m as usize + 0x90), 1, &[]) == NONE {
+            return 0;
+        }
+        let m = rd(MISSION);
+        if m == 0 || rd(m as usize + 0x3C) != 1 {
+            return 0;
+        }
+        rd(m as usize + 0x90)
+    }
+}
+
+macro_rules! activity_event_fwd {
+    ($name:ident, $c:expr, $info_slot:expr, $level_slot:expr, ($($a:ident),*)) => {
+        extern "C" fn $name($($a: u32),*) {
+            hit($c);
+            unsafe {
+                let info = activity_info_checked();
+                if info == 0 {
+                    return;
+                }
+                hit($c + 1);
+                vcall(info, $info_slot / 4, &[$($a),*]);
+                let lv = level_instance();
+                if lv != 0 {
+                    hit($c + 2);
+                    vcall(lv, $level_slot / 4, &[$($a),*]);
+                }
+            }
+        }
+    };
+}
+activity_event_fwd!(a_human_killed, 22, 0x4C, 0x18, (a0, a1, a2, a3));
+activity_event_fwd!(a_obj_killed, 25, 0x50, 0x1C, (a0, a1, a2, a3));
+activity_event_fwd!(a_veh_destroyed, 28, 0x54, 0x20, (a0, a1, a2, a3));
+activity_event_fwd!(a_ev15, 31, 0x48, 0x2C, (a0, a1, a2, a3, a4));
+
+// 0x53BE30 game_mode_activity_time_step (float dt)
+extern "C" fn a_time_step(dt: u32) {
+    hit(34);
+    unsafe {
+        let dt = q32(dt);
+        let lv = level_instance();
+        if lv != 0 {
+            hit(35);
+            vcall(lv, 0x10 / 4, &[dt]);
+        }
+        let mut m = rd(MISSION);
+        if m == 0 {
+            return;
+        }
+        if rd(m as usize + 0x3C) == 1 {
+            if vcall(rd(m as usize + 0x90), 1, &[]) == 2 {
+                return;
+            }
+            m = rd(MISSION);
+        }
+        if m == 0 || rd(m as usize + 0x3C) != 1 {
+            return;
+        }
+        if vcall(rd(m as usize + 0x90), 1, &[]) != 0xD {
+            return;
+        }
+        let m = rd(MISSION);
+        if m != 0 && rd(m as usize + 0x3C) == 1 {
+            hit(36);
+            vcall(rd(m as usize + 0x90), 0x68 / 4, &[dt]);
+        } else {
+            // The original loads a null `this` and faults here; do nothing instead.
+            hit(37);
+        }
+    }
+}
+
+/// The current diversion instance when the local player exists, else 0.
+unsafe fn diversion_with_player() -> u32 {
+    unsafe { if rd(LOCAL_PLAYER) == 0 { 0 } else { rd(DIVERSION) } }
+}
+
+macro_rules! diversion_fwd {
+    ($name:ident, $c:expr, $slot:expr, ($($a:ident),*)) => {
+        extern "C" fn $name($($a: u32),*) {
+            hit($c);
+            unsafe {
+                let inst = diversion_with_player();
+                if inst != 0 {
+                    hit($c + 1);
+                    vcall(inst, $slot / 4, &[$($a),*]);
+                }
+            }
+        }
+    };
+}
+diversion_fwd!(d_ev20, 42, 0x30, (a0));
+diversion_fwd!(d_ev21, 44, 0x34, (a0));
+diversion_fwd!(d_ev22, 46, 0x38, (a0));
+diversion_fwd!(d_obj_killed, 48, 0x18, (a0, a1, a2, a3));
+diversion_fwd!(d_veh_destroyed, 50, 0x1C, (a0, a1, a2, a3));
+diversion_fwd!(d_damaged, 52, 0x24, (a0, a1, a2, a3));
+diversion_fwd!(d_ev19, 54, 0x3C, (a0, a1, a2, a3));
+diversion_fwd!(d_human_killed, 56, 0x14, (a0, a1, a2, a3, a4));
+diversion_fwd!(d_ev15, 58, 0x28, (a0, a1, a2, a3, a4));
+
+// 0x603D70 game_mode_diversion_on_player_respawned: no local-player test
+extern "C" fn d_respawned(a0: u32) {
+    hit(40);
+    unsafe {
+        let inst = rd(DIVERSION);
+        if inst != 0 {
+            hit(41);
+            vcall(inst, 0x2C / 4, &[a0]);
+        }
+    }
+}
+
+// 0x603CC0 game_mode_diversion_on_game_event_13: the third argument is a float
+extern "C" fn d_ev13(a0: u32, a1: u32, a2: u32, a3: u32, a4: u32) {
+    hit(60);
+    unsafe {
+        let inst = diversion_with_player();
+        if inst != 0 {
+            hit(61);
+            vcall(inst, 0x20 / 4, &[a0, a1, q32(a2), a3, a4]);
+        }
+    }
+}
+
+// 0x603800 game_mode_diversion_time_step (float dt)
+extern "C" fn d_time_step(dt: u32) {
+    hit(62);
+    unsafe {
+        let inst = diversion_with_player();
+        if inst != 0 {
+            hit(63);
+            vcall(inst, 0xC / 4, &[q32(dt)]);
+        }
+    }
+}
+
+// 0x603570 game_mode_diversion_reset: type vf1 on every enabled diversion type
+extern "C" fn d_reset() {
+    hit(64);
+    unsafe {
+        let mut p = 0x0140_B168usize;
+        loop {
+            let t = rd(p);
+            if rb(t as usize + 0x14) != 0 {
+                hit(65);
+                vcall(t, 1, &[]);
+            }
+            p += 4;
+            if p >= 0x0140_B1FC {
+                break;
+            }
+        }
+    }
+}
+
+// --- install ----------------------------------------------------------------------------------------
+
+pub fn install() {
+    let shadowed: [(usize, &[u8], &[usize], extern "C" fn()); COUNT] = [
+        (CURRENT_TYPE, &CURRENT_TYPE_BODY, &CURRENT_TYPE_BODY_CALLS, current_type_thunk),
+        (IS_FIGHTER, &IS_FIGHTER_BODY, &IS_FIGHTER_BODY_CALLS, is_fighter_thunk),
+        (PLAYER_FLAG, &PLAYER_FLAG_BODY, &PLAYER_FLAG_BODY_CALLS, player_flag_thunk),
+        (COUNTDOWN, &COUNTDOWN_BODY, &COUNTDOWN_BODY_CALLS, countdown_thunk),
+        (MARKER_FIND, &MARKER_FIND_BODY, &MARKER_FIND_BODY_CALLS, marker_find_thunk),
+        (MARKER_INDEX, &MARKER_INDEX_BODY, &MARKER_INDEX_BODY_CALLS, marker_index_thunk),
+        (MARKER_REMOVE, &MARKER_REMOVE_BODY, &MARKER_REMOVE_BODY_CALLS, marker_remove_thunk),
+        (LEVELS_DONE, &LEVELS_DONE_BODY, &LEVELS_DONE_BODY_CALLS, levels_done_thunk),
+        (LEVELS_MASK, &LEVELS_MASK_BODY, &LEVELS_MASK_BODY_CALLS, levels_mask_thunk),
+        (START_BLOCKED, &START_BLOCKED_BODY, &START_BLOCKED_BODY_CALLS, start_blocked_thunk),
+        (DIV_TYPE_ID, &DIV_TYPE_ID_BODY, &DIV_TYPE_ID_BODY_CALLS, div_type_id_thunk),
+        (BTN_DOWN, &BTN_DOWN_BODY, &BTN_DOWN_BODY_CALLS, btn_down_thunk),
+        (ROLL_CHANCE, &ROLL_CHANCE_BODY, &ROLL_CHANCE_BODY_CALLS, roll_chance_thunk),
+        (REMAP, &REMAP_BODY, &REMAP_BODY_CALLS, remap_thunk),
+        (WAIT_TIMER, &WAIT_TIMER_BODY, &WAIT_TIMER_BODY_CALLS, wait_timer_thunk),
+        (BTN_PRESSED, &BTN_PRESSED_BODY, &BTN_PRESSED_BODY_CALLS, btn_pressed_thunk),
+        (BTN_NAME, &BTN_NAME_BODY, &BTN_NAME_BODY_CALLS, btn_name_thunk),
+        (HUD_OPEN, &HUD_OPEN_BODY, &HUD_OPEN_BODY_CALLS, hud_open_thunk),
+        (R_LEAVE, &R_LEAVE_BODY, &R_LEAVE_BODY_CALLS, racing_leave_thunk),
+        (R_INIT, &R_INIT_BODY, &R_INIT_BODY_CALLS, racing_init_thunk),
+    ];
+    let counted: [(&str, usize, &[u8], usize); 28] = [
+        ("activity_release_player_control", 0x0053_E830, &RELEASE_CTRL_BODY, release_control as *const () as usize),
+        ("activity_hud_marker_free", 0x005E_6410, &MARKER_FREE_BODY, marker_free_thunk as *const () as usize),
+        ("fight_club_fighter_group_clear", 0x005D_F120, &FIGHTER_CLEAR_BODY, fighter_clear as *const () as usize),
+        ("game_mode_activity_on_game_event_20", 0x0053_C2D0, &A_EV20_BODY, a_ev20 as *const () as usize),
+        ("game_mode_activity_on_game_event_21", 0x0053_C2F0, &A_EV21_BODY, a_ev21 as *const () as usize),
+        ("game_mode_activity_on_game_event_22", 0x0053_C310, &A_EV22_BODY, a_ev22 as *const () as usize),
+        ("game_mode_activity_on_game_event_23", 0x0053_C330, &A_EV23_BODY, a_ev23 as *const () as usize),
+        ("game_mode_activity_on_game_event_26", 0x0053_C350, &A_EV26_BODY, a_ev26 as *const () as usize),
+        ("game_mode_activity_on_object_damaged", 0x0053_C1E0, &A_DAMAGED_BODY, a_damaged as *const () as usize),
+        ("game_mode_activity_on_game_event_19", 0x0053_C2A0, &A_EV19_BODY, a_ev19 as *const () as usize),
+        ("game_mode_activity_on_human_killed", 0x0053_BED0, &A_HUMAN_KILLED_BODY, a_human_killed as *const () as usize),
+        ("game_mode_activity_on_object_killed", 0x0053_BF50, &A_OBJ_KILLED_BODY, a_obj_killed as *const () as usize),
+        ("game_mode_activity_on_vehicle_destroyed", 0x0053_BFD0, &A_VEH_DESTROYED_BODY, a_veh_destroyed as *const () as usize),
+        ("game_mode_activity_on_game_event_15", 0x0053_C210, &A_EV15_BODY, a_ev15 as *const () as usize),
+        ("game_mode_activity_time_step", 0x0053_BE30, &A_TIME_STEP_BODY, a_time_step as *const () as usize),
+        ("game_mode_diversion_on_player_respawned", 0x0060_3D70, &D_RESPAWNED_BODY, d_respawned as *const () as usize),
+        ("game_mode_diversion_on_game_event_20", 0x0060_3D90, &D_EV20_BODY, d_ev20 as *const () as usize),
+        ("game_mode_diversion_on_game_event_21", 0x0060_3DB0, &D_EV21_BODY, d_ev21 as *const () as usize),
+        ("game_mode_diversion_on_game_event_22", 0x0060_3E00, &D_EV22_BODY, d_ev22 as *const () as usize),
+        ("game_mode_diversion_on_object_killed", 0x0060_3C60, &D_OBJ_KILLED_BODY, d_obj_killed as *const () as usize),
+        ("game_mode_diversion_on_vehicle_destroyed", 0x0060_3C90, &D_VEH_DESTROYED_BODY, d_veh_destroyed as *const () as usize),
+        ("game_mode_diversion_on_object_damaged", 0x0060_3D00, &D_DAMAGED_BODY, d_damaged as *const () as usize),
+        ("game_mode_diversion_on_game_event_19", 0x0060_3DD0, &D_EV19_BODY, d_ev19 as *const () as usize),
+        ("game_mode_diversion_on_human_killed", 0x0060_3C20, &D_HUMAN_KILLED_BODY, d_human_killed as *const () as usize),
+        ("game_mode_diversion_on_game_event_15", 0x0060_3D30, &D_EV15_BODY, d_ev15 as *const () as usize),
+        ("game_mode_diversion_on_game_event_13", 0x0060_3CC0, &D_EV13_BODY, d_ev13 as *const () as usize),
+        ("game_mode_diversion_time_step", 0x0060_3800, &D_TIME_STEP_BODY, d_time_step as *const () as usize),
+        ("game_mode_diversion_reset", 0x0060_3570, &D_RESET_BODY, d_reset as *const () as usize),
+    ];
+    let mut ok = 0;
+    let total = COUNT + counted.len();
+    for (id, body, call_offsets, thunk) in shadowed {
+        let port = &PORTS[id];
+        // The shadow copy first: replacing patches the entry.
+        match unsafe { detour::relocate(port.addr, body, call_offsets) } {
+            Ok(copy) => port.original.store(copy, Ordering::Relaxed),
+            Err(e) => log(&format!("port_activities2: {}: no shadow copy: {e:?}", port.name)),
+        }
+        if replace_pinned(port.name, port.addr, body, thunk as usize) {
+            ok += 1;
+        }
+    }
+    for (name, addr, body, thunk) in counted {
+        if replace_pinned(name, addr, body, thunk) {
+            ok += 1;
+        }
+    }
+    log(&format!("port_activities2: replaced {ok}/{total} with Rust"));
+}
+
+/// One line for the periodic log.
+pub fn summary() -> String {
+    let mut parts: Vec<String> = PORTS
+        .iter()
+        .filter_map(|p| {
+            let c = p.calls.load(Ordering::Relaxed);
+            (c > 0).then(|| format!("{} {c} ({})", p.name, p.mismatches.load(Ordering::Relaxed)))
+        })
+        .collect();
+    for (i, c) in CTR.iter().enumerate() {
+        let c = c.load(Ordering::Relaxed);
+        if c > 0 && !CTR_NAMES[i].is_empty() {
+            parts.push(format!("{} {c}", CTR_NAMES[i]));
+        }
+    }
+    if parts.is_empty() { String::new() } else { format!("port_activities2: {}", parts.join(", ")) }
+}
+
+// --- original bodies (tools/body_bytes.py) ---------------------------------------------------------
+
+const CURRENT_TYPE_BODY: [u8; 32] = [
+    0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x13, 0x83, 0x78, 0x3C, 0x01, 0x75, 0x0D, 0x8B,
+    0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x01, 0x8B, 0x50, 0x04, 0xFF, 0xE2, 0x83, 0xC8, 0xFF, 0xC3,
+];
+const CURRENT_TYPE_BODY_CALLS: [usize; 0] = [];
+const IS_FIGHTER_BODY: [u8; 71] = [
+    0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x38, 0x83, 0x78, 0x3C, 0x01, 0x75, 0x32, 0x8B,
+    0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x01, 0x8B, 0x50, 0x04, 0xFF, 0xD2, 0x83, 0xF8, 0x03, 0x75,
+    0x20, 0x85, 0xF6, 0x74, 0x1C, 0x8B, 0x0D, 0xC8, 0x76, 0x52, 0x02, 0x33, 0xC0, 0x85, 0xC9, 0x76,
+    0x10, 0x3B, 0x34, 0x85, 0xC0, 0xA5, 0x40, 0x01, 0x74, 0x0A, 0x83, 0xC0, 0x01, 0x3B, 0xC1, 0x72,
+    0xF0, 0x32, 0xC0, 0xC3, 0xB0, 0x01, 0xC3,
+];
+const IS_FIGHTER_BODY_CALLS: [usize; 0] = [];
+const PLAYER_FLAG_BODY: [u8; 26] = [
+    0x85, 0xC0, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0x3B, 0x05, 0xD4, 0x03, 0x17, 0x02, 0xA0, 0xC6, 0x76,
+    0x52, 0x02, 0x74, 0x05, 0xA0, 0xC7, 0x76, 0x52, 0x02, 0xC3,
+];
+const PLAYER_FLAG_BODY_CALLS: [usize; 0] = [];
+const COUNTDOWN_BODY: [u8; 56] = [
+    0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x56, 0x74, 0x10, 0x83, 0x78, 0x3C, 0x01, 0x75, 0x0A,
+    0x8B, 0xB0, 0x90, 0x00, 0x00, 0x00, 0x85, 0xF6, 0x75, 0x08, 0xD9, 0x05, 0x94, 0x07, 0xDD, 0x00,
+    0x5E, 0xC3, 0x8B, 0x06, 0x8B, 0x50, 0x04, 0x8B, 0xCE, 0xFF, 0xD2, 0x83, 0xF8, 0x03, 0x75, 0xEA,
+    0xD9, 0x86, 0xA4, 0x01, 0x00, 0x00, 0x5E, 0xC3,
+];
+const COUNTDOWN_BODY_CALLS: [usize; 0] = [];
+const MARKER_FIND_BODY: [u8; 53] = [
+    0x8B, 0x15, 0x38, 0xC2, 0x79, 0x02, 0x33, 0xC0, 0x85, 0xD2, 0x57, 0x7E, 0x1A, 0x8B, 0x3D, 0x30,
+    0xC2, 0x79, 0x02, 0x8D, 0x4F, 0x08, 0x39, 0x31, 0x74, 0x11, 0x83, 0xC0, 0x01, 0x81, 0xC1, 0x04,
+    0x01, 0x00, 0x00, 0x3B, 0xC2, 0x7C, 0xEF, 0x33, 0xC0, 0x5F, 0xC3, 0x69, 0xC0, 0x04, 0x01, 0x00,
+    0x00, 0x03, 0xC7, 0x5F, 0xC3,
+];
+const MARKER_FIND_BODY_CALLS: [usize; 0] = [];
+const MARKER_INDEX_BODY: [u8; 42] = [
+    0x8B, 0x15, 0x38, 0xC2, 0x79, 0x02, 0x33, 0xC0, 0x85, 0xD2, 0x7E, 0x1A, 0x8B, 0x0D, 0x30, 0xC2,
+    0x79, 0x02, 0x83, 0xC1, 0x08, 0x39, 0x31, 0x74, 0x10, 0x83, 0xC0, 0x01, 0x81, 0xC1, 0x04, 0x01,
+    0x00, 0x00, 0x3B, 0xC2, 0x7C, 0xEF, 0x83, 0xC8, 0xFF, 0xC3,
+];
+const MARKER_INDEX_BODY_CALLS: [usize; 0] = [];
+const MARKER_REMOVE_BODY: [u8; 74] = [
+    0x57, 0x8B, 0xF8, 0xA1, 0x38, 0xC2, 0x79, 0x02, 0x8D, 0x48, 0xFF, 0x3B, 0xF9, 0x7D, 0x31, 0x8B,
+    0x0D, 0x30, 0xC2, 0x79, 0x02, 0x69, 0xFF, 0x04, 0x01, 0x00, 0x00, 0x69, 0xC0, 0x04, 0x01, 0x00,
+    0x00, 0x56, 0x03, 0xF9, 0x8D, 0xB4, 0x08, 0xFC, 0xFE, 0xFF, 0xFF, 0xB9, 0x41, 0x00, 0x00, 0x00,
+    0xF3, 0xA5, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x29, 0x05, 0x38, 0xC2, 0x79, 0x02, 0x5E, 0x5F, 0xC3,
+    0x89, 0x0D, 0x38, 0xC2, 0x79, 0x02, 0x32, 0xC0, 0x5F, 0xC3,
+];
+const MARKER_REMOVE_BODY_CALLS: [usize; 0] = [];
+const LEVELS_DONE_BODY: [u8; 63] = [
+    0x8B, 0x15, 0x9C, 0x71, 0x79, 0x02, 0x33, 0xC0, 0x85, 0xD2, 0x56, 0x76, 0x28, 0x8B, 0x31, 0xB9,
+    0x9C, 0x6E, 0x79, 0x02, 0x39, 0x31, 0x74, 0x0F, 0x83, 0xC0, 0x01, 0x83, 0xC1, 0x0C, 0x3B, 0xC2,
+    0x72, 0xF2, 0x83, 0xC8, 0xFF, 0x5E, 0xC3, 0x8D, 0x04, 0x40, 0x8D, 0x04, 0x85, 0x9C, 0x6E, 0x79,
+    0x02, 0x85, 0xC0, 0x75, 0x05, 0x83, 0xC8, 0xFF, 0x5E, 0xC3, 0x8B, 0x40, 0x04, 0x5E, 0xC3,
+];
+const LEVELS_DONE_BODY_CALLS: [usize; 0] = [];
+const LEVELS_MASK_BODY: [u8; 88] = [
+    0x8B, 0x15, 0x9C, 0x71, 0x79, 0x02, 0x33, 0xC0, 0x85, 0xD2, 0x56, 0x76, 0x27, 0x8B, 0x31, 0xB9,
+    0x9C, 0x6E, 0x79, 0x02, 0x39, 0x31, 0x74, 0x0E, 0x83, 0xC0, 0x01, 0x83, 0xC1, 0x0C, 0x3B, 0xC2,
+    0x72, 0xF2, 0x32, 0xC0, 0x5E, 0xC3, 0x8D, 0x04, 0x40, 0x8D, 0x04, 0x85, 0x9C, 0x6E, 0x79, 0x02,
+    0x85, 0xC0, 0x75, 0x04, 0x32, 0xC0, 0x5E, 0xC3, 0x33, 0xC9, 0x85, 0xFF, 0x7C, 0x16, 0x0F, 0xB6,
+    0x40, 0x08, 0xBA, 0x01, 0x00, 0x00, 0x00, 0xD3, 0xE2, 0x85, 0xD0, 0x74, 0xE7, 0x83, 0xC1, 0x01,
+    0x3B, 0xCF, 0x7E, 0xEE, 0xB0, 0x01, 0x5E, 0xC3,
+];
+const LEVELS_MASK_BODY_CALLS: [usize; 0] = [];
+const START_BLOCKED_BODY: [u8; 66] = [
+    0x83, 0x3D, 0x88, 0x78, 0x52, 0x02, 0x00, 0x75, 0x33, 0xA1, 0x30, 0x32, 0x7A, 0x02, 0x83, 0xF8,
+    0x04, 0x74, 0x29, 0x83, 0xF8, 0x05, 0x74, 0x24, 0x83, 0xF8, 0x01, 0x74, 0x1F, 0x83, 0xF8, 0x02,
+    0x74, 0x1A, 0x83, 0xF8, 0x03, 0x74, 0x15, 0x83, 0x3D, 0xA4, 0x52, 0x7A, 0x02, 0x00, 0x75, 0x0C,
+    0x83, 0x3D, 0x20, 0x10, 0xEA, 0x00, 0x02, 0x74, 0x03, 0x33, 0xC0, 0xC3, 0xB8, 0x01, 0x00, 0x00,
+    0x00, 0xC3,
+];
+const START_BLOCKED_BODY_CALLS: [usize; 0] = [];
+const DIV_TYPE_ID_BODY: [u8; 23] = [
+    0xA1, 0x88, 0x78, 0x52, 0x02, 0x85, 0xC0, 0x74, 0x0A, 0x8B, 0x48, 0x08, 0x8B, 0x01, 0x8B, 0x50,
+    0x08, 0xFF, 0xE2, 0x83, 0xC8, 0xFF, 0xC3,
+];
+const DIV_TYPE_ID_BODY_CALLS: [usize; 0] = [];
+const BTN_DOWN_BODY: [u8; 135] = [
+    0x83, 0xF8, 0x07, 0x77, 0x7F, 0xFF, 0x24, 0x85, 0xB8, 0x1D, 0x5E, 0x00, 0xB9, 0x5E, 0x00, 0x00,
+    0x00, 0xE8, 0xFA, 0xD8, 0xF1, 0xFF, 0x2C, 0x01, 0xF6, 0xD8, 0x1B, 0xC0, 0x83, 0xC0, 0x01, 0xC3,
+    0xB9, 0x5F, 0x00, 0x00, 0x00, 0xE8, 0xE6, 0xD8, 0xF1, 0xFF, 0x2C, 0x01, 0xF6, 0xD8, 0x1B, 0xC0,
+    0x83, 0xC0, 0x01, 0xC3, 0xB9, 0x60, 0x00, 0x00, 0x00, 0xE8, 0xD2, 0xD8, 0xF1, 0xFF, 0x2C, 0x01,
+    0xF6, 0xD8, 0x1B, 0xC0, 0x83, 0xC0, 0x01, 0xC3, 0xB9, 0x61, 0x00, 0x00, 0x00, 0xE8, 0xBE, 0xD8,
+    0xF1, 0xFF, 0x2C, 0x01, 0xF6, 0xD8, 0x1B, 0xC0, 0x83, 0xC0, 0x01, 0xC3, 0xB9, 0x06, 0x00, 0x00,
+    0x00, 0xE8, 0xAA, 0xD8, 0xF1, 0xFF, 0x2C, 0x01, 0xF6, 0xD8, 0x1B, 0xC0, 0x83, 0xC0, 0x01, 0xC3,
+    0xB9, 0x07, 0x00, 0x00, 0x00, 0xE8, 0x96, 0xD8, 0xF1, 0xFF, 0x2C, 0x01, 0xF6, 0xD8, 0x1B, 0xC0,
+    0x83, 0xC0, 0x01, 0xC3, 0x32, 0xC0, 0xC3,
+];
+const BTN_DOWN_BODY_CALLS: [usize; 6] = [0x11, 0x25, 0x39, 0x4d, 0x61, 0x75];
+const ROLL_CHANCE_BODY: [u8; 46] = [
+    0x51, 0x56, 0xB8, 0xF8, 0x30, 0xEC, 0x00, 0x8B, 0xF1, 0xE8, 0x92, 0xF1, 0x56, 0x00, 0xD9, 0x5C,
+    0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x46, 0x14, 0x5E, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x41, 0x75, 0x07, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x59, 0xC3, 0x33, 0xC0, 0x59, 0xC3,
+];
+const ROLL_CHANCE_BODY_CALLS: [usize; 1] = [0x9];
+const REMAP_BODY: [u8; 21] = [
+    0xD9, 0x41, 0x04, 0xD8, 0x74, 0x24, 0x04, 0xD8, 0x4C, 0x24, 0x08, 0xD8, 0x44, 0x24, 0x0C, 0xD9,
+    0x59, 0x04, 0xC2, 0x0C, 0x00,
+];
+const REMAP_BODY_CALLS: [usize; 0] = [];
+const WAIT_TIMER_BODY: [u8; 93] = [
+    0x83, 0x7A, 0x2C, 0x00, 0x7C, 0x38, 0x8B, 0x42, 0x2C, 0x85, 0xC0, 0x7C, 0x4D, 0x8B, 0x0D, 0xAC,
+    0x43, 0xE8, 0x00, 0x3B, 0xC1, 0x7E, 0x13, 0x2B, 0xC1, 0x3D, 0x00, 0xE9, 0xA4, 0x35, 0x7C, 0x3A,
+    0xC7, 0x42, 0x0C, 0x08, 0x00, 0x00, 0x00, 0xB0, 0x01, 0xC3, 0x2B, 0xC8, 0x81, 0xF9, 0x00, 0xE9,
+    0xA4, 0x35, 0x7D, 0x26, 0xC7, 0x42, 0x0C, 0x08, 0x00, 0x00, 0x00, 0xB0, 0x01, 0xC3, 0xA1, 0xAC,
+    0x43, 0xE8, 0x00, 0x05, 0xDC, 0x05, 0x00, 0x00, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0x89, 0x42, 0x2C,
+    0x7E, 0x08, 0x05, 0x00, 0x2E, 0xB6, 0x94, 0x89, 0x42, 0x2C, 0xB0, 0x01, 0xC3,
+];
+const WAIT_TIMER_BODY_CALLS: [usize; 0] = [];
+const BTN_PRESSED_BODY: [u8; 135] = [
+    0x83, 0xF8, 0x07, 0x77, 0x7F, 0xFF, 0x24, 0x85, 0x68, 0x1E, 0x5E, 0x00, 0xB9, 0x5E, 0x00, 0x00,
+    0x00, 0xE8, 0x0A, 0xD9, 0xF1, 0xFF, 0x2C, 0x01, 0xF6, 0xD8, 0x1B, 0xC0, 0x83, 0xC0, 0x01, 0xC3,
+    0xB9, 0x5F, 0x00, 0x00, 0x00, 0xE8, 0xF6, 0xD8, 0xF1, 0xFF, 0x2C, 0x01, 0xF6, 0xD8, 0x1B, 0xC0,
+    0x83, 0xC0, 0x01, 0xC3, 0xB9, 0x60, 0x00, 0x00, 0x00, 0xE8, 0xE2, 0xD8, 0xF1, 0xFF, 0x2C, 0x01,
+    0xF6, 0xD8, 0x1B, 0xC0, 0x83, 0xC0, 0x01, 0xC3, 0xB9, 0x61, 0x00, 0x00, 0x00, 0xE8, 0xCE, 0xD8,
+    0xF1, 0xFF, 0x2C, 0x01, 0xF6, 0xD8, 0x1B, 0xC0, 0x83, 0xC0, 0x01, 0xC3, 0xB9, 0x06, 0x00, 0x00,
+    0x00, 0xE8, 0xBA, 0xD8, 0xF1, 0xFF, 0x2C, 0x01, 0xF6, 0xD8, 0x1B, 0xC0, 0x83, 0xC0, 0x01, 0xC3,
+    0xB9, 0x07, 0x00, 0x00, 0x00, 0xE8, 0xA6, 0xD8, 0xF1, 0xFF, 0x2C, 0x01, 0xF6, 0xD8, 0x1B, 0xC0,
+    0x83, 0xC0, 0x01, 0xC3, 0x32, 0xC0, 0xC3,
+];
+const BTN_PRESSED_BODY_CALLS: [usize; 6] = [0x11, 0x25, 0x39, 0x4d, 0x61, 0x75];
+const BTN_NAME_BODY: [u8; 75] = [
+    0x83, 0xF8, 0x07, 0x77, 0x43, 0xFF, 0x24, 0x85, 0xDC, 0x1E, 0x5E, 0x00, 0xB8, 0x5E, 0x00, 0x00,
+    0x00, 0xE9, 0x0A, 0xDD, 0xF1, 0xFF, 0xB8, 0x5F, 0x00, 0x00, 0x00, 0xE9, 0x00, 0xDD, 0xF1, 0xFF,
+    0xB8, 0x60, 0x00, 0x00, 0x00, 0xE9, 0xF6, 0xDC, 0xF1, 0xFF, 0xB8, 0x61, 0x00, 0x00, 0x00, 0xE9,
+    0xEC, 0xDC, 0xF1, 0xFF, 0xB8, 0x06, 0x00, 0x00, 0x00, 0xE9, 0xE2, 0xDC, 0xF1, 0xFF, 0xB8, 0x07,
+    0x00, 0x00, 0x00, 0xE9, 0xD8, 0xDC, 0xF1, 0xFF, 0x33, 0xC0, 0xC3,
+];
+const BTN_NAME_BODY_CALLS: [usize; 0] = [];
+const HUD_OPEN_BODY: [u8; 17] = [
+    0xB9, 0x30, 0x07, 0xDF, 0x00, 0xE8, 0x46, 0x07, 0x5B, 0x00, 0xF7, 0xD8, 0x1B, 0xC0, 0xF7, 0xD8,
+    0xC3,
+];
+const HUD_OPEN_BODY_CALLS: [usize; 1] = [0x5];
+const RELEASE_CTRL_BODY: [u8; 22] = [
+    0x8B, 0x15, 0x30, 0x74, 0x52, 0x02, 0xE8, 0xD5, 0x69, 0xFB, 0xFF, 0xC7, 0x05, 0x30, 0x74, 0x52,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0xC3,
+];
+const A_EV20_BODY: [u8; 29] = [
+    0xA1, 0x88, 0x8E, 0x40, 0x01, 0x85, 0xC0, 0x74, 0x13, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x0C,
+    0x8B, 0x01, 0x8B, 0x54, 0x24, 0x04, 0x8B, 0x40, 0x30, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const A_EV21_BODY: [u8; 29] = [
+    0xA1, 0x88, 0x8E, 0x40, 0x01, 0x85, 0xC0, 0x74, 0x13, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x0C,
+    0x8B, 0x01, 0x8B, 0x54, 0x24, 0x04, 0x8B, 0x40, 0x34, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const A_EV22_BODY: [u8; 29] = [
+    0xA1, 0x88, 0x8E, 0x40, 0x01, 0x85, 0xC0, 0x74, 0x13, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x0C,
+    0x8B, 0x01, 0x8B, 0x54, 0x24, 0x04, 0x8B, 0x40, 0x38, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const A_EV23_BODY: [u8; 29] = [
+    0xA1, 0x88, 0x8E, 0x40, 0x01, 0x85, 0xC0, 0x74, 0x13, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x0C,
+    0x8B, 0x01, 0x8B, 0x54, 0x24, 0x04, 0x8B, 0x40, 0x3C, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const A_EV26_BODY: [u8; 33] = [
+    0x8B, 0x0D, 0x88, 0x8E, 0x40, 0x01, 0x85, 0xC9, 0x74, 0x16, 0x8B, 0x54, 0x24, 0x0C, 0x8B, 0x01,
+    0x8B, 0x40, 0x28, 0x52, 0x8B, 0x54, 0x24, 0x0C, 0x52, 0x8B, 0x54, 0x24, 0x0C, 0x52, 0xFF, 0xD0,
+    0xC3,
+];
+const A_DAMAGED_BODY: [u8; 44] = [
+    0xA1, 0x88, 0x8E, 0x40, 0x01, 0x85, 0xC0, 0x74, 0x22, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x1B,
+    0x8B, 0x54, 0x24, 0x10, 0x8B, 0x01, 0x8B, 0x40, 0x28, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0x8B,
+    0x54, 0x24, 0x10, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const A_EV19_BODY: [u8; 44] = [
+    0xA1, 0x88, 0x8E, 0x40, 0x01, 0x85, 0xC0, 0x74, 0x22, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x1B,
+    0x8B, 0x54, 0x24, 0x10, 0x8B, 0x01, 0x8B, 0x40, 0x40, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0x8B,
+    0x54, 0x24, 0x10, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const A_HUMAN_KILLED_BODY: [u8; 124] = [
+    0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x72, 0x56, 0xBE, 0x01, 0x00, 0x00, 0x00, 0x39,
+    0x70, 0x3C, 0x75, 0x66, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x01, 0x8B, 0x50, 0x04, 0xFF,
+    0xD2, 0x83, 0xF8, 0xFF, 0x74, 0x54, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x4B, 0x39,
+    0x70, 0x3C, 0x75, 0x46, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x85, 0xC9, 0x74, 0x3C, 0x8B, 0x74,
+    0x24, 0x14, 0x8B, 0x01, 0x8B, 0x50, 0x4C, 0x53, 0x8B, 0x5C, 0x24, 0x10, 0x55, 0x8B, 0x6C, 0x24,
+    0x10, 0x57, 0x8B, 0x7C, 0x24, 0x1C, 0x56, 0x57, 0x53, 0x55, 0xFF, 0xD2, 0xA1, 0x88, 0x8E, 0x40,
+    0x01, 0x85, 0xC0, 0x74, 0x12, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x0B, 0x8B, 0x01, 0x8B, 0x50,
+    0x18, 0x56, 0x57, 0x53, 0x55, 0xFF, 0xD2, 0x5F, 0x5D, 0x5B, 0x5E, 0xC3,
+];
+const A_OBJ_KILLED_BODY: [u8; 124] = [
+    0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x72, 0x56, 0xBE, 0x01, 0x00, 0x00, 0x00, 0x39,
+    0x70, 0x3C, 0x75, 0x66, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x01, 0x8B, 0x50, 0x04, 0xFF,
+    0xD2, 0x83, 0xF8, 0xFF, 0x74, 0x54, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x4B, 0x39,
+    0x70, 0x3C, 0x75, 0x46, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x85, 0xC9, 0x74, 0x3C, 0x8B, 0x74,
+    0x24, 0x14, 0x8B, 0x01, 0x8B, 0x50, 0x50, 0x53, 0x8B, 0x5C, 0x24, 0x10, 0x55, 0x8B, 0x6C, 0x24,
+    0x10, 0x57, 0x8B, 0x7C, 0x24, 0x1C, 0x56, 0x57, 0x53, 0x55, 0xFF, 0xD2, 0xA1, 0x88, 0x8E, 0x40,
+    0x01, 0x85, 0xC0, 0x74, 0x12, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x0B, 0x8B, 0x01, 0x8B, 0x50,
+    0x1C, 0x56, 0x57, 0x53, 0x55, 0xFF, 0xD2, 0x5F, 0x5D, 0x5B, 0x5E, 0xC3,
+];
+const A_VEH_DESTROYED_BODY: [u8; 124] = [
+    0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x72, 0x56, 0xBE, 0x01, 0x00, 0x00, 0x00, 0x39,
+    0x70, 0x3C, 0x75, 0x66, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x01, 0x8B, 0x50, 0x04, 0xFF,
+    0xD2, 0x83, 0xF8, 0xFF, 0x74, 0x54, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x4B, 0x39,
+    0x70, 0x3C, 0x75, 0x46, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x85, 0xC9, 0x74, 0x3C, 0x8B, 0x74,
+    0x24, 0x14, 0x8B, 0x01, 0x8B, 0x50, 0x54, 0x53, 0x8B, 0x5C, 0x24, 0x10, 0x55, 0x8B, 0x6C, 0x24,
+    0x10, 0x57, 0x8B, 0x7C, 0x24, 0x1C, 0x56, 0x57, 0x53, 0x55, 0xFF, 0xD2, 0xA1, 0x88, 0x8E, 0x40,
+    0x01, 0x85, 0xC0, 0x74, 0x12, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x0B, 0x8B, 0x01, 0x8B, 0x50,
+    0x20, 0x56, 0x57, 0x53, 0x55, 0xFF, 0xD2, 0x5F, 0x5D, 0x5B, 0x5E, 0xC3,
+];
+const A_EV15_BODY: [u8; 134] = [
+    0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x7C, 0x56, 0xBE, 0x01, 0x00, 0x00, 0x00, 0x39,
+    0x70, 0x3C, 0x75, 0x70, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x01, 0x8B, 0x50, 0x04, 0xFF,
+    0xD2, 0x83, 0xF8, 0xFF, 0x74, 0x5E, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x55, 0x39,
+    0x70, 0x3C, 0x75, 0x50, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x85, 0xC9, 0x74, 0x46, 0x8B, 0x74,
+    0x24, 0x18, 0x8B, 0x01, 0x8B, 0x54, 0x24, 0x08, 0x8B, 0x40, 0x48, 0x53, 0x8B, 0x5C, 0x24, 0x14,
+    0x55, 0x8B, 0x6C, 0x24, 0x14, 0x57, 0x8B, 0x7C, 0x24, 0x20, 0x56, 0x57, 0x53, 0x55, 0x52, 0xFF,
+    0xD0, 0xA1, 0x88, 0x8E, 0x40, 0x01, 0x85, 0xC0, 0x74, 0x17, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74,
+    0x10, 0x8B, 0x11, 0x8B, 0x44, 0x24, 0x14, 0x8B, 0x52, 0x2C, 0x56, 0x57, 0x53, 0x55, 0x50, 0xFF,
+    0xD2, 0x5F, 0x5D, 0x5B, 0x5E, 0xC3,
+];
+const A_TIME_STEP_BODY: [u8; 156] = [
+    0xA1, 0x88, 0x8E, 0x40, 0x01, 0x85, 0xC0, 0x74, 0x16, 0x8B, 0x48, 0x10, 0x85, 0xC9, 0x74, 0x0F,
+    0x8B, 0x01, 0xD9, 0x44, 0x24, 0x04, 0x8B, 0x50, 0x10, 0x51, 0xD9, 0x1C, 0x24, 0xFF, 0xD2, 0xA1,
+    0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x73, 0x83, 0x78, 0x3C, 0x01, 0x75, 0x19, 0x8B, 0x80,
+    0x90, 0x00, 0x00, 0x00, 0x8B, 0x10, 0x8B, 0xC8, 0x8B, 0x42, 0x04, 0xFF, 0xD0, 0x83, 0xF8, 0x02,
+    0x74, 0x59, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x50, 0x83, 0x78, 0x3C, 0x01, 0x75,
+    0x4A, 0x8B, 0x80, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x10, 0x8B, 0xC8, 0x8B, 0x42, 0x04, 0xFF, 0xD0,
+    0x83, 0xF8, 0x0D, 0x75, 0x36, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x1C, 0x83, 0x78,
+    0x3C, 0x01, 0x75, 0x16, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0xD9, 0x44, 0x24, 0x04, 0x8B, 0x11,
+    0x8B, 0x42, 0x68, 0x51, 0xD9, 0x1C, 0x24, 0xFF, 0xD0, 0xC3, 0xD9, 0x44, 0x24, 0x04, 0x33, 0xC9,
+    0x8B, 0x11, 0x8B, 0x42, 0x68, 0x51, 0xD9, 0x1C, 0x24, 0xFF, 0xD0, 0xC3,
+];
+const D_RESPAWNED_BODY: [u8; 23] = [
+    0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85, 0xC9, 0x74, 0x0C, 0x8B, 0x01, 0x8B, 0x54, 0x24, 0x04,
+    0x8B, 0x40, 0x2C, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_EV20_BODY: [u8; 32] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x16, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x0C, 0x8B, 0x01, 0x8B, 0x54, 0x24, 0x04, 0x8B, 0x40, 0x30, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_EV21_BODY: [u8; 32] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x16, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x0C, 0x8B, 0x01, 0x8B, 0x54, 0x24, 0x04, 0x8B, 0x40, 0x34, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_EV22_BODY: [u8; 32] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x16, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x0C, 0x8B, 0x01, 0x8B, 0x54, 0x24, 0x04, 0x8B, 0x40, 0x38, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_OBJ_KILLED_BODY: [u8; 47] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x25, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x1B, 0x8B, 0x54, 0x24, 0x10, 0x8B, 0x01, 0x8B, 0x40, 0x18, 0x52, 0x8B, 0x54, 0x24,
+    0x10, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_VEH_DESTROYED_BODY: [u8; 47] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x25, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x1B, 0x8B, 0x54, 0x24, 0x10, 0x8B, 0x01, 0x8B, 0x40, 0x1C, 0x52, 0x8B, 0x54, 0x24,
+    0x10, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_DAMAGED_BODY: [u8; 47] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x25, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x1B, 0x8B, 0x54, 0x24, 0x10, 0x8B, 0x01, 0x8B, 0x40, 0x24, 0x52, 0x8B, 0x54, 0x24,
+    0x10, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_EV19_BODY: [u8; 47] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x25, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x1B, 0x8B, 0x54, 0x24, 0x10, 0x8B, 0x01, 0x8B, 0x40, 0x3C, 0x52, 0x8B, 0x54, 0x24,
+    0x10, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_HUMAN_KILLED_BODY: [u8; 52] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x2A, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x20, 0x8B, 0x54, 0x24, 0x14, 0x8B, 0x01, 0x8B, 0x40, 0x14, 0x52, 0x8B, 0x54, 0x24,
+    0x14, 0x52, 0x8B, 0x54, 0x24, 0x14, 0x52, 0x8B, 0x54, 0x24, 0x14, 0x52, 0x8B, 0x54, 0x24, 0x14,
+    0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_EV15_BODY: [u8; 52] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x2A, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x20, 0x8B, 0x54, 0x24, 0x14, 0x8B, 0x01, 0x8B, 0x40, 0x28, 0x52, 0x8B, 0x54, 0x24,
+    0x14, 0x52, 0x8B, 0x54, 0x24, 0x14, 0x52, 0x8B, 0x54, 0x24, 0x14, 0x52, 0x8B, 0x54, 0x24, 0x14,
+    0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_EV13_BODY: [u8; 55] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x2D, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x23, 0x8B, 0x54, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0x8B, 0x01, 0x8B, 0x40, 0x20,
+    0x52, 0x8B, 0x54, 0x24, 0x14, 0x52, 0x8B, 0x54, 0x24, 0x10, 0x51, 0xD9, 0x1C, 0x24, 0x52, 0x8B,
+    0x54, 0x24, 0x14, 0x52, 0xFF, 0xD0, 0xC3,
+];
+const D_TIME_STEP_BODY: [u8; 35] = [
+    0x83, 0x3D, 0xD4, 0x03, 0x17, 0x02, 0x00, 0x74, 0x19, 0x8B, 0x0D, 0x88, 0x78, 0x52, 0x02, 0x85,
+    0xC9, 0x74, 0x0F, 0x8B, 0x01, 0xD9, 0x44, 0x24, 0x04, 0x8B, 0x50, 0x0C, 0x51, 0xD9, 0x1C, 0x24,
+    0xFF, 0xD2, 0xC3,
+];
+const D_RESET_BODY: [u8; 34] = [
+    0x56, 0xBE, 0x68, 0xB1, 0x40, 0x01, 0x8B, 0x0E, 0x80, 0x79, 0x14, 0x00, 0x74, 0x07, 0x8B, 0x01,
+    0x8B, 0x50, 0x04, 0xFF, 0xD2, 0x83, 0xC6, 0x04, 0x81, 0xFE, 0xFC, 0xB1, 0x40, 0x01, 0x7C, 0xE6,
+    0x5E, 0xC3,
+];
+const R_LEAVE_BODY: [u8; 35] = [
+    0x8B, 0x0D, 0x0C, 0x63, 0x3D, 0x03, 0x33, 0xC0, 0xC7, 0x05, 0x60, 0xA8, 0xEA, 0x00, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xA3, 0x50, 0x7B, 0x52, 0x02, 0x89, 0x0D, 0xE4, 0x64, 0x7A, 0x02, 0xA2, 0x4E, 0x7B,
+    0x52, 0x02, 0xC3,
+];
+const R_LEAVE_BODY_CALLS: [usize; 0] = [];
+const R_INIT_BODY: [u8; 40] = [
+    0xA1, 0x0C, 0x63, 0x3D, 0x03, 0x33, 0xC9, 0xC7, 0x05, 0x60, 0xA8, 0xEA, 0x00, 0xFF, 0xFF, 0xFF,
+    0xFF, 0x89, 0x0D, 0x50, 0x7B, 0x52, 0x02, 0xA3, 0xE4, 0x64, 0x7A, 0x02, 0x88, 0x0D, 0x4E, 0x7B,
+    0x52, 0x02, 0xA3, 0xEC, 0x64, 0x7A, 0x02, 0xC3,
+];
+const R_INIT_BODY_CALLS: [usize; 0] = [];
+const MARKER_FREE_BODY: [u8; 90] = [
+    0x56, 0x8B, 0xF0, 0x85, 0xF6, 0x75, 0x05, 0x83, 0xC8, 0xFF, 0x5E, 0xC3, 0xE8, 0x0F, 0xED, 0xFF,
+    0xFF, 0x8B, 0xF0, 0x83, 0xFE, 0xFF, 0x74, 0xEF, 0x8B, 0x0D, 0x30, 0xC2, 0x79, 0x02, 0x69, 0xC0,
+    0x04, 0x01, 0x00, 0x00, 0x8B, 0x4C, 0x08, 0x08, 0x85, 0xC9, 0x74, 0x23, 0x0F, 0xB7, 0xC1, 0x3D,
+    0x80, 0x00, 0x00, 0x00, 0x73, 0x19, 0x69, 0xC0, 0x2C, 0x02, 0x00, 0x00, 0x05, 0xF0, 0x96, 0x1A,
+    0x03, 0x39, 0x88, 0x24, 0x02, 0x00, 0x00, 0x75, 0x06, 0x50, 0xE8, 0x21, 0xE5, 0x5A, 0x00, 0x8B,
+    0xC6, 0xE8, 0x1A, 0x06, 0x00, 0x00, 0x8B, 0xC6, 0x5E, 0xC3,
+];
+const FIGHTER_CLEAR_BODY: [u8; 70] = [
+    0x55, 0x8B, 0x6C, 0x24, 0x08, 0x56, 0x33, 0xF6, 0x39, 0xB5, 0x48, 0x01, 0x00, 0x00, 0x7E, 0x1C,
+    0x57, 0x8D, 0x7D, 0x48, 0x8B, 0x0F, 0x8B, 0x01, 0x8B, 0x50, 0x0C, 0xFF, 0xD2, 0x83, 0xC6, 0x01,
+    0x83, 0xC7, 0x04, 0x3B, 0xB5, 0x48, 0x01, 0x00, 0x00, 0x7C, 0xE9, 0x5F, 0x5E, 0xC6, 0x45, 0x00,
+    0x00, 0xC7, 0x45, 0x44, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x85, 0x48, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x5D, 0xC2, 0x04, 0x00,
+];
