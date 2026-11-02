@@ -1,4 +1,7 @@
-//! Port module: two large functions as whole-function replacements.
+//! STATUS: done and installed: 12 translated camera functions (camera_follow_update, camera_update and 10 callees), checked
+//! statically (esp / x87 consistency) and instruction by instruction against the CPU. In progress, NOT installed (not yet
+//! translated here): 0x4969b0, 0x497220, 0x4A01B0, 0x499B50. Nothing has been run in the game.
+//! Port module: large functions as whole-function replacements.
 //!
 //! - effect_instance_update (0x50F880..0x50FD37, 1,207 bytes, no jump table): EAX = &cur_pos,
 //!   EDX = &prev_mat, 11 cdecl stack arguments (doc 46 S8e), plain `ret`. Runs on the game thread
@@ -6,6 +9,24 @@
 //! - render_frame (0x52A710..0x52ABFD, 1,262 bytes, no jump table): no arguments, plain `ret`,
 //!   render thread (supervisor thread, `game_render_thread_frame` 0x522640). Not reproduced: the
 //!   /GS security cookie (the original only checks that its own frame is intact).
+//!
+//! - camera_follow_update (0x49B4B0..0x49D06C, 7,100 bytes with any jump table): camera mode 0 update, cdecl (f32 dt), plain `ret`, game thread (camera_update)
+//! - camera_update (0x4932F0..0x49380E, 1,310 bytes with any jump table): per-frame camera update, no arguments, plain `ret`, game thread (sim_frame twice a frame)
+//! - cam_498d40 (0x498D40..0x499113, 979 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - cam_499480 (0x499480..0x49979F, 799 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - cam_499190 (0x499190..0x499476, 742 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - cam_497a20 (0x497A20..0x497C7A, 602 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - cam_4938c0 (0x4938C0..0x493AE8, 552 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - cam_496be0 (0x496BE0..0x496D98, 440 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - cam_492df0 (0x492DF0..0x492FD3, 483 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - cam_49ae60 (0x49AE60..0x49AFEE, 398 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - cam_49f320 (0x49F320..0x49FC96, 2,422 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - cam_49d7a0 (0x49D7A0..0x49D8AC, 268 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//!
+//! The functions after render_frame are block-by-block translations of the original machine code
+//! (see the runtime comment further down): registers, flags, the x87 stack and the stack frame are
+//! locals, and every callee is called by address with the registers and stack arguments the
+//! original has at that call.
 //!
 //! Callees stay the original functions, called by address with the registers and stack arguments
 //! the original sets up. x87 arithmetic runs at 53-bit precision: f64 intermediates, every
@@ -23,6 +44,18 @@ use crate::portlib::*;
 
 const EIU: usize = 0x0050_F880;
 const RENDER_FRAME: usize = 0x0052_A710;
+const CAMERA_FOLLOW_UPDATE: usize = 0x0049b4b0;
+const CAMERA_UPDATE: usize = 0x004932f0;
+const CAM_498D40: usize = 0x00498d40;
+const CAM_499480: usize = 0x00499480;
+const CAM_499190: usize = 0x00499190;
+const CAM_497A20: usize = 0x00497a20;
+const CAM_4938C0: usize = 0x004938c0;
+const CAM_496BE0: usize = 0x00496be0;
+const CAM_492DF0: usize = 0x00492df0;
+const CAM_49AE60: usize = 0x0049ae60;
+const CAM_49F320: usize = 0x0049f320;
+const CAM_49D7A0: usize = 0x0049d7a0;
 
 macro_rules! counters {
     ($($id:ident $name:expr,)*) => {
@@ -64,6 +97,89 @@ counters! {
     RfTag "rf_tagging_625620",
     RfPost1 "rf_render5_direct",
     RfPost2 "rf_render5_built",
+    CfCalls "cf_calls",
+    CfTarget "cf_target",
+    CfCastBlock "cf_cast_block",
+    CfRay "cf_ray",
+    CfBlendTimer "cf_blend_timer",
+    CfLerpTimer "cf_lerp_timer",
+    CfBlendOrient "cf_blend_orient",
+    CfNoBlend "cf_no_blend",
+    CfSubA "cf_sub_a",
+    CfM0 "cf_m0",
+    CfM1 "cf_m1",
+    CfM2 "cf_m2",
+    CfM3 "cf_m3",
+    CfM4 "cf_m4",
+    CfCam7 "cf_cam7",
+    CfSmooth "cf_smooth",
+    CfSub01 "cf_sub01",
+    CfNoVeh "cf_no_veh",
+    CfCam9Test "cf_cam9_test",
+    CfCam9 "cf_cam9",
+    CfNot9 "cf_not9",
+    CfTail "cf_tail",
+    CfTailZero "cf_tail_zero",
+    CuCalls "cu_calls",
+    CuTarget "cu_target",
+    CuPre "cu_pre",
+    CuPhysDt "cu_phys_dt",
+    CuModeUpdate "cu_mode_update",
+    CuModeCall "cu_mode_call",
+    CuSmooth "cu_smooth",
+    CuCut "cu_cut",
+    CuFovBlend "cu_fov_blend",
+    CuFade "cu_fade",
+    CuFadeCast "cu_fade_cast",
+    CuTimerImport "cu_timer_import",
+    CuNoMove "cu_no_move",
+    CuRegionReset "cu_region_reset",
+    Cam498d40Calls "cam498d40_calls",
+    Cam498d40B498E06 "cam498d40_b498_e06",
+    Cam498d40B498E8C "cam498d40_b498_e8_c",
+    Cam498d40B498F1A "cam498d40_b498_f1_a",
+    Cam498d40B498FB0 "cam498d40_b498_f_b0",
+    Cam498d40B49907F "cam498d40_b49907_f",
+    Cam499480Calls "cam499480_calls",
+    Cam499480B49961B "cam499480_b49961_b",
+    Cam499190Calls "cam499190_calls",
+    Cam499190B4991D3 "cam499190_b4991_d3",
+    Cam499190B499236 "cam499190_b499236",
+    Cam499190B49926D "cam499190_b49926_d",
+    Cam499190B4992B1 "cam499190_b4992_b1",
+    Cam499190B499344 "cam499190_b499344",
+    Cam499190B4993DA "cam499190_b4993_d_a",
+    Cam497a20Calls "cam497a20_calls",
+    Cam497a20B497AB9 "cam497a20_b497_a_b9",
+    Cam497a20B497B0A "cam497a20_b497_b0_a",
+    Cam497a20B497B37 "cam497a20_b497_b37",
+    Cam497a20B497B8A "cam497a20_b497_b8_a",
+    Cam497a20B497BC0 "cam497a20_b497_b_c0",
+    Cam497a20B497BF9 "cam497a20_b497_b_f9",
+    Cam497a20B497C45 "cam497a20_b497_c45",
+    Cam4938c0Calls "cam4938c0_calls",
+    Cam4938c0B4938D8 "cam4938c0_b4938_d8",
+    Cam4938c0B4938F0 "cam4938c0_b4938_f0",
+    Cam4938c0B493A3B "cam4938c0_b493_a3_b",
+    Cam4938c0B493A93 "cam4938c0_b493_a93",
+    Cam496be0Calls "cam496be0_calls",
+    Cam496be0B496C69 "cam496be0_b496_c69",
+    Cam492df0Calls "cam492df0_calls",
+    Cam492df0B492E2A "cam492df0_b492_e2_a",
+    Cam492df0B492F1D "cam492df0_b492_f1_d",
+    Cam492df0B492F9D "cam492df0_b492_f9_d",
+    Cam49ae60Calls "cam49ae60_calls",
+    Cam49ae60B49AF79 "cam49ae60_b49_a_f79",
+    Cam49f320Calls "cam49f320_calls",
+    Cam49f320B49F369 "cam49f320_b49_f369",
+    Cam49f320B49F3B4 "cam49f320_b49_f3_b4",
+    Cam49f320B49F53B "cam49f320_b49_f53_b",
+    Cam49f320B49F59C "cam49f320_b49_f59_c",
+    Cam49f320B49F791 "cam49f320_b49_f791",
+    Cam49f320B49F7D7 "cam49f320_b49_f7_d7",
+    Cam49f320B49F850 "cam49f320_b49_f850",
+    Cam49f320B49F88E "cam49f320_b49_f88_e",
+    Cam49d7a0Calls "cam49d7a0_calls",
 }
 
 fn bump(c: C) {
@@ -73,11 +189,107 @@ fn bump(c: C) {
 /// Install this module's replacements (called from hooks::install_all).
 pub fn install() {
     let mut ok = 0u32;
-    let total = 2u32;
+    let total = 14u32;
     if replace_pinned("effect_instance_update", EIU, &EFFECT_INSTANCE_UPDATE_BODY, eiu_thunk as extern "C" fn() as usize) {
         ok += 1;
     }
     if replace_pinned("render_frame", RENDER_FRAME, &RENDER_FRAME_BODY, render_frame_entry as extern "C" fn() as usize) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "camera_follow_update",
+        CAMERA_FOLLOW_UPDATE,
+        &CAMERA_FOLLOW_UPDATE_BODY,
+        camera_follow_update_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "camera_update",
+        CAMERA_UPDATE,
+        &CAMERA_UPDATE_BODY,
+        camera_update_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_498d40",
+        CAM_498D40,
+        &CAM_498D40_BODY,
+        cam_498d40_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_499480",
+        CAM_499480,
+        &CAM_499480_BODY,
+        cam_499480_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_499190",
+        CAM_499190,
+        &CAM_499190_BODY,
+        cam_499190_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_497a20",
+        CAM_497A20,
+        &CAM_497A20_BODY,
+        cam_497a20_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_4938c0",
+        CAM_4938C0,
+        &CAM_4938C0_BODY,
+        cam_4938c0_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_496be0",
+        CAM_496BE0,
+        &CAM_496BE0_BODY,
+        cam_496be0_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_492df0",
+        CAM_492DF0,
+        &CAM_492DF0_BODY,
+        cam_492df0_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_49ae60",
+        CAM_49AE60,
+        &CAM_49AE60_BODY,
+        cam_49ae60_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_49f320",
+        CAM_49F320,
+        &CAM_49F320_BODY,
+        cam_49f320_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_49d7a0",
+        CAM_49D7A0,
+        &CAM_49D7A0_BODY,
+        cam_49d7a0_thunk as extern "C" fn() as usize,
+    ) {
         ok += 1;
     }
     crate::log(&format!("port_big: replaced {ok}/{total} with Rust"));
@@ -85,7 +297,7 @@ pub fn install() {
 
 /// Per-function call counts for the periodic log.
 pub fn summary() -> String {
-    if CNT[C::EiuCalls as usize].load(Ordering::Relaxed) == 0 && CNT[C::RfCalls as usize].load(Ordering::Relaxed) == 0 {
+    if CNT.iter().all(|c| c.load(Ordering::Relaxed) == 0) {
         return String::new();
     }
     let parts: Vec<String> = (0..C::N as usize)
@@ -713,3 +925,12578 @@ const RENDER_FRAME_BODY: [u8; 1262] = [
     0x50, 0xE8, 0xAA, 0x1D, 0x6E, 0x00, 0xE8, 0x05, 0x66, 0xFF, 0xFF, 0x8B, 0x4C, 0x24, 0x30, 0x5F,
     0x5E, 0x5D, 0x5B, 0x33, 0xCC, 0xE8, 0x55, 0xB4, 0x76, 0x00, 0x83, 0xC4, 0x24, 0xC3,
 ];
+
+// =============================================================================================
+// Block-level x86 transliteration runtime, used by the mechanically translated large functions
+// below (camera_follow_update). The translated body keeps the original's registers, flags,
+// x87 stack and stack frame in locals, runs the original's basic blocks one by one, and calls
+// every callee by address with the registers and stack arguments the original has at that
+// call. So registers that pass through to a callee are exact, and so are the compares (flags
+// are computed from the same operands, x87 status from the same f64 values).
+// =============================================================================================
+
+#[allow(dead_code)]
+unsafe fn ww(p: usize, v: u16) {
+    *(p as *mut u16) = v
+}
+
+unsafe fn wdf64(p: usize, v: f64) {
+    std::ptr::write_unaligned(p as *mut f64, v)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Fl {
+    zf: bool,
+    sf: bool,
+    cf: bool,
+    of: bool,
+    pf: bool,
+}
+
+fn fl_mask(bits: u32) -> u32 {
+    if bits == 32 { u32::MAX } else { (1u32 << bits) - 1 }
+}
+
+fn f_logic(r: u32, bits: u32) -> Fl {
+    let r = r & fl_mask(bits);
+    Fl { zf: r == 0, sf: r & (1 << (bits - 1)) != 0, cf: false, of: false, pf: (r as u8).count_ones() % 2 == 0 }
+}
+
+fn f_sub(a: u32, b: u32, bits: u32) -> Fl {
+    let m = fl_mask(bits);
+    let (a, b) = (a & m, b & m);
+    let r = a.wrapping_sub(b) & m;
+    let sb = 1u32 << (bits - 1);
+    Fl { zf: r == 0, sf: r & sb != 0, cf: a < b, of: ((a ^ b) & (a ^ r) & sb) != 0, pf: (r as u8).count_ones() % 2 == 0 }
+}
+
+fn f_add(a: u32, b: u32, bits: u32) -> Fl {
+    let m = fl_mask(bits);
+    let (a, b) = (a & m, b & m);
+    let r = a.wrapping_add(b) & m;
+    let sb = 1u32 << (bits - 1);
+    Fl { zf: r == 0, sf: r & sb != 0, cf: r < a, of: (!(a ^ b) & (a ^ r) & sb) != 0, pf: (r as u8).count_ones() % 2 == 0 }
+}
+
+/// x87 stack of f64 (the game runs the x87 at 53-bit precision) and the condition codes of the
+/// last compare (C0 = 0x100, C2 = 0x400, C3 = 0x4000, as `fnstsw ax` returns them).
+struct X87 {
+    v: [f64; 8],
+    top: usize,
+    sw: u16,
+}
+
+impl X87 {
+    fn new() -> X87 {
+        X87 { v: [0.0; 8], top: 0, sw: 0 }
+    }
+    fn push(&mut self, x: f64) {
+        self.top = (self.top + 7) & 7;
+        self.v[self.top] = x;
+    }
+    fn pop(&mut self) -> f64 {
+        let x = self.v[self.top];
+        self.top = (self.top + 1) & 7;
+        x
+    }
+    fn s(&self, i: usize) -> f64 {
+        self.v[(self.top + i) & 7]
+    }
+    fn set(&mut self, i: usize, x: f64) {
+        self.v[(self.top + i) & 7] = x;
+    }
+    fn xch(&mut self, i: usize) {
+        self.v.swap(self.top, (self.top + i) & 7);
+    }
+}
+
+/// `fcom`: unordered -> C3|C2|C0, a > b -> 0, a < b -> C0, equal -> C3.
+fn fcmp(a: f64, b: f64) -> u16 {
+    if a.is_nan() || b.is_nan() {
+        0x4500
+    } else if a > b {
+        0
+    } else if a < b {
+        0x0100
+    } else {
+        0x4000
+    }
+}
+
+#[repr(C)]
+struct Blk {
+    f: u32,
+    eax: u32,
+    ecx: u32,
+    edx: u32,
+    ebx: u32,
+    esi: u32,
+    edi: u32,
+    args: u32,
+    nargs: u32,
+    xmm0: u32,
+    sw_before: u32,
+    sw_after: u32,
+    has_in: u32,
+    pad: u32,
+    st_in: [f64; 2],
+    st_out: [f64; 4],
+}
+
+/// Call `b.f` with the register file and `b.nargs` stack dwords copied from `b.args` (the
+/// original's esp). All of eax, ecx, edx, ebx, esi, edi and xmm0 come back as the callee left them.
+/// A value the callee leaves on the x87 stack (TOP moved) is popped into `st_out`; the number of
+/// such values is returned. With `has_in` = 1 or 2 the callee gets `st_in[0]` on ST0 (and `st_in[1]` on ST1): the `_ftol` / `_CIpow` shape.
+unsafe fn callx_raw(b: &mut Blk) -> usize {
+    std::arch::asm!(
+        "push ebx", "push esi", "push edi", "push ebp",
+        "mov ebp, esp",
+        "mov ebx, eax",
+        "push ebx",
+        "push dword ptr [ebx]",
+        "fnstsw word ptr [ebx + 40]",
+        "mov ecx, [ebx + 32]",
+        "mov esi, [ebx + 28]",
+        "2:",
+        "test ecx, ecx",
+        "jz 3f",
+        "push dword ptr [esi + ecx*4 - 4]",
+        "dec ecx",
+        "jmp 2b",
+        "3:",
+        "cmp dword ptr [ebx + 48], 2",
+        "jb 4f",
+        "fld qword ptr [ebx + 64]",
+        "4:",
+        "cmp dword ptr [ebx + 48], 0",
+        "je 5f",
+        "fld qword ptr [ebx + 56]",
+        "5:",
+        "movss xmm0, dword ptr [ebx + 36]",
+        "mov ecx, [ebx + 8]", "mov edx, [ebx + 12]", "mov esi, [ebx + 20]", "mov edi, [ebx + 24]",
+        "mov eax, [ebx + 4]",
+        "mov ebx, [ebx + 16]",
+        "call dword ptr [ebp - 8]",
+        "push eax",
+        "mov eax, [ebp - 4]",
+        "pop dword ptr [eax + 4]",
+        "mov [eax + 8], ecx", "mov [eax + 12], edx", "mov [eax + 16], ebx", "mov [eax + 20], esi",
+        "mov [eax + 24], edi",
+        "movss dword ptr [eax + 36], xmm0",
+        "fnstsw word ptr [eax + 44]",
+        "mov esp, ebp",
+        "pop ebp", "pop edi", "pop esi", "pop ebx",
+        inout("eax") b as *mut Blk => _,
+        clobber_abi("C"),
+    );
+    let tb = (b.sw_before >> 11) & 7;
+    let ta = (b.sw_after >> 11) & 7;
+    let n = (((tb + 8) - ta) & 7) as usize;
+    let n = n.min(4);
+    for k in 0..n {
+        std::arch::asm!("fstp qword ptr [{p}]", p = in(reg) &mut b.st_out[k] as *mut f64, options(nostack));
+    }
+    n
+}
+
+#[allow(dead_code)]
+fn f_sbb(a: u32, b: u32, c: u32, bits: u32) -> Fl {
+    let m = fl_mask(bits);
+    let (a, b) = (a & m, b & m);
+    let r = a.wrapping_sub(b).wrapping_sub(c) & m;
+    let sb = 1u32 << (bits - 1);
+    Fl {
+        zf: r == 0,
+        sf: r & sb != 0,
+        cf: (a as u64) < (b as u64) + (c as u64),
+        of: ((a ^ b) & (a ^ r) & sb) != 0,
+        pf: (r as u8).count_ones() % 2 == 0,
+    }
+}
+
+#[allow(dead_code)]
+fn f_adc(a: u32, b: u32, c: u32, bits: u32) -> Fl {
+    let m = fl_mask(bits);
+    let (a, b) = (a & m, b & m);
+    let r = a.wrapping_add(b).wrapping_add(c) & m;
+    let sb = 1u32 << (bits - 1);
+    Fl {
+        zf: r == 0,
+        sf: r & sb != 0,
+        cf: (a as u64) + (b as u64) + (c as u64) > m as u64,
+        of: (!(a ^ b) & (a ^ r) & sb) != 0,
+        pf: (r as u8).count_ones() % 2 == 0,
+    }
+}
+
+/// Register file at entry / exit of a translated function, passed through the entry thunk.
+#[repr(C)]
+struct Ent {
+    eax: u32,
+    ecx: u32,
+    edx: u32,
+    ebx: u32,
+    esi: u32,
+    edi: u32,
+    ebp: u32,
+    xmm0: u32,
+    nst: u32,
+    pad: u32,
+    st0: f64,
+}
+
+/// Entry thunk for a translated function: saves the entry registers (and the address of the
+/// stack arguments) for `$f(ent, args)`, then loads the registers the translation ended with,
+/// ST0 when it ends with a value on the x87 stack, and xmm0, and returns with `ret $n`.
+macro_rules! ent_thunk {
+    ($name:ident, $f:ident, $n:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 48",
+                "mov [esp], eax", "mov [esp + 4], ecx", "mov [esp + 8], edx", "mov [esp + 12], ebx",
+                "mov [esp + 16], esi", "mov [esp + 20], edi", "mov [esp + 24], ebp",
+                "mov dword ptr [esp + 36], 0",
+                "mov dword ptr [esp + 32], 0",
+                "movss dword ptr [esp + 28], xmm0",
+                "lea eax, [esp + 52]",
+                "push eax",
+                "lea eax, [esp + 4]",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "mov eax, [esp]", "mov ecx, [esp + 4]", "mov edx, [esp + 8]", "mov ebx, [esp + 12]",
+                "mov esi, [esp + 16]", "mov edi, [esp + 20]",
+                "movss xmm0, dword ptr [esp + 28]",
+                "cmp dword ptr [esp + 32], 0",
+                "je 2f",
+                "fld qword ptr [esp + 40]",
+                "2:",
+                "add esp, 48",
+                "ret {n}",
+                f = sym $f,
+                n = const $n,
+            )
+        }
+    };
+}
+
+
+// --- camera_follow_update (0x49b4b0..0x49d06c, 7100 bytes) ----------------------------------------
+//
+// Camera mode 0 update (the gameplay follow camera), `camera_modes[0].update(dt)` from
+// camera_update on the game thread (sim_frame). cdecl, one f32 argument (dt) on the stack, plain
+// `ret`, no register inputs; the original saves ebx / esi / edi and keeps its frame in ebp.
+// Facts the translation was checked against (tools in the scratchpad `camera` folder):
+// - x87 depth is 0 at the return and consistent at every join; esp is consistent at every join
+//   and at the early exit 0x49D04E.
+// - Callees returning on ST0 (popped from the real x87 stack as they return): 0x49B6D5 (0xBDCE30),
+//   0x49BC73 (0x40EA20), 0x49BD14 / 0x49BD29 (0x4F1AC0), 0x49BEB4 (0x412080), 0x49BF3C (0x496880),
+//   0x49C65B / 0x49C685 (0x428CD0), 0x49CC8F / 0x49CC9F (0x6528C0), 0x49CCBC / 0x49CCCC (0x8AD190),
+//   0x49CEEF / 0x49CF02 (0xBDE980). Callees returning on xmm0 (movss store): 0xBE3380, 0xBF14D0,
+//   0xBF1600, 0xBF1560, 0xBDED80.
+// - 0x49B7CB passes ST0 to the float-to-int 0xDA0140; the other x87 values live across a call stay
+//   in the translation's x87 stack.
+// - stdcall callees (their own `ret n` is applied to the translated esp): 0x49AE60 (4), 0xBE2D90
+//   (0x10), 0xBE3150 (8), 0xBE49A0 (4), 0xBE50F0 (8), 0xBE51D0 (8), and the two vtable calls with
+//   two arguments at 0x49C45A / 0x49C880 (8).
+// - Jump table 0x49D058 (5 entries, index = [0x25F5C54] <= 4): 0x49C1E6, 0x49C210, 0x49C201,
+//   0x49C21C, 0x49C22C.
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn camera_follow_update_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x49b4b0;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x49b4b0 => {
+            bump(C::CfCalls);
+            // 0x49b4b0: push ebp
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebp);
+            // 0x49b4b1: mov ebp, esp
+            ebp = esp;
+            // 0x49b4b3: and esp, 0xfffffff8
+            { let r = (esp) & (0xfffffff8u32); fl = f_logic(r, 32); esp = r; }
+            // 0x49b4b6: sub esp, 0x154
+            { let a = esp; let b = 0x154u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49b4bc: mov eax, dword ptr [0x25f5bb0]
+            eax = rd(0x25f5bb0usize);
+            // 0x49b4c1: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49b4c3: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x49b4c4: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49b4c5: mov esi, dword ptr [0x21703d4]
+            esi = rd(0x21703d4usize);
+            // 0x49b4cb: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x49b4cc: mov dword ptr [esp + 0x20], esi
+            wd((esp.wrapping_add(0x20)) as usize, esi);
+            // 0x49b4d0: je 0x49d04e
+            if fl.zf { pc = 0x49d04e; } else { pc = 0x49b4d6; } continue;
+        }
+        0x49b4d6 => {
+            bump(C::CfTarget);
+            // 0x49b4d6: mov ecx, eax
+            ecx = eax;
+            // 0x49b4d8: and ecx, 0xfff
+            { let r = (ecx) & (0xfffu32); fl = f_logic(r, 32); ecx = r; }
+            // 0x49b4de: shl ecx, 4
+            { let r = ecx << 4; fl = f_logic(r, 32); ecx = r; }
+            // 0x49b4e1: mov edi, dword ptr [ecx + 0x2149c64]
+            edi = rd((ecx.wrapping_add(0x2149c64)) as usize);
+            // 0x49b4e7: test edi, edi
+            fl = f_logic((edi) & (edi), 32);
+            // 0x49b4e9: mov dword ptr [esp + 0x34], edi
+            wd((esp.wrapping_add(0x34)) as usize, edi);
+            // 0x49b4ed: je 0x49d04e
+            if fl.zf { pc = 0x49d04e; } else { pc = 0x49b4f3; } continue;
+        }
+        0x49b4f3 => {
+            // 0x49b4f3: cmp dword ptr [edi + 0x44], eax
+            fl = f_sub(rd((edi.wrapping_add(0x44)) as usize), eax, 32);
+            // 0x49b4f6: jne 0x49d04e
+            if !fl.zf { pc = 0x49d04e; } else { pc = 0x49b4fc; } continue;
+        }
+        0x49b4fc => {
+            // 0x49b4fc: fld dword ptr [0x25f5b20]
+            fx.push(rf(0x25f5b20usize) as f64);
+            // 0x49b502: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49b503: fadd dword ptr [0x25f5d50]
+            { let v = fx.s(0) + (rf(0x25f5d50usize) as f64); fx.set(0, v); }
+            // 0x49b509: fstp dword ptr [0x25f5b20]
+            wf(0x25f5b20usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b50f: fld dword ptr [0x25f5d54]
+            fx.push(rf(0x25f5d54usize) as f64);
+            // 0x49b515: fadd dword ptr [0x25f5b24]
+            { let v = fx.s(0) + (rf(0x25f5b24usize) as f64); fx.set(0, v); }
+            // 0x49b51b: fstp dword ptr [0x25f5b24]
+            wf(0x25f5b24usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b521: fld dword ptr [0x25f5d58]
+            fx.push(rf(0x25f5d58usize) as f64);
+            // 0x49b527: fadd dword ptr [0x25f5b28]
+            { let v = fx.s(0) + (rf(0x25f5b28usize) as f64); fx.set(0, v); }
+            // 0x49b52d: fstp dword ptr [0x25f5b28]
+            wf(0x25f5b28usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b533: fldz 
+            fx.push(0.0);
+            // 0x49b535: fst dword ptr [0x25f5d50]
+            wf(0x25f5d50usize, fx.s(0) as f32);
+            // 0x49b53b: fst dword ptr [0x25f5d54]
+            wf(0x25f5d54usize, fx.s(0) as f32);
+            // 0x49b541: fstp dword ptr [0x25f5d58]
+            wf(0x25f5d58usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b547: fld dword ptr [ebp + 8]
+            fx.push(rf((ebp.wrapping_add(0x8)) as usize) as f64);
+            // 0x49b54a: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b54d: call 0x49ae60
+            callx!(0x49ae60, 1, 1, 0, 0.0, 0.0);
+            // 0x49b552: mov eax, dword ptr [0xe9a5bc]
+            eax = rd(0xe9a5bcusize);
+            // 0x49b557: cmp eax, 0x10
+            fl = f_sub(eax, 0x10u32, 32);
+            // 0x49b55a: mov ebx, 1
+            ebx = 0x1u32;
+            // 0x49b55f: je 0x49b566
+            if fl.zf { pc = 0x49b566; } else { pc = 0x49b561; } continue;
+        }
+        0x49b561 => {
+            // 0x49b561: cmp eax, 0x11
+            fl = f_sub(eax, 0x11u32, 32);
+            // 0x49b564: jne 0x49b5ac
+            if !fl.zf { pc = 0x49b5ac; } else { pc = 0x49b566; } continue;
+        }
+        0x49b566 => {
+            // 0x49b566: fld1 
+            fx.push(1.0);
+            // 0x49b568: fcomp dword ptr [0xe9a5c8]
+            fx.sw = fcmp(fx.s(0), (rf(0xe9a5c8usize) as f64));
+            fx.pop();
+            // 0x49b56e: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49b570: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49b573: jp 0x49b5ac
+            if fl.pf { pc = 0x49b5ac; } else { pc = 0x49b575; } continue;
+        }
+        0x49b575 => {
+            // 0x49b575: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x49b577: je 0x49b5ac
+            if fl.zf { pc = 0x49b5ac; } else { pc = 0x49b579; } continue;
+        }
+        0x49b579 => {
+            // 0x49b579: mov eax, dword ptr [esi + 0x10cc]
+            eax = rd((esi.wrapping_add(0x10cc)) as usize);
+            // 0x49b57f: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49b581: je 0x49b5ac
+            if fl.zf { pc = 0x49b5ac; } else { pc = 0x49b583; } continue;
+        }
+        0x49b583 => {
+            // 0x49b583: mov eax, dword ptr [eax + 0xc4]
+            eax = rd((eax.wrapping_add(0xc4)) as usize);
+            // 0x49b589: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49b58b: je 0x49b5ac
+            if fl.zf { pc = 0x49b5ac; } else { pc = 0x49b58d; } continue;
+        }
+        0x49b58d => {
+            // 0x49b58d: mov eax, dword ptr [eax + 8]
+            eax = rd((eax.wrapping_add(0x8)) as usize);
+            // 0x49b590: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49b592: je 0x49b5ac
+            if fl.zf { pc = 0x49b5ac; } else { pc = 0x49b594; } continue;
+        }
+        0x49b594 => {
+            // 0x49b594: test byte ptr [eax + 0xc], bl
+            fl = f_logic(((rb((eax.wrapping_add(0xc)) as usize) as u32)) & ((ebx & 0xff)), 8);
+            // 0x49b597: je 0x49b5ac
+            if fl.zf { pc = 0x49b5ac; } else { pc = 0x49b599; } continue;
+        }
+        0x49b599 => {
+            // 0x49b599: test byte ptr [esi + 0x1161], bl
+            fl = f_logic(((rb((esi.wrapping_add(0x1161)) as usize) as u32)) & ((ebx & 0xff)), 8);
+            // 0x49b59f: jne 0x49b5f6
+            if !fl.zf { pc = 0x49b5f6; } else { pc = 0x49b5a1; } continue;
+        }
+        0x49b5a1 => {
+            // 0x49b5a1: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x49b5a2: mov ecx, esi
+            ecx = esi;
+            // 0x49b5a4: call 0x9da290
+            callx!(0x9da290, 1, 0, 0, 0.0, 0.0);
+            // 0x49b5a9: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            pc = 0x49b5ac; continue;
+        }
+        0x49b5ac => {
+            // 0x49b5ac: test byte ptr [esi + 0x1161], bl
+            fl = f_logic(((rb((esi.wrapping_add(0x1161)) as usize) as u32)) & ((ebx & 0xff)), 8);
+            // 0x49b5b2: jne 0x49b5f6
+            if !fl.zf { pc = 0x49b5f6; } else { pc = 0x49b5b4; } continue;
+        }
+        0x49b5b4 => {
+            // 0x49b5b4: mov edx, dword ptr [esi + 0xc0]
+            edx = rd((esi.wrapping_add(0xc0)) as usize);
+            // 0x49b5ba: shr edx, 0x1d
+            { let r = edx >> 29; fl = f_logic(r, 32); edx = r; }
+            // 0x49b5bd: test bl, dl
+            fl = f_logic(((ebx & 0xff)) & ((edx & 0xff)), 8);
+            // 0x49b5bf: jne 0x49b5f6
+            if !fl.zf { pc = 0x49b5f6; } else { pc = 0x49b5c1; } continue;
+        }
+        0x49b5c1 => {
+            // 0x49b5c1: mov eax, dword ptr [0x27b3c60]
+            eax = rd(0x27b3c60usize);
+            // 0x49b5c6: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49b5c8: je 0x49b5e1
+            if fl.zf { pc = 0x49b5e1; } else { pc = 0x49b5ca; } continue;
+        }
+        0x49b5ca => {
+            // 0x49b5ca: cmp dword ptr [eax + 0x3c], ebx
+            fl = f_sub(rd((eax.wrapping_add(0x3c)) as usize), ebx, 32);
+            // 0x49b5cd: jne 0x49b5e1
+            if !fl.zf { pc = 0x49b5e1; } else { pc = 0x49b5cf; } continue;
+        }
+        0x49b5cf => {
+            // 0x49b5cf: mov ecx, dword ptr [eax + 0x90]
+            ecx = rd((eax.wrapping_add(0x90)) as usize);
+            // 0x49b5d5: mov eax, dword ptr [ecx]
+            eax = rd((ecx) as usize);
+            // 0x49b5d7: mov edx, dword ptr [eax + 4]
+            edx = rd((eax.wrapping_add(0x4)) as usize);
+            // 0x49b5da: call edx
+            callx!(edx as usize, 0, 0, 0, 0.0, 0.0);
+            // 0x49b5dc: cmp eax, 0xd
+            fl = f_sub(eax, 0xdu32, 32);
+            // 0x49b5df: je 0x49b5f6
+            if fl.zf { pc = 0x49b5f6; } else { pc = 0x49b5e1; } continue;
+        }
+        0x49b5e1 => {
+            // 0x49b5e1: cmp byte ptr [0x2526ba3], 0
+            fl = f_sub((rb(0x2526ba3usize) as u32), 0x0u32, 8);
+            // 0x49b5e8: jne 0x49b5f6
+            if !fl.zf { pc = 0x49b5f6; } else { pc = 0x49b5ea; } continue;
+        }
+        0x49b5ea => {
+            // 0x49b5ea: fld dword ptr [0xe9a64c]
+            fx.push(rf(0xe9a64cusize) as f64);
+            // 0x49b5f0: fstp dword ptr [0x25f5d38]
+            wf(0x25f5d38usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x49b5f6; continue;
+        }
+        0x49b5f6 => {
+            // 0x49b5f6: fld dword ptr [ebp + 8]
+            fx.push(rf((ebp.wrapping_add(0x8)) as usize) as f64);
+            // 0x49b5f9: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49b5fa: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b5fd: call 0x4996f0
+            callx!(0x4996f0, 1, 0, 0, 0.0, 0.0);
+            // 0x49b602: mov ecx, dword ptr [edi + 0x44]
+            ecx = rd((edi.wrapping_add(0x44)) as usize);
+            // 0x49b605: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49b608: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x49b60a: je 0x49b625
+            if fl.zf { pc = 0x49b625; } else { pc = 0x49b60c; } continue;
+        }
+        0x49b60c => {
+            // 0x49b60c: mov eax, ecx
+            eax = ecx;
+            // 0x49b60e: and eax, 0xfff
+            { let r = (eax) & (0xfffu32); fl = f_logic(r, 32); eax = r; }
+            // 0x49b613: shl eax, 4
+            { let r = eax << 4; fl = f_logic(r, 32); eax = r; }
+            // 0x49b616: mov eax, dword ptr [eax + 0x2149c64]
+            eax = rd((eax.wrapping_add(0x2149c64)) as usize);
+            // 0x49b61c: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49b61e: je 0x49b625
+            if fl.zf { pc = 0x49b625; } else { pc = 0x49b620; } continue;
+        }
+        0x49b620 => {
+            // 0x49b620: cmp dword ptr [eax + 0x44], ecx
+            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
+            // 0x49b623: je 0x49b641
+            if fl.zf { pc = 0x49b641; } else { pc = 0x49b625; } continue;
+        }
+        0x49b625 => {
+            // 0x49b625: xor edi, edi
+            fl = f_logic(0, 32); edi = 0;
+            pc = 0x49b627; continue;
+        }
+        0x49b627 => {
+            // 0x49b627: mov dword ptr [esp + 0x10], 0
+            wd((esp.wrapping_add(0x10)) as usize, 0x0u32);
+            pc = 0x49b62f; continue;
+        }
+        0x49b62f => {
+            // 0x49b62f: test edi, edi
+            fl = f_logic((edi) & (edi), 32);
+            // 0x49b631: je 0x49b665
+            if fl.zf { pc = 0x49b665; } else { pc = 0x49b633; } continue;
+        }
+        0x49b633 => {
+            // 0x49b633: mov edx, dword ptr [edi + 0x5e0]
+            edx = rd((edi.wrapping_add(0x5e0)) as usize);
+            // 0x49b639: mov eax, dword ptr [edx + 0x164]
+            eax = rd((edx.wrapping_add(0x164)) as usize);
+            // 0x49b63f: jmp 0x49b668
+            pc = 0x49b668; continue;
+        }
+        0x49b641 => {
+            // 0x49b641: cmp dword ptr [eax + 0x4c], ebx
+            fl = f_sub(rd((eax.wrapping_add(0x4c)) as usize), ebx, 32);
+            // 0x49b644: jne 0x49b625
+            if !fl.zf { pc = 0x49b625; } else { pc = 0x49b646; } continue;
+        }
+        0x49b646 => {
+            // 0x49b646: mov edi, eax
+            edi = eax;
+            // 0x49b648: mov eax, dword ptr [eax + 0x10cc]
+            eax = rd((eax.wrapping_add(0x10cc)) as usize);
+            // 0x49b64e: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49b650: je 0x49b627
+            if fl.zf { pc = 0x49b627; } else { pc = 0x49b652; } continue;
+        }
+        0x49b652 => {
+            // 0x49b652: mov eax, dword ptr [eax + 0xc4]
+            eax = rd((eax.wrapping_add(0xc4)) as usize);
+            // 0x49b658: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49b65a: je 0x49b627
+            if fl.zf { pc = 0x49b627; } else { pc = 0x49b65c; } continue;
+        }
+        0x49b65c => {
+            // 0x49b65c: mov ecx, dword ptr [eax + 8]
+            ecx = rd((eax.wrapping_add(0x8)) as usize);
+            // 0x49b65f: mov dword ptr [esp + 0x10], ecx
+            wd((esp.wrapping_add(0x10)) as usize, ecx);
+            // 0x49b663: jmp 0x49b62f
+            pc = 0x49b62f; continue;
+        }
+        0x49b665 => {
+            // 0x49b665: or eax, 0xffffffff
+            { let r = (eax) | (0xffffffffu32); fl = f_logic(r, 32); eax = r; }
+            pc = 0x49b668; continue;
+        }
+        0x49b668 => {
+            // 0x49b668: cmp eax, -1
+            fl = f_sub(eax, 0xffffffffu32, 32);
+            // 0x49b66b: jne 0x49b671
+            if !fl.zf { pc = 0x49b671; } else { pc = 0x49b66d; } continue;
+        }
+        0x49b66d => {
+            // 0x49b66d: or ebx, eax
+            { let r = (ebx) | (eax); fl = f_logic(r, 32); ebx = r; }
+            // 0x49b66f: jmp 0x49b67b
+            pc = 0x49b67b; continue;
+        }
+        0x49b671 => {
+            // 0x49b671: lea eax, [eax + eax*2]
+            eax = (eax.wrapping_add(eax.wrapping_mul(2)));
+            // 0x49b674: mov ebx, dword ptr [eax*4 + 0xe90e44]
+            ebx = rd((eax.wrapping_mul(4).wrapping_add(0xe90e44)) as usize);
+            pc = 0x49b67b; continue;
+        }
+        0x49b67b => {
+            // 0x49b67b: test edi, edi
+            fl = f_logic((edi) & (edi), 32);
+            // 0x49b67d: mov dword ptr [esp + 0x44], ebx
+            wd((esp.wrapping_add(0x44)) as usize, ebx);
+            // 0x49b681: je 0x49b6f7
+            if fl.zf { pc = 0x49b6f7; } else { pc = 0x49b683; } continue;
+        }
+        0x49b683 => {
+            // 0x49b683: mov ecx, dword ptr [0x15b8708]
+            ecx = rd(0x15b8708usize);
+            // 0x49b689: mov esi, dword ptr [edi + 0x5e0]
+            esi = rd((edi.wrapping_add(0x5e0)) as usize);
+            // 0x49b68f: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49b690: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49b691: call 0x6efa80
+            callx!(0x6efa80, 2, 0, 0, 0.0, 0.0);
+            // 0x49b696: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49b699: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49b69b: jne 0x49b6b1
+            if !fl.zf { pc = 0x49b6b1; } else { pc = 0x49b69d; } continue;
+        }
+        0x49b69d => {
+            // 0x49b69d: mov edx, dword ptr [0x15b8700]
+            edx = rd(0x15b8700usize);
+            // 0x49b6a3: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49b6a4: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49b6a5: call 0x6efa80
+            callx!(0x6efa80, 2, 0, 0, 0.0, 0.0);
+            // 0x49b6aa: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49b6ad: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49b6af: je 0x49b6f7
+            if fl.zf { pc = 0x49b6f7; } else { pc = 0x49b6b1; } continue;
+        }
+        0x49b6b1 => {
+            // 0x49b6b1: mov eax, dword ptr [esp + 0x10]
+            eax = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49b6b5: call 0xb72800
+            callx!(0xb72800, 0, 0, 0, 0.0, 0.0);
+            // 0x49b6ba: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49b6bc: jne 0x49b6f0
+            if !fl.zf { pc = 0x49b6f0; } else { pc = 0x49b6be; } continue;
+        }
+        0x49b6be => {
+            // 0x49b6be: call 0x53c4d0
+            callx!(0x53c4d0, 0, 0, 0, 0.0, 0.0);
+            // 0x49b6c3: cmp eax, 3
+            fl = f_sub(eax, 0x3u32, 32);
+            // 0x49b6c6: je 0x49b6f0
+            if fl.zf { pc = 0x49b6f0; } else { pc = 0x49b6c8; } continue;
+        }
+        0x49b6c8 => {
+            // 0x49b6c8: cmp ebx, 0x54d
+            fl = f_sub(ebx, 0x54du32, 32);
+            // 0x49b6ce: je 0x49b6f0
+            if fl.zf { pc = 0x49b6f0; } else { pc = 0x49b6d0; } continue;
+        }
+        0x49b6d0 => {
+            // 0x49b6d0: mov eax, 0xec30f8
+            eax = 0xec30f8u32;
+            // 0x49b6d5: call 0xbdce30
+            callx!(0xbdce30, 0, 0, 0, 0.0, 0.0);
+            // 0x49b6da: fld dword ptr [0x2797754]
+            fx.push(rf(0x2797754usize) as f64);
+            // 0x49b6e0: fcompp 
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop(); fx.pop();
+            // 0x49b6e2: mov byte ptr [0x347ae10], 1
+            wb(0x347ae10usize, (0x1u32) as u8);
+            // 0x49b6e9: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49b6eb: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49b6ee: jne 0x49b6f7
+            if !fl.zf { pc = 0x49b6f7; } else { pc = 0x49b6f0; } continue;
+        }
+        0x49b6f0 => {
+            // 0x49b6f0: mov byte ptr [0x347ae10], 0
+            wb(0x347ae10usize, (0x0u32) as u8);
+            pc = 0x49b6f7; continue;
+        }
+        0x49b6f7 => {
+            // 0x49b6f7: xor bl, bl
+            fl = f_logic(0, 8); ebx = (ebx & 0xffffff00) | ((0) & 0xff);
+            // 0x49b6f9: cmp byte ptr [0x347ae10], bl
+            fl = f_sub((rb(0x347ae10usize) as u32), (ebx & 0xff), 8);
+            // 0x49b6ff: jne 0x49b7bf
+            if !fl.zf { pc = 0x49b7bf; } else { pc = 0x49b705; } continue;
+        }
+        0x49b705 => {
+            bump(C::CfCastBlock);
+            // 0x49b705: test edi, edi
+            fl = f_logic((edi) & (edi), 32);
+            // 0x49b707: je 0x49b7bf
+            if fl.zf { pc = 0x49b7bf; } else { pc = 0x49b70d; } continue;
+        }
+        0x49b70d => {
+            // 0x49b70d: mov eax, dword ptr [esp + 0x10]
+            eax = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49b711: call 0xb72800
+            callx!(0xb72800, 0, 0, 0, 0.0, 0.0);
+            // 0x49b716: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49b718: je 0x49b730
+            if fl.zf { pc = 0x49b730; } else { pc = 0x49b71a; } continue;
+        }
+        0x49b71a => {
+            // 0x49b71a: mov eax, dword ptr [esp + 0x44]
+            eax = rd((esp.wrapping_add(0x44)) as usize);
+            // 0x49b71e: cmp eax, 0x562
+            fl = f_sub(eax, 0x562u32, 32);
+            // 0x49b723: je 0x49b730
+            if fl.zf { pc = 0x49b730; } else { pc = 0x49b725; } continue;
+        }
+        0x49b725 => {
+            // 0x49b725: cmp eax, 0x54d
+            fl = f_sub(eax, 0x54du32, 32);
+            // 0x49b72a: jne 0x49b7bf
+            if !fl.zf { pc = 0x49b7bf; } else { pc = 0x49b730; } continue;
+        }
+        0x49b730 => {
+            // 0x49b730: mov eax, dword ptr [0x15b8708]
+            eax = rd(0x15b8708usize);
+            // 0x49b735: mov esi, dword ptr [edi + 0x5e0]
+            esi = rd((edi.wrapping_add(0x5e0)) as usize);
+            // 0x49b73b: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49b73c: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49b73d: call 0x6ef9c0
+            callx!(0x6ef9c0, 2, 0, 0, 0.0, 0.0);
+            // 0x49b742: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49b745: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49b747: je 0x49b769
+            if fl.zf { pc = 0x49b769; } else { pc = 0x49b749; } continue;
+        }
+        0x49b749 => {
+            // 0x49b749: mov ecx, dword ptr [0x15b8704]
+            ecx = rd(0x15b8704usize);
+            // 0x49b74f: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49b750: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49b751: call 0x6ef9c0
+            callx!(0x6ef9c0, 2, 0, 0, 0.0, 0.0);
+            // 0x49b756: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49b759: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49b75b: jne 0x49b769
+            if !fl.zf { pc = 0x49b769; } else { pc = 0x49b75d; } continue;
+        }
+        0x49b75d => {
+            // 0x49b75d: mov bl, 1
+            ebx = (ebx & 0xffffff00) | ((0x1u32) & 0xff);
+            // 0x49b75f: mov dword ptr [0x2526c14], 0x12c
+            wd(0x2526c14usize, 0x12cu32);
+            pc = 0x49b769; continue;
+        }
+        0x49b769 => {
+            // 0x49b769: cmp dword ptr [esi + 0x10], 0
+            fl = f_sub(rd((esi.wrapping_add(0x10)) as usize), 0x0u32, 32);
+            // 0x49b76d: je 0x49b791
+            if fl.zf { pc = 0x49b791; } else { pc = 0x49b76f; } continue;
+        }
+        0x49b76f => {
+            // 0x49b76f: mov eax, dword ptr [esi + 0x14]
+            eax = rd((esi.wrapping_add(0x14)) as usize);
+            // 0x49b772: cmp eax, -1
+            fl = f_sub(eax, 0xffffffffu32, 32);
+            // 0x49b775: je 0x49b791
+            if fl.zf { pc = 0x49b791; } else { pc = 0x49b777; } continue;
+        }
+        0x49b777 => {
+            // 0x49b777: lea edx, [eax + eax*2]
+            edx = (eax.wrapping_add(eax.wrapping_mul(2)));
+            // 0x49b77a: mov al, byte ptr [edx*4 + 0xe8ee9b]
+            eax = (eax & 0xffffff00) | (((rb((edx.wrapping_mul(4).wrapping_add(0xe8ee9b)) as usize) as u32)) & 0xff);
+            // 0x49b781: and al, 1
+            { let r = ((eax & 0xff)) & (0x1u32); fl = f_logic(r, 8); eax = (eax & 0xffffff00) | ((r) & 0xff); }
+            // 0x49b783: je 0x49b791
+            if fl.zf { pc = 0x49b791; } else { pc = 0x49b785; } continue;
+        }
+        0x49b785 => {
+            // 0x49b785: mov dword ptr [0x2526c14], 0x12c
+            wd(0x2526c14usize, 0x12cu32);
+            // 0x49b78f: jmp 0x49b795
+            pc = 0x49b795; continue;
+        }
+        0x49b791 => {
+            // 0x49b791: test bl, bl
+            fl = f_logic(((ebx & 0xff)) & ((ebx & 0xff)), 8);
+            // 0x49b793: je 0x49b7bf
+            if fl.zf { pc = 0x49b7bf; } else { pc = 0x49b795; } continue;
+        }
+        0x49b795 => {
+            bump(C::CfRay);
+            // 0x49b795: movsx eax, word ptr [edi + 0xcf0]
+            eax = rw((edi.wrapping_add(0xcf0)) as usize) as i16 as i32 as u32;
+            // 0x49b79c: push 0
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x0u32);
+            // 0x49b79e: push 0x25f6870
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f6870u32);
+            // 0x49b7a3: lea ecx, [edi + 0x20]
+            ecx = (edi.wrapping_add(0x20));
+            // 0x49b7a6: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49b7a7: mov ecx, dword ptr [esi]
+            ecx = rd((esi) as usize);
+            // 0x49b7a9: lea edx, [edi + 0x14]
+            edx = (edi.wrapping_add(0x14));
+            // 0x49b7ac: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49b7ad: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49b7ae: call 0xcedf10
+            callx!(0xcedf10, 5, 0, 0, 0.0, 0.0);
+            // 0x49b7b3: add esp, 0x14
+            { let a = esp; let b = 0x14u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49b7b6: mov byte ptr [0x2526ba7], 1
+            wb(0x2526ba7usize, (0x1u32) as u8);
+            // 0x49b7bd: jmp 0x49b7e2
+            pc = 0x49b7e2; continue;
+        }
+        0x49b7bf => {
+            // 0x49b7bf: fld dword ptr [0xe8437c]
+            fx.push(rf(0xe8437cusize) as f64);
+            // 0x49b7c5: fmul qword ptr [0xe5c200]
+            { let v = fx.s(0) * rdf64(0xe5c200usize); fx.set(0, v); }
+            // 0x49b7cb: call 0xda0140
+            { let i0 = fx.pop(); callx!(0xda0140, 0, 0, 1, i0, 0.0); }
+            // 0x49b7d0: add dword ptr [0x2526c14], eax
+            { let a = rd(0x2526c14usize); let b = eax; fl = f_add(a, b, 32); wd(0x2526c14usize, a.wrapping_add(b)); }
+            // 0x49b7d6: jns 0x49b7e2
+            if !fl.sf { pc = 0x49b7e2; } else { pc = 0x49b7d8; } continue;
+        }
+        0x49b7d8 => {
+            // 0x49b7d8: mov dword ptr [0x2526c14], 0
+            wd(0x2526c14usize, 0x0u32);
+            pc = 0x49b7e2; continue;
+        }
+        0x49b7e2 => {
+            // 0x49b7e2: test edi, edi
+            fl = f_logic((edi) & (edi), 32);
+            // 0x49b7e4: je 0x49b897
+            if fl.zf { pc = 0x49b897; } else { pc = 0x49b7ea; } continue;
+        }
+        0x49b7ea => {
+            // 0x49b7ea: cmp dword ptr [0x2526c14], 0
+            fl = f_sub(rd(0x2526c14usize), 0x0u32, 32);
+            // 0x49b7f1: jle 0x49b897
+            if fl.zf || fl.sf != fl.of { pc = 0x49b897; } else { pc = 0x49b7f7; } continue;
+        }
+        0x49b7f7 => {
+            // 0x49b7f7: fild dword ptr [0x2526c14]
+            fx.push(rd(0x2526c14usize) as i32 as f64);
+            // 0x49b7fd: fdiv qword ptr [0xe5c5e8]
+            { let v = fx.s(0) / rdf64(0xe5c5e8usize); fx.set(0, v); }
+            // 0x49b803: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b807: fld dword ptr [0x25f6870]
+            fx.push(rf(0x25f6870usize) as f64);
+            // 0x49b80d: fld dword ptr [0xe9a664]
+            fx.push(rf(0xe9a664usize) as f64);
+            // 0x49b813: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49b815: fsubp st(2)
+            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49b817: fxch st(1)
+            fx.xch(1);
+            // 0x49b819: fstp dword ptr [esp + 0x38]
+            wf((esp.wrapping_add(0x38)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b81d: fld dword ptr [0x25f6874]
+            fx.push(rf(0x25f6874usize) as f64);
+            // 0x49b823: fld dword ptr [0xe9a668]
+            fx.push(rf(0xe9a668usize) as f64);
+            // 0x49b829: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49b82b: fsubp st(2)
+            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49b82d: fxch st(1)
+            fx.xch(1);
+            // 0x49b82f: fstp dword ptr [esp + 0x3c]
+            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b833: fld dword ptr [0x25f6878]
+            fx.push(rf(0x25f6878usize) as f64);
+            // 0x49b839: fld dword ptr [0xe9a66c]
+            fx.push(rf(0xe9a66cusize) as f64);
+            // 0x49b83f: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49b841: fsubp st(2)
+            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49b843: fxch st(1)
+            fx.xch(1);
+            // 0x49b845: fstp dword ptr [esp + 0x40]
+            wf((esp.wrapping_add(0x40)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b849: fld dword ptr [esp + 0x38]
+            fx.push(rf((esp.wrapping_add(0x38)) as usize) as f64);
+            // 0x49b84d: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49b851: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49b853: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49b855: fxch st(1)
+            fx.xch(1);
+            // 0x49b857: fstp dword ptr [esp + 0x48]
+            wf((esp.wrapping_add(0x48)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b85b: fld dword ptr [esp + 0x3c]
+            fx.push(rf((esp.wrapping_add(0x3c)) as usize) as f64);
+            // 0x49b85f: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49b861: fstp dword ptr [esp + 0x4c]
+            wf((esp.wrapping_add(0x4c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b865: fmul dword ptr [esp + 0x40]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x40)) as usize) as f64); fx.set(0, v); }
+            // 0x49b869: fstp dword ptr [esp + 0x50]
+            wf((esp.wrapping_add(0x50)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b86d: fld dword ptr [esp + 0x48]
+            fx.push(rf((esp.wrapping_add(0x48)) as usize) as f64);
+            // 0x49b871: faddp st(3)
+            { let v = fx.s(3) + fx.s(0); fx.set(3, v); }
+            fx.pop();
+            // 0x49b873: fxch st(2)
+            fx.xch(2);
+            // 0x49b875: fstp dword ptr [esp + 0x38]
+            wf((esp.wrapping_add(0x38)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b879: mov ecx, dword ptr [esp + 0x38]
+            ecx = rd((esp.wrapping_add(0x38)) as usize);
+            // 0x49b87d: fadd dword ptr [esp + 0x4c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x4c)) as usize) as f64); fx.set(0, v); }
+            // 0x49b881: fstp dword ptr [esp + 0x3c]
+            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b885: mov edx, dword ptr [esp + 0x3c]
+            edx = rd((esp.wrapping_add(0x3c)) as usize);
+            // 0x49b889: fadd dword ptr [esp + 0x50]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x50)) as usize) as f64); fx.set(0, v); }
+            // 0x49b88d: fstp dword ptr [esp + 0x40]
+            wf((esp.wrapping_add(0x40)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b891: mov eax, dword ptr [esp + 0x40]
+            eax = rd((esp.wrapping_add(0x40)) as usize);
+            // 0x49b895: jmp 0x49b8a8
+            pc = 0x49b8a8; continue;
+        }
+        0x49b897 => {
+            // 0x49b897: mov ecx, dword ptr [0xe9a664]
+            ecx = rd(0xe9a664usize);
+            // 0x49b89d: mov edx, dword ptr [0xe9a668]
+            edx = rd(0xe9a668usize);
+            // 0x49b8a3: mov eax, dword ptr [0xe9a66c]
+            eax = rd(0xe9a66cusize);
+            pc = 0x49b8a8; continue;
+        }
+        0x49b8a8 => {
+            // 0x49b8a8: test byte ptr [0x3494394], 1
+            fl = f_logic(((rb(0x3494394usize) as u32)) & (0x1u32), 8);
+            // 0x49b8af: mov dword ptr [esp + 0x50], eax
+            wd((esp.wrapping_add(0x50)) as usize, eax);
+            // 0x49b8b3: mov dword ptr [esp + 0x4c], edx
+            wd((esp.wrapping_add(0x4c)) as usize, edx);
+            // 0x49b8b7: mov dword ptr [esp + 0x48], ecx
+            wd((esp.wrapping_add(0x48)) as usize, ecx);
+            // 0x49b8bb: jne 0x49b8ce
+            if !fl.zf { pc = 0x49b8ce; } else { pc = 0x49b8bd; } continue;
+        }
+        0x49b8bd => {
+            // 0x49b8bd: or dword ptr [0x3494394], 1
+            { let r = (rd(0x3494394usize)) | (0x1u32); fl = f_logic(r, 32); wd(0x3494394usize, r); }
+            // 0x49b8c4: mov dword ptr [0x3494390], 0xffffffff
+            wd(0x3494390usize, 0xffffffffu32);
+            pc = 0x49b8ce; continue;
+        }
+        0x49b8ce => {
+            // 0x49b8ce: test edi, edi
+            fl = f_logic((edi) & (edi), 32);
+            // 0x49b8d0: mov byte ptr [esp + 0x16], 0
+            wb((esp.wrapping_add(0x16)) as usize, (0x0u32) as u8);
+            // 0x49b8d5: je 0x49bada
+            if fl.zf { pc = 0x49bada; } else { pc = 0x49b8db; } continue;
+        }
+        0x49b8db => {
+            // 0x49b8db: cmp byte ptr [0x347ae10], 0
+            fl = f_sub((rb(0x347ae10usize) as u32), 0x0u32, 8);
+            // 0x49b8e2: jne 0x49bada
+            if !fl.zf { pc = 0x49bada; } else { pc = 0x49b8e8; } continue;
+        }
+        0x49b8e8 => {
+            // 0x49b8e8: mov eax, dword ptr [esp + 0x10]
+            eax = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49b8ec: call 0xb72800
+            callx!(0xb72800, 0, 0, 0, 0.0, 0.0);
+            // 0x49b8f1: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49b8f3: je 0x49b90b
+            if fl.zf { pc = 0x49b90b; } else { pc = 0x49b8f5; } continue;
+        }
+        0x49b8f5 => {
+            // 0x49b8f5: mov eax, dword ptr [esp + 0x44]
+            eax = rd((esp.wrapping_add(0x44)) as usize);
+            // 0x49b8f9: cmp eax, 0x562
+            fl = f_sub(eax, 0x562u32, 32);
+            // 0x49b8fe: je 0x49b90b
+            if fl.zf { pc = 0x49b90b; } else { pc = 0x49b900; } continue;
+        }
+        0x49b900 => {
+            // 0x49b900: cmp eax, 0x54d
+            fl = f_sub(eax, 0x54du32, 32);
+            // 0x49b905: jne 0x49bada
+            if !fl.zf { pc = 0x49bada; } else { pc = 0x49b90b; } continue;
+        }
+        0x49b90b => {
+            // 0x49b90b: mov ebx, dword ptr [0x15b8700]
+            ebx = rd(0x15b8700usize);
+            // 0x49b911: mov esi, dword ptr [edi + 0x5e0]
+            esi = rd((edi.wrapping_add(0x5e0)) as usize);
+            // 0x49b917: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x49b918: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49b919: call 0x6efa80
+            callx!(0x6efa80, 2, 0, 0, 0.0, 0.0);
+            // 0x49b91e: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49b921: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49b923: je 0x49ba7f
+            if fl.zf { pc = 0x49ba7f; } else { pc = 0x49b929; } continue;
+        }
+        0x49b929 => {
+            // 0x49b929: xor ebx, ebx
+            fl = f_logic(0, 32); ebx = 0;
+            // 0x49b92b: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x49b92c: lea ecx, [esp + 0x68]
+            ecx = (esp.wrapping_add(0x68));
+            // 0x49b930: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49b931: movsx ecx, word ptr [edi + 0xcee]
+            ecx = rw((edi.wrapping_add(0xcee)) as usize) as i16 as i32 as u32;
+            // 0x49b938: lea edx, [edi + 0x20]
+            edx = (edi.wrapping_add(0x20));
+            // 0x49b93b: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49b93c: lea eax, [edi + 0x14]
+            eax = (edi.wrapping_add(0x14));
+            // 0x49b93f: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49b940: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49b941: mov ecx, dword ptr [esi]
+            ecx = rd((esi) as usize);
+            // 0x49b943: call 0xcedf10
+            callx!(0xcedf10, 5, 0, 0, 0.0, 0.0);
+            // 0x49b948: mov eax, dword ptr [esp + 0x7c]
+            eax = rd((esp.wrapping_add(0x7c)) as usize);
+            // 0x49b94c: mov edx, dword ptr [esp + 0x78]
+            edx = rd((esp.wrapping_add(0x78)) as usize);
+            // 0x49b950: fld dword ptr [0xdd1c88]
+            fx.push(rf(0xdd1c88usize) as f64);
+            // 0x49b956: mov ecx, dword ptr [esp + 0x80]
+            ecx = rd((esp.wrapping_add(0x80)) as usize);
+            // 0x49b95d: fstp dword ptr [esp + 0x104]
+            wf((esp.wrapping_add(0x104)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49b964: mov dword ptr [esp + 0xf0], eax
+            wd((esp.wrapping_add(0xf0)) as usize, eax);
+            // 0x49b96b: mov eax, dword ptr [esp + 0x60]
+            eax = rd((esp.wrapping_add(0x60)) as usize);
+            // 0x49b96f: add esp, 0x14
+            { let a = esp; let b = 0x14u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49b972: mov dword ptr [esp + 0xd8], edx
+            wd((esp.wrapping_add(0xd8)) as usize, edx);
+            // 0x49b979: mov edx, dword ptr [esp + 0x48]
+            edx = rd((esp.wrapping_add(0x48)) as usize);
+            // 0x49b97d: mov dword ptr [esp + 0xe0], ecx
+            wd((esp.wrapping_add(0xe0)) as usize, ecx);
+            // 0x49b984: mov ecx, dword ptr [esp + 0x50]
+            ecx = rd((esp.wrapping_add(0x50)) as usize);
+            // 0x49b988: mov dword ptr [esp + 0xe8], eax
+            wd((esp.wrapping_add(0xe8)) as usize, eax);
+            // 0x49b98f: mov eax, 1
+            eax = 0x1u32;
+            // 0x49b994: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x49b995: mov dword ptr [esp + 0xe8], edx
+            wd((esp.wrapping_add(0xe8)) as usize, edx);
+            // 0x49b99c: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49b99d: lea edx, [esp + 0x5c]
+            edx = (esp.wrapping_add(0x5c));
+            // 0x49b9a1: mov dword ptr [esp + 0xf4], ecx
+            wd((esp.wrapping_add(0xf4)) as usize, ecx);
+            // 0x49b9a8: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49b9a9: lea ecx, [esp + 0xe4]
+            ecx = (esp.wrapping_add(0xe4));
+            // 0x49b9b0: mov dword ptr [esp + 0x100], ebx
+            wd((esp.wrapping_add(0x100)) as usize, ebx);
+            // 0x49b9b7: mov dword ptr [esp + 0x128], ebx
+            wd((esp.wrapping_add(0x128)) as usize, ebx);
+            // 0x49b9be: mov dword ptr [esp + 0x60], ebx
+            wd((esp.wrapping_add(0x60)) as usize, ebx);
+            // 0x49b9c2: mov dword ptr [esp + 0x64], ebx
+            wd((esp.wrapping_add(0x64)) as usize, ebx);
+            // 0x49b9c6: mov dword ptr [esp + 0x68], 0x80000000
+            wd((esp.wrapping_add(0x68)) as usize, 0x80000000u32);
+            // 0x49b9ce: mov dword ptr [esp + 0x138], eax
+            wd((esp.wrapping_add(0x138)) as usize, eax);
+            // 0x49b9d5: mov dword ptr [esp + 0x130], 3
+            wd((esp.wrapping_add(0x130)) as usize, 0x3u32);
+            // 0x49b9e0: mov dword ptr [esp + 0x12c], 0x4941f0
+            wd((esp.wrapping_add(0x12c)) as usize, 0x4941f0u32);
+            // 0x49b9eb: mov dword ptr [esp + 0x134], eax
+            wd((esp.wrapping_add(0x134)) as usize, eax);
+            // 0x49b9f2: call 0x6fa820
+            callx!(0x6fa820, 3, 0, 0, 0.0, 0.0);
+            // 0x49b9f7: add esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49b9fa: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49b9fc: je 0x49ba17
+            if fl.zf { pc = 0x49ba17; } else { pc = 0x49b9fe; } continue;
+        }
+        0x49b9fe => {
+            // 0x49b9fe: lea ecx, [esp + 0x54]
+            ecx = (esp.wrapping_add(0x54));
+            // 0x49ba02: mov byte ptr [0x347ae11], 1
+            wb(0x347ae11usize, (0x1u32) as u8);
+            // 0x49ba09: mov byte ptr [esp + 0x16], bl
+            wb((esp.wrapping_add(0x16)) as usize, ((ebx & 0xff)) as u8);
+            // 0x49ba0d: call 0x4080b0
+            callx!(0x4080b0, 0, 0, 0, 0.0, 0.0);
+            // 0x49ba12: jmp 0x49bab0
+            pc = 0x49bab0; continue;
+        }
+        0x49ba17 => {
+            // 0x49ba17: cmp dword ptr [esp + 0x44], 0x562
+            fl = f_sub(rd((esp.wrapping_add(0x44)) as usize), 0x562u32, 32);
+            // 0x49ba1f: mov eax, dword ptr [0xe843ac]
+            eax = rd(0xe843acusize);
+            // 0x49ba24: mov byte ptr [0x347ae11], bl
+            wb(0x347ae11usize, ((ebx & 0xff)) as u8);
+            // 0x49ba2a: mov byte ptr [esp + 0x16], 1
+            wb((esp.wrapping_add(0x16)) as usize, (0x1u32) as u8);
+            // 0x49ba2f: jne 0x49ba57
+            if !fl.zf { pc = 0x49ba57; } else { pc = 0x49ba31; } continue;
+        }
+        0x49ba31 => {
+            // 0x49ba31: add eax, 0x12c
+            { let a = eax; let b = 0x12cu32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x49ba36: cmp eax, 0x6b49d200
+            fl = f_sub(eax, 0x6b49d200u32, 32);
+            // 0x49ba3b: mov dword ptr [0x3494390], eax
+            wd(0x3494390usize, eax);
+            // 0x49ba40: jle 0x49ba74
+            if fl.zf || fl.sf != fl.of { pc = 0x49ba74; } else { pc = 0x49ba42; } continue;
+        }
+        0x49ba42 => {
+            // 0x49ba42: sub eax, 0x6b49d200
+            { let a = eax; let b = 0x6b49d200u32; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x49ba47: lea ecx, [esp + 0x54]
+            ecx = (esp.wrapping_add(0x54));
+            // 0x49ba4b: mov dword ptr [0x3494390], eax
+            wd(0x3494390usize, eax);
+            // 0x49ba50: call 0x4080b0
+            callx!(0x4080b0, 0, 0, 0, 0.0, 0.0);
+            // 0x49ba55: jmp 0x49bab0
+            pc = 0x49bab0; continue;
+        }
+        0x49ba57 => {
+            // 0x49ba57: cmp eax, 0x6b49d200
+            fl = f_sub(eax, 0x6b49d200u32, 32);
+            // 0x49ba5c: mov dword ptr [0x3494390], eax
+            wd(0x3494390usize, eax);
+            // 0x49ba61: jle 0x49ba6d
+            if fl.zf || fl.sf != fl.of { pc = 0x49ba6d; } else { pc = 0x49ba63; } continue;
+        }
+        0x49ba63 => {
+            // 0x49ba63: add eax, 0x94b62e00
+            { let a = eax; let b = 0x94b62e00u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x49ba68: mov dword ptr [0x3494390], eax
+            wd(0x3494390usize, eax);
+            pc = 0x49ba6d; continue;
+        }
+        0x49ba6d => {
+            // 0x49ba6d: mov byte ptr [0x2526b5a], 1
+            wb(0x2526b5ausize, (0x1u32) as u8);
+            pc = 0x49ba74; continue;
+        }
+        0x49ba74 => {
+            // 0x49ba74: lea ecx, [esp + 0x54]
+            ecx = (esp.wrapping_add(0x54));
+            // 0x49ba78: call 0x4080b0
+            callx!(0x4080b0, 0, 0, 0, 0.0, 0.0);
+            // 0x49ba7d: jmp 0x49bab0
+            pc = 0x49bab0; continue;
+        }
+        0x49ba7f => {
+            // 0x49ba7f: cmp byte ptr [0x347ae11], 0
+            fl = f_sub((rb(0x347ae11usize) as u32), 0x0u32, 8);
+            // 0x49ba86: jne 0x49baae
+            if !fl.zf { pc = 0x49baae; } else { pc = 0x49ba88; } continue;
+        }
+        0x49ba88 => {
+            // 0x49ba88: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x49ba89: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49ba8a: call 0x6ef9c0
+            callx!(0x6ef9c0, 2, 0, 0, 0.0, 0.0);
+            // 0x49ba8f: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49ba92: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49ba94: je 0x49baae
+            if fl.zf { pc = 0x49baae; } else { pc = 0x49ba96; } continue;
+        }
+        0x49ba96 => {
+            // 0x49ba96: mov eax, dword ptr [0x15b86fc]
+            eax = rd(0x15b86fcusize);
+            // 0x49ba9b: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49ba9c: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49ba9d: call 0x6ef9c0
+            callx!(0x6ef9c0, 2, 0, 0, 0.0, 0.0);
+            // 0x49baa2: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49baa5: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49baa7: jne 0x49baae
+            if !fl.zf { pc = 0x49baae; } else { pc = 0x49baa9; } continue;
+        }
+        0x49baa9 => {
+            // 0x49baa9: mov byte ptr [esp + 0x16], 1
+            wb((esp.wrapping_add(0x16)) as usize, (0x1u32) as u8);
+            pc = 0x49baae; continue;
+        }
+        0x49baae => {
+            // 0x49baae: xor ebx, ebx
+            fl = f_logic(0, 32); ebx = 0;
+            pc = 0x49bab0; continue;
+        }
+        0x49bab0 => {
+            // 0x49bab0: mov eax, dword ptr [edi + 0x5e0]
+            eax = rd((edi.wrapping_add(0x5e0)) as usize);
+            // 0x49bab6: cmp dword ptr [eax + 0x10], ebx
+            fl = f_sub(rd((eax.wrapping_add(0x10)) as usize), ebx, 32);
+            // 0x49bab9: je 0x49bada
+            if fl.zf { pc = 0x49bada; } else { pc = 0x49babb; } continue;
+        }
+        0x49babb => {
+            // 0x49babb: mov eax, dword ptr [eax + 0x14]
+            eax = rd((eax.wrapping_add(0x14)) as usize);
+            // 0x49babe: cmp eax, -1
+            fl = f_sub(eax, 0xffffffffu32, 32);
+            // 0x49bac1: je 0x49bada
+            if fl.zf { pc = 0x49bada; } else { pc = 0x49bac3; } continue;
+        }
+        0x49bac3 => {
+            // 0x49bac3: lea ecx, [eax + eax*2]
+            ecx = (eax.wrapping_add(eax.wrapping_mul(2)));
+            // 0x49bac6: mov edx, dword ptr [ecx*4 + 0xe8ee98]
+            edx = rd((ecx.wrapping_mul(4).wrapping_add(0xe8ee98)) as usize);
+            // 0x49bacd: shr edx, 0x17
+            { let r = edx >> 23; fl = f_logic(r, 32); edx = r; }
+            // 0x49bad0: and dl, 1
+            { let r = ((edx & 0xff)) & (0x1u32); fl = f_logic(r, 8); edx = (edx & 0xffffff00) | ((r) & 0xff); }
+            // 0x49bad3: je 0x49bada
+            if fl.zf { pc = 0x49bada; } else { pc = 0x49bad5; } continue;
+        }
+        0x49bad5 => {
+            // 0x49bad5: mov byte ptr [esp + 0x16], 1
+            wb((esp.wrapping_add(0x16)) as usize, (0x1u32) as u8);
+            pc = 0x49bada; continue;
+        }
+        0x49bada => {
+            // 0x49bada: cmp byte ptr [esp + 0x16], 0
+            fl = f_sub((rb((esp.wrapping_add(0x16)) as usize) as u32), 0x0u32, 8);
+            // 0x49badf: fld dword ptr [0xe9a654]
+            fx.push(rf(0xe9a654usize) as f64);
+            // 0x49bae5: mov ebx, dword ptr [0xe843ac]
+            ebx = rd(0xe843acusize);
+            // 0x49baeb: fst dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            // 0x49baef: mov byte ptr [esp + 0x17], 0
+            wb((esp.wrapping_add(0x17)) as usize, (0x0u32) as u8);
+            // 0x49baf4: jne 0x49bb85
+            if !fl.zf { pc = 0x49bb85; } else { pc = 0x49bafa; } continue;
+        }
+        0x49bafa => {
+            // 0x49bafa: cmp byte ptr [0x2526ba6], 0
+            fl = f_sub((rb(0x2526ba6usize) as u32), 0x0u32, 8);
+            // 0x49bb01: je 0x49bb21
+            if fl.zf { pc = 0x49bb21; } else { pc = 0x49bb03; } continue;
+        }
+        0x49bb03 => {
+            // 0x49bb03: lea eax, [ebx + 0x1f4]
+            eax = (ebx.wrapping_add(0x1f4));
+            // 0x49bb09: cmp eax, 0x6b49d200
+            fl = f_sub(eax, 0x6b49d200u32, 32);
+            // 0x49bb0e: mov dword ptr [0xe9a6b8], eax
+            wd(0xe9a6b8usize, eax);
+            // 0x49bb13: jle 0x49bb26
+            if fl.zf || fl.sf != fl.of { pc = 0x49bb26; } else { pc = 0x49bb15; } continue;
+        }
+        0x49bb15 => {
+            // 0x49bb15: sub eax, 0x6b49d200
+            { let a = eax; let b = 0x6b49d200u32; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x49bb1a: mov dword ptr [0xe9a6b8], eax
+            wd(0xe9a6b8usize, eax);
+            // 0x49bb1f: jmp 0x49bb26
+            pc = 0x49bb26; continue;
+        }
+        0x49bb21 => {
+            // 0x49bb21: mov eax, dword ptr [0xe9a6b8]
+            eax = rd(0xe9a6b8usize);
+            pc = 0x49bb26; continue;
+        }
+        0x49bb26 => {
+            // 0x49bb26: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49bb28: jl 0x49bdc4
+            if fl.sf != fl.of { pc = 0x49bdc4; } else { pc = 0x49bb2e; } continue;
+        }
+        0x49bb2e => {
+            bump(C::CfLerpTimer);
+            // 0x49bb2e: mov eax, 0xe9a6b8
+            eax = 0xe9a6b8u32;
+            // 0x49bb33: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bb37: call 0xbdd230
+            callx!(0xbdd230, 0, 0, 0, 0.0, 0.0);
+            // 0x49bb3c: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49bb3e: mov byte ptr [esp + 0x17], 1
+            wb((esp.wrapping_add(0x17)) as usize, (0x1u32) as u8);
+            // 0x49bb43: je 0x49bb5e
+            if fl.zf { pc = 0x49bb5e; } else { pc = 0x49bb45; } continue;
+        }
+        0x49bb45 => {
+            // 0x49bb45: fld dword ptr [0x2526c18]
+            fx.push(rf(0x2526c18usize) as f64);
+            // 0x49bb4b: mov dword ptr [0xe9a6b8], 0xffffffff
+            wd(0xe9a6b8usize, 0xffffffffu32);
+            // 0x49bb55: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bb59: jmp 0x49bdc6
+            pc = 0x49bdc6; continue;
+        }
+        0x49bb5e => {
+            // 0x49bb5e: fld dword ptr [0x2526c18]
+            fx.push(rf(0x2526c18usize) as f64);
+            // 0x49bb64: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49bb68: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49bb6a: fsubp st(2)
+            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49bb6c: fld dword ptr [0xe8437c]
+            fx.push(rf(0xe8437cusize) as f64);
+            // 0x49bb72: fmul qword ptr [0xe5bff8]
+            { let v = fx.s(0) * rdf64(0xe5bff8usize); fx.set(0, v); }
+            // 0x49bb78: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49bb7a: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49bb7c: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bb80: jmp 0x49bdc6
+            pc = 0x49bdc6; continue;
+        }
+        0x49bb85 => {
+            bump(C::CfBlendTimer);
+            // 0x49bb85: cmp dword ptr [0x3494390], 0
+            fl = f_sub(rd(0x3494390usize), 0x0u32, 32);
+            // 0x49bb8c: jl 0x49bdc4
+            if fl.sf != fl.of { pc = 0x49bdc4; } else { pc = 0x49bb92; } continue;
+        }
+        0x49bb92 => {
+            // 0x49bb92: mov eax, 0x3494390
+            eax = 0x3494390u32;
+            // 0x49bb97: call 0xbdd260
+            callx!(0xbdd260, 0, 0, 0, 0.0, 0.0);
+            // 0x49bb9c: mov dword ptr [esp + 0x18], eax
+            wd((esp.wrapping_add(0x18)) as usize, eax);
+            // 0x49bba0: fild dword ptr [esp + 0x18]
+            fx.push(rd((esp.wrapping_add(0x18)) as usize) as i32 as f64);
+            // 0x49bba4: fdiv qword ptr [0xe5c5e8]
+            { let v = fx.s(0) / rdf64(0xe5c5e8usize); fx.set(0, v); }
+            // 0x49bbaa: fld1 
+            fx.push(1.0);
+            // 0x49bbac: fsubrp st(1)
+            { let v = fx.s(0) - fx.s(1); fx.set(1, v); }
+            fx.pop();
+            // 0x49bbae: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bbb2: fld1 
+            fx.push(1.0);
+            // 0x49bbb4: fcom dword ptr [esp + 0x10]
+            fx.sw = fcmp(fx.s(0), (rf((esp.wrapping_add(0x10)) as usize) as f64));
+            // 0x49bbb8: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49bbba: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49bbbd: je 0x49bbc5
+            if fl.zf { pc = 0x49bbc5; } else { pc = 0x49bbbf; } continue;
+        }
+        0x49bbbf => {
+            // 0x49bbbf: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bbc3: jmp 0x49bbc7
+            pc = 0x49bbc7; continue;
+        }
+        0x49bbc5 => {
+            // 0x49bbc5: fstp st(0)
+            fx.pop();
+            pc = 0x49bbc7; continue;
+        }
+        0x49bbc7 => {
+            // 0x49bbc7: cmp byte ptr [0x2526ba6], 0
+            fl = f_sub((rb(0x2526ba6usize) as u32), 0x0u32, 8);
+            // 0x49bbce: mov byte ptr [esp + 0x17], 1
+            wb((esp.wrapping_add(0x17)) as usize, (0x1u32) as u8);
+            // 0x49bbd3: jne 0x49bbdd
+            if !fl.zf { pc = 0x49bbdd; } else { pc = 0x49bbd5; } continue;
+        }
+        0x49bbd5 => {
+            // 0x49bbd5: fstp dword ptr [0x2526c18]
+            wf(0x2526c18usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bbdb: jmp 0x49bbdf
+            pc = 0x49bbdf; continue;
+        }
+        0x49bbdd => {
+            // 0x49bbdd: fstp st(0)
+            fx.pop();
+            pc = 0x49bbdf; continue;
+        }
+        0x49bbdf => {
+            // 0x49bbdf: cmp dword ptr [0x25f5ae8], 0
+            fl = f_sub(rd(0x25f5ae8usize), 0x0u32, 32);
+            // 0x49bbe6: jne 0x49bbfb
+            if !fl.zf { pc = 0x49bbfb; } else { pc = 0x49bbe8; } continue;
+        }
+        0x49bbe8 => {
+            // 0x49bbe8: cmp dword ptr [0x25f5c54], 1
+            fl = f_sub(rd(0x25f5c54usize), 0x1u32, 32);
+            // 0x49bbef: jne 0x49bbfb
+            if !fl.zf { pc = 0x49bbfb; } else { pc = 0x49bbf1; } continue;
+        }
+        0x49bbf1 => {
+            // 0x49bbf1: mov dword ptr [0x25f5c54], 0
+            wd(0x25f5c54usize, 0x0u32);
+            pc = 0x49bbfb; continue;
+        }
+        0x49bbfb => {
+            bump(C::CfBlendOrient);
+            // 0x49bbfb: lea eax, [esp + 0x13c]
+            eax = (esp.wrapping_add(0x13c));
+            // 0x49bc02: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49bc03: lea ecx, [esp + 0x58]
+            ecx = (esp.wrapping_add(0x58));
+            // 0x49bc07: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49bc08: movsx ecx, word ptr [edi + 0xcee]
+            ecx = rw((edi.wrapping_add(0xcee)) as usize) as i16 as i32 as u32;
+            // 0x49bc0f: lea edx, [edi + 0x20]
+            edx = (edi.wrapping_add(0x20));
+            // 0x49bc12: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49bc13: mov edx, dword ptr [edi + 0x5e0]
+            edx = rd((edi.wrapping_add(0x5e0)) as usize);
+            // 0x49bc19: lea eax, [edi + 0x14]
+            eax = (edi.wrapping_add(0x14));
+            // 0x49bc1c: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49bc1d: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49bc1e: mov ecx, dword ptr [edx]
+            ecx = rd((edx) as usize);
+            // 0x49bc20: call 0xcedf10
+            callx!(0xcedf10, 5, 0, 0, 0.0, 0.0);
+            // 0x49bc25: add esp, 0x10
+            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49bc28: fld dword ptr [esp + 0x4c]
+            fx.push(rf((esp.wrapping_add(0x4c)) as usize) as f64);
+            // 0x49bc2c: fsub dword ptr [esp + 0x58]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x58)) as usize) as f64); fx.set(0, v); }
+            // 0x49bc30: fstp dword ptr [esp + 0x3c]
+            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bc34: fld dword ptr [esp + 0x50]
+            fx.push(rf((esp.wrapping_add(0x50)) as usize) as f64);
+            // 0x49bc38: fsub dword ptr [esp + 0x5c]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x5c)) as usize) as f64); fx.set(0, v); }
+            // 0x49bc3c: fstp dword ptr [esp + 0x40]
+            wf((esp.wrapping_add(0x40)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bc40: fld dword ptr [esp + 0x54]
+            fx.push(rf((esp.wrapping_add(0x54)) as usize) as f64);
+            // 0x49bc44: fsub dword ptr [esp + 0x60]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x60)) as usize) as f64); fx.set(0, v); }
+            // 0x49bc48: fstp dword ptr [esp + 0x44]
+            wf((esp.wrapping_add(0x44)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bc4c: fld dword ptr [esp + 0x40]
+            fx.push(rf((esp.wrapping_add(0x40)) as usize) as f64);
+            // 0x49bc50: fld dword ptr [esp + 0x3c]
+            fx.push(rf((esp.wrapping_add(0x3c)) as usize) as f64);
+            // 0x49bc54: fld dword ptr [esp + 0x44]
+            fx.push(rf((esp.wrapping_add(0x44)) as usize) as f64);
+            // 0x49bc58: fld st(1)
+            { let v = fx.s(1); fx.push(v); }
+            // 0x49bc5a: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49bc5c: fld st(2)
+            { let v = fx.s(2); fx.push(v); }
+            // 0x49bc5e: fmulp st(3)
+            { let v = fx.s(3) * fx.s(0); fx.set(3, v); }
+            fx.pop();
+            // 0x49bc60: fxch st(1)
+            fx.xch(1);
+            // 0x49bc62: faddp st(2)
+            { let v = fx.s(2) + fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49bc64: fmul st(0), st(0)
+            { let v = fx.s(0) * fx.s(0); fx.set(0, v); }
+            // 0x49bc66: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49bc68: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bc6c: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49bc70: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bc73: call 0x40ea20
+            callx!(0x40ea20, 1, 0, 0, 0.0, 0.0);
+            // 0x49bc78: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49bc7b: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bc7f: lea esi, [esp + 0x70]
+            esi = (esp.wrapping_add(0x70));
+            // 0x49bc83: lea edi, [esp + 0x38]
+            edi = (esp.wrapping_add(0x38));
+            // 0x49bc87: call 0xbddba0
+            callx!(0xbddba0, 0, 0, 0, 0.0, 0.0);
+            // 0x49bc8c: lea ecx, [esp + 0x80]
+            ecx = (esp.wrapping_add(0x80));
+            // 0x49bc93: call 0xbe4b20
+            callx!(0xbe4b20, 0, 0, 0, 0.0, 0.0);
+            // 0x49bc98: fld1 
+            fx.push(1.0);
+            // 0x49bc9a: fcomp dword ptr [esp + 0x10]
+            fx.sw = fcmp(fx.s(0), (rf((esp.wrapping_add(0x10)) as usize) as f64));
+            fx.pop();
+            // 0x49bc9e: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49bca0: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49bca3: jp 0x49bcbc
+            if fl.pf { pc = 0x49bcbc; } else { pc = 0x49bca5; } continue;
+        }
+        0x49bca5 => {
+            // 0x49bca5: mov ecx, 9
+            ecx = 0x9u32;
+            // 0x49bcaa: lea esi, [esp + 0x80]
+            esi = (esp.wrapping_add(0x80));
+            // 0x49bcb1: lea edi, [esp + 0xa4]
+            edi = (esp.wrapping_add(0xa4));
+            // 0x49bcb8: rep movsd dword ptr es:[edi], dword ptr [esi]
+            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
+            // 0x49bcba: jmp 0x49bd0a
+            pc = 0x49bd0a; continue;
+        }
+        0x49bcbc => {
+            // 0x49bcbc: mov edi, 0x25f5b5c
+            edi = 0x25f5b5cu32;
+            // 0x49bcc1: lea eax, [esp + 0xc8]
+            eax = (esp.wrapping_add(0xc8));
+            // 0x49bcc8: call 0xc053e0
+            callx!(0xc053e0, 0, 0, 0, 0.0, 0.0);
+            // 0x49bccd: lea edi, [esp + 0x80]
+            edi = (esp.wrapping_add(0x80));
+            // 0x49bcd4: lea eax, [esp + 0x70]
+            eax = (esp.wrapping_add(0x70));
+            // 0x49bcd8: call 0xc053e0
+            callx!(0xc053e0, 0, 0, 0, 0.0, 0.0);
+            // 0x49bcdd: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49bce1: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49bce2: lea ecx, [esp + 0x74]
+            ecx = (esp.wrapping_add(0x74));
+            // 0x49bce6: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bce9: lea esi, [esp + 0xcc]
+            esi = (esp.wrapping_add(0xcc));
+            // 0x49bcf0: lea edi, [esp + 0x58]
+            edi = (esp.wrapping_add(0x58));
+            // 0x49bcf4: call 0xc05e80
+            callx!(0xc05e80, 1, 0, 0, 0.0, 0.0);
+            // 0x49bcf9: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49bcfc: lea ecx, [esp + 0xa4]
+            ecx = (esp.wrapping_add(0xa4));
+            // 0x49bd03: mov eax, edi
+            eax = edi;
+            // 0x49bd05: call 0xc057d0
+            callx!(0xc057d0, 0, 0, 0, 0.0, 0.0);
+            pc = 0x49bd0a; continue;
+        }
+        0x49bd0a => {
+            // 0x49bd0a: fld dword ptr [0x25f5b78]
+            fx.push(rf(0x25f5b78usize) as f64);
+            // 0x49bd10: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49bd11: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bd14: call 0x4f1ac0
+            callx!(0x4f1ac0, 1, 0, 0, 0.0, 0.0);
+            // 0x49bd19: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49bd1b: fstp dword ptr [esp + 0x48]
+            wf((esp.wrapping_add(0x48)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bd1f: fld dword ptr [esp + 0xc4]
+            fx.push(rf((esp.wrapping_add(0xc4)) as usize) as f64);
+            // 0x49bd26: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bd29: call 0x4f1ac0
+            callx!(0x4f1ac0, 1, 0, 0, 0.0, 0.0);
+            // 0x49bd2e: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49bd30: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49bd33: lea ecx, [esp + 0xa4]
+            ecx = (esp.wrapping_add(0xa4));
+            // 0x49bd3a: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bd3e: call 0xbe3380
+            callx!(0xbe3380, 0, 0, 0, 0.0, 0.0);
+            // 0x49bd43: movss dword ptr [esp + 0x18], xmm0
+            wd((esp.wrapping_add(0x18)) as usize, xmm0);
+            // 0x49bd49: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49bd4d: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bd51: sub esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49bd54: fldz 
+            fx.push(0.0);
+            // 0x49bd56: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bd5a: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x49bd5e: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bd61: call 0xbf14d0
+            callx!(0xbf14d0, 2, 0, 0, 0.0, 0.0);
+            // 0x49bd66: movss dword ptr [esp + 0x20], xmm0
+            wd((esp.wrapping_add(0x20)) as usize, xmm0);
+            // 0x49bd6c: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x49bd70: fstp dword ptr [0x25f5c58]
+            wf(0x25f5c58usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bd76: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49bd79: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49bd7d: lea eax, [esp + 0x10]
+            eax = (esp.wrapping_add(0x10));
+            // 0x49bd81: fsub dword ptr [esp + 0x44]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x44)) as usize) as f64); fx.set(0, v); }
+            // 0x49bd85: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49bd86: lea ecx, [esp + 0x48]
+            ecx = (esp.wrapping_add(0x48));
+            // 0x49bd8a: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49bd8b: fadd dword ptr [0x25f5c78]
+            { let v = fx.s(0) + (rf(0x25f5c78usize) as f64); fx.set(0, v); }
+            // 0x49bd91: lea edi, [esp + 0x20]
+            edi = (esp.wrapping_add(0x20));
+            // 0x49bd95: lea esi, [esp + 0x144]
+            esi = (esp.wrapping_add(0x144));
+            // 0x49bd9c: fstp dword ptr [0x25f5c78]
+            wf(0x25f5c78usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bda2: call 0xbe3150
+            callx!(0xbe3150, 2, 2, 0, 0.0, 0.0);
+            // 0x49bda7: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49bdab: fst dword ptr [0x25f5c64]
+            wf(0x25f5c64usize, fx.s(0) as f32);
+            // 0x49bdb1: fstp dword ptr [0x25f5c60]
+            wf(0x25f5c60usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bdb7: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49bdbb: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bdbf: jmp 0x49bf4a
+            pc = 0x49bf4a; continue;
+        }
+        0x49bdc4 => {
+            // 0x49bdc4: fstp st(0)
+            fx.pop();
+            pc = 0x49bdc6; continue;
+        }
+        0x49bdc6 => {
+            bump(C::CfNoBlend);
+            // 0x49bdc6: cmp byte ptr [0xe99886], 0
+            fl = f_sub((rb(0xe99886usize) as u32), 0x0u32, 8);
+            // 0x49bdcd: je 0x49beff
+            if fl.zf { pc = 0x49beff; } else { pc = 0x49bdd3; } continue;
+        }
+        0x49bdd3 => {
+            // 0x49bdd3: cmp dword ptr [0x25f5d1c], 0
+            fl = f_sub(rd(0x25f5d1cusize), 0x0u32, 32);
+            // 0x49bdda: jl 0x49beff
+            if fl.sf != fl.of { pc = 0x49beff; } else { pc = 0x49bde0; } continue;
+        }
+        0x49bde0 => {
+            // 0x49bde0: mov eax, 0x25f5d1c
+            eax = 0x25f5d1cu32;
+            // 0x49bde5: call 0xbdd230
+            callx!(0xbdd230, 0, 0, 0, 0.0, 0.0);
+            // 0x49bdea: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49bdec: je 0x49bdf8
+            if fl.zf { pc = 0x49bdf8; } else { pc = 0x49bdee; } continue;
+        }
+        0x49bdee => {
+            // 0x49bdee: call 0x49e920
+            callx!(0x49e920, 0, 0, 0, 0.0, 0.0);
+            // 0x49bdf3: jmp 0x49bf4a
+            pc = 0x49bf4a; continue;
+        }
+        0x49bdf8 => {
+            // 0x49bdf8: mov eax, 0x25f5d18
+            eax = 0x25f5d18u32;
+            // 0x49bdfd: call 0xbdd230
+            callx!(0xbdd230, 0, 0, 0, 0.0, 0.0);
+            // 0x49be02: fld dword ptr [0x25f5d10]
+            fx.push(rf(0x25f5d10usize) as f64);
+            // 0x49be08: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49be0a: je 0x49be3a
+            if fl.zf { pc = 0x49be3a; } else { pc = 0x49be0c; } continue;
+        }
+        0x49be0c => {
+            // 0x49be0c: mov eax, 0x25f5d1c
+            eax = 0x25f5d1cu32;
+            // 0x49be11: call 0xbdd260
+            callx!(0xbdd260, 0, 0, 0, 0.0, 0.0);
+            // 0x49be16: mov dword ptr [esp + 0x1c], eax
+            wd((esp.wrapping_add(0x1c)) as usize, eax);
+            // 0x49be1a: fild dword ptr [esp + 0x1c]
+            fx.push(rd((esp.wrapping_add(0x1c)) as usize) as i32 as f64);
+            // 0x49be1e: fidiv dword ptr [0x25f5d20]
+            { let v = fx.s(0) / (rd(0x25f5d20usize) as i32 as f64); fx.set(0, v); }
+            // 0x49be24: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49be28: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49be2c: fld dword ptr [0x25f5d08]
+            fx.push(rf(0x25f5d08usize) as f64);
+            // 0x49be32: fsub st(2)
+            { let v = fx.s(0) - fx.s(2); fx.set(0, v); }
+            // 0x49be34: fmulp st(1)
+            { let v = fx.s(1) * fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49be36: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49be38: jmp 0x49be82
+            pc = 0x49be82; continue;
+        }
+        0x49be3a => {
+            // 0x49be3a: mov eax, 0x25f5d14
+            eax = 0x25f5d14u32;
+            // 0x49be3f: call 0xbdd230
+            callx!(0xbdd230, 0, 0, 0, 0.0, 0.0);
+            // 0x49be44: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49be46: jne 0x49be7a
+            if !fl.zf { pc = 0x49be7a; } else { pc = 0x49be48; } continue;
+        }
+        0x49be48 => {
+            // 0x49be48: mov eax, 0x25f5d14
+            eax = 0x25f5d14u32;
+            // 0x49be4d: call 0xbdd260
+            callx!(0xbdd260, 0, 0, 0, 0.0, 0.0);
+            // 0x49be52: mov dword ptr [esp + 0x1c], eax
+            wd((esp.wrapping_add(0x1c)) as usize, eax);
+            // 0x49be56: fild dword ptr [esp + 0x1c]
+            fx.push(rd((esp.wrapping_add(0x1c)) as usize) as i32 as f64);
+            // 0x49be5a: fidiv dword ptr [0x25f5d24]
+            { let v = fx.s(0) / (rd(0x25f5d24usize) as i32 as f64); fx.set(0, v); }
+            // 0x49be60: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49be64: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49be68: fld dword ptr [0x25f5d08]
+            fx.push(rf(0x25f5d08usize) as f64);
+            // 0x49be6e: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49be70: fsubp st(3)
+            { let v = fx.s(3) - fx.s(0); fx.set(3, v); }
+            fx.pop();
+            // 0x49be72: fxch st(1)
+            fx.xch(1);
+            // 0x49be74: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49be76: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49be78: jmp 0x49be82
+            pc = 0x49be82; continue;
+        }
+        0x49be7a => {
+            // 0x49be7a: fstp st(0)
+            fx.pop();
+            // 0x49be7c: fld dword ptr [0x25f5d08]
+            fx.push(rf(0x25f5d08usize) as f64);
+            pc = 0x49be82; continue;
+        }
+        0x49be82 => {
+            // 0x49be82: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49be86: lea eax, [esp + 0x54]
+            eax = (esp.wrapping_add(0x54));
+            // 0x49be8a: fld dword ptr [0x25f5b20]
+            fx.push(rf(0x25f5b20usize) as f64);
+            // 0x49be90: fsub dword ptr [esp + 0x48]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x48)) as usize) as f64); fx.set(0, v); }
+            // 0x49be94: fstp dword ptr [esp + 0x54]
+            wf((esp.wrapping_add(0x54)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49be98: fld dword ptr [0x25f5b24]
+            fx.push(rf(0x25f5b24usize) as f64);
+            // 0x49be9e: fsub dword ptr [esp + 0x4c]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x4c)) as usize) as f64); fx.set(0, v); }
+            // 0x49bea2: fstp dword ptr [esp + 0x58]
+            wf((esp.wrapping_add(0x58)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bea6: fld dword ptr [0x25f5b28]
+            fx.push(rf(0x25f5b28usize) as f64);
+            // 0x49beac: fsub dword ptr [esp + 0x50]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x50)) as usize) as f64); fx.set(0, v); }
+            // 0x49beb0: fstp dword ptr [esp + 0x5c]
+            wf((esp.wrapping_add(0x5c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49beb4: call 0x412080
+            callx!(0x412080, 0, 0, 0, 0.0, 0.0);
+            // 0x49beb9: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bebd: fld dword ptr [0x25f5d08]
+            fx.push(rf(0x25f5d08usize) as f64);
+            // 0x49bec3: fld dword ptr [0x25f5d10]
+            fx.push(rf(0x25f5d10usize) as f64);
+            // 0x49bec9: fcompp 
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop(); fx.pop();
+            // 0x49becb: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49becd: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49bed1: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49bed4: jp 0x49bef1
+            if fl.pf { pc = 0x49bef1; } else { pc = 0x49bed6; } continue;
+        }
+        0x49bed6 => {
+            // 0x49bed6: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49beda: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x49bedc: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49bede: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49bee1: jne 0x49bee7
+            if !fl.zf { pc = 0x49bee7; } else { pc = 0x49bee3; } continue;
+        }
+        0x49bee3 => {
+            // 0x49bee3: fstp st(0)
+            fx.pop();
+            // 0x49bee5: jmp 0x49bee9
+            pc = 0x49bee9; continue;
+        }
+        0x49bee7 => {
+            // 0x49bee7: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            pc = 0x49bee9; continue;
+        }
+        0x49bee9 => {
+            // 0x49bee9: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49beed: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            pc = 0x49bef1; continue;
+        }
+        0x49bef1 => {
+            // 0x49bef1: fstp dword ptr [0x25f5d0c]
+            wf(0x25f5d0cusize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bef7: fld dword ptr [0x25f5d0c]
+            fx.push(rf(0x25f5d0cusize) as f64);
+            // 0x49befd: jmp 0x49bf44
+            pc = 0x49bf44; continue;
+        }
+        0x49beff => {
+            // 0x49beff: mov edx, dword ptr [esp + 0x34]
+            edx = rd((esp.wrapping_add(0x34)) as usize);
+            // 0x49bf03: mov ecx, dword ptr [edx + 0x44]
+            ecx = rd((edx.wrapping_add(0x44)) as usize);
+            // 0x49bf06: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x49bf08: je 0x49bf4a
+            if fl.zf { pc = 0x49bf4a; } else { pc = 0x49bf0a; } continue;
+        }
+        0x49bf0a => {
+            // 0x49bf0a: mov eax, ecx
+            eax = ecx;
+            // 0x49bf0c: and eax, 0xfff
+            { let r = (eax) & (0xfffu32); fl = f_logic(r, 32); eax = r; }
+            // 0x49bf11: shl eax, 4
+            { let r = eax << 4; fl = f_logic(r, 32); eax = r; }
+            // 0x49bf14: mov eax, dword ptr [eax + 0x2149c64]
+            eax = rd((eax.wrapping_add(0x2149c64)) as usize);
+            // 0x49bf1a: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49bf1c: je 0x49bf4a
+            if fl.zf { pc = 0x49bf4a; } else { pc = 0x49bf1e; } continue;
+        }
+        0x49bf1e => {
+            // 0x49bf1e: cmp dword ptr [eax + 0x44], ecx
+            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
+            // 0x49bf21: jne 0x49bf4a
+            if !fl.zf { pc = 0x49bf4a; } else { pc = 0x49bf23; } continue;
+        }
+        0x49bf23 => {
+            // 0x49bf23: cmp dword ptr [eax + 0x4c], 5
+            fl = f_sub(rd((eax.wrapping_add(0x4c)) as usize), 0x5u32, 32);
+            // 0x49bf27: jne 0x49bf4a
+            if !fl.zf { pc = 0x49bf4a; } else { pc = 0x49bf29; } continue;
+        }
+        0x49bf29 => {
+            // 0x49bf29: cmp byte ptr [0x2526ba2], 1
+            fl = f_sub((rb(0x2526ba2usize) as u32), 0x1u32, 8);
+            // 0x49bf30: jne 0x49bf4a
+            if !fl.zf { pc = 0x49bf4a; } else { pc = 0x49bf32; } continue;
+        }
+        0x49bf32 => {
+            // 0x49bf32: fld dword ptr [0x25f5ba8]
+            fx.push(rf(0x25f5ba8usize) as f64);
+            // 0x49bf38: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49bf39: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bf3c: call 0x496880
+            callx!(0x496880, 1, 0, 0, 0.0, 0.0);
+            // 0x49bf41: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            pc = 0x49bf44; continue;
+        }
+        0x49bf44 => {
+            // 0x49bf44: fstp dword ptr [0xe9a654]
+            wf(0xe9a654usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x49bf4a; continue;
+        }
+        0x49bf4a => {
+            // 0x49bf4a: mov cl, byte ptr [esp + 0x16]
+            ecx = (ecx & 0xffffff00) | (((rb((esp.wrapping_add(0x16)) as usize) as u32)) & 0xff);
+            // 0x49bf4e: push 0x25f5ae8
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5ae8u32);
+            // 0x49bf53: mov eax, 0x25f5c54
+            eax = 0x25f5c54u32;
+            // 0x49bf58: mov byte ptr [0x2526ba6], cl
+            wb(0x2526ba6usize, ((ecx & 0xff)) as u8);
+            // 0x49bf5e: call 0x496be0
+            callx!(0x496be0, 1, 0, 0, 0.0, 0.0);
+            // 0x49bf63: mov eax, dword ptr [0xe9a6b4]
+            eax = rd(0xe9a6b4usize);
+            // 0x49bf68: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49bf6b: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49bf6d: jl 0x49bf92
+            if fl.sf != fl.of { pc = 0x49bf92; } else { pc = 0x49bf6f; } continue;
+        }
+        0x49bf6f => {
+            // 0x49bf6f: cmp eax, ebx
+            fl = f_sub(eax, ebx, 32);
+            // 0x49bf71: jle 0x49bf7e
+            if fl.zf || fl.sf != fl.of { pc = 0x49bf7e; } else { pc = 0x49bf73; } continue;
+        }
+        0x49bf73 => {
+            // 0x49bf73: sub eax, ebx
+            { let a = eax; let b = ebx; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x49bf75: cmp eax, 0x35a4e900
+            fl = f_sub(eax, 0x35a4e900u32, 32);
+            // 0x49bf7a: jl 0x49bf92
+            if fl.sf != fl.of { pc = 0x49bf92; } else { pc = 0x49bf7c; } continue;
+        }
+        0x49bf7c => {
+            // 0x49bf7c: jmp 0x49bf88
+            pc = 0x49bf88; continue;
+        }
+        0x49bf7e => {
+            // 0x49bf7e: sub ebx, eax
+            { let a = ebx; let b = eax; fl = f_sub(a, b, 32); ebx = a.wrapping_sub(b); }
+            // 0x49bf80: cmp ebx, 0x35a4e900
+            fl = f_sub(ebx, 0x35a4e900u32, 32);
+            // 0x49bf86: jge 0x49bf92
+            if fl.sf == fl.of { pc = 0x49bf92; } else { pc = 0x49bf88; } continue;
+        }
+        0x49bf88 => {
+            // 0x49bf88: mov dword ptr [0xe9a6b4], 0xffffffff
+            wd(0xe9a6b4usize, 0xffffffffu32);
+            pc = 0x49bf92; continue;
+        }
+        0x49bf92 => {
+            // 0x49bf92: mov ebx, dword ptr [esp + 0x34]
+            ebx = rd((esp.wrapping_add(0x34)) as usize);
+            // 0x49bf96: mov eax, ebx
+            eax = ebx;
+            // 0x49bf98: lea esi, [esp + 0x130]
+            esi = (esp.wrapping_add(0x130));
+            // 0x49bf9f: call 0x4969b0
+            callx!(0x4969b0, 0, 0, 0, 0.0, 0.0);
+            // 0x49bfa4: mov ecx, dword ptr [ebx + 0x44]
+            ecx = rd((ebx.wrapping_add(0x44)) as usize);
+            // 0x49bfa7: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x49bfa9: je 0x49bfc5
+            if fl.zf { pc = 0x49bfc5; } else { pc = 0x49bfab; } continue;
+        }
+        0x49bfab => {
+            // 0x49bfab: mov edx, ecx
+            edx = ecx;
+            // 0x49bfad: and edx, 0xfff
+            { let r = (edx) & (0xfffu32); fl = f_logic(r, 32); edx = r; }
+            // 0x49bfb3: shl edx, 4
+            { let r = edx << 4; fl = f_logic(r, 32); edx = r; }
+            // 0x49bfb6: mov eax, dword ptr [edx + 0x2149c64]
+            eax = rd((edx.wrapping_add(0x2149c64)) as usize);
+            // 0x49bfbc: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49bfbe: je 0x49bfc5
+            if fl.zf { pc = 0x49bfc5; } else { pc = 0x49bfc0; } continue;
+        }
+        0x49bfc0 => {
+            // 0x49bfc0: cmp dword ptr [eax + 0x44], ecx
+            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
+            // 0x49bfc3: je 0x49bfcf
+            if fl.zf { pc = 0x49bfcf; } else { pc = 0x49bfc5; } continue;
+        }
+        0x49bfc5 => {
+            // 0x49bfc5: mov dword ptr [esp + 0x44], 0
+            wd((esp.wrapping_add(0x44)) as usize, 0x0u32);
+            // 0x49bfcd: jmp 0x49bfe1
+            pc = 0x49bfe1; continue;
+        }
+        0x49bfcf => {
+            // 0x49bfcf: xor ecx, ecx
+            fl = f_logic(0, 32); ecx = 0;
+            // 0x49bfd1: cmp dword ptr [eax + 0x4c], 5
+            fl = f_sub(rd((eax.wrapping_add(0x4c)) as usize), 0x5u32, 32);
+            // 0x49bfd5: setne cl
+            ecx = (ecx & 0xffffff00) | (((!fl.zf) as u32) & 0xff);
+            // 0x49bfd8: sub ecx, 1
+            { let a = ecx; let b = 0x1u32; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x49bfdb: and ecx, eax
+            { let r = (ecx) & (eax); fl = f_logic(r, 32); ecx = r; }
+            // 0x49bfdd: mov dword ptr [esp + 0x44], ecx
+            wd((esp.wrapping_add(0x44)) as usize, ecx);
+            pc = 0x49bfe1; continue;
+        }
+        0x49bfe1 => {
+            // 0x49bfe1: call 0x497190
+            callx!(0x497190, 0, 0, 0, 0.0, 0.0);
+            // 0x49bfe6: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49bfe8: je 0x49c15a
+            if fl.zf { pc = 0x49c15a; } else { pc = 0x49bfee; } continue;
+        }
+        0x49bfee => {
+            bump(C::CfSubA);
+            // 0x49bfee: fld dword ptr [0x25f5ca4]
+            fx.push(rf(0x25f5ca4usize) as f64);
+            // 0x49bff4: fsub qword ptr [0xe5bfa0]
+            { let v = fx.s(0) - rdf64(0xe5bfa0usize); fx.set(0, v); }
+            // 0x49bffa: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49bffe: fld dword ptr [0xdd0584]
+            fx.push(rf(0xdd0584usize) as f64);
+            // 0x49c004: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49c008: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x49c00a: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c00c: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49c00f: jp 0x49c0ee
+            if fl.pf { pc = 0x49c0ee; } else { pc = 0x49c015; } continue;
+        }
+        0x49c015 => {
+            // 0x49c015: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49c017: fcomp st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop();
+            // 0x49c019: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c01b: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49c01e: jp 0x49c0f0
+            if fl.pf { pc = 0x49c0f0; } else { pc = 0x49c024; } continue;
+        }
+        0x49c024 => {
+            // 0x49c024: sub esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49c027: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c02b: fldz 
+            fx.push(0.0);
+            // 0x49c02d: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c031: fld dword ptr [0x25f5ca0]
+            fx.push(rf(0x25f5ca0usize) as f64);
+            // 0x49c037: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c03a: call 0xbf0e00
+            callx!(0xbf0e00, 3, 0, 0, 0.0, 0.0);
+            // 0x49c03f: add esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49c042: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49c044: je 0x49c0f2
+            if fl.zf { pc = 0x49c0f2; } else { pc = 0x49c04a; } continue;
+        }
+        0x49c04a => {
+            // 0x49c04a: mov esi, dword ptr [0xe9a6b0]
+            esi = rd(0xe9a6b0usize);
+            pc = 0x49c050; continue;
+        }
+        0x49c050 => {
+            // 0x49c050: mov edi, dword ptr [esp + 0x44]
+            edi = rd((esp.wrapping_add(0x44)) as usize);
+            // 0x49c054: test edi, edi
+            fl = f_logic((edi) & (edi), 32);
+            // 0x49c056: je 0x49c19b
+            if fl.zf { pc = 0x49c19b; } else { pc = 0x49c05c; } continue;
+        }
+        0x49c05c => {
+            // 0x49c05c: cmp dword ptr [0x21703d4], 0
+            fl = f_sub(rd(0x21703d4usize), 0x0u32, 32);
+            // 0x49c063: je 0x49c1af
+            if fl.zf { pc = 0x49c1af; } else { pc = 0x49c069; } continue;
+        }
+        0x49c069 => {
+            // 0x49c069: mov edx, dword ptr [0x21703d4]
+            edx = rd(0x21703d4usize);
+            // 0x49c06f: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49c070: call 0x9b9030
+            callx!(0x9b9030, 1, 0, 0, 0.0, 0.0);
+            // 0x49c075: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49c078: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49c07a: je 0x49c1af
+            if fl.zf { pc = 0x49c1af; } else { pc = 0x49c080; } continue;
+        }
+        0x49c080 => {
+            // 0x49c080: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x49c082: jl 0x49c0ab
+            if fl.sf != fl.of { pc = 0x49c0ab; } else { pc = 0x49c084; } continue;
+        }
+        0x49c084 => {
+            // 0x49c084: mov eax, 0xe9a6b0
+            eax = 0xe9a6b0u32;
+            // 0x49c089: call 0xbdd230
+            callx!(0xbdd230, 0, 0, 0, 0.0, 0.0);
+            // 0x49c08e: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49c090: jne 0x49c0ab
+            if !fl.zf { pc = 0x49c0ab; } else { pc = 0x49c092; } continue;
+        }
+        0x49c092 => {
+            // 0x49c092: mov eax, dword ptr [0x25f5c54]
+            eax = rd(0x25f5c54usize);
+            // 0x49c097: cmp eax, 1
+            fl = f_sub(eax, 0x1u32, 32);
+            // 0x49c09a: je 0x49c0ab
+            if fl.zf { pc = 0x49c0ab; } else { pc = 0x49c09c; } continue;
+        }
+        0x49c09c => {
+            // 0x49c09c: cmp eax, 2
+            fl = f_sub(eax, 0x2u32, 32);
+            // 0x49c09f: je 0x49c0ab
+            if fl.zf { pc = 0x49c0ab; } else { pc = 0x49c0a1; } continue;
+        }
+        0x49c0a1 => {
+            // 0x49c0a1: mov dword ptr [0x25f5c54], 4
+            wd(0x25f5c54usize, 0x4u32);
+            pc = 0x49c0ab; continue;
+        }
+        0x49c0ab => {
+            // 0x49c0ab: mov ecx, dword ptr [edi + 0x44]
+            ecx = rd((edi.wrapping_add(0x44)) as usize);
+            // 0x49c0ae: call 0xab1740
+            callx!(0xab1740, 0, 0, 0, 0.0, 0.0);
+            // 0x49c0b3: cmp byte ptr [0x2529771], 0
+            fl = f_sub((rb(0x2529771usize) as u32), 0x0u32, 8);
+            // 0x49c0ba: jne 0x49c1af
+            if !fl.zf { pc = 0x49c1af; } else { pc = 0x49c0c0; } continue;
+        }
+        0x49c0c0 => {
+            // 0x49c0c0: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49c0c2: je 0x49c1af
+            if fl.zf { pc = 0x49c1af; } else { pc = 0x49c0c8; } continue;
+        }
+        0x49c0c8 => {
+            // 0x49c0c8: cmp byte ptr [eax + 0x174], 0
+            fl = f_sub((rb((eax.wrapping_add(0x174)) as usize) as u32), 0x0u32, 8);
+            // 0x49c0cf: je 0x49c168
+            if fl.zf { pc = 0x49c168; } else { pc = 0x49c0d5; } continue;
+        }
+        0x49c0d5 => {
+            // 0x49c0d5: mov eax, dword ptr [edi + 0x84e4]
+            eax = rd((edi.wrapping_add(0x84e4)) as usize);
+            // 0x49c0db: add eax, 0x454
+            { let a = eax; let b = 0x454u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x49c0e0: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c0e1: call 0x49ded0
+            callx!(0x49ded0, 1, 0, 0, 0.0, 0.0);
+            // 0x49c0e6: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49c0e9: jmp 0x49c1af
+            pc = 0x49c1af; continue;
+        }
+        0x49c0ee => {
+            // 0x49c0ee: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            pc = 0x49c0f0; continue;
+        }
+        0x49c0f0 => {
+            // 0x49c0f0: fstp st(0)
+            fx.pop();
+            pc = 0x49c0f2; continue;
+        }
+        0x49c0f2 => {
+            // 0x49c0f2: mov edi, dword ptr [esp + 0x44]
+            edi = rd((esp.wrapping_add(0x44)) as usize);
+            // 0x49c0f6: mov byte ptr [0x25f5d34], 0
+            wb(0x25f5d34usize, (0x0u32) as u8);
+            // 0x49c0fd: call 0x49e990
+            callx!(0x49e990, 0, 0, 0, 0.0, 0.0);
+            // 0x49c102: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49c104: jl 0x49c132
+            if fl.sf != fl.of { pc = 0x49c132; } else { pc = 0x49c106; } continue;
+        }
+        0x49c106 => {
+            // 0x49c106: mov edx, dword ptr [0xe843ac]
+            edx = rd(0xe843acusize);
+            // 0x49c10c: lea esi, [eax + edx]
+            esi = (eax.wrapping_add(edx));
+            // 0x49c10f: cmp esi, 0x6b49d200
+            fl = f_sub(esi, 0x6b49d200u32, 32);
+            // 0x49c115: mov dword ptr [0xe9a6b0], esi
+            wd(0xe9a6b0usize, esi);
+            // 0x49c11b: jle 0x49c050
+            if fl.zf || fl.sf != fl.of { pc = 0x49c050; } else { pc = 0x49c121; } continue;
+        }
+        0x49c121 => {
+            // 0x49c121: sub esi, 0x6b49d200
+            { let a = esi; let b = 0x6b49d200u32; fl = f_sub(a, b, 32); esi = a.wrapping_sub(b); }
+            // 0x49c127: mov dword ptr [0xe9a6b0], esi
+            wd(0xe9a6b0usize, esi);
+            // 0x49c12d: jmp 0x49c050
+            pc = 0x49c050; continue;
+        }
+        0x49c132 => {
+            // 0x49c132: mov ecx, dword ptr [0xe843ac]
+            ecx = rd(0xe843acusize);
+            // 0x49c138: lea esi, [eax + ecx]
+            esi = (eax.wrapping_add(ecx));
+            // 0x49c13b: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x49c13d: mov dword ptr [0xe9a6b0], esi
+            wd(0xe9a6b0usize, esi);
+            // 0x49c143: jge 0x49c050
+            if fl.sf == fl.of { pc = 0x49c050; } else { pc = 0x49c149; } continue;
+        }
+        0x49c149 => {
+            // 0x49c149: add esi, 0x6b49d200
+            { let a = esi; let b = 0x6b49d200u32; fl = f_add(a, b, 32); esi = a.wrapping_add(b); }
+            // 0x49c14f: mov dword ptr [0xe9a6b0], esi
+            wd(0xe9a6b0usize, esi);
+            // 0x49c155: jmp 0x49c050
+            pc = 0x49c050; continue;
+        }
+        0x49c15a => {
+            // 0x49c15a: or esi, 0xffffffff
+            { let r = (esi) | (0xffffffffu32); fl = f_logic(r, 32); esi = r; }
+            // 0x49c15d: mov dword ptr [0xe9a6b0], esi
+            wd(0xe9a6b0usize, esi);
+            // 0x49c163: jmp 0x49c050
+            pc = 0x49c050; continue;
+        }
+        0x49c168 => {
+            // 0x49c168: cmp byte ptr [eax + 0x10c], 0
+            fl = f_sub((rb((eax.wrapping_add(0x10c)) as usize) as u32), 0x0u32, 8);
+            // 0x49c16f: je 0x49c1af
+            if fl.zf { pc = 0x49c1af; } else { pc = 0x49c171; } continue;
+        }
+        0x49c171 => {
+            // 0x49c171: call 0x53c4d0
+            callx!(0x53c4d0, 0, 0, 0, 0.0, 0.0);
+            // 0x49c176: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49c178: jne 0x49c182
+            if !fl.zf { pc = 0x49c182; } else { pc = 0x49c17a; } continue;
+        }
+        0x49c17a => {
+            // 0x49c17a: cmp byte ptr [0x2526b9a], al
+            fl = f_sub((rb(0x2526b9ausize) as u32), (eax & 0xff), 8);
+            // 0x49c180: jne 0x49c1af
+            if !fl.zf { pc = 0x49c1af; } else { pc = 0x49c182; } continue;
+        }
+        0x49c182 => {
+            // 0x49c182: mov eax, dword ptr [edi + 0x84e4]
+            eax = rd((edi.wrapping_add(0x84e4)) as usize);
+            // 0x49c188: mov ecx, dword ptr [edi + 0x44]
+            ecx = rd((edi.wrapping_add(0x44)) as usize);
+            // 0x49c18b: add eax, 0x470
+            { let a = eax; let b = 0x470u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x49c190: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c191: call 0x49ded0
+            callx!(0x49ded0, 1, 0, 0, 0.0, 0.0);
+            // 0x49c196: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49c199: jmp 0x49c1af
+            pc = 0x49c1af; continue;
+        }
+        0x49c19b => {
+            // 0x49c19b: cmp dword ptr [0x25f5d3c], 0
+            fl = f_sub(rd(0x25f5d3cusize), 0x0u32, 32);
+            // 0x49c1a2: je 0x49c1af
+            if fl.zf { pc = 0x49c1af; } else { pc = 0x49c1a4; } continue;
+        }
+        0x49c1a4 => {
+            // 0x49c1a4: xor edi, edi
+            fl = f_logic(0, 32); edi = 0;
+            // 0x49c1a6: call 0x49d7a0
+            callx!(0x49d7a0, 0, 0, 0, 0.0, 0.0);
+            // 0x49c1ab: mov edi, dword ptr [esp + 0x44]
+            edi = rd((esp.wrapping_add(0x44)) as usize);
+            pc = 0x49c1af; continue;
+        }
+        0x49c1af => {
+            // 0x49c1af: cmp byte ptr [0xe9985b], 0
+            fl = f_sub((rb(0xe9985busize) as u32), 0x0u32, 8);
+            // 0x49c1b6: je 0x49c1d5
+            if fl.zf { pc = 0x49c1d5; } else { pc = 0x49c1b8; } continue;
+        }
+        0x49c1b8 => {
+            // 0x49c1b8: fld dword ptr [ebp + 8]
+            fx.push(rf((ebp.wrapping_add(0x8)) as usize) as f64);
+            // 0x49c1bb: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c1bc: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c1bf: push 0x25f5c54
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5c54u32);
+            // 0x49c1c4: lea eax, [esp + 0x138]
+            eax = (esp.wrapping_add(0x138));
+            // 0x49c1cb: mov ecx, ebx
+            ecx = ebx;
+            // 0x49c1cd: call 0x497a20
+            callx!(0x497a20, 2, 0, 0, 0.0, 0.0);
+            // 0x49c1d2: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            pc = 0x49c1d5; continue;
+        }
+        0x49c1d5 => {
+            // 0x49c1d5: mov eax, dword ptr [0x25f5c54]
+            eax = rd(0x25f5c54usize);
+            // 0x49c1da: cmp eax, 4
+            fl = f_sub(eax, 0x4u32, 32);
+            // 0x49c1dd: ja 0x49c24b
+            if !fl.cf && !fl.zf { pc = 0x49c24b; } else { pc = 0x49c1df; } continue;
+        }
+        0x49c1df => {
+            // 0x49c1df: jmp dword ptr [eax*4 + 0x49d058]
+            pc = rd((0x49d058u32.wrapping_add(eax.wrapping_mul(4))) as usize) as usize; continue;
+        }
+        0x49c1e6 => {
+            bump(C::CfM0);
+            // 0x49c1e6: fld dword ptr [ebp + 8]
+            fx.push(rf((ebp.wrapping_add(0x8)) as usize) as f64);
+            // 0x49c1e9: lea edx, [esp + 0x130]
+            edx = (esp.wrapping_add(0x130));
+            // 0x49c1f0: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49c1f1: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c1f2: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c1f5: push 0x25f5c54
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5c54u32);
+            // 0x49c1fa: call 0x498d40
+            callx!(0x498d40, 3, 0, 0, 0.0, 0.0);
+            // 0x49c1ff: jmp 0x49c248
+            pc = 0x49c248; continue;
+        }
+        0x49c201 => {
+            bump(C::CfM1);
+            // 0x49c201: push 0x25f5c54
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5c54u32);
+            // 0x49c206: call 0x499190
+            callx!(0x499190, 1, 0, 0, 0.0, 0.0);
+            // 0x49c20b: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49c20e: jmp 0x49c24b
+            pc = 0x49c24b; continue;
+        }
+        0x49c210 => {
+            bump(C::CfM2);
+            // 0x49c210: mov eax, 0x25f5c54
+            eax = 0x25f5c54u32;
+            // 0x49c215: call 0x499120
+            callx!(0x499120, 0, 0, 0, 0.0, 0.0);
+            // 0x49c21a: jmp 0x49c24b
+            pc = 0x49c24b; continue;
+        }
+        0x49c21c => {
+            bump(C::CfM3);
+            // 0x49c21c: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x49c21d: mov esi, 0x25f5c54
+            esi = 0x25f5c54u32;
+            // 0x49c222: call 0x499410
+            callx!(0x499410, 1, 0, 0, 0.0, 0.0);
+            // 0x49c227: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49c22a: jmp 0x49c24b
+            pc = 0x49c24b; continue;
+        }
+        0x49c22c => {
+            bump(C::CfM4);
+            // 0x49c22c: cmp dword ptr [0xe9a5bc], 9
+            fl = f_sub(rd(0xe9a5bcusize), 0x9u32, 32);
+            // 0x49c233: fld dword ptr [ebp + 8]
+            fx.push(rf((ebp.wrapping_add(0x8)) as usize) as f64);
+            // 0x49c236: sete al
+            eax = (eax & 0xffffff00) | (((fl.zf) as u32) & 0xff);
+            // 0x49c239: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49c23a: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c23b: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c23e: push 0x25f5c54
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5c54u32);
+            // 0x49c243: call 0x499480
+            callx!(0x499480, 3, 0, 0, 0.0, 0.0);
+            pc = 0x49c248; continue;
+        }
+        0x49c248 => {
+            // 0x49c248: add esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            pc = 0x49c24b; continue;
+        }
+        0x49c24b => {
+            // 0x49c24b: cmp dword ptr [0xe9a5bc], 7
+            fl = f_sub(rd(0xe9a5bcusize), 0x7u32, 32);
+            // 0x49c252: jne 0x49c393
+            if !fl.zf { pc = 0x49c393; } else { pc = 0x49c258; } continue;
+        }
+        0x49c258 => {
+            bump(C::CfCam7);
+            // 0x49c258: mov esi, dword ptr [0xf53964]
+            esi = rd(0xf53964usize);
+            // 0x49c25e: mov ecx, dword ptr [0x25f5bb0]
+            ecx = rd(0x25f5bb0usize);
+            // 0x49c264: imul esi, esi, 0x34
+            esi = esi.wrapping_mul(0x34u32);
+            // 0x49c267: add esi, 0x25f6738
+            { let a = esi; let b = 0x25f6738u32; fl = f_add(a, b, 32); esi = a.wrapping_add(b); }
+            // 0x49c26d: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x49c26f: je 0x49c393
+            if fl.zf { pc = 0x49c393; } else { pc = 0x49c275; } continue;
+        }
+        0x49c275 => {
+            // 0x49c275: mov edx, ecx
+            edx = ecx;
+            // 0x49c277: and edx, 0xfff
+            { let r = (edx) & (0xfffu32); fl = f_logic(r, 32); edx = r; }
+            // 0x49c27d: shl edx, 4
+            { let r = edx << 4; fl = f_logic(r, 32); edx = r; }
+            // 0x49c280: mov eax, dword ptr [edx + 0x2149c64]
+            eax = rd((edx.wrapping_add(0x2149c64)) as usize);
+            // 0x49c286: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49c288: je 0x49c393
+            if fl.zf { pc = 0x49c393; } else { pc = 0x49c28e; } continue;
+        }
+        0x49c28e => {
+            // 0x49c28e: cmp dword ptr [eax + 0x44], ecx
+            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
+            // 0x49c291: jne 0x49c393
+            if !fl.zf { pc = 0x49c393; } else { pc = 0x49c297; } continue;
+        }
+        0x49c297 => {
+            // 0x49c297: cmp dword ptr [eax + 0x4c], 5
+            fl = f_sub(rd((eax.wrapping_add(0x4c)) as usize), 0x5u32, 32);
+            // 0x49c29b: jne 0x49c393
+            if !fl.zf { pc = 0x49c393; } else { pc = 0x49c2a1; } continue;
+        }
+        0x49c2a1 => {
+            // 0x49c2a1: test byte ptr [esi + 0x30], 1
+            fl = f_logic(((rb((esi.wrapping_add(0x30)) as usize) as u32)) & (0x1u32), 8);
+            // 0x49c2a5: je 0x49c393
+            if fl.zf { pc = 0x49c393; } else { pc = 0x49c2ab; } continue;
+        }
+        0x49c2ab => {
+            // 0x49c2ab: lea ecx, [eax + 0x20]
+            ecx = (eax.wrapping_add(0x20));
+            // 0x49c2ae: lea eax, [esp + 0xa4]
+            eax = (esp.wrapping_add(0xa4));
+            // 0x49c2b5: call 0xbe2c60
+            callx!(0xbe2c60, 0, 0, 0, 0.0, 0.0);
+            // 0x49c2ba: fld dword ptr [esi + 0x20]
+            fx.push(rf((esi.wrapping_add(0x20)) as usize) as f64);
+            // 0x49c2bd: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c2be: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c2c1: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49c2c2: call 0xbe51d0
+            callx!(0xbe51d0, 2, 2, 0, 0.0, 0.0);
+            // 0x49c2c7: fld dword ptr [esi + 0x1c]
+            fx.push(rf((esi.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49c2ca: fmul qword ptr [0xe5bf70]
+            { let v = fx.s(0) * rdf64(0xe5bf70usize); fx.set(0, v); }
+            // 0x49c2d0: lea ecx, [esp + 0xa4]
+            ecx = (esp.wrapping_add(0xa4));
+            // 0x49c2d7: fstp dword ptr [esp + 0x34]
+            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c2db: call 0xbe3380
+            callx!(0xbe3380, 0, 0, 0, 0.0, 0.0);
+            // 0x49c2e0: mov ecx, dword ptr [esp + 0x20]
+            ecx = rd((esp.wrapping_add(0x20)) as usize);
+            // 0x49c2e4: test byte ptr [ecx + 0x1163], 0x20
+            fl = f_logic(((rb((ecx.wrapping_add(0x1163)) as usize) as u32)) & (0x20u32), 8);
+            // 0x49c2eb: movss dword ptr [esp + 0x1c], xmm0
+            wd((esp.wrapping_add(0x1c)) as usize, xmm0);
+            // 0x49c2f1: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49c2f5: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c2f9: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49c2fd: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c2ff: fld dword ptr [esp + 0x34]
+            fx.push(rf((esp.wrapping_add(0x34)) as usize) as f64);
+            // 0x49c303: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c305: fsubp st(2)
+            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c307: fxch st(1)
+            fx.xch(1);
+            // 0x49c309: fstp dword ptr [esp + 0x34]
+            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c30d: fadd st(1)
+            { let v = fx.s(0) + fx.s(1); fx.set(0, v); }
+            // 0x49c30f: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c313: jne 0x49c387
+            if !fl.zf { pc = 0x49c387; } else { pc = 0x49c315; } continue;
+        }
+        0x49c315 => {
+            // 0x49c315: fstp st(0)
+            fx.pop();
+            // 0x49c317: sub esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49c31a: fld dword ptr [esp + 0x3c]
+            fx.push(rf((esp.wrapping_add(0x3c)) as usize) as f64);
+            // 0x49c31e: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c322: fld dword ptr [0x25f5c58]
+            fx.push(rf(0x25f5c58usize) as f64);
+            // 0x49c328: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c32b: call 0xbf1600
+            callx!(0xbf1600, 2, 0, 0, 0.0, 0.0);
+            // 0x49c330: movss dword ptr [esp + 0x28], xmm0
+            wd((esp.wrapping_add(0x28)) as usize, xmm0);
+            // 0x49c336: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49c33a: fcomp dword ptr [0xdd32c0]
+            fx.sw = fcmp(fx.s(0), (rf(0xdd32c0usize) as f64));
+            fx.pop();
+            // 0x49c340: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49c343: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c345: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49c348: jp 0x49c350
+            if fl.pf { pc = 0x49c350; } else { pc = 0x49c34a; } continue;
+        }
+        0x49c34a => {
+            // 0x49c34a: fld dword ptr [esp + 0x34]
+            fx.push(rf((esp.wrapping_add(0x34)) as usize) as f64);
+            // 0x49c34e: jmp 0x49c387
+            pc = 0x49c387; continue;
+        }
+        0x49c350 => {
+            // 0x49c350: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49c354: sub esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49c357: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c35b: fld dword ptr [0x25f5c58]
+            fx.push(rf(0x25f5c58usize) as f64);
+            // 0x49c361: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c364: call 0xbf1600
+            callx!(0xbf1600, 2, 0, 0, 0.0, 0.0);
+            // 0x49c369: movss dword ptr [esp + 0x28], xmm0
+            wd((esp.wrapping_add(0x28)) as usize, xmm0);
+            // 0x49c36f: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49c373: fcomp dword ptr [0xdd32c0]
+            fx.sw = fcmp(fx.s(0), (rf(0xdd32c0usize) as f64));
+            fx.pop();
+            // 0x49c379: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49c37c: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c37e: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49c381: jne 0x49c393
+            if !fl.zf { pc = 0x49c393; } else { pc = 0x49c383; } continue;
+        }
+        0x49c383 => {
+            // 0x49c383: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            pc = 0x49c387; continue;
+        }
+        0x49c387 => {
+            // 0x49c387: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c388: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c38b: call 0x49dfb0
+            callx!(0x49dfb0, 1, 0, 0, 0.0, 0.0);
+            // 0x49c390: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            pc = 0x49c393; continue;
+        }
+        0x49c393 => {
+            // 0x49c393: mov eax, dword ptr [0x25f5c54]
+            eax = rd(0x25f5c54usize);
+            // 0x49c398: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49c39a: je 0x49c3fd
+            if fl.zf { pc = 0x49c3fd; } else { pc = 0x49c39c; } continue;
+        }
+        0x49c39c => {
+            // 0x49c39c: cmp eax, 1
+            fl = f_sub(eax, 0x1u32, 32);
+            // 0x49c39f: je 0x49c3fd
+            if fl.zf { pc = 0x49c3fd; } else { pc = 0x49c3a1; } continue;
+        }
+        0x49c3a1 => {
+            // 0x49c3a1: xor ebx, ebx
+            fl = f_logic(0, 32); ebx = 0;
+            pc = 0x49c3a3; continue;
+        }
+        0x49c3a3 => {
+            bump(C::CfSmooth);
+            // 0x49c3a3: fld dword ptr [0x25f5c7c]
+            fx.push(rf(0x25f5c7cusize) as f64);
+            // 0x49c3a9: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c3ab: fldz 
+            fx.push(0.0);
+            // 0x49c3ad: fsubrp st(1)
+            { let v = fx.s(0) - fx.s(1); fx.set(1, v); }
+            fx.pop();
+            // 0x49c3af: fmul qword ptr [0xe5c628]
+            { let v = fx.s(0) * rdf64(0xe5c628usize); fx.set(0, v); }
+            // 0x49c3b5: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49c3b7: fstp dword ptr [0x25f5c7c]
+            wf(0x25f5c7cusize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x49c3bd; continue;
+        }
+        0x49c3bd => {
+            // 0x49c3bd: cmp edi, ebx
+            fl = f_sub(edi, ebx, 32);
+            // 0x49c3bf: fld dword ptr [0x25f5c74]
+            fx.push(rf(0x25f5c74usize) as f64);
+            // 0x49c3c5: fadd dword ptr [0x25f5c78]
+            { let v = fx.s(0) + (rf(0x25f5c78usize) as f64); fx.set(0, v); }
+            // 0x49c3cb: fadd dword ptr [0x25f5c7c]
+            { let v = fx.s(0) + (rf(0x25f5c7cusize) as f64); fx.set(0, v); }
+            // 0x49c3d1: fadd dword ptr [0xe9a650]
+            { let v = fx.s(0) + (rf(0xe9a650usize) as f64); fx.set(0, v); }
+            // 0x49c3d7: fstp dword ptr [0x25f5c5c]
+            wf(0x25f5c5cusize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c3dd: je 0x49c632
+            if fl.zf { pc = 0x49c632; } else { pc = 0x49c3e3; } continue;
+        }
+        0x49c3e3 => {
+            // 0x49c3e3: mov ecx, dword ptr [edi + 0x84e4]
+            ecx = rd((edi.wrapping_add(0x84e4)) as usize);
+            // 0x49c3e9: cmp dword ptr [ecx + 0x9c], 4
+            fl = f_sub(rd((ecx.wrapping_add(0x9c)) as usize), 0x4u32, 32);
+            // 0x49c3f0: jne 0x49c632
+            if !fl.zf { pc = 0x49c632; } else { pc = 0x49c3f6; } continue;
+        }
+        0x49c3f6 => {
+            // 0x49c3f6: fld1 
+            fx.push(1.0);
+            // 0x49c3f8: jmp 0x49c638
+            pc = 0x49c638; continue;
+        }
+        0x49c3fd => {
+            bump(C::CfSub01);
+            // 0x49c3fd: mov eax, dword ptr [0x25f5bb0]
+            eax = rd(0x25f5bb0usize);
+            // 0x49c402: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49c404: je 0x49c424
+            if fl.zf { pc = 0x49c424; } else { pc = 0x49c406; } continue;
+        }
+        0x49c406 => {
+            // 0x49c406: mov edx, eax
+            edx = eax;
+            // 0x49c408: and edx, 0xfff
+            { let r = (edx) & (0xfffu32); fl = f_logic(r, 32); edx = r; }
+            // 0x49c40e: shl edx, 4
+            { let r = edx << 4; fl = f_logic(r, 32); edx = r; }
+            // 0x49c411: mov ecx, dword ptr [edx + 0x2149c64]
+            ecx = rd((edx.wrapping_add(0x2149c64)) as usize);
+            // 0x49c417: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x49c419: je 0x49c424
+            if fl.zf { pc = 0x49c424; } else { pc = 0x49c41b; } continue;
+        }
+        0x49c41b => {
+            // 0x49c41b: cmp dword ptr [ecx + 0x44], eax
+            fl = f_sub(rd((ecx.wrapping_add(0x44)) as usize), eax, 32);
+            // 0x49c41e: je 0x49c544
+            if fl.zf { pc = 0x49c544; } else { pc = 0x49c424; } continue;
+        }
+        0x49c424 => {
+            // 0x49c424: xor esi, esi
+            fl = f_logic(0, 32); esi = 0;
+            pc = 0x49c426; continue;
+        }
+        0x49c426 => {
+            // 0x49c426: xor al, al
+            fl = f_logic(0, 8); eax = (eax & 0xffffff00) | ((0) & 0xff);
+            pc = 0x49c428; continue;
+        }
+        0x49c428 => {
+            // 0x49c428: xor ebx, ebx
+            fl = f_logic(0, 32); ebx = 0;
+            // 0x49c42a: cmp esi, ebx
+            fl = f_sub(esi, ebx, 32);
+            // 0x49c42c: je 0x49c3a3
+            if fl.zf { pc = 0x49c3a3; } else { pc = 0x49c432; } continue;
+        }
+        0x49c432 => {
+            // 0x49c432: mov ecx, dword ptr [esi + 0x84e4]
+            ecx = rd((esi.wrapping_add(0x84e4)) as usize);
+            // 0x49c438: cmp dword ptr [ecx + 0x9c], 3
+            fl = f_sub(rd((ecx.wrapping_add(0x9c)) as usize), 0x3u32, 32);
+            // 0x49c43f: jne 0x49c3a3
+            if !fl.zf { pc = 0x49c3a3; } else { pc = 0x49c445; } continue;
+        }
+        0x49c445 => {
+            // 0x49c445: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49c447: je 0x49c3a3
+            if fl.zf { pc = 0x49c3a3; } else { pc = 0x49c44d; } continue;
+        }
+        0x49c44d => {
+            // 0x49c44d: mov edx, dword ptr [esi]
+            edx = rd((esi) as usize);
+            // 0x49c44f: mov edx, dword ptr [edx]
+            edx = rd((edx) as usize);
+            // 0x49c451: push -1
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0xffffffffu32);
+            // 0x49c453: lea eax, [esp + 0x68]
+            eax = (esp.wrapping_add(0x68));
+            // 0x49c457: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49c458: mov ecx, esi
+            ecx = esi;
+            // 0x49c45a: call edx
+            callx!(edx as usize, 2, 2, 0, 0.0, 0.0);
+            // 0x49c45c: fldz 
+            fx.push(0.0);
+            // 0x49c45e: mov ecx, dword ptr [esi + 0x18]
+            ecx = rd((esi.wrapping_add(0x18)) as usize);
+            // 0x49c461: fstp dword ptr [esp + 0xf0]
+            wf((esp.wrapping_add(0xf0)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c468: mov dword ptr [esp + 0xe8], ecx
+            wd((esp.wrapping_add(0xe8)) as usize, ecx);
+            // 0x49c46f: fld dword ptr [esp + 0xe8]
+            fx.push(rf((esp.wrapping_add(0xe8)) as usize) as f64);
+            // 0x49c476: fsub dword ptr [0xe999b0]
+            { let v = fx.s(0) - (rf(0xe999b0usize) as f64); fx.set(0, v); }
+            // 0x49c47c: mov eax, dword ptr [esi + 0x14]
+            eax = rd((esi.wrapping_add(0x14)) as usize);
+            // 0x49c47f: mov edx, dword ptr [esi + 0x1c]
+            edx = rd((esi.wrapping_add(0x1c)) as usize);
+            // 0x49c482: mov dword ptr [esp + 0xd8], eax
+            wd((esp.wrapping_add(0xd8)) as usize, eax);
+            // 0x49c489: mov dword ptr [esp + 0xe4], eax
+            wd((esp.wrapping_add(0xe4)) as usize, eax);
+            // 0x49c490: fstp dword ptr [esp + 0xe8]
+            wf((esp.wrapping_add(0xe8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c497: mov dword ptr [esp + 0xf4], ebx
+            wd((esp.wrapping_add(0xf4)) as usize, ebx);
+            // 0x49c49e: fld dword ptr [esp + 0x64]
+            fx.push(rf((esp.wrapping_add(0x64)) as usize) as f64);
+            // 0x49c4a2: mov dword ptr [esp + 0x11c], ebx
+            wd((esp.wrapping_add(0x11c)) as usize, ebx);
+            // 0x49c4a9: fld dword ptr [esp + 0x68]
+            fx.push(rf((esp.wrapping_add(0x68)) as usize) as f64);
+            // 0x49c4ad: mov dword ptr [esp + 0x120], ebx
+            wd((esp.wrapping_add(0x120)) as usize, ebx);
+            // 0x49c4b4: fld dword ptr [0xe999ac]
+            fx.push(rf(0xe999acusize) as f64);
+            // 0x49c4ba: mov dword ptr [esp + 0x12c], ebx
+            wd((esp.wrapping_add(0x12c)) as usize, ebx);
+            // 0x49c4c1: fld st(1)
+            { let v = fx.s(1); fx.push(v); }
+            // 0x49c4c3: mov dword ptr [esp + 0x54], ebx
+            wd((esp.wrapping_add(0x54)) as usize, ebx);
+            // 0x49c4c7: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c4c9: mov dword ptr [esp + 0x58], ebx
+            wd((esp.wrapping_add(0x58)) as usize, ebx);
+            // 0x49c4cd: mov dword ptr [esp + 0x5c], 0x80000000
+            wd((esp.wrapping_add(0x5c)) as usize, 0x80000000u32);
+            // 0x49c4d5: mov dword ptr [esp + 0xdc], ecx
+            wd((esp.wrapping_add(0xdc)) as usize, ecx);
+            // 0x49c4dc: fld st(2)
+            { let v = fx.s(2); fx.push(v); }
+            // 0x49c4de: mov dword ptr [esp + 0xe0], edx
+            wd((esp.wrapping_add(0xe0)) as usize, edx);
+            // 0x49c4e5: fmulp st(3)
+            { let v = fx.s(3) * fx.s(0); fx.set(3, v); }
+            fx.pop();
+            // 0x49c4e7: mov dword ptr [esp + 0xec], edx
+            wd((esp.wrapping_add(0xec)) as usize, edx);
+            // 0x49c4ee: fxch st(1)
+            fx.xch(1);
+            // 0x49c4f0: mov dword ptr [esp + 0x128], ebx
+            wd((esp.wrapping_add(0x128)) as usize, ebx);
+            // 0x49c4f7: mov dword ptr [esp + 0x124], 0x37
+            wd((esp.wrapping_add(0x124)) as usize, 0x37u32);
+            // 0x49c502: faddp st(2)
+            { let v = fx.s(2) + fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c504: fxch st(1)
+            fx.xch(1);
+            // 0x49c506: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c50a: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x49c50e: fld st(1)
+            { let v = fx.s(1); fx.push(v); }
+            // 0x49c510: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c512: fcompp 
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop(); fx.pop();
+            // 0x49c514: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c516: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49c519: jp 0x49c56a
+            if fl.pf { pc = 0x49c56a; } else { pc = 0x49c51b; } continue;
+        }
+        0x49c51b => {
+            // 0x49c51b: lea eax, [esp + 0x54]
+            eax = (esp.wrapping_add(0x54));
+            // 0x49c51f: push 1
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x1u32);
+            // 0x49c521: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49c522: lea ecx, [esp + 0xe0]
+            ecx = (esp.wrapping_add(0xe0));
+            // 0x49c529: call 0x6fa330
+            callx!(0x6fa330, 2, 0, 0, 0.0, 0.0);
+            // 0x49c52e: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49c531: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49c533: je 0x49c56a
+            if fl.zf { pc = 0x49c56a; } else { pc = 0x49c535; } continue;
+        }
+        0x49c535 => {
+            // 0x49c535: fld dword ptr [0xe999a8]
+            fx.push(rf(0xe999a8usize) as f64);
+            // 0x49c53b: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c53f: jmp 0x49c606
+            pc = 0x49c606; continue;
+        }
+        0x49c544 => {
+            // 0x49c544: cmp dword ptr [ecx + 0x4c], 5
+            fl = f_sub(rd((ecx.wrapping_add(0x4c)) as usize), 0x5u32, 32);
+            // 0x49c548: jne 0x49c424
+            if !fl.zf { pc = 0x49c424; } else { pc = 0x49c54e; } continue;
+        }
+        0x49c54e => {
+            // 0x49c54e: xor edx, edx
+            fl = f_logic(0, 32); edx = 0;
+            // 0x49c550: mov esi, ecx
+            esi = ecx;
+            // 0x49c552: call 0xaa7380
+            callx!(0xaa7380, 0, 0, 0, 0.0, 0.0);
+            // 0x49c557: cmp eax, dword ptr [0x21703d4]
+            fl = f_sub(eax, rd(0x21703d4usize), 32);
+            // 0x49c55d: jne 0x49c426
+            if !fl.zf { pc = 0x49c426; } else { pc = 0x49c563; } continue;
+        }
+        0x49c563 => {
+            // 0x49c563: mov al, 1
+            eax = (eax & 0xffffff00) | ((0x1u32) & 0xff);
+            // 0x49c565: jmp 0x49c428
+            pc = 0x49c428; continue;
+        }
+        0x49c56a => {
+            // 0x49c56a: mov esi, dword ptr [esi + 0x84e4]
+            esi = rd((esi.wrapping_add(0x84e4)) as usize);
+            // 0x49c570: fld dword ptr [esi + 0x4e8]
+            fx.push(rf((esi.wrapping_add(0x4e8)) as usize) as f64);
+            // 0x49c576: fld dword ptr [esp + 0x68]
+            fx.push(rf((esp.wrapping_add(0x68)) as usize) as f64);
+            // 0x49c57a: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49c57c: fmulp st(1)
+            { let v = fx.s(1) * fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49c57e: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c582: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49c586: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c588: fabs 
+            { let v = fx.s(0).abs(); fx.set(0, v); }
+            // 0x49c58a: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c58e: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x49c592: fld dword ptr [esi + 0x4f0]
+            fx.push(rf((esi.wrapping_add(0x4f0)) as usize) as f64);
+            // 0x49c598: fcompp 
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop(); fx.pop();
+            // 0x49c59a: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c59c: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49c59f: jne 0x49c5ab
+            if !fl.zf { pc = 0x49c5ab; } else { pc = 0x49c5a1; } continue;
+        }
+        0x49c5a1 => {
+            // 0x49c5a1: fstp st(0)
+            fx.pop();
+            // 0x49c5a3: fldz 
+            fx.push(0.0);
+            // 0x49c5a5: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c5a9: jmp 0x49c606
+            pc = 0x49c606; continue;
+        }
+        0x49c5ab => {
+            // 0x49c5ab: fld dword ptr [esi + 0x4ec]
+            fx.push(rf((esi.wrapping_add(0x4ec)) as usize) as f64);
+            // 0x49c5b1: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49c5b3: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c5b7: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x49c5bb: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x49c5bd: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c5bf: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49c5c2: jp 0x49c5cc
+            if fl.pf { pc = 0x49c5cc; } else { pc = 0x49c5c4; } continue;
+        }
+        0x49c5c4 => {
+            // 0x49c5c4: fxch st(1)
+            fx.xch(1);
+            // 0x49c5c6: fst dword ptr [esp + 0x34]
+            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
+            // 0x49c5ca: jmp 0x49c5d2
+            pc = 0x49c5d2; continue;
+        }
+        0x49c5cc => {
+            // 0x49c5cc: fst dword ptr [esp + 0x34]
+            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
+            // 0x49c5d0: fxch st(1)
+            fx.xch(1);
+            pc = 0x49c5d2; continue;
+        }
+        0x49c5d2 => {
+            // 0x49c5d2: fld dword ptr [esp + 0x34]
+            fx.push(rf((esp.wrapping_add(0x34)) as usize) as f64);
+            // 0x49c5d6: fld dword ptr [esi + 0x4ec]
+            fx.push(rf((esi.wrapping_add(0x4ec)) as usize) as f64);
+            // 0x49c5dc: fcompp 
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop(); fx.pop();
+            // 0x49c5de: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c5e0: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49c5e3: jne 0x49c5f4
+            if !fl.zf { pc = 0x49c5f4; } else { pc = 0x49c5e5; } continue;
+        }
+        0x49c5e5 => {
+            // 0x49c5e5: fcomp st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop();
+            // 0x49c5e7: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c5e9: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49c5ec: je 0x49c604
+            if fl.zf { pc = 0x49c604; } else { pc = 0x49c5ee; } continue;
+        }
+        0x49c5ee => {
+            // 0x49c5ee: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c5f2: jmp 0x49c606
+            pc = 0x49c606; continue;
+        }
+        0x49c5f4 => {
+            // 0x49c5f4: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x49c5f6: fstp st(0)
+            fx.pop();
+            // 0x49c5f8: fld dword ptr [esi + 0x4ec]
+            fx.push(rf((esi.wrapping_add(0x4ec)) as usize) as f64);
+            // 0x49c5fe: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c602: jmp 0x49c606
+            pc = 0x49c606; continue;
+        }
+        0x49c604 => {
+            // 0x49c604: fstp st(0)
+            fx.pop();
+            pc = 0x49c606; continue;
+        }
+        0x49c606 => {
+            // 0x49c606: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49c60a: lea ecx, [esp + 0x54]
+            ecx = (esp.wrapping_add(0x54));
+            // 0x49c60e: fld dword ptr [0x25f5c7c]
+            fx.push(rf(0x25f5c7cusize) as f64);
+            // 0x49c614: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c616: fsubp st(2)
+            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c618: fxch st(1)
+            fx.xch(1);
+            // 0x49c61a: fmul qword ptr [0xe5c628]
+            { let v = fx.s(0) * rdf64(0xe5c628usize); fx.set(0, v); }
+            // 0x49c620: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49c622: fstp dword ptr [0x25f5c7c]
+            wf(0x25f5c7cusize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c628: call 0x4080b0
+            callx!(0x4080b0, 0, 0, 0, 0.0, 0.0);
+            // 0x49c62d: jmp 0x49c3bd
+            pc = 0x49c3bd; continue;
+        }
+        0x49c632 => {
+            bump(C::CfNoVeh);
+            // 0x49c632: fld dword ptr [0xe88150]
+            fx.push(rf(0xe88150usize) as f64);
+            pc = 0x49c638; continue;
+        }
+        0x49c638 => {
+            // 0x49c638: cmp byte ptr [esp + 0x16], 0
+            fl = f_sub((rb((esp.wrapping_add(0x16)) as usize) as u32), 0x0u32, 8);
+            // 0x49c63d: fstp dword ptr [esp + 0x34]
+            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c641: fld dword ptr [0x25f5c58]
+            fx.push(rf(0x25f5c58usize) as f64);
+            // 0x49c647: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c64b: jne 0x49c73e
+            if !fl.zf { pc = 0x49c73e; } else { pc = 0x49c651; } continue;
+        }
+        0x49c651 => {
+            // 0x49c651: fld dword ptr [0x25f5c6c]
+            fx.push(rf(0x25f5c6cusize) as f64);
+            // 0x49c657: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c658: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c65b: call 0x428cd0
+            callx!(0x428cd0, 1, 0, 0, 0.0, 0.0);
+            // 0x49c660: fmul dword ptr [0x2526c04]
+            { let v = fx.s(0) * (rf(0x2526c04usize) as f64); fx.set(0, v); }
+            // 0x49c666: fadd dword ptr [esp + 0x14]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
+            // 0x49c66a: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c66e: fld dword ptr [0x25f5c6c]
+            fx.push(rf(0x25f5c6cusize) as f64);
+            // 0x49c674: fmul qword ptr [0xe5c210]
+            { let v = fx.s(0) * rdf64(0xe5c210usize); fx.set(0, v); }
+            // 0x49c67a: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c67e: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49c682: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c685: call 0x428cd0
+            callx!(0x428cd0, 1, 0, 0, 0.0, 0.0);
+            // 0x49c68a: fld dword ptr [0x2526c08]
+            fx.push(rf(0x2526c08usize) as f64);
+            // 0x49c690: sub esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49c693: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c695: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c697: fld dword ptr [0x25f5c68]
+            fx.push(rf(0x25f5c68usize) as f64);
+            // 0x49c69d: faddp st(2)
+            { let v = fx.s(2) + fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c69f: fxch st(1)
+            fx.xch(1);
+            // 0x49c6a1: fstp dword ptr [esp + 0x28]
+            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c6a5: fld dword ptr [0x2526bfc]
+            fx.push(rf(0x2526bfcusize) as f64);
+            // 0x49c6ab: fld dword ptr [0x2526c04]
+            fx.push(rf(0x2526c04usize) as f64);
+            // 0x49c6b1: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c6b3: fsubp st(2)
+            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c6b5: fld qword ptr [0xdd50e8]
+            fx.push(rdf64(0xdd50e8usize));
+            // 0x49c6bb: fmul st(2), st(0)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            // 0x49c6bd: fxch st(2)
+            fx.xch(2);
+            // 0x49c6bf: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49c6c1: fstp dword ptr [0x2526c04]
+            wf(0x2526c04usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c6c7: fld dword ptr [0x2526c00]
+            fx.push(rf(0x2526c00usize) as f64);
+            // 0x49c6cd: fsub st(2)
+            { let v = fx.s(0) - fx.s(2); fx.set(0, v); }
+            // 0x49c6cf: fmulp st(1)
+            { let v = fx.s(1) * fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49c6d1: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49c6d3: fstp dword ptr [0x2526c08]
+            wf(0x2526c08usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c6d9: fld dword ptr [0xe84380]
+            fx.push(rf(0xe84380usize) as f64);
+            // 0x49c6df: fmul dword ptr [0x2797430]
+            { let v = fx.s(0) * (rf(0x2797430usize) as f64); fx.set(0, v); }
+            // 0x49c6e5: fadd dword ptr [0x25f5c6c]
+            { let v = fx.s(0) + (rf(0x25f5c6cusize) as f64); fx.set(0, v); }
+            // 0x49c6eb: fstp dword ptr [0x25f5c6c]
+            wf(0x25f5c6cusize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c6f1: fld dword ptr [esp + 0x40]
+            fx.push(rf((esp.wrapping_add(0x40)) as usize) as f64);
+            // 0x49c6f5: fmul dword ptr [0xe8437c]
+            { let v = fx.s(0) * (rf(0xe8437cusize) as f64); fx.set(0, v); }
+            // 0x49c6fb: fstp dword ptr [esp + 0x2c]
+            wf((esp.wrapping_add(0x2c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c6ff: fld dword ptr [esp + 0x2c]
+            fx.push(rf((esp.wrapping_add(0x2c)) as usize) as f64);
+            // 0x49c703: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c707: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49c70b: fadd dword ptr [0x25f5c60]
+            { let v = fx.s(0) + (rf(0x25f5c60usize) as f64); fx.set(0, v); }
+            // 0x49c711: fstp dword ptr [esp + 0x2c]
+            wf((esp.wrapping_add(0x2c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c715: fld dword ptr [esp + 0x2c]
+            fx.push(rf((esp.wrapping_add(0x2c)) as usize) as f64);
+            // 0x49c719: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c71d: fld dword ptr [0x25f5c64]
+            fx.push(rf(0x25f5c64usize) as f64);
+            // 0x49c723: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c726: call 0xbf1560
+            callx!(0xbf1560, 3, 0, 0, 0.0, 0.0);
+            // 0x49c72b: movss dword ptr [esp + 0x2c], xmm0
+            wd((esp.wrapping_add(0x2c)) as usize, xmm0);
+            // 0x49c731: fld dword ptr [esp + 0x2c]
+            fx.push(rf((esp.wrapping_add(0x2c)) as usize) as f64);
+            // 0x49c735: fstp dword ptr [0x25f5c64]
+            wf(0x25f5c64usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c73b: add esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            pc = 0x49c73e; continue;
+        }
+        0x49c73e => {
+            // 0x49c73e: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49c742: sub esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49c745: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c749: lea edx, [esp + 0x8c]
+            edx = (esp.wrapping_add(0x8c));
+            // 0x49c750: fld dword ptr [0x25f5c64]
+            fx.push(rf(0x25f5c64usize) as f64);
+            // 0x49c756: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c75a: fld dword ptr [0x25f5c5c]
+            fx.push(rf(0x25f5c5cusize) as f64);
+            // 0x49c760: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c763: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49c764: call 0xbe2d90
+            callx!(0xbe2d90, 4, 4, 0, 0.0, 0.0);
+            // 0x49c769: fld dword ptr [0xe9a628]
+            fx.push(rf(0xe9a628usize) as f64);
+            // 0x49c76f: cmp byte ptr [esp + 0x17], 0
+            fl = f_sub((rb((esp.wrapping_add(0x17)) as usize) as u32), 0x0u32, 8);
+            // 0x49c774: je 0x49c780
+            if fl.zf { pc = 0x49c780; } else { pc = 0x49c776; } continue;
+        }
+        0x49c776 => {
+            // 0x49c776: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49c77a: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c77e: jmp 0x49c784
+            pc = 0x49c784; continue;
+        }
+        0x49c780 => {
+            // 0x49c780: fst dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            pc = 0x49c784; continue;
+        }
+        0x49c784 => {
+            // 0x49c784: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49c788: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c78a: fsubp st(2)
+            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c78c: fxch st(1)
+            fx.xch(1);
+            // 0x49c78e: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c792: fldz 
+            fx.push(0.0);
+            // 0x49c794: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x49c798: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x49c79a: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c79c: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49c79f: jne 0x49c7a7
+            if !fl.zf { pc = 0x49c7a7; } else { pc = 0x49c7a1; } continue;
+        }
+        0x49c7a1 => {
+            // 0x49c7a1: fstp dword ptr [esp + 0x34]
+            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c7a5: jmp 0x49c7ad
+            pc = 0x49c7ad; continue;
+        }
+        0x49c7a7 => {
+            // 0x49c7a7: fstp st(0)
+            fx.pop();
+            // 0x49c7a9: fst dword ptr [esp + 0x34]
+            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
+            pc = 0x49c7ad; continue;
+        }
+        0x49c7ad => {
+            // 0x49c7ad: fld dword ptr [0x25f5d04]
+            fx.push(rf(0x25f5d04usize) as f64);
+            // 0x49c7b3: fsub dword ptr [esp + 0x34]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x34)) as usize) as f64); fx.set(0, v); }
+            // 0x49c7b7: fstp dword ptr [0x25f5d04]
+            wf(0x25f5d04usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c7bd: fld dword ptr [0x25f5d04]
+            fx.push(rf(0x25f5d04usize) as f64);
+            // 0x49c7c3: fld dword ptr [0xe9a654]
+            fx.push(rf(0xe9a654usize) as f64);
+            // 0x49c7c9: fdiv dword ptr [0x25f6334]
+            { let v = fx.s(0) / (rf(0x25f6334usize) as f64); fx.set(0, v); }
+            // 0x49c7cf: fld dword ptr [0xe999e8]
+            fx.push(rf(0xe999e8usize) as f64);
+            // 0x49c7d5: fmul dword ptr [ebp + 8]
+            { let v = fx.s(0) * (rf((ebp.wrapping_add(0x8)) as usize) as f64); fx.set(0, v); }
+            // 0x49c7d8: fmulp st(1)
+            { let v = fx.s(1) * fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49c7da: fsubp st(1)
+            { let v = fx.s(1) - fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49c7dc: fldz 
+            fx.push(0.0);
+            // 0x49c7de: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x49c7e0: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c7e2: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49c7e5: jp 0x49c7eb
+            if fl.pf { pc = 0x49c7eb; } else { pc = 0x49c7e7; } continue;
+        }
+        0x49c7e7 => {
+            // 0x49c7e7: fld st(1)
+            { let v = fx.s(1); fx.push(v); }
+            // 0x49c7e9: jmp 0x49c7ed
+            pc = 0x49c7ed; continue;
+        }
+        0x49c7eb => {
+            // 0x49c7eb: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            pc = 0x49c7ed; continue;
+        }
+        0x49c7ed => {
+            // 0x49c7ed: fcomp st(4)
+            fx.sw = fcmp(fx.s(0), fx.s(4));
+            fx.pop();
+            // 0x49c7ef: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c7f1: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49c7f4: jp 0x49c807
+            if fl.pf { pc = 0x49c807; } else { pc = 0x49c7f6; } continue;
+        }
+        0x49c7f6 => {
+            // 0x49c7f6: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x49c7f8: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c7fa: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49c7fd: jp 0x49c803
+            if fl.pf { pc = 0x49c803; } else { pc = 0x49c7ff; } continue;
+        }
+        0x49c7ff => {
+            // 0x49c7ff: fstp st(0)
+            fx.pop();
+            // 0x49c801: jmp 0x49c80d
+            pc = 0x49c80d; continue;
+        }
+        0x49c803 => {
+            // 0x49c803: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x49c805: jmp 0x49c80d
+            pc = 0x49c80d; continue;
+        }
+        0x49c807 => {
+            // 0x49c807: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x49c809: fstp st(0)
+            fx.pop();
+            // 0x49c80b: fld st(1)
+            { let v = fx.s(1); fx.push(v); }
+            pc = 0x49c80d; continue;
+        }
+        0x49c80d => {
+            // 0x49c80d: cmp byte ptr [0xe99885], 0
+            fl = f_sub((rb(0xe99885usize) as u32), 0x0u32, 8);
+            // 0x49c814: fstp dword ptr [0x25f5d04]
+            wf(0x25f5d04usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c81a: jne 0x49c850
+            if !fl.zf { pc = 0x49c850; } else { pc = 0x49c81c; } continue;
+        }
+        0x49c81c => {
+            // 0x49c81c: fcom dword ptr [0x25f5ca0]
+            fx.sw = fcmp(fx.s(0), (rf(0x25f5ca0usize) as f64));
+            // 0x49c822: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c824: test ah, 0x44
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x44u32), 8);
+            // 0x49c827: jp 0x49c838
+            if fl.pf { pc = 0x49c838; } else { pc = 0x49c829; } continue;
+        }
+        0x49c829 => {
+            // 0x49c829: fcomp dword ptr [0x25f5ca4]
+            fx.sw = fcmp(fx.s(0), (rf(0x25f5ca4usize) as f64));
+            fx.pop();
+            // 0x49c82f: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49c831: test ah, 0x44
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x44u32), 8);
+            // 0x49c834: jnp 0x49c852
+            if !fl.pf { pc = 0x49c852; } else { pc = 0x49c836; } continue;
+        }
+        0x49c836 => {
+            // 0x49c836: jmp 0x49c83a
+            pc = 0x49c83a; continue;
+        }
+        0x49c838 => {
+            // 0x49c838: fstp st(0)
+            fx.pop();
+            pc = 0x49c83a; continue;
+        }
+        0x49c83a => {
+            // 0x49c83a: mov dword ptr [0xe9a6ac], 0xffffffff
+            wd(0xe9a6acusize, 0xffffffffu32);
+            // 0x49c844: mov byte ptr [0xe99885], 1
+            wb(0xe99885usize, (0x1u32) as u8);
+            // 0x49c84b: jmp 0x49cb95
+            pc = 0x49cb95; continue;
+        }
+        0x49c850 => {
+            // 0x49c850: fstp st(0)
+            fx.pop();
+            pc = 0x49c852; continue;
+        }
+        0x49c852 => {
+            // 0x49c852: cmp dword ptr [0xe9a6ac], ebx
+            fl = f_sub(rd(0xe9a6acusize), ebx, 32);
+            // 0x49c858: jl 0x49cb95
+            if fl.sf != fl.of { pc = 0x49cb95; } else { pc = 0x49c85e; } continue;
+        }
+        0x49c85e => {
+            // 0x49c85e: cmp dword ptr [0x21703d4], ebx
+            fl = f_sub(rd(0x21703d4usize), ebx, 32);
+            // 0x49c864: je 0x49cb95
+            if fl.zf { pc = 0x49cb95; } else { pc = 0x49c86a; } continue;
+        }
+        0x49c86a => {
+            // 0x49c86a: mov ecx, dword ptr [0x21703d4]
+            ecx = rd(0x21703d4usize);
+            // 0x49c870: fstp st(0)
+            fx.pop();
+            // 0x49c872: mov eax, dword ptr [ecx]
+            eax = rd((ecx) as usize);
+            // 0x49c874: mov eax, dword ptr [eax]
+            eax = rd((eax) as usize);
+            // 0x49c876: push -1
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0xffffffffu32);
+            // 0x49c878: lea edx, [esp + 0xcc]
+            edx = (esp.wrapping_add(0xcc));
+            // 0x49c87f: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49c880: call eax
+            callx!(eax as usize, 2, 2, 0, 0.0, 0.0);
+            // 0x49c882: fld dword ptr [esp + 0xc8]
+            fx.push(rf((esp.wrapping_add(0xc8)) as usize) as f64);
+            // 0x49c889: fld dword ptr [0xe8437c]
+            fx.push(rf(0xe8437cusize) as f64);
+            // 0x49c88f: lea esi, [esp + 0x54]
+            esi = (esp.wrapping_add(0x54));
+            // 0x49c893: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c895: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c897: fxch st(1)
+            fx.xch(1);
+            // 0x49c899: fstp dword ptr [esp + 0x38]
+            wf((esp.wrapping_add(0x38)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c89d: fld dword ptr [esp + 0xcc]
+            fx.push(rf((esp.wrapping_add(0xcc)) as usize) as f64);
+            // 0x49c8a4: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49c8a6: fstp dword ptr [esp + 0x3c]
+            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c8aa: fmul dword ptr [esp + 0xd0]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0xd0)) as usize) as f64); fx.set(0, v); }
+            // 0x49c8b1: fstp dword ptr [esp + 0x40]
+            wf((esp.wrapping_add(0x40)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c8b5: fld dword ptr [esp + 0x38]
+            fx.push(rf((esp.wrapping_add(0x38)) as usize) as f64);
+            // 0x49c8b9: fadd dword ptr [0x25f630c]
+            { let v = fx.s(0) + (rf(0x25f630cusize) as f64); fx.set(0, v); }
+            // 0x49c8bf: fstp dword ptr [0x25f630c]
+            wf(0x25f630cusize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c8c5: fld dword ptr [esp + 0x3c]
+            fx.push(rf((esp.wrapping_add(0x3c)) as usize) as f64);
+            // 0x49c8c9: fadd dword ptr [0x25f6310]
+            { let v = fx.s(0) + (rf(0x25f6310usize) as f64); fx.set(0, v); }
+            // 0x49c8cf: fstp dword ptr [0x25f6310]
+            wf(0x25f6310usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c8d5: fld dword ptr [esp + 0x40]
+            fx.push(rf((esp.wrapping_add(0x40)) as usize) as f64);
+            // 0x49c8d9: fadd dword ptr [0x25f6314]
+            { let v = fx.s(0) + (rf(0x25f6314usize) as f64); fx.set(0, v); }
+            // 0x49c8df: fstp dword ptr [0x25f6314]
+            wf(0x25f6314usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c8e5: fld dword ptr [0x25f5b5c]
+            fx.push(rf(0x25f5b5cusize) as f64);
+            // 0x49c8eb: fld dword ptr [0xe9a660]
+            fx.push(rf(0xe9a660usize) as f64);
+            // 0x49c8f1: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c8f3: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c8f5: fxch st(1)
+            fx.xch(1);
+            // 0x49c8f7: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c8fb: fld dword ptr [0x25f5b60]
+            fx.push(rf(0x25f5b60usize) as f64);
+            // 0x49c901: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49c903: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c907: fmul dword ptr [0x25f5b64]
+            { let v = fx.s(0) * (rf(0x25f5b64usize) as f64); fx.set(0, v); }
+            // 0x49c90d: fstp dword ptr [esp + 0x28]
+            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c911: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x49c915: fadd dword ptr [esp + 0x48]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x48)) as usize) as f64); fx.set(0, v); }
+            // 0x49c919: fstp dword ptr [esp + 0x38]
+            wf((esp.wrapping_add(0x38)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c91d: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49c921: fadd dword ptr [esp + 0x4c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x4c)) as usize) as f64); fx.set(0, v); }
+            // 0x49c925: fstp dword ptr [esp + 0x3c]
+            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c929: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49c92d: fadd dword ptr [esp + 0x50]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x50)) as usize) as f64); fx.set(0, v); }
+            // 0x49c931: fstp dword ptr [esp + 0x40]
+            wf((esp.wrapping_add(0x40)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c935: fld dword ptr [0x25f630c]
+            fx.push(rf(0x25f630cusize) as f64);
+            // 0x49c93b: fsub dword ptr [esp + 0x38]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x38)) as usize) as f64); fx.set(0, v); }
+            // 0x49c93f: fstp dword ptr [esp + 0x54]
+            wf((esp.wrapping_add(0x54)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c943: fld dword ptr [0x25f6310]
+            fx.push(rf(0x25f6310usize) as f64);
+            // 0x49c949: fsub dword ptr [esp + 0x3c]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x3c)) as usize) as f64); fx.set(0, v); }
+            // 0x49c94d: fstp dword ptr [esp + 0x58]
+            wf((esp.wrapping_add(0x58)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c951: fld dword ptr [0x25f6314]
+            fx.push(rf(0x25f6314usize) as f64);
+            // 0x49c957: fsub dword ptr [esp + 0x40]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x40)) as usize) as f64); fx.set(0, v); }
+            // 0x49c95b: fstp dword ptr [esp + 0x5c]
+            wf((esp.wrapping_add(0x5c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c95f: call 0xbddff0
+            callx!(0xbddff0, 0, 0, 0, 0.0, 0.0);
+            // 0x49c964: lea ecx, [esp + 0x80]
+            ecx = (esp.wrapping_add(0x80));
+            // 0x49c96b: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c96c: mov eax, esi
+            eax = esi;
+            // 0x49c96e: call 0xbe49a0
+            callx!(0xbe49a0, 1, 1, 0, 0.0, 0.0);
+            // 0x49c973: fld dword ptr [0x25f5ba8]
+            fx.push(rf(0x25f5ba8usize) as f64);
+            // 0x49c979: fdiv dword ptr [0x25f632c]
+            { let v = fx.s(0) / (rf(0x25f632cusize) as f64); fx.set(0, v); }
+            // 0x49c97f: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c980: lea edx, [esp + 0x84]
+            edx = (esp.wrapping_add(0x84));
+            // 0x49c987: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c98b: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49c98f: fmul dword ptr [0xf539d8]
+            { let v = fx.s(0) * (rf(0xf539d8usize) as f64); fx.set(0, v); }
+            // 0x49c995: fstp dword ptr [esp + 0x38]
+            wf((esp.wrapping_add(0x38)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c999: fld dword ptr [esp + 0x38]
+            fx.push(rf((esp.wrapping_add(0x38)) as usize) as f64);
+            // 0x49c99d: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c9a0: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49c9a1: call 0xbe50f0
+            callx!(0xbe50f0, 2, 2, 0, 0.0, 0.0);
+            // 0x49c9a6: fld dword ptr [esp + 0x34]
+            fx.push(rf((esp.wrapping_add(0x34)) as usize) as f64);
+            // 0x49c9aa: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49c9ac: mov esi, 0xa
+            esi = 0xau32;
+            // 0x49c9b1: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x49c9b5; continue;
+        }
+        0x49c9b5 => {
+            // 0x49c9b5: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49c9b9: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49c9ba: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c9bc: lea eax, [esp + 0xa8]
+            eax = (esp.wrapping_add(0xa8));
+            // 0x49c9c3: fld dword ptr [esp + 0x9c]
+            fx.push(rf((esp.wrapping_add(0x9c)) as usize) as f64);
+            // 0x49c9ca: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c9cc: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c9ce: fxch st(1)
+            fx.xch(1);
+            // 0x49c9d0: fstp dword ptr [esp + 0x68]
+            wf((esp.wrapping_add(0x68)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c9d4: fld st(1)
+            { let v = fx.s(1); fx.push(v); }
+            // 0x49c9d6: fld dword ptr [esp + 0xa0]
+            fx.push(rf((esp.wrapping_add(0xa0)) as usize) as f64);
+            // 0x49c9dd: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c9df: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49c9e1: fxch st(1)
+            fx.xch(1);
+            // 0x49c9e3: fstp dword ptr [esp + 0x6c]
+            wf((esp.wrapping_add(0x6c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c9e7: fld dword ptr [esp + 0xa4]
+            fx.push(rf((esp.wrapping_add(0xa4)) as usize) as f64);
+            // 0x49c9ee: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49c9f0: fmulp st(4)
+            { let v = fx.s(4) * fx.s(0); fx.set(4, v); }
+            fx.pop();
+            // 0x49c9f2: fxch st(3)
+            fx.xch(3);
+            // 0x49c9f4: fstp dword ptr [esp + 0x70]
+            wf((esp.wrapping_add(0x70)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49c9f8: fld dword ptr [esp + 0x3c]
+            fx.push(rf((esp.wrapping_add(0x3c)) as usize) as f64);
+            // 0x49c9fc: fsub dword ptr [esp + 0x68]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x68)) as usize) as f64); fx.set(0, v); }
+            // 0x49ca00: fstp dword ptr [esp + 0x58]
+            wf((esp.wrapping_add(0x58)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca04: fld dword ptr [esp + 0x40]
+            fx.push(rf((esp.wrapping_add(0x40)) as usize) as f64);
+            // 0x49ca08: fsub dword ptr [esp + 0x6c]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x6c)) as usize) as f64); fx.set(0, v); }
+            // 0x49ca0c: fstp dword ptr [esp + 0x5c]
+            wf((esp.wrapping_add(0x5c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca10: fld dword ptr [esp + 0x44]
+            fx.push(rf((esp.wrapping_add(0x44)) as usize) as f64);
+            // 0x49ca14: fsub dword ptr [esp + 0x70]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x70)) as usize) as f64); fx.set(0, v); }
+            // 0x49ca18: fstp dword ptr [esp + 0x60]
+            wf((esp.wrapping_add(0x60)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca1c: fld dword ptr [esp + 0x84]
+            fx.push(rf((esp.wrapping_add(0x84)) as usize) as f64);
+            // 0x49ca23: fstp dword ptr [esp + 0xa8]
+            wf((esp.wrapping_add(0xa8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca2a: fld dword ptr [esp + 0x88]
+            fx.push(rf((esp.wrapping_add(0x88)) as usize) as f64);
+            // 0x49ca31: fstp dword ptr [esp + 0xac]
+            wf((esp.wrapping_add(0xac)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca38: fld dword ptr [esp + 0x8c]
+            fx.push(rf((esp.wrapping_add(0x8c)) as usize) as f64);
+            // 0x49ca3f: fstp dword ptr [esp + 0xb0]
+            wf((esp.wrapping_add(0xb0)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca46: fld dword ptr [esp + 0x90]
+            fx.push(rf((esp.wrapping_add(0x90)) as usize) as f64);
+            // 0x49ca4d: fstp dword ptr [esp + 0xb4]
+            wf((esp.wrapping_add(0xb4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca54: fld dword ptr [esp + 0x94]
+            fx.push(rf((esp.wrapping_add(0x94)) as usize) as f64);
+            // 0x49ca5b: fstp dword ptr [esp + 0xb8]
+            wf((esp.wrapping_add(0xb8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca62: fld dword ptr [esp + 0x98]
+            fx.push(rf((esp.wrapping_add(0x98)) as usize) as f64);
+            // 0x49ca69: fstp dword ptr [esp + 0xbc]
+            wf((esp.wrapping_add(0xbc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca70: fxch st(1)
+            fx.xch(1);
+            // 0x49ca72: fstp dword ptr [esp + 0xc0]
+            wf((esp.wrapping_add(0xc0)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca79: fstp dword ptr [esp + 0xc4]
+            wf((esp.wrapping_add(0xc4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca80: fstp dword ptr [esp + 0xc8]
+            wf((esp.wrapping_add(0xc8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca87: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49ca8b: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ca8e: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49ca8f: call 0xbe50f0
+            callx!(0xbe50f0, 2, 2, 0, 0.0, 0.0);
+            // 0x49ca94: fld dword ptr [0x25f630c]
+            fx.push(rf(0x25f630cusize) as f64);
+            // 0x49ca9a: fsub dword ptr [esp + 0x54]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x54)) as usize) as f64); fx.set(0, v); }
+            // 0x49ca9e: lea ecx, [esp + 0xa4]
+            ecx = (esp.wrapping_add(0xa4));
+            // 0x49caa5: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49caa6: lea edx, [esp + 0x74]
+            edx = (esp.wrapping_add(0x74));
+            // 0x49caaa: fstp dword ptr [esp + 0x74]
+            wf((esp.wrapping_add(0x74)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49caae: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49caaf: fld dword ptr [0x25f6310]
+            fx.push(rf(0x25f6310usize) as f64);
+            // 0x49cab5: lea eax, [esp + 0xc4]
+            eax = (esp.wrapping_add(0xc4));
+            // 0x49cabc: fsub dword ptr [esp + 0x60]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x60)) as usize) as f64); fx.set(0, v); }
+            // 0x49cac0: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49cac1: fstp dword ptr [esp + 0x80]
+            wf((esp.wrapping_add(0x80)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cac8: fld dword ptr [0x25f6314]
+            fx.push(rf(0x25f6314usize) as f64);
+            // 0x49cace: fsub dword ptr [esp + 0x68]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x68)) as usize) as f64); fx.set(0, v); }
+            // 0x49cad2: fstp dword ptr [esp + 0x84]
+            wf((esp.wrapping_add(0x84)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cad9: call 0xbded80
+            callx!(0xbded80, 3, 0, 0, 0.0, 0.0);
+            // 0x49cade: movss dword ptr [esp + 0x28], xmm0
+            wd((esp.wrapping_add(0x28)) as usize, xmm0);
+            // 0x49cae4: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49cae8: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49caeb: lea ecx, [esp + 0x84]
+            ecx = (esp.wrapping_add(0x84));
+            // 0x49caf2: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49caf5: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49caf6: call 0xbe50f0
+            callx!(0xbe50f0, 2, 2, 0, 0.0, 0.0);
+            // 0x49cafb: sub esi, 1
+            { let a = esi; let b = 0x1u32; fl = f_sub(a, b, 32); esi = a.wrapping_sub(b); }
+            // 0x49cafe: jne 0x49c9b5
+            if !fl.zf { pc = 0x49c9b5; } else { pc = 0x49cb04; } continue;
+        }
+        0x49cb04 => {
+            // 0x49cb04: lea edx, [esp + 0x20]
+            edx = (esp.wrapping_add(0x20));
+            // 0x49cb08: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49cb09: push 0x25f5c78
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5c78u32);
+            // 0x49cb0e: mov edi, 0x25f5c60
+            edi = 0x25f5c60u32;
+            // 0x49cb13: lea esi, [esp + 0x88]
+            esi = (esp.wrapping_add(0x88));
+            // 0x49cb1a: call 0xbe3150
+            callx!(0xbe3150, 2, 2, 0, 0.0, 0.0);
+            // 0x49cb1f: fldz 
+            fx.push(0.0);
+            // 0x49cb21: sub esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49cb24: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cb28: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49cb2c: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cb2f: call 0xbf14d0
+            callx!(0xbf14d0, 2, 0, 0, 0.0, 0.0);
+            // 0x49cb34: mov eax, dword ptr [0xe9a6ac]
+            eax = rd(0xe9a6acusize);
+            // 0x49cb39: movss dword ptr [esp + 0x28], xmm0
+            wd((esp.wrapping_add(0x28)) as usize, xmm0);
+            // 0x49cb3f: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49cb43: fstp dword ptr [0x25f5c58]
+            wf(0x25f5c58usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cb49: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49cb4c: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49cb4e: fld dword ptr [0x25f5c78]
+            fx.push(rf(0x25f5c78usize) as f64);
+            // 0x49cb54: fsub dword ptr [0xe9a650]
+            { let v = fx.s(0) - (rf(0xe9a650usize) as f64); fx.set(0, v); }
+            // 0x49cb5a: fstp dword ptr [0x25f5c78]
+            wf(0x25f5c78usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cb60: jl 0x49cb8b
+            if fl.sf != fl.of { pc = 0x49cb8b; } else { pc = 0x49cb62; } continue;
+        }
+        0x49cb62 => {
+            // 0x49cb62: mov ecx, dword ptr [0xe843ac]
+            ecx = rd(0xe843acusize);
+            // 0x49cb68: cmp eax, ecx
+            fl = f_sub(eax, ecx, 32);
+            // 0x49cb6a: jle 0x49cb77
+            if fl.zf || fl.sf != fl.of { pc = 0x49cb77; } else { pc = 0x49cb6c; } continue;
+        }
+        0x49cb6c => {
+            // 0x49cb6c: sub eax, ecx
+            { let a = eax; let b = ecx; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x49cb6e: cmp eax, 0x35a4e900
+            fl = f_sub(eax, 0x35a4e900u32, 32);
+            // 0x49cb73: jl 0x49cb8b
+            if fl.sf != fl.of { pc = 0x49cb8b; } else { pc = 0x49cb75; } continue;
+        }
+        0x49cb75 => {
+            // 0x49cb75: jmp 0x49cb81
+            pc = 0x49cb81; continue;
+        }
+        0x49cb77 => {
+            // 0x49cb77: sub ecx, eax
+            { let a = ecx; let b = eax; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x49cb79: cmp ecx, 0x35a4e900
+            fl = f_sub(ecx, 0x35a4e900u32, 32);
+            // 0x49cb7f: jge 0x49cb8b
+            if fl.sf == fl.of { pc = 0x49cb8b; } else { pc = 0x49cb81; } continue;
+        }
+        0x49cb81 => {
+            // 0x49cb81: mov dword ptr [0xe9a6ac], 0xffffffff
+            wd(0xe9a6acusize, 0xffffffffu32);
+            pc = 0x49cb8b; continue;
+        }
+        0x49cb8b => {
+            // 0x49cb8b: mov edi, dword ptr [esp + 0x44]
+            edi = rd((esp.wrapping_add(0x44)) as usize);
+            // 0x49cb8f: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49cb93: xor ebx, ebx
+            fl = f_logic(0, 32); ebx = 0;
+            pc = 0x49cb95; continue;
+        }
+        0x49cb95 => {
+            bump(C::CfCam9Test);
+            // 0x49cb95: cmp dword ptr [0xe9a5bc], 9
+            fl = f_sub(rd(0xe9a5bcusize), 0x9u32, 32);
+            // 0x49cb9c: jne 0x49cc60
+            if !fl.zf { pc = 0x49cc60; } else { pc = 0x49cba2; } continue;
+        }
+        0x49cba2 => {
+            bump(C::CfCam9);
+            // 0x49cba2: mov ecx, dword ptr [esp + 0x4c]
+            ecx = rd((esp.wrapping_add(0x4c)) as usize);
+            // 0x49cba6: fstp st(0)
+            fx.pop();
+            // 0x49cba8: mov eax, dword ptr [esp + 0x48]
+            eax = rd((esp.wrapping_add(0x48)) as usize);
+            // 0x49cbac: mov edx, dword ptr [esp + 0x50]
+            edx = rd((esp.wrapping_add(0x50)) as usize);
+            // 0x49cbb0: mov dword ptr [0x25f5b24], ecx
+            wd(0x25f5b24usize, ecx);
+            // 0x49cbb6: mov dword ptr [0x25f5b20], eax
+            wd(0x25f5b20usize, eax);
+            // 0x49cbbb: mov dword ptr [0x25f5b28], edx
+            wd(0x25f5b28usize, edx);
+            // 0x49cbc1: mov ecx, 9
+            ecx = 0x9u32;
+            // 0x49cbc6: lea esi, [esp + 0x80]
+            esi = (esp.wrapping_add(0x80));
+            // 0x49cbcd: mov edi, 0x25f5b5c
+            edi = 0x25f5b5cu32;
+            // 0x49cbd2: rep movsd dword ptr es:[edi], dword ptr [esi]
+            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
+            // 0x49cbd4: fld dword ptr [0x25f5ba8]
+            fx.push(rf(0x25f5ba8usize) as f64);
+            // 0x49cbda: fdiv dword ptr [0x25f632c]
+            { let v = fx.s(0) / (rf(0x25f632cusize) as f64); fx.set(0, v); }
+            // 0x49cbe0: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49cbe1: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cbe5: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49cbe9: fmul dword ptr [0xf539d8]
+            { let v = fx.s(0) * (rf(0xf539d8usize) as f64); fx.set(0, v); }
+            // 0x49cbef: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cbf3: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49cbf7: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49cbf9: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cbfc: push 0x25f5b5c
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5b5cu32);
+            // 0x49cc01: call 0xbe50f0
+            callx!(0xbe50f0, 2, 2, 0, 0.0, 0.0);
+            // 0x49cc06: lea eax, [esp + 0x20]
+            eax = (esp.wrapping_add(0x20));
+            // 0x49cc0a: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49cc0b: push 0x25f5c78
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5c78u32);
+            // 0x49cc10: mov edi, 0x25f5c60
+            edi = 0x25f5c60u32;
+            // 0x49cc15: lea esi, [esp + 0x88]
+            esi = (esp.wrapping_add(0x88));
+            // 0x49cc1c: call 0xbe3150
+            callx!(0xbe3150, 2, 2, 0, 0.0, 0.0);
+            // 0x49cc21: fldz 
+            fx.push(0.0);
+            // 0x49cc23: sub esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49cc26: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cc2a: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49cc2e: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cc31: call 0xbf14d0
+            callx!(0xbf14d0, 2, 0, 0, 0.0, 0.0);
+            // 0x49cc36: movss dword ptr [esp + 0x28], xmm0
+            wd((esp.wrapping_add(0x28)) as usize, xmm0);
+            // 0x49cc3c: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49cc40: fstp dword ptr [0x25f5c58]
+            wf(0x25f5c58usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cc46: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49cc49: fld dword ptr [0x25f5c78]
+            fx.push(rf(0x25f5c78usize) as f64);
+            // 0x49cc4f: fsub dword ptr [0xe9a650]
+            { let v = fx.s(0) - (rf(0xe9a650usize) as f64); fx.set(0, v); }
+            // 0x49cc55: fstp dword ptr [0x25f5c78]
+            wf(0x25f5c78usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cc5b: jmp 0x49cf3c
+            pc = 0x49cf3c; continue;
+        }
+        0x49cc60 => {
+            bump(C::CfNot9);
+            // 0x49cc60: mov eax, dword ptr [0x27b3c60]
+            eax = rd(0x27b3c60usize);
+            // 0x49cc65: fst dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            // 0x49cc69: cmp eax, ebx
+            fl = f_sub(eax, ebx, 32);
+            // 0x49cc6b: je 0x49ccae
+            if fl.zf { pc = 0x49ccae; } else { pc = 0x49cc6d; } continue;
+        }
+        0x49cc6d => {
+            // 0x49cc6d: cmp dword ptr [eax + 0x3c], 1
+            fl = f_sub(rd((eax.wrapping_add(0x3c)) as usize), 0x1u32, 32);
+            // 0x49cc71: jne 0x49ccae
+            if !fl.zf { pc = 0x49ccae; } else { pc = 0x49cc73; } continue;
+        }
+        0x49cc73 => {
+            // 0x49cc73: mov ecx, dword ptr [eax + 0x90]
+            ecx = rd((eax.wrapping_add(0x90)) as usize);
+            // 0x49cc79: fstp st(0)
+            fx.pop();
+            // 0x49cc7b: mov edx, dword ptr [ecx]
+            edx = rd((ecx) as usize);
+            // 0x49cc7d: mov eax, dword ptr [edx + 4]
+            eax = rd((edx.wrapping_add(0x4)) as usize);
+            // 0x49cc80: call eax
+            callx!(eax as usize, 0, 0, 0, 0.0, 0.0);
+            // 0x49cc82: cmp eax, 4
+            fl = f_sub(eax, 0x4u32, 32);
+            // 0x49cc85: jne 0x49ccaa
+            if !fl.zf { pc = 0x49ccaa; } else { pc = 0x49cc87; } continue;
+        }
+        0x49cc87 => {
+            // 0x49cc87: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49cc8b: fstp qword ptr [esp + 0x20]
+            wdf64((esp.wrapping_add(0x20)) as usize, fx.s(0));
+            fx.pop();
+            // 0x49cc8f: call 0x6528c0
+            callx!(0x6528c0, 0, 0, 0, 0.0, 0.0);
+            // 0x49cc94: fcomp qword ptr [esp + 0x20]
+            fx.sw = fcmp(fx.s(0), rdf64((esp.wrapping_add(0x20)) as usize));
+            fx.pop();
+            // 0x49cc98: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49cc9a: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49cc9d: jnp 0x49ccd9
+            if !fl.pf { pc = 0x49ccd9; } else { pc = 0x49cc9f; } continue;
+        }
+        0x49cc9f => {
+            // 0x49cc9f: call 0x6528c0
+            callx!(0x6528c0, 0, 0, 0, 0.0, 0.0);
+            // 0x49cca4: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cca8: jmp 0x49ccd9
+            pc = 0x49ccd9; continue;
+        }
+        0x49ccaa => {
+            // 0x49ccaa: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            pc = 0x49ccae; continue;
+        }
+        0x49ccae => {
+            // 0x49ccae: call 0x895ca0
+            callx!(0x895ca0, 0, 0, 0, 0.0, 0.0);
+            // 0x49ccb3: cmp eax, 2
+            fl = f_sub(eax, 0x2u32, 32);
+            // 0x49ccb6: jne 0x49ccd7
+            if !fl.zf { pc = 0x49ccd7; } else { pc = 0x49ccb8; } continue;
+        }
+        0x49ccb8 => {
+            // 0x49ccb8: fstp qword ptr [esp + 0x20]
+            wdf64((esp.wrapping_add(0x20)) as usize, fx.s(0));
+            fx.pop();
+            // 0x49ccbc: call 0x8ad190
+            callx!(0x8ad190, 0, 0, 0, 0.0, 0.0);
+            // 0x49ccc1: fcomp qword ptr [esp + 0x20]
+            fx.sw = fcmp(fx.s(0), rdf64((esp.wrapping_add(0x20)) as usize));
+            fx.pop();
+            // 0x49ccc5: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49ccc7: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49ccca: jnp 0x49ccd9
+            if !fl.pf { pc = 0x49ccd9; } else { pc = 0x49cccc; } continue;
+        }
+        0x49cccc => {
+            // 0x49cccc: call 0x8ad190
+            callx!(0x8ad190, 0, 0, 0, 0.0, 0.0);
+            // 0x49ccd1: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ccd5: jmp 0x49ccd9
+            pc = 0x49ccd9; continue;
+        }
+        0x49ccd7 => {
+            // 0x49ccd7: fstp st(0)
+            fx.pop();
+            pc = 0x49ccd9; continue;
+        }
+        0x49ccd9 => {
+            // 0x49ccd9: cmp edi, ebx
+            fl = f_sub(edi, ebx, 32);
+            // 0x49ccdb: je 0x49cd7a
+            if fl.zf { pc = 0x49cd7a; } else { pc = 0x49cce1; } continue;
+        }
+        0x49cce1 => {
+            // 0x49cce1: mov ecx, dword ptr [edi + 0x84e4]
+            ecx = rd((edi.wrapping_add(0x84e4)) as usize);
+            // 0x49cce7: mov eax, dword ptr [ecx + 0x9c]
+            eax = rd((ecx.wrapping_add(0x9c)) as usize);
+            // 0x49cced: cmp eax, 3
+            fl = f_sub(eax, 0x3u32, 32);
+            // 0x49ccf0: je 0x49ccf7
+            if fl.zf { pc = 0x49ccf7; } else { pc = 0x49ccf2; } continue;
+        }
+        0x49ccf2 => {
+            // 0x49ccf2: cmp eax, 2
+            fl = f_sub(eax, 0x2u32, 32);
+            // 0x49ccf5: jne 0x49cd09
+            if !fl.zf { pc = 0x49cd09; } else { pc = 0x49ccf7; } continue;
+        }
+        0x49ccf7 => {
+            // 0x49ccf7: mov edi, dword ptr [esp + 0x44]
+            edi = rd((esp.wrapping_add(0x44)) as usize);
+            // 0x49ccfb: call 0xaab6b0
+            callx!(0xaab6b0, 0, 0, 0, 0.0, 0.0);
+            // 0x49cd00: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49cd02: sete al
+            eax = (eax & 0xffffff00) | (((fl.zf) as u32) & 0xff);
+            // 0x49cd05: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49cd07: jne 0x49cd7a
+            if !fl.zf { pc = 0x49cd7a; } else { pc = 0x49cd09; } continue;
+        }
+        0x49cd09 => {
+            // 0x49cd09: fld dword ptr [esp + 0x98]
+            fx.push(rf((esp.wrapping_add(0x98)) as usize) as f64);
+            // 0x49cd10: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49cd12: fstp dword ptr [esp + 0x38]
+            wf((esp.wrapping_add(0x38)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cd16: mov edx, dword ptr [esp + 0x38]
+            edx = rd((esp.wrapping_add(0x38)) as usize);
+            // 0x49cd1a: fld dword ptr [esp + 0x9c]
+            fx.push(rf((esp.wrapping_add(0x9c)) as usize) as f64);
+            // 0x49cd21: mov dword ptr [esp + 0x20], edx
+            wd((esp.wrapping_add(0x20)) as usize, edx);
+            // 0x49cd25: mov edx, dword ptr [esp + 0x44]
+            edx = rd((esp.wrapping_add(0x44)) as usize);
+            // 0x49cd29: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49cd2b: fstp dword ptr [esp + 0x3c]
+            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cd2f: mov eax, dword ptr [esp + 0x3c]
+            eax = rd((esp.wrapping_add(0x3c)) as usize);
+            // 0x49cd33: fld dword ptr [esp + 0xa0]
+            fx.push(rf((esp.wrapping_add(0xa0)) as usize) as f64);
+            // 0x49cd3a: mov dword ptr [esp + 0x24], eax
+            wd((esp.wrapping_add(0x24)) as usize, eax);
+            // 0x49cd3e: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49cd40: fstp dword ptr [esp + 0x40]
+            wf((esp.wrapping_add(0x40)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cd44: mov ecx, dword ptr [esp + 0x40]
+            ecx = rd((esp.wrapping_add(0x40)) as usize);
+            // 0x49cd48: fld dword ptr [esp + 0x3c]
+            fx.push(rf((esp.wrapping_add(0x3c)) as usize) as f64);
+            // 0x49cd4c: mov dword ptr [esp + 0x28], ecx
+            wd((esp.wrapping_add(0x28)) as usize, ecx);
+            // 0x49cd50: mov ecx, dword ptr [edx + 0x84e4]
+            ecx = rd((edx.wrapping_add(0x84e4)) as usize);
+            // 0x49cd56: fld dword ptr [ecx + 0x410]
+            fx.push(rf((ecx.wrapping_add(0x410)) as usize) as f64);
+            // 0x49cd5c: fcompp 
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop(); fx.pop();
+            // 0x49cd5e: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49cd60: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49cd63: jne 0x49cdb9
+            if !fl.zf { pc = 0x49cdb9; } else { pc = 0x49cd65; } continue;
+        }
+        0x49cd65 => {
+            // 0x49cd65: fld dword ptr [ecx + 0x410]
+            fx.push(rf((ecx.wrapping_add(0x410)) as usize) as f64);
+            // 0x49cd6b: lea esi, [esp + 0x20]
+            esi = (esp.wrapping_add(0x20));
+            // 0x49cd6f: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cd73: call 0xbde150
+            callx!(0xbde150, 0, 0, 0, 0.0, 0.0);
+            // 0x49cd78: jmp 0x49cdb9
+            pc = 0x49cdb9; continue;
+        }
+        0x49cd7a => {
+            // 0x49cd7a: fld dword ptr [esp + 0x98]
+            fx.push(rf((esp.wrapping_add(0x98)) as usize) as f64);
+            // 0x49cd81: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49cd83: fstp dword ptr [esp + 0x54]
+            wf((esp.wrapping_add(0x54)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cd87: mov eax, dword ptr [esp + 0x54]
+            eax = rd((esp.wrapping_add(0x54)) as usize);
+            // 0x49cd8b: fld dword ptr [esp + 0x9c]
+            fx.push(rf((esp.wrapping_add(0x9c)) as usize) as f64);
+            // 0x49cd92: mov dword ptr [esp + 0x20], eax
+            wd((esp.wrapping_add(0x20)) as usize, eax);
+            // 0x49cd96: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49cd98: fstp dword ptr [esp + 0x58]
+            wf((esp.wrapping_add(0x58)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cd9c: mov ecx, dword ptr [esp + 0x58]
+            ecx = rd((esp.wrapping_add(0x58)) as usize);
+            // 0x49cda0: fld dword ptr [esp + 0xa0]
+            fx.push(rf((esp.wrapping_add(0xa0)) as usize) as f64);
+            // 0x49cda7: mov dword ptr [esp + 0x24], ecx
+            wd((esp.wrapping_add(0x24)) as usize, ecx);
+            // 0x49cdab: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49cdad: fstp dword ptr [esp + 0x5c]
+            wf((esp.wrapping_add(0x5c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cdb1: mov edx, dword ptr [esp + 0x5c]
+            edx = rd((esp.wrapping_add(0x5c)) as usize);
+            // 0x49cdb5: mov dword ptr [esp + 0x28], edx
+            wd((esp.wrapping_add(0x28)) as usize, edx);
+            pc = 0x49cdb9; continue;
+        }
+        0x49cdb9 => {
+            // 0x49cdb9: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49cdbd: lea ecx, [esp + 0x70]
+            ecx = (esp.wrapping_add(0x70));
+            // 0x49cdc1: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49cdc3: fmul dword ptr [esp + 0x20]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49cdc7: fstp dword ptr [esp + 0x54]
+            wf((esp.wrapping_add(0x54)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cdcb: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49cdcf: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49cdd1: fstp dword ptr [esp + 0x58]
+            wf((esp.wrapping_add(0x58)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cdd5: fmul dword ptr [esp + 0x28]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x28)) as usize) as f64); fx.set(0, v); }
+            // 0x49cdd9: fstp dword ptr [esp + 0x5c]
+            wf((esp.wrapping_add(0x5c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cddd: fld dword ptr [esp + 0x48]
+            fx.push(rf((esp.wrapping_add(0x48)) as usize) as f64);
+            // 0x49cde1: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49cde3: fadd dword ptr [esp + 0x54]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x54)) as usize) as f64); fx.set(0, v); }
+            // 0x49cde7: fstp dword ptr [esp + 0x38]
+            wf((esp.wrapping_add(0x38)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cdeb: fld dword ptr [esp + 0x58]
+            fx.push(rf((esp.wrapping_add(0x58)) as usize) as f64);
+            // 0x49cdef: fld dword ptr [esp + 0x4c]
+            fx.push(rf((esp.wrapping_add(0x4c)) as usize) as f64);
+            // 0x49cdf3: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49cdf5: faddp st(2)
+            { let v = fx.s(2) + fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49cdf7: fxch st(1)
+            fx.xch(1);
+            // 0x49cdf9: fstp dword ptr [esp + 0x3c]
+            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cdfd: fld dword ptr [esp + 0x5c]
+            fx.push(rf((esp.wrapping_add(0x5c)) as usize) as f64);
+            // 0x49ce01: fld dword ptr [esp + 0x50]
+            fx.push(rf((esp.wrapping_add(0x50)) as usize) as f64);
+            // 0x49ce05: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49ce07: faddp st(2)
+            { let v = fx.s(2) + fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49ce09: fxch st(1)
+            fx.xch(1);
+            // 0x49ce0b: fstp dword ptr [esp + 0x40]
+            wf((esp.wrapping_add(0x40)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ce0f: fld dword ptr [esp + 0x38]
+            fx.push(rf((esp.wrapping_add(0x38)) as usize) as f64);
+            // 0x49ce13: fsubp st(3)
+            { let v = fx.s(3) - fx.s(0); fx.set(3, v); }
+            fx.pop();
+            // 0x49ce15: fxch st(2)
+            fx.xch(2);
+            // 0x49ce17: fstp dword ptr [esp + 0x70]
+            wf((esp.wrapping_add(0x70)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ce1b: fsub dword ptr [esp + 0x3c]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x3c)) as usize) as f64); fx.set(0, v); }
+            // 0x49ce1f: fstp dword ptr [esp + 0x74]
+            wf((esp.wrapping_add(0x74)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ce23: fsub dword ptr [esp + 0x40]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x40)) as usize) as f64); fx.set(0, v); }
+            // 0x49ce27: fstp dword ptr [esp + 0x78]
+            wf((esp.wrapping_add(0x78)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ce2b: call 0xbdda80
+            callx!(0xbdda80, 0, 0, 0, 0.0, 0.0);
+            // 0x49ce30: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49ce32: je 0x49ce56
+            if fl.zf { pc = 0x49ce56; } else { pc = 0x49ce34; } continue;
+        }
+        0x49ce34 => {
+            // 0x49ce34: mov eax, dword ptr [esp + 0x48]
+            eax = rd((esp.wrapping_add(0x48)) as usize);
+            // 0x49ce38: mov ecx, dword ptr [esp + 0x4c]
+            ecx = rd((esp.wrapping_add(0x4c)) as usize);
+            // 0x49ce3c: mov edx, dword ptr [esp + 0x50]
+            edx = rd((esp.wrapping_add(0x50)) as usize);
+            // 0x49ce40: mov dword ptr [0x25f5b20], eax
+            wd(0x25f5b20usize, eax);
+            // 0x49ce45: mov dword ptr [0x25f5b24], ecx
+            wd(0x25f5b24usize, ecx);
+            // 0x49ce4b: mov dword ptr [0x25f5b28], edx
+            wd(0x25f5b28usize, edx);
+            // 0x49ce51: jmp 0x49cf29
+            pc = 0x49cf29; continue;
+        }
+        0x49ce56 => {
+            // 0x49ce56: lea eax, [esp + 0x70]
+            eax = (esp.wrapping_add(0x70));
+            // 0x49ce5a: push 0x4941f0
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x4941f0u32);
+            // 0x49ce5f: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49ce60: lea edi, [esp + 0x40]
+            edi = (esp.wrapping_add(0x40));
+            // 0x49ce64: lea eax, [esp + 0x50]
+            eax = (esp.wrapping_add(0x50));
+            // 0x49ce68: call 0x4938c0
+            callx!(0x4938c0, 2, 0, 0, 0.0, 0.0);
+            // 0x49ce6d: mov ecx, dword ptr [eax]
+            ecx = rd((eax) as usize);
+            // 0x49ce6f: mov dword ptr [0x25f5b20], ecx
+            wd(0x25f5b20usize, ecx);
+            // 0x49ce75: mov edx, dword ptr [eax + 4]
+            edx = rd((eax.wrapping_add(0x4)) as usize);
+            // 0x49ce78: mov dword ptr [0x25f5b24], edx
+            wd(0x25f5b24usize, edx);
+            // 0x49ce7e: mov eax, dword ptr [eax + 8]
+            eax = rd((eax.wrapping_add(0x8)) as usize);
+            // 0x49ce81: lea ecx, [esp + 0x24]
+            ecx = (esp.wrapping_add(0x24));
+            // 0x49ce85: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49ce86: lea edx, [esp + 0x2c]
+            edx = (esp.wrapping_add(0x2c));
+            // 0x49ce8a: mov dword ptr [0x25f5b28], eax
+            wd(0x25f5b28usize, eax);
+            // 0x49ce8f: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49ce90: lea ecx, [esp + 0x80]
+            ecx = (esp.wrapping_add(0x80));
+            // 0x49ce97: mov eax, edi
+            eax = edi;
+            // 0x49ce99: call 0x728940
+            callx!(0x728940, 4, 0, 0, 0.0, 0.0);
+            // 0x49ce9e: add esp, 0x10
+            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49cea1: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49cea3: je 0x49cee5
+            if fl.zf { pc = 0x49cee5; } else { pc = 0x49cea5; } continue;
+        }
+        0x49cea5 => {
+            // 0x49cea5: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x49cea9: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49cead: fadd qword ptr [0xe5c370]
+            { let v = fx.s(0) + rdf64(0xe5c370usize); fx.set(0, v); }
+            // 0x49ceb3: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49ceb7: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x49cebb: fld dword ptr [0x25f5b24]
+            fx.push(rf(0x25f5b24usize) as f64);
+            // 0x49cec1: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x49cec3: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49cec5: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49cec8: jp 0x49cee1
+            if fl.pf { pc = 0x49cee1; } else { pc = 0x49ceca; } continue;
+        }
+        0x49ceca => {
+            // 0x49ceca: fsubr st(1)
+            { let v = fx.s(1) - fx.s(0); fx.set(0, v); }
+            // 0x49cecc: fcomp qword ptr [0xe5c330]
+            fx.sw = fcmp(fx.s(0), rdf64(0xe5c330usize));
+            fx.pop();
+            // 0x49ced2: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49ced4: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49ced7: jp 0x49cee3
+            if fl.pf { pc = 0x49cee3; } else { pc = 0x49ced9; } continue;
+        }
+        0x49ced9 => {
+            // 0x49ced9: fstp dword ptr [0x25f5b24]
+            wf(0x25f5b24usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cedf: jmp 0x49cee5
+            pc = 0x49cee5; continue;
+        }
+        0x49cee1 => {
+            // 0x49cee1: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            pc = 0x49cee3; continue;
+        }
+        0x49cee3 => {
+            // 0x49cee3: fstp st(0)
+            fx.pop();
+            pc = 0x49cee5; continue;
+        }
+        0x49cee5 => {
+            // 0x49cee5: lea eax, [esp + 0x38]
+            eax = (esp.wrapping_add(0x38));
+            // 0x49cee9: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49ceea: lea ecx, [esp + 0x4c]
+            ecx = (esp.wrapping_add(0x4c));
+            // 0x49ceee: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49ceef: call 0xbde980
+            callx!(0xbde980, 2, 0, 0, 0.0, 0.0);
+            // 0x49cef4: fstp dword ptr [esp + 0x28]
+            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cef8: lea edx, [esp + 0x50]
+            edx = (esp.wrapping_add(0x50));
+            // 0x49cefc: push 0x25f5b20
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5b20u32);
+            // 0x49cf01: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49cf02: call 0xbde980
+            callx!(0xbde980, 4, 0, 0, 0.0, 0.0);
+            // 0x49cf07: fsubr dword ptr [esp + 0x30]
+            { let v = (rf((esp.wrapping_add(0x30)) as usize) as f64) - fx.s(0); fx.set(0, v); }
+            // 0x49cf0b: fld dword ptr [0x25f5d04]
+            fx.push(rf(0x25f5d04usize) as f64);
+            // 0x49cf11: add esp, 0x10
+            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49cf14: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x49cf16: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49cf18: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49cf1b: jne 0x49cf21
+            if !fl.zf { pc = 0x49cf21; } else { pc = 0x49cf1d; } continue;
+        }
+        0x49cf1d => {
+            // 0x49cf1d: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x49cf1f: jmp 0x49cf23
+            pc = 0x49cf23; continue;
+        }
+        0x49cf21 => {
+            // 0x49cf21: fstp st(0)
+            fx.pop();
+            pc = 0x49cf23; continue;
+        }
+        0x49cf23 => {
+            // 0x49cf23: fstp dword ptr [0x25f5d04]
+            wf(0x25f5d04usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x49cf29; continue;
+        }
+        0x49cf29 => {
+            // 0x49cf29: mov ecx, 9
+            ecx = 0x9u32;
+            // 0x49cf2e: mov edi, 0x25f5b5c
+            edi = 0x25f5b5cu32;
+            // 0x49cf33: lea esi, [esp + 0x80]
+            esi = (esp.wrapping_add(0x80));
+            // 0x49cf3a: rep movsd dword ptr es:[edi], dword ptr [esi]
+            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
+            pc = 0x49cf3c; continue;
+        }
+        0x49cf3c => {
+            bump(C::CfTail);
+            // 0x49cf3c: call 0x497140
+            callx!(0x497140, 0, 0, 0, 0.0, 0.0);
+            // 0x49cf41: fldz 
+            fx.push(0.0);
+            // 0x49cf43: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x49cf45: fld dword ptr [0xe9a660]
+            fx.push(rf(0xe9a660usize) as f64);
+            // 0x49cf4b: fucom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x49cf4d: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49cf4f: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x49cf51: test ah, 0x44
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x44u32), 8);
+            // 0x49cf54: jnp 0x49d002
+            if !fl.pf { pc = 0x49d002; } else { pc = 0x49cf5a; } continue;
+        }
+        0x49cf5a => {
+            // 0x49cf5a: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x49cf5c: push 0x4941f0
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x4941f0u32);
+            // 0x49cf61: fld dword ptr [0x25f5b5c]
+            fx.push(rf(0x25f5b5cusize) as f64);
+            // 0x49cf67: lea edi, [esp + 0x74]
+            edi = (esp.wrapping_add(0x74));
+            // 0x49cf6b: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49cf6d: fstp dword ptr [esp + 0x3c]
+            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cf71: mov eax, dword ptr [esp + 0x3c]
+            eax = rd((esp.wrapping_add(0x3c)) as usize);
+            // 0x49cf75: fld dword ptr [0x25f5b60]
+            fx.push(rf(0x25f5b60usize) as f64);
+            // 0x49cf7b: mov dword ptr [0x25f5d50], eax
+            wd(0x25f5d50usize, eax);
+            // 0x49cf80: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49cf82: lea eax, [esp + 0xcc]
+            eax = (esp.wrapping_add(0xcc));
+            // 0x49cf89: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49cf8a: lea eax, [esp + 0x50]
+            eax = (esp.wrapping_add(0x50));
+            // 0x49cf8e: fstp dword ptr [esp + 0x44]
+            wf((esp.wrapping_add(0x44)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cf92: mov ecx, dword ptr [esp + 0x44]
+            ecx = rd((esp.wrapping_add(0x44)) as usize);
+            // 0x49cf96: mov dword ptr [0x25f5d54], ecx
+            wd(0x25f5d54usize, ecx);
+            // 0x49cf9c: fmul dword ptr [0x25f5b64]
+            { let v = fx.s(0) * (rf(0x25f5b64usize) as f64); fx.set(0, v); }
+            // 0x49cfa2: fstp dword ptr [esp + 0x48]
+            wf((esp.wrapping_add(0x48)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cfa6: mov edx, dword ptr [esp + 0x48]
+            edx = rd((esp.wrapping_add(0x48)) as usize);
+            // 0x49cfaa: fld dword ptr [0x25f5b20]
+            fx.push(rf(0x25f5b20usize) as f64);
+            // 0x49cfb0: mov dword ptr [0x25f5d58], edx
+            wd(0x25f5d58usize, edx);
+            // 0x49cfb6: fadd dword ptr [esp + 0x40]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x40)) as usize) as f64); fx.set(0, v); }
+            // 0x49cfba: fstp dword ptr [esp + 0x78]
+            wf((esp.wrapping_add(0x78)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cfbe: fld dword ptr [esp + 0x44]
+            fx.push(rf((esp.wrapping_add(0x44)) as usize) as f64);
+            // 0x49cfc2: fadd dword ptr [0x25f5b24]
+            { let v = fx.s(0) + (rf(0x25f5b24usize) as f64); fx.set(0, v); }
+            // 0x49cfc8: fstp dword ptr [esp + 0x7c]
+            wf((esp.wrapping_add(0x7c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cfcc: fld dword ptr [esp + 0x48]
+            fx.push(rf((esp.wrapping_add(0x48)) as usize) as f64);
+            // 0x49cfd0: fadd dword ptr [0x25f5b28]
+            { let v = fx.s(0) + (rf(0x25f5b28usize) as f64); fx.set(0, v); }
+            // 0x49cfd6: fstp dword ptr [esp + 0x80]
+            wf((esp.wrapping_add(0x80)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49cfdd: call 0x4938c0
+            callx!(0x4938c0, 2, 0, 0, 0.0, 0.0);
+            // 0x49cfe2: mov ecx, dword ptr [eax]
+            ecx = rd((eax) as usize);
+            // 0x49cfe4: fldz 
+            fx.push(0.0);
+            // 0x49cfe6: mov dword ptr [0x25f5b20], ecx
+            wd(0x25f5b20usize, ecx);
+            // 0x49cfec: mov edx, dword ptr [eax + 4]
+            edx = rd((eax.wrapping_add(0x4)) as usize);
+            // 0x49cfef: mov dword ptr [0x25f5b24], edx
+            wd(0x25f5b24usize, edx);
+            // 0x49cff5: mov eax, dword ptr [eax + 8]
+            eax = rd((eax.wrapping_add(0x8)) as usize);
+            // 0x49cff8: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49cffb: mov dword ptr [0x25f5b28], eax
+            wd(0x25f5b28usize, eax);
+            // 0x49d000: jmp 0x49d016
+            pc = 0x49d016; continue;
+        }
+        0x49d002 => {
+            bump(C::CfTailZero);
+            // 0x49d002: fstp st(0)
+            fx.pop();
+            // 0x49d004: fst dword ptr [0x25f5d50]
+            wf(0x25f5d50usize, fx.s(0) as f32);
+            // 0x49d00a: fst dword ptr [0x25f5d54]
+            wf(0x25f5d54usize, fx.s(0) as f32);
+            // 0x49d010: fst dword ptr [0x25f5d58]
+            wf(0x25f5d58usize, fx.s(0) as f32);
+            pc = 0x49d016; continue;
+        }
+        0x49d016 => {
+            // 0x49d016: fst dword ptr [0x25f5ca0]
+            wf(0x25f5ca0usize, fx.s(0) as f32);
+            // 0x49d01c: fst dword ptr [0x25f5ca4]
+            wf(0x25f5ca4usize, fx.s(0) as f32);
+            // 0x49d022: fst dword ptr [0x25f5c80]
+            wf(0x25f5c80usize, fx.s(0) as f32);
+            // 0x49d028: fstp dword ptr [0x25f5c84]
+            wf(0x25f5c84usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49d02e: fld dword ptr [0x25f5cb0]
+            fx.push(rf(0x25f5cb0usize) as f64);
+            // 0x49d034: fstp dword ptr [0x25f5cb4]
+            wf(0x25f5cb4usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49d03a: fld1 
+            fx.push(1.0);
+            // 0x49d03c: fstp dword ptr [0x25f5cb0]
+            wf(0x25f5cb0usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49d042: fld dword ptr [0xe999dc]
+            fx.push(rf(0xe999dcusize) as f64);
+            // 0x49d048: fstp dword ptr [0x25f5cb8]
+            wf(0x25f5cb8usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x49d04e; continue;
+        }
+        0x49d04e => {
+            // 0x49d04e: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x49d04f: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x49d050: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x49d051: mov esp, ebp
+            esp = ebp;
+            // 0x49d053: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x49d054: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn camera_follow_update_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { camera_follow_update_body(&mut *ent, args) }
+}
+
+ent_thunk!(camera_follow_update_thunk, camera_follow_update_entry, 0);
+
+const CAMERA_FOLLOW_UPDATE_BODY: [u8; 7100] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x81, 0xEC, 0x54, 0x01, 0x00, 0x00, 0xA1, 0xB0, 0x5B, 0x5F,
+    0x02, 0x85, 0xC0, 0x53, 0x56, 0x8B, 0x35, 0xD4, 0x03, 0x17, 0x02, 0x57, 0x89, 0x74, 0x24, 0x20,
+    0x0F, 0x84, 0x78, 0x1B, 0x00, 0x00, 0x8B, 0xC8, 0x81, 0xE1, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE1,
+    0x04, 0x8B, 0xB9, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xFF, 0x89, 0x7C, 0x24, 0x34, 0x0F, 0x84, 0x5B,
+    0x1B, 0x00, 0x00, 0x39, 0x47, 0x44, 0x0F, 0x85, 0x52, 0x1B, 0x00, 0x00, 0xD9, 0x05, 0x20, 0x5B,
+    0x5F, 0x02, 0x51, 0xD8, 0x05, 0x50, 0x5D, 0x5F, 0x02, 0xD9, 0x1D, 0x20, 0x5B, 0x5F, 0x02, 0xD9,
+    0x05, 0x54, 0x5D, 0x5F, 0x02, 0xD8, 0x05, 0x24, 0x5B, 0x5F, 0x02, 0xD9, 0x1D, 0x24, 0x5B, 0x5F,
+    0x02, 0xD9, 0x05, 0x58, 0x5D, 0x5F, 0x02, 0xD8, 0x05, 0x28, 0x5B, 0x5F, 0x02, 0xD9, 0x1D, 0x28,
+    0x5B, 0x5F, 0x02, 0xD9, 0xEE, 0xD9, 0x15, 0x50, 0x5D, 0x5F, 0x02, 0xD9, 0x15, 0x54, 0x5D, 0x5F,
+    0x02, 0xD9, 0x1D, 0x58, 0x5D, 0x5F, 0x02, 0xD9, 0x45, 0x08, 0xD9, 0x1C, 0x24, 0xE8, 0x0E, 0xF9,
+    0xFF, 0xFF, 0xA1, 0xBC, 0xA5, 0xE9, 0x00, 0x83, 0xF8, 0x10, 0xBB, 0x01, 0x00, 0x00, 0x00, 0x74,
+    0x05, 0x83, 0xF8, 0x11, 0x75, 0x46, 0xD9, 0xE8, 0xD8, 0x1D, 0xC8, 0xA5, 0xE9, 0x00, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x41, 0x7A, 0x37, 0x85, 0xF6, 0x74, 0x33, 0x8B, 0x86, 0xCC, 0x10, 0x00, 0x00, 0x85,
+    0xC0, 0x74, 0x29, 0x8B, 0x80, 0xC4, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x1F, 0x8B, 0x40, 0x08,
+    0x85, 0xC0, 0x74, 0x18, 0x84, 0x58, 0x0C, 0x74, 0x13, 0x84, 0x9E, 0x61, 0x11, 0x00, 0x00, 0x75,
+    0x55, 0x53, 0x8B, 0xCE, 0xE8, 0xE7, 0xEC, 0x53, 0x00, 0x83, 0xC4, 0x04, 0x84, 0x9E, 0x61, 0x11,
+    0x00, 0x00, 0x75, 0x42, 0x8B, 0x96, 0xC0, 0x00, 0x00, 0x00, 0xC1, 0xEA, 0x1D, 0x84, 0xD3, 0x75,
+    0x35, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x17, 0x39, 0x58, 0x3C, 0x75, 0x12, 0x8B,
+    0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x01, 0x8B, 0x50, 0x04, 0xFF, 0xD2, 0x83, 0xF8, 0x0D, 0x74,
+    0x15, 0x80, 0x3D, 0xA3, 0x6B, 0x52, 0x02, 0x00, 0x75, 0x0C, 0xD9, 0x05, 0x4C, 0xA6, 0xE9, 0x00,
+    0xD9, 0x1D, 0x38, 0x5D, 0x5F, 0x02, 0xD9, 0x45, 0x08, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0xEE, 0xE0,
+    0xFF, 0xFF, 0x8B, 0x4F, 0x44, 0x83, 0xC4, 0x04, 0x85, 0xC9, 0x74, 0x19, 0x8B, 0xC1, 0x25, 0xFF,
+    0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x74, 0x05,
+    0x39, 0x48, 0x44, 0x74, 0x1C, 0x33, 0xFF, 0xC7, 0x44, 0x24, 0x10, 0x00, 0x00, 0x00, 0x00, 0x85,
+    0xFF, 0x74, 0x32, 0x8B, 0x97, 0xE0, 0x05, 0x00, 0x00, 0x8B, 0x82, 0x64, 0x01, 0x00, 0x00, 0xEB,
+    0x27, 0x39, 0x58, 0x4C, 0x75, 0xDF, 0x8B, 0xF8, 0x8B, 0x80, 0xCC, 0x10, 0x00, 0x00, 0x85, 0xC0,
+    0x74, 0xD5, 0x8B, 0x80, 0xC4, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x74, 0xCB, 0x8B, 0x48, 0x08, 0x89,
+    0x4C, 0x24, 0x10, 0xEB, 0xCA, 0x83, 0xC8, 0xFF, 0x83, 0xF8, 0xFF, 0x75, 0x04, 0x0B, 0xD8, 0xEB,
+    0x0A, 0x8D, 0x04, 0x40, 0x8B, 0x1C, 0x85, 0x44, 0x0E, 0xE9, 0x00, 0x85, 0xFF, 0x89, 0x5C, 0x24,
+    0x44, 0x74, 0x74, 0x8B, 0x0D, 0x08, 0x87, 0x5B, 0x01, 0x8B, 0xB7, 0xE0, 0x05, 0x00, 0x00, 0x51,
+    0x56, 0xE8, 0xEA, 0x43, 0x25, 0x00, 0x83, 0xC4, 0x08, 0x84, 0xC0, 0x75, 0x14, 0x8B, 0x15, 0x00,
+    0x87, 0x5B, 0x01, 0x52, 0x56, 0xE8, 0xD6, 0x43, 0x25, 0x00, 0x83, 0xC4, 0x08, 0x84, 0xC0, 0x74,
+    0x46, 0x8B, 0x44, 0x24, 0x10, 0xE8, 0x46, 0x71, 0x6D, 0x00, 0x84, 0xC0, 0x75, 0x32, 0xE8, 0x0D,
+    0x0E, 0x0A, 0x00, 0x83, 0xF8, 0x03, 0x74, 0x28, 0x81, 0xFB, 0x4D, 0x05, 0x00, 0x00, 0x74, 0x20,
+    0xB8, 0xF8, 0x30, 0xEC, 0x00, 0xE8, 0x56, 0x17, 0x74, 0x00, 0xD9, 0x05, 0x54, 0x77, 0x79, 0x02,
+    0xDE, 0xD9, 0xC6, 0x05, 0x10, 0xAE, 0x47, 0x03, 0x01, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x07,
+    0xC6, 0x05, 0x10, 0xAE, 0x47, 0x03, 0x00, 0x32, 0xDB, 0x38, 0x1D, 0x10, 0xAE, 0x47, 0x03, 0x0F,
+    0x85, 0xBA, 0x00, 0x00, 0x00, 0x85, 0xFF, 0x0F, 0x84, 0xB2, 0x00, 0x00, 0x00, 0x8B, 0x44, 0x24,
+    0x10, 0xE8, 0xEA, 0x70, 0x6D, 0x00, 0x84, 0xC0, 0x74, 0x16, 0x8B, 0x44, 0x24, 0x44, 0x3D, 0x62,
+    0x05, 0x00, 0x00, 0x74, 0x0B, 0x3D, 0x4D, 0x05, 0x00, 0x00, 0x0F, 0x85, 0x8F, 0x00, 0x00, 0x00,
+    0xA1, 0x08, 0x87, 0x5B, 0x01, 0x8B, 0xB7, 0xE0, 0x05, 0x00, 0x00, 0x50, 0x56, 0xE8, 0x7E, 0x42,
+    0x25, 0x00, 0x83, 0xC4, 0x08, 0x84, 0xC0, 0x74, 0x20, 0x8B, 0x0D, 0x04, 0x87, 0x5B, 0x01, 0x51,
+    0x56, 0xE8, 0x6A, 0x42, 0x25, 0x00, 0x83, 0xC4, 0x08, 0x84, 0xC0, 0x75, 0x0C, 0xB3, 0x01, 0xC7,
+    0x05, 0x14, 0x6C, 0x52, 0x02, 0x2C, 0x01, 0x00, 0x00, 0x83, 0x7E, 0x10, 0x00, 0x74, 0x22, 0x8B,
+    0x46, 0x14, 0x83, 0xF8, 0xFF, 0x74, 0x1A, 0x8D, 0x14, 0x40, 0x8A, 0x04, 0x95, 0x9B, 0xEE, 0xE8,
+    0x00, 0x24, 0x01, 0x74, 0x0C, 0xC7, 0x05, 0x14, 0x6C, 0x52, 0x02, 0x2C, 0x01, 0x00, 0x00, 0xEB,
+    0x04, 0x84, 0xDB, 0x74, 0x2A, 0x0F, 0xBF, 0x87, 0xF0, 0x0C, 0x00, 0x00, 0x6A, 0x00, 0x68, 0x70,
+    0x68, 0x5F, 0x02, 0x8D, 0x4F, 0x20, 0x51, 0x8B, 0x0E, 0x8D, 0x57, 0x14, 0x52, 0x50, 0xE8, 0x5D,
+    0x27, 0x85, 0x00, 0x83, 0xC4, 0x14, 0xC6, 0x05, 0xA7, 0x6B, 0x52, 0x02, 0x01, 0xEB, 0x23, 0xD9,
+    0x05, 0x7C, 0x43, 0xE8, 0x00, 0xDC, 0x0D, 0x00, 0xC2, 0xE5, 0x00, 0xE8, 0x70, 0x49, 0x90, 0x00,
+    0x01, 0x05, 0x14, 0x6C, 0x52, 0x02, 0x79, 0x0A, 0xC7, 0x05, 0x14, 0x6C, 0x52, 0x02, 0x00, 0x00,
+    0x00, 0x00, 0x85, 0xFF, 0x0F, 0x84, 0xAD, 0x00, 0x00, 0x00, 0x83, 0x3D, 0x14, 0x6C, 0x52, 0x02,
+    0x00, 0x0F, 0x8E, 0xA0, 0x00, 0x00, 0x00, 0xDB, 0x05, 0x14, 0x6C, 0x52, 0x02, 0xDC, 0x35, 0xE8,
+    0xC5, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x05, 0x70, 0x68, 0x5F, 0x02, 0xD9, 0x05, 0x64,
+    0xA6, 0xE9, 0x00, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x38, 0xD9, 0x05, 0x74,
+    0x68, 0x5F, 0x02, 0xD9, 0x05, 0x68, 0xA6, 0xE9, 0x00, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9,
+    0x5C, 0x24, 0x3C, 0xD9, 0x05, 0x78, 0x68, 0x5F, 0x02, 0xD9, 0x05, 0x6C, 0xA6, 0xE9, 0x00, 0xD9,
+    0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x40, 0xD9, 0x44, 0x24, 0x38, 0xD9, 0x44, 0x24,
+    0x18, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x48, 0xD9, 0x44, 0x24, 0x3C, 0xD8,
+    0xC9, 0xD9, 0x5C, 0x24, 0x4C, 0xD8, 0x4C, 0x24, 0x40, 0xD9, 0x5C, 0x24, 0x50, 0xD9, 0x44, 0x24,
+    0x48, 0xDE, 0xC3, 0xD9, 0xCA, 0xD9, 0x5C, 0x24, 0x38, 0x8B, 0x4C, 0x24, 0x38, 0xD8, 0x44, 0x24,
+    0x4C, 0xD9, 0x5C, 0x24, 0x3C, 0x8B, 0x54, 0x24, 0x3C, 0xD8, 0x44, 0x24, 0x50, 0xD9, 0x5C, 0x24,
+    0x40, 0x8B, 0x44, 0x24, 0x40, 0xEB, 0x11, 0x8B, 0x0D, 0x64, 0xA6, 0xE9, 0x00, 0x8B, 0x15, 0x68,
+    0xA6, 0xE9, 0x00, 0xA1, 0x6C, 0xA6, 0xE9, 0x00, 0xF6, 0x05, 0x94, 0x43, 0x49, 0x03, 0x01, 0x89,
+    0x44, 0x24, 0x50, 0x89, 0x54, 0x24, 0x4C, 0x89, 0x4C, 0x24, 0x48, 0x75, 0x11, 0x83, 0x0D, 0x94,
+    0x43, 0x49, 0x03, 0x01, 0xC7, 0x05, 0x90, 0x43, 0x49, 0x03, 0xFF, 0xFF, 0xFF, 0xFF, 0x85, 0xFF,
+    0xC6, 0x44, 0x24, 0x16, 0x00, 0x0F, 0x84, 0xFF, 0x01, 0x00, 0x00, 0x80, 0x3D, 0x10, 0xAE, 0x47,
+    0x03, 0x00, 0x0F, 0x85, 0xF2, 0x01, 0x00, 0x00, 0x8B, 0x44, 0x24, 0x10, 0xE8, 0x0F, 0x6F, 0x6D,
+    0x00, 0x84, 0xC0, 0x74, 0x16, 0x8B, 0x44, 0x24, 0x44, 0x3D, 0x62, 0x05, 0x00, 0x00, 0x74, 0x0B,
+    0x3D, 0x4D, 0x05, 0x00, 0x00, 0x0F, 0x85, 0xCF, 0x01, 0x00, 0x00, 0x8B, 0x1D, 0x00, 0x87, 0x5B,
+    0x01, 0x8B, 0xB7, 0xE0, 0x05, 0x00, 0x00, 0x53, 0x56, 0xE8, 0x62, 0x41, 0x25, 0x00, 0x83, 0xC4,
+    0x08, 0x84, 0xC0, 0x0F, 0x84, 0x56, 0x01, 0x00, 0x00, 0x33, 0xDB, 0x53, 0x8D, 0x4C, 0x24, 0x68,
+    0x51, 0x0F, 0xBF, 0x8F, 0xEE, 0x0C, 0x00, 0x00, 0x8D, 0x57, 0x20, 0x52, 0x8D, 0x47, 0x14, 0x50,
+    0x51, 0x8B, 0x0E, 0xE8, 0xC8, 0x25, 0x85, 0x00, 0x8B, 0x44, 0x24, 0x7C, 0x8B, 0x54, 0x24, 0x78,
+    0xD9, 0x05, 0x88, 0x1C, 0xDD, 0x00, 0x8B, 0x8C, 0x24, 0x80, 0x00, 0x00, 0x00, 0xD9, 0x9C, 0x24,
+    0x04, 0x01, 0x00, 0x00, 0x89, 0x84, 0x24, 0xF0, 0x00, 0x00, 0x00, 0x8B, 0x44, 0x24, 0x60, 0x83,
+    0xC4, 0x14, 0x89, 0x94, 0x24, 0xD8, 0x00, 0x00, 0x00, 0x8B, 0x54, 0x24, 0x48, 0x89, 0x8C, 0x24,
+    0xE0, 0x00, 0x00, 0x00, 0x8B, 0x4C, 0x24, 0x50, 0x89, 0x84, 0x24, 0xE8, 0x00, 0x00, 0x00, 0xB8,
+    0x01, 0x00, 0x00, 0x00, 0x53, 0x89, 0x94, 0x24, 0xE8, 0x00, 0x00, 0x00, 0x50, 0x8D, 0x54, 0x24,
+    0x5C, 0x89, 0x8C, 0x24, 0xF4, 0x00, 0x00, 0x00, 0x52, 0x8D, 0x8C, 0x24, 0xE4, 0x00, 0x00, 0x00,
+    0x89, 0x9C, 0x24, 0x00, 0x01, 0x00, 0x00, 0x89, 0x9C, 0x24, 0x28, 0x01, 0x00, 0x00, 0x89, 0x5C,
+    0x24, 0x60, 0x89, 0x5C, 0x24, 0x64, 0xC7, 0x44, 0x24, 0x68, 0x00, 0x00, 0x00, 0x80, 0x89, 0x84,
+    0x24, 0x38, 0x01, 0x00, 0x00, 0xC7, 0x84, 0x24, 0x30, 0x01, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+    0xC7, 0x84, 0x24, 0x2C, 0x01, 0x00, 0x00, 0xF0, 0x41, 0x49, 0x00, 0x89, 0x84, 0x24, 0x34, 0x01,
+    0x00, 0x00, 0xE8, 0x29, 0xEE, 0x25, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x74, 0x19, 0x8D, 0x4C,
+    0x24, 0x54, 0xC6, 0x05, 0x11, 0xAE, 0x47, 0x03, 0x01, 0x88, 0x5C, 0x24, 0x16, 0xE8, 0x9E, 0xC6,
+    0xF6, 0xFF, 0xE9, 0x99, 0x00, 0x00, 0x00, 0x81, 0x7C, 0x24, 0x44, 0x62, 0x05, 0x00, 0x00, 0xA1,
+    0xAC, 0x43, 0xE8, 0x00, 0x88, 0x1D, 0x11, 0xAE, 0x47, 0x03, 0xC6, 0x44, 0x24, 0x16, 0x01, 0x75,
+    0x26, 0x05, 0x2C, 0x01, 0x00, 0x00, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0x90, 0x43, 0x49, 0x03,
+    0x7E, 0x32, 0x2D, 0x00, 0xD2, 0x49, 0x6B, 0x8D, 0x4C, 0x24, 0x54, 0xA3, 0x90, 0x43, 0x49, 0x03,
+    0xE8, 0x5B, 0xC6, 0xF6, 0xFF, 0xEB, 0x59, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0x90, 0x43, 0x49,
+    0x03, 0x7E, 0x0A, 0x05, 0x00, 0x2E, 0xB6, 0x94, 0xA3, 0x90, 0x43, 0x49, 0x03, 0xC6, 0x05, 0x5A,
+    0x6B, 0x52, 0x02, 0x01, 0x8D, 0x4C, 0x24, 0x54, 0xE8, 0x33, 0xC6, 0xF6, 0xFF, 0xEB, 0x31, 0x80,
+    0x3D, 0x11, 0xAE, 0x47, 0x03, 0x00, 0x75, 0x26, 0x53, 0x56, 0xE8, 0x31, 0x3F, 0x25, 0x00, 0x83,
+    0xC4, 0x08, 0x84, 0xC0, 0x74, 0x18, 0xA1, 0xFC, 0x86, 0x5B, 0x01, 0x50, 0x56, 0xE8, 0x1E, 0x3F,
+    0x25, 0x00, 0x83, 0xC4, 0x08, 0x84, 0xC0, 0x75, 0x05, 0xC6, 0x44, 0x24, 0x16, 0x01, 0x33, 0xDB,
+    0x8B, 0x87, 0xE0, 0x05, 0x00, 0x00, 0x39, 0x58, 0x10, 0x74, 0x1F, 0x8B, 0x40, 0x14, 0x83, 0xF8,
+    0xFF, 0x74, 0x17, 0x8D, 0x0C, 0x40, 0x8B, 0x14, 0x8D, 0x98, 0xEE, 0xE8, 0x00, 0xC1, 0xEA, 0x17,
+    0x80, 0xE2, 0x01, 0x74, 0x05, 0xC6, 0x44, 0x24, 0x16, 0x01, 0x80, 0x7C, 0x24, 0x16, 0x00, 0xD9,
+    0x05, 0x54, 0xA6, 0xE9, 0x00, 0x8B, 0x1D, 0xAC, 0x43, 0xE8, 0x00, 0xD9, 0x54, 0x24, 0x18, 0xC6,
+    0x44, 0x24, 0x17, 0x00, 0x0F, 0x85, 0x8B, 0x00, 0x00, 0x00, 0x80, 0x3D, 0xA6, 0x6B, 0x52, 0x02,
+    0x00, 0x74, 0x1E, 0x8D, 0x83, 0xF4, 0x01, 0x00, 0x00, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0xB8,
+    0xA6, 0xE9, 0x00, 0x7E, 0x11, 0x2D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0xB8, 0xA6, 0xE9, 0x00, 0xEB,
+    0x05, 0xA1, 0xB8, 0xA6, 0xE9, 0x00, 0x85, 0xC0, 0x0F, 0x8C, 0x96, 0x02, 0x00, 0x00, 0xB8, 0xB8,
+    0xA6, 0xE9, 0x00, 0xD9, 0x5C, 0x24, 0x18, 0xE8, 0xF4, 0x16, 0x74, 0x00, 0x84, 0xC0, 0xC6, 0x44,
+    0x24, 0x17, 0x01, 0x74, 0x19, 0xD9, 0x05, 0x18, 0x6C, 0x52, 0x02, 0xC7, 0x05, 0xB8, 0xA6, 0xE9,
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xD9, 0x5C, 0x24, 0x18, 0xE9, 0x68, 0x02, 0x00, 0x00, 0xD9, 0x05,
+    0x18, 0x6C, 0x52, 0x02, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0x05, 0x7C, 0x43,
+    0xE8, 0x00, 0xDC, 0x0D, 0xF8, 0xBF, 0xE5, 0x00, 0xDE, 0xCA, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x18,
+    0xE9, 0x41, 0x02, 0x00, 0x00, 0x83, 0x3D, 0x90, 0x43, 0x49, 0x03, 0x00, 0x0F, 0x8C, 0x32, 0x02,
+    0x00, 0x00, 0xB8, 0x90, 0x43, 0x49, 0x03, 0xE8, 0xC4, 0x16, 0x74, 0x00, 0x89, 0x44, 0x24, 0x18,
+    0xDB, 0x44, 0x24, 0x18, 0xDC, 0x35, 0xE8, 0xC5, 0xE5, 0x00, 0xD9, 0xE8, 0xDE, 0xE1, 0xD9, 0x5C,
+    0x24, 0x10, 0xD9, 0xE8, 0xD8, 0x54, 0x24, 0x10, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x74, 0x06, 0xD9,
+    0x5C, 0x24, 0x10, 0xEB, 0x02, 0xDD, 0xD8, 0x80, 0x3D, 0xA6, 0x6B, 0x52, 0x02, 0x00, 0xC6, 0x44,
+    0x24, 0x17, 0x01, 0x75, 0x08, 0xD9, 0x1D, 0x18, 0x6C, 0x52, 0x02, 0xEB, 0x02, 0xDD, 0xD8, 0x83,
+    0x3D, 0xE8, 0x5A, 0x5F, 0x02, 0x00, 0x75, 0x13, 0x83, 0x3D, 0x54, 0x5C, 0x5F, 0x02, 0x01, 0x75,
+    0x0A, 0xC7, 0x05, 0x54, 0x5C, 0x5F, 0x02, 0x00, 0x00, 0x00, 0x00, 0x8D, 0x84, 0x24, 0x3C, 0x01,
+    0x00, 0x00, 0x50, 0x8D, 0x4C, 0x24, 0x58, 0x51, 0x0F, 0xBF, 0x8F, 0xEE, 0x0C, 0x00, 0x00, 0x8D,
+    0x57, 0x20, 0x52, 0x8B, 0x97, 0xE0, 0x05, 0x00, 0x00, 0x8D, 0x47, 0x14, 0x50, 0x51, 0x8B, 0x0A,
+    0xE8, 0xEB, 0x22, 0x85, 0x00, 0x83, 0xC4, 0x10, 0xD9, 0x44, 0x24, 0x4C, 0xD8, 0x64, 0x24, 0x58,
+    0xD9, 0x5C, 0x24, 0x3C, 0xD9, 0x44, 0x24, 0x50, 0xD8, 0x64, 0x24, 0x5C, 0xD9, 0x5C, 0x24, 0x40,
+    0xD9, 0x44, 0x24, 0x54, 0xD8, 0x64, 0x24, 0x60, 0xD9, 0x5C, 0x24, 0x44, 0xD9, 0x44, 0x24, 0x40,
+    0xD9, 0x44, 0x24, 0x3C, 0xD9, 0x44, 0x24, 0x44, 0xD9, 0xC1, 0xDE, 0xCA, 0xD9, 0xC2, 0xDE, 0xCB,
+    0xD9, 0xC9, 0xDE, 0xC2, 0xDC, 0xC8, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x1C,
+    0xD9, 0x1C, 0x24, 0xE8, 0xA8, 0x2D, 0xF7, 0xFF, 0x83, 0xC4, 0x04, 0xD9, 0x5C, 0x24, 0x1C, 0x8D,
+    0x74, 0x24, 0x70, 0x8D, 0x7C, 0x24, 0x38, 0xE8, 0x14, 0x1F, 0x74, 0x00, 0x8D, 0x8C, 0x24, 0x80,
+    0x00, 0x00, 0x00, 0xE8, 0x88, 0x8E, 0x74, 0x00, 0xD9, 0xE8, 0xD8, 0x5C, 0x24, 0x10, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x41, 0x7A, 0x17, 0xB9, 0x09, 0x00, 0x00, 0x00, 0x8D, 0xB4, 0x24, 0x80, 0x00, 0x00,
+    0x00, 0x8D, 0xBC, 0x24, 0xA4, 0x00, 0x00, 0x00, 0xF3, 0xA5, 0xEB, 0x4E, 0xBF, 0x5C, 0x5B, 0x5F,
+    0x02, 0x8D, 0x84, 0x24, 0xC8, 0x00, 0x00, 0x00, 0xE8, 0x13, 0x97, 0x76, 0x00, 0x8D, 0xBC, 0x24,
+    0x80, 0x00, 0x00, 0x00, 0x8D, 0x44, 0x24, 0x70, 0xE8, 0x03, 0x97, 0x76, 0x00, 0xD9, 0x44, 0x24,
+    0x10, 0x51, 0x8D, 0x4C, 0x24, 0x74, 0xD9, 0x1C, 0x24, 0x8D, 0xB4, 0x24, 0xCC, 0x00, 0x00, 0x00,
+    0x8D, 0x7C, 0x24, 0x58, 0xE8, 0x87, 0xA1, 0x76, 0x00, 0x83, 0xC4, 0x04, 0x8D, 0x8C, 0x24, 0xA4,
+    0x00, 0x00, 0x00, 0x8B, 0xC7, 0xE8, 0xC6, 0x9A, 0x76, 0x00, 0xD9, 0x05, 0x78, 0x5B, 0x5F, 0x02,
+    0x51, 0xD9, 0x1C, 0x24, 0xE8, 0xA7, 0x5D, 0x05, 0x00, 0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x48, 0xD9,
+    0x84, 0x24, 0xC4, 0x00, 0x00, 0x00, 0xD9, 0x1C, 0x24, 0xE8, 0x92, 0x5D, 0x05, 0x00, 0xD9, 0xE0,
+    0x83, 0xC4, 0x04, 0x8D, 0x8C, 0x24, 0xA4, 0x00, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0xE8, 0x3D,
+    0x76, 0x74, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0x5C, 0x24,
+    0x18, 0x83, 0xEC, 0x08, 0xD9, 0xEE, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x20, 0xD9, 0x1C,
+    0x24, 0xE8, 0x6A, 0x57, 0x75, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x20,
+    0xD9, 0x1D, 0x58, 0x5C, 0x5F, 0x02, 0x83, 0xC4, 0x08, 0xD9, 0x44, 0x24, 0x10, 0x8D, 0x44, 0x24,
+    0x10, 0xD8, 0x64, 0x24, 0x44, 0x50, 0x8D, 0x4C, 0x24, 0x48, 0x51, 0xD8, 0x05, 0x78, 0x5C, 0x5F,
+    0x02, 0x8D, 0x7C, 0x24, 0x20, 0x8D, 0xB4, 0x24, 0x44, 0x01, 0x00, 0x00, 0xD9, 0x1D, 0x78, 0x5C,
+    0x5F, 0x02, 0xE8, 0xA9, 0x73, 0x74, 0x00, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0x15, 0x64, 0x5C, 0x5F,
+    0x02, 0xD9, 0x1D, 0x60, 0x5C, 0x5F, 0x02, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x18, 0xE9,
+    0x86, 0x01, 0x00, 0x00, 0xDD, 0xD8, 0x80, 0x3D, 0x86, 0x98, 0xE9, 0x00, 0x00, 0x0F, 0x84, 0x2C,
+    0x01, 0x00, 0x00, 0x83, 0x3D, 0x1C, 0x5D, 0x5F, 0x02, 0x00, 0x0F, 0x8C, 0x1F, 0x01, 0x00, 0x00,
+    0xB8, 0x1C, 0x5D, 0x5F, 0x02, 0xE8, 0x46, 0x14, 0x74, 0x00, 0x84, 0xC0, 0x74, 0x0A, 0xE8, 0x2D,
+    0x2B, 0x00, 0x00, 0xE9, 0x52, 0x01, 0x00, 0x00, 0xB8, 0x18, 0x5D, 0x5F, 0x02, 0xE8, 0x2E, 0x14,
+    0x74, 0x00, 0xD9, 0x05, 0x10, 0x5D, 0x5F, 0x02, 0x84, 0xC0, 0x74, 0x2E, 0xB8, 0x1C, 0x5D, 0x5F,
+    0x02, 0xE8, 0x4A, 0x14, 0x74, 0x00, 0x89, 0x44, 0x24, 0x1C, 0xDB, 0x44, 0x24, 0x1C, 0xDA, 0x35,
+    0x20, 0x5D, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0x05, 0x08, 0x5D,
+    0x5F, 0x02, 0xD8, 0xE2, 0xDE, 0xC9, 0xDE, 0xC1, 0xEB, 0x48, 0xB8, 0x14, 0x5D, 0x5F, 0x02, 0xE8,
+    0xEC, 0x13, 0x74, 0x00, 0x84, 0xC0, 0x75, 0x32, 0xB8, 0x14, 0x5D, 0x5F, 0x02, 0xE8, 0x0E, 0x14,
+    0x74, 0x00, 0x89, 0x44, 0x24, 0x1C, 0xDB, 0x44, 0x24, 0x1C, 0xDA, 0x35, 0x24, 0x5D, 0x5F, 0x02,
+    0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0x05, 0x08, 0x5D, 0x5F, 0x02, 0xD9, 0xC0,
+    0xDE, 0xEB, 0xD9, 0xC9, 0xDE, 0xCA, 0xDE, 0xC1, 0xEB, 0x08, 0xDD, 0xD8, 0xD9, 0x05, 0x08, 0x5D,
+    0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x10, 0x8D, 0x44, 0x24, 0x54, 0xD9, 0x05, 0x20, 0x5B, 0x5F, 0x02,
+    0xD8, 0x64, 0x24, 0x48, 0xD9, 0x5C, 0x24, 0x54, 0xD9, 0x05, 0x24, 0x5B, 0x5F, 0x02, 0xD8, 0x64,
+    0x24, 0x4C, 0xD9, 0x5C, 0x24, 0x58, 0xD9, 0x05, 0x28, 0x5B, 0x5F, 0x02, 0xD8, 0x64, 0x24, 0x50,
+    0xD9, 0x5C, 0x24, 0x5C, 0xE8, 0xC7, 0x61, 0xF7, 0xFF, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x05, 0x08,
+    0x5D, 0x5F, 0x02, 0xD9, 0x05, 0x10, 0x5D, 0x5F, 0x02, 0xDE, 0xD9, 0xDF, 0xE0, 0xD9, 0x44, 0x24,
+    0x10, 0xF6, 0xC4, 0x41, 0x7A, 0x1B, 0xD9, 0x44, 0x24, 0x1C, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x41, 0x75, 0x04, 0xDD, 0xD8, 0xEB, 0x02, 0xDD, 0xD9, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24,
+    0x10, 0xD9, 0x1D, 0x0C, 0x5D, 0x5F, 0x02, 0xD9, 0x05, 0x0C, 0x5D, 0x5F, 0x02, 0xEB, 0x45, 0x8B,
+    0x54, 0x24, 0x34, 0x8B, 0x4A, 0x44, 0x85, 0xC9, 0x74, 0x40, 0x8B, 0xC1, 0x25, 0xFF, 0x0F, 0x00,
+    0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x74, 0x2C, 0x39, 0x48,
+    0x44, 0x75, 0x27, 0x83, 0x78, 0x4C, 0x05, 0x75, 0x21, 0x80, 0x3D, 0xA2, 0x6B, 0x52, 0x02, 0x01,
+    0x75, 0x18, 0xD9, 0x05, 0xA8, 0x5B, 0x5F, 0x02, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0x3F, 0xA9, 0xFF,
+    0xFF, 0x83, 0xC4, 0x04, 0xD9, 0x1D, 0x54, 0xA6, 0xE9, 0x00, 0x8A, 0x4C, 0x24, 0x16, 0x68, 0xE8,
+    0x5A, 0x5F, 0x02, 0xB8, 0x54, 0x5C, 0x5F, 0x02, 0x88, 0x0D, 0xA6, 0x6B, 0x52, 0x02, 0xE8, 0x7D,
+    0xAC, 0xFF, 0xFF, 0xA1, 0xB4, 0xA6, 0xE9, 0x00, 0x83, 0xC4, 0x04, 0x85, 0xC0, 0x7C, 0x23, 0x3B,
+    0xC3, 0x7E, 0x0B, 0x2B, 0xC3, 0x3D, 0x00, 0xE9, 0xA4, 0x35, 0x7C, 0x16, 0xEB, 0x0A, 0x2B, 0xD8,
+    0x81, 0xFB, 0x00, 0xE9, 0xA4, 0x35, 0x7D, 0x0A, 0xC7, 0x05, 0xB4, 0xA6, 0xE9, 0x00, 0xFF, 0xFF,
+    0xFF, 0xFF, 0x8B, 0x5C, 0x24, 0x34, 0x8B, 0xC3, 0x8D, 0xB4, 0x24, 0x30, 0x01, 0x00, 0x00, 0xE8,
+    0x0C, 0xAA, 0xFF, 0xFF, 0x8B, 0x4B, 0x44, 0x85, 0xC9, 0x74, 0x1A, 0x8B, 0xD1, 0x81, 0xE2, 0xFF,
+    0x0F, 0x00, 0x00, 0xC1, 0xE2, 0x04, 0x8B, 0x82, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x74, 0x05,
+    0x39, 0x48, 0x44, 0x74, 0x0A, 0xC7, 0x44, 0x24, 0x44, 0x00, 0x00, 0x00, 0x00, 0xEB, 0x12, 0x33,
+    0xC9, 0x83, 0x78, 0x4C, 0x05, 0x0F, 0x95, 0xC1, 0x83, 0xE9, 0x01, 0x23, 0xC8, 0x89, 0x4C, 0x24,
+    0x44, 0xE8, 0xAA, 0xB1, 0xFF, 0xFF, 0x84, 0xC0, 0x0F, 0x84, 0x6C, 0x01, 0x00, 0x00, 0xD9, 0x05,
+    0xA4, 0x5C, 0x5F, 0x02, 0xDC, 0x25, 0xA0, 0xBF, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x05,
+    0x84, 0x05, 0xDD, 0x00, 0xD9, 0x44, 0x24, 0x1C, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x0F,
+    0x8A, 0xD9, 0x00, 0x00, 0x00, 0xD9, 0xE0, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x0F, 0x8A,
+    0xCC, 0x00, 0x00, 0x00, 0x83, 0xEC, 0x0C, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0xEE, 0xD9, 0x5C, 0x24,
+    0x04, 0xD9, 0x05, 0xA0, 0x5C, 0x5F, 0x02, 0xD9, 0x1C, 0x24, 0xE8, 0xC1, 0x4D, 0x75, 0x00, 0x83,
+    0xC4, 0x0C, 0x84, 0xC0, 0x0F, 0x84, 0xA8, 0x00, 0x00, 0x00, 0x8B, 0x35, 0xB0, 0xA6, 0xE9, 0x00,
+    0x8B, 0x7C, 0x24, 0x44, 0x85, 0xFF, 0x0F, 0x84, 0x3F, 0x01, 0x00, 0x00, 0x83, 0x3D, 0xD4, 0x03,
+    0x17, 0x02, 0x00, 0x0F, 0x84, 0x46, 0x01, 0x00, 0x00, 0x8B, 0x15, 0xD4, 0x03, 0x17, 0x02, 0x52,
+    0xE8, 0xBB, 0xCF, 0x51, 0x00, 0x83, 0xC4, 0x04, 0x84, 0xC0, 0x0F, 0x84, 0x2F, 0x01, 0x00, 0x00,
+    0x85, 0xF6, 0x7C, 0x27, 0xB8, 0xB0, 0xA6, 0xE9, 0x00, 0xE8, 0xA2, 0x11, 0x74, 0x00, 0x84, 0xC0,
+    0x75, 0x19, 0xA1, 0x54, 0x5C, 0x5F, 0x02, 0x83, 0xF8, 0x01, 0x74, 0x0F, 0x83, 0xF8, 0x02, 0x74,
+    0x0A, 0xC7, 0x05, 0x54, 0x5C, 0x5F, 0x02, 0x04, 0x00, 0x00, 0x00, 0x8B, 0x4F, 0x44, 0xE8, 0x8D,
+    0x56, 0x61, 0x00, 0x80, 0x3D, 0x71, 0x97, 0x52, 0x02, 0x00, 0x0F, 0x85, 0xEF, 0x00, 0x00, 0x00,
+    0x85, 0xC0, 0x0F, 0x84, 0xE7, 0x00, 0x00, 0x00, 0x80, 0xB8, 0x74, 0x01, 0x00, 0x00, 0x00, 0x0F,
+    0x84, 0x93, 0x00, 0x00, 0x00, 0x8B, 0x87, 0xE4, 0x84, 0x00, 0x00, 0x05, 0x54, 0x04, 0x00, 0x00,
+    0x51, 0xE8, 0xEA, 0x1D, 0x00, 0x00, 0x83, 0xC4, 0x04, 0xE9, 0xC1, 0x00, 0x00, 0x00, 0xDD, 0xD9,
+    0xDD, 0xD8, 0x8B, 0x7C, 0x24, 0x44, 0xC6, 0x05, 0x34, 0x5D, 0x5F, 0x02, 0x00, 0xE8, 0x8E, 0x28,
+    0x00, 0x00, 0x85, 0xC0, 0x7C, 0x2C, 0x8B, 0x15, 0xAC, 0x43, 0xE8, 0x00, 0x8D, 0x34, 0x10, 0x81,
+    0xFE, 0x00, 0xD2, 0x49, 0x6B, 0x89, 0x35, 0xB0, 0xA6, 0xE9, 0x00, 0x0F, 0x8E, 0x2F, 0xFF, 0xFF,
+    0xFF, 0x81, 0xEE, 0x00, 0xD2, 0x49, 0x6B, 0x89, 0x35, 0xB0, 0xA6, 0xE9, 0x00, 0xE9, 0x1E, 0xFF,
+    0xFF, 0xFF, 0x8B, 0x0D, 0xAC, 0x43, 0xE8, 0x00, 0x8D, 0x34, 0x08, 0x85, 0xF6, 0x89, 0x35, 0xB0,
+    0xA6, 0xE9, 0x00, 0x0F, 0x8D, 0x07, 0xFF, 0xFF, 0xFF, 0x81, 0xC6, 0x00, 0xD2, 0x49, 0x6B, 0x89,
+    0x35, 0xB0, 0xA6, 0xE9, 0x00, 0xE9, 0xF6, 0xFE, 0xFF, 0xFF, 0x83, 0xCE, 0xFF, 0x89, 0x35, 0xB0,
+    0xA6, 0xE9, 0x00, 0xE9, 0xE8, 0xFE, 0xFF, 0xFF, 0x80, 0xB8, 0x0C, 0x01, 0x00, 0x00, 0x00, 0x74,
+    0x3E, 0xE8, 0x5A, 0x03, 0x0A, 0x00, 0x85, 0xC0, 0x75, 0x08, 0x38, 0x05, 0x9A, 0x6B, 0x52, 0x02,
+    0x75, 0x2D, 0x8B, 0x87, 0xE4, 0x84, 0x00, 0x00, 0x8B, 0x4F, 0x44, 0x05, 0x70, 0x04, 0x00, 0x00,
+    0x51, 0xE8, 0x3A, 0x1D, 0x00, 0x00, 0x83, 0xC4, 0x04, 0xEB, 0x14, 0x83, 0x3D, 0x3C, 0x5D, 0x5F,
+    0x02, 0x00, 0x74, 0x0B, 0x33, 0xFF, 0xE8, 0xF5, 0x15, 0x00, 0x00, 0x8B, 0x7C, 0x24, 0x44, 0x80,
+    0x3D, 0x5B, 0x98, 0xE9, 0x00, 0x00, 0x74, 0x1D, 0xD9, 0x45, 0x08, 0x51, 0xD9, 0x1C, 0x24, 0x68,
+    0x54, 0x5C, 0x5F, 0x02, 0x8D, 0x84, 0x24, 0x38, 0x01, 0x00, 0x00, 0x8B, 0xCB, 0xE8, 0x4E, 0xB8,
+    0xFF, 0xFF, 0x83, 0xC4, 0x08, 0xA1, 0x54, 0x5C, 0x5F, 0x02, 0x83, 0xF8, 0x04, 0x77, 0x6C, 0xFF,
+    0x24, 0x85, 0x58, 0xD0, 0x49, 0x00, 0xD9, 0x45, 0x08, 0x8D, 0x94, 0x24, 0x30, 0x01, 0x00, 0x00,
+    0x52, 0x51, 0xD9, 0x1C, 0x24, 0x68, 0x54, 0x5C, 0x5F, 0x02, 0xE8, 0x41, 0xCB, 0xFF, 0xFF, 0xEB,
+    0x47, 0x68, 0x54, 0x5C, 0x5F, 0x02, 0xE8, 0x85, 0xCF, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0xEB, 0x3B,
+    0xB8, 0x54, 0x5C, 0x5F, 0x02, 0xE8, 0x06, 0xCF, 0xFF, 0xFF, 0xEB, 0x2F, 0x53, 0xBE, 0x54, 0x5C,
+    0x5F, 0x02, 0xE8, 0xE9, 0xD1, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0xEB, 0x1F, 0x83, 0x3D, 0xBC, 0xA5,
+    0xE9, 0x00, 0x09, 0xD9, 0x45, 0x08, 0x0F, 0x94, 0xC0, 0x50, 0x51, 0xD9, 0x1C, 0x24, 0x68, 0x54,
+    0x5C, 0x5F, 0x02, 0xE8, 0x38, 0xD2, 0xFF, 0xFF, 0x83, 0xC4, 0x0C, 0x83, 0x3D, 0xBC, 0xA5, 0xE9,
+    0x00, 0x07, 0x0F, 0x85, 0x3B, 0x01, 0x00, 0x00, 0x8B, 0x35, 0x64, 0x39, 0xF5, 0x00, 0x8B, 0x0D,
+    0xB0, 0x5B, 0x5F, 0x02, 0x6B, 0xF6, 0x34, 0x81, 0xC6, 0x38, 0x67, 0x5F, 0x02, 0x85, 0xC9, 0x0F,
+    0x84, 0x1E, 0x01, 0x00, 0x00, 0x8B, 0xD1, 0x81, 0xE2, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE2, 0x04,
+    0x8B, 0x82, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x0F, 0x84, 0x05, 0x01, 0x00, 0x00, 0x39, 0x48,
+    0x44, 0x0F, 0x85, 0xFC, 0x00, 0x00, 0x00, 0x83, 0x78, 0x4C, 0x05, 0x0F, 0x85, 0xF2, 0x00, 0x00,
+    0x00, 0xF6, 0x46, 0x30, 0x01, 0x0F, 0x84, 0xE8, 0x00, 0x00, 0x00, 0x8D, 0x48, 0x20, 0x8D, 0x84,
+    0x24, 0xA4, 0x00, 0x00, 0x00, 0xE8, 0xA6, 0x69, 0x74, 0x00, 0xD9, 0x46, 0x20, 0x51, 0xD9, 0x1C,
+    0x24, 0x50, 0xE8, 0x09, 0x8F, 0x74, 0x00, 0xD9, 0x46, 0x1C, 0xDC, 0x0D, 0x70, 0xBF, 0xE5, 0x00,
+    0x8D, 0x8C, 0x24, 0xA4, 0x00, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x34, 0xE8, 0xA0, 0x70, 0x74, 0x00,
+    0x8B, 0x4C, 0x24, 0x20, 0xF6, 0x81, 0x63, 0x11, 0x00, 0x00, 0x20, 0xF3, 0x0F, 0x11, 0x44, 0x24,
+    0x1C, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0xC0, 0xD9,
+    0x44, 0x24, 0x34, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x34, 0xD8, 0xC1, 0xD9,
+    0x5C, 0x24, 0x10, 0x75, 0x72, 0xDD, 0xD8, 0x83, 0xEC, 0x08, 0xD9, 0x44, 0x24, 0x3C, 0xD9, 0x5C,
+    0x24, 0x04, 0xD9, 0x05, 0x58, 0x5C, 0x5F, 0x02, 0xD9, 0x1C, 0x24, 0xE8, 0xD0, 0x52, 0x75, 0x00,
+    0xF3, 0x0F, 0x11, 0x44, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x28, 0xD8, 0x1D, 0xC0, 0x32, 0xDD, 0x00,
+    0x83, 0xC4, 0x08, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x06, 0xD9, 0x44, 0x24, 0x34, 0xEB, 0x37,
+    0xD9, 0x44, 0x24, 0x10, 0x83, 0xEC, 0x08, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x05, 0x58, 0x5C, 0x5F,
+    0x02, 0xD9, 0x1C, 0x24, 0xE8, 0x97, 0x52, 0x75, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x28, 0xD9,
+    0x44, 0x24, 0x28, 0xD8, 0x1D, 0xC0, 0x32, 0xDD, 0x00, 0x83, 0xC4, 0x08, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x41, 0x75, 0x10, 0xD9, 0x44, 0x24, 0x10, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0x20, 0x1C, 0x00, 0x00,
+    0x83, 0xC4, 0x04, 0xA1, 0x54, 0x5C, 0x5F, 0x02, 0x85, 0xC0, 0x74, 0x61, 0x83, 0xF8, 0x01, 0x74,
+    0x5C, 0x33, 0xDB, 0xD9, 0x05, 0x7C, 0x5C, 0x5F, 0x02, 0xD9, 0xC0, 0xD9, 0xEE, 0xDE, 0xE1, 0xDC,
+    0x0D, 0x28, 0xC6, 0xE5, 0x00, 0xDE, 0xC1, 0xD9, 0x1D, 0x7C, 0x5C, 0x5F, 0x02, 0x3B, 0xFB, 0xD9,
+    0x05, 0x74, 0x5C, 0x5F, 0x02, 0xD8, 0x05, 0x78, 0x5C, 0x5F, 0x02, 0xD8, 0x05, 0x7C, 0x5C, 0x5F,
+    0x02, 0xD8, 0x05, 0x50, 0xA6, 0xE9, 0x00, 0xD9, 0x1D, 0x5C, 0x5C, 0x5F, 0x02, 0x0F, 0x84, 0x4F,
+    0x02, 0x00, 0x00, 0x8B, 0x8F, 0xE4, 0x84, 0x00, 0x00, 0x83, 0xB9, 0x9C, 0x00, 0x00, 0x00, 0x04,
+    0x0F, 0x85, 0x3C, 0x02, 0x00, 0x00, 0xD9, 0xE8, 0xE9, 0x3B, 0x02, 0x00, 0x00, 0xA1, 0xB0, 0x5B,
+    0x5F, 0x02, 0x85, 0xC0, 0x74, 0x1E, 0x8B, 0xD0, 0x81, 0xE2, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE2,
+    0x04, 0x8B, 0x8A, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC9, 0x74, 0x09, 0x39, 0x41, 0x44, 0x0F, 0x84,
+    0x20, 0x01, 0x00, 0x00, 0x33, 0xF6, 0x32, 0xC0, 0x33, 0xDB, 0x3B, 0xF3, 0x0F, 0x84, 0x71, 0xFF,
+    0xFF, 0xFF, 0x8B, 0x8E, 0xE4, 0x84, 0x00, 0x00, 0x83, 0xB9, 0x9C, 0x00, 0x00, 0x00, 0x03, 0x0F,
+    0x85, 0x5E, 0xFF, 0xFF, 0xFF, 0x84, 0xC0, 0x0F, 0x84, 0x56, 0xFF, 0xFF, 0xFF, 0x8B, 0x16, 0x8B,
+    0x12, 0x6A, 0xFF, 0x8D, 0x44, 0x24, 0x68, 0x50, 0x8B, 0xCE, 0xFF, 0xD2, 0xD9, 0xEE, 0x8B, 0x4E,
+    0x18, 0xD9, 0x9C, 0x24, 0xF0, 0x00, 0x00, 0x00, 0x89, 0x8C, 0x24, 0xE8, 0x00, 0x00, 0x00, 0xD9,
+    0x84, 0x24, 0xE8, 0x00, 0x00, 0x00, 0xD8, 0x25, 0xB0, 0x99, 0xE9, 0x00, 0x8B, 0x46, 0x14, 0x8B,
+    0x56, 0x1C, 0x89, 0x84, 0x24, 0xD8, 0x00, 0x00, 0x00, 0x89, 0x84, 0x24, 0xE4, 0x00, 0x00, 0x00,
+    0xD9, 0x9C, 0x24, 0xE8, 0x00, 0x00, 0x00, 0x89, 0x9C, 0x24, 0xF4, 0x00, 0x00, 0x00, 0xD9, 0x44,
+    0x24, 0x64, 0x89, 0x9C, 0x24, 0x1C, 0x01, 0x00, 0x00, 0xD9, 0x44, 0x24, 0x68, 0x89, 0x9C, 0x24,
+    0x20, 0x01, 0x00, 0x00, 0xD9, 0x05, 0xAC, 0x99, 0xE9, 0x00, 0x89, 0x9C, 0x24, 0x2C, 0x01, 0x00,
+    0x00, 0xD9, 0xC1, 0x89, 0x5C, 0x24, 0x54, 0xDE, 0xCA, 0x89, 0x5C, 0x24, 0x58, 0xC7, 0x44, 0x24,
+    0x5C, 0x00, 0x00, 0x00, 0x80, 0x89, 0x8C, 0x24, 0xDC, 0x00, 0x00, 0x00, 0xD9, 0xC2, 0x89, 0x94,
+    0x24, 0xE0, 0x00, 0x00, 0x00, 0xDE, 0xCB, 0x89, 0x94, 0x24, 0xEC, 0x00, 0x00, 0x00, 0xD9, 0xC9,
+    0x89, 0x9C, 0x24, 0x28, 0x01, 0x00, 0x00, 0xC7, 0x84, 0x24, 0x24, 0x01, 0x00, 0x00, 0x37, 0x00,
+    0x00, 0x00, 0xDE, 0xC2, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x20, 0xD9, 0xC1,
+    0xDE, 0xCA, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x4F, 0x8D, 0x44, 0x24, 0x54, 0x6A,
+    0x01, 0x50, 0x8D, 0x8C, 0x24, 0xE0, 0x00, 0x00, 0x00, 0xE8, 0x02, 0xDE, 0x25, 0x00, 0x83, 0xC4,
+    0x08, 0x84, 0xC0, 0x74, 0x35, 0xD9, 0x05, 0xA8, 0x99, 0xE9, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0xE9,
+    0xC2, 0x00, 0x00, 0x00, 0x83, 0x79, 0x4C, 0x05, 0x0F, 0x85, 0xD6, 0xFE, 0xFF, 0xFF, 0x33, 0xD2,
+    0x8B, 0xF1, 0xE8, 0x29, 0xAE, 0x60, 0x00, 0x3B, 0x05, 0xD4, 0x03, 0x17, 0x02, 0x0F, 0x85, 0xC3,
+    0xFE, 0xFF, 0xFF, 0xB0, 0x01, 0xE9, 0xBE, 0xFE, 0xFF, 0xFF, 0x8B, 0xB6, 0xE4, 0x84, 0x00, 0x00,
+    0xD9, 0x86, 0xE8, 0x04, 0x00, 0x00, 0xD9, 0x44, 0x24, 0x68, 0xD9, 0xE0, 0xDE, 0xC9, 0xD9, 0x5C,
+    0x24, 0x10, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC0, 0xD9, 0xE1, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44,
+    0x24, 0x20, 0xD9, 0x86, 0xF0, 0x04, 0x00, 0x00, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75,
+    0x0A, 0xDD, 0xD8, 0xD9, 0xEE, 0xD9, 0x5C, 0x24, 0x10, 0xEB, 0x5B, 0xD9, 0x86, 0xEC, 0x04, 0x00,
+    0x00, 0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x05, 0x7A, 0x08, 0xD9, 0xC9, 0xD9, 0x54, 0x24, 0x34, 0xEB, 0x06, 0xD9, 0x54, 0x24, 0x34,
+    0xD9, 0xC9, 0xD9, 0x44, 0x24, 0x34, 0xD9, 0x86, 0xEC, 0x04, 0x00, 0x00, 0xDE, 0xD9, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x41, 0x75, 0x0F, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x74, 0x16, 0xD9, 0x5C,
+    0x24, 0x10, 0xEB, 0x12, 0xDD, 0xD9, 0xDD, 0xD8, 0xD9, 0x86, 0xEC, 0x04, 0x00, 0x00, 0xD9, 0x5C,
+    0x24, 0x10, 0xEB, 0x02, 0xDD, 0xD8, 0xD9, 0x44, 0x24, 0x10, 0x8D, 0x4C, 0x24, 0x54, 0xD9, 0x05,
+    0x7C, 0x5C, 0x5F, 0x02, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xDC, 0x0D, 0x28, 0xC6, 0xE5, 0x00,
+    0xDE, 0xC1, 0xD9, 0x1D, 0x7C, 0x5C, 0x5F, 0x02, 0xE8, 0x83, 0xBA, 0xF6, 0xFF, 0xE9, 0x8B, 0xFD,
+    0xFF, 0xFF, 0xD9, 0x05, 0x50, 0x81, 0xE8, 0x00, 0x80, 0x7C, 0x24, 0x16, 0x00, 0xD9, 0x5C, 0x24,
+    0x34, 0xD9, 0x05, 0x58, 0x5C, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x10, 0x0F, 0x85, 0xED, 0x00, 0x00,
+    0x00, 0xD9, 0x05, 0x6C, 0x5C, 0x5F, 0x02, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0x70, 0xC6, 0xF8, 0xFF,
+    0xD8, 0x0D, 0x04, 0x6C, 0x52, 0x02, 0xD8, 0x44, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x05,
+    0x6C, 0x5C, 0x5F, 0x02, 0xDC, 0x0D, 0x10, 0xC2, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x24, 0xD9, 0x44,
+    0x24, 0x24, 0xD9, 0x1C, 0x24, 0xE8, 0x46, 0xC6, 0xF8, 0xFF, 0xD9, 0x05, 0x08, 0x6C, 0x52, 0x02,
+    0x83, 0xEC, 0x08, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0x05, 0x68, 0x5C, 0x5F, 0x02, 0xDE, 0xC2, 0xD9,
+    0xC9, 0xD9, 0x5C, 0x24, 0x28, 0xD9, 0x05, 0xFC, 0x6B, 0x52, 0x02, 0xD9, 0x05, 0x04, 0x6C, 0x52,
+    0x02, 0xD9, 0xC0, 0xDE, 0xEA, 0xDD, 0x05, 0xE8, 0x50, 0xDD, 0x00, 0xDC, 0xCA, 0xD9, 0xCA, 0xDE,
+    0xC1, 0xD9, 0x1D, 0x04, 0x6C, 0x52, 0x02, 0xD9, 0x05, 0x00, 0x6C, 0x52, 0x02, 0xD8, 0xE2, 0xDE,
+    0xC9, 0xDE, 0xC1, 0xD9, 0x1D, 0x08, 0x6C, 0x52, 0x02, 0xD9, 0x05, 0x80, 0x43, 0xE8, 0x00, 0xD8,
+    0x0D, 0x30, 0x74, 0x79, 0x02, 0xD8, 0x05, 0x6C, 0x5C, 0x5F, 0x02, 0xD9, 0x1D, 0x6C, 0x5C, 0x5F,
+    0x02, 0xD9, 0x44, 0x24, 0x40, 0xD8, 0x0D, 0x7C, 0x43, 0xE8, 0x00, 0xD9, 0x5C, 0x24, 0x2C, 0xD9,
+    0x44, 0x24, 0x2C, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x28, 0xD8, 0x05, 0x60, 0x5C, 0x5F,
+    0x02, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x05, 0x64,
+    0x5C, 0x5F, 0x02, 0xD9, 0x1C, 0x24, 0xE8, 0x35, 0x4E, 0x75, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24,
+    0x2C, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0x1D, 0x64, 0x5C, 0x5F, 0x02, 0x83, 0xC4, 0x0C, 0xD9, 0x44,
+    0x24, 0x10, 0x83, 0xEC, 0x0C, 0xD9, 0x5C, 0x24, 0x08, 0x8D, 0x94, 0x24, 0x8C, 0x00, 0x00, 0x00,
+    0xD9, 0x05, 0x64, 0x5C, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x05, 0x5C, 0x5C, 0x5F, 0x02,
+    0xD9, 0x1C, 0x24, 0x52, 0xE8, 0x27, 0x66, 0x74, 0x00, 0xD9, 0x05, 0x28, 0xA6, 0xE9, 0x00, 0x80,
+    0x7C, 0x24, 0x17, 0x00, 0x74, 0x0A, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0x5C, 0x24, 0x10, 0xEB, 0x04,
+    0xD9, 0x54, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9, 0x5C,
+    0x24, 0x20, 0xD9, 0xEE, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75,
+    0x06, 0xD9, 0x5C, 0x24, 0x34, 0xEB, 0x06, 0xDD, 0xD8, 0xD9, 0x54, 0x24, 0x34, 0xD9, 0x05, 0x04,
+    0x5D, 0x5F, 0x02, 0xD8, 0x64, 0x24, 0x34, 0xD9, 0x1D, 0x04, 0x5D, 0x5F, 0x02, 0xD9, 0x05, 0x04,
+    0x5D, 0x5F, 0x02, 0xD9, 0x05, 0x54, 0xA6, 0xE9, 0x00, 0xD8, 0x35, 0x34, 0x63, 0x5F, 0x02, 0xD9,
+    0x05, 0xE8, 0x99, 0xE9, 0x00, 0xD8, 0x4D, 0x08, 0xDE, 0xC9, 0xDE, 0xE9, 0xD9, 0xEE, 0xD8, 0xD1,
+    0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x04, 0xD9, 0xC1, 0xEB, 0x02, 0xD9, 0xC0, 0xD8, 0xDC, 0xDF,
+    0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x11, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x04, 0xDD,
+    0xD8, 0xEB, 0x0A, 0xDD, 0xD9, 0xEB, 0x06, 0xDD, 0xD9, 0xDD, 0xD8, 0xD9, 0xC1, 0x80, 0x3D, 0x85,
+    0x98, 0xE9, 0x00, 0x00, 0xD9, 0x1D, 0x04, 0x5D, 0x5F, 0x02, 0x75, 0x34, 0xD8, 0x15, 0xA0, 0x5C,
+    0x5F, 0x02, 0xDF, 0xE0, 0xF6, 0xC4, 0x44, 0x7A, 0x0F, 0xD8, 0x1D, 0xA4, 0x5C, 0x5F, 0x02, 0xDF,
+    0xE0, 0xF6, 0xC4, 0x44, 0x7B, 0x1C, 0xEB, 0x02, 0xDD, 0xD8, 0xC7, 0x05, 0xAC, 0xA6, 0xE9, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xC6, 0x05, 0x85, 0x98, 0xE9, 0x00, 0x01, 0xE9, 0x45, 0x03, 0x00, 0x00,
+    0xDD, 0xD8, 0x39, 0x1D, 0xAC, 0xA6, 0xE9, 0x00, 0x0F, 0x8C, 0x37, 0x03, 0x00, 0x00, 0x39, 0x1D,
+    0xD4, 0x03, 0x17, 0x02, 0x0F, 0x84, 0x2B, 0x03, 0x00, 0x00, 0x8B, 0x0D, 0xD4, 0x03, 0x17, 0x02,
+    0xDD, 0xD8, 0x8B, 0x01, 0x8B, 0x00, 0x6A, 0xFF, 0x8D, 0x94, 0x24, 0xCC, 0x00, 0x00, 0x00, 0x52,
+    0xFF, 0xD0, 0xD9, 0x84, 0x24, 0xC8, 0x00, 0x00, 0x00, 0xD9, 0x05, 0x7C, 0x43, 0xE8, 0x00, 0x8D,
+    0x74, 0x24, 0x54, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x38, 0xD9, 0x84, 0x24,
+    0xCC, 0x00, 0x00, 0x00, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x3C, 0xD8, 0x8C, 0x24, 0xD0, 0x00, 0x00,
+    0x00, 0xD9, 0x5C, 0x24, 0x40, 0xD9, 0x44, 0x24, 0x38, 0xD8, 0x05, 0x0C, 0x63, 0x5F, 0x02, 0xD9,
+    0x1D, 0x0C, 0x63, 0x5F, 0x02, 0xD9, 0x44, 0x24, 0x3C, 0xD8, 0x05, 0x10, 0x63, 0x5F, 0x02, 0xD9,
+    0x1D, 0x10, 0x63, 0x5F, 0x02, 0xD9, 0x44, 0x24, 0x40, 0xD8, 0x05, 0x14, 0x63, 0x5F, 0x02, 0xD9,
+    0x1D, 0x14, 0x63, 0x5F, 0x02, 0xD9, 0x05, 0x5C, 0x5B, 0x5F, 0x02, 0xD9, 0x05, 0x60, 0xA6, 0xE9,
+    0x00, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x05, 0x60, 0x5B, 0x5F,
+    0x02, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x24, 0xD8, 0x0D, 0x64, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24,
+    0x28, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0x44, 0x24, 0x48, 0xD9, 0x5C, 0x24, 0x38, 0xD9, 0x44, 0x24,
+    0x24, 0xD8, 0x44, 0x24, 0x4C, 0xD9, 0x5C, 0x24, 0x3C, 0xD9, 0x44, 0x24, 0x28, 0xD8, 0x44, 0x24,
+    0x50, 0xD9, 0x5C, 0x24, 0x40, 0xD9, 0x05, 0x0C, 0x63, 0x5F, 0x02, 0xD8, 0x64, 0x24, 0x38, 0xD9,
+    0x5C, 0x24, 0x54, 0xD9, 0x05, 0x10, 0x63, 0x5F, 0x02, 0xD8, 0x64, 0x24, 0x3C, 0xD9, 0x5C, 0x24,
+    0x58, 0xD9, 0x05, 0x14, 0x63, 0x5F, 0x02, 0xD8, 0x64, 0x24, 0x40, 0xD9, 0x5C, 0x24, 0x5C, 0xE8,
+    0x8C, 0x16, 0x74, 0x00, 0x8D, 0x8C, 0x24, 0x80, 0x00, 0x00, 0x00, 0x51, 0x8B, 0xC6, 0xE8, 0x2D,
+    0x80, 0x74, 0x00, 0xD9, 0x05, 0xA8, 0x5B, 0x5F, 0x02, 0xD8, 0x35, 0x2C, 0x63, 0x5F, 0x02, 0x51,
+    0x8D, 0x94, 0x24, 0x84, 0x00, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x24, 0xD9, 0x44, 0x24, 0x24, 0xD8,
+    0x0D, 0xD8, 0x39, 0xF5, 0x00, 0xD9, 0x5C, 0x24, 0x38, 0xD9, 0x44, 0x24, 0x38, 0xD9, 0x1C, 0x24,
+    0x52, 0xE8, 0x4A, 0x87, 0x74, 0x00, 0xD9, 0x44, 0x24, 0x34, 0xD9, 0xE0, 0xBE, 0x0A, 0x00, 0x00,
+    0x00, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x10, 0x51, 0xD9, 0xC0, 0x8D, 0x84, 0x24, 0xA8,
+    0x00, 0x00, 0x00, 0xD9, 0x84, 0x24, 0x9C, 0x00, 0x00, 0x00, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9,
+    0xD9, 0x5C, 0x24, 0x68, 0xD9, 0xC1, 0xD9, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0xD9, 0xC0, 0xDE,
+    0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x6C, 0xD9, 0x84, 0x24, 0xA4, 0x00, 0x00, 0x00, 0xD9, 0xC0,
+    0xDE, 0xCC, 0xD9, 0xCB, 0xD9, 0x5C, 0x24, 0x70, 0xD9, 0x44, 0x24, 0x3C, 0xD8, 0x64, 0x24, 0x68,
+    0xD9, 0x5C, 0x24, 0x58, 0xD9, 0x44, 0x24, 0x40, 0xD8, 0x64, 0x24, 0x6C, 0xD9, 0x5C, 0x24, 0x5C,
+    0xD9, 0x44, 0x24, 0x44, 0xD8, 0x64, 0x24, 0x70, 0xD9, 0x5C, 0x24, 0x60, 0xD9, 0x84, 0x24, 0x84,
+    0x00, 0x00, 0x00, 0xD9, 0x9C, 0x24, 0xA8, 0x00, 0x00, 0x00, 0xD9, 0x84, 0x24, 0x88, 0x00, 0x00,
+    0x00, 0xD9, 0x9C, 0x24, 0xAC, 0x00, 0x00, 0x00, 0xD9, 0x84, 0x24, 0x8C, 0x00, 0x00, 0x00, 0xD9,
+    0x9C, 0x24, 0xB0, 0x00, 0x00, 0x00, 0xD9, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, 0xD9, 0x9C, 0x24,
+    0xB4, 0x00, 0x00, 0x00, 0xD9, 0x84, 0x24, 0x94, 0x00, 0x00, 0x00, 0xD9, 0x9C, 0x24, 0xB8, 0x00,
+    0x00, 0x00, 0xD9, 0x84, 0x24, 0x98, 0x00, 0x00, 0x00, 0xD9, 0x9C, 0x24, 0xBC, 0x00, 0x00, 0x00,
+    0xD9, 0xC9, 0xD9, 0x9C, 0x24, 0xC0, 0x00, 0x00, 0x00, 0xD9, 0x9C, 0x24, 0xC4, 0x00, 0x00, 0x00,
+    0xD9, 0x9C, 0x24, 0xC8, 0x00, 0x00, 0x00, 0xD9, 0x44, 0x24, 0x24, 0xD9, 0x1C, 0x24, 0x50, 0xE8,
+    0x5C, 0x86, 0x74, 0x00, 0xD9, 0x05, 0x0C, 0x63, 0x5F, 0x02, 0xD8, 0x64, 0x24, 0x54, 0x8D, 0x8C,
+    0x24, 0xA4, 0x00, 0x00, 0x00, 0x51, 0x8D, 0x54, 0x24, 0x74, 0xD9, 0x5C, 0x24, 0x74, 0x52, 0xD9,
+    0x05, 0x10, 0x63, 0x5F, 0x02, 0x8D, 0x84, 0x24, 0xC4, 0x00, 0x00, 0x00, 0xD8, 0x64, 0x24, 0x60,
+    0x50, 0xD9, 0x9C, 0x24, 0x80, 0x00, 0x00, 0x00, 0xD9, 0x05, 0x14, 0x63, 0x5F, 0x02, 0xD8, 0x64,
+    0x24, 0x68, 0xD9, 0x9C, 0x24, 0x84, 0x00, 0x00, 0x00, 0xE8, 0xA2, 0x22, 0x74, 0x00, 0xF3, 0x0F,
+    0x11, 0x44, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x28, 0x83, 0xC4, 0x08, 0x8D, 0x8C, 0x24, 0x84, 0x00,
+    0x00, 0x00, 0xD9, 0x1C, 0x24, 0x51, 0xE8, 0xF5, 0x85, 0x74, 0x00, 0x83, 0xEE, 0x01, 0x0F, 0x85,
+    0xB1, 0xFE, 0xFF, 0xFF, 0x8D, 0x54, 0x24, 0x20, 0x52, 0x68, 0x78, 0x5C, 0x5F, 0x02, 0xBF, 0x60,
+    0x5C, 0x5F, 0x02, 0x8D, 0xB4, 0x24, 0x88, 0x00, 0x00, 0x00, 0xE8, 0x31, 0x66, 0x74, 0x00, 0xD9,
+    0xEE, 0x83, 0xEC, 0x08, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x28, 0xD9, 0x1C, 0x24, 0xE8,
+    0x9C, 0x49, 0x75, 0x00, 0xA1, 0xAC, 0xA6, 0xE9, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x28, 0xD9,
+    0x44, 0x24, 0x28, 0xD9, 0x1D, 0x58, 0x5C, 0x5F, 0x02, 0x83, 0xC4, 0x08, 0x85, 0xC0, 0xD9, 0x05,
+    0x78, 0x5C, 0x5F, 0x02, 0xD8, 0x25, 0x50, 0xA6, 0xE9, 0x00, 0xD9, 0x1D, 0x78, 0x5C, 0x5F, 0x02,
+    0x7C, 0x29, 0x8B, 0x0D, 0xAC, 0x43, 0xE8, 0x00, 0x3B, 0xC1, 0x7E, 0x0B, 0x2B, 0xC1, 0x3D, 0x00,
+    0xE9, 0xA4, 0x35, 0x7C, 0x16, 0xEB, 0x0A, 0x2B, 0xC8, 0x81, 0xF9, 0x00, 0xE9, 0xA4, 0x35, 0x7D,
+    0x0A, 0xC7, 0x05, 0xAC, 0xA6, 0xE9, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x8B, 0x7C, 0x24, 0x44, 0xD9,
+    0x44, 0x24, 0x10, 0x33, 0xDB, 0x83, 0x3D, 0xBC, 0xA5, 0xE9, 0x00, 0x09, 0x0F, 0x85, 0xBE, 0x00,
+    0x00, 0x00, 0x8B, 0x4C, 0x24, 0x4C, 0xDD, 0xD8, 0x8B, 0x44, 0x24, 0x48, 0x8B, 0x54, 0x24, 0x50,
+    0x89, 0x0D, 0x24, 0x5B, 0x5F, 0x02, 0xA3, 0x20, 0x5B, 0x5F, 0x02, 0x89, 0x15, 0x28, 0x5B, 0x5F,
+    0x02, 0xB9, 0x09, 0x00, 0x00, 0x00, 0x8D, 0xB4, 0x24, 0x80, 0x00, 0x00, 0x00, 0xBF, 0x5C, 0x5B,
+    0x5F, 0x02, 0xF3, 0xA5, 0xD9, 0x05, 0xA8, 0x5B, 0x5F, 0x02, 0xD8, 0x35, 0x2C, 0x63, 0x5F, 0x02,
+    0x51, 0xD9, 0x5C, 0x24, 0x24, 0xD9, 0x44, 0x24, 0x24, 0xD8, 0x0D, 0xD8, 0x39, 0xF5, 0x00, 0xD9,
+    0x5C, 0x24, 0x24, 0xD9, 0x44, 0x24, 0x24, 0xD9, 0xE0, 0xD9, 0x1C, 0x24, 0x68, 0x5C, 0x5B, 0x5F,
+    0x02, 0xE8, 0xEA, 0x84, 0x74, 0x00, 0x8D, 0x44, 0x24, 0x20, 0x50, 0x68, 0x78, 0x5C, 0x5F, 0x02,
+    0xBF, 0x60, 0x5C, 0x5F, 0x02, 0x8D, 0xB4, 0x24, 0x88, 0x00, 0x00, 0x00, 0xE8, 0x2F, 0x65, 0x74,
+    0x00, 0xD9, 0xEE, 0x83, 0xEC, 0x08, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x28, 0xD9, 0x1C,
+    0x24, 0xE8, 0x9A, 0x48, 0x75, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x28,
+    0xD9, 0x1D, 0x58, 0x5C, 0x5F, 0x02, 0x83, 0xC4, 0x08, 0xD9, 0x05, 0x78, 0x5C, 0x5F, 0x02, 0xD8,
+    0x25, 0x50, 0xA6, 0xE9, 0x00, 0xD9, 0x1D, 0x78, 0x5C, 0x5F, 0x02, 0xE9, 0xDC, 0x02, 0x00, 0x00,
+    0xA1, 0x60, 0x3C, 0x7B, 0x02, 0xD9, 0x54, 0x24, 0x18, 0x3B, 0xC3, 0x74, 0x41, 0x83, 0x78, 0x3C,
+    0x01, 0x75, 0x3B, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0xDD, 0xD8, 0x8B, 0x11, 0x8B, 0x42, 0x04,
+    0xFF, 0xD0, 0x83, 0xF8, 0x04, 0x75, 0x23, 0xD9, 0x44, 0x24, 0x10, 0xDD, 0x5C, 0x24, 0x20, 0xE8,
+    0x2C, 0x5C, 0x1B, 0x00, 0xDC, 0x5C, 0x24, 0x20, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7B, 0x3A, 0xE8,
+    0x1C, 0x5C, 0x1B, 0x00, 0xD9, 0x5C, 0x24, 0x18, 0xEB, 0x2F, 0xD9, 0x44, 0x24, 0x10, 0xE8, 0xED,
+    0x8F, 0x3F, 0x00, 0x83, 0xF8, 0x02, 0x75, 0x1F, 0xDD, 0x5C, 0x24, 0x20, 0xE8, 0xCF, 0x04, 0x41,
+    0x00, 0xDC, 0x5C, 0x24, 0x20, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7B, 0x0D, 0xE8, 0xBF, 0x04, 0x41,
+    0x00, 0xD9, 0x5C, 0x24, 0x18, 0xEB, 0x02, 0xDD, 0xD8, 0x3B, 0xFB, 0x0F, 0x84, 0x99, 0x00, 0x00,
+    0x00, 0x8B, 0x8F, 0xE4, 0x84, 0x00, 0x00, 0x8B, 0x81, 0x9C, 0x00, 0x00, 0x00, 0x83, 0xF8, 0x03,
+    0x74, 0x05, 0x83, 0xF8, 0x02, 0x75, 0x12, 0x8B, 0x7C, 0x24, 0x44, 0xE8, 0xB0, 0xE9, 0x60, 0x00,
+    0x84, 0xC0, 0x0F, 0x94, 0xC0, 0x84, 0xC0, 0x75, 0x71, 0xD9, 0x84, 0x24, 0x98, 0x00, 0x00, 0x00,
+    0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x38, 0x8B, 0x54, 0x24, 0x38, 0xD9, 0x84, 0x24, 0x9C, 0x00, 0x00,
+    0x00, 0x89, 0x54, 0x24, 0x20, 0x8B, 0x54, 0x24, 0x44, 0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x3C, 0x8B,
+    0x44, 0x24, 0x3C, 0xD9, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0x89, 0x44, 0x24, 0x24, 0xD9, 0xE0,
+    0xD9, 0x5C, 0x24, 0x40, 0x8B, 0x4C, 0x24, 0x40, 0xD9, 0x44, 0x24, 0x3C, 0x89, 0x4C, 0x24, 0x28,
+    0x8B, 0x8A, 0xE4, 0x84, 0x00, 0x00, 0xD9, 0x81, 0x10, 0x04, 0x00, 0x00, 0xDE, 0xD9, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x41, 0x75, 0x54, 0xD9, 0x81, 0x10, 0x04, 0x00, 0x00, 0x8D, 0x74, 0x24, 0x20, 0xD9,
+    0x5C, 0x24, 0x24, 0xE8, 0xD8, 0x13, 0x74, 0x00, 0xEB, 0x3F, 0xD9, 0x84, 0x24, 0x98, 0x00, 0x00,
+    0x00, 0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x54, 0x8B, 0x44, 0x24, 0x54, 0xD9, 0x84, 0x24, 0x9C, 0x00,
+    0x00, 0x00, 0x89, 0x44, 0x24, 0x20, 0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x58, 0x8B, 0x4C, 0x24, 0x58,
+    0xD9, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0x89, 0x4C, 0x24, 0x24, 0xD9, 0xE0, 0xD9, 0x5C, 0x24,
+    0x5C, 0x8B, 0x54, 0x24, 0x5C, 0x89, 0x54, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x18, 0x8D, 0x4C, 0x24,
+    0x70, 0xD9, 0xC0, 0xD8, 0x4C, 0x24, 0x20, 0xD9, 0x5C, 0x24, 0x54, 0xD9, 0x44, 0x24, 0x24, 0xD8,
+    0xC9, 0xD9, 0x5C, 0x24, 0x58, 0xD8, 0x4C, 0x24, 0x28, 0xD9, 0x5C, 0x24, 0x5C, 0xD9, 0x44, 0x24,
+    0x48, 0xD9, 0xC0, 0xD8, 0x44, 0x24, 0x54, 0xD9, 0x5C, 0x24, 0x38, 0xD9, 0x44, 0x24, 0x58, 0xD9,
+    0x44, 0x24, 0x4C, 0xD9, 0xC0, 0xDE, 0xC2, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x3C, 0xD9, 0x44, 0x24,
+    0x5C, 0xD9, 0x44, 0x24, 0x50, 0xD9, 0xC0, 0xDE, 0xC2, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x40, 0xD9,
+    0x44, 0x24, 0x38, 0xDE, 0xEB, 0xD9, 0xCA, 0xD9, 0x5C, 0x24, 0x70, 0xD8, 0x64, 0x24, 0x3C, 0xD9,
+    0x5C, 0x24, 0x74, 0xD8, 0x64, 0x24, 0x40, 0xD9, 0x5C, 0x24, 0x78, 0xE8, 0x50, 0x0C, 0x74, 0x00,
+    0x84, 0xC0, 0x74, 0x22, 0x8B, 0x44, 0x24, 0x48, 0x8B, 0x4C, 0x24, 0x4C, 0x8B, 0x54, 0x24, 0x50,
+    0xA3, 0x20, 0x5B, 0x5F, 0x02, 0x89, 0x0D, 0x24, 0x5B, 0x5F, 0x02, 0x89, 0x15, 0x28, 0x5B, 0x5F,
+    0x02, 0xE9, 0xD3, 0x00, 0x00, 0x00, 0x8D, 0x44, 0x24, 0x70, 0x68, 0xF0, 0x41, 0x49, 0x00, 0x50,
+    0x8D, 0x7C, 0x24, 0x40, 0x8D, 0x44, 0x24, 0x50, 0xE8, 0x53, 0x6A, 0xFF, 0xFF, 0x8B, 0x08, 0x89,
+    0x0D, 0x20, 0x5B, 0x5F, 0x02, 0x8B, 0x50, 0x04, 0x89, 0x15, 0x24, 0x5B, 0x5F, 0x02, 0x8B, 0x40,
+    0x08, 0x8D, 0x4C, 0x24, 0x24, 0x51, 0x8D, 0x54, 0x24, 0x2C, 0xA3, 0x28, 0x5B, 0x5F, 0x02, 0x52,
+    0x8D, 0x8C, 0x24, 0x80, 0x00, 0x00, 0x00, 0x8B, 0xC7, 0xE8, 0xA2, 0xBA, 0x28, 0x00, 0x83, 0xC4,
+    0x10, 0x84, 0xC0, 0x74, 0x40, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0x44, 0x24, 0x1C, 0xDC, 0x05, 0x70,
+    0xC3, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x20, 0xD9, 0x05, 0x24, 0x5B, 0x5F,
+    0x02, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x17, 0xD8, 0xE9, 0xDC, 0x1D, 0x30, 0xC3,
+    0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x0A, 0xD9, 0x1D, 0x24, 0x5B, 0x5F, 0x02, 0xEB,
+    0x04, 0xDD, 0xD9, 0xDD, 0xD8, 0x8D, 0x44, 0x24, 0x38, 0x50, 0x8D, 0x4C, 0x24, 0x4C, 0x51, 0xE8,
+    0x8C, 0x1A, 0x74, 0x00, 0xD9, 0x5C, 0x24, 0x28, 0x8D, 0x54, 0x24, 0x50, 0x68, 0x20, 0x5B, 0x5F,
+    0x02, 0x52, 0xE8, 0x79, 0x1A, 0x74, 0x00, 0xD8, 0x6C, 0x24, 0x30, 0xD9, 0x05, 0x04, 0x5D, 0x5F,
+    0x02, 0x83, 0xC4, 0x10, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x04, 0xDD, 0xD9, 0xEB,
+    0x02, 0xDD, 0xD8, 0xD9, 0x1D, 0x04, 0x5D, 0x5F, 0x02, 0xB9, 0x09, 0x00, 0x00, 0x00, 0xBF, 0x5C,
+    0x5B, 0x5F, 0x02, 0x8D, 0xB4, 0x24, 0x80, 0x00, 0x00, 0x00, 0xF3, 0xA5, 0xE8, 0xFF, 0xA1, 0xFF,
+    0xFF, 0xD9, 0xEE, 0xD9, 0xC0, 0xD9, 0x05, 0x60, 0xA6, 0xE9, 0x00, 0xDD, 0xE1, 0xDF, 0xE0, 0xDD,
+    0xD9, 0xF6, 0xC4, 0x44, 0x0F, 0x8B, 0xA8, 0x00, 0x00, 0x00, 0xDD, 0xD9, 0x68, 0xF0, 0x41, 0x49,
+    0x00, 0xD9, 0x05, 0x5C, 0x5B, 0x5F, 0x02, 0x8D, 0x7C, 0x24, 0x74, 0xD8, 0xC9, 0xD9, 0x5C, 0x24,
+    0x3C, 0x8B, 0x44, 0x24, 0x3C, 0xD9, 0x05, 0x60, 0x5B, 0x5F, 0x02, 0xA3, 0x50, 0x5D, 0x5F, 0x02,
+    0xD8, 0xC9, 0x8D, 0x84, 0x24, 0xCC, 0x00, 0x00, 0x00, 0x50, 0x8D, 0x44, 0x24, 0x50, 0xD9, 0x5C,
+    0x24, 0x44, 0x8B, 0x4C, 0x24, 0x44, 0x89, 0x0D, 0x54, 0x5D, 0x5F, 0x02, 0xD8, 0x0D, 0x64, 0x5B,
+    0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x48, 0x8B, 0x54, 0x24, 0x48, 0xD9, 0x05, 0x20, 0x5B, 0x5F, 0x02,
+    0x89, 0x15, 0x58, 0x5D, 0x5F, 0x02, 0xD8, 0x44, 0x24, 0x40, 0xD9, 0x5C, 0x24, 0x78, 0xD9, 0x44,
+    0x24, 0x44, 0xD8, 0x05, 0x24, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x7C, 0xD9, 0x44, 0x24, 0x48,
+    0xD8, 0x05, 0x28, 0x5B, 0x5F, 0x02, 0xD9, 0x9C, 0x24, 0x80, 0x00, 0x00, 0x00, 0xE8, 0xDE, 0x68,
+    0xFF, 0xFF, 0x8B, 0x08, 0xD9, 0xEE, 0x89, 0x0D, 0x20, 0x5B, 0x5F, 0x02, 0x8B, 0x50, 0x04, 0x89,
+    0x15, 0x24, 0x5B, 0x5F, 0x02, 0x8B, 0x40, 0x08, 0x83, 0xC4, 0x08, 0xA3, 0x28, 0x5B, 0x5F, 0x02,
+    0xEB, 0x14, 0xDD, 0xD8, 0xD9, 0x15, 0x50, 0x5D, 0x5F, 0x02, 0xD9, 0x15, 0x54, 0x5D, 0x5F, 0x02,
+    0xD9, 0x15, 0x58, 0x5D, 0x5F, 0x02, 0xD9, 0x15, 0xA0, 0x5C, 0x5F, 0x02, 0xD9, 0x15, 0xA4, 0x5C,
+    0x5F, 0x02, 0xD9, 0x15, 0x80, 0x5C, 0x5F, 0x02, 0xD9, 0x1D, 0x84, 0x5C, 0x5F, 0x02, 0xD9, 0x05,
+    0xB0, 0x5C, 0x5F, 0x02, 0xD9, 0x1D, 0xB4, 0x5C, 0x5F, 0x02, 0xD9, 0xE8, 0xD9, 0x1D, 0xB0, 0x5C,
+    0x5F, 0x02, 0xD9, 0x05, 0xDC, 0x99, 0xE9, 0x00, 0xD9, 0x1D, 0xB8, 0x5C, 0x5F, 0x02, 0x5F, 0x5E,
+    0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8D, 0x49, 0x00, 0xE6, 0xC1, 0x49, 0x00, 0x10, 0xC2, 0x49, 0x00,
+    0x01, 0xC2, 0x49, 0x00, 0x1C, 0xC2, 0x49, 0x00, 0x2C, 0xC2, 0x49, 0x00,
+];
+
+
+// --- camera_update (0x4932f0..0x49380e, 1310 bytes) ----------------------------------------
+//
+// Per-frame camera update, `sim_frame` twice a frame (docs 11 and 19), game thread. No arguments,
+// plain `ret`. Saves ebx / ebp / esi / edi, keeps a 0x8C-byte frame; ends by calling 0x4A9BE0
+// (region) and the optional 0x2526B5A reset. The mode update is an indirect `call eax` with the
+// dt on the stack, taken from the mode table 0xDD5250 (mode 0 is camera_follow_update).
+// - Callees returning on ST0: 0x4933F4 (0x6FF860), 0x4934CA (0xBDEA30), 0x493797 (0xBDE980).
+// - 0x493734 is the import slot 0xDB807C called with one argument it pops itself.
+// - x87 values (dt, the blend factor) live across the indirect and direct calls stay in the
+//   translation's x87 stack.
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn camera_update_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x4932f0;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x4932f0 => {
+            bump(C::CuCalls);
+            // 0x4932f0: mov eax, dword ptr [0x25f5bb0]
+            eax = rd(0x25f5bb0usize);
+            // 0x4932f5: sub esp, 0x8c
+            { let a = esp; let b = 0x8cu32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x4932fb: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x4932fc: push ebp
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebp);
+            // 0x4932fd: xor ebx, ebx
+            fl = f_logic(0, 32); ebx = 0;
+            // 0x4932ff: cmp eax, ebx
+            fl = f_sub(eax, ebx, 32);
+            // 0x493301: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x493302: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x493303: je 0x493803
+            if fl.zf { pc = 0x493803; } else { pc = 0x493309; } continue;
+        }
+        0x493309 => {
+            bump(C::CuTarget);
+            // 0x493309: mov ecx, eax
+            ecx = eax;
+            // 0x49330b: and ecx, 0xfff
+            { let r = (ecx) & (0xfffu32); fl = f_logic(r, 32); ecx = r; }
+            // 0x493311: shl ecx, 4
+            { let r = ecx << 4; fl = f_logic(r, 32); ecx = r; }
+            // 0x493314: mov ebp, dword ptr [ecx + 0x2149c64]
+            ebp = rd((ecx.wrapping_add(0x2149c64)) as usize);
+            // 0x49331a: cmp ebp, ebx
+            fl = f_sub(ebp, ebx, 32);
+            // 0x49331c: mov dword ptr [esp + 0x18], ebp
+            wd((esp.wrapping_add(0x18)) as usize, ebp);
+            // 0x493320: je 0x493803
+            if fl.zf { pc = 0x493803; } else { pc = 0x493326; } continue;
+        }
+        0x493326 => {
+            // 0x493326: cmp dword ptr [ebp + 0x44], eax
+            fl = f_sub(rd((ebp.wrapping_add(0x44)) as usize), eax, 32);
+            // 0x493329: jne 0x493803
+            if !fl.zf { pc = 0x493803; } else { pc = 0x49332f; } continue;
+        }
+        0x49332f => {
+            bump(C::CuPre);
+            // 0x49332f: call 0x4a3540
+            callx!(0x4a3540, 0, 0, 0, 0.0, 0.0);
+            // 0x493334: fld dword ptr [0xe8437c]
+            fx.push(rf(0xe8437cusize) as f64);
+            // 0x49333a: cmp dword ptr [0xe96c00], 0xd
+            fl = f_sub(rd(0xe96c00usize), 0xdu32, 32);
+            // 0x493341: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493345: jne 0x493374
+            if !fl.zf { pc = 0x493374; } else { pc = 0x493347; } continue;
+        }
+        0x493347 => {
+            // 0x493347: cmp dword ptr [0x213c444], 1
+            fl = f_sub(rd(0x213c444usize), 0x1u32, 32);
+            // 0x49334e: jne 0x493374
+            if !fl.zf { pc = 0x493374; } else { pc = 0x493350; } continue;
+        }
+        0x493350 => {
+            // 0x493350: mov eax, dword ptr [0x213b4f8]
+            eax = rd(0x213b4f8usize);
+            // 0x493355: cmp eax, ebx
+            fl = f_sub(eax, ebx, 32);
+            // 0x493357: je 0x493374
+            if fl.zf { pc = 0x493374; } else { pc = 0x493359; } continue;
+        }
+        0x493359 => {
+            // 0x493359: mov eax, dword ptr [eax + 4]
+            eax = rd((eax.wrapping_add(0x4)) as usize);
+            // 0x49335c: cmp eax, ebx
+            fl = f_sub(eax, ebx, 32);
+            // 0x49335e: je 0x493374
+            if fl.zf { pc = 0x493374; } else { pc = 0x493360; } continue;
+        }
+        0x493360 => {
+            // 0x493360: mov eax, dword ptr [eax + 4]
+            eax = rd((eax.wrapping_add(0x4)) as usize);
+            // 0x493363: cmp eax, ebx
+            fl = f_sub(eax, ebx, 32);
+            // 0x493365: je 0x493374
+            if fl.zf { pc = 0x493374; } else { pc = 0x493367; } continue;
+        }
+        0x493367 => {
+            // 0x493367: mov edx, dword ptr [eax + 4]
+            edx = rd((eax.wrapping_add(0x4)) as usize);
+            // 0x49336a: cmp dword ptr [edx], 2
+            fl = f_sub(rd((edx) as usize), 0x2u32, 32);
+            // 0x49336d: jne 0x493374
+            if !fl.zf { pc = 0x493374; } else { pc = 0x49336f; } continue;
+        }
+        0x49336f => {
+            // 0x49336f: call 0x8aaa80
+            callx!(0x8aaa80, 0, 0, 0, 0.0, 0.0);
+            pc = 0x493374; continue;
+        }
+        0x493374 => {
+            // 0x493374: mov ecx, dword ptr [0x25f5b18]
+            ecx = rd(0x25f5b18usize);
+            // 0x49337a: mov eax, dword ptr [0x25f5b14]
+            eax = rd(0x25f5b14usize);
+            // 0x49337f: mov edx, dword ptr [0x25f5b1c]
+            edx = rd(0x25f5b1cusize);
+            // 0x493385: mov dword ptr [0x25f5b30], ecx
+            wd(0x25f5b30usize, ecx);
+            // 0x49338b: mov ecx, 9
+            ecx = 0x9u32;
+            // 0x493390: mov esi, 0x25f5b38
+            esi = 0x25f5b38u32;
+            // 0x493395: mov edi, 0x25f5b80
+            edi = 0x25f5b80u32;
+            // 0x49339a: mov dword ptr [0x25f5b2c], eax
+            wd(0x25f5b2cusize, eax);
+            // 0x49339f: mov dword ptr [0x25f5b34], edx
+            wd(0x25f5b34usize, edx);
+            // 0x4933a5: rep movsd dword ptr es:[edi], dword ptr [esi]
+            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
+            // 0x4933a7: fld dword ptr [0x25f5ba4]
+            fx.push(rf(0x25f5ba4usize) as f64);
+            // 0x4933ad: fstp dword ptr [0x25f5bac]
+            wf(0x25f5bacusize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4933b3: mov ecx, dword ptr [0x25f5bb0]
+            ecx = rd(0x25f5bb0usize);
+            // 0x4933b9: cmp ecx, ebx
+            fl = f_sub(ecx, ebx, 32);
+            // 0x4933bb: je 0x4933fb
+            if fl.zf { pc = 0x4933fb; } else { pc = 0x4933bd; } continue;
+        }
+        0x4933bd => {
+            // 0x4933bd: mov eax, ecx
+            eax = ecx;
+            // 0x4933bf: and eax, 0xfff
+            { let r = (eax) & (0xfffu32); fl = f_logic(r, 32); eax = r; }
+            // 0x4933c4: shl eax, 4
+            { let r = eax << 4; fl = f_logic(r, 32); eax = r; }
+            // 0x4933c7: mov eax, dword ptr [eax + 0x2149c64]
+            eax = rd((eax.wrapping_add(0x2149c64)) as usize);
+            // 0x4933cd: cmp eax, ebx
+            fl = f_sub(eax, ebx, 32);
+            // 0x4933cf: je 0x4933fb
+            if fl.zf { pc = 0x4933fb; } else { pc = 0x4933d1; } continue;
+        }
+        0x4933d1 => {
+            // 0x4933d1: cmp dword ptr [eax + 0x44], ecx
+            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
+            // 0x4933d4: jne 0x4933fb
+            if !fl.zf { pc = 0x4933fb; } else { pc = 0x4933d6; } continue;
+        }
+        0x4933d6 => {
+            // 0x4933d6: test byte ptr [0x25f5be8], 2
+            fl = f_logic(((rb(0x25f5be8usize) as u32)) & (0x2u32), 8);
+            // 0x4933dd: jne 0x4933fb
+            if !fl.zf { pc = 0x4933fb; } else { pc = 0x4933df; } continue;
+        }
+        0x4933df => {
+            // 0x4933df: mov ecx, dword ptr [eax + 0x4c]
+            ecx = rd((eax.wrapping_add(0x4c)) as usize);
+            // 0x4933e2: cmp ecx, 5
+            fl = f_sub(ecx, 0x5u32, 32);
+            // 0x4933e5: je 0x4933f4
+            if fl.zf { pc = 0x4933f4; } else { pc = 0x4933e7; } continue;
+        }
+        0x4933e7 => {
+            // 0x4933e7: cmp ecx, 1
+            fl = f_sub(ecx, 0x1u32, 32);
+            // 0x4933ea: jne 0x4933fb
+            if !fl.zf { pc = 0x4933fb; } else { pc = 0x4933ec; } continue;
+        }
+        0x4933ec => {
+            // 0x4933ec: cmp byte ptr [eax + 0x595], bl
+            fl = f_sub((rb((eax.wrapping_add(0x595)) as usize) as u32), (ebx & 0xff), 8);
+            // 0x4933f2: je 0x4933fb
+            if fl.zf { pc = 0x4933fb; } else { pc = 0x4933f4; } continue;
+        }
+        0x4933f4 => {
+            bump(C::CuPhysDt);
+            // 0x4933f4: call 0x6ff860
+            callx!(0x6ff860, 0, 0, 0, 0.0, 0.0);
+            // 0x4933f9: jmp 0x4933ff
+            pc = 0x4933ff; continue;
+        }
+        0x4933fb => {
+            // 0x4933fb: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            pc = 0x4933ff; continue;
+        }
+        0x4933ff => {
+            // 0x4933ff: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493403: fld dword ptr [0x25f5b14]
+            fx.push(rf(0x25f5b14usize) as f64);
+            // 0x493409: fstp dword ptr [esp + 0x28]
+            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49340d: fld dword ptr [0x25f5b18]
+            fx.push(rf(0x25f5b18usize) as f64);
+            // 0x493413: fstp dword ptr [esp + 0x2c]
+            wf((esp.wrapping_add(0x2c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493417: fld dword ptr [0x25f5b1c]
+            fx.push(rf(0x25f5b1cusize) as f64);
+            // 0x49341d: fstp dword ptr [esp + 0x30]
+            wf((esp.wrapping_add(0x30)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493421: fldz 
+            fx.push(0.0);
+            // 0x493423: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x493427: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x493429: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49342b: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x49342d: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x493430: jne 0x493487
+            if !fl.zf { pc = 0x493487; } else { pc = 0x493432; } continue;
+        }
+        0x493432 => {
+            bump(C::CuModeUpdate);
+            // 0x493432: mov eax, dword ptr [0x25f5ae8]
+            eax = rd(0x25f5ae8usize);
+            // 0x493437: lea ecx, [eax + eax*4]
+            ecx = (eax.wrapping_add(eax.wrapping_mul(4)));
+            // 0x49343a: mov eax, dword ptr [ecx*4 + 0xdd5258]
+            eax = rd((ecx.wrapping_mul(4).wrapping_add(0xdd5258)) as usize);
+            // 0x493441: cmp eax, ebx
+            fl = f_sub(eax, ebx, 32);
+            // 0x493443: je 0x493452
+            if fl.zf { pc = 0x493452; } else { pc = 0x493445; } continue;
+        }
+        0x493445 => {
+            bump(C::CuModeCall);
+            // 0x493445: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x493446: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493449: call eax
+            callx!(eax as usize, 1, 0, 0, 0.0, 0.0);
+            // 0x49344b: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49344f: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            pc = 0x493452; continue;
+        }
+        0x493452 => {
+            // 0x493452: test byte ptr [0x25f5be8], 2
+            fl = f_logic(((rb(0x25f5be8usize) as u32)) & (0x2u32), 8);
+            // 0x493459: je 0x493487
+            if fl.zf { pc = 0x493487; } else { pc = 0x49345b; } continue;
+        }
+        0x49345b => {
+            bump(C::CuSmooth);
+            // 0x49345b: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49345c: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49345f: push 0x25f5b5c
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5b5cu32);
+            // 0x493464: push 0x25f5ba8
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5ba8u32);
+            // 0x493469: push 0x25f5b20
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5b20u32);
+            // 0x49346e: mov edi, 0x25f5ba8
+            edi = 0x25f5ba8u32;
+            // 0x493473: mov ecx, 0x25f5b20
+            ecx = 0x25f5b20u32;
+            // 0x493478: mov eax, 0x25f5b5c
+            eax = 0x25f5b5cu32;
+            // 0x49347d: call 0x4a33a0
+            callx!(0x4a33a0, 4, 0, 0, 0.0, 0.0);
+            // 0x493482: add esp, 0x10
+            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x493485: jmp 0x493489
+            pc = 0x493489; continue;
+        }
+        0x493487 => {
+            // 0x493487: fstp st(0)
+            fx.pop();
+            pc = 0x493489; continue;
+        }
+        0x493489 => {
+            // 0x493489: call 0x4a0ea0
+            callx!(0x4a0ea0, 0, 0, 0, 0.0, 0.0);
+            // 0x49348e: test byte ptr [0x25f5be8], 4
+            fl = f_logic(((rb(0x25f5be8usize) as u32)) & (0x4u32), 8);
+            // 0x493495: je 0x4934f0
+            if fl.zf { pc = 0x4934f0; } else { pc = 0x493497; } continue;
+        }
+        0x493497 => {
+            bump(C::CuCut);
+            // 0x493497: fld dword ptr [0x25f5b14]
+            fx.push(rf(0x25f5b14usize) as f64);
+            // 0x49349d: fstp dword ptr [esp + 0x34]
+            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4934a1: fld dword ptr [0x25f5b18]
+            fx.push(rf(0x25f5b18usize) as f64);
+            // 0x4934a7: fstp dword ptr [esp + 0x38]
+            wf((esp.wrapping_add(0x38)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4934ab: fld dword ptr [0x25f5b1c]
+            fx.push(rf(0x25f5b1cusize) as f64);
+            // 0x4934b1: fstp dword ptr [esp + 0x3c]
+            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4934b5: call 0x492df0
+            callx!(0x492df0, 0, 0, 0, 0.0, 0.0);
+            // 0x4934ba: and dword ptr [0x25f5be8], 0xfffffffb
+            { let r = (rd(0x25f5be8usize)) & (0xfffffffbu32); fl = f_logic(r, 32); wd(0x25f5be8usize, r); }
+            // 0x4934c1: lea eax, [esp + 0x34]
+            eax = (esp.wrapping_add(0x34));
+            // 0x4934c5: mov ecx, 0x25f5b14
+            ecx = 0x25f5b14u32;
+            // 0x4934ca: call 0xbdea30
+            callx!(0xbdea30, 0, 0, 0, 0.0, 0.0);
+            // 0x4934cf: fcomp qword ptr [0xe5c540]
+            fx.sw = fcmp(fx.s(0), rdf64(0xe5c540usize));
+            fx.pop();
+            // 0x4934d5: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x4934d7: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x4934da: jne 0x4934f0
+            if !fl.zf { pc = 0x4934f0; } else { pc = 0x4934dc; } continue;
+        }
+        0x4934dc => {
+            // 0x4934dc: mov dl, byte ptr [0x2528b48]
+            edx = (edx & 0xffffff00) | (((rb(0x2528b48usize) as u32)) & 0xff);
+            // 0x4934e2: test dl, dl
+            fl = f_logic(((edx & 0xff)) & ((edx & 0xff)), 8);
+            // 0x4934e4: jne 0x4934f0
+            if !fl.zf { pc = 0x4934f0; } else { pc = 0x4934e6; } continue;
+        }
+        0x4934e6 => {
+            // 0x4934e6: mov byte ptr [0x2529620], 1
+            wb(0x2529620usize, (0x1u32) as u8);
+            // 0x4934ed: lea ecx, [ecx]
+            // no-op
+            pc = 0x4934f0; continue;
+        }
+        0x4934f0 => {
+            // 0x4934f0: mov ecx, dword ptr [0x25f5b24]
+            ecx = rd(0x25f5b24usize);
+            // 0x4934f6: mov eax, dword ptr [0x25f5b20]
+            eax = rd(0x25f5b20usize);
+            // 0x4934fb: mov edx, dword ptr [0x25f5b28]
+            edx = rd(0x25f5b28usize);
+            // 0x493501: mov dword ptr [0x25f5b18], ecx
+            wd(0x25f5b18usize, ecx);
+            // 0x493507: mov ecx, 9
+            ecx = 0x9u32;
+            // 0x49350c: mov esi, 0x25f5b5c
+            esi = 0x25f5b5cu32;
+            // 0x493511: mov edi, 0x25f5b38
+            edi = 0x25f5b38u32;
+            // 0x493516: mov dword ptr [0x25f5b14], eax
+            wd(0x25f5b14usize, eax);
+            // 0x49351b: mov dword ptr [0x25f5b1c], edx
+            wd(0x25f5b1cusize, edx);
+            // 0x493521: rep movsd dword ptr es:[edi], dword ptr [esi]
+            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
+            // 0x493523: test byte ptr [0x25f5be8], 8
+            fl = f_logic(((rb(0x25f5be8usize) as u32)) & (0x8u32), 8);
+            // 0x49352a: je 0x49357e
+            if fl.zf { pc = 0x49357e; } else { pc = 0x49352c; } continue;
+        }
+        0x49352c => {
+            bump(C::CuFovBlend);
+            // 0x49352c: fld dword ptr [0xe84384]
+            fx.push(rf(0xe84384usize) as f64);
+            // 0x493532: fmul qword ptr [0xe5c130]
+            { let v = fx.s(0) * rdf64(0xe5c130usize); fx.set(0, v); }
+            // 0x493538: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49353c: fldz 
+            fx.push(0.0);
+            // 0x49353e: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x493542: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x493544: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x493546: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x493549: jne 0x49355e
+            if !fl.zf { pc = 0x49355e; } else { pc = 0x49354b; } continue;
+        }
+        0x49354b => {
+            // 0x49354b: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x49354d: fld1 
+            fx.push(1.0);
+            // 0x49354f: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x493551: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x493553: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x493555: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x493558: jne 0x493560
+            if !fl.zf { pc = 0x493560; } else { pc = 0x49355a; } continue;
+        }
+        0x49355a => {
+            // 0x49355a: fstp st(0)
+            fx.pop();
+            // 0x49355c: jmp 0x493564
+            pc = 0x493564; continue;
+        }
+        0x49355e => {
+            // 0x49355e: fstp st(0)
+            fx.pop();
+            pc = 0x493560; continue;
+        }
+        0x493560 => {
+            // 0x493560: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x493564; continue;
+        }
+        0x493564 => {
+            // 0x493564: fld dword ptr [0x25f5ba8]
+            fx.push(rf(0x25f5ba8usize) as f64);
+            // 0x49356a: fld dword ptr [0x25f5ba4]
+            fx.push(rf(0x25f5ba4usize) as f64);
+            // 0x493570: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x493572: fsubp st(2)
+            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x493574: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x493578: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x49357a: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49357c: jmp 0x493584
+            pc = 0x493584; continue;
+        }
+        0x49357e => {
+            // 0x49357e: fld dword ptr [0x25f5ba8]
+            fx.push(rf(0x25f5ba8usize) as f64);
+            pc = 0x493584; continue;
+        }
+        0x493584 => {
+            // 0x493584: cmp byte ptr [0xe8825f], bl
+            fl = f_sub((rb(0xe8825fusize) as u32), (ebx & 0xff), 8);
+            // 0x49358a: fstp dword ptr [0x25f5ba4]
+            wf(0x25f5ba4usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493590: je 0x49375a
+            if fl.zf { pc = 0x49375a; } else { pc = 0x493596; } continue;
+        }
+        0x493596 => {
+            bump(C::CuFade);
+            // 0x493596: mov edx, dword ptr [0x25f5b28]
+            edx = rd(0x25f5b28usize);
+            // 0x49359c: fld dword ptr [0xe5daa0]
+            fx.push(rf(0xe5daa0usize) as f64);
+            // 0x4935a2: mov eax, dword ptr [0x25f5b20]
+            eax = rd(0x25f5b20usize);
+            // 0x4935a7: fstp dword ptr [esp + 0x58]
+            wf((esp.wrapping_add(0x58)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4935ab: mov ecx, dword ptr [0x25f5b24]
+            ecx = rd(0x25f5b24usize);
+            // 0x4935b1: mov dword ptr [esp + 0x48], edx
+            wd((esp.wrapping_add(0x48)) as usize, edx);
+            // 0x4935b5: mov dword ptr [esp + 0x54], edx
+            wd((esp.wrapping_add(0x54)) as usize, edx);
+            // 0x4935b9: mov edx, dword ptr [0xf53908]
+            edx = rd(0xf53908usize);
+            // 0x4935bf: cmp edx, ebx
+            fl = f_sub(edx, ebx, 32);
+            // 0x4935c1: mov dword ptr [esp + 0x5c], ebx
+            wd((esp.wrapping_add(0x5c)) as usize, ebx);
+            // 0x4935c5: mov dword ptr [esp + 0x84], ebx
+            wd((esp.wrapping_add(0x84)) as usize, ebx);
+            // 0x4935cc: mov dword ptr [esp + 0x88], ebx
+            wd((esp.wrapping_add(0x88)) as usize, ebx);
+            // 0x4935d3: mov dword ptr [esp + 0x94], ebx
+            wd((esp.wrapping_add(0x94)) as usize, ebx);
+            // 0x4935da: mov dword ptr [esp + 0x1c], ebx
+            wd((esp.wrapping_add(0x1c)) as usize, ebx);
+            // 0x4935de: mov dword ptr [esp + 0x20], ebx
+            wd((esp.wrapping_add(0x20)) as usize, ebx);
+            // 0x4935e2: mov dword ptr [esp + 0x24], 0x80000000
+            wd((esp.wrapping_add(0x24)) as usize, 0x80000000u32);
+            // 0x4935ea: mov dword ptr [esp + 0x40], eax
+            wd((esp.wrapping_add(0x40)) as usize, eax);
+            // 0x4935ee: mov dword ptr [esp + 0x44], ecx
+            wd((esp.wrapping_add(0x44)) as usize, ecx);
+            // 0x4935f2: mov dword ptr [esp + 0x4c], eax
+            wd((esp.wrapping_add(0x4c)) as usize, eax);
+            // 0x4935f6: mov dword ptr [esp + 0x50], ecx
+            wd((esp.wrapping_add(0x50)) as usize, ecx);
+            // 0x4935fa: mov dword ptr [esp + 0x8c], 0x50
+            wd((esp.wrapping_add(0x8c)) as usize, 0x50u32);
+            // 0x493605: mov dword ptr [esp + 0x90], 1
+            wd((esp.wrapping_add(0x90)) as usize, 0x1u32);
+            // 0x493610: je 0x493621
+            if fl.zf { pc = 0x493621; } else { pc = 0x493612; } continue;
+        }
+        0x493612 => {
+            // 0x493612: call 0x492d40
+            callx!(0x492d40, 0, 0, 0, 0.0, 0.0);
+            // 0x493617: mov edx, dword ptr [0xf53908]
+            edx = rd(0xf53908usize);
+            // 0x49361d: cmp edx, ebx
+            fl = f_sub(edx, ebx, 32);
+            // 0x49361f: jne 0x493612
+            if !fl.zf { pc = 0x493612; } else { pc = 0x493621; } continue;
+        }
+        0x493621 => {
+            // 0x493621: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x493622: lea eax, [esp + 0x20]
+            eax = (esp.wrapping_add(0x20));
+            // 0x493626: push 1
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x1u32);
+            // 0x493628: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x493629: lea ecx, [esp + 0x4c]
+            ecx = (esp.wrapping_add(0x4c));
+            // 0x49362d: call 0x6fa820
+            callx!(0x6fa820, 3, 0, 0, 0.0, 0.0);
+            // 0x493632: add esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x493635: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x493637: je 0x493725
+            if fl.zf { pc = 0x493725; } else { pc = 0x49363d; } continue;
+        }
+        0x49363d => {
+            bump(C::CuFadeCast);
+            // 0x49363d: mov eax, dword ptr [esp + 0x20]
+            eax = rd((esp.wrapping_add(0x20)) as usize);
+            // 0x493641: cmp eax, ebx
+            fl = f_sub(eax, ebx, 32);
+            // 0x493643: jle 0x493725
+            if fl.zf || fl.sf != fl.of { pc = 0x493725; } else { pc = 0x493649; } continue;
+        }
+        0x493649 => {
+            // 0x493649: mov edi, dword ptr [esp + 0x1c]
+            edi = rd((esp.wrapping_add(0x1c)) as usize);
+            // 0x49364d: mov ebp, dword ptr [0xebcea0]
+            ebp = rd(0xebcea0usize);
+            // 0x493653: mov ebx, dword ptr [0xebce9c]
+            ebx = rd(0xebce9cusize);
+            // 0x493659: add edi, 0x28
+            { let a = edi; let b = 0x28u32; fl = f_add(a, b, 32); edi = a.wrapping_add(b); }
+            // 0x49365c: mov dword ptr [esp + 0x10], eax
+            wd((esp.wrapping_add(0x10)) as usize, eax);
+            pc = 0x493660; continue;
+        }
+        0x493660 => {
+            // 0x493660: mov eax, dword ptr [edi]
+            eax = rd((edi) as usize);
+            // 0x493662: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x493664: je 0x493713
+            if fl.zf { pc = 0x493713; } else { pc = 0x49366a; } continue;
+        }
+        0x49366a => {
+            // 0x49366a: mov ecx, eax
+            ecx = eax;
+            // 0x49366c: and ecx, 0xfff
+            { let r = (ecx) & (0xfffu32); fl = f_logic(r, 32); ecx = r; }
+            // 0x493672: shl ecx, 4
+            { let r = ecx << 4; fl = f_logic(r, 32); ecx = r; }
+            // 0x493675: mov esi, dword ptr [ecx + 0x2149c64]
+            esi = rd((ecx.wrapping_add(0x2149c64)) as usize);
+            // 0x49367b: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x49367d: je 0x493713
+            if fl.zf { pc = 0x493713; } else { pc = 0x493683; } continue;
+        }
+        0x493683 => {
+            // 0x493683: mov ecx, dword ptr [esi + 0x44]
+            ecx = rd((esi.wrapping_add(0x44)) as usize);
+            // 0x493686: cmp ecx, eax
+            fl = f_sub(ecx, eax, 32);
+            // 0x493688: jne 0x493713
+            if !fl.zf { pc = 0x493713; } else { pc = 0x49368e; } continue;
+        }
+        0x49368e => {
+            // 0x49368e: cmp dword ptr [esi + 0x4c], 1
+            fl = f_sub(rd((esi.wrapping_add(0x4c)) as usize), 0x1u32, 32);
+            // 0x493692: jne 0x493713
+            if !fl.zf { pc = 0x493713; } else { pc = 0x493694; } continue;
+        }
+        0x493694 => {
+            // 0x493694: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x493696: je 0x493702
+            if fl.zf { pc = 0x493702; } else { pc = 0x493698; } continue;
+        }
+        0x493698 => {
+            // 0x493698: test ebx, ebx
+            fl = f_logic((ebx) & (ebx), 32);
+            // 0x49369a: je 0x4936ab
+            if fl.zf { pc = 0x4936ab; } else { pc = 0x49369c; } continue;
+        }
+        0x49369c => {
+            // 0x49369c: cmp ecx, dword ptr [ebx + 0x44]
+            fl = f_sub(ecx, rd((ebx.wrapping_add(0x44)) as usize), 32);
+            // 0x49369f: jne 0x4936ab
+            if !fl.zf { pc = 0x4936ab; } else { pc = 0x4936a1; } continue;
+        }
+        0x4936a1 => {
+            // 0x4936a1: cmp ebp, 7
+            fl = f_sub(ebp, 0x7u32, 32);
+            // 0x4936a4: je 0x4936ab
+            if fl.zf { pc = 0x4936ab; } else { pc = 0x4936a6; } continue;
+        }
+        0x4936a6 => {
+            // 0x4936a6: cmp ebp, 8
+            fl = f_sub(ebp, 0x8u32, 32);
+            // 0x4936a9: jne 0x493702
+            if !fl.zf { pc = 0x493702; } else { pc = 0x4936ab; } continue;
+        }
+        0x4936ab => {
+            // 0x4936ab: mov eax, esi
+            eax = esi;
+            // 0x4936ad: call 0x9b92e0
+            callx!(0x9b92e0, 0, 0, 0, 0.0, 0.0);
+            // 0x4936b2: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x4936b4: jne 0x493702
+            if !fl.zf { pc = 0x493702; } else { pc = 0x4936b6; } continue;
+        }
+        0x4936b6 => {
+            // 0x4936b6: mov edx, dword ptr [esi + 0xd74]
+            edx = rd((esi.wrapping_add(0xd74)) as usize);
+            // 0x4936bc: mov ecx, edx
+            ecx = edx;
+            // 0x4936be: call 0xae28f0
+            callx!(0xae28f0, 0, 0, 0, 0.0, 0.0);
+            // 0x4936c3: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x4936c5: setne al
+            eax = (eax & 0xffffff00) | (((!fl.zf) as u32) & 0xff);
+            // 0x4936c8: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x4936ca: je 0x493702
+            if fl.zf { pc = 0x493702; } else { pc = 0x4936cc; } continue;
+        }
+        0x4936cc => {
+            // 0x4936cc: mov ecx, edx
+            ecx = edx;
+            // 0x4936ce: call 0xae28f0
+            callx!(0xae28f0, 0, 0, 0, 0.0, 0.0);
+            // 0x4936d3: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x4936d5: je 0x493702
+            if fl.zf { pc = 0x493702; } else { pc = 0x4936d7; } continue;
+        }
+        0x4936d7 => {
+            // 0x4936d7: mov ecx, dword ptr [esi + 0xd78]
+            ecx = rd((esi.wrapping_add(0xd78)) as usize);
+            // 0x4936dd: cmp ecx, -1
+            fl = f_sub(ecx, 0xffffffffu32, 32);
+            // 0x4936e0: je 0x493702
+            if fl.zf { pc = 0x493702; } else { pc = 0x4936e2; } continue;
+        }
+        0x4936e2 => {
+            // 0x4936e2: mov edx, dword ptr [eax + 0x84e4]
+            edx = rd((eax.wrapping_add(0x84e4)) as usize);
+            // 0x4936e8: mov eax, dword ptr [edx + ecx*4 + 0x6f4]
+            eax = rd((edx.wrapping_add(ecx.wrapping_mul(4)).wrapping_add(0x6f4)) as usize);
+            // 0x4936ef: cmp eax, dword ptr [0x33d630c]
+            fl = f_sub(eax, rd(0x33d630cusize), 32);
+            // 0x4936f5: je 0x493713
+            if fl.zf { pc = 0x493713; } else { pc = 0x4936f7; } continue;
+        }
+        0x4936f7 => {
+            // 0x4936f7: mov eax, esi
+            eax = esi;
+            // 0x4936f9: call 0x926650
+            callx!(0x926650, 0, 0, 0, 0.0, 0.0);
+            // 0x4936fe: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x493700: jne 0x493713
+            if !fl.zf { pc = 0x493713; } else { pc = 0x493702; } continue;
+        }
+        0x493702 => {
+            // 0x493702: call 0x492d90
+            callx!(0x492d90, 0, 0, 0, 0.0, 0.0);
+            // 0x493707: mov ebp, dword ptr [0xebcea0]
+            ebp = rd(0xebcea0usize);
+            // 0x49370d: mov ebx, dword ptr [0xebce9c]
+            ebx = rd(0xebce9cusize);
+            pc = 0x493713; continue;
+        }
+        0x493713 => {
+            // 0x493713: add edi, 0x3c
+            { let a = edi; let b = 0x3cu32; fl = f_add(a, b, 32); edi = a.wrapping_add(b); }
+            // 0x493716: sub dword ptr [esp + 0x10], 1
+            { let a = rd((esp.wrapping_add(0x10)) as usize); let b = 0x1u32; fl = f_sub(a, b, 32); wd((esp.wrapping_add(0x10)) as usize, a.wrapping_sub(b)); }
+            // 0x49371b: jne 0x493660
+            if !fl.zf { pc = 0x493660; } else { pc = 0x493721; } continue;
+        }
+        0x493721 => {
+            // 0x493721: mov ebp, dword ptr [esp + 0x18]
+            ebp = rd((esp.wrapping_add(0x18)) as usize);
+            pc = 0x493725; continue;
+        }
+        0x493725 => {
+            // 0x493725: mov esi, dword ptr [esp + 0x24]
+            esi = rd((esp.wrapping_add(0x24)) as usize);
+            // 0x493729: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x49372b: js 0x49375a
+            if fl.sf { pc = 0x49375a; } else { pc = 0x49372d; } continue;
+        }
+        0x49372d => {
+            bump(C::CuTimerImport);
+            // 0x49372d: mov ecx, dword ptr [0x31bf2bc]
+            ecx = rd(0x31bf2bcusize);
+            // 0x493733: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x493734: call dword ptr [0xdb807c]
+            callx!(rd(0xdb807cusize) as usize, 1, 1, 0, 0.0, 0.0);
+            // 0x49373a: mov ecx, dword ptr [esp + 0x1c]
+            ecx = rd((esp.wrapping_add(0x1c)) as usize);
+            // 0x49373e: and esi, 0x3fffffff
+            { let r = (esi) & (0x3fffffffu32); fl = f_logic(r, 32); esi = r; }
+            // 0x493744: mov edx, esi
+            edx = esi;
+            // 0x493746: shl edx, 4
+            { let r = edx << 4; fl = f_logic(r, 32); edx = r; }
+            // 0x493749: sub edx, esi
+            { let a = edx; let b = esi; fl = f_sub(a, b, 32); edx = a.wrapping_sub(b); }
+            // 0x49374b: add edx, edx
+            { let a = edx; let b = edx; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
+            // 0x49374d: push 0x17
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x17u32);
+            // 0x49374f: add edx, edx
+            { let a = edx; let b = edx; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
+            // 0x493751: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x493752: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x493753: mov ecx, eax
+            ecx = eax;
+            // 0x493755: call 0xd2b7d0
+            callx!(0xd2b7d0, 3, 3, 0, 0.0, 0.0);
+            pc = 0x49375a; continue;
+        }
+        0x49375a => {
+            // 0x49375a: mov edx, dword ptr [ebp + 0x14]
+            edx = rd((ebp.wrapping_add(0x14)) as usize);
+            // 0x49375d: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x493761: mov dword ptr [0x25f5bb4], edx
+            wd(0x25f5bb4usize, edx);
+            // 0x493767: mov eax, dword ptr [ebp + 0x18]
+            eax = rd((ebp.wrapping_add(0x18)) as usize);
+            // 0x49376a: mov dword ptr [0x25f5bb8], eax
+            wd(0x25f5bb8usize, eax);
+            // 0x49376f: mov ecx, dword ptr [ebp + 0x1c]
+            ecx = rd((ebp.wrapping_add(0x1c)) as usize);
+            // 0x493772: mov dword ptr [0x25f5bbc], ecx
+            wd(0x25f5bbcusize, ecx);
+            // 0x493778: lea edx, [esp + 0x28]
+            edx = (esp.wrapping_add(0x28));
+            // 0x49377c: lea esi, [ebp + 0x20]
+            esi = (ebp.wrapping_add(0x20));
+            // 0x49377f: mov ecx, 9
+            ecx = 0x9u32;
+            // 0x493784: mov edi, 0x25f5bc0
+            edi = 0x25f5bc0u32;
+            // 0x493789: push 0x25f5b14
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5b14u32);
+            // 0x49378e: rep movsd dword ptr es:[edi], dword ptr [esi]
+            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
+            // 0x493790: fstp dword ptr [0x25f5be4]
+            wf(0x25f5be4usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493796: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x493797: call 0xbde980
+            callx!(0xbde980, 2, 0, 0, 0.0, 0.0);
+            // 0x49379c: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49379f: fadd dword ptr [0x2526be8]
+            { let v = fx.s(0) + (rf(0x2526be8usize) as f64); fx.set(0, v); }
+            // 0x4937a5: mov byte ptr [0xe996e5], 1
+            wb(0xe996e5usize, (0x1u32) as u8);
+            // 0x4937ac: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4937b0: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x4937b4: fcomp dword ptr [0xe88be8]
+            fx.sw = fcmp(fx.s(0), (rf(0xe88be8usize) as f64));
+            fx.pop();
+            // 0x4937ba: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x4937bc: test ah, 1
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x1u32), 8);
+            // 0x4937bf: je 0x4937c8
+            if fl.zf { pc = 0x4937c8; } else { pc = 0x4937c1; } continue;
+        }
+        0x4937c1 => {
+            bump(C::CuNoMove);
+            // 0x4937c1: mov byte ptr [0xe996e5], 0
+            wb(0xe996e5usize, (0x0u32) as u8);
+            pc = 0x4937c8; continue;
+        }
+        0x4937c8 => {
+            // 0x4937c8: movzx eax, word ptr [0x25f5bec]
+            eax = (rw(0x25f5becusize) as u32);
+            // 0x4937cf: fldz 
+            fx.push(0.0);
+            // 0x4937d1: mov edi, 0x25f5b14
+            edi = 0x25f5b14u32;
+            // 0x4937d6: fstp dword ptr [0x2526be8]
+            wf(0x2526be8usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4937dc: mov dword ptr [0x25f5bf0], eax
+            wd(0x25f5bf0usize, eax);
+            // 0x4937e1: call 0x4a9be0
+            callx!(0x4a9be0, 0, 0, 0, 0.0, 0.0);
+            // 0x4937e6: cmp byte ptr [0x2526b5a], 0
+            fl = f_sub((rb(0x2526b5ausize) as u32), 0x0u32, 8);
+            // 0x4937ed: mov word ptr [0x25f5bec], ax
+            ww(0x25f5becusize, ((eax & 0xffff)) as u16);
+            // 0x4937f3: je 0x493803
+            if fl.zf { pc = 0x493803; } else { pc = 0x4937f5; } continue;
+        }
+        0x4937f5 => {
+            bump(C::CuRegionReset);
+            // 0x4937f5: mov byte ptr [0xfa239a], 0
+            wb(0xfa239ausize, (0x0u32) as u8);
+            // 0x4937fc: mov byte ptr [0x2526b5a], 0
+            wb(0x2526b5ausize, (0x0u32) as u8);
+            pc = 0x493803; continue;
+        }
+        0x493803 => {
+            // 0x493803: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x493804: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x493805: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x493806: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x493807: add esp, 0x8c
+            { let a = esp; let b = 0x8cu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49380d: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn camera_update_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { camera_update_body(&mut *ent, args) }
+}
+
+ent_thunk!(camera_update_thunk, camera_update_entry, 0);
+
+const CAMERA_UPDATE_BODY: [u8; 1310] = [
+    0xA1, 0xB0, 0x5B, 0x5F, 0x02, 0x81, 0xEC, 0x8C, 0x00, 0x00, 0x00, 0x53, 0x55, 0x33, 0xDB, 0x3B,
+    0xC3, 0x56, 0x57, 0x0F, 0x84, 0xFA, 0x04, 0x00, 0x00, 0x8B, 0xC8, 0x81, 0xE1, 0xFF, 0x0F, 0x00,
+    0x00, 0xC1, 0xE1, 0x04, 0x8B, 0xA9, 0x64, 0x9C, 0x14, 0x02, 0x3B, 0xEB, 0x89, 0x6C, 0x24, 0x18,
+    0x0F, 0x84, 0xDD, 0x04, 0x00, 0x00, 0x39, 0x45, 0x44, 0x0F, 0x85, 0xD4, 0x04, 0x00, 0x00, 0xE8,
+    0x0C, 0x02, 0x01, 0x00, 0xD9, 0x05, 0x7C, 0x43, 0xE8, 0x00, 0x83, 0x3D, 0x00, 0x6C, 0xE9, 0x00,
+    0x0D, 0xD9, 0x5C, 0x24, 0x14, 0x75, 0x2D, 0x83, 0x3D, 0x44, 0xC4, 0x13, 0x02, 0x01, 0x75, 0x24,
+    0xA1, 0xF8, 0xB4, 0x13, 0x02, 0x3B, 0xC3, 0x74, 0x1B, 0x8B, 0x40, 0x04, 0x3B, 0xC3, 0x74, 0x14,
+    0x8B, 0x40, 0x04, 0x3B, 0xC3, 0x74, 0x0D, 0x8B, 0x50, 0x04, 0x83, 0x3A, 0x02, 0x75, 0x05, 0xE8,
+    0x0C, 0x77, 0x41, 0x00, 0x8B, 0x0D, 0x18, 0x5B, 0x5F, 0x02, 0xA1, 0x14, 0x5B, 0x5F, 0x02, 0x8B,
+    0x15, 0x1C, 0x5B, 0x5F, 0x02, 0x89, 0x0D, 0x30, 0x5B, 0x5F, 0x02, 0xB9, 0x09, 0x00, 0x00, 0x00,
+    0xBE, 0x38, 0x5B, 0x5F, 0x02, 0xBF, 0x80, 0x5B, 0x5F, 0x02, 0xA3, 0x2C, 0x5B, 0x5F, 0x02, 0x89,
+    0x15, 0x34, 0x5B, 0x5F, 0x02, 0xF3, 0xA5, 0xD9, 0x05, 0xA4, 0x5B, 0x5F, 0x02, 0xD9, 0x1D, 0xAC,
+    0x5B, 0x5F, 0x02, 0x8B, 0x0D, 0xB0, 0x5B, 0x5F, 0x02, 0x3B, 0xCB, 0x74, 0x3E, 0x8B, 0xC1, 0x25,
+    0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x3B, 0xC3, 0x74,
+    0x2A, 0x39, 0x48, 0x44, 0x75, 0x25, 0xF6, 0x05, 0xE8, 0x5B, 0x5F, 0x02, 0x02, 0x75, 0x1C, 0x8B,
+    0x48, 0x4C, 0x83, 0xF9, 0x05, 0x74, 0x0D, 0x83, 0xF9, 0x01, 0x75, 0x0F, 0x38, 0x98, 0x95, 0x05,
+    0x00, 0x00, 0x74, 0x07, 0xE8, 0x67, 0xC4, 0x26, 0x00, 0xEB, 0x04, 0xD9, 0x44, 0x24, 0x14, 0xD9,
+    0x5C, 0x24, 0x14, 0xD9, 0x05, 0x14, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x28, 0xD9, 0x05, 0x18,
+    0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x05, 0x1C, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24,
+    0x30, 0xD9, 0xEE, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41,
+    0x75, 0x55, 0xA1, 0xE8, 0x5A, 0x5F, 0x02, 0x8D, 0x0C, 0x80, 0x8B, 0x04, 0x8D, 0x58, 0x52, 0xDD,
+    0x00, 0x3B, 0xC3, 0x74, 0x0D, 0x51, 0xD9, 0x1C, 0x24, 0xFF, 0xD0, 0xD9, 0x44, 0x24, 0x18, 0x83,
+    0xC4, 0x04, 0xF6, 0x05, 0xE8, 0x5B, 0x5F, 0x02, 0x02, 0x74, 0x2C, 0x51, 0xD9, 0x1C, 0x24, 0x68,
+    0x5C, 0x5B, 0x5F, 0x02, 0x68, 0xA8, 0x5B, 0x5F, 0x02, 0x68, 0x20, 0x5B, 0x5F, 0x02, 0xBF, 0xA8,
+    0x5B, 0x5F, 0x02, 0xB9, 0x20, 0x5B, 0x5F, 0x02, 0xB8, 0x5C, 0x5B, 0x5F, 0x02, 0xE8, 0x1E, 0xFF,
+    0x00, 0x00, 0x83, 0xC4, 0x10, 0xEB, 0x02, 0xDD, 0xD8, 0xE8, 0x12, 0xDA, 0x00, 0x00, 0xF6, 0x05,
+    0xE8, 0x5B, 0x5F, 0x02, 0x04, 0x74, 0x59, 0xD9, 0x05, 0x14, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24,
+    0x34, 0xD9, 0x05, 0x18, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x38, 0xD9, 0x05, 0x1C, 0x5B, 0x5F,
+    0x02, 0xD9, 0x5C, 0x24, 0x3C, 0xE8, 0x36, 0xF9, 0xFF, 0xFF, 0x83, 0x25, 0xE8, 0x5B, 0x5F, 0x02,
+    0xFB, 0x8D, 0x44, 0x24, 0x34, 0xB9, 0x14, 0x5B, 0x5F, 0x02, 0xE8, 0x61, 0xB5, 0x74, 0x00, 0xDC,
+    0x1D, 0x40, 0xC5, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x14, 0x8A, 0x15, 0x48, 0x8B,
+    0x52, 0x02, 0x84, 0xD2, 0x75, 0x0A, 0xC6, 0x05, 0x20, 0x96, 0x52, 0x02, 0x01, 0x8D, 0x49, 0x00,
+    0x8B, 0x0D, 0x24, 0x5B, 0x5F, 0x02, 0xA1, 0x20, 0x5B, 0x5F, 0x02, 0x8B, 0x15, 0x28, 0x5B, 0x5F,
+    0x02, 0x89, 0x0D, 0x18, 0x5B, 0x5F, 0x02, 0xB9, 0x09, 0x00, 0x00, 0x00, 0xBE, 0x5C, 0x5B, 0x5F,
+    0x02, 0xBF, 0x38, 0x5B, 0x5F, 0x02, 0xA3, 0x14, 0x5B, 0x5F, 0x02, 0x89, 0x15, 0x1C, 0x5B, 0x5F,
+    0x02, 0xF3, 0xA5, 0xF6, 0x05, 0xE8, 0x5B, 0x5F, 0x02, 0x08, 0x74, 0x52, 0xD9, 0x05, 0x84, 0x43,
+    0xE8, 0x00, 0xDC, 0x0D, 0x30, 0xC1, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0xEE, 0xD9, 0x44,
+    0x24, 0x10, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x13, 0xDD, 0xD9, 0xD9, 0xE8, 0xD8,
+    0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0x75, 0x06, 0xDD, 0xD8, 0xEB, 0x06, 0xDD, 0xD8,
+    0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x05, 0xA8, 0x5B, 0x5F, 0x02, 0xD9, 0x05, 0xA4, 0x5B, 0x5F, 0x02,
+    0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0x44, 0x24, 0x10, 0xDE, 0xCA, 0xDE, 0xC1, 0xEB, 0x06, 0xD9, 0x05,
+    0xA8, 0x5B, 0x5F, 0x02, 0x38, 0x1D, 0x5F, 0x82, 0xE8, 0x00, 0xD9, 0x1D, 0xA4, 0x5B, 0x5F, 0x02,
+    0x0F, 0x84, 0xC4, 0x01, 0x00, 0x00, 0x8B, 0x15, 0x28, 0x5B, 0x5F, 0x02, 0xD9, 0x05, 0xA0, 0xDA,
+    0xE5, 0x00, 0xA1, 0x20, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x58, 0x8B, 0x0D, 0x24, 0x5B, 0x5F,
+    0x02, 0x89, 0x54, 0x24, 0x48, 0x89, 0x54, 0x24, 0x54, 0x8B, 0x15, 0x08, 0x39, 0xF5, 0x00, 0x3B,
+    0xD3, 0x89, 0x5C, 0x24, 0x5C, 0x89, 0x9C, 0x24, 0x84, 0x00, 0x00, 0x00, 0x89, 0x9C, 0x24, 0x88,
+    0x00, 0x00, 0x00, 0x89, 0x9C, 0x24, 0x94, 0x00, 0x00, 0x00, 0x89, 0x5C, 0x24, 0x1C, 0x89, 0x5C,
+    0x24, 0x20, 0xC7, 0x44, 0x24, 0x24, 0x00, 0x00, 0x00, 0x80, 0x89, 0x44, 0x24, 0x40, 0x89, 0x4C,
+    0x24, 0x44, 0x89, 0x44, 0x24, 0x4C, 0x89, 0x4C, 0x24, 0x50, 0xC7, 0x84, 0x24, 0x8C, 0x00, 0x00,
+    0x00, 0x50, 0x00, 0x00, 0x00, 0xC7, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x74, 0x0F, 0xE8, 0x29, 0xF7, 0xFF, 0xFF, 0x8B, 0x15, 0x08, 0x39, 0xF5, 0x00, 0x3B, 0xD3, 0x75,
+    0xF1, 0x53, 0x8D, 0x44, 0x24, 0x20, 0x6A, 0x01, 0x50, 0x8D, 0x4C, 0x24, 0x4C, 0xE8, 0xEE, 0x71,
+    0x26, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x0F, 0x84, 0xE8, 0x00, 0x00, 0x00, 0x8B, 0x44, 0x24,
+    0x20, 0x3B, 0xC3, 0x0F, 0x8E, 0xDC, 0x00, 0x00, 0x00, 0x8B, 0x7C, 0x24, 0x1C, 0x8B, 0x2D, 0xA0,
+    0xCE, 0xEB, 0x00, 0x8B, 0x1D, 0x9C, 0xCE, 0xEB, 0x00, 0x83, 0xC7, 0x28, 0x89, 0x44, 0x24, 0x10,
+    0x8B, 0x07, 0x85, 0xC0, 0x0F, 0x84, 0xA9, 0x00, 0x00, 0x00, 0x8B, 0xC8, 0x81, 0xE1, 0xFF, 0x0F,
+    0x00, 0x00, 0xC1, 0xE1, 0x04, 0x8B, 0xB1, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xF6, 0x0F, 0x84, 0x90,
+    0x00, 0x00, 0x00, 0x8B, 0x4E, 0x44, 0x3B, 0xC8, 0x0F, 0x85, 0x85, 0x00, 0x00, 0x00, 0x83, 0x7E,
+    0x4C, 0x01, 0x75, 0x7F, 0x85, 0xC9, 0x74, 0x6A, 0x85, 0xDB, 0x74, 0x0F, 0x3B, 0x4B, 0x44, 0x75,
+    0x0A, 0x83, 0xFD, 0x07, 0x74, 0x05, 0x83, 0xFD, 0x08, 0x75, 0x57, 0x8B, 0xC6, 0xE8, 0x2E, 0x5C,
+    0x52, 0x00, 0x84, 0xC0, 0x75, 0x4C, 0x8B, 0x96, 0x74, 0x0D, 0x00, 0x00, 0x8B, 0xCA, 0xE8, 0x2D,
+    0xF2, 0x64, 0x00, 0x85, 0xC0, 0x0F, 0x95, 0xC0, 0x84, 0xC0, 0x74, 0x36, 0x8B, 0xCA, 0xE8, 0x1D,
+    0xF2, 0x64, 0x00, 0x85, 0xC0, 0x74, 0x2B, 0x8B, 0x8E, 0x78, 0x0D, 0x00, 0x00, 0x83, 0xF9, 0xFF,
+    0x74, 0x20, 0x8B, 0x90, 0xE4, 0x84, 0x00, 0x00, 0x8B, 0x84, 0x8A, 0xF4, 0x06, 0x00, 0x00, 0x3B,
+    0x05, 0x0C, 0x63, 0x3D, 0x03, 0x74, 0x1C, 0x8B, 0xC6, 0xE8, 0x52, 0x2F, 0x49, 0x00, 0x84, 0xC0,
+    0x75, 0x11, 0xE8, 0x89, 0xF6, 0xFF, 0xFF, 0x8B, 0x2D, 0xA0, 0xCE, 0xEB, 0x00, 0x8B, 0x1D, 0x9C,
+    0xCE, 0xEB, 0x00, 0x83, 0xC7, 0x3C, 0x83, 0x6C, 0x24, 0x10, 0x01, 0x0F, 0x85, 0x3F, 0xFF, 0xFF,
+    0xFF, 0x8B, 0x6C, 0x24, 0x18, 0x8B, 0x74, 0x24, 0x24, 0x85, 0xF6, 0x78, 0x2D, 0x8B, 0x0D, 0xBC,
+    0xF2, 0x1B, 0x03, 0x51, 0xFF, 0x15, 0x7C, 0x80, 0xDB, 0x00, 0x8B, 0x4C, 0x24, 0x1C, 0x81, 0xE6,
+    0xFF, 0xFF, 0xFF, 0x3F, 0x8B, 0xD6, 0xC1, 0xE2, 0x04, 0x2B, 0xD6, 0x03, 0xD2, 0x6A, 0x17, 0x03,
+    0xD2, 0x52, 0x51, 0x8B, 0xC8, 0xE8, 0x76, 0x80, 0x89, 0x00, 0x8B, 0x55, 0x14, 0xD9, 0x44, 0x24,
+    0x14, 0x89, 0x15, 0xB4, 0x5B, 0x5F, 0x02, 0x8B, 0x45, 0x18, 0xA3, 0xB8, 0x5B, 0x5F, 0x02, 0x8B,
+    0x4D, 0x1C, 0x89, 0x0D, 0xBC, 0x5B, 0x5F, 0x02, 0x8D, 0x54, 0x24, 0x28, 0x8D, 0x75, 0x20, 0xB9,
+    0x09, 0x00, 0x00, 0x00, 0xBF, 0xC0, 0x5B, 0x5F, 0x02, 0x68, 0x14, 0x5B, 0x5F, 0x02, 0xF3, 0xA5,
+    0xD9, 0x1D, 0xE4, 0x5B, 0x5F, 0x02, 0x52, 0xE8, 0xE4, 0xB1, 0x74, 0x00, 0x83, 0xC4, 0x08, 0xD8,
+    0x05, 0xE8, 0x6B, 0x52, 0x02, 0xC6, 0x05, 0xE5, 0x96, 0xE9, 0x00, 0x01, 0xD9, 0x5C, 0x24, 0x18,
+    0xD9, 0x44, 0x24, 0x18, 0xD8, 0x1D, 0xE8, 0x8B, 0xE8, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x01, 0x74,
+    0x07, 0xC6, 0x05, 0xE5, 0x96, 0xE9, 0x00, 0x00, 0x0F, 0xB7, 0x05, 0xEC, 0x5B, 0x5F, 0x02, 0xD9,
+    0xEE, 0xBF, 0x14, 0x5B, 0x5F, 0x02, 0xD9, 0x1D, 0xE8, 0x6B, 0x52, 0x02, 0xA3, 0xF0, 0x5B, 0x5F,
+    0x02, 0xE8, 0xFA, 0x63, 0x01, 0x00, 0x80, 0x3D, 0x5A, 0x6B, 0x52, 0x02, 0x00, 0x66, 0xA3, 0xEC,
+    0x5B, 0x5F, 0x02, 0x74, 0x0E, 0xC6, 0x05, 0x9A, 0x23, 0xFA, 0x00, 0x00, 0xC6, 0x05, 0x5A, 0x6B,
+    0x52, 0x02, 0x00, 0x5F, 0x5E, 0x5D, 0x5B, 0x81, 0xC4, 0x8C, 0x00, 0x00, 0x00, 0xC3,
+];
+
+
+// --- cam_498d40 (0x498d40..0x499113, 979 bytes) ----------------------------------------
+
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn cam_498d40_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x498d40;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x498d40 => {
+            bump(C::Cam498d40Calls);
+            // 0x498d40: mov ecx, dword ptr [0x25f5bb0]
+            ecx = rd(0x25f5bb0usize);
+            // 0x498d46: sub esp, 0x68
+            { let a = esp; let b = 0x68u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x498d49: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x498d4b: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x498d4c: push ebp
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebp);
+            // 0x498d4d: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x498d4e: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x498d4f: je 0x498d6a
+            if fl.zf { pc = 0x498d6a; } else { pc = 0x498d51; } continue;
+        }
+        0x498d51 => {
+            // 0x498d51: mov eax, ecx
+            eax = ecx;
+            // 0x498d53: and eax, 0xfff
+            { let r = (eax) & (0xfffu32); fl = f_logic(r, 32); eax = r; }
+            // 0x498d58: shl eax, 4
+            { let r = eax << 4; fl = f_logic(r, 32); eax = r; }
+            // 0x498d5b: mov eax, dword ptr [eax + 0x2149c64]
+            eax = rd((eax.wrapping_add(0x2149c64)) as usize);
+            // 0x498d61: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x498d63: je 0x498d6a
+            if fl.zf { pc = 0x498d6a; } else { pc = 0x498d65; } continue;
+        }
+        0x498d65 => {
+            // 0x498d65: cmp dword ptr [eax + 0x44], ecx
+            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
+            // 0x498d68: je 0x498d6e
+            if fl.zf { pc = 0x498d6e; } else { pc = 0x498d6a; } continue;
+        }
+        0x498d6a => {
+            // 0x498d6a: xor ebp, ebp
+            fl = f_logic(0, 32); ebp = 0;
+            // 0x498d6c: jmp 0x498d7e
+            pc = 0x498d7e; continue;
+        }
+        0x498d6e => {
+            // 0x498d6e: xor ecx, ecx
+            fl = f_logic(0, 32); ecx = 0;
+            // 0x498d70: cmp dword ptr [eax + 0x4c], 5
+            fl = f_sub(rd((eax.wrapping_add(0x4c)) as usize), 0x5u32, 32);
+            // 0x498d74: setne cl
+            ecx = (ecx & 0xffffff00) | (((!fl.zf) as u32) & 0xff);
+            // 0x498d77: sub ecx, 1
+            { let a = ecx; let b = 0x1u32; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x498d7a: and ecx, eax
+            { let r = (ecx) & (eax); fl = f_logic(r, 32); ecx = r; }
+            // 0x498d7c: mov ebp, ecx
+            ebp = ecx;
+            pc = 0x498d7e; continue;
+        }
+        0x498d7e => {
+            // 0x498d7e: fldz 
+            fx.push(0.0);
+            // 0x498d80: mov esi, dword ptr [esp + 0x7c]
+            esi = rd((esp.wrapping_add(0x7c)) as usize);
+            // 0x498d84: xor bl, bl
+            fl = f_logic(0, 8); ebx = (ebx & 0xffffff00) | ((0) & 0xff);
+            // 0x498d86: fstp dword ptr [esi + 0xc]
+            wf((esi.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498d89: test ebp, ebp
+            fl = f_logic((ebp) & (ebp), 32);
+            // 0x498d8b: je 0x498dcc
+            if fl.zf { pc = 0x498dcc; } else { pc = 0x498d8d; } continue;
+        }
+        0x498d8d => {
+            // 0x498d8d: mov eax, dword ptr [ebp + 0x84e4]
+            eax = rd((ebp.wrapping_add(0x84e4)) as usize);
+            // 0x498d93: cmp dword ptr [eax + 0x9c], 2
+            fl = f_sub(rd((eax.wrapping_add(0x9c)) as usize), 0x2u32, 32);
+            // 0x498d9a: jne 0x498dbe
+            if !fl.zf { pc = 0x498dbe; } else { pc = 0x498d9c; } continue;
+        }
+        0x498d9c => {
+            // 0x498d9c: mov edi, ebp
+            edi = ebp;
+            // 0x498d9e: call 0xaab6b0
+            callx!(0xaab6b0, 30, 0, 0, 0.0, 0.0);
+            // 0x498da3: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x498da5: jne 0x498da9
+            if !fl.zf { pc = 0x498da9; } else { pc = 0x498da7; } continue;
+        }
+        0x498da7 => {
+            // 0x498da7: mov bl, 1
+            ebx = (ebx & 0xffffff00) | ((0x1u32) & 0xff);
+            pc = 0x498da9; continue;
+        }
+        0x498da9 => {
+            // 0x498da9: cmp byte ptr [ebp + 0x84d8], 1
+            fl = f_sub((rb((ebp.wrapping_add(0x84d8)) as usize) as u32), 0x1u32, 8);
+            // 0x498db0: jne 0x498dd6
+            if !fl.zf { pc = 0x498dd6; } else { pc = 0x498db2; } continue;
+        }
+        0x498db2 => {
+            // 0x498db2: mov eax, dword ptr [ebp + 0x6ce8]
+            eax = rd((ebp.wrapping_add(0x6ce8)) as usize);
+            // 0x498db8: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x498dba: jne 0x498dd0
+            if !fl.zf { pc = 0x498dd0; } else { pc = 0x498dbc; } continue;
+        }
+        0x498dbc => {
+            // 0x498dbc: jmp 0x498de1
+            pc = 0x498de1; continue;
+        }
+        0x498dbe => {
+            // 0x498dbe: mov ebx, dword ptr [eax + 0x5b0]
+            ebx = rd((eax.wrapping_add(0x5b0)) as usize);
+            // 0x498dc4: shr ebx, 0x1e
+            { let r = ebx >> 30; fl = f_logic(r, 32); ebx = r; }
+            // 0x498dc7: and bl, 1
+            { let r = ((ebx & 0xff)) & (0x1u32); fl = f_logic(r, 8); ebx = (ebx & 0xffffff00) | ((r) & 0xff); }
+            // 0x498dca: jmp 0x498da9
+            pc = 0x498da9; continue;
+        }
+        0x498dcc => {
+            // 0x498dcc: xor bl, bl
+            fl = f_logic(0, 8); ebx = (ebx & 0xffffff00) | ((0) & 0xff);
+            // 0x498dce: jmp 0x498dee
+            pc = 0x498dee; continue;
+        }
+        0x498dd0 => {
+            // 0x498dd0: jg 0x498dd6
+            if !fl.zf && fl.sf == fl.of { pc = 0x498dd6; } else { pc = 0x498dd2; } continue;
+        }
+        0x498dd2 => {
+            // 0x498dd2: xor eax, eax
+            fl = f_logic(0, 32); eax = 0;
+            // 0x498dd4: jmp 0x498de1
+            pc = 0x498de1; continue;
+        }
+        0x498dd6 => {
+            // 0x498dd6: mov eax, dword ptr [ebp + 0x8abc]
+            eax = rd((ebp.wrapping_add(0x8abc)) as usize);
+            // 0x498ddc: call 0x960d60
+            callx!(0x960d60, 30, 0, 0, 0.0, 0.0);
+            pc = 0x498de1; continue;
+        }
+        0x498de1 => {
+            // 0x498de1: cmp eax, dword ptr [0x21703d4]
+            fl = f_sub(eax, rd(0x21703d4usize), 32);
+            // 0x498de7: mov byte ptr [esp + 0x13], 1
+            wb((esp.wrapping_add(0x13)) as usize, (0x1u32) as u8);
+            // 0x498dec: je 0x498df3
+            if fl.zf { pc = 0x498df3; } else { pc = 0x498dee; } continue;
+        }
+        0x498dee => {
+            // 0x498dee: mov byte ptr [esp + 0x13], 0
+            wb((esp.wrapping_add(0x13)) as usize, (0x0u32) as u8);
+            pc = 0x498df3; continue;
+        }
+        0x498df3 => {
+            // 0x498df3: test bl, bl
+            fl = f_logic(((ebx & 0xff)) & ((ebx & 0xff)), 8);
+            // 0x498df5: je 0x499044
+            if fl.zf { pc = 0x499044; } else { pc = 0x498dfb; } continue;
+        }
+        0x498dfb => {
+            // 0x498dfb: cmp byte ptr [esp + 0x13], 0
+            fl = f_sub((rb((esp.wrapping_add(0x13)) as usize) as u32), 0x0u32, 8);
+            // 0x498e00: je 0x49903d
+            if fl.zf { pc = 0x49903d; } else { pc = 0x498e06; } continue;
+        }
+        0x498e06 => {
+            bump(C::Cam498d40B498E06);
+            // 0x498e06: fld dword ptr [esi + 4]
+            fx.push(rf((esi.wrapping_add(0x4)) as usize) as f64);
+            // 0x498e09: sub esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x498e0c: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498e10: lea ebx, [esi + 0x24]
+            ebx = (esi.wrapping_add(0x24));
+            // 0x498e13: fld dword ptr [esi + 0x10]
+            fx.push(rf((esi.wrapping_add(0x10)) as usize) as f64);
+            // 0x498e16: lea edx, [esp + 0x60]
+            edx = (esp.wrapping_add(0x60));
+            // 0x498e1a: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498e1e: fld dword ptr [ebx]
+            fx.push(rf((ebx) as usize) as f64);
+            // 0x498e20: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498e23: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x498e24: call 0xbe2d90
+            callx!(0xbe2d90, 34, 4, 0, 0.0, 0.0);
+            // 0x498e29: lea edi, [esp + 0x54]
+            edi = (esp.wrapping_add(0x54));
+            // 0x498e2d: lea eax, [esp + 0x34]
+            eax = (esp.wrapping_add(0x34));
+            // 0x498e31: call 0xc053e0
+            callx!(0xc053e0, 30, 0, 0, 0.0, 0.0);
+            // 0x498e36: test ebp, ebp
+            fl = f_logic((ebp) & (ebp), 32);
+            // 0x498e38: je 0x498eea
+            if fl.zf { pc = 0x498eea; } else { pc = 0x498e3e; } continue;
+        }
+        0x498e3e => {
+            // 0x498e3e: cmp dword ptr [esi + 0x68], 0
+            fl = f_sub(rd((esi.wrapping_add(0x68)) as usize), 0x0u32, 32);
+            // 0x498e42: lea edx, [esi + 0x68]
+            edx = (esi.wrapping_add(0x68));
+            // 0x498e45: jl 0x498eea
+            if fl.sf != fl.of { pc = 0x498eea; } else { pc = 0x498e4b; } continue;
+        }
+        0x498e4b => {
+            // 0x498e4b: mov eax, edx
+            eax = edx;
+            // 0x498e4d: call 0xbdd230
+            callx!(0xbdd230, 30, 0, 0, 0.0, 0.0);
+            // 0x498e52: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x498e54: jne 0x498eea
+            if !fl.zf { pc = 0x498eea; } else { pc = 0x498e5a; } continue;
+        }
+        0x498e5a => {
+            // 0x498e5a: mov esi, dword ptr [ebp + 0x84e4]
+            esi = rd((ebp.wrapping_add(0x84e4)) as usize);
+            // 0x498e60: fld dword ptr [esi + 0x4d0]
+            fx.push(rf((esi.wrapping_add(0x4d0)) as usize) as f64);
+            // 0x498e66: mov eax, edx
+            eax = edx;
+            // 0x498e68: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498e6c: call 0xbdd260
+            callx!(0xbdd260, 30, 0, 0, 0.0, 0.0);
+            // 0x498e71: cmp dword ptr [esi + 0x9c], 3
+            fl = f_sub(rd((esi.wrapping_add(0x9c)) as usize), 0x3u32, 32);
+            // 0x498e78: mov dword ptr [esp + 0x14], eax
+            wd((esp.wrapping_add(0x14)) as usize, eax);
+            // 0x498e7c: fild dword ptr [esp + 0x14]
+            fx.push(rd((esp.wrapping_add(0x14)) as usize) as i32 as f64);
+            // 0x498e80: fdiv qword ptr [0xe5bf98]
+            { let v = fx.s(0) / rdf64(0xe5bf98usize); fx.set(0, v); }
+            // 0x498e86: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498e8a: jne 0x498ece
+            if !fl.zf { pc = 0x498ece; } else { pc = 0x498e8c; } continue;
+        }
+        0x498e8c => {
+            bump(C::Cam498d40B498E8C);
+            // 0x498e8c: mov ecx, ebp
+            ecx = ebp;
+            // 0x498e8e: call 0xaa6a90
+            callx!(0xaa6a90, 30, 0, 0, 0.0, 0.0);
+            // 0x498e93: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498e97: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x498e9b: mov esi, dword ptr [ebp + 0x84e4]
+            esi = rd((ebp.wrapping_add(0x84e4)) as usize);
+            // 0x498ea1: fdiv dword ptr [esi + 0x4f4]
+            { let v = fx.s(0) / (rf((esi.wrapping_add(0x4f4)) as usize) as f64); fx.set(0, v); }
+            // 0x498ea7: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498eab: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x498eaf: fcomp qword ptr [0xe5bf40]
+            fx.sw = fcmp(fx.s(0), rdf64(0xe5bf40usize));
+            fx.pop();
+            // 0x498eb5: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x498eb7: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x498eba: jp 0x498ec2
+            if fl.pf { pc = 0x498ec2; } else { pc = 0x498ebc; } continue;
+        }
+        0x498ebc => {
+            // 0x498ebc: fld1 
+            fx.push(1.0);
+            // 0x498ebe: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x498ec2; continue;
+        }
+        0x498ec2 => {
+            // 0x498ec2: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x498ec6: fmul dword ptr [esp + 0x18]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
+            // 0x498eca: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x498ece; continue;
+        }
+        0x498ece => {
+            // 0x498ece: mov eax, dword ptr [ebp + 0x84e4]
+            eax = rd((ebp.wrapping_add(0x84e4)) as usize);
+            // 0x498ed4: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x498ed8: fsub dword ptr [eax + 0x4cc]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x4cc)) as usize) as f64); fx.set(0, v); }
+            // 0x498ede: fmul dword ptr [esp + 0x1c]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x498ee2: fadd dword ptr [eax + 0x4cc]
+            { let v = fx.s(0) + (rf((eax.wrapping_add(0x4cc)) as usize) as f64); fx.set(0, v); }
+            // 0x498ee8: jmp 0x498ef6
+            pc = 0x498ef6; continue;
+        }
+        0x498eea => {
+            // 0x498eea: mov esi, dword ptr [ebp + 0x84e4]
+            esi = rd((ebp.wrapping_add(0x84e4)) as usize);
+            // 0x498ef0: fld dword ptr [esi + 0x4cc]
+            fx.push(rf((esi.wrapping_add(0x4cc)) as usize) as f64);
+            pc = 0x498ef6; continue;
+        }
+        0x498ef6 => {
+            // 0x498ef6: test dword ptr [esi + 0x5b0], 0x80000000
+            fl = f_logic((rd((esi.wrapping_add(0x5b0)) as usize)) & (0x80000000u32), 32);
+            // 0x498f00: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498f04: fld dword ptr [0xe8437c]
+            fx.push(rf(0xe8437cusize) as f64);
+            // 0x498f0a: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x498f0c: fmul dword ptr [esp + 0x14]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
+            // 0x498f10: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498f14: je 0x498fae
+            if fl.zf { pc = 0x498fae; } else { pc = 0x498f1a; } continue;
+        }
+        0x498f1a => {
+            bump(C::Cam498d40B498F1A);
+            // 0x498f1a: fmul dword ptr [esi + 0x4d4]
+            { let v = fx.s(0) * (rf((esi.wrapping_add(0x4d4)) as usize) as f64); fx.set(0, v); }
+            // 0x498f20: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498f24: fld dword ptr [ebp + 0x3c]
+            fx.push(rf((ebp.wrapping_add(0x3c)) as usize) as f64);
+            // 0x498f27: fmul dword ptr [esp + 0x70]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x70)) as usize) as f64); fx.set(0, v); }
+            // 0x498f2b: fld dword ptr [ebp + 0x38]
+            fx.push(rf((ebp.wrapping_add(0x38)) as usize) as f64);
+            // 0x498f2e: fmul dword ptr [esp + 0x6c]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x6c)) as usize) as f64); fx.set(0, v); }
+            // 0x498f32: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x498f34: fld dword ptr [ebp + 0x40]
+            fx.push(rf((ebp.wrapping_add(0x40)) as usize) as f64);
+            // 0x498f37: fmul dword ptr [esp + 0x74]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x74)) as usize) as f64); fx.set(0, v); }
+            // 0x498f3b: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x498f3d: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498f41: fld1 
+            fx.push(1.0);
+            // 0x498f43: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x498f47: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x498f49: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x498f4b: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x498f4d: test ah, 1
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x1u32), 8);
+            // 0x498f50: jne 0x498f58
+            if !fl.zf { pc = 0x498f58; } else { pc = 0x498f52; } continue;
+        }
+        0x498f52 => {
+            // 0x498f52: fstp st(0)
+            fx.pop();
+            // 0x498f54: fldz 
+            fx.push(0.0);
+            // 0x498f56: jmp 0x498f6e
+            pc = 0x498f6e; continue;
+        }
+        0x498f58 => {
+            // 0x498f58: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x498f59: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498f5c: call 0x42ef30
+            callx!(0x42ef30, 31, 0, 0, 0.0, 0.0);
+            // 0x498f61: fabs 
+            { let v = fx.s(0).abs(); fx.set(0, v); }
+            // 0x498f63: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x498f66: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498f6a: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            pc = 0x498f6e; continue;
+        }
+        0x498f6e => {
+            // 0x498f6e: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498f72: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x498f76: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x498f7a: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x498f7c: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x498f7e: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x498f81: jp 0x498f8f
+            if fl.pf { pc = 0x498f8f; } else { pc = 0x498f83; } continue;
+        }
+        0x498f83 => {
+            // 0x498f83: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x498f85: fstp st(0)
+            fx.pop();
+            // 0x498f87: fld1 
+            fx.push(1.0);
+            // 0x498f89: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498f8d: jmp 0x498fb0
+            pc = 0x498fb0; continue;
+        }
+        0x498f8f => {
+            // 0x498f8f: fdivp st(1)
+            { let v = fx.s(1) / fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x498f91: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498f95: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x498f99: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x498f9d: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x498f9f: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x498fa1: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x498fa3: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x498fa6: jne 0x498fae
+            if !fl.zf { pc = 0x498fae; } else { pc = 0x498fa8; } continue;
+        }
+        0x498fa8 => {
+            // 0x498fa8: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498fac: jmp 0x498fb0
+            pc = 0x498fb0; continue;
+        }
+        0x498fae => {
+            // 0x498fae: fstp st(0)
+            fx.pop();
+            pc = 0x498fb0; continue;
+        }
+        0x498fb0 => {
+            bump(C::Cam498d40B498FB0);
+            // 0x498fb0: lea edi, [ebp + 0x20]
+            edi = (ebp.wrapping_add(0x20));
+            // 0x498fb3: lea eax, [esp + 0x24]
+            eax = (esp.wrapping_add(0x24));
+            // 0x498fb7: call 0xc053e0
+            callx!(0xc053e0, 30, 0, 0, 0.0, 0.0);
+            // 0x498fbc: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x498fc0: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x498fc1: lea ecx, [esp + 0x28]
+            ecx = (esp.wrapping_add(0x28));
+            // 0x498fc5: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498fc8: lea esi, [esp + 0x38]
+            esi = (esp.wrapping_add(0x38));
+            // 0x498fcc: lea edi, [esp + 0x48]
+            edi = (esp.wrapping_add(0x48));
+            // 0x498fd0: call 0xc05e80
+            callx!(0xc05e80, 31, 0, 0, 0.0, 0.0);
+            // 0x498fd5: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x498fd8: lea ecx, [esp + 0x54]
+            ecx = (esp.wrapping_add(0x54));
+            // 0x498fdc: mov eax, edi
+            eax = edi;
+            // 0x498fde: call 0xc057d0
+            callx!(0xc057d0, 30, 0, 0, 0.0, 0.0);
+            // 0x498fe3: lea eax, [esp + 0x20]
+            eax = (esp.wrapping_add(0x20));
+            // 0x498fe7: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x498fe8: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x498fe9: lea edi, [esp + 0x24]
+            edi = (esp.wrapping_add(0x24));
+            // 0x498fed: mov esi, ecx
+            esi = ecx;
+            // 0x498fef: call 0xbe3150
+            callx!(0xbe3150, 32, 2, 0, 0.0, 0.0);
+            // 0x498ff4: fldz 
+            fx.push(0.0);
+            // 0x498ff6: sub esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x498ff9: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x498ffd: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x499001: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499004: call 0xbf14d0
+            callx!(0xbf14d0, 32, 0, 0, 0.0, 0.0);
+            // 0x499009: movss dword ptr [esp + 0x28], xmm0
+            wd((esp.wrapping_add(0x28)) as usize, xmm0);
+            // 0x49900f: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x499013: fstp dword ptr [0x25f5c58]
+            wf(0x25f5c58usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499019: mov ecx, dword ptr [ebp + 0x84e4]
+            ecx = rd((ebp.wrapping_add(0x84e4)) as usize);
+            // 0x49901f: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x499022: cmp dword ptr [ecx + 0x7c8], 1
+            fl = f_sub(rd((ecx.wrapping_add(0x7c8)) as usize), 0x1u32, 32);
+            // 0x499029: je 0x499061
+            if fl.zf { pc = 0x499061; } else { pc = 0x49902b; } continue;
+        }
+        0x49902b => {
+            // 0x49902b: mov eax, dword ptr [esp + 0x7c]
+            eax = rd((esp.wrapping_add(0x7c)) as usize);
+            // 0x49902f: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x499033: fst dword ptr [eax + 0x10]
+            wf((eax.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            // 0x499036: mov esi, eax
+            esi = eax;
+            // 0x499038: fstp dword ptr [eax + 0xc]
+            wf((eax.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49903b: jmp 0x499065
+            pc = 0x499065; continue;
+        }
+        0x49903d => {
+            // 0x49903d: fldz 
+            fx.push(0.0);
+            // 0x49903f: fstp dword ptr [esi + 0xc]
+            wf((esi.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499042: jmp 0x499065
+            pc = 0x499065; continue;
+        }
+        0x499044 => {
+            // 0x499044: fld dword ptr [esp + 0x80]
+            fx.push(rf((esp.wrapping_add(0x80)) as usize) as f64);
+            // 0x49904b: mov eax, dword ptr [esp + 0x84]
+            eax = rd((esp.wrapping_add(0x84)) as usize);
+            // 0x499052: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x499053: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499056: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x499057: call 0x498a20
+            callx!(0x498a20, 32, 0, 0, 0.0, 0.0);
+            // 0x49905c: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49905f: jmp 0x499065
+            pc = 0x499065; continue;
+        }
+        0x499061 => {
+            // 0x499061: mov esi, dword ptr [esp + 0x7c]
+            esi = rd((esp.wrapping_add(0x7c)) as usize);
+            pc = 0x499065; continue;
+        }
+        0x499065 => {
+            // 0x499065: test ebp, ebp
+            fl = f_logic((ebp) & (ebp), 32);
+            // 0x499067: je 0x4990a8
+            if fl.zf { pc = 0x4990a8; } else { pc = 0x499069; } continue;
+        }
+        0x499069 => {
+            // 0x499069: mov ebx, dword ptr [ebp + 0x84e4]
+            ebx = rd((ebp.wrapping_add(0x84e4)) as usize);
+            // 0x49906f: cmp dword ptr [ebx + 0x7c8], 1
+            fl = f_sub(rd((ebx.wrapping_add(0x7c8)) as usize), 0x1u32, 32);
+            // 0x499076: jne 0x4990a8
+            if !fl.zf { pc = 0x4990a8; } else { pc = 0x499078; } continue;
+        }
+        0x499078 => {
+            // 0x499078: cmp byte ptr [esp + 0x13], 0
+            fl = f_sub((rb((esp.wrapping_add(0x13)) as usize) as u32), 0x0u32, 8);
+            // 0x49907d: je 0x4990a8
+            if fl.zf { pc = 0x4990a8; } else { pc = 0x49907f; } continue;
+        }
+        0x49907f => {
+            bump(C::Cam498d40B49907F);
+            // 0x49907f: lea edx, [esp + 0x1c]
+            edx = (esp.wrapping_add(0x1c));
+            // 0x499083: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x499084: lea eax, [esp + 0x1c]
+            eax = (esp.wrapping_add(0x1c));
+            // 0x499088: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x499089: lea esi, [ebp + 0x20]
+            esi = (ebp.wrapping_add(0x20));
+            // 0x49908c: lea edi, [esp + 0x28]
+            edi = (esp.wrapping_add(0x28));
+            // 0x499090: call 0xbe3150
+            callx!(0xbe3150, 32, 2, 0, 0.0, 0.0);
+            // 0x499095: fld dword ptr [ebx + 0x7cc]
+            fx.push(rf((ebx.wrapping_add(0x7cc)) as usize) as f64);
+            // 0x49909b: fmul dword ptr [esp + 0x20]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49909f: mov ecx, dword ptr [esp + 0x7c]
+            ecx = rd((esp.wrapping_add(0x7c)) as usize);
+            // 0x4990a3: mov esi, ecx
+            esi = ecx;
+            // 0x4990a5: fstp dword ptr [ecx + 0xc]
+            wf((ecx.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x4990a8; continue;
+        }
+        0x4990a8 => {
+            // 0x4990a8: mov eax, dword ptr [0xe9a6b0]
+            eax = rd(0xe9a6b0usize);
+            // 0x4990ad: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x4990af: jl 0x4990d6
+            if fl.sf != fl.of { pc = 0x4990d6; } else { pc = 0x4990b1; } continue;
+        }
+        0x4990b1 => {
+            // 0x4990b1: mov ecx, dword ptr [0xe843ac]
+            ecx = rd(0xe843acusize);
+            // 0x4990b7: cmp eax, ecx
+            fl = f_sub(eax, ecx, 32);
+            // 0x4990b9: jle 0x4990c6
+            if fl.zf || fl.sf != fl.of { pc = 0x4990c6; } else { pc = 0x4990bb; } continue;
+        }
+        0x4990bb => {
+            // 0x4990bb: sub eax, ecx
+            { let a = eax; let b = ecx; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x4990bd: cmp eax, 0x35a4e900
+            fl = f_sub(eax, 0x35a4e900u32, 32);
+            // 0x4990c2: jl 0x4990d0
+            if fl.sf != fl.of { pc = 0x4990d0; } else { pc = 0x4990c4; } continue;
+        }
+        0x4990c4 => {
+            // 0x4990c4: jmp 0x4990d6
+            pc = 0x4990d6; continue;
+        }
+        0x4990c6 => {
+            // 0x4990c6: sub ecx, eax
+            { let a = ecx; let b = eax; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x4990c8: cmp ecx, 0x35a4e900
+            fl = f_sub(ecx, 0x35a4e900u32, 32);
+            // 0x4990ce: jl 0x4990d6
+            if fl.sf != fl.of { pc = 0x4990d6; } else { pc = 0x4990d0; } continue;
+        }
+        0x4990d0 => {
+            // 0x4990d0: mov dword ptr [esi], 4
+            wd((esi) as usize, 0x4u32);
+            pc = 0x4990d6; continue;
+        }
+        0x4990d6 => {
+            // 0x4990d6: test ebp, ebp
+            fl = f_logic((ebp) & (ebp), 32);
+            // 0x4990d8: je 0x49910b
+            if fl.zf { pc = 0x49910b; } else { pc = 0x4990da; } continue;
+        }
+        0x4990da => {
+            // 0x4990da: mov esi, dword ptr [0x21703d4]
+            esi = rd(0x21703d4usize);
+            // 0x4990e0: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x4990e2: je 0x49910b
+            if fl.zf { pc = 0x49910b; } else { pc = 0x4990e4; } continue;
+        }
+        0x4990e4 => {
+            // 0x4990e4: mov edx, dword ptr [ebp + 0x84e4]
+            edx = rd((ebp.wrapping_add(0x84e4)) as usize);
+            // 0x4990ea: cmp dword ptr [edx + 0x9c], 4
+            fl = f_sub(rd((edx.wrapping_add(0x9c)) as usize), 0x4u32, 32);
+            // 0x4990f1: sete al
+            eax = (eax & 0xffffff00) | (((fl.zf) as u32) & 0xff);
+            // 0x4990f4: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x4990f6: je 0x49910b
+            if fl.zf { pc = 0x49910b; } else { pc = 0x4990f8; } continue;
+        }
+        0x4990f8 => {
+            // 0x4990f8: call 0x960c30
+            callx!(0x960c30, 30, 0, 0, 0.0, 0.0);
+            // 0x4990fd: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x4990ff: je 0x49910b
+            if fl.zf { pc = 0x49910b; } else { pc = 0x499101; } continue;
+        }
+        0x499101 => {
+            // 0x499101: mov eax, dword ptr [esp + 0x7c]
+            eax = rd((esp.wrapping_add(0x7c)) as usize);
+            // 0x499105: mov dword ptr [eax], 4
+            wd((eax) as usize, 0x4u32);
+            pc = 0x49910b; continue;
+        }
+        0x49910b => {
+            // 0x49910b: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x49910c: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x49910d: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x49910e: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x49910f: add esp, 0x68
+            { let a = esp; let b = 0x68u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x499112: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn cam_498d40_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { cam_498d40_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_498d40_thunk, cam_498d40_entry, 0);
+
+const CAM_498D40_BODY: [u8; 979] = [
+    0x8B, 0x0D, 0xB0, 0x5B, 0x5F, 0x02, 0x83, 0xEC, 0x68, 0x85, 0xC9, 0x53, 0x55, 0x56, 0x57, 0x74,
+    0x19, 0x8B, 0xC1, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14,
+    0x02, 0x85, 0xC0, 0x74, 0x05, 0x39, 0x48, 0x44, 0x74, 0x04, 0x33, 0xED, 0xEB, 0x10, 0x33, 0xC9,
+    0x83, 0x78, 0x4C, 0x05, 0x0F, 0x95, 0xC1, 0x83, 0xE9, 0x01, 0x23, 0xC8, 0x8B, 0xE9, 0xD9, 0xEE,
+    0x8B, 0x74, 0x24, 0x7C, 0x32, 0xDB, 0xD9, 0x5E, 0x0C, 0x85, 0xED, 0x74, 0x3F, 0x8B, 0x85, 0xE4,
+    0x84, 0x00, 0x00, 0x83, 0xB8, 0x9C, 0x00, 0x00, 0x00, 0x02, 0x75, 0x22, 0x8B, 0xFD, 0xE8, 0x0D,
+    0x29, 0x61, 0x00, 0x84, 0xC0, 0x75, 0x02, 0xB3, 0x01, 0x80, 0xBD, 0xD8, 0x84, 0x00, 0x00, 0x01,
+    0x75, 0x24, 0x8B, 0x85, 0xE8, 0x6C, 0x00, 0x00, 0x85, 0xC0, 0x75, 0x14, 0xEB, 0x23, 0x8B, 0x98,
+    0xB0, 0x05, 0x00, 0x00, 0xC1, 0xEB, 0x1E, 0x80, 0xE3, 0x01, 0xEB, 0xDD, 0x32, 0xDB, 0xEB, 0x1E,
+    0x7F, 0x04, 0x33, 0xC0, 0xEB, 0x0B, 0x8B, 0x85, 0xBC, 0x8A, 0x00, 0x00, 0xE8, 0x7F, 0x7F, 0x4C,
+    0x00, 0x3B, 0x05, 0xD4, 0x03, 0x17, 0x02, 0xC6, 0x44, 0x24, 0x13, 0x01, 0x74, 0x05, 0xC6, 0x44,
+    0x24, 0x13, 0x00, 0x84, 0xDB, 0x0F, 0x84, 0x49, 0x02, 0x00, 0x00, 0x80, 0x7C, 0x24, 0x13, 0x00,
+    0x0F, 0x84, 0x37, 0x02, 0x00, 0x00, 0xD9, 0x46, 0x04, 0x83, 0xEC, 0x0C, 0xD9, 0x5C, 0x24, 0x08,
+    0x8D, 0x5E, 0x24, 0xD9, 0x46, 0x10, 0x8D, 0x54, 0x24, 0x60, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x03,
+    0xD9, 0x1C, 0x24, 0x52, 0xE8, 0x67, 0x9F, 0x74, 0x00, 0x8D, 0x7C, 0x24, 0x54, 0x8D, 0x44, 0x24,
+    0x34, 0xE8, 0xAA, 0xC5, 0x76, 0x00, 0x85, 0xED, 0x0F, 0x84, 0xAC, 0x00, 0x00, 0x00, 0x83, 0x7E,
+    0x68, 0x00, 0x8D, 0x56, 0x68, 0x0F, 0x8C, 0x9F, 0x00, 0x00, 0x00, 0x8B, 0xC2, 0xE8, 0xDE, 0x43,
+    0x74, 0x00, 0x84, 0xC0, 0x0F, 0x85, 0x90, 0x00, 0x00, 0x00, 0x8B, 0xB5, 0xE4, 0x84, 0x00, 0x00,
+    0xD9, 0x86, 0xD0, 0x04, 0x00, 0x00, 0x8B, 0xC2, 0xD9, 0x5C, 0x24, 0x18, 0xE8, 0xEF, 0x43, 0x74,
+    0x00, 0x83, 0xBE, 0x9C, 0x00, 0x00, 0x00, 0x03, 0x89, 0x44, 0x24, 0x14, 0xDB, 0x44, 0x24, 0x14,
+    0xDC, 0x35, 0x98, 0xBF, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x1C, 0x75, 0x42, 0x8B, 0xCD, 0xE8, 0xFD,
+    0xDB, 0x60, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0x8B, 0xB5, 0xE4, 0x84, 0x00,
+    0x00, 0xD8, 0xB6, 0xF4, 0x04, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0xDC,
+    0x1D, 0x40, 0xBF, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x06, 0xD9, 0xE8, 0xD9, 0x5C,
+    0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0x4C, 0x24, 0x18, 0xD9, 0x5C, 0x24, 0x18, 0x8B, 0x85,
+    0xE4, 0x84, 0x00, 0x00, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0xA0, 0xCC, 0x04, 0x00, 0x00, 0xD8, 0x4C,
+    0x24, 0x1C, 0xD8, 0x80, 0xCC, 0x04, 0x00, 0x00, 0xEB, 0x0C, 0x8B, 0xB5, 0xE4, 0x84, 0x00, 0x00,
+    0xD9, 0x86, 0xCC, 0x04, 0x00, 0x00, 0xF7, 0x86, 0xB0, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+    0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x05, 0x7C, 0x43, 0xE8, 0x00, 0xD9, 0xC0, 0xD8, 0x4C, 0x24, 0x14,
+    0xD9, 0x5C, 0x24, 0x14, 0x0F, 0x84, 0x94, 0x00, 0x00, 0x00, 0xD8, 0x8E, 0xD4, 0x04, 0x00, 0x00,
+    0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x45, 0x3C, 0xD8, 0x4C, 0x24, 0x70, 0xD9, 0x45, 0x38, 0xD8, 0x4C,
+    0x24, 0x6C, 0xDE, 0xC1, 0xD9, 0x45, 0x40, 0xD8, 0x4C, 0x24, 0x74, 0xDE, 0xC1, 0xD9, 0x5C, 0x24,
+    0x1C, 0xD9, 0xE8, 0xD9, 0x44, 0x24, 0x1C, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x01,
+    0x75, 0x06, 0xDD, 0xD8, 0xD9, 0xEE, 0xEB, 0x16, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0xCF, 0x5F, 0xF9,
+    0xFF, 0xD9, 0xE1, 0x83, 0xC4, 0x04, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0x5C,
+    0x24, 0x18, 0xD9, 0x44, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x05, 0x7A, 0x0C, 0xDD, 0xD9, 0xDD, 0xD8, 0xD9, 0xE8, 0xD9, 0x5C, 0x24, 0x14, 0xEB, 0x21, 0xDE,
+    0xF9, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0xD1, 0xDF,
+    0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0x75, 0x06, 0xD9, 0x5C, 0x24, 0x14, 0xEB, 0x02, 0xDD, 0xD8,
+    0x8D, 0x7D, 0x20, 0x8D, 0x44, 0x24, 0x24, 0xE8, 0x24, 0xC4, 0x76, 0x00, 0xD9, 0x44, 0x24, 0x14,
+    0x51, 0x8D, 0x4C, 0x24, 0x28, 0xD9, 0x1C, 0x24, 0x8D, 0x74, 0x24, 0x38, 0x8D, 0x7C, 0x24, 0x48,
+    0xE8, 0xAB, 0xCE, 0x76, 0x00, 0x83, 0xC4, 0x04, 0x8D, 0x4C, 0x24, 0x54, 0x8B, 0xC7, 0xE8, 0xED,
+    0xC7, 0x76, 0x00, 0x8D, 0x44, 0x24, 0x20, 0x50, 0x53, 0x8D, 0x7C, 0x24, 0x24, 0x8B, 0xF1, 0xE8,
+    0x5C, 0xA1, 0x74, 0x00, 0xD9, 0xEE, 0x83, 0xEC, 0x08, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24,
+    0x28, 0xD9, 0x1C, 0x24, 0xE8, 0xC7, 0x84, 0x75, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x28, 0xD9,
+    0x44, 0x24, 0x28, 0xD9, 0x1D, 0x58, 0x5C, 0x5F, 0x02, 0x8B, 0x8D, 0xE4, 0x84, 0x00, 0x00, 0x83,
+    0xC4, 0x08, 0x83, 0xB9, 0xC8, 0x07, 0x00, 0x00, 0x01, 0x74, 0x36, 0x8B, 0x44, 0x24, 0x7C, 0xD9,
+    0x44, 0x24, 0x1C, 0xD9, 0x50, 0x10, 0x8B, 0xF0, 0xD9, 0x58, 0x0C, 0xEB, 0x28, 0xD9, 0xEE, 0xD9,
+    0x5E, 0x0C, 0xEB, 0x21, 0xD9, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, 0x8B, 0x84, 0x24, 0x84, 0x00,
+    0x00, 0x00, 0x51, 0xD9, 0x1C, 0x24, 0x56, 0xE8, 0xC4, 0xF9, 0xFF, 0xFF, 0x83, 0xC4, 0x08, 0xEB,
+    0x04, 0x8B, 0x74, 0x24, 0x7C, 0x85, 0xED, 0x74, 0x3F, 0x8B, 0x9D, 0xE4, 0x84, 0x00, 0x00, 0x83,
+    0xBB, 0xC8, 0x07, 0x00, 0x00, 0x01, 0x75, 0x30, 0x80, 0x7C, 0x24, 0x13, 0x00, 0x74, 0x29, 0x8D,
+    0x54, 0x24, 0x1C, 0x52, 0x8D, 0x44, 0x24, 0x1C, 0x50, 0x8D, 0x75, 0x20, 0x8D, 0x7C, 0x24, 0x28,
+    0xE8, 0xBB, 0xA0, 0x74, 0x00, 0xD9, 0x83, 0xCC, 0x07, 0x00, 0x00, 0xD8, 0x4C, 0x24, 0x20, 0x8B,
+    0x4C, 0x24, 0x7C, 0x8B, 0xF1, 0xD9, 0x59, 0x0C, 0xA1, 0xB0, 0xA6, 0xE9, 0x00, 0x85, 0xC0, 0x7C,
+    0x25, 0x8B, 0x0D, 0xAC, 0x43, 0xE8, 0x00, 0x3B, 0xC1, 0x7E, 0x0B, 0x2B, 0xC1, 0x3D, 0x00, 0xE9,
+    0xA4, 0x35, 0x7C, 0x0C, 0xEB, 0x10, 0x2B, 0xC8, 0x81, 0xF9, 0x00, 0xE9, 0xA4, 0x35, 0x7C, 0x06,
+    0xC7, 0x06, 0x04, 0x00, 0x00, 0x00, 0x85, 0xED, 0x74, 0x31, 0x8B, 0x35, 0xD4, 0x03, 0x17, 0x02,
+    0x85, 0xF6, 0x74, 0x27, 0x8B, 0x95, 0xE4, 0x84, 0x00, 0x00, 0x83, 0xBA, 0x9C, 0x00, 0x00, 0x00,
+    0x04, 0x0F, 0x94, 0xC0, 0x84, 0xC0, 0x74, 0x13, 0xE8, 0x33, 0x7B, 0x4C, 0x00, 0x84, 0xC0, 0x74,
+    0x0A, 0x8B, 0x44, 0x24, 0x7C, 0xC7, 0x00, 0x04, 0x00, 0x00, 0x00, 0x5F, 0x5E, 0x5D, 0x5B, 0x83,
+    0xC4, 0x68, 0xC3,
+];
+
+
+// --- cam_499480 (0x499480..0x49979f, 799 bytes) ----------------------------------------
+
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn cam_499480_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x499480;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x499480 => {
+            bump(C::Cam499480Calls);
+            // 0x499480: fld dword ptr [esp + 8]
+            fx.push(rf((esp.wrapping_add(0x8)) as usize) as f64);
+            // 0x499484: sub esp, 0x18
+            { let a = esp; let b = 0x18u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x499487: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x499488: mov ebx, dword ptr [esp + 0x20]
+            ebx = rd((esp.wrapping_add(0x20)) as usize);
+            // 0x49948c: push ebp
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebp);
+            // 0x49948d: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49948e: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x49948f: mov edi, dword ptr [esp + 0x34]
+            edi = rd((esp.wrapping_add(0x34)) as usize);
+            // 0x499493: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x499494: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x499495: mov esi, ebx
+            esi = ebx;
+            // 0x499497: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49949a: call 0x498770
+            callx!(0x498770, 12, 0, 0, 0.0, 0.0);
+            // 0x49949f: fld dword ptr [esp + 0x38]
+            fx.push(rf((esp.wrapping_add(0x38)) as usize) as f64);
+            // 0x4994a3: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x4994a6: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x4994a7: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x4994a8: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4994ab: call 0x4988c0
+            callx!(0x4988c0, 12, 0, 0, 0.0, 0.0);
+            // 0x4994b0: fldz 
+            fx.push(0.0);
+            // 0x4994b2: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x4994b5: fstp dword ptr [ebx + 0xc]
+            wf((ebx.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4994b8: mov ecx, dword ptr [0x25f5bb0]
+            ecx = rd(0x25f5bb0usize);
+            // 0x4994be: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x4994c0: je 0x4994db
+            if fl.zf { pc = 0x4994db; } else { pc = 0x4994c2; } continue;
+        }
+        0x4994c2 => {
+            // 0x4994c2: mov eax, ecx
+            eax = ecx;
+            // 0x4994c4: and eax, 0xfff
+            { let r = (eax) & (0xfffu32); fl = f_logic(r, 32); eax = r; }
+            // 0x4994c9: shl eax, 4
+            { let r = eax << 4; fl = f_logic(r, 32); eax = r; }
+            // 0x4994cc: mov eax, dword ptr [eax + 0x2149c64]
+            eax = rd((eax.wrapping_add(0x2149c64)) as usize);
+            // 0x4994d2: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x4994d4: je 0x4994db
+            if fl.zf { pc = 0x4994db; } else { pc = 0x4994d6; } continue;
+        }
+        0x4994d6 => {
+            // 0x4994d6: cmp dword ptr [eax + 0x44], ecx
+            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
+            // 0x4994d9: je 0x4994df
+            if fl.zf { pc = 0x4994df; } else { pc = 0x4994db; } continue;
+        }
+        0x4994db => {
+            // 0x4994db: xor edi, edi
+            fl = f_logic(0, 32); edi = 0;
+            // 0x4994dd: jmp 0x4994ef
+            pc = 0x4994ef; continue;
+        }
+        0x4994df => {
+            // 0x4994df: xor ecx, ecx
+            fl = f_logic(0, 32); ecx = 0;
+            // 0x4994e1: cmp dword ptr [eax + 0x4c], 5
+            fl = f_sub(rd((eax.wrapping_add(0x4c)) as usize), 0x5u32, 32);
+            // 0x4994e5: setne cl
+            ecx = (ecx & 0xffffff00) | (((!fl.zf) as u32) & 0xff);
+            // 0x4994e8: sub ecx, 1
+            { let a = ecx; let b = 0x1u32; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x4994eb: and ecx, eax
+            { let r = (ecx) & (eax); fl = f_logic(r, 32); ecx = r; }
+            // 0x4994ed: mov edi, ecx
+            edi = ecx;
+            pc = 0x4994ef; continue;
+        }
+        0x4994ef => {
+            // 0x4994ef: cmp dword ptr [ebx + 0xe8], 0
+            fl = f_sub(rd((ebx.wrapping_add(0xe8)) as usize), 0x0u32, 32);
+            // 0x4994f6: jne 0x4996e8
+            if !fl.zf { pc = 0x4996e8; } else { pc = 0x4994fc; } continue;
+        }
+        0x4994fc => {
+            // 0x4994fc: mov eax, dword ptr [0xe9a6b0]
+            eax = rd(0xe9a6b0usize);
+            // 0x499501: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x499503: jge 0x499533
+            if fl.sf == fl.of { pc = 0x499533; } else { pc = 0x499505; } continue;
+        }
+        0x499505 => {
+            // 0x499505: mov eax, dword ptr [0xe843ac]
+            eax = rd(0xe843acusize);
+            // 0x49950a: add eax, 0x2710
+            { let a = eax; let b = 0x2710u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x49950f: cmp eax, 0x6b49d200
+            fl = f_sub(eax, 0x6b49d200u32, 32);
+            // 0x499514: mov dword ptr [ebx], 0
+            wd((ebx) as usize, 0x0u32);
+            // 0x49951a: mov dword ptr [ebx + 0x68], eax
+            wd((ebx.wrapping_add(0x68)) as usize, eax);
+            // 0x49951d: jle 0x4996e8
+            if fl.zf || fl.sf != fl.of { pc = 0x4996e8; } else { pc = 0x499523; } continue;
+        }
+        0x499523 => {
+            // 0x499523: add eax, 0x94b62e00
+            { let a = eax; let b = 0x94b62e00u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x499528: mov dword ptr [ebx + 0x68], eax
+            wd((ebx.wrapping_add(0x68)) as usize, eax);
+            // 0x49952b: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x49952c: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x49952d: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x49952e: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x49952f: add esp, 0x18
+            { let a = esp; let b = 0x18u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x499532: ret 
+            break;
+        }
+        0x499533 => {
+            // 0x499533: mov ebp, dword ptr [0xe843ac]
+            ebp = rd(0xe843acusize);
+            // 0x499539: cmp eax, ebp
+            fl = f_sub(eax, ebp, 32);
+            // 0x49953b: jle 0x49954c
+            if fl.zf || fl.sf != fl.of { pc = 0x49954c; } else { pc = 0x49953d; } continue;
+        }
+        0x49953d => {
+            // 0x49953d: sub eax, ebp
+            { let a = eax; let b = ebp; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x49953f: cmp eax, 0x35a4e900
+            fl = f_sub(eax, 0x35a4e900u32, 32);
+            // 0x499544: jl 0x4996e8
+            if fl.sf != fl.of { pc = 0x4996e8; } else { pc = 0x49954a; } continue;
+        }
+        0x49954a => {
+            // 0x49954a: jmp 0x49955c
+            pc = 0x49955c; continue;
+        }
+        0x49954c => {
+            // 0x49954c: mov edx, ebp
+            edx = ebp;
+            // 0x49954e: sub edx, eax
+            { let a = edx; let b = eax; fl = f_sub(a, b, 32); edx = a.wrapping_sub(b); }
+            // 0x499550: cmp edx, 0x35a4e900
+            fl = f_sub(edx, 0x35a4e900u32, 32);
+            // 0x499556: jge 0x4996e8
+            if fl.sf == fl.of { pc = 0x4996e8; } else { pc = 0x49955c; } continue;
+        }
+        0x49955c => {
+            // 0x49955c: mov esi, dword ptr [0x21703d4]
+            esi = rd(0x21703d4usize);
+            // 0x499562: mov eax, dword ptr [esi + 0xc0]
+            eax = rd((esi.wrapping_add(0xc0)) as usize);
+            // 0x499568: mov ecx, eax
+            ecx = eax;
+            // 0x49956a: shr ecx, 0x1e
+            { let r = ecx >> 30; fl = f_logic(r, 32); ecx = r; }
+            // 0x49956d: test cl, 1
+            fl = f_logic(((ecx & 0xff)) & (0x1u32), 8);
+            // 0x499570: jne 0x4996e8
+            if !fl.zf { pc = 0x4996e8; } else { pc = 0x499576; } continue;
+        }
+        0x499576 => {
+            // 0x499576: shr eax, 0x1d
+            { let r = eax >> 29; fl = f_logic(r, 32); eax = r; }
+            // 0x499579: test al, 1
+            fl = f_logic(((eax & 0xff)) & (0x1u32), 8);
+            // 0x49957b: jne 0x4996e8
+            if !fl.zf { pc = 0x4996e8; } else { pc = 0x499581; } continue;
+        }
+        0x499581 => {
+            // 0x499581: cmp byte ptr [0x2529771], 0
+            fl = f_sub((rb(0x2529771usize) as u32), 0x0u32, 8);
+            // 0x499588: jne 0x4996e8
+            if !fl.zf { pc = 0x4996e8; } else { pc = 0x49958e; } continue;
+        }
+        0x49958e => {
+            // 0x49958e: cmp dword ptr [0xe9a5bc], 7
+            fl = f_sub(rd(0xe9a5bcusize), 0x7u32, 32);
+            // 0x499595: je 0x4996e8
+            if fl.zf { pc = 0x4996e8; } else { pc = 0x49959b; } continue;
+        }
+        0x49959b => {
+            // 0x49959b: test edi, edi
+            fl = f_logic((edi) & (edi), 32);
+            // 0x49959d: je 0x4996a8
+            if fl.zf { pc = 0x4996a8; } else { pc = 0x4995a3; } continue;
+        }
+        0x4995a3 => {
+            // 0x4995a3: cmp byte ptr [edi + 0x84d8], 1
+            fl = f_sub((rb((edi.wrapping_add(0x84d8)) as usize) as u32), 0x1u32, 8);
+            // 0x4995aa: jne 0x4996a8
+            if !fl.zf { pc = 0x4996a8; } else { pc = 0x4995b0; } continue;
+        }
+        0x4995b0 => {
+            // 0x4995b0: mov edx, dword ptr [edi + 0x84e4]
+            edx = rd((edi.wrapping_add(0x84e4)) as usize);
+            // 0x4995b6: mov eax, dword ptr [edx + 0x9c]
+            eax = rd((edx.wrapping_add(0x9c)) as usize);
+            // 0x4995bc: sub eax, 3
+            { let a = eax; let b = 0x3u32; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x4995bf: je 0x49960d
+            if fl.zf { pc = 0x49960d; } else { pc = 0x4995c1; } continue;
+        }
+        0x4995c1 => {
+            // 0x4995c1: sub eax, 1
+            { let a = eax; let b = 0x1u32; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x4995c4: jne 0x4996a8
+            if !fl.zf { pc = 0x4996a8; } else { pc = 0x4995ca; } continue;
+        }
+        0x4995ca => {
+            // 0x4995ca: mov edi, dword ptr [edi + 0x550]
+            edi = rd((edi.wrapping_add(0x550)) as usize);
+            // 0x4995d0: test edi, edi
+            fl = f_logic((edi) & (edi), 32);
+            // 0x4995d2: je 0x4996a8
+            if fl.zf { pc = 0x4996a8; } else { pc = 0x4995d8; } continue;
+        }
+        0x4995d8 => {
+            // 0x4995d8: fld dword ptr [edi + 0x68]
+            fx.push(rf((edi.wrapping_add(0x68)) as usize) as f64);
+            // 0x4995db: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x4995dc: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4995df: call 0x49ee60
+            callx!(0x49ee60, 11, 0, 0, 0.0, 0.0);
+            // 0x4995e4: fcomp qword ptr [0xe5c1a0]
+            fx.sw = fcmp(fx.s(0), rdf64(0xe5c1a0usize));
+            fx.pop();
+            // 0x4995ea: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x4995ed: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x4995ef: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x4995f2: jnp 0x4996e8
+            if !fl.pf { pc = 0x4996e8; } else { pc = 0x4995f8; } continue;
+        }
+        0x4995f8 => {
+            // 0x4995f8: call 0x960c30
+            callx!(0x960c30, 10, 0, 0, 0.0, 0.0);
+            // 0x4995fd: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x4995ff: je 0x4996a8
+            if fl.zf { pc = 0x4996a8; } else { pc = 0x499605; } continue;
+        }
+        0x499605 => {
+            // 0x499605: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x499606: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x499607: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x499608: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x499609: add esp, 0x18
+            { let a = esp; let b = 0x18u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49960c: ret 
+            break;
+        }
+        0x49960d => {
+            // 0x49960d: mov eax, dword ptr [edi + 0x540]
+            eax = rd((edi.wrapping_add(0x540)) as usize);
+            // 0x499613: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x499615: je 0x4996a8
+            if fl.zf { pc = 0x4996a8; } else { pc = 0x49961b; } continue;
+        }
+        0x49961b => {
+            bump(C::Cam499480B49961B);
+            // 0x49961b: fld dword ptr [eax + 0x24]
+            fx.push(rf((eax.wrapping_add(0x24)) as usize) as f64);
+            // 0x49961e: mov ecx, edi
+            ecx = edi;
+            // 0x499620: fstp dword ptr [esp + 0x2c]
+            wf((esp.wrapping_add(0x2c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499624: call 0xaa6a90
+            callx!(0xaa6a90, 10, 0, 0, 0.0, 0.0);
+            // 0x499629: lea eax, [esp + 0x1c]
+            eax = (esp.wrapping_add(0x1c));
+            // 0x49962d: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499631: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x499632: mov ecx, edi
+            ecx = edi;
+            // 0x499634: call 0xaa69d0
+            callx!(0xaa69d0, 11, 0, 0, 0.0, 0.0);
+            // 0x499639: fld dword ptr [edi + 0x30]
+            fx.push(rf((edi.wrapping_add(0x30)) as usize) as f64);
+            // 0x49963c: fmul dword ptr [esp + 0x24]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
+            // 0x499640: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x499643: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x499647: fmul dword ptr [edi + 0x2c]
+            { let v = fx.s(0) * (rf((edi.wrapping_add(0x2c)) as usize) as f64); fx.set(0, v); }
+            // 0x49964a: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x49964c: fld dword ptr [edi + 0x34]
+            fx.push(rf((edi.wrapping_add(0x34)) as usize) as f64);
+            // 0x49964f: fmul dword ptr [esp + 0x24]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
+            // 0x499653: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x499655: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499659: fld dword ptr [esp + 0x2c]
+            fx.push(rf((esp.wrapping_add(0x2c)) as usize) as f64);
+            // 0x49965d: fabs 
+            { let v = fx.s(0).abs(); fx.set(0, v); }
+            // 0x49965f: fstp dword ptr [esp + 0x2c]
+            wf((esp.wrapping_add(0x2c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499663: fld dword ptr [esp + 0x2c]
+            fx.push(rf((esp.wrapping_add(0x2c)) as usize) as f64);
+            // 0x499667: fcomp qword ptr [0xe5c1a0]
+            fx.sw = fcmp(fx.s(0), rdf64(0xe5c1a0usize));
+            fx.pop();
+            // 0x49966d: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49966f: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x499672: jp 0x49968d
+            if fl.pf { pc = 0x49968d; } else { pc = 0x499674; } continue;
+        }
+        0x499674 => {
+            // 0x499674: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x499678: mov ecx, dword ptr [edi + 0x84e4]
+            ecx = rd((edi.wrapping_add(0x84e4)) as usize);
+            // 0x49967e: fld dword ptr [ecx + 0x4f4]
+            fx.push(rf((ecx.wrapping_add(0x4f4)) as usize) as f64);
+            // 0x499684: fcompp 
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop(); fx.pop();
+            // 0x499686: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x499688: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49968b: je 0x4996e8
+            if fl.zf { pc = 0x4996e8; } else { pc = 0x49968d; } continue;
+        }
+        0x49968d => {
+            // 0x49968d: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x499691: fabs 
+            { let v = fx.s(0).abs(); fx.set(0, v); }
+            // 0x499693: fstp dword ptr [esp + 0x2c]
+            wf((esp.wrapping_add(0x2c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499697: fld dword ptr [esp + 0x2c]
+            fx.push(rf((esp.wrapping_add(0x2c)) as usize) as f64);
+            // 0x49969b: fcomp qword ptr [0xe5c0f8]
+            fx.sw = fcmp(fx.s(0), rdf64(0xe5c0f8usize));
+            fx.pop();
+            // 0x4996a1: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x4996a3: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x4996a6: je 0x4996e8
+            if fl.zf { pc = 0x4996e8; } else { pc = 0x4996a8; } continue;
+        }
+        0x4996a8 => {
+            // 0x4996a8: lea eax, [ebp + 0x2710]
+            eax = (ebp.wrapping_add(0x2710));
+            // 0x4996ae: cmp eax, 0x6b49d200
+            fl = f_sub(eax, 0x6b49d200u32, 32);
+            // 0x4996b3: mov dword ptr [ebx + 0x68], eax
+            wd((ebx.wrapping_add(0x68)) as usize, eax);
+            // 0x4996b6: jle 0x4996c0
+            if fl.zf || fl.sf != fl.of { pc = 0x4996c0; } else { pc = 0x4996b8; } continue;
+        }
+        0x4996b8 => {
+            // 0x4996b8: add eax, 0x94b62e00
+            { let a = eax; let b = 0x94b62e00u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x4996bd: mov dword ptr [ebx + 0x68], eax
+            wd((ebx.wrapping_add(0x68)) as usize, eax);
+            pc = 0x4996c0; continue;
+        }
+        0x4996c0 => {
+            // 0x4996c0: lea eax, [ebp + 0x7d0]
+            eax = (ebp.wrapping_add(0x7d0));
+            // 0x4996c6: cmp eax, 0x6b49d200
+            fl = f_sub(eax, 0x6b49d200u32, 32);
+            // 0x4996cb: mov dword ptr [0xe9a6b0], 0xffffffff
+            wd(0xe9a6b0usize, 0xffffffffu32);
+            // 0x4996d5: mov dword ptr [ebx + 0x6c], eax
+            wd((ebx.wrapping_add(0x6c)) as usize, eax);
+            // 0x4996d8: jle 0x4996e2
+            if fl.zf || fl.sf != fl.of { pc = 0x4996e2; } else { pc = 0x4996da; } continue;
+        }
+        0x4996da => {
+            // 0x4996da: add eax, 0x94b62e00
+            { let a = eax; let b = 0x94b62e00u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x4996df: mov dword ptr [ebx + 0x6c], eax
+            wd((ebx.wrapping_add(0x6c)) as usize, eax);
+            pc = 0x4996e2; continue;
+        }
+        0x4996e2 => {
+            // 0x4996e2: mov dword ptr [ebx], 0
+            wd((ebx) as usize, 0x0u32);
+            pc = 0x4996e8; continue;
+        }
+        0x4996e8 => {
+            // 0x4996e8: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x4996e9: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x4996ea: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x4996eb: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x4996ec: add esp, 0x18
+            { let a = esp; let b = 0x18u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x4996ef: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn cam_499480_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { cam_499480_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_499480_thunk, cam_499480_entry, 0);
+
+const CAM_499480_BODY: [u8; 799] = [
+    0xD9, 0x44, 0x24, 0x08, 0x83, 0xEC, 0x18, 0x53, 0x8B, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x8B,
+    0x7C, 0x24, 0x34, 0x57, 0x51, 0x8B, 0xF3, 0xD9, 0x1C, 0x24, 0xE8, 0xD1, 0xF2, 0xFF, 0xFF, 0xD9,
+    0x44, 0x24, 0x38, 0x83, 0xC4, 0x08, 0x57, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0x10, 0xF4, 0xFF, 0xFF,
+    0xD9, 0xEE, 0x83, 0xC4, 0x08, 0xD9, 0x5B, 0x0C, 0x8B, 0x0D, 0xB0, 0x5B, 0x5F, 0x02, 0x85, 0xC9,
+    0x74, 0x19, 0x8B, 0xC1, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C,
+    0x14, 0x02, 0x85, 0xC0, 0x74, 0x05, 0x39, 0x48, 0x44, 0x74, 0x04, 0x33, 0xFF, 0xEB, 0x10, 0x33,
+    0xC9, 0x83, 0x78, 0x4C, 0x05, 0x0F, 0x95, 0xC1, 0x83, 0xE9, 0x01, 0x23, 0xC8, 0x8B, 0xF9, 0x83,
+    0xBB, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x85, 0xEC, 0x01, 0x00, 0x00, 0xA1, 0xB0, 0xA6, 0xE9,
+    0x00, 0x85, 0xC0, 0x7D, 0x2E, 0xA1, 0xAC, 0x43, 0xE8, 0x00, 0x05, 0x10, 0x27, 0x00, 0x00, 0x3D,
+    0x00, 0xD2, 0x49, 0x6B, 0xC7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x89, 0x43, 0x68, 0x0F, 0x8E, 0xC5,
+    0x01, 0x00, 0x00, 0x05, 0x00, 0x2E, 0xB6, 0x94, 0x89, 0x43, 0x68, 0x5F, 0x5E, 0x5D, 0x5B, 0x83,
+    0xC4, 0x18, 0xC3, 0x8B, 0x2D, 0xAC, 0x43, 0xE8, 0x00, 0x3B, 0xC5, 0x7E, 0x0F, 0x2B, 0xC5, 0x3D,
+    0x00, 0xE9, 0xA4, 0x35, 0x0F, 0x8C, 0x9E, 0x01, 0x00, 0x00, 0xEB, 0x10, 0x8B, 0xD5, 0x2B, 0xD0,
+    0x81, 0xFA, 0x00, 0xE9, 0xA4, 0x35, 0x0F, 0x8D, 0x8C, 0x01, 0x00, 0x00, 0x8B, 0x35, 0xD4, 0x03,
+    0x17, 0x02, 0x8B, 0x86, 0xC0, 0x00, 0x00, 0x00, 0x8B, 0xC8, 0xC1, 0xE9, 0x1E, 0xF6, 0xC1, 0x01,
+    0x0F, 0x85, 0x72, 0x01, 0x00, 0x00, 0xC1, 0xE8, 0x1D, 0xA8, 0x01, 0x0F, 0x85, 0x67, 0x01, 0x00,
+    0x00, 0x80, 0x3D, 0x71, 0x97, 0x52, 0x02, 0x00, 0x0F, 0x85, 0x5A, 0x01, 0x00, 0x00, 0x83, 0x3D,
+    0xBC, 0xA5, 0xE9, 0x00, 0x07, 0x0F, 0x84, 0x4D, 0x01, 0x00, 0x00, 0x85, 0xFF, 0x0F, 0x84, 0x05,
+    0x01, 0x00, 0x00, 0x80, 0xBF, 0xD8, 0x84, 0x00, 0x00, 0x01, 0x0F, 0x85, 0xF8, 0x00, 0x00, 0x00,
+    0x8B, 0x97, 0xE4, 0x84, 0x00, 0x00, 0x8B, 0x82, 0x9C, 0x00, 0x00, 0x00, 0x83, 0xE8, 0x03, 0x74,
+    0x4C, 0x83, 0xE8, 0x01, 0x0F, 0x85, 0xDE, 0x00, 0x00, 0x00, 0x8B, 0xBF, 0x50, 0x05, 0x00, 0x00,
+    0x85, 0xFF, 0x0F, 0x84, 0xD0, 0x00, 0x00, 0x00, 0xD9, 0x47, 0x68, 0x51, 0xD9, 0x1C, 0x24, 0xE8,
+    0x7C, 0x58, 0x00, 0x00, 0xDC, 0x1D, 0xA0, 0xC1, 0xE5, 0x00, 0x83, 0xC4, 0x04, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x05, 0x0F, 0x8B, 0xF0, 0x00, 0x00, 0x00, 0xE8, 0x33, 0x76, 0x4C, 0x00, 0x84, 0xC0, 0x0F,
+    0x84, 0xA3, 0x00, 0x00, 0x00, 0x5F, 0x5E, 0x5D, 0x5B, 0x83, 0xC4, 0x18, 0xC3, 0x8B, 0x87, 0x40,
+    0x05, 0x00, 0x00, 0x85, 0xC0, 0x0F, 0x84, 0x8D, 0x00, 0x00, 0x00, 0xD9, 0x40, 0x24, 0x8B, 0xCF,
+    0xD9, 0x5C, 0x24, 0x2C, 0xE8, 0x67, 0xD4, 0x60, 0x00, 0x8D, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24,
+    0x14, 0x50, 0x8B, 0xCF, 0xE8, 0x97, 0xD3, 0x60, 0x00, 0xD9, 0x47, 0x30, 0xD8, 0x4C, 0x24, 0x24,
+    0x83, 0xC4, 0x04, 0xD9, 0x44, 0x24, 0x1C, 0xD8, 0x4F, 0x2C, 0xDE, 0xC1, 0xD9, 0x47, 0x34, 0xD8,
+    0x4C, 0x24, 0x24, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0xE1, 0xD9,
+    0x5C, 0x24, 0x2C, 0xD9, 0x44, 0x24, 0x2C, 0xDC, 0x1D, 0xA0, 0xC1, 0xE5, 0x00, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x05, 0x7A, 0x19, 0xD9, 0x44, 0x24, 0x14, 0x8B, 0x8F, 0xE4, 0x84, 0x00, 0x00, 0xD9, 0x81,
+    0xF4, 0x04, 0x00, 0x00, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x74, 0x5B, 0xD9, 0x44, 0x24,
+    0x18, 0xD9, 0xE1, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x44, 0x24, 0x2C, 0xDC, 0x1D, 0xF8, 0xC0, 0xE5,
+    0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x74, 0x40, 0x8D, 0x85, 0x10, 0x27, 0x00, 0x00, 0x3D, 0x00,
+    0xD2, 0x49, 0x6B, 0x89, 0x43, 0x68, 0x7E, 0x08, 0x05, 0x00, 0x2E, 0xB6, 0x94, 0x89, 0x43, 0x68,
+    0x8D, 0x85, 0xD0, 0x07, 0x00, 0x00, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0xC7, 0x05, 0xB0, 0xA6, 0xE9,
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x89, 0x43, 0x6C, 0x7E, 0x08, 0x05, 0x00, 0x2E, 0xB6, 0x94, 0x89,
+    0x43, 0x6C, 0xC7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x5F, 0x5E, 0x5D, 0x5B, 0x83, 0xC4, 0x18, 0xC3,
+    0xA1, 0xB0, 0x5B, 0x5F, 0x02, 0x83, 0xEC, 0x08, 0x85, 0xC0, 0x56, 0x74, 0x1A, 0x8B, 0xC8, 0x81,
+    0xE1, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE1, 0x04, 0x8B, 0xB1, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xF6,
+    0x74, 0x05, 0x39, 0x46, 0x44, 0x74, 0x02, 0x33, 0xF6, 0x83, 0x7E, 0x4C, 0x01, 0x0F, 0x85, 0x28,
+    0x01, 0x00, 0x00, 0x8B, 0xD6, 0xE8, 0xC6, 0xBE, 0x4E, 0x00, 0x84, 0xC0, 0x74, 0x04, 0xD9, 0xEE,
+    0xEB, 0x07, 0x8B, 0xCE, 0xE8, 0x67, 0xAB, 0x4C, 0x00, 0x8B, 0x96, 0xE0, 0x05, 0x00, 0x00, 0xD9,
+    0x5C, 0x24, 0x04, 0x81, 0x7A, 0x14, 0x70, 0x01, 0x00, 0x00, 0xD9, 0xE8, 0x75, 0x04, 0xD9, 0x54,
+    0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xDC, 0x15, 0x10, 0xC2, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x41, 0x75, 0x04, 0xDD, 0xD8, 0xEB, 0x11, 0xDD, 0xD9, 0xDC, 0x1D, 0xE8, 0x50, 0xDD, 0x00, 0xDF,
+    0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x06, 0xD9, 0xEE, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04,
+    0x8B, 0xD6, 0xD8, 0x25, 0x10, 0x6C, 0x52, 0x02, 0xD9, 0x5C, 0x24, 0x08, 0xE8, 0x5F, 0xBE, 0x4E,
+    0x00, 0x84, 0xC0, 0x74, 0x08, 0xD9, 0x05, 0xD0, 0x99, 0xE9, 0x00, 0xEB, 0x06, 0xD9, 0x05,
+];
+
+
+// --- cam_499190 (0x499190..0x499476, 742 bytes) ----------------------------------------
+
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn cam_499190_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x499190;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x499190 => {
+            bump(C::Cam499190Calls);
+            // 0x499190: sub esp, 0x5c
+            { let a = esp; let b = 0x5cu32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x499193: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x499194: mov ebx, dword ptr [esp + 0x64]
+            ebx = rd((esp.wrapping_add(0x64)) as usize);
+            // 0x499198: mov ecx, dword ptr [ebx + 0x90]
+            ecx = rd((ebx.wrapping_add(0x90)) as usize);
+            // 0x49919e: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x4991a0: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x4991a1: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x4991a2: je 0x49939d
+            if fl.zf { pc = 0x49939d; } else { pc = 0x4991a8; } continue;
+        }
+        0x4991a8 => {
+            // 0x4991a8: mov eax, ecx
+            eax = ecx;
+            // 0x4991aa: and eax, 0xfff
+            { let r = (eax) & (0xfffu32); fl = f_logic(r, 32); eax = r; }
+            // 0x4991af: shl eax, 4
+            { let r = eax << 4; fl = f_logic(r, 32); eax = r; }
+            // 0x4991b2: mov eax, dword ptr [eax + 0x2149c64]
+            eax = rd((eax.wrapping_add(0x2149c64)) as usize);
+            // 0x4991b8: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x4991ba: je 0x49939d
+            if fl.zf { pc = 0x49939d; } else { pc = 0x4991c0; } continue;
+        }
+        0x4991c0 => {
+            // 0x4991c0: cmp dword ptr [eax + 0x44], ecx
+            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
+            // 0x4991c3: jne 0x49939d
+            if !fl.zf { pc = 0x49939d; } else { pc = 0x4991c9; } continue;
+        }
+        0x4991c9 => {
+            // 0x4991c9: cmp dword ptr [eax + 0x4c], 5
+            fl = f_sub(rd((eax.wrapping_add(0x4c)) as usize), 0x5u32, 32);
+            // 0x4991cd: jne 0x49939d
+            if !fl.zf { pc = 0x49939d; } else { pc = 0x4991d3; } continue;
+        }
+        0x4991d3 => {
+            bump(C::Cam499190B4991D3);
+            // 0x4991d3: lea ecx, [eax + 0x20]
+            ecx = (eax.wrapping_add(0x20));
+            // 0x4991d6: lea eax, [esp + 0x14]
+            eax = (esp.wrapping_add(0x14));
+            // 0x4991da: lea edx, [ebx + 0x98]
+            edx = (ebx.wrapping_add(0x98));
+            // 0x4991e0: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x4991e1: call 0x406810
+            callx!(0x406810, 3, 0, 0, 0.0, 0.0);
+            // 0x4991e6: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x4991e9: lea eax, [esp + 0x14]
+            eax = (esp.wrapping_add(0x14));
+            // 0x4991ed: lea ecx, [esp + 0x44]
+            ecx = (esp.wrapping_add(0x44));
+            // 0x4991f1: call 0xbe4b20
+            callx!(0xbe4b20, 2, 0, 0, 0.0, 0.0);
+            // 0x4991f6: mov edi, 0x25f5b5c
+            edi = 0x25f5b5cu32;
+            // 0x4991fb: lea eax, [esp + 0x24]
+            eax = (esp.wrapping_add(0x24));
+            // 0x4991ff: call 0xc053e0
+            callx!(0xc053e0, 2, 0, 0, 0.0, 0.0);
+            // 0x499204: lea edi, [esp + 0x44]
+            edi = (esp.wrapping_add(0x44));
+            // 0x499208: lea eax, [esp + 0x14]
+            eax = (esp.wrapping_add(0x14));
+            // 0x49920c: call 0xc053e0
+            callx!(0xc053e0, 2, 0, 0, 0.0, 0.0);
+            // 0x499211: fld dword ptr [ebx + 0x94]
+            fx.push(rf((ebx.wrapping_add(0x94)) as usize) as f64);
+            // 0x499217: fmul dword ptr [0xe8437c]
+            { let v = fx.s(0) * (rf(0xe8437cusize) as f64); fx.set(0, v); }
+            // 0x49921d: fstp dword ptr [esp + 0x6c]
+            wf((esp.wrapping_add(0x6c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499221: fld1 
+            fx.push(1.0);
+            // 0x499223: fcom dword ptr [esp + 0x6c]
+            fx.sw = fcmp(fx.s(0), (rf((esp.wrapping_add(0x6c)) as usize) as f64));
+            // 0x499227: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x499229: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49922c: je 0x499234
+            if fl.zf { pc = 0x499234; } else { pc = 0x49922e; } continue;
+        }
+        0x49922e => {
+            // 0x49922e: fstp dword ptr [esp + 0x6c]
+            wf((esp.wrapping_add(0x6c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499232: jmp 0x499236
+            pc = 0x499236; continue;
+        }
+        0x499234 => {
+            // 0x499234: fstp st(0)
+            fx.pop();
+            pc = 0x499236; continue;
+        }
+        0x499236 => {
+            bump(C::Cam499190B499236);
+            // 0x499236: fld dword ptr [esp + 0x6c]
+            fx.push(rf((esp.wrapping_add(0x6c)) as usize) as f64);
+            // 0x49923a: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49923b: lea ecx, [esp + 0x18]
+            ecx = (esp.wrapping_add(0x18));
+            // 0x49923f: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499242: lea esi, [esp + 0x28]
+            esi = (esp.wrapping_add(0x28));
+            // 0x499246: lea edi, [esp + 0x38]
+            edi = (esp.wrapping_add(0x38));
+            // 0x49924a: call 0xc05e80
+            callx!(0xc05e80, 3, 0, 0, 0.0, 0.0);
+            // 0x49924f: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x499252: lea ecx, [esp + 0x44]
+            ecx = (esp.wrapping_add(0x44));
+            // 0x499256: mov eax, edi
+            eax = edi;
+            // 0x499258: call 0xc057d0
+            callx!(0xc057d0, 2, 0, 0, 0.0, 0.0);
+            // 0x49925d: fld dword ptr [ebx + 4]
+            fx.push(rf((ebx.wrapping_add(0x4)) as usize) as f64);
+            // 0x499260: cmp byte ptr [ebx + 0xa8], 0
+            fl = f_sub((rb((ebx.wrapping_add(0xa8)) as usize) as u32), 0x0u32, 8);
+            // 0x499267: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49926b: je 0x4992a8
+            if fl.zf { pc = 0x4992a8; } else { pc = 0x49926d; } continue;
+        }
+        0x49926d => {
+            bump(C::Cam499190B49926D);
+            // 0x49926d: call 0xbe3380
+            callx!(0xbe3380, 2, 0, 0, 0.0, 0.0);
+            // 0x499272: movss dword ptr [esp + 0x6c], xmm0
+            wd((esp.wrapping_add(0x6c)) as usize, xmm0);
+            // 0x499278: fld dword ptr [esp + 0x6c]
+            fx.push(rf((esp.wrapping_add(0x6c)) as usize) as f64);
+            // 0x49927c: sub esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49927f: fstp dword ptr [esp + 0x74]
+            wf((esp.wrapping_add(0x74)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499283: fldz 
+            fx.push(0.0);
+            // 0x499285: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499289: fld dword ptr [esp + 0x74]
+            fx.push(rf((esp.wrapping_add(0x74)) as usize) as f64);
+            // 0x49928d: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499290: call 0xbf14d0
+            callx!(0xbf14d0, 4, 0, 0, 0.0, 0.0);
+            // 0x499295: movss dword ptr [esp + 0x74], xmm0
+            wd((esp.wrapping_add(0x74)) as usize, xmm0);
+            // 0x49929b: fld dword ptr [esp + 0x74]
+            fx.push(rf((esp.wrapping_add(0x74)) as usize) as f64);
+            // 0x49929f: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x4992a2: fstp dword ptr [0x25f5c58]
+            wf(0x25f5c58usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x4992a8; continue;
+        }
+        0x4992a8 => {
+            // 0x4992a8: cmp byte ptr [ebx + 0xa9], 0
+            fl = f_sub((rb((ebx.wrapping_add(0xa9)) as usize) as u32), 0x0u32, 8);
+            // 0x4992af: je 0x4992dc
+            if fl.zf { pc = 0x4992dc; } else { pc = 0x4992b1; } continue;
+        }
+        0x4992b1 => {
+            bump(C::Cam499190B4992B1);
+            // 0x4992b1: fld dword ptr [esp + 0x60]
+            fx.push(rf((esp.wrapping_add(0x60)) as usize) as f64);
+            // 0x4992b5: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x4992b6: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4992b9: call 0x4f1ac0
+            callx!(0x4f1ac0, 3, 0, 0, 0.0, 0.0);
+            // 0x4992be: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x4992c0: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x4992c3: fstp dword ptr [esp + 0x6c]
+            wf((esp.wrapping_add(0x6c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4992c7: fld dword ptr [esp + 0x6c]
+            fx.push(rf((esp.wrapping_add(0x6c)) as usize) as f64);
+            // 0x4992cb: fst dword ptr [ebx + 0x24]
+            wf((ebx.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            // 0x4992ce: fld dword ptr [ebx + 0x20]
+            fx.push(rf((ebx.wrapping_add(0x20)) as usize) as f64);
+            // 0x4992d1: fadd dword ptr [0xe9a650]
+            { let v = fx.s(0) + (rf(0xe9a650usize) as f64); fx.set(0, v); }
+            // 0x4992d7: fsubp st(1)
+            { let v = fx.s(1) - fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x4992d9: fstp dword ptr [ebx + 0x24]
+            wf((ebx.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x4992dc; continue;
+        }
+        0x4992dc => {
+            // 0x4992dc: fldz 
+            fx.push(0.0);
+            // 0x4992de: fcom dword ptr [ebx + 0xac]
+            fx.sw = fcmp(fx.s(0), (rf((ebx.wrapping_add(0xac)) as usize) as f64));
+            // 0x4992e4: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x4992e6: test ah, 0x44
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x44u32), 8);
+            // 0x4992e9: jnp 0x49939b
+            if !fl.pf { pc = 0x49939b; } else { pc = 0x4992ef; } continue;
+        }
+        0x4992ef => {
+            // 0x4992ef: fld dword ptr [ebx + 4]
+            fx.push(rf((ebx.wrapping_add(0x4)) as usize) as f64);
+            // 0x4992f2: fsub dword ptr [esp + 0x10]
+            { let v = fx.s(0) - (rf((esp.wrapping_add(0x10)) as usize) as f64); fx.set(0, v); }
+            // 0x4992f6: fstp dword ptr [esp + 0x6c]
+            wf((esp.wrapping_add(0x6c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4992fa: fld dword ptr [esp + 0x6c]
+            fx.push(rf((esp.wrapping_add(0x6c)) as usize) as f64);
+            // 0x4992fe: fld qword ptr [0xe5c160]
+            fx.push(rdf64(0xe5c160usize));
+            // 0x499304: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x499306: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x499308: fxch st(1)
+            fx.xch(1);
+            // 0x49930a: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49930d: jp 0x499317
+            if fl.pf { pc = 0x499317; } else { pc = 0x49930f; } continue;
+        }
+        0x49930f => {
+            // 0x49930f: fsub qword ptr [0xe5bf78]
+            { let v = fx.s(0) - rdf64(0xe5bf78usize); fx.set(0, v); }
+            // 0x499315: jmp 0x49932a
+            pc = 0x49932a; continue;
+        }
+        0x499317 => {
+            // 0x499317: fcom qword ptr [0xe5c170]
+            fx.sw = fcmp(fx.s(0), rdf64(0xe5c170usize));
+            // 0x49931d: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49931f: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x499322: jp 0x499332
+            if fl.pf { pc = 0x499332; } else { pc = 0x499324; } continue;
+        }
+        0x499324 => {
+            // 0x499324: fadd qword ptr [0xe5bf78]
+            { let v = fx.s(0) + rdf64(0xe5bf78usize); fx.set(0, v); }
+            pc = 0x49932a; continue;
+        }
+        0x49932a => {
+            // 0x49932a: fstp dword ptr [esp + 0x6c]
+            wf((esp.wrapping_add(0x6c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49932e: fld dword ptr [esp + 0x6c]
+            fx.push(rf((esp.wrapping_add(0x6c)) as usize) as f64);
+            pc = 0x499332; continue;
+        }
+        0x499332 => {
+            // 0x499332: cmp byte ptr [0x2526b9f], 0
+            fl = f_sub((rb(0x2526b9fusize) as u32), 0x0u32, 8);
+            // 0x499339: je 0x499344
+            if fl.zf { pc = 0x499344; } else { pc = 0x49933b; } continue;
+        }
+        0x49933b => {
+            // 0x49933b: fstp st(0)
+            fx.pop();
+            // 0x49933d: fstp st(0)
+            fx.pop();
+            // 0x49933f: fstp dword ptr [ebx + 0xc]
+            wf((ebx.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499342: jmp 0x49939d
+            pc = 0x49939d; continue;
+        }
+        0x499344 => {
+            bump(C::Cam499190B499344);
+            // 0x499344: fstp st(2)
+            { let v = fx.s(0); fx.set(2, v); fx.pop(); }
+            // 0x499346: fld dword ptr [ebx + 0xac]
+            fx.push(rf((ebx.wrapping_add(0xac)) as usize) as f64);
+            // 0x49934c: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49934e: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x499350: fdivp st(1)
+            { let v = fx.s(1) / fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x499352: fstp dword ptr [esp + 0x6c]
+            wf((esp.wrapping_add(0x6c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499356: fld dword ptr [esp + 0x6c]
+            fx.push(rf((esp.wrapping_add(0x6c)) as usize) as f64);
+            // 0x49935a: fst dword ptr [ebx + 0xc]
+            wf((ebx.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            // 0x49935d: fld dword ptr [0xe5cf30]
+            fx.push(rf(0xe5cf30usize) as f64);
+            // 0x499363: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x499365: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x499367: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49936a: jp 0x49938c
+            if fl.pf { pc = 0x49938c; } else { pc = 0x49936c; } continue;
+        }
+        0x49936c => {
+            // 0x49936c: fstp st(0)
+            fx.pop();
+            // 0x49936e: fld dword ptr [0xdd347c]
+            fx.push(rf(0xdd347cusize) as f64);
+            // 0x499374: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x499376: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x499378: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x49937b: jne 0x49938c
+            if !fl.zf { pc = 0x49938c; } else { pc = 0x49937d; } continue;
+        }
+        0x49937d => {
+            // 0x49937d: fstp st(0)
+            fx.pop();
+            // 0x49937f: fstp dword ptr [esp + 0x6c]
+            wf((esp.wrapping_add(0x6c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499383: fld dword ptr [esp + 0x6c]
+            fx.push(rf((esp.wrapping_add(0x6c)) as usize) as f64);
+            // 0x499387: fstp dword ptr [ebx + 0xc]
+            wf((ebx.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49938a: jmp 0x49939d
+            pc = 0x49939d; continue;
+        }
+        0x49938c => {
+            // 0x49938c: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x49938e: fstp dword ptr [esp + 0x6c]
+            wf((esp.wrapping_add(0x6c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499392: fld dword ptr [esp + 0x6c]
+            fx.push(rf((esp.wrapping_add(0x6c)) as usize) as f64);
+            // 0x499396: fstp dword ptr [ebx + 0xc]
+            wf((ebx.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x499399: jmp 0x49939d
+            pc = 0x49939d; continue;
+        }
+        0x49939b => {
+            // 0x49939b: fstp st(0)
+            fx.pop();
+            pc = 0x49939d; continue;
+        }
+        0x49939d => {
+            // 0x49939d: cmp dword ptr [ebx + 0xa4], 0
+            fl = f_sub(rd((ebx.wrapping_add(0xa4)) as usize), 0x0u32, 32);
+            // 0x4993a4: jl 0x499403
+            if fl.sf != fl.of { pc = 0x499403; } else { pc = 0x4993a6; } continue;
+        }
+        0x4993a6 => {
+            // 0x4993a6: mov eax, dword ptr [ebx + 0xa4]
+            eax = rd((ebx.wrapping_add(0xa4)) as usize);
+            // 0x4993ac: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x4993ae: jl 0x4993da
+            if fl.sf != fl.of { pc = 0x4993da; } else { pc = 0x4993b0; } continue;
+        }
+        0x4993b0 => {
+            // 0x4993b0: mov ecx, dword ptr [0xe843ac]
+            ecx = rd(0xe843acusize);
+            // 0x4993b6: cmp eax, ecx
+            fl = f_sub(eax, ecx, 32);
+            // 0x4993b8: jle 0x4993d0
+            if fl.zf || fl.sf != fl.of { pc = 0x4993d0; } else { pc = 0x4993ba; } continue;
+        }
+        0x4993ba => {
+            // 0x4993ba: sub eax, ecx
+            { let a = eax; let b = ecx; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x4993bc: cmp eax, 0x35a4e900
+            fl = f_sub(eax, 0x35a4e900u32, 32);
+            // 0x4993c1: jl 0x4993da
+            if fl.sf != fl.of { pc = 0x4993da; } else { pc = 0x4993c3; } continue;
+        }
+        0x4993c3 => {
+            // 0x4993c3: mov dword ptr [ebx], 0
+            wd((ebx) as usize, 0x0u32);
+            // 0x4993c9: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x4993ca: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x4993cb: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x4993cc: add esp, 0x5c
+            { let a = esp; let b = 0x5cu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x4993cf: ret 
+            break;
+        }
+        0x4993d0 => {
+            // 0x4993d0: sub ecx, eax
+            { let a = ecx; let b = eax; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x4993d2: cmp ecx, 0x35a4e900
+            fl = f_sub(ecx, 0x35a4e900u32, 32);
+            // 0x4993d8: jl 0x499403
+            if fl.sf != fl.of { pc = 0x499403; } else { pc = 0x4993da; } continue;
+        }
+        0x4993da => {
+            bump(C::Cam499190B4993DA);
+            // 0x4993da: fld dword ptr [0x25f5ca4]
+            fx.push(rf(0x25f5ca4usize) as f64);
+            // 0x4993e0: fld dword ptr [0x25f5ca0]
+            fx.push(rf(0x25f5ca0usize) as f64);
+            // 0x4993e6: fmul st(0), st(0)
+            { let v = fx.s(0) * fx.s(0); fx.set(0, v); }
+            // 0x4993e8: fld st(1)
+            { let v = fx.s(1); fx.push(v); }
+            // 0x4993ea: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x4993ec: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x4993ee: fstp dword ptr [esp + 0x6c]
+            wf((esp.wrapping_add(0x6c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4993f2: fld dword ptr [esp + 0x6c]
+            fx.push(rf((esp.wrapping_add(0x6c)) as usize) as f64);
+            // 0x4993f6: fcomp dword ptr [0xe5c6a4]
+            fx.sw = fcmp(fx.s(0), (rf(0xe5c6a4usize) as f64));
+            fx.pop();
+            // 0x4993fc: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x4993fe: test ah, 1
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x1u32), 8);
+            // 0x499401: jne 0x499409
+            if !fl.zf { pc = 0x499409; } else { pc = 0x499403; } continue;
+        }
+        0x499403 => {
+            // 0x499403: mov dword ptr [ebx], 0
+            wd((ebx) as usize, 0x0u32);
+            pc = 0x499409; continue;
+        }
+        0x499409 => {
+            // 0x499409: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x49940a: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x49940b: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x49940c: add esp, 0x5c
+            { let a = esp; let b = 0x5cu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49940f: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn cam_499190_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { cam_499190_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_499190_thunk, cam_499190_entry, 0);
+
+const CAM_499190_BODY: [u8; 742] = [
+    0x83, 0xEC, 0x5C, 0x53, 0x8B, 0x5C, 0x24, 0x64, 0x8B, 0x8B, 0x90, 0x00, 0x00, 0x00, 0x85, 0xC9,
+    0x56, 0x57, 0x0F, 0x84, 0xF5, 0x01, 0x00, 0x00, 0x8B, 0xC1, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1,
+    0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x0F, 0x84, 0xDD, 0x01, 0x00, 0x00,
+    0x39, 0x48, 0x44, 0x0F, 0x85, 0xD4, 0x01, 0x00, 0x00, 0x83, 0x78, 0x4C, 0x05, 0x0F, 0x85, 0xCA,
+    0x01, 0x00, 0x00, 0x8D, 0x48, 0x20, 0x8D, 0x44, 0x24, 0x14, 0x8D, 0x93, 0x98, 0x00, 0x00, 0x00,
+    0x50, 0xE8, 0x2A, 0xD6, 0xF6, 0xFF, 0x83, 0xC4, 0x04, 0x8D, 0x44, 0x24, 0x14, 0x8D, 0x4C, 0x24,
+    0x44, 0xE8, 0x2A, 0xB9, 0x74, 0x00, 0xBF, 0x5C, 0x5B, 0x5F, 0x02, 0x8D, 0x44, 0x24, 0x24, 0xE8,
+    0xDC, 0xC1, 0x76, 0x00, 0x8D, 0x7C, 0x24, 0x44, 0x8D, 0x44, 0x24, 0x14, 0xE8, 0xCF, 0xC1, 0x76,
+    0x00, 0xD9, 0x83, 0x94, 0x00, 0x00, 0x00, 0xD8, 0x0D, 0x7C, 0x43, 0xE8, 0x00, 0xD9, 0x5C, 0x24,
+    0x6C, 0xD9, 0xE8, 0xD8, 0x54, 0x24, 0x6C, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x74, 0x06, 0xD9, 0x5C,
+    0x24, 0x6C, 0xEB, 0x02, 0xDD, 0xD8, 0xD9, 0x44, 0x24, 0x6C, 0x51, 0x8D, 0x4C, 0x24, 0x18, 0xD9,
+    0x1C, 0x24, 0x8D, 0x74, 0x24, 0x28, 0x8D, 0x7C, 0x24, 0x38, 0xE8, 0x31, 0xCC, 0x76, 0x00, 0x83,
+    0xC4, 0x04, 0x8D, 0x4C, 0x24, 0x44, 0x8B, 0xC7, 0xE8, 0x73, 0xC5, 0x76, 0x00, 0xD9, 0x43, 0x04,
+    0x80, 0xBB, 0xA8, 0x00, 0x00, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0x74, 0x3B, 0xE8, 0x0E, 0xA1,
+    0x74, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x6C, 0xD9, 0x44, 0x24, 0x6C, 0x83, 0xEC, 0x08, 0xD9,
+    0x5C, 0x24, 0x74, 0xD9, 0xEE, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x74, 0xD9, 0x1C, 0x24,
+    0xE8, 0x3B, 0x82, 0x75, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x74, 0xD9, 0x44, 0x24, 0x74, 0x83,
+    0xC4, 0x08, 0xD9, 0x1D, 0x58, 0x5C, 0x5F, 0x02, 0x80, 0xBB, 0xA9, 0x00, 0x00, 0x00, 0x00, 0x74,
+    0x2B, 0xD9, 0x44, 0x24, 0x60, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0x02, 0x88, 0x05, 0x00, 0xD9, 0xE0,
+    0x83, 0xC4, 0x04, 0xD9, 0x5C, 0x24, 0x6C, 0xD9, 0x44, 0x24, 0x6C, 0xD9, 0x53, 0x24, 0xD9, 0x43,
+    0x20, 0xD8, 0x05, 0x50, 0xA6, 0xE9, 0x00, 0xDE, 0xE9, 0xD9, 0x5B, 0x24, 0xD9, 0xEE, 0xD8, 0x93,
+    0xAC, 0x00, 0x00, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x44, 0x0F, 0x8B, 0xAC, 0x00, 0x00, 0x00, 0xD9,
+    0x43, 0x04, 0xD8, 0x64, 0x24, 0x10, 0xD9, 0x5C, 0x24, 0x6C, 0xD9, 0x44, 0x24, 0x6C, 0xDD, 0x05,
+    0x60, 0xC1, 0xE5, 0x00, 0xD8, 0xD1, 0xDF, 0xE0, 0xD9, 0xC9, 0xF6, 0xC4, 0x05, 0x7A, 0x08, 0xDC,
+    0x25, 0x78, 0xBF, 0xE5, 0x00, 0xEB, 0x13, 0xDC, 0x15, 0x70, 0xC1, 0xE5, 0x00, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x05, 0x7A, 0x0E, 0xDC, 0x05, 0x78, 0xBF, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x6C, 0xD9, 0x44,
+    0x24, 0x6C, 0x80, 0x3D, 0x9F, 0x6B, 0x52, 0x02, 0x00, 0x74, 0x09, 0xDD, 0xD8, 0xDD, 0xD8, 0xD9,
+    0x5B, 0x0C, 0xEB, 0x59, 0xDD, 0xDA, 0xD9, 0x83, 0xAC, 0x00, 0x00, 0x00, 0xD9, 0xE0, 0xDE, 0xCA,
+    0xDE, 0xF9, 0xD9, 0x5C, 0x24, 0x6C, 0xD9, 0x44, 0x24, 0x6C, 0xD9, 0x53, 0x0C, 0xD9, 0x05, 0x30,
+    0xCF, 0xE5, 0x00, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x20, 0xDD, 0xD8, 0xD9, 0x05,
+    0x7C, 0x34, 0xDD, 0x00, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x0F, 0xDD, 0xD8, 0xD9,
+    0x5C, 0x24, 0x6C, 0xD9, 0x44, 0x24, 0x6C, 0xD9, 0x5B, 0x0C, 0xEB, 0x11, 0xDD, 0xD9, 0xD9, 0x5C,
+    0x24, 0x6C, 0xD9, 0x44, 0x24, 0x6C, 0xD9, 0x5B, 0x0C, 0xEB, 0x02, 0xDD, 0xD8, 0x83, 0xBB, 0xA4,
+    0x00, 0x00, 0x00, 0x00, 0x7C, 0x5D, 0x8B, 0x83, 0xA4, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x7C, 0x2A,
+    0x8B, 0x0D, 0xAC, 0x43, 0xE8, 0x00, 0x3B, 0xC1, 0x7E, 0x16, 0x2B, 0xC1, 0x3D, 0x00, 0xE9, 0xA4,
+    0x35, 0x7C, 0x17, 0xC7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x5F, 0x5E, 0x5B, 0x83, 0xC4, 0x5C, 0xC3,
+    0x2B, 0xC8, 0x81, 0xF9, 0x00, 0xE9, 0xA4, 0x35, 0x7C, 0x29, 0xD9, 0x05, 0xA4, 0x5C, 0x5F, 0x02,
+    0xD9, 0x05, 0xA0, 0x5C, 0x5F, 0x02, 0xDC, 0xC8, 0xD9, 0xC1, 0xDE, 0xCA, 0xDE, 0xC1, 0xD9, 0x5C,
+    0x24, 0x6C, 0xD9, 0x44, 0x24, 0x6C, 0xD8, 0x1D, 0xA4, 0xC6, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x01, 0x75, 0x06, 0xC7, 0x03, 0x00, 0x00, 0x00, 0x00, 0x5F, 0x5E, 0x5B, 0x83, 0xC4, 0x5C, 0xC3,
+    0x56, 0xE8, 0xAA, 0xF1, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0x8B, 0xCE, 0xE8, 0xC0, 0xF2, 0xFF, 0xFF,
+    0xA1, 0xB0, 0xA6, 0xE9, 0x00, 0x85, 0xC0, 0x7C, 0x4C, 0x8B, 0x0D, 0xAC, 0x43, 0xE8, 0x00, 0x3B,
+    0xC1, 0x7E, 0x0B, 0x2B, 0xC1, 0x3D, 0x00, 0xE9, 0xA4, 0x35, 0x7C, 0x39, 0xEB, 0x0A, 0x2B, 0xC8,
+    0x81, 0xF9, 0x00, 0xE9, 0xA4, 0x35, 0x7D, 0x2D, 0x80, 0xBE, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x74,
+    0x24, 0x8B, 0x44, 0x24, 0x04, 0x83, 0xC0, 0x38, 0xC7, 0x05, 0xB0, 0xA6, 0xE9, 0x00, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xE8, 0xE9, 0x4A, 0x00, 0x00, 0xD9, 0xEE, 0xD9, 0x1D, 0x78, 0x5C, 0x5F, 0x02, 0xC7,
+    0x06, 0x00, 0x00, 0x00, 0x00, 0xC3,
+];
+
+
+// --- cam_497a20 (0x497a20..0x497c7a, 602 bytes) ----------------------------------------
+
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn cam_497a20_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x497a20;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x497a20 => {
+            bump(C::Cam497a20Calls);
+            // 0x497a20: sub esp, 0x48
+            { let a = esp; let b = 0x48u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x497a23: fldz 
+            fx.push(0.0);
+            // 0x497a25: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x497a26: mov ebx, dword ptr [esp + 0x50]
+            ebx = rd((esp.wrapping_add(0x50)) as usize);
+            // 0x497a2a: fstp dword ptr [esp + 0x50]
+            wf((esp.wrapping_add(0x50)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497a2e: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x497a2f: mov esi, ecx
+            esi = ecx;
+            // 0x497a31: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x497a33: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x497a34: mov edi, eax
+            edi = eax;
+            // 0x497a36: je 0x497c45
+            if fl.zf { pc = 0x497c45; } else { pc = 0x497a3c; } continue;
+        }
+        0x497a3c => {
+            // 0x497a3c: cmp dword ptr [esi + 0x4c], 5
+            fl = f_sub(rd((esi.wrapping_add(0x4c)) as usize), 0x5u32, 32);
+            // 0x497a40: jne 0x497c45
+            if !fl.zf { pc = 0x497c45; } else { pc = 0x497a46; } continue;
+        }
+        0x497a46 => {
+            // 0x497a46: mov eax, esi
+            eax = esi;
+            // 0x497a48: call 0xab5340
+            callx!(0xab5340, 3, 0, 0, 0.0, 0.0);
+            // 0x497a4d: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x497a4f: jne 0x497c45
+            if !fl.zf { pc = 0x497c45; } else { pc = 0x497a55; } continue;
+        }
+        0x497a55 => {
+            // 0x497a55: mov eax, dword ptr [esi + 0x84e4]
+            eax = rd((esi.wrapping_add(0x84e4)) as usize);
+            // 0x497a5b: cmp dword ptr [eax + 0x9c], 3
+            fl = f_sub(rd((eax.wrapping_add(0x9c)) as usize), 0x3u32, 32);
+            // 0x497a62: sete al
+            eax = (eax & 0xffffff00) | (((fl.zf) as u32) & 0xff);
+            // 0x497a65: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x497a67: jne 0x497c45
+            if !fl.zf { pc = 0x497c45; } else { pc = 0x497a6d; } continue;
+        }
+        0x497a6d => {
+            // 0x497a6d: mov ecx, 0xec5ae4
+            ecx = 0xec5ae4u32;
+            // 0x497a72: lea eax, [esp + 0x2c]
+            eax = (esp.wrapping_add(0x2c));
+            // 0x497a76: call 0xbe2c60
+            callx!(0xbe2c60, 3, 0, 0, 0.0, 0.0);
+            // 0x497a7b: mov ecx, dword ptr [esi + 0x84e4]
+            ecx = rd((esi.wrapping_add(0x84e4)) as usize);
+            // 0x497a81: cmp dword ptr [ecx + 0x9c], 1
+            fl = f_sub(rd((ecx.wrapping_add(0x9c)) as usize), 0x1u32, 32);
+            // 0x497a88: sete al
+            eax = (eax & 0xffffff00) | (((fl.zf) as u32) & 0xff);
+            // 0x497a8b: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x497a8d: je 0x497aac
+            if fl.zf { pc = 0x497aac; } else { pc = 0x497a8f; } continue;
+        }
+        0x497a8f => {
+            // 0x497a8f: mov eax, esi
+            eax = esi;
+            // 0x497a91: call 0xadd870
+            callx!(0xadd870, 3, 0, 0, 0.0, 0.0);
+            // 0x497a96: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x497a98: jne 0x497b0a
+            if !fl.zf { pc = 0x497b0a; } else { pc = 0x497a9a; } continue;
+        }
+        0x497a9a => {
+            // 0x497a9a: lea edx, [esp + 0x20]
+            edx = (esp.wrapping_add(0x20));
+            // 0x497a9e: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x497a9f: call 0xaab8e0
+            callx!(0xaab8e0, 4, 0, 0, 0.0, 0.0);
+            // 0x497aa4: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x497aa7: cmp eax, 1
+            fl = f_sub(eax, 0x1u32, 32);
+            // 0x497aaa: jbe 0x497b0a
+            if fl.cf || fl.zf { pc = 0x497b0a; } else { pc = 0x497aac; } continue;
+        }
+        0x497aac => {
+            // 0x497aac: mov eax, dword ptr [esi + 0x8f50]
+            eax = rd((esi.wrapping_add(0x8f50)) as usize);
+            // 0x497ab2: shr eax, 0xc
+            { let r = eax >> 12; fl = f_logic(r, 32); eax = r; }
+            // 0x497ab5: test al, 1
+            fl = f_logic(((eax & 0xff)) & (0x1u32), 8);
+            // 0x497ab7: jne 0x497b02
+            if !fl.zf { pc = 0x497b02; } else { pc = 0x497ab9; } continue;
+        }
+        0x497ab9 => {
+            bump(C::Cam497a20B497AB9);
+            // 0x497ab9: fld dword ptr [0xe5c584]
+            fx.push(rf(0xe5c584usize) as f64);
+            // 0x497abf: sub esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x497ac2: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497ac6: fldz 
+            fx.push(0.0);
+            // 0x497ac8: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497acc: fld dword ptr [esi + 0x3c]
+            fx.push(rf((esi.wrapping_add(0x3c)) as usize) as f64);
+            // 0x497acf: fmul dword ptr [0xec5ad0]
+            { let v = fx.s(0) * (rf(0xec5ad0usize) as f64); fx.set(0, v); }
+            // 0x497ad5: fld dword ptr [esi + 0x38]
+            fx.push(rf((esi.wrapping_add(0x38)) as usize) as f64);
+            // 0x497ad8: fmul dword ptr [0xec5acc]
+            { let v = fx.s(0) * (rf(0xec5accusize) as f64); fx.set(0, v); }
+            // 0x497ade: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x497ae0: fld dword ptr [esi + 0x40]
+            fx.push(rf((esi.wrapping_add(0x40)) as usize) as f64);
+            // 0x497ae3: fmul dword ptr [0xec5ad4]
+            { let v = fx.s(0) * (rf(0xec5ad4usize) as f64); fx.set(0, v); }
+            // 0x497ae9: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x497aeb: fstp dword ptr [esp + 0x64]
+            wf((esp.wrapping_add(0x64)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497aef: fld dword ptr [esp + 0x64]
+            fx.push(rf((esp.wrapping_add(0x64)) as usize) as f64);
+            // 0x497af3: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497af6: call 0xbf1670
+            callx!(0xbf1670, 6, 0, 0, 0.0, 0.0);
+            // 0x497afb: add esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x497afe: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x497b00: je 0x497b0a
+            if fl.zf { pc = 0x497b0a; } else { pc = 0x497b02; } continue;
+        }
+        0x497b02 => {
+            // 0x497b02: lea eax, [esi + 0x38]
+            eax = (esi.wrapping_add(0x38));
+            // 0x497b05: jmp 0x497bf0
+            pc = 0x497bf0; continue;
+        }
+        0x497b0a => {
+            bump(C::Cam497a20B497B0A);
+            // 0x497b0a: fld dword ptr [edi + 4]
+            fx.push(rf((edi.wrapping_add(0x4)) as usize) as f64);
+            // 0x497b0d: fld dword ptr [edi]
+            fx.push(rf((edi) as usize) as f64);
+            // 0x497b0f: fld dword ptr [edi + 8]
+            fx.push(rf((edi.wrapping_add(0x8)) as usize) as f64);
+            // 0x497b12: fld st(1)
+            { let v = fx.s(1); fx.push(v); }
+            // 0x497b14: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x497b16: fld st(2)
+            { let v = fx.s(2); fx.push(v); }
+            // 0x497b18: fmulp st(3)
+            { let v = fx.s(3) * fx.s(0); fx.set(3, v); }
+            fx.pop();
+            // 0x497b1a: fxch st(1)
+            fx.xch(1);
+            // 0x497b1c: faddp st(2)
+            { let v = fx.s(2) + fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x497b1e: fmul st(0), st(0)
+            { let v = fx.s(0) * fx.s(0); fx.set(0, v); }
+            // 0x497b20: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x497b22: fstp dword ptr [esp + 0x58]
+            wf((esp.wrapping_add(0x58)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497b26: fld dword ptr [esp + 0x58]
+            fx.push(rf((esp.wrapping_add(0x58)) as usize) as f64);
+            // 0x497b2a: fcomp dword ptr [0xdd518c]
+            fx.sw = fcmp(fx.s(0), (rf(0xdd518cusize) as f64));
+            fx.pop();
+            // 0x497b30: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x497b32: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x497b35: jne 0x497b8a
+            if !fl.zf { pc = 0x497b8a; } else { pc = 0x497b37; } continue;
+        }
+        0x497b37 => {
+            bump(C::Cam497a20B497B37);
+            // 0x497b37: fld dword ptr [0xe885a8]
+            fx.push(rf(0xe885a8usize) as f64);
+            // 0x497b3d: sub esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x497b40: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497b44: fldz 
+            fx.push(0.0);
+            // 0x497b46: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497b4a: fld dword ptr [edi]
+            fx.push(rf((edi) as usize) as f64);
+            // 0x497b4c: fmul dword ptr [0xec5acc]
+            { let v = fx.s(0) * (rf(0xec5accusize) as f64); fx.set(0, v); }
+            // 0x497b52: fld dword ptr [edi + 4]
+            fx.push(rf((edi.wrapping_add(0x4)) as usize) as f64);
+            // 0x497b55: fmul dword ptr [0xec5ad0]
+            { let v = fx.s(0) * (rf(0xec5ad0usize) as f64); fx.set(0, v); }
+            // 0x497b5b: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x497b5d: fld dword ptr [edi + 8]
+            fx.push(rf((edi.wrapping_add(0x8)) as usize) as f64);
+            // 0x497b60: fmul dword ptr [0xec5ad4]
+            { let v = fx.s(0) * (rf(0xec5ad4usize) as f64); fx.set(0, v); }
+            // 0x497b66: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x497b68: fstp dword ptr [esp + 0x64]
+            wf((esp.wrapping_add(0x64)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497b6c: fld dword ptr [esp + 0x64]
+            fx.push(rf((esp.wrapping_add(0x64)) as usize) as f64);
+            // 0x497b70: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497b73: call 0xbf1670
+            callx!(0xbf1670, 6, 0, 0, 0.0, 0.0);
+            // 0x497b78: add esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x497b7b: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x497b7d: je 0x497b8a
+            if fl.zf { pc = 0x497b8a; } else { pc = 0x497b7f; } continue;
+        }
+        0x497b7f => {
+            // 0x497b7f: lea esi, [esp + 0x20]
+            esi = (esp.wrapping_add(0x20));
+            // 0x497b83: call 0xbddba0
+            callx!(0xbddba0, 3, 0, 0, 0.0, 0.0);
+            // 0x497b88: jmp 0x497bf0
+            pc = 0x497bf0; continue;
+        }
+        0x497b8a => {
+            bump(C::Cam497a20B497B8A);
+            // 0x497b8a: fld dword ptr [esi + 0x30]
+            fx.push(rf((esi.wrapping_add(0x30)) as usize) as f64);
+            // 0x497b8d: lea edi, [esi + 0x2c]
+            edi = (esi.wrapping_add(0x2c));
+            // 0x497b90: fmul dword ptr [0xec5ad0]
+            { let v = fx.s(0) * (rf(0xec5ad0usize) as f64); fx.set(0, v); }
+            // 0x497b96: fld dword ptr [edi]
+            fx.push(rf((edi) as usize) as f64);
+            // 0x497b98: fmul dword ptr [0xec5acc]
+            { let v = fx.s(0) * (rf(0xec5accusize) as f64); fx.set(0, v); }
+            // 0x497b9e: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x497ba0: fld dword ptr [edi + 8]
+            fx.push(rf((edi.wrapping_add(0x8)) as usize) as f64);
+            // 0x497ba3: fmul dword ptr [0xec5ad4]
+            { let v = fx.s(0) * (rf(0xec5ad4usize) as f64); fx.set(0, v); }
+            // 0x497ba9: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x497bab: fstp dword ptr [esp + 0x58]
+            wf((esp.wrapping_add(0x58)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497baf: fld dword ptr [esp + 0x58]
+            fx.push(rf((esp.wrapping_add(0x58)) as usize) as f64);
+            // 0x497bb3: fcomp qword ptr [0xe5cdb8]
+            fx.sw = fcmp(fx.s(0), rdf64(0xe5cdb8usize));
+            fx.pop();
+            // 0x497bb9: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x497bbb: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x497bbe: jne 0x497bf9
+            if !fl.zf { pc = 0x497bf9; } else { pc = 0x497bc0; } continue;
+        }
+        0x497bc0 => {
+            bump(C::Cam497a20B497BC0);
+            // 0x497bc0: push 0xec5acc
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0xec5accu32);
+            // 0x497bc5: mov ecx, edi
+            ecx = edi;
+            // 0x497bc7: lea eax, [esp + 0x14]
+            eax = (esp.wrapping_add(0x14));
+            // 0x497bcb: call 0x42eea0
+            callx!(0x42eea0, 4, 1, 0, 0.0, 0.0);
+            // 0x497bd0: lea esi, [esp + 0x10]
+            esi = (esp.wrapping_add(0x10));
+            // 0x497bd4: call 0xbde150
+            callx!(0xbde150, 3, 0, 0, 0.0, 0.0);
+            // 0x497bd9: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x497bda: mov ecx, esi
+            ecx = esi;
+            // 0x497bdc: lea eax, [esp + 0x24]
+            eax = (esp.wrapping_add(0x24));
+            // 0x497be0: call 0x42eea0
+            callx!(0x42eea0, 4, 1, 0, 0.0, 0.0);
+            // 0x497be5: lea esi, [esp + 0x20]
+            esi = (esp.wrapping_add(0x20));
+            // 0x497be9: call 0xbde150
+            callx!(0xbde150, 3, 0, 0, 0.0, 0.0);
+            // 0x497bee: mov eax, esi
+            eax = esi;
+            pc = 0x497bf0; continue;
+        }
+        0x497bf0 => {
+            // 0x497bf0: lea ecx, [esp + 0x2c]
+            ecx = (esp.wrapping_add(0x2c));
+            // 0x497bf4: call 0xbe4b20
+            callx!(0xbe4b20, 3, 0, 0, 0.0, 0.0);
+            pc = 0x497bf9; continue;
+        }
+        0x497bf9 => {
+            bump(C::Cam497a20B497BF9);
+            // 0x497bf9: fld dword ptr [ebx + 4]
+            fx.push(rf((ebx.wrapping_add(0x4)) as usize) as f64);
+            // 0x497bfc: lea ecx, [esp + 0x2c]
+            ecx = (esp.wrapping_add(0x2c));
+            // 0x497c00: fstp qword ptr [esp + 0x10]
+            wdf64((esp.wrapping_add(0x10)) as usize, fx.s(0));
+            fx.pop();
+            // 0x497c04: call 0xbe3380
+            callx!(0xbe3380, 3, 0, 0, 0.0, 0.0);
+            // 0x497c09: movss dword ptr [esp + 0x58], xmm0
+            wd((esp.wrapping_add(0x58)) as usize, xmm0);
+            // 0x497c0f: fld dword ptr [esp + 0x58]
+            fx.push(rf((esp.wrapping_add(0x58)) as usize) as f64);
+            // 0x497c13: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x497c14: fsubr qword ptr [esp + 0x14]
+            { let v = rdf64((esp.wrapping_add(0x14)) as usize) - fx.s(0); fx.set(0, v); }
+            // 0x497c18: fstp dword ptr [esp + 0x5c]
+            wf((esp.wrapping_add(0x5c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497c1c: fld dword ptr [esp + 0x5c]
+            fx.push(rf((esp.wrapping_add(0x5c)) as usize) as f64);
+            // 0x497c20: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497c23: call 0x40b820
+            callx!(0x40b820, 4, 0, 0, 0.0, 0.0);
+            // 0x497c28: fstp dword ptr [esp + 0x5c]
+            wf((esp.wrapping_add(0x5c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497c2c: fld dword ptr [esp + 0x4c]
+            fx.push(rf((esp.wrapping_add(0x4c)) as usize) as f64);
+            // 0x497c30: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497c33: call 0x4f1ac0
+            callx!(0x4f1ac0, 4, 0, 0, 0.0, 0.0);
+            // 0x497c38: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x497c3a: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x497c3d: fmul dword ptr [esp + 0x58]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x58)) as usize) as f64); fx.set(0, v); }
+            // 0x497c41: fstp dword ptr [esp + 0x58]
+            wf((esp.wrapping_add(0x58)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x497c45; continue;
+        }
+        0x497c45 => {
+            bump(C::Cam497a20B497C45);
+            // 0x497c45: fld dword ptr [esp + 0x5c]
+            fx.push(rf((esp.wrapping_add(0x5c)) as usize) as f64);
+            // 0x497c49: sub esp, 0x10
+            { let a = esp; let b = 0x10u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x497c4c: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497c50: fld dword ptr [0xe999e0]
+            fx.push(rf(0xe999e0usize) as f64);
+            // 0x497c56: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497c5a: fld dword ptr [esp + 0x68]
+            fx.push(rf((esp.wrapping_add(0x68)) as usize) as f64);
+            // 0x497c5e: fstp dword ptr [esp + 4]
+            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497c62: fld dword ptr [ebx + 0x20]
+            fx.push(rf((ebx.wrapping_add(0x20)) as usize) as f64);
+            // 0x497c65: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497c68: call 0x4970c0
+            callx!(0x4970c0, 7, 0, 0, 0.0, 0.0);
+            // 0x497c6d: add esp, 0x10
+            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x497c70: fstp dword ptr [ebx + 0x20]
+            wf((ebx.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x497c73: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x497c74: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x497c75: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x497c76: add esp, 0x48
+            { let a = esp; let b = 0x48u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x497c79: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn cam_497a20_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { cam_497a20_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_497a20_thunk, cam_497a20_entry, 0);
+
+const CAM_497A20_BODY: [u8; 602] = [
+    0x83, 0xEC, 0x48, 0xD9, 0xEE, 0x53, 0x8B, 0x5C, 0x24, 0x50, 0xD9, 0x5C, 0x24, 0x50, 0x56, 0x8B,
+    0xF1, 0x85, 0xF6, 0x57, 0x8B, 0xF8, 0x0F, 0x84, 0x09, 0x02, 0x00, 0x00, 0x83, 0x7E, 0x4C, 0x05,
+    0x0F, 0x85, 0xFF, 0x01, 0x00, 0x00, 0x8B, 0xC6, 0xE8, 0xF3, 0xD8, 0x61, 0x00, 0x84, 0xC0, 0x0F,
+    0x85, 0xF0, 0x01, 0x00, 0x00, 0x8B, 0x86, 0xE4, 0x84, 0x00, 0x00, 0x83, 0xB8, 0x9C, 0x00, 0x00,
+    0x00, 0x03, 0x0F, 0x94, 0xC0, 0x84, 0xC0, 0x0F, 0x85, 0xD8, 0x01, 0x00, 0x00, 0xB9, 0xE4, 0x5A,
+    0xEC, 0x00, 0x8D, 0x44, 0x24, 0x2C, 0xE8, 0xE5, 0xB1, 0x74, 0x00, 0x8B, 0x8E, 0xE4, 0x84, 0x00,
+    0x00, 0x83, 0xB9, 0x9C, 0x00, 0x00, 0x00, 0x01, 0x0F, 0x94, 0xC0, 0x84, 0xC0, 0x74, 0x1D, 0x8B,
+    0xC6, 0xE8, 0xDA, 0x5D, 0x64, 0x00, 0x84, 0xC0, 0x75, 0x70, 0x8D, 0x54, 0x24, 0x20, 0x52, 0xE8,
+    0x3C, 0x3E, 0x61, 0x00, 0x83, 0xC4, 0x04, 0x83, 0xF8, 0x01, 0x76, 0x5E, 0x8B, 0x86, 0x50, 0x8F,
+    0x00, 0x00, 0xC1, 0xE8, 0x0C, 0xA8, 0x01, 0x75, 0x49, 0xD9, 0x05, 0x84, 0xC5, 0xE5, 0x00, 0x83,
+    0xEC, 0x0C, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0xEE, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x46, 0x3C, 0xD8,
+    0x0D, 0xD0, 0x5A, 0xEC, 0x00, 0xD9, 0x46, 0x38, 0xD8, 0x0D, 0xCC, 0x5A, 0xEC, 0x00, 0xDE, 0xC1,
+    0xD9, 0x46, 0x40, 0xD8, 0x0D, 0xD4, 0x5A, 0xEC, 0x00, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x64, 0xD9,
+    0x44, 0x24, 0x64, 0xD9, 0x1C, 0x24, 0xE8, 0x75, 0x9B, 0x75, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0,
+    0x74, 0x08, 0x8D, 0x46, 0x38, 0xE9, 0xE6, 0x00, 0x00, 0x00, 0xD9, 0x47, 0x04, 0xD9, 0x07, 0xD9,
+    0x47, 0x08, 0xD9, 0xC1, 0xDE, 0xCA, 0xD9, 0xC2, 0xDE, 0xCB, 0xD9, 0xC9, 0xDE, 0xC2, 0xDC, 0xC8,
+    0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x58, 0xD9, 0x44, 0x24, 0x58, 0xD8, 0x1D, 0x8C, 0x51, 0xDD, 0x00,
+    0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x53, 0xD9, 0x05, 0xA8, 0x85, 0xE8, 0x00, 0x83, 0xEC, 0x0C,
+    0xD9, 0x5C, 0x24, 0x08, 0xD9, 0xEE, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x07, 0xD8, 0x0D, 0xCC, 0x5A,
+    0xEC, 0x00, 0xD9, 0x47, 0x04, 0xD8, 0x0D, 0xD0, 0x5A, 0xEC, 0x00, 0xDE, 0xC1, 0xD9, 0x47, 0x08,
+    0xD8, 0x0D, 0xD4, 0x5A, 0xEC, 0x00, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x64, 0xD9, 0x44, 0x24, 0x64,
+    0xD9, 0x1C, 0x24, 0xE8, 0xF8, 0x9A, 0x75, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x74, 0x0B, 0x8D,
+    0x74, 0x24, 0x20, 0xE8, 0x18, 0x60, 0x74, 0x00, 0xEB, 0x66, 0xD9, 0x46, 0x30, 0x8D, 0x7E, 0x2C,
+    0xD8, 0x0D, 0xD0, 0x5A, 0xEC, 0x00, 0xD9, 0x07, 0xD8, 0x0D, 0xCC, 0x5A, 0xEC, 0x00, 0xDE, 0xC1,
+    0xD9, 0x47, 0x08, 0xD8, 0x0D, 0xD4, 0x5A, 0xEC, 0x00, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x58, 0xD9,
+    0x44, 0x24, 0x58, 0xDC, 0x1D, 0xB8, 0xCD, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x39,
+    0x68, 0xCC, 0x5A, 0xEC, 0x00, 0x8B, 0xCF, 0x8D, 0x44, 0x24, 0x14, 0xE8, 0xD0, 0x72, 0xF9, 0xFF,
+    0x8D, 0x74, 0x24, 0x10, 0xE8, 0x77, 0x65, 0x74, 0x00, 0x57, 0x8B, 0xCE, 0x8D, 0x44, 0x24, 0x24,
+    0xE8, 0xBB, 0x72, 0xF9, 0xFF, 0x8D, 0x74, 0x24, 0x20, 0xE8, 0x62, 0x65, 0x74, 0x00, 0x8B, 0xC6,
+    0x8D, 0x4C, 0x24, 0x2C, 0xE8, 0x27, 0xCF, 0x74, 0x00, 0xD9, 0x43, 0x04, 0x8D, 0x4C, 0x24, 0x2C,
+    0xDD, 0x5C, 0x24, 0x10, 0xE8, 0x77, 0xB7, 0x74, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x58, 0xD9,
+    0x44, 0x24, 0x58, 0x51, 0xDC, 0x6C, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x5C, 0xD9, 0x44, 0x24, 0x5C,
+    0xD9, 0x1C, 0x24, 0xE8, 0xF8, 0x3B, 0xF7, 0xFF, 0xD9, 0x5C, 0x24, 0x5C, 0xD9, 0x44, 0x24, 0x4C,
+    0xD9, 0x1C, 0x24, 0xE8, 0x88, 0x9E, 0x05, 0x00, 0xD9, 0xE0, 0x83, 0xC4, 0x04, 0xD8, 0x4C, 0x24,
+    0x58, 0xD9, 0x5C, 0x24, 0x58, 0xD9, 0x44, 0x24, 0x5C, 0x83, 0xEC, 0x10, 0xD9, 0x5C, 0x24, 0x0C,
+    0xD9, 0x05, 0xE0, 0x99, 0xE9, 0x00, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x68, 0xD9, 0x5C,
+    0x24, 0x04, 0xD9, 0x43, 0x20, 0xD9, 0x1C, 0x24, 0xE8, 0x53, 0xF4, 0xFF, 0xFF, 0x83, 0xC4, 0x10,
+    0xD9, 0x5B, 0x20, 0x5F, 0x5E, 0x5B, 0x83, 0xC4, 0x48, 0xC3,
+];
+
+
+// --- cam_4938c0 (0x4938c0..0x493ae8, 552 bytes) ----------------------------------------
+
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn cam_4938c0_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x4938c0;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x4938c0 => {
+            bump(C::Cam4938c0Calls);
+            // 0x4938c0: push ebp
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebp);
+            // 0x4938c1: mov ebp, esp
+            ebp = esp;
+            // 0x4938c3: and esp, 0xfffffff8
+            { let r = (esp) & (0xfffffff8u32); fl = f_logic(r, 32); esp = r; }
+            // 0x4938c6: sub esp, 0x68
+            { let a = esp; let b = 0x68u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x4938c9: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x4938ca: mov ebx, dword ptr [ebp + 8]
+            ebx = rd((ebp.wrapping_add(0x8)) as usize);
+            // 0x4938cd: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x4938ce: xor esi, esi
+            fl = f_logic(0, 32); esi = 0;
+            // 0x4938d0: cmp dword ptr [0x252864c], esi
+            fl = f_sub(rd(0x252864cusize), esi, 32);
+            // 0x4938d6: je 0x4938f0
+            if fl.zf { pc = 0x4938f0; } else { pc = 0x4938d8; } continue;
+        }
+        0x4938d8 => {
+            bump(C::Cam4938c0B4938D8);
+            // 0x4938d8: fld dword ptr [edi]
+            fx.push(rf((edi) as usize) as f64);
+            // 0x4938da: mov eax, ebx
+            eax = ebx;
+            // 0x4938dc: fstp dword ptr [ebx]
+            wf((ebx) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4938de: fld dword ptr [edi + 4]
+            fx.push(rf((edi.wrapping_add(0x4)) as usize) as f64);
+            // 0x4938e1: fstp dword ptr [ebx + 4]
+            wf((ebx.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4938e4: fld dword ptr [edi + 8]
+            fx.push(rf((edi.wrapping_add(0x8)) as usize) as f64);
+            // 0x4938e7: fstp dword ptr [ebx + 8]
+            wf((ebx.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4938ea: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x4938eb: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x4938ec: mov esp, ebp
+            esp = ebp;
+            // 0x4938ee: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x4938ef: ret 
+            break;
+        }
+        0x4938f0 => {
+            bump(C::Cam4938c0B4938F0);
+            // 0x4938f0: mov ecx, dword ptr [eax]
+            ecx = rd((eax) as usize);
+            // 0x4938f2: fld dword ptr [0xe99a70]
+            fx.push(rf(0xe99a70usize) as f64);
+            // 0x4938f8: mov edx, dword ptr [eax + 4]
+            edx = rd((eax.wrapping_add(0x4)) as usize);
+            // 0x4938fb: fstp dword ptr [esp + 0x30]
+            wf((esp.wrapping_add(0x30)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x4938ff: mov eax, dword ptr [eax + 8]
+            eax = rd((eax.wrapping_add(0x8)) as usize);
+            // 0x493902: mov dword ptr [esp + 0x18], ecx
+            wd((esp.wrapping_add(0x18)) as usize, ecx);
+            // 0x493906: mov ecx, dword ptr [edi]
+            ecx = rd((edi) as usize);
+            // 0x493908: mov dword ptr [esp + 0x20], eax
+            wd((esp.wrapping_add(0x20)) as usize, eax);
+            // 0x49390c: mov eax, dword ptr [edi + 8]
+            eax = rd((edi.wrapping_add(0x8)) as usize);
+            // 0x49390f: mov dword ptr [esp + 0x1c], edx
+            wd((esp.wrapping_add(0x1c)) as usize, edx);
+            // 0x493913: mov edx, dword ptr [edi + 4]
+            edx = rd((edi.wrapping_add(0x4)) as usize);
+            // 0x493916: mov dword ptr [esp + 0x24], ecx
+            wd((esp.wrapping_add(0x24)) as usize, ecx);
+            // 0x49391a: mov ecx, dword ptr [ebp + 0xc]
+            ecx = rd((ebp.wrapping_add(0xc)) as usize);
+            // 0x49391d: mov dword ptr [esp + 0x2c], eax
+            wd((esp.wrapping_add(0x2c)) as usize, eax);
+            // 0x493921: mov eax, 1
+            eax = 0x1u32;
+            // 0x493926: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x493927: mov dword ptr [esp + 0x2c], edx
+            wd((esp.wrapping_add(0x2c)) as usize, edx);
+            // 0x49392b: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x49392c: lea edx, [esp + 0x14]
+            edx = (esp.wrapping_add(0x14));
+            // 0x493930: mov dword ptr [esp + 0x68], ecx
+            wd((esp.wrapping_add(0x68)) as usize, ecx);
+            // 0x493934: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x493935: lea ecx, [esp + 0x24]
+            ecx = (esp.wrapping_add(0x24));
+            // 0x493939: mov dword ptr [esp + 0x40], esi
+            wd((esp.wrapping_add(0x40)) as usize, esi);
+            // 0x49393d: mov dword ptr [esp + 0x68], esi
+            wd((esp.wrapping_add(0x68)) as usize, esi);
+            // 0x493941: mov dword ptr [esp + 0x18], esi
+            wd((esp.wrapping_add(0x18)) as usize, esi);
+            // 0x493945: mov dword ptr [esp + 0x1c], esi
+            wd((esp.wrapping_add(0x1c)) as usize, esi);
+            // 0x493949: mov dword ptr [esp + 0x20], 0x80000000
+            wd((esp.wrapping_add(0x20)) as usize, 0x80000000u32);
+            // 0x493951: mov dword ptr [esp + 0x78], eax
+            wd((esp.wrapping_add(0x78)) as usize, eax);
+            // 0x493955: mov dword ptr [esp + 0x70], 3
+            wd((esp.wrapping_add(0x70)) as usize, 0x3u32);
+            // 0x49395d: mov dword ptr [esp + 0x74], eax
+            wd((esp.wrapping_add(0x74)) as usize, eax);
+            // 0x493961: call 0x6fa820
+            callx!(0x6fa820, 4, 0, 0, 0.0, 0.0);
+            // 0x493966: add esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x493969: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x49396b: je 0x493ac7
+            if fl.zf { pc = 0x493ac7; } else { pc = 0x493971; } continue;
+        }
+        0x493971 => {
+            // 0x493971: cmp dword ptr [esp + 0x10], esi
+            fl = f_sub(rd((esp.wrapping_add(0x10)) as usize), esi, 32);
+            // 0x493975: mov dword ptr [esp + 8], esi
+            wd((esp.wrapping_add(0x8)) as usize, esi);
+            // 0x493979: jle 0x493a1f
+            if fl.zf || fl.sf != fl.of { pc = 0x493a1f; } else { pc = 0x49397f; } continue;
+        }
+        0x49397f => {
+            // 0x49397f: mov esi, dword ptr [esp + 0xc]
+            esi = rd((esp.wrapping_add(0xc)) as usize);
+            pc = 0x493983; continue;
+        }
+        0x493983 => {
+            // 0x493983: mov eax, dword ptr [0x21703d4]
+            eax = rd(0x21703d4usize);
+            // 0x493988: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x493989: call 0x9b9320
+            callx!(0x9b9320, 2, 0, 0, 0.0, 0.0);
+            // 0x49398e: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x493991: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x493993: je 0x493a6f
+            if fl.zf { pc = 0x493a6f; } else { pc = 0x493999; } continue;
+        }
+        0x493999 => {
+            // 0x493999: mov ecx, dword ptr [esi + 0x28]
+            ecx = rd((esi.wrapping_add(0x28)) as usize);
+            // 0x49399c: mov edx, dword ptr [0x21703d4]
+            edx = rd(0x21703d4usize);
+            // 0x4939a2: cmp dword ptr [edx + 0xd74], ecx
+            fl = f_sub(rd((edx.wrapping_add(0xd74)) as usize), ecx, 32);
+            // 0x4939a8: jne 0x493a6f
+            if !fl.zf { pc = 0x493a6f; } else { pc = 0x4939ae; } continue;
+        }
+        0x4939ae => {
+            // 0x4939ae: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x4939b0: je 0x4939cb
+            if fl.zf { pc = 0x4939cb; } else { pc = 0x4939b2; } continue;
+        }
+        0x4939b2 => {
+            // 0x4939b2: mov eax, ecx
+            eax = ecx;
+            // 0x4939b4: and eax, 0xfff
+            { let r = (eax) & (0xfffu32); fl = f_logic(r, 32); eax = r; }
+            // 0x4939b9: shl eax, 4
+            { let r = eax << 4; fl = f_logic(r, 32); eax = r; }
+            // 0x4939bc: mov eax, dword ptr [eax + 0x2149c64]
+            eax = rd((eax.wrapping_add(0x2149c64)) as usize);
+            // 0x4939c2: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x4939c4: je 0x4939cb
+            if fl.zf { pc = 0x4939cb; } else { pc = 0x4939c6; } continue;
+        }
+        0x4939c6 => {
+            // 0x4939c6: cmp dword ptr [eax + 0x44], ecx
+            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
+            // 0x4939c9: je 0x4939cf
+            if fl.zf { pc = 0x4939cf; } else { pc = 0x4939cb; } continue;
+        }
+        0x4939cb => {
+            // 0x4939cb: xor eax, eax
+            fl = f_logic(0, 32); eax = 0;
+            // 0x4939cd: jmp 0x4939dd
+            pc = 0x4939dd; continue;
+        }
+        0x4939cf => {
+            // 0x4939cf: xor ecx, ecx
+            fl = f_logic(0, 32); ecx = 0;
+            // 0x4939d1: cmp dword ptr [eax + 0x4c], 5
+            fl = f_sub(rd((eax.wrapping_add(0x4c)) as usize), 0x5u32, 32);
+            // 0x4939d5: setne cl
+            ecx = (ecx & 0xffffff00) | (((!fl.zf) as u32) & 0xff);
+            // 0x4939d8: sub ecx, 1
+            { let a = ecx; let b = 0x1u32; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x4939db: and eax, ecx
+            { let r = (eax) & (ecx); fl = f_logic(r, 32); eax = r; }
+            pc = 0x4939dd; continue;
+        }
+        0x4939dd => {
+            // 0x4939dd: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x4939de: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x4939df: call 0xaad320
+            callx!(0xaad320, 3, 0, 0, 0.0, 0.0);
+            // 0x4939e4: add esp, 8
+            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x4939e7: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x4939e9: je 0x493a6f
+            if fl.zf { pc = 0x493a6f; } else { pc = 0x4939ef; } continue;
+        }
+        0x4939ef => {
+            // 0x4939ef: mov edx, dword ptr [eax + 0xb4]
+            edx = rd((eax.wrapping_add(0xb4)) as usize);
+            // 0x4939f5: mov eax, dword ptr [edx + 4]
+            eax = rd((edx.wrapping_add(0x4)) as usize);
+            // 0x4939f8: cmp eax, 4
+            fl = f_sub(eax, 0x4u32, 32);
+            // 0x4939fb: je 0x493a07
+            if fl.zf { pc = 0x493a07; } else { pc = 0x4939fd; } continue;
+        }
+        0x4939fd => {
+            // 0x4939fd: cmp eax, 8
+            fl = f_sub(eax, 0x8u32, 32);
+            // 0x493a00: je 0x493a07
+            if fl.zf { pc = 0x493a07; } else { pc = 0x493a02; } continue;
+        }
+        0x493a02 => {
+            // 0x493a02: cmp eax, 1
+            fl = f_sub(eax, 0x1u32, 32);
+            // 0x493a05: jne 0x493a6f
+            if !fl.zf { pc = 0x493a6f; } else { pc = 0x493a07; } continue;
+        }
+        0x493a07 => {
+            // 0x493a07: mov eax, dword ptr [esp + 8]
+            eax = rd((esp.wrapping_add(0x8)) as usize);
+            // 0x493a0b: add eax, 1
+            { let a = eax; let b = 0x1u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x493a0e: add esi, 0x3c
+            { let a = esi; let b = 0x3cu32; fl = f_add(a, b, 32); esi = a.wrapping_add(b); }
+            // 0x493a11: cmp eax, dword ptr [esp + 0x10]
+            fl = f_sub(eax, rd((esp.wrapping_add(0x10)) as usize), 32);
+            // 0x493a15: mov dword ptr [esp + 8], eax
+            wd((esp.wrapping_add(0x8)) as usize, eax);
+            // 0x493a19: jl 0x493983
+            if fl.sf != fl.of { pc = 0x493983; } else { pc = 0x493a1f; } continue;
+        }
+        0x493a1f => {
+            // 0x493a1f: fld dword ptr [edi]
+            fx.push(rf((edi) as usize) as f64);
+            // 0x493a21: mov esi, dword ptr [esp + 0x14]
+            esi = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x493a25: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x493a27: fstp dword ptr [ebx]
+            wf((ebx) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493a29: fld dword ptr [edi + 4]
+            fx.push(rf((edi.wrapping_add(0x4)) as usize) as f64);
+            // 0x493a2c: fstp dword ptr [ebx + 4]
+            wf((ebx.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493a2f: fld dword ptr [edi + 8]
+            fx.push(rf((edi.wrapping_add(0x8)) as usize) as f64);
+            // 0x493a32: fstp dword ptr [ebx + 8]
+            wf((ebx.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493a35: js 0x493ae0
+            if fl.sf { pc = 0x493ae0; } else { pc = 0x493a3b; } continue;
+        }
+        0x493a3b => {
+            bump(C::Cam4938c0B493A3B);
+            // 0x493a3b: mov eax, dword ptr [0x31bf2bc]
+            eax = rd(0x31bf2bcusize);
+            // 0x493a40: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x493a41: call dword ptr [0xdb807c]
+            callx!(rd(0xdb807cusize) as usize, 2, 1, 0, 0.0, 0.0);
+            // 0x493a47: mov edx, dword ptr [esp + 0xc]
+            edx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x493a4b: and esi, 0x3fffffff
+            { let r = (esi) & (0x3fffffffu32); fl = f_logic(r, 32); esi = r; }
+            // 0x493a51: mov ecx, esi
+            ecx = esi;
+            // 0x493a53: shl ecx, 4
+            { let r = ecx << 4; fl = f_logic(r, 32); ecx = r; }
+            // 0x493a56: sub ecx, esi
+            { let a = ecx; let b = esi; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x493a58: add ecx, ecx
+            { let a = ecx; let b = ecx; fl = f_add(a, b, 32); ecx = a.wrapping_add(b); }
+            // 0x493a5a: push 0x17
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x17u32);
+            // 0x493a5c: add ecx, ecx
+            { let a = ecx; let b = ecx; fl = f_add(a, b, 32); ecx = a.wrapping_add(b); }
+            // 0x493a5e: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x493a5f: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x493a60: mov ecx, eax
+            ecx = eax;
+            // 0x493a62: call 0xd2b7d0
+            callx!(0xd2b7d0, 4, 3, 0, 0.0, 0.0);
+            // 0x493a67: mov eax, ebx
+            eax = ebx;
+            // 0x493a69: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x493a6a: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x493a6b: mov esp, ebp
+            esp = ebp;
+            // 0x493a6d: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x493a6e: ret 
+            break;
+        }
+        0x493a6f => {
+            // 0x493a6f: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x493a71: je 0x493a1f
+            if fl.zf { pc = 0x493a1f; } else { pc = 0x493a73; } continue;
+        }
+        0x493a73 => {
+            // 0x493a73: fld dword ptr [esi + 0xc]
+            fx.push(rf((esi.wrapping_add(0xc)) as usize) as f64);
+            // 0x493a76: mov byte ptr [0x2526b5a], 1
+            wb(0x2526b5ausize, (0x1u32) as u8);
+            // 0x493a7d: fstp dword ptr [ebx]
+            wf((ebx) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493a7f: fld dword ptr [esi + 0x10]
+            fx.push(rf((esi.wrapping_add(0x10)) as usize) as f64);
+            // 0x493a82: fstp dword ptr [ebx + 4]
+            wf((ebx.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493a85: fld dword ptr [esi + 0x14]
+            fx.push(rf((esi.wrapping_add(0x14)) as usize) as f64);
+            // 0x493a88: mov esi, dword ptr [esp + 0x14]
+            esi = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x493a8c: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x493a8e: fstp dword ptr [ebx + 8]
+            wf((ebx.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493a91: js 0x493ae0
+            if fl.sf { pc = 0x493ae0; } else { pc = 0x493a93; } continue;
+        }
+        0x493a93 => {
+            bump(C::Cam4938c0B493A93);
+            // 0x493a93: mov eax, dword ptr [0x31bf2bc]
+            eax = rd(0x31bf2bcusize);
+            // 0x493a98: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x493a99: call dword ptr [0xdb807c]
+            callx!(rd(0xdb807cusize) as usize, 2, 1, 0, 0.0, 0.0);
+            // 0x493a9f: mov edx, dword ptr [esp + 0xc]
+            edx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x493aa3: and esi, 0x3fffffff
+            { let r = (esi) & (0x3fffffffu32); fl = f_logic(r, 32); esi = r; }
+            // 0x493aa9: mov ecx, esi
+            ecx = esi;
+            // 0x493aab: shl ecx, 4
+            { let r = ecx << 4; fl = f_logic(r, 32); ecx = r; }
+            // 0x493aae: sub ecx, esi
+            { let a = ecx; let b = esi; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x493ab0: add ecx, ecx
+            { let a = ecx; let b = ecx; fl = f_add(a, b, 32); ecx = a.wrapping_add(b); }
+            // 0x493ab2: push 0x17
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x17u32);
+            // 0x493ab4: add ecx, ecx
+            { let a = ecx; let b = ecx; fl = f_add(a, b, 32); ecx = a.wrapping_add(b); }
+            // 0x493ab6: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x493ab7: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x493ab8: mov ecx, eax
+            ecx = eax;
+            // 0x493aba: call 0xd2b7d0
+            callx!(0xd2b7d0, 4, 3, 0, 0.0, 0.0);
+            // 0x493abf: mov eax, ebx
+            eax = ebx;
+            // 0x493ac1: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x493ac2: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x493ac3: mov esp, ebp
+            esp = ebp;
+            // 0x493ac5: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x493ac6: ret 
+            break;
+        }
+        0x493ac7 => {
+            // 0x493ac7: fld dword ptr [edi]
+            fx.push(rf((edi) as usize) as f64);
+            // 0x493ac9: lea ecx, [esp + 0xc]
+            ecx = (esp.wrapping_add(0xc));
+            // 0x493acd: fstp dword ptr [ebx]
+            wf((ebx) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493acf: fld dword ptr [edi + 4]
+            fx.push(rf((edi.wrapping_add(0x4)) as usize) as f64);
+            // 0x493ad2: fstp dword ptr [ebx + 4]
+            wf((ebx.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493ad5: fld dword ptr [edi + 8]
+            fx.push(rf((edi.wrapping_add(0x8)) as usize) as f64);
+            // 0x493ad8: fstp dword ptr [ebx + 8]
+            wf((ebx.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x493adb: call 0x4080b0
+            callx!(0x4080b0, 1, 0, 0, 0.0, 0.0);
+            pc = 0x493ae0; continue;
+        }
+        0x493ae0 => {
+            // 0x493ae0: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x493ae1: mov eax, ebx
+            eax = ebx;
+            // 0x493ae3: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x493ae4: mov esp, ebp
+            esp = ebp;
+            // 0x493ae6: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x493ae7: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn cam_4938c0_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { cam_4938c0_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_4938c0_thunk, cam_4938c0_entry, 0);
+
+const CAM_4938C0_BODY: [u8; 552] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x68, 0x53, 0x8B, 0x5D, 0x08, 0x56, 0x33, 0xF6,
+    0x39, 0x35, 0x4C, 0x86, 0x52, 0x02, 0x74, 0x18, 0xD9, 0x07, 0x8B, 0xC3, 0xD9, 0x1B, 0xD9, 0x47,
+    0x04, 0xD9, 0x5B, 0x04, 0xD9, 0x47, 0x08, 0xD9, 0x5B, 0x08, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3,
+    0x8B, 0x08, 0xD9, 0x05, 0x70, 0x9A, 0xE9, 0x00, 0x8B, 0x50, 0x04, 0xD9, 0x5C, 0x24, 0x30, 0x8B,
+    0x40, 0x08, 0x89, 0x4C, 0x24, 0x18, 0x8B, 0x0F, 0x89, 0x44, 0x24, 0x20, 0x8B, 0x47, 0x08, 0x89,
+    0x54, 0x24, 0x1C, 0x8B, 0x57, 0x04, 0x89, 0x4C, 0x24, 0x24, 0x8B, 0x4D, 0x0C, 0x89, 0x44, 0x24,
+    0x2C, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x56, 0x89, 0x54, 0x24, 0x2C, 0x50, 0x8D, 0x54, 0x24, 0x14,
+    0x89, 0x4C, 0x24, 0x68, 0x52, 0x8D, 0x4C, 0x24, 0x24, 0x89, 0x74, 0x24, 0x40, 0x89, 0x74, 0x24,
+    0x68, 0x89, 0x74, 0x24, 0x18, 0x89, 0x74, 0x24, 0x1C, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00,
+    0x80, 0x89, 0x44, 0x24, 0x78, 0xC7, 0x44, 0x24, 0x70, 0x03, 0x00, 0x00, 0x00, 0x89, 0x44, 0x24,
+    0x74, 0xE8, 0xBA, 0x6E, 0x26, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x0F, 0x84, 0x56, 0x01, 0x00,
+    0x00, 0x39, 0x74, 0x24, 0x10, 0x89, 0x74, 0x24, 0x08, 0x0F, 0x8E, 0xA0, 0x00, 0x00, 0x00, 0x8B,
+    0x74, 0x24, 0x0C, 0xA1, 0xD4, 0x03, 0x17, 0x02, 0x50, 0xE8, 0x92, 0x59, 0x52, 0x00, 0x83, 0xC4,
+    0x04, 0x84, 0xC0, 0x0F, 0x84, 0xD6, 0x00, 0x00, 0x00, 0x8B, 0x4E, 0x28, 0x8B, 0x15, 0xD4, 0x03,
+    0x17, 0x02, 0x39, 0x8A, 0x74, 0x0D, 0x00, 0x00, 0x0F, 0x85, 0xC1, 0x00, 0x00, 0x00, 0x85, 0xC9,
+    0x74, 0x19, 0x8B, 0xC1, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C,
+    0x14, 0x02, 0x85, 0xC0, 0x74, 0x05, 0x39, 0x48, 0x44, 0x74, 0x04, 0x33, 0xC0, 0xEB, 0x0E, 0x33,
+    0xC9, 0x83, 0x78, 0x4C, 0x05, 0x0F, 0x95, 0xC1, 0x83, 0xE9, 0x01, 0x23, 0xC1, 0x56, 0x50, 0xE8,
+    0x3C, 0x99, 0x61, 0x00, 0x83, 0xC4, 0x08, 0x85, 0xC0, 0x0F, 0x84, 0x80, 0x00, 0x00, 0x00, 0x8B,
+    0x90, 0xB4, 0x00, 0x00, 0x00, 0x8B, 0x42, 0x04, 0x83, 0xF8, 0x04, 0x74, 0x0A, 0x83, 0xF8, 0x08,
+    0x74, 0x05, 0x83, 0xF8, 0x01, 0x75, 0x68, 0x8B, 0x44, 0x24, 0x08, 0x83, 0xC0, 0x01, 0x83, 0xC6,
+    0x3C, 0x3B, 0x44, 0x24, 0x10, 0x89, 0x44, 0x24, 0x08, 0x0F, 0x8C, 0x64, 0xFF, 0xFF, 0xFF, 0xD9,
+    0x07, 0x8B, 0x74, 0x24, 0x14, 0x85, 0xF6, 0xD9, 0x1B, 0xD9, 0x47, 0x04, 0xD9, 0x5B, 0x04, 0xD9,
+    0x47, 0x08, 0xD9, 0x5B, 0x08, 0x0F, 0x88, 0xA5, 0x00, 0x00, 0x00, 0xA1, 0xBC, 0xF2, 0x1B, 0x03,
+    0x50, 0xFF, 0x15, 0x7C, 0x80, 0xDB, 0x00, 0x8B, 0x54, 0x24, 0x0C, 0x81, 0xE6, 0xFF, 0xFF, 0xFF,
+    0x3F, 0x8B, 0xCE, 0xC1, 0xE1, 0x04, 0x2B, 0xCE, 0x03, 0xC9, 0x6A, 0x17, 0x03, 0xC9, 0x51, 0x52,
+    0x8B, 0xC8, 0xE8, 0x69, 0x7D, 0x89, 0x00, 0x8B, 0xC3, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x85,
+    0xF6, 0x74, 0xAC, 0xD9, 0x46, 0x0C, 0xC6, 0x05, 0x5A, 0x6B, 0x52, 0x02, 0x01, 0xD9, 0x1B, 0xD9,
+    0x46, 0x10, 0xD9, 0x5B, 0x04, 0xD9, 0x46, 0x14, 0x8B, 0x74, 0x24, 0x14, 0x85, 0xF6, 0xD9, 0x5B,
+    0x08, 0x78, 0x4D, 0xA1, 0xBC, 0xF2, 0x1B, 0x03, 0x50, 0xFF, 0x15, 0x7C, 0x80, 0xDB, 0x00, 0x8B,
+    0x54, 0x24, 0x0C, 0x81, 0xE6, 0xFF, 0xFF, 0xFF, 0x3F, 0x8B, 0xCE, 0xC1, 0xE1, 0x04, 0x2B, 0xCE,
+    0x03, 0xC9, 0x6A, 0x17, 0x03, 0xC9, 0x51, 0x52, 0x8B, 0xC8, 0xE8, 0x11, 0x7D, 0x89, 0x00, 0x8B,
+    0xC3, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0xD9, 0x07, 0x8D, 0x4C, 0x24, 0x0C, 0xD9, 0x1B, 0xD9,
+    0x47, 0x04, 0xD9, 0x5B, 0x04, 0xD9, 0x47, 0x08, 0xD9, 0x5B, 0x08, 0xE8, 0xD0, 0x45, 0xF7, 0xFF,
+    0x5E, 0x8B, 0xC3, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3,
+];
+
+
+// --- cam_496be0 (0x496be0..0x496d98, 440 bytes) ----------------------------------------
+
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn cam_496be0_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x496be0;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x496be0 => {
+            bump(C::Cam496be0Calls);
+            // 0x496be0: sub esp, 0x14
+            { let a = esp; let b = 0x14u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x496be3: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x496be4: mov ebx, dword ptr [esp + 0x1c]
+            ebx = rd((esp.wrapping_add(0x1c)) as usize);
+            // 0x496be8: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x496be9: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x496bea: mov edi, eax
+            edi = eax;
+            // 0x496bec: mov eax, dword ptr [0x25f5bb0]
+            eax = rd(0x25f5bb0usize);
+            // 0x496bf1: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x496bf3: je 0x496d85
+            if fl.zf { pc = 0x496d85; } else { pc = 0x496bf9; } continue;
+        }
+        0x496bf9 => {
+            // 0x496bf9: mov ecx, eax
+            ecx = eax;
+            // 0x496bfb: and ecx, 0xfff
+            { let r = (ecx) & (0xfffu32); fl = f_logic(r, 32); ecx = r; }
+            // 0x496c01: shl ecx, 4
+            { let r = ecx << 4; fl = f_logic(r, 32); ecx = r; }
+            // 0x496c04: mov esi, dword ptr [ecx + 0x2149c64]
+            esi = rd((ecx.wrapping_add(0x2149c64)) as usize);
+            // 0x496c0a: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x496c0c: je 0x496d85
+            if fl.zf { pc = 0x496d85; } else { pc = 0x496c12; } continue;
+        }
+        0x496c12 => {
+            // 0x496c12: cmp dword ptr [esi + 0x44], eax
+            fl = f_sub(rd((esi.wrapping_add(0x44)) as usize), eax, 32);
+            // 0x496c15: jne 0x496d85
+            if !fl.zf { pc = 0x496d85; } else { pc = 0x496c1b; } continue;
+        }
+        0x496c1b => {
+            // 0x496c1b: cmp dword ptr [esi + 0x4c], 5
+            fl = f_sub(rd((esi.wrapping_add(0x4c)) as usize), 0x5u32, 32);
+            // 0x496c1f: jne 0x496d85
+            if !fl.zf { pc = 0x496d85; } else { pc = 0x496c25; } continue;
+        }
+        0x496c25 => {
+            // 0x496c25: mov eax, esi
+            eax = esi;
+            // 0x496c27: call 0x806720
+            callx!(0x806720, 2, 0, 0, 0.0, 0.0);
+            // 0x496c2c: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x496c2e: je 0x496d85
+            if fl.zf { pc = 0x496d85; } else { pc = 0x496c34; } continue;
+        }
+        0x496c34 => {
+            // 0x496c34: cmp dword ptr [0xe9a5bc], 7
+            fl = f_sub(rd(0xe9a5bcusize), 0x7u32, 32);
+            // 0x496c3b: je 0x496d85
+            if fl.zf { pc = 0x496d85; } else { pc = 0x496c41; } continue;
+        }
+        0x496c41 => {
+            // 0x496c41: lea edx, [esp + 0x14]
+            edx = (esp.wrapping_add(0x14));
+            // 0x496c45: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x496c46: mov ecx, esi
+            ecx = esi;
+            // 0x496c48: call 0xaa68e0
+            callx!(0xaa68e0, 3, 0, 0, 0.0, 0.0);
+            // 0x496c4d: fldz 
+            fx.push(0.0);
+            // 0x496c4f: mov eax, dword ptr [esi + 0x84e4]
+            eax = rd((esi.wrapping_add(0x84e4)) as usize);
+            // 0x496c55: fcomp dword ptr [eax + 0x5b8]
+            fx.sw = fcmp(fx.s(0), (rf((eax.wrapping_add(0x5b8)) as usize) as f64));
+            fx.pop();
+            // 0x496c5b: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x496c5e: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x496c60: test ah, 0x44
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x44u32), 8);
+            // 0x496c63: jnp 0x496d91
+            if !fl.pf { pc = 0x496d91; } else { pc = 0x496c69; } continue;
+        }
+        0x496c69 => {
+            bump(C::Cam496be0B496C69);
+            // 0x496c69: fld dword ptr [edi + 0xe4]
+            fx.push(rf((edi.wrapping_add(0xe4)) as usize) as f64);
+            // 0x496c6f: mov edi, dword ptr [esi + 0x84e4]
+            edi = rd((esi.wrapping_add(0x84e4)) as usize);
+            // 0x496c75: lea eax, [esp + 0x14]
+            eax = (esp.wrapping_add(0x14));
+            // 0x496c79: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x496c7d: call 0x412080
+            callx!(0x412080, 2, 0, 0, 0.0, 0.0);
+            // 0x496c82: fdiv dword ptr [edi + 0x5b8]
+            { let v = fx.s(0) / (rf((edi.wrapping_add(0x5b8)) as usize) as f64); fx.set(0, v); }
+            // 0x496c88: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x496c8c: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x496c90: fld dword ptr [edi + 0x5a8]
+            fx.push(rf((edi.wrapping_add(0x5a8)) as usize) as f64);
+            // 0x496c96: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x496c9a: fld st(0)
+            { let v = fx.s(0); fx.push(v); }
+            // 0x496c9c: fsubp st(2)
+            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x496c9e: fxch st(1)
+            fx.xch(1);
+            // 0x496ca0: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x496ca4: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x496ca8: fmulp st(2)
+            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
+            fx.pop();
+            // 0x496caa: faddp st(1)
+            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
+            fx.pop();
+            // 0x496cac: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x496cb0: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x496cb4: fst dword ptr [ebx + 0xc0]
+            wf((ebx.wrapping_add(0xc0)) as usize, fx.s(0) as f32);
+            // 0x496cba: mov ecx, dword ptr [esi + 0x84e4]
+            ecx = rd((esi.wrapping_add(0x84e4)) as usize);
+            // 0x496cc0: fmul dword ptr [ecx + 0x5a4]
+            { let v = fx.s(0) * (rf((ecx.wrapping_add(0x5a4)) as usize) as f64); fx.set(0, v); }
+            // 0x496cc6: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x496cca: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x496cce: fst dword ptr [ebx + 0xc0]
+            wf((ebx.wrapping_add(0xc0)) as usize, fx.s(0) as f32);
+            // 0x496cd4: mov edx, dword ptr [esi + 0x84e4]
+            edx = rd((esi.wrapping_add(0x84e4)) as usize);
+            // 0x496cda: fld dword ptr [edx + 0x5a8]
+            fx.push(rf((edx.wrapping_add(0x5a8)) as usize) as f64);
+            // 0x496ce0: fcomp st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop();
+            // 0x496ce2: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x496ce4: test ah, 0x41
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
+            // 0x496ce7: je 0x496cf3
+            if fl.zf { pc = 0x496cf3; } else { pc = 0x496ce9; } continue;
+        }
+        0x496ce9 => {
+            // 0x496ce9: mov eax, edx
+            eax = edx;
+            // 0x496ceb: fstp st(0)
+            fx.pop();
+            // 0x496ced: fld dword ptr [eax + 0x5a8]
+            fx.push(rf((eax.wrapping_add(0x5a8)) as usize) as f64);
+            pc = 0x496cf3; continue;
+        }
+        0x496cf3 => {
+            // 0x496cf3: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x496cf7: mov eax, esi
+            eax = esi;
+            // 0x496cf9: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x496cfd: fst dword ptr [ebx + 0xc0]
+            wf((ebx.wrapping_add(0xc0)) as usize, fx.s(0) as f32);
+            // 0x496d03: call 0xab51d0
+            callx!(0xab51d0, 2, 0, 0, 0.0, 0.0);
+            // 0x496d08: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x496d0a: je 0x496d39
+            if fl.zf { pc = 0x496d39; } else { pc = 0x496d0c; } continue;
+        }
+        0x496d0c => {
+            // 0x496d0c: mov ecx, dword ptr [esi + 0x84e4]
+            ecx = rd((esi.wrapping_add(0x84e4)) as usize);
+            // 0x496d12: fld dword ptr [ecx + 0x5a8]
+            fx.push(rf((ecx.wrapping_add(0x5a8)) as usize) as f64);
+            // 0x496d18: fmul qword ptr [0xe5c210]
+            { let v = fx.s(0) * rdf64(0xe5c210usize); fx.set(0, v); }
+            // 0x496d1e: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x496d22: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x496d26: fcom st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            // 0x496d28: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x496d2a: fstp st(1)
+            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
+            // 0x496d2c: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x496d2f: jp 0x496d39
+            if fl.pf { pc = 0x496d39; } else { pc = 0x496d31; } continue;
+        }
+        0x496d31 => {
+            // 0x496d31: fstp dword ptr [ebx + 0xc0]
+            wf((ebx.wrapping_add(0xc0)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x496d37: jmp 0x496d3b
+            pc = 0x496d3b; continue;
+        }
+        0x496d39 => {
+            // 0x496d39: fstp st(0)
+            fx.pop();
+            pc = 0x496d3b; continue;
+        }
+        0x496d3b => {
+            // 0x496d3b: cmp dword ptr [0xea03c0], -1
+            fl = f_sub(rd(0xea03c0usize), 0xffffffffu32, 32);
+            // 0x496d42: je 0x496d91
+            if fl.zf { pc = 0x496d91; } else { pc = 0x496d44; } continue;
+        }
+        0x496d44 => {
+            // 0x496d44: mov eax, dword ptr [0xea0404]
+            eax = rd(0xea0404usize);
+            // 0x496d49: sub eax, 3
+            { let a = eax; let b = 0x3u32; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x496d4c: je 0x496d6c
+            if fl.zf { pc = 0x496d6c; } else { pc = 0x496d4e; } continue;
+        }
+        0x496d4e => {
+            // 0x496d4e: sub eax, 1
+            { let a = eax; let b = 0x1u32; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x496d51: jne 0x496d91
+            if !fl.zf { pc = 0x496d91; } else { pc = 0x496d53; } continue;
+        }
+        0x496d53 => {
+            // 0x496d53: fld dword ptr [ebx + 0xc0]
+            fx.push(rf((ebx.wrapping_add(0xc0)) as usize) as f64);
+            // 0x496d59: fadd qword ptr [0xe5bf68]
+            { let v = fx.s(0) + rdf64(0xe5bf68usize); fx.set(0, v); }
+            // 0x496d5f: fstp dword ptr [ebx + 0xc0]
+            wf((ebx.wrapping_add(0xc0)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x496d65: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x496d66: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x496d67: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x496d68: add esp, 0x14
+            { let a = esp; let b = 0x14u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x496d6b: ret 
+            break;
+        }
+        0x496d6c => {
+            // 0x496d6c: fld dword ptr [ebx + 0xc0]
+            fx.push(rf((ebx.wrapping_add(0xc0)) as usize) as f64);
+            // 0x496d72: fsub qword ptr [0xe5bf68]
+            { let v = fx.s(0) - rdf64(0xe5bf68usize); fx.set(0, v); }
+            // 0x496d78: fstp dword ptr [ebx + 0xc0]
+            wf((ebx.wrapping_add(0xc0)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x496d7e: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x496d7f: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x496d80: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x496d81: add esp, 0x14
+            { let a = esp; let b = 0x14u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x496d84: ret 
+            break;
+        }
+        0x496d85 => {
+            // 0x496d85: fld dword ptr [edi + 0xe4]
+            fx.push(rf((edi.wrapping_add(0xe4)) as usize) as f64);
+            // 0x496d8b: fstp dword ptr [ebx + 0xc0]
+            wf((ebx.wrapping_add(0xc0)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x496d91; continue;
+        }
+        0x496d91 => {
+            // 0x496d91: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x496d92: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x496d93: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x496d94: add esp, 0x14
+            { let a = esp; let b = 0x14u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x496d97: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn cam_496be0_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { cam_496be0_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_496be0_thunk, cam_496be0_entry, 0);
+
+const CAM_496BE0_BODY: [u8; 440] = [
+    0x83, 0xEC, 0x14, 0x53, 0x8B, 0x5C, 0x24, 0x1C, 0x56, 0x57, 0x8B, 0xF8, 0xA1, 0xB0, 0x5B, 0x5F,
+    0x02, 0x85, 0xC0, 0x0F, 0x84, 0x8C, 0x01, 0x00, 0x00, 0x8B, 0xC8, 0x81, 0xE1, 0xFF, 0x0F, 0x00,
+    0x00, 0xC1, 0xE1, 0x04, 0x8B, 0xB1, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xF6, 0x0F, 0x84, 0x73, 0x01,
+    0x00, 0x00, 0x39, 0x46, 0x44, 0x0F, 0x85, 0x6A, 0x01, 0x00, 0x00, 0x83, 0x7E, 0x4C, 0x05, 0x0F,
+    0x85, 0x60, 0x01, 0x00, 0x00, 0x8B, 0xC6, 0xE8, 0xF4, 0xFA, 0x36, 0x00, 0x84, 0xC0, 0x0F, 0x84,
+    0x51, 0x01, 0x00, 0x00, 0x83, 0x3D, 0xBC, 0xA5, 0xE9, 0x00, 0x07, 0x0F, 0x84, 0x44, 0x01, 0x00,
+    0x00, 0x8D, 0x54, 0x24, 0x14, 0x52, 0x8B, 0xCE, 0xE8, 0x93, 0xFC, 0x60, 0x00, 0xD9, 0xEE, 0x8B,
+    0x86, 0xE4, 0x84, 0x00, 0x00, 0xD8, 0x98, 0xB8, 0x05, 0x00, 0x00, 0x83, 0xC4, 0x04, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x44, 0x0F, 0x8B, 0x28, 0x01, 0x00, 0x00, 0xD9, 0x87, 0xE4, 0x00, 0x00, 0x00, 0x8B,
+    0xBE, 0xE4, 0x84, 0x00, 0x00, 0x8D, 0x44, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x10, 0xE8, 0xFE, 0xB3,
+    0xF7, 0xFF, 0xD8, 0xB7, 0xB8, 0x05, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C,
+    0xD9, 0x87, 0xA8, 0x05, 0x00, 0x00, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9,
+    0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x10, 0xDE, 0xCA, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x10,
+    0xD9, 0x44, 0x24, 0x10, 0xD9, 0x93, 0xC0, 0x00, 0x00, 0x00, 0x8B, 0x8E, 0xE4, 0x84, 0x00, 0x00,
+    0xD8, 0x89, 0xA4, 0x05, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0x93,
+    0xC0, 0x00, 0x00, 0x00, 0x8B, 0x96, 0xE4, 0x84, 0x00, 0x00, 0xD9, 0x82, 0xA8, 0x05, 0x00, 0x00,
+    0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x74, 0x0A, 0x8B, 0xC2, 0xDD, 0xD8, 0xD9, 0x80, 0xA8,
+    0x05, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0xC6, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x93, 0xC0,
+    0x00, 0x00, 0x00, 0xE8, 0xC8, 0xE4, 0x61, 0x00, 0x84, 0xC0, 0x74, 0x2D, 0x8B, 0x8E, 0xE4, 0x84,
+    0x00, 0x00, 0xD9, 0x81, 0xA8, 0x05, 0x00, 0x00, 0xDC, 0x0D, 0x10, 0xC2, 0xE5, 0x00, 0xD9, 0x5C,
+    0x24, 0x10, 0xD9, 0x44, 0x24, 0x10, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x05, 0x7A,
+    0x08, 0xD9, 0x9B, 0xC0, 0x00, 0x00, 0x00, 0xEB, 0x02, 0xDD, 0xD8, 0x83, 0x3D, 0xC0, 0x03, 0xEA,
+    0x00, 0xFF, 0x74, 0x4D, 0xA1, 0x04, 0x04, 0xEA, 0x00, 0x83, 0xE8, 0x03, 0x74, 0x1E, 0x83, 0xE8,
+    0x01, 0x75, 0x3E, 0xD9, 0x83, 0xC0, 0x00, 0x00, 0x00, 0xDC, 0x05, 0x68, 0xBF, 0xE5, 0x00, 0xD9,
+    0x9B, 0xC0, 0x00, 0x00, 0x00, 0x5F, 0x5E, 0x5B, 0x83, 0xC4, 0x14, 0xC3, 0xD9, 0x83, 0xC0, 0x00,
+    0x00, 0x00, 0xDC, 0x25, 0x68, 0xBF, 0xE5, 0x00, 0xD9, 0x9B, 0xC0, 0x00, 0x00, 0x00, 0x5F, 0x5E,
+    0x5B, 0x83, 0xC4, 0x14, 0xC3, 0xD9, 0x87, 0xE4, 0x00, 0x00, 0x00, 0xD9, 0x9B, 0xC0, 0x00, 0x00,
+    0x00, 0x5F, 0x5E, 0x5B, 0x83, 0xC4, 0x14, 0xC3,
+];
+
+
+// --- cam_492df0 (0x492df0..0x492fd3, 483 bytes) ----------------------------------------
+
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn cam_492df0_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x492df0;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x492df0 => {
+            bump(C::Cam492df0Calls);
+            // 0x492df0: sub esp, 0x5c
+            { let a = esp; let b = 0x5cu32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x492df3: cmp dword ptr [0x25f5ae8], 0
+            fl = f_sub(rd(0x25f5ae8usize), 0x0u32, 32);
+            // 0x492dfa: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x492dfb: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x492dfc: jne 0x492fcd
+            if !fl.zf { pc = 0x492fcd; } else { pc = 0x492e02; } continue;
+        }
+        0x492e02 => {
+            // 0x492e02: mov byte ptr [0x2526b5a], 1
+            wb(0x2526b5ausize, (0x1u32) as u8);
+            // 0x492e09: call 0x49a670
+            callx!(0x49a670, 2, 0, 0, 0.0, 0.0);
+            // 0x492e0e: cmp dword ptr [0x25f5ae8], 0
+            fl = f_sub(rd(0x25f5ae8usize), 0x0u32, 32);
+            // 0x492e15: jne 0x492e2a
+            if !fl.zf { pc = 0x492e2a; } else { pc = 0x492e17; } continue;
+        }
+        0x492e17 => {
+            // 0x492e17: cmp dword ptr [0x25f5c54], 1
+            fl = f_sub(rd(0x25f5c54usize), 0x1u32, 32);
+            // 0x492e1e: jne 0x492e2a
+            if !fl.zf { pc = 0x492e2a; } else { pc = 0x492e20; } continue;
+        }
+        0x492e20 => {
+            // 0x492e20: mov dword ptr [0x25f5c54], 0
+            wd(0x25f5c54usize, 0x0u32);
+            pc = 0x492e2a; continue;
+        }
+        0x492e2a => {
+            bump(C::Cam492df0B492E2A);
+            // 0x492e2a: call 0x499b50
+            callx!(0x499b50, 2, 0, 0, 0.0, 0.0);
+            // 0x492e2f: mov eax, dword ptr [0xe9a664]
+            eax = rd(0xe9a664usize);
+            // 0x492e34: mov ecx, dword ptr [0xe9a668]
+            ecx = rd(0xe9a668usize);
+            // 0x492e3a: mov edx, dword ptr [0xe9a66c]
+            edx = rd(0xe9a66cusize);
+            // 0x492e40: lea esi, [esp + 0x28]
+            esi = (esp.wrapping_add(0x28));
+            // 0x492e44: mov dword ptr [esp + 0x10], eax
+            wd((esp.wrapping_add(0x10)) as usize, eax);
+            // 0x492e48: mov dword ptr [esp + 0x14], ecx
+            wd((esp.wrapping_add(0x14)) as usize, ecx);
+            // 0x492e4c: mov dword ptr [esp + 0x18], edx
+            wd((esp.wrapping_add(0x18)) as usize, edx);
+            // 0x492e50: call 0x49d140
+            callx!(0x49d140, 2, 0, 0, 0.0, 0.0);
+            // 0x492e55: fld dword ptr [0x25f5b14]
+            fx.push(rf(0x25f5b14usize) as f64);
+            // 0x492e5b: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x492e5f: lea eax, [esp + 0x34]
+            eax = (esp.wrapping_add(0x34));
+            // 0x492e63: fld dword ptr [0x25f5b18]
+            fx.push(rf(0x25f5b18usize) as f64);
+            // 0x492e69: push 0x4941f0
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x4941f0u32);
+            // 0x492e6e: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x492e72: push eax
+            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
+            // 0x492e73: fld dword ptr [0x25f5b1c]
+            fx.push(rf(0x25f5b1cusize) as f64);
+            // 0x492e79: mov edi, esi
+            edi = esi;
+            // 0x492e7b: lea eax, [esp + 0x18]
+            eax = (esp.wrapping_add(0x18));
+            // 0x492e7f: fstp dword ptr [esp + 0x2c]
+            wf((esp.wrapping_add(0x2c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x492e83: call 0x4938c0
+            callx!(0x4938c0, 4, 0, 0, 0.0, 0.0);
+            // 0x492e88: mov ecx, dword ptr [eax]
+            ecx = rd((eax) as usize);
+            // 0x492e8a: mov dword ptr [0x25f5b20], ecx
+            wd(0x25f5b20usize, ecx);
+            // 0x492e90: mov edx, dword ptr [eax + 4]
+            edx = rd((eax.wrapping_add(0x4)) as usize);
+            // 0x492e93: mov dword ptr [0x25f5b24], edx
+            wd(0x25f5b24usize, edx);
+            // 0x492e99: mov esi, dword ptr [eax + 8]
+            esi = rd((eax.wrapping_add(0x8)) as usize);
+            // 0x492e9c: mov dword ptr [0x25f5b28], esi
+            wd(0x25f5b28usize, esi);
+            // 0x492ea2: mov edi, dword ptr [eax]
+            edi = rd((eax) as usize);
+            // 0x492ea4: mov dword ptr [0x25f5b14], edi
+            wd(0x25f5b14usize, edi);
+            // 0x492eaa: mov edi, dword ptr [eax + 4]
+            edi = rd((eax.wrapping_add(0x4)) as usize);
+            // 0x492ead: mov dword ptr [0x25f5b18], edi
+            wd(0x25f5b18usize, edi);
+            // 0x492eb3: mov eax, dword ptr [eax + 8]
+            eax = rd((eax.wrapping_add(0x8)) as usize);
+            // 0x492eb6: mov dword ptr [0x25f5b2c], ecx
+            wd(0x25f5b2cusize, ecx);
+            // 0x492ebc: lea ecx, [esp + 0x30]
+            ecx = (esp.wrapping_add(0x30));
+            // 0x492ec0: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x492ec1: push 0x25f5b20
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5b20u32);
+            // 0x492ec6: mov dword ptr [0x25f5b1c], eax
+            wd(0x25f5b1cusize, eax);
+            // 0x492ecb: mov dword ptr [0x25f5b30], edx
+            wd(0x25f5b30usize, edx);
+            // 0x492ed1: mov dword ptr [0x25f5b34], esi
+            wd(0x25f5b34usize, esi);
+            // 0x492ed7: call 0xbde980
+            callx!(0xbde980, 6, 0, 0, 0.0, 0.0);
+            // 0x492edc: fstp dword ptr [0x25f5d04]
+            wf(0x25f5d04usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x492ee2: fldz 
+            fx.push(0.0);
+            // 0x492ee4: lea edx, [esp + 0x2c]
+            edx = (esp.wrapping_add(0x2c));
+            // 0x492ee8: push 0x25f5b14
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5b14u32);
+            // 0x492eed: fstp dword ptr [0x25f5c78]
+            wf(0x25f5c78usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x492ef3: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x492ef4: call 0xbde980
+            callx!(0xbde980, 8, 0, 0, 0.0, 0.0);
+            // 0x492ef9: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x492efd: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x492f01: add esp, 0x18
+            { let a = esp; let b = 0x18u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x492f04: fld dword ptr [0x2526be8]
+            fx.push(rf(0x2526be8usize) as f64);
+            // 0x492f0a: fcomp st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop();
+            // 0x492f0c: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x492f0e: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x492f11: jp 0x492f1b
+            if fl.pf { pc = 0x492f1b; } else { pc = 0x492f13; } continue;
+        }
+        0x492f13 => {
+            // 0x492f13: fstp dword ptr [0x2526be8]
+            wf(0x2526be8usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x492f19: jmp 0x492f1d
+            pc = 0x492f1d; continue;
+        }
+        0x492f1b => {
+            // 0x492f1b: fstp st(0)
+            fx.pop();
+            pc = 0x492f1d; continue;
+        }
+        0x492f1d => {
+            bump(C::Cam492df0B492F1D);
+            // 0x492f1d: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x492f21: lea ecx, [esp + 0x1c]
+            ecx = (esp.wrapping_add(0x1c));
+            // 0x492f25: fsub dword ptr [0x25f5b20]
+            { let v = fx.s(0) - (rf(0x25f5b20usize) as f64); fx.set(0, v); }
+            // 0x492f2b: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x492f2f: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x492f33: fsub dword ptr [0x25f5b24]
+            { let v = fx.s(0) - (rf(0x25f5b24usize) as f64); fx.set(0, v); }
+            // 0x492f39: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x492f3d: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x492f41: fsub dword ptr [0x25f5b28]
+            { let v = fx.s(0) - (rf(0x25f5b28usize) as f64); fx.set(0, v); }
+            // 0x492f47: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x492f4b: call 0xbdda80
+            callx!(0xbdda80, 2, 0, 0, 0.0, 0.0);
+            // 0x492f50: test al, al
+            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
+            // 0x492f52: je 0x492f89
+            if fl.zf { pc = 0x492f89; } else { pc = 0x492f54; } continue;
+        }
+        0x492f54 => {
+            // 0x492f54: mov ecx, dword ptr [0x25f5bb0]
+            ecx = rd(0x25f5bb0usize);
+            // 0x492f5a: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x492f5c: je 0x492f77
+            if fl.zf { pc = 0x492f77; } else { pc = 0x492f5e; } continue;
+        }
+        0x492f5e => {
+            // 0x492f5e: mov eax, ecx
+            eax = ecx;
+            // 0x492f60: and eax, 0xfff
+            { let r = (eax) & (0xfffu32); fl = f_logic(r, 32); eax = r; }
+            // 0x492f65: shl eax, 4
+            { let r = eax << 4; fl = f_logic(r, 32); eax = r; }
+            // 0x492f68: mov eax, dword ptr [eax + 0x2149c64]
+            eax = rd((eax.wrapping_add(0x2149c64)) as usize);
+            // 0x492f6e: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x492f70: je 0x492f77
+            if fl.zf { pc = 0x492f77; } else { pc = 0x492f72; } continue;
+        }
+        0x492f72 => {
+            // 0x492f72: cmp dword ptr [eax + 0x44], ecx
+            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
+            // 0x492f75: je 0x492f79
+            if fl.zf { pc = 0x492f79; } else { pc = 0x492f77; } continue;
+        }
+        0x492f77 => {
+            // 0x492f77: xor eax, eax
+            fl = f_logic(0, 32); eax = 0;
+            pc = 0x492f79; continue;
+        }
+        0x492f79 => {
+            // 0x492f79: lea esi, [eax + 0x20]
+            esi = (eax.wrapping_add(0x20));
+            // 0x492f7c: mov ecx, 9
+            ecx = 0x9u32;
+            // 0x492f81: lea edi, [esp + 0x40]
+            edi = (esp.wrapping_add(0x40));
+            // 0x492f85: rep movsd dword ptr es:[edi], dword ptr [esi]
+            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
+            // 0x492f87: jmp 0x492f9d
+            pc = 0x492f9d; continue;
+        }
+        0x492f89 => {
+            // 0x492f89: push 0xec5acc
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0xec5accu32);
+            // 0x492f8e: lea ecx, [esp + 0x20]
+            ecx = (esp.wrapping_add(0x20));
+            // 0x492f92: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x492f93: lea edx, [esp + 0x48]
+            edx = (esp.wrapping_add(0x48));
+            // 0x492f97: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x492f98: call 0xbe4c80
+            callx!(0xbe4c80, 5, 3, 0, 0.0, 0.0);
+            pc = 0x492f9d; continue;
+        }
+        0x492f9d => {
+            bump(C::Cam492df0B492F9D);
+            // 0x492f9d: mov ecx, 9
+            ecx = 0x9u32;
+            // 0x492fa2: mov edi, 0x25f5b5c
+            edi = 0x25f5b5cu32;
+            // 0x492fa7: lea esi, [esp + 0x40]
+            esi = (esp.wrapping_add(0x40));
+            // 0x492fab: rep movsd dword ptr es:[edi], dword ptr [esi]
+            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
+            // 0x492fad: mov ecx, 9
+            ecx = 0x9u32;
+            // 0x492fb2: mov edi, 0x25f5b38
+            edi = 0x25f5b38u32;
+            // 0x492fb7: lea esi, [esp + 0x40]
+            esi = (esp.wrapping_add(0x40));
+            // 0x492fbb: rep movsd dword ptr es:[edi], dword ptr [esi]
+            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
+            // 0x492fbd: mov ecx, 9
+            ecx = 0x9u32;
+            // 0x492fc2: mov edi, 0x25f5b80
+            edi = 0x25f5b80u32;
+            // 0x492fc7: lea esi, [esp + 0x40]
+            esi = (esp.wrapping_add(0x40));
+            // 0x492fcb: rep movsd dword ptr es:[edi], dword ptr [esi]
+            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
+            pc = 0x492fcd; continue;
+        }
+        0x492fcd => {
+            // 0x492fcd: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x492fce: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x492fcf: add esp, 0x5c
+            { let a = esp; let b = 0x5cu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x492fd2: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn cam_492df0_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { cam_492df0_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_492df0_thunk, cam_492df0_entry, 0);
+
+const CAM_492DF0_BODY: [u8; 483] = [
+    0x83, 0xEC, 0x5C, 0x83, 0x3D, 0xE8, 0x5A, 0x5F, 0x02, 0x00, 0x56, 0x57, 0x0F, 0x85, 0xCB, 0x01,
+    0x00, 0x00, 0xC6, 0x05, 0x5A, 0x6B, 0x52, 0x02, 0x01, 0xE8, 0x62, 0x78, 0x00, 0x00, 0x83, 0x3D,
+    0xE8, 0x5A, 0x5F, 0x02, 0x00, 0x75, 0x13, 0x83, 0x3D, 0x54, 0x5C, 0x5F, 0x02, 0x01, 0x75, 0x0A,
+    0xC7, 0x05, 0x54, 0x5C, 0x5F, 0x02, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x21, 0x6D, 0x00, 0x00, 0xA1,
+    0x64, 0xA6, 0xE9, 0x00, 0x8B, 0x0D, 0x68, 0xA6, 0xE9, 0x00, 0x8B, 0x15, 0x6C, 0xA6, 0xE9, 0x00,
+    0x8D, 0x74, 0x24, 0x28, 0x89, 0x44, 0x24, 0x10, 0x89, 0x4C, 0x24, 0x14, 0x89, 0x54, 0x24, 0x18,
+    0xE8, 0xEB, 0xA2, 0x00, 0x00, 0xD9, 0x05, 0x14, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x1C, 0x8D,
+    0x44, 0x24, 0x34, 0xD9, 0x05, 0x18, 0x5B, 0x5F, 0x02, 0x68, 0xF0, 0x41, 0x49, 0x00, 0xD9, 0x5C,
+    0x24, 0x24, 0x50, 0xD9, 0x05, 0x1C, 0x5B, 0x5F, 0x02, 0x8B, 0xFE, 0x8D, 0x44, 0x24, 0x18, 0xD9,
+    0x5C, 0x24, 0x2C, 0xE8, 0x38, 0x0A, 0x00, 0x00, 0x8B, 0x08, 0x89, 0x0D, 0x20, 0x5B, 0x5F, 0x02,
+    0x8B, 0x50, 0x04, 0x89, 0x15, 0x24, 0x5B, 0x5F, 0x02, 0x8B, 0x70, 0x08, 0x89, 0x35, 0x28, 0x5B,
+    0x5F, 0x02, 0x8B, 0x38, 0x89, 0x3D, 0x14, 0x5B, 0x5F, 0x02, 0x8B, 0x78, 0x04, 0x89, 0x3D, 0x18,
+    0x5B, 0x5F, 0x02, 0x8B, 0x40, 0x08, 0x89, 0x0D, 0x2C, 0x5B, 0x5F, 0x02, 0x8D, 0x4C, 0x24, 0x30,
+    0x51, 0x68, 0x20, 0x5B, 0x5F, 0x02, 0xA3, 0x1C, 0x5B, 0x5F, 0x02, 0x89, 0x15, 0x30, 0x5B, 0x5F,
+    0x02, 0x89, 0x35, 0x34, 0x5B, 0x5F, 0x02, 0xE8, 0xA4, 0xBA, 0x74, 0x00, 0xD9, 0x1D, 0x04, 0x5D,
+    0x5F, 0x02, 0xD9, 0xEE, 0x8D, 0x54, 0x24, 0x2C, 0x68, 0x14, 0x5B, 0x5F, 0x02, 0xD9, 0x1D, 0x78,
+    0x5C, 0x5F, 0x02, 0x52, 0xE8, 0x87, 0xBA, 0x74, 0x00, 0xD9, 0x5C, 0x24, 0x24, 0xD9, 0x44, 0x24,
+    0x24, 0x83, 0xC4, 0x18, 0xD9, 0x05, 0xE8, 0x6B, 0x52, 0x02, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4,
+    0x05, 0x7A, 0x08, 0xD9, 0x1D, 0xE8, 0x6B, 0x52, 0x02, 0xEB, 0x02, 0xDD, 0xD8, 0xD9, 0x44, 0x24,
+    0x10, 0x8D, 0x4C, 0x24, 0x1C, 0xD8, 0x25, 0x20, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x1C, 0xD9,
+    0x44, 0x24, 0x14, 0xD8, 0x25, 0x24, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24,
+    0x18, 0xD8, 0x25, 0x28, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x24, 0xE8, 0x30, 0xAB, 0x74, 0x00,
+    0x84, 0xC0, 0x74, 0x35, 0x8B, 0x0D, 0xB0, 0x5B, 0x5F, 0x02, 0x85, 0xC9, 0x74, 0x19, 0x8B, 0xC1,
+    0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0,
+    0x74, 0x05, 0x39, 0x48, 0x44, 0x74, 0x02, 0x33, 0xC0, 0x8D, 0x70, 0x20, 0xB9, 0x09, 0x00, 0x00,
+    0x00, 0x8D, 0x7C, 0x24, 0x40, 0xF3, 0xA5, 0xEB, 0x14, 0x68, 0xCC, 0x5A, 0xEC, 0x00, 0x8D, 0x4C,
+    0x24, 0x20, 0x51, 0x8D, 0x54, 0x24, 0x48, 0x52, 0xE8, 0xE3, 0x1C, 0x75, 0x00, 0xB9, 0x09, 0x00,
+    0x00, 0x00, 0xBF, 0x5C, 0x5B, 0x5F, 0x02, 0x8D, 0x74, 0x24, 0x40, 0xF3, 0xA5, 0xB9, 0x09, 0x00,
+    0x00, 0x00, 0xBF, 0x38, 0x5B, 0x5F, 0x02, 0x8D, 0x74, 0x24, 0x40, 0xF3, 0xA5, 0xB9, 0x09, 0x00,
+    0x00, 0x00, 0xBF, 0x80, 0x5B, 0x5F, 0x02, 0x8D, 0x74, 0x24, 0x40, 0xF3, 0xA5, 0x5F, 0x5E, 0x83,
+    0xC4, 0x5C, 0xC3,
+];
+
+
+// --- cam_49ae60 (0x49ae60..0x49afee, 398 bytes) ----------------------------------------
+
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn cam_49ae60_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x49ae60;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x49ae60 => {
+            bump(C::Cam49ae60Calls);
+            // 0x49ae60: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49ae61: mov ecx, dword ptr [0xe9a68c]
+            ecx = rd(0xe9a68cusize);
+            // 0x49ae67: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x49ae69: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49ae6a: mov esi, dword ptr [0xe843ac]
+            esi = rd(0xe843acusize);
+            // 0x49ae70: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x49ae71: mov edi, dword ptr [0x25f5bb0]
+            edi = rd(0x25f5bb0usize);
+            // 0x49ae77: jl 0x49ae9e
+            if fl.sf != fl.of { pc = 0x49ae9e; } else { pc = 0x49ae79; } continue;
+        }
+        0x49ae79 => {
+            // 0x49ae79: cmp ecx, esi
+            fl = f_sub(ecx, esi, 32);
+            // 0x49ae7b: jle 0x49ae8e
+            if fl.zf || fl.sf != fl.of { pc = 0x49ae8e; } else { pc = 0x49ae7d; } continue;
+        }
+        0x49ae7d => {
+            // 0x49ae7d: mov eax, ecx
+            eax = ecx;
+            // 0x49ae7f: sub eax, esi
+            { let a = eax; let b = esi; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x49ae81: cmp eax, 0x35a4e900
+            fl = f_sub(eax, 0x35a4e900u32, 32);
+            // 0x49ae86: jl 0x49afb3
+            if fl.sf != fl.of { pc = 0x49afb3; } else { pc = 0x49ae8c; } continue;
+        }
+        0x49ae8c => {
+            // 0x49ae8c: jmp 0x49ae9e
+            pc = 0x49ae9e; continue;
+        }
+        0x49ae8e => {
+            // 0x49ae8e: mov edx, esi
+            edx = esi;
+            // 0x49ae90: sub edx, ecx
+            { let a = edx; let b = ecx; fl = f_sub(a, b, 32); edx = a.wrapping_sub(b); }
+            // 0x49ae92: cmp edx, 0x35a4e900
+            fl = f_sub(edx, 0x35a4e900u32, 32);
+            // 0x49ae98: jge 0x49afb3
+            if fl.sf == fl.of { pc = 0x49afb3; } else { pc = 0x49ae9e; } continue;
+        }
+        0x49ae9e => {
+            // 0x49ae9e: mov ecx, edi
+            ecx = edi;
+            // 0x49aea0: call 0x49aab0
+            callx!(0x49aab0, 2, 0, 0, 0.0, 0.0);
+            // 0x49aea5: xor cl, cl
+            fl = f_logic(0, 8); ecx = (ecx & 0xffffff00) | ((0) & 0xff);
+            // 0x49aea7: cmp eax, dword ptr [0xe9a6a8]
+            fl = f_sub(eax, rd(0xe9a6a8usize), 32);
+            // 0x49aead: mov byte ptr [0xe9a6a4], cl
+            wb(0xe9a6a4usize, ((ecx & 0xff)) as u8);
+            // 0x49aeb3: je 0x49aebd
+            if fl.zf { pc = 0x49aebd; } else { pc = 0x49aeb5; } continue;
+        }
+        0x49aeb5 => {
+            // 0x49aeb5: mov cl, 1
+            ecx = (ecx & 0xffffff00) | ((0x1u32) & 0xff);
+            // 0x49aeb7: mov byte ptr [0xe9a6a4], cl
+            wb(0xe9a6a4usize, ((ecx & 0xff)) as u8);
+            pc = 0x49aebd; continue;
+        }
+        0x49aebd => {
+            // 0x49aebd: test cl, cl
+            fl = f_logic(((ecx & 0xff)) & ((ecx & 0xff)), 8);
+            // 0x49aebf: mov dword ptr [0xe9a6a8], eax
+            wd(0xe9a6a8usize, eax);
+            // 0x49aec4: jne 0x49aee8
+            if !fl.zf { pc = 0x49aee8; } else { pc = 0x49aec6; } continue;
+        }
+        0x49aec6 => {
+            // 0x49aec6: cmp edi, dword ptr [0xe9a6a0]
+            fl = f_sub(edi, rd(0xe9a6a0usize), 32);
+            // 0x49aecc: jne 0x49aee8
+            if !fl.zf { pc = 0x49aee8; } else { pc = 0x49aece; } continue;
+        }
+        0x49aece => {
+            // 0x49aece: mov ecx, dword ptr [0xe9a68c]
+            ecx = rd(0xe9a68cusize);
+            // 0x49aed4: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x49aed6: jl 0x49af37
+            if fl.sf != fl.of { pc = 0x49af37; } else { pc = 0x49aed8; } continue;
+        }
+        0x49aed8 => {
+            // 0x49aed8: cmp ecx, esi
+            fl = f_sub(ecx, esi, 32);
+            // 0x49aeda: jle 0x49af2b
+            if fl.zf || fl.sf != fl.of { pc = 0x49af2b; } else { pc = 0x49aedc; } continue;
+        }
+        0x49aedc => {
+            // 0x49aedc: mov edx, ecx
+            edx = ecx;
+            // 0x49aede: sub edx, esi
+            { let a = edx; let b = esi; fl = f_sub(a, b, 32); edx = a.wrapping_sub(b); }
+            // 0x49aee0: cmp edx, 0x35a4e900
+            fl = f_sub(edx, 0x35a4e900u32, 32);
+            // 0x49aee6: jl 0x49af37
+            if fl.sf != fl.of { pc = 0x49af37; } else { pc = 0x49aee8; } continue;
+        }
+        0x49aee8 => {
+            // 0x49aee8: mov ecx, dword ptr [0xe9a5bc]
+            ecx = rd(0xe9a5bcusize);
+            // 0x49aeee: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49aeef: call 0x49acd0
+            callx!(0x49acd0, 3, 1, 0, 0.0, 0.0);
+            // 0x49aef4: mov eax, dword ptr [0xe9a680]
+            eax = rd(0xe9a680usize);
+            // 0x49aef9: mov edx, dword ptr [0xe9a6a8]
+            edx = rd(0xe9a6a8usize);
+            // 0x49aeff: imul eax, eax, 0x2c
+            eax = eax.wrapping_mul(0x2cu32);
+            // 0x49af02: cmp byte ptr [eax + 0x25f633c], 0
+            fl = f_sub((rb((eax.wrapping_add(0x25f633c)) as usize) as u32), 0x0u32, 8);
+            // 0x49af09: mov ecx, dword ptr [0xe9a67c]
+            ecx = rd(0xe9a67cusize);
+            // 0x49af0f: jne 0x49af16
+            if !fl.zf { pc = 0x49af16; } else { pc = 0x49af11; } continue;
+        }
+        0x49af11 => {
+            // 0x49af11: mov eax, edx
+            eax = edx;
+            // 0x49af13: imul eax, eax, 0x2c
+            eax = eax.wrapping_mul(0x2cu32);
+            pc = 0x49af16; continue;
+        }
+        0x49af16 => {
+            // 0x49af16: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x49af18: fld dword ptr [eax + 0x25f6338]
+            fx.push(rf((eax.wrapping_add(0x25f6338)) as usize) as f64);
+            // 0x49af1e: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49af22: jne 0x49af4e
+            if !fl.zf { pc = 0x49af4e; } else { pc = 0x49af24; } continue;
+        }
+        0x49af24 => {
+            // 0x49af24: cmp edx, 1
+            fl = f_sub(edx, 0x1u32, 32);
+            // 0x49af27: je 0x49af57
+            if fl.zf { pc = 0x49af57; } else { pc = 0x49af29; } continue;
+        }
+        0x49af29 => {
+            // 0x49af29: jmp 0x49af61
+            pc = 0x49af61; continue;
+        }
+        0x49af2b => {
+            // 0x49af2b: mov edx, esi
+            edx = esi;
+            // 0x49af2d: sub edx, ecx
+            { let a = edx; let b = ecx; fl = f_sub(a, b, 32); edx = a.wrapping_sub(b); }
+            // 0x49af2f: cmp edx, 0x35a4e900
+            fl = f_sub(edx, 0x35a4e900u32, 32);
+            // 0x49af35: jl 0x49aee8
+            if fl.sf != fl.of { pc = 0x49aee8; } else { pc = 0x49af37; } continue;
+        }
+        0x49af37 => {
+            // 0x49af37: mov eax, dword ptr [0xe9a5bc]
+            eax = rd(0xe9a5bcusize);
+            // 0x49af3c: mov edx, dword ptr [0xe9a67c]
+            edx = rd(0xe9a67cusize);
+            // 0x49af42: cmp eax, edx
+            fl = f_sub(eax, edx, 32);
+            // 0x49af44: je 0x49afb3
+            if fl.zf { pc = 0x49afb3; } else { pc = 0x49af46; } continue;
+        }
+        0x49af46 => {
+            // 0x49af46: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49af47: call 0x49acd0
+            callx!(0x49acd0, 3, 1, 0, 0.0, 0.0);
+            // 0x49af4c: jmp 0x49afad
+            pc = 0x49afad; continue;
+        }
+        0x49af4e => {
+            // 0x49af4e: cmp ecx, 1
+            fl = f_sub(ecx, 0x1u32, 32);
+            // 0x49af51: jne 0x49af61
+            if !fl.zf { pc = 0x49af61; } else { pc = 0x49af53; } continue;
+        }
+        0x49af53 => {
+            // 0x49af53: test edx, edx
+            fl = f_logic((edx) & (edx), 32);
+            // 0x49af55: jne 0x49af61
+            if !fl.zf { pc = 0x49af61; } else { pc = 0x49af57; } continue;
+        }
+        0x49af57 => {
+            // 0x49af57: fld dword ptr [0xe99860]
+            fx.push(rf(0xe99860usize) as f64);
+            // 0x49af5d: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x49af61; continue;
+        }
+        0x49af61 => {
+            // 0x49af61: mov eax, dword ptr [0x21703d4]
+            eax = rd(0x21703d4usize);
+            // 0x49af66: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49af68: je 0x49af79
+            if fl.zf { pc = 0x49af79; } else { pc = 0x49af6a; } continue;
+        }
+        0x49af6a => {
+            // 0x49af6a: cmp byte ptr [eax + 0x595], 0
+            fl = f_sub((rb((eax.wrapping_add(0x595)) as usize) as u32), 0x0u32, 8);
+            // 0x49af71: je 0x49af79
+            if fl.zf { pc = 0x49af79; } else { pc = 0x49af73; } continue;
+        }
+        0x49af73 => {
+            // 0x49af73: fld1 
+            fx.push(1.0);
+            // 0x49af75: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x49af79; continue;
+        }
+        0x49af79 => {
+            bump(C::Cam49ae60B49AF79);
+            // 0x49af79: fld dword ptr [esp + 8]
+            fx.push(rf((esp.wrapping_add(0x8)) as usize) as f64);
+            // 0x49af7d: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49af7e: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49af81: push edx
+            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
+            // 0x49af82: mov edx, dword ptr [0xe9a694]
+            edx = rd(0xe9a694usize);
+            // 0x49af88: mov eax, edi
+            eax = edi;
+            // 0x49af8a: call 0x49a6e0
+            callx!(0x49a6e0, 4, 2, 0, 0.0, 0.0);
+            // 0x49af8f: fld dword ptr [0xe9a698]
+            fx.push(rf(0xe9a698usize) as f64);
+            // 0x49af95: mov ecx, dword ptr [0xe9a690]
+            ecx = rd(0xe9a690usize);
+            // 0x49af9b: fstp dword ptr [0xe9a69c]
+            wf(0xe9a69cusize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49afa1: mov dword ptr [0xe9a694], ecx
+            wd(0xe9a694usize, ecx);
+            // 0x49afa7: mov dword ptr [0xe9a6a0], edi
+            wd(0xe9a6a0usize, edi);
+            pc = 0x49afad; continue;
+        }
+        0x49afad => {
+            // 0x49afad: mov ecx, dword ptr [0xe9a68c]
+            ecx = rd(0xe9a68cusize);
+            pc = 0x49afb3; continue;
+        }
+        0x49afb3 => {
+            // 0x49afb3: test ecx, ecx
+            fl = f_logic((ecx) & (ecx), 32);
+            // 0x49afb5: jl 0x49afdb
+            if fl.sf != fl.of { pc = 0x49afdb; } else { pc = 0x49afb7; } continue;
+        }
+        0x49afb7 => {
+            // 0x49afb7: cmp ecx, esi
+            fl = f_sub(ecx, esi, 32);
+            // 0x49afb9: jle 0x49afc7
+            if fl.zf || fl.sf != fl.of { pc = 0x49afc7; } else { pc = 0x49afbb; } continue;
+        }
+        0x49afbb => {
+            // 0x49afbb: sub ecx, esi
+            { let a = ecx; let b = esi; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x49afbd: cmp ecx, 0x35a4e900
+            fl = f_sub(ecx, 0x35a4e900u32, 32);
+            // 0x49afc3: jl 0x49afdb
+            if fl.sf != fl.of { pc = 0x49afdb; } else { pc = 0x49afc5; } continue;
+        }
+        0x49afc5 => {
+            // 0x49afc5: jmp 0x49afd1
+            pc = 0x49afd1; continue;
+        }
+        0x49afc7 => {
+            // 0x49afc7: sub esi, ecx
+            { let a = esi; let b = ecx; fl = f_sub(a, b, 32); esi = a.wrapping_sub(b); }
+            // 0x49afc9: cmp esi, 0x35a4e900
+            fl = f_sub(esi, 0x35a4e900u32, 32);
+            // 0x49afcf: jge 0x49afdb
+            if fl.sf == fl.of { pc = 0x49afdb; } else { pc = 0x49afd1; } continue;
+        }
+        0x49afd1 => {
+            // 0x49afd1: mov dword ptr [0xe9a68c], 0xffffffff
+            wd(0xe9a68cusize, 0xffffffffu32);
+            pc = 0x49afdb; continue;
+        }
+        0x49afdb => {
+            // 0x49afdb: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49afdf: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49afe0: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49afe3: call 0x49a4c0
+            callx!(0x49a4c0, 3, 1, 0, 0.0, 0.0);
+            // 0x49afe8: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x49afe9: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x49afea: pop ecx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ecx = v; }
+            // 0x49afeb: ret 4
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn cam_49ae60_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { cam_49ae60_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_49ae60_thunk, cam_49ae60_entry, 4);
+
+const CAM_49AE60_BODY: [u8; 398] = [
+    0x51, 0x8B, 0x0D, 0x8C, 0xA6, 0xE9, 0x00, 0x85, 0xC9, 0x56, 0x8B, 0x35, 0xAC, 0x43, 0xE8, 0x00,
+    0x57, 0x8B, 0x3D, 0xB0, 0x5B, 0x5F, 0x02, 0x7C, 0x25, 0x3B, 0xCE, 0x7E, 0x11, 0x8B, 0xC1, 0x2B,
+    0xC6, 0x3D, 0x00, 0xE9, 0xA4, 0x35, 0x0F, 0x8C, 0x27, 0x01, 0x00, 0x00, 0xEB, 0x10, 0x8B, 0xD6,
+    0x2B, 0xD1, 0x81, 0xFA, 0x00, 0xE9, 0xA4, 0x35, 0x0F, 0x8D, 0x15, 0x01, 0x00, 0x00, 0x8B, 0xCF,
+    0xE8, 0x0B, 0xFC, 0xFF, 0xFF, 0x32, 0xC9, 0x3B, 0x05, 0xA8, 0xA6, 0xE9, 0x00, 0x88, 0x0D, 0xA4,
+    0xA6, 0xE9, 0x00, 0x74, 0x08, 0xB1, 0x01, 0x88, 0x0D, 0xA4, 0xA6, 0xE9, 0x00, 0x84, 0xC9, 0xA3,
+    0xA8, 0xA6, 0xE9, 0x00, 0x75, 0x22, 0x3B, 0x3D, 0xA0, 0xA6, 0xE9, 0x00, 0x75, 0x1A, 0x8B, 0x0D,
+    0x8C, 0xA6, 0xE9, 0x00, 0x85, 0xC9, 0x7C, 0x5F, 0x3B, 0xCE, 0x7E, 0x4F, 0x8B, 0xD1, 0x2B, 0xD6,
+    0x81, 0xFA, 0x00, 0xE9, 0xA4, 0x35, 0x7C, 0x4F, 0x8B, 0x0D, 0xBC, 0xA5, 0xE9, 0x00, 0x51, 0xE8,
+    0xDC, 0xFD, 0xFF, 0xFF, 0xA1, 0x80, 0xA6, 0xE9, 0x00, 0x8B, 0x15, 0xA8, 0xA6, 0xE9, 0x00, 0x6B,
+    0xC0, 0x2C, 0x80, 0xB8, 0x3C, 0x63, 0x5F, 0x02, 0x00, 0x8B, 0x0D, 0x7C, 0xA6, 0xE9, 0x00, 0x75,
+    0x05, 0x8B, 0xC2, 0x6B, 0xC0, 0x2C, 0x85, 0xC9, 0xD9, 0x80, 0x38, 0x63, 0x5F, 0x02, 0xD9, 0x5C,
+    0x24, 0x08, 0x75, 0x2A, 0x83, 0xFA, 0x01, 0x74, 0x2E, 0xEB, 0x36, 0x8B, 0xD6, 0x2B, 0xD1, 0x81,
+    0xFA, 0x00, 0xE9, 0xA4, 0x35, 0x7C, 0xB1, 0xA1, 0xBC, 0xA5, 0xE9, 0x00, 0x8B, 0x15, 0x7C, 0xA6,
+    0xE9, 0x00, 0x3B, 0xC2, 0x74, 0x6D, 0x52, 0xE8, 0x84, 0xFD, 0xFF, 0xFF, 0xEB, 0x5F, 0x83, 0xF9,
+    0x01, 0x75, 0x0E, 0x85, 0xD2, 0x75, 0x0A, 0xD9, 0x05, 0x60, 0x98, 0xE9, 0x00, 0xD9, 0x5C, 0x24,
+    0x08, 0xA1, 0xD4, 0x03, 0x17, 0x02, 0x85, 0xC0, 0x74, 0x0F, 0x80, 0xB8, 0x95, 0x05, 0x00, 0x00,
+    0x00, 0x74, 0x06, 0xD9, 0xE8, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x08, 0x51, 0xD9, 0x1C,
+    0x24, 0x52, 0x8B, 0x15, 0x94, 0xA6, 0xE9, 0x00, 0x8B, 0xC7, 0xE8, 0x51, 0xF7, 0xFF, 0xFF, 0xD9,
+    0x05, 0x98, 0xA6, 0xE9, 0x00, 0x8B, 0x0D, 0x90, 0xA6, 0xE9, 0x00, 0xD9, 0x1D, 0x9C, 0xA6, 0xE9,
+    0x00, 0x89, 0x0D, 0x94, 0xA6, 0xE9, 0x00, 0x89, 0x3D, 0xA0, 0xA6, 0xE9, 0x00, 0x8B, 0x0D, 0x8C,
+    0xA6, 0xE9, 0x00, 0x85, 0xC9, 0x7C, 0x24, 0x3B, 0xCE, 0x7E, 0x0C, 0x2B, 0xCE, 0x81, 0xF9, 0x00,
+    0xE9, 0xA4, 0x35, 0x7C, 0x16, 0xEB, 0x0A, 0x2B, 0xF1, 0x81, 0xFE, 0x00, 0xE9, 0xA4, 0x35, 0x7D,
+    0x0A, 0xC7, 0x05, 0x8C, 0xA6, 0xE9, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xD9, 0x44, 0x24, 0x10, 0x51,
+    0xD9, 0x1C, 0x24, 0xE8, 0xD8, 0xF4, 0xFF, 0xFF, 0x5F, 0x5E, 0x59, 0xC2, 0x04, 0x00,
+];
+
+
+// --- cam_49f320 (0x49f320..0x49fc96, 2422 bytes) ----------------------------------------
+
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn cam_49f320_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x49f320;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x49f320 => {
+            bump(C::Cam49f320Calls);
+            // 0x49f320: sub esp, 0x4b4
+            { let a = esp; let b = 0x4b4u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49f326: push ebx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
+            // 0x49f327: push ebp
+            esp = esp.wrapping_sub(4); wd(esp as usize, ebp);
+            // 0x49f328: mov ebp, dword ptr [esp + 0x4c0]
+            ebp = rd((esp.wrapping_add(0x4c0)) as usize);
+            // 0x49f32f: push edi
+            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
+            // 0x49f330: push 0x4b0
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x4b0u32);
+            // 0x49f335: push 0
+            esp = esp.wrapping_sub(4); wd(esp as usize, 0x0u32);
+            // 0x49f337: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49f338: mov edi, eax
+            edi = eax;
+            // 0x49f33a: call 0xca0bc0
+            callx!(0xca0bc0, 4, 0, 0, 0.0, 0.0);
+            // 0x49f33f: fldz 
+            fx.push(0.0);
+            // 0x49f341: mov eax, dword ptr [esp + 0x4d4]
+            eax = rd((esp.wrapping_add(0x4d4)) as usize);
+            // 0x49f348: fst dword ptr [esp + 0x30]
+            wf((esp.wrapping_add(0x30)) as usize, fx.s(0) as f32);
+            // 0x49f34c: lea ecx, [edi - 1]
+            ecx = (edi.wrapping_add(0xffffffff));
+            // 0x49f34f: add esp, 0xc
+            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49f352: xor ebx, ebx
+            fl = f_logic(0, 32); ebx = 0;
+            // 0x49f354: cmp ecx, 4
+            fl = f_sub(ecx, 0x4u32, 32);
+            // 0x49f357: jl 0x49f39c
+            if fl.sf != fl.of { pc = 0x49f39c; } else { pc = 0x49f359; } continue;
+        }
+        0x49f359 => {
+            // 0x49f359: lea edx, [ecx - 4]
+            edx = (ecx.wrapping_add(0xfffffffc));
+            // 0x49f35c: shr edx, 2
+            { let r = edx >> 2; fl = f_logic(r, 32); edx = r; }
+            // 0x49f35f: add edx, 1
+            { let a = edx; let b = 0x1u32; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
+            // 0x49f362: lea ebx, [edx*4]
+            ebx = (edx.wrapping_mul(4));
+            pc = 0x49f369; continue;
+        }
+        0x49f369 => {
+            bump(C::Cam49f320B49F369);
+            // 0x49f369: fld dword ptr [eax]
+            fx.push(rf((eax) as usize) as f64);
+            // 0x49f36b: add eax, 0x10
+            { let a = eax; let b = 0x10u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x49f36e: sub edx, 1
+            { let a = edx; let b = 0x1u32; fl = f_sub(a, b, 32); edx = a.wrapping_sub(b); }
+            // 0x49f371: fadd dword ptr [esp + 0x24]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
+            // 0x49f375: fstp dword ptr [esp + 0x28]
+            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f379: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49f37d: fadd dword ptr [eax - 0xc]
+            { let v = fx.s(0) + (rf((eax.wrapping_add(0xfffffff4)) as usize) as f64); fx.set(0, v); }
+            // 0x49f380: fstp dword ptr [esp + 0x28]
+            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f384: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49f388: fadd dword ptr [eax - 8]
+            { let v = fx.s(0) + (rf((eax.wrapping_add(0xfffffff8)) as usize) as f64); fx.set(0, v); }
+            // 0x49f38b: fstp dword ptr [esp + 0x28]
+            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f38f: fld dword ptr [esp + 0x28]
+            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
+            // 0x49f393: fadd dword ptr [eax - 4]
+            { let v = fx.s(0) + (rf((eax.wrapping_add(0xfffffffc)) as usize) as f64); fx.set(0, v); }
+            // 0x49f396: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f39a: jne 0x49f369
+            if !fl.zf { pc = 0x49f369; } else { pc = 0x49f39c; } continue;
+        }
+        0x49f39c => {
+            // 0x49f39c: cmp ebx, ecx
+            fl = f_sub(ebx, ecx, 32);
+            // 0x49f39e: jge 0x49f3b4
+            if fl.sf == fl.of { pc = 0x49f3b4; } else { pc = 0x49f3a0; } continue;
+        }
+        0x49f3a0 => {
+            // 0x49f3a0: sub ecx, ebx
+            { let a = ecx; let b = ebx; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            pc = 0x49f3a2; continue;
+        }
+        0x49f3a2 => {
+            // 0x49f3a2: fld dword ptr [eax]
+            fx.push(rf((eax) as usize) as f64);
+            // 0x49f3a4: add eax, 4
+            { let a = eax; let b = 0x4u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x49f3a7: sub ecx, 1
+            { let a = ecx; let b = 0x1u32; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
+            // 0x49f3aa: fadd dword ptr [esp + 0x24]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
+            // 0x49f3ae: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f3b2: jne 0x49f3a2
+            if !fl.zf { pc = 0x49f3a2; } else { pc = 0x49f3b4; } continue;
+        }
+        0x49f3b4 => {
+            bump(C::Cam49f320B49F3B4);
+            // 0x49f3b4: mov eax, dword ptr [ebp]
+            eax = rd((ebp) as usize);
+            // 0x49f3b7: mov ecx, dword ptr [ebp + 4]
+            ecx = rd((ebp.wrapping_add(0x4)) as usize);
+            // 0x49f3ba: fld dword ptr [eax + 0x1c]
+            fx.push(rf((eax.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49f3bd: fsub dword ptr [ecx + 0x1c]
+            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f3c0: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f3c4: fld dword ptr [eax + 0x20]
+            fx.push(rf((eax.wrapping_add(0x20)) as usize) as f64);
+            // 0x49f3c7: fsub dword ptr [ecx + 0x20]
+            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49f3ca: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f3ce: fld dword ptr [eax + 0x24]
+            fx.push(rf((eax.wrapping_add(0x24)) as usize) as f64);
+            // 0x49f3d1: fsub dword ptr [ecx + 0x24]
+            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
+            // 0x49f3d4: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f3d8: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49f3dc: fld qword ptr [0xdd50e8]
+            fx.push(rdf64(0xdd50e8usize));
+            // 0x49f3e2: fmul st(1), st(0)
+            { let v = fx.s(1) * fx.s(0); fx.set(1, v); }
+            // 0x49f3e4: fxch st(1)
+            fx.xch(1);
+            // 0x49f3e6: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f3ea: fld dword ptr [esp + 0x1c]
+            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49f3ee: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f3f0: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f3f4: fld dword ptr [esp + 0x20]
+            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
+            // 0x49f3f8: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f3fa: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f3fe: fld dword ptr [eax + 0x1c]
+            fx.push(rf((eax.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49f401: fadd dword ptr [esp + 0xc]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0xc)) as usize) as f64); fx.set(0, v); }
+            // 0x49f405: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f409: mov edx, dword ptr [esp + 0x18]
+            edx = rd((esp.wrapping_add(0x18)) as usize);
+            // 0x49f40d: fld dword ptr [eax + 0x20]
+            fx.push(rf((eax.wrapping_add(0x20)) as usize) as f64);
+            // 0x49f410: fadd dword ptr [esp + 0x10]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x10)) as usize) as f64); fx.set(0, v); }
+            // 0x49f414: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f418: fld dword ptr [eax + 0x24]
+            fx.push(rf((eax.wrapping_add(0x24)) as usize) as f64);
+            // 0x49f41b: mov dword ptr [esp + 0x40], edx
+            wd((esp.wrapping_add(0x40)) as usize, edx);
+            // 0x49f41f: fadd dword ptr [esp + 0x14]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
+            // 0x49f423: mov edx, dword ptr [esp + 0x1c]
+            edx = rd((esp.wrapping_add(0x1c)) as usize);
+            // 0x49f427: mov dword ptr [esp + 0x44], edx
+            wd((esp.wrapping_add(0x44)) as usize, edx);
+            // 0x49f42b: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f42f: mov edx, dword ptr [esp + 0x20]
+            edx = rd((esp.wrapping_add(0x20)) as usize);
+            // 0x49f433: mov dword ptr [esp + 0x48], edx
+            wd((esp.wrapping_add(0x48)) as usize, edx);
+            // 0x49f437: fld dword ptr [eax + 0x40]
+            fx.push(rf((eax.wrapping_add(0x40)) as usize) as f64);
+            // 0x49f43a: fsub dword ptr [ecx + 0x40]
+            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x40)) as usize) as f64); fx.set(0, v); }
+            // 0x49f43d: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f441: fld dword ptr [eax + 0x44]
+            fx.push(rf((eax.wrapping_add(0x44)) as usize) as f64);
+            // 0x49f444: fsub dword ptr [ecx + 0x44]
+            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x44)) as usize) as f64); fx.set(0, v); }
+            // 0x49f447: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f44b: fld dword ptr [eax + 0x48]
+            fx.push(rf((eax.wrapping_add(0x48)) as usize) as f64);
+            // 0x49f44e: fsub dword ptr [ecx + 0x48]
+            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x48)) as usize) as f64); fx.set(0, v); }
+            // 0x49f451: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f455: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49f459: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f45b: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f45f: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49f463: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f465: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f469: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x49f46d: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f46f: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f473: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49f477: fadd dword ptr [eax + 0x40]
+            { let v = fx.s(0) + (rf((eax.wrapping_add(0x40)) as usize) as f64); fx.set(0, v); }
+            // 0x49f47a: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f47e: mov edx, dword ptr [esp + 0xc]
+            edx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49f482: fld dword ptr [eax + 0x44]
+            fx.push(rf((eax.wrapping_add(0x44)) as usize) as f64);
+            // 0x49f485: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f489: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f48d: fld dword ptr [eax + 0x48]
+            fx.push(rf((eax.wrapping_add(0x48)) as usize) as f64);
+            // 0x49f490: mov dword ptr [esp + 0x1c0], edx
+            wd((esp.wrapping_add(0x1c0)) as usize, edx);
+            // 0x49f497: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49f49b: mov edx, dword ptr [esp + 0x10]
+            edx = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49f49f: mov dword ptr [esp + 0x1c4], edx
+            wd((esp.wrapping_add(0x1c4)) as usize, edx);
+            // 0x49f4a6: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f4aa: mov edx, dword ptr [esp + 0x14]
+            edx = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49f4ae: mov dword ptr [esp + 0x1c8], edx
+            wd((esp.wrapping_add(0x1c8)) as usize, edx);
+            // 0x49f4b5: fld dword ptr [eax + 0x28]
+            fx.push(rf((eax.wrapping_add(0x28)) as usize) as f64);
+            // 0x49f4b8: fsub dword ptr [ecx + 0x28]
+            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x28)) as usize) as f64); fx.set(0, v); }
+            // 0x49f4bb: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f4bf: fld dword ptr [eax + 0x2c]
+            fx.push(rf((eax.wrapping_add(0x2c)) as usize) as f64);
+            // 0x49f4c2: fsub dword ptr [ecx + 0x2c]
+            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x2c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f4c5: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f4c9: fld dword ptr [eax + 0x30]
+            fx.push(rf((eax.wrapping_add(0x30)) as usize) as f64);
+            // 0x49f4cc: fsub dword ptr [ecx + 0x30]
+            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x30)) as usize) as f64); fx.set(0, v); }
+            // 0x49f4cf: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f4d3: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49f4d7: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f4d9: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f4dd: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49f4e1: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f4e3: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f4e7: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x49f4eb: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f4ed: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f4f1: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49f4f5: fadd dword ptr [eax + 0x28]
+            { let v = fx.s(0) + (rf((eax.wrapping_add(0x28)) as usize) as f64); fx.set(0, v); }
+            // 0x49f4f8: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f4fc: fld dword ptr [eax + 0x2c]
+            fx.push(rf((eax.wrapping_add(0x2c)) as usize) as f64);
+            // 0x49f4ff: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f503: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f507: mov ecx, dword ptr [esp + 0x10]
+            ecx = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49f50b: fld dword ptr [eax + 0x30]
+            fx.push(rf((eax.wrapping_add(0x30)) as usize) as f64);
+            // 0x49f50e: mov eax, dword ptr [esp + 0xc]
+            eax = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49f512: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49f516: mov dword ptr [esp + 0x340], eax
+            wd((esp.wrapping_add(0x340)) as usize, eax);
+            // 0x49f51d: mov dword ptr [esp + 0x344], ecx
+            wd((esp.wrapping_add(0x344)) as usize, ecx);
+            // 0x49f524: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f528: mov edx, dword ptr [esp + 0x14]
+            edx = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49f52c: mov dword ptr [esp + 0x348], edx
+            wd((esp.wrapping_add(0x348)) as usize, edx);
+            // 0x49f533: xor edx, edx
+            fl = f_logic(0, 32); edx = 0;
+            // 0x49f535: test edi, edi
+            fl = f_logic((edi) & (edi), 32);
+            // 0x49f537: jle 0x49f59c
+            if fl.zf || fl.sf != fl.of { pc = 0x49f59c; } else { pc = 0x49f539; } continue;
+        }
+        0x49f539 => {
+            // 0x49f539: xor eax, eax
+            fl = f_logic(0, 32); eax = 0;
+            pc = 0x49f53b; continue;
+        }
+        0x49f53b => {
+            bump(C::Cam49f320B49F53B);
+            // 0x49f53b: mov ecx, dword ptr [ebp + edx*4]
+            ecx = rd((ebp.wrapping_add(edx.wrapping_mul(4))) as usize);
+            // 0x49f53f: mov ebx, dword ptr [ecx + 0x1c]
+            ebx = rd((ecx.wrapping_add(0x1c)) as usize);
+            // 0x49f542: mov dword ptr [esp + eax + 0x4c], ebx
+            wd((esp.wrapping_add(eax).wrapping_add(0x4c)) as usize, ebx);
+            // 0x49f546: mov ebx, dword ptr [ecx + 0x20]
+            ebx = rd((ecx.wrapping_add(0x20)) as usize);
+            // 0x49f549: mov dword ptr [esp + eax + 0x50], ebx
+            wd((esp.wrapping_add(eax).wrapping_add(0x50)) as usize, ebx);
+            // 0x49f54d: mov ebx, dword ptr [ecx + 0x24]
+            ebx = rd((ecx.wrapping_add(0x24)) as usize);
+            // 0x49f550: mov dword ptr [esp + eax + 0x54], ebx
+            wd((esp.wrapping_add(eax).wrapping_add(0x54)) as usize, ebx);
+            // 0x49f554: mov ebx, dword ptr [ecx + 0x40]
+            ebx = rd((ecx.wrapping_add(0x40)) as usize);
+            // 0x49f557: mov dword ptr [esp + eax + 0x1cc], ebx
+            wd((esp.wrapping_add(eax).wrapping_add(0x1cc)) as usize, ebx);
+            // 0x49f55e: mov ebx, dword ptr [ecx + 0x44]
+            ebx = rd((ecx.wrapping_add(0x44)) as usize);
+            // 0x49f561: mov dword ptr [esp + eax + 0x1d0], ebx
+            wd((esp.wrapping_add(eax).wrapping_add(0x1d0)) as usize, ebx);
+            // 0x49f568: mov ebx, dword ptr [ecx + 0x48]
+            ebx = rd((ecx.wrapping_add(0x48)) as usize);
+            // 0x49f56b: add ecx, 0x28
+            { let a = ecx; let b = 0x28u32; fl = f_add(a, b, 32); ecx = a.wrapping_add(b); }
+            // 0x49f56e: mov dword ptr [esp + eax + 0x1d4], ebx
+            wd((esp.wrapping_add(eax).wrapping_add(0x1d4)) as usize, ebx);
+            // 0x49f575: mov ebx, dword ptr [ecx]
+            ebx = rd((ecx) as usize);
+            // 0x49f577: mov dword ptr [esp + eax + 0x34c], ebx
+            wd((esp.wrapping_add(eax).wrapping_add(0x34c)) as usize, ebx);
+            // 0x49f57e: mov ebx, dword ptr [ecx + 4]
+            ebx = rd((ecx.wrapping_add(0x4)) as usize);
+            // 0x49f581: mov dword ptr [esp + eax + 0x350], ebx
+            wd((esp.wrapping_add(eax).wrapping_add(0x350)) as usize, ebx);
+            // 0x49f588: mov ecx, dword ptr [ecx + 8]
+            ecx = rd((ecx.wrapping_add(0x8)) as usize);
+            // 0x49f58b: mov dword ptr [esp + eax + 0x354], ecx
+            wd((esp.wrapping_add(eax).wrapping_add(0x354)) as usize, ecx);
+            // 0x49f592: add edx, 1
+            { let a = edx; let b = 0x1u32; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
+            // 0x49f595: add eax, 0xc
+            { let a = eax; let b = 0xcu32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x49f598: cmp edx, edi
+            fl = f_sub(edx, edi, 32);
+            // 0x49f59a: jl 0x49f53b
+            if fl.sf != fl.of { pc = 0x49f53b; } else { pc = 0x49f59c; } continue;
+        }
+        0x49f59c => {
+            bump(C::Cam49f320B49F59C);
+            // 0x49f59c: mov eax, dword ptr [ebp + edi*4 - 8]
+            eax = rd((ebp.wrapping_add(edi.wrapping_mul(4)).wrapping_add(0xfffffff8)) as usize);
+            // 0x49f5a0: mov ecx, dword ptr [ebp + edi*4 - 4]
+            ecx = rd((ebp.wrapping_add(edi.wrapping_mul(4)).wrapping_add(0xfffffffc)) as usize);
+            // 0x49f5a4: fld dword ptr [ecx + 0x1c]
+            fx.push(rf((ecx.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49f5a7: lea ebx, [edi + edi*2]
+            ebx = (edi.wrapping_add(edi.wrapping_mul(2)));
+            // 0x49f5aa: fsub dword ptr [eax + 0x1c]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f5ad: add ebx, ebx
+            { let a = ebx; let b = ebx; fl = f_add(a, b, 32); ebx = a.wrapping_add(b); }
+            // 0x49f5af: add ebx, ebx
+            { let a = ebx; let b = ebx; fl = f_add(a, b, 32); ebx = a.wrapping_add(b); }
+            // 0x49f5b1: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f5b5: fld dword ptr [ecx + 0x20]
+            fx.push(rf((ecx.wrapping_add(0x20)) as usize) as f64);
+            // 0x49f5b8: fsub dword ptr [eax + 0x20]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49f5bb: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f5bf: fld dword ptr [ecx + 0x24]
+            fx.push(rf((ecx.wrapping_add(0x24)) as usize) as f64);
+            // 0x49f5c2: fsub dword ptr [eax + 0x24]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
+            // 0x49f5c5: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f5c9: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49f5cd: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f5cf: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f5d3: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49f5d7: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f5d9: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f5dd: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x49f5e1: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f5e3: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f5e7: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49f5eb: fadd dword ptr [ecx + 0x1c]
+            { let v = fx.s(0) + (rf((ecx.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f5ee: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f5f2: mov edx, dword ptr [esp + 0xc]
+            edx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49f5f6: fld dword ptr [ecx + 0x20]
+            fx.push(rf((ecx.wrapping_add(0x20)) as usize) as f64);
+            // 0x49f5f9: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f5fd: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f601: fld dword ptr [ecx + 0x24]
+            fx.push(rf((ecx.wrapping_add(0x24)) as usize) as f64);
+            // 0x49f604: mov ecx, dword ptr [esp + 0x10]
+            ecx = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49f608: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49f60c: mov dword ptr [esp + ebx + 0x4c], edx
+            wd((esp.wrapping_add(ebx).wrapping_add(0x4c)) as usize, edx);
+            // 0x49f610: mov dword ptr [esp + ebx + 0x50], ecx
+            wd((esp.wrapping_add(ebx).wrapping_add(0x50)) as usize, ecx);
+            // 0x49f614: mov ecx, dword ptr [ebp + edi*4 - 4]
+            ecx = rd((ebp.wrapping_add(edi.wrapping_mul(4)).wrapping_add(0xfffffffc)) as usize);
+            // 0x49f618: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f61c: mov edx, dword ptr [esp + 0x14]
+            edx = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49f620: mov dword ptr [esp + ebx + 0x54], edx
+            wd((esp.wrapping_add(ebx).wrapping_add(0x54)) as usize, edx);
+            // 0x49f624: fld dword ptr [ecx + 0x40]
+            fx.push(rf((ecx.wrapping_add(0x40)) as usize) as f64);
+            // 0x49f627: fsub dword ptr [eax + 0x40]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x40)) as usize) as f64); fx.set(0, v); }
+            // 0x49f62a: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f62e: fld dword ptr [ecx + 0x44]
+            fx.push(rf((ecx.wrapping_add(0x44)) as usize) as f64);
+            // 0x49f631: fsub dword ptr [eax + 0x44]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x44)) as usize) as f64); fx.set(0, v); }
+            // 0x49f634: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f638: fld dword ptr [ecx + 0x48]
+            fx.push(rf((ecx.wrapping_add(0x48)) as usize) as f64);
+            // 0x49f63b: fsub dword ptr [eax + 0x48]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x48)) as usize) as f64); fx.set(0, v); }
+            // 0x49f63e: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f642: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49f646: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f648: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f64c: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49f650: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f652: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f656: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x49f65a: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f65c: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f660: fld dword ptr [ecx + 0x40]
+            fx.push(rf((ecx.wrapping_add(0x40)) as usize) as f64);
+            // 0x49f663: fadd dword ptr [esp + 0x18]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
+            // 0x49f667: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f66b: fld dword ptr [ecx + 0x44]
+            fx.push(rf((ecx.wrapping_add(0x44)) as usize) as f64);
+            // 0x49f66e: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f672: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f676: mov edx, dword ptr [esp + 0x10]
+            edx = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49f67a: fld dword ptr [ecx + 0x48]
+            fx.push(rf((ecx.wrapping_add(0x48)) as usize) as f64);
+            // 0x49f67d: mov ecx, dword ptr [esp + 0xc]
+            ecx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49f681: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49f685: mov dword ptr [esp + ebx + 0x1cc], ecx
+            wd((esp.wrapping_add(ebx).wrapping_add(0x1cc)) as usize, ecx);
+            // 0x49f68c: mov dword ptr [esp + ebx + 0x1d0], edx
+            wd((esp.wrapping_add(ebx).wrapping_add(0x1d0)) as usize, edx);
+            // 0x49f693: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f697: mov ecx, dword ptr [esp + 0x14]
+            ecx = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49f69b: mov dword ptr [esp + ebx + 0x1d4], ecx
+            wd((esp.wrapping_add(ebx).wrapping_add(0x1d4)) as usize, ecx);
+            // 0x49f6a2: mov ecx, dword ptr [ebp + edi*4 - 4]
+            ecx = rd((ebp.wrapping_add(edi.wrapping_mul(4)).wrapping_add(0xfffffffc)) as usize);
+            // 0x49f6a6: fld dword ptr [ecx + 0x28]
+            fx.push(rf((ecx.wrapping_add(0x28)) as usize) as f64);
+            // 0x49f6a9: fsub dword ptr [eax + 0x28]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x28)) as usize) as f64); fx.set(0, v); }
+            // 0x49f6ac: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f6b0: fld dword ptr [ecx + 0x2c]
+            fx.push(rf((ecx.wrapping_add(0x2c)) as usize) as f64);
+            // 0x49f6b3: fsub dword ptr [eax + 0x2c]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x2c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f6b6: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f6ba: fld dword ptr [ecx + 0x30]
+            fx.push(rf((ecx.wrapping_add(0x30)) as usize) as f64);
+            // 0x49f6bd: fsub dword ptr [eax + 0x30]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x30)) as usize) as f64); fx.set(0, v); }
+            // 0x49f6c0: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f6c4: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49f6c8: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f6ca: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f6ce: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49f6d2: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f6d4: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f6d8: fmul dword ptr [esp + 0x14]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
+            // 0x49f6dc: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f6e0: fld dword ptr [ecx + 0x28]
+            fx.push(rf((ecx.wrapping_add(0x28)) as usize) as f64);
+            // 0x49f6e3: fadd dword ptr [esp + 0x18]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
+            // 0x49f6e7: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f6eb: mov edx, dword ptr [esp + 0xc]
+            edx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49f6ef: fld dword ptr [ecx + 0x2c]
+            fx.push(rf((ecx.wrapping_add(0x2c)) as usize) as f64);
+            // 0x49f6f2: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f6f6: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f6fa: mov eax, dword ptr [esp + 0x10]
+            eax = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49f6fe: fld dword ptr [ecx + 0x30]
+            fx.push(rf((ecx.wrapping_add(0x30)) as usize) as f64);
+            // 0x49f701: mov dword ptr [esp + ebx + 0x34c], edx
+            wd((esp.wrapping_add(ebx).wrapping_add(0x34c)) as usize, edx);
+            // 0x49f708: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49f70c: mov dword ptr [esp + ebx + 0x350], eax
+            wd((esp.wrapping_add(ebx).wrapping_add(0x350)) as usize, eax);
+            // 0x49f713: lea edx, [esp + 0x40]
+            edx = (esp.wrapping_add(0x40));
+            // 0x49f717: lea eax, [edi + 2]
+            eax = (edi.wrapping_add(0x2));
+            // 0x49f71a: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f71e: mov ecx, dword ptr [esp + 0x14]
+            ecx = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49f722: mov dword ptr [esp + ebx + 0x354], ecx
+            wd((esp.wrapping_add(ebx).wrapping_add(0x354)) as usize, ecx);
+            // 0x49f729: fst dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            // 0x49f72d: lea ecx, [esp + 0x1c0]
+            ecx = (esp.wrapping_add(0x1c0));
+            // 0x49f734: fst dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            // 0x49f738: mov dword ptr [esp + 0xc], edx
+            wd((esp.wrapping_add(0xc)) as usize, edx);
+            // 0x49f73c: fstp dword ptr [esp + 0x3c]
+            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f740: lea edx, [esp + 0x340]
+            edx = (esp.wrapping_add(0x340));
+            // 0x49f747: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49f74b: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49f74c: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f74f: mov dword ptr [esp + 0x14], eax
+            wd((esp.wrapping_add(0x14)) as usize, eax);
+            // 0x49f753: mov dword ptr [esp + 0x20], eax
+            wd((esp.wrapping_add(0x20)) as usize, eax);
+            // 0x49f757: mov dword ptr [esp + 0x1c], ecx
+            wd((esp.wrapping_add(0x1c)) as usize, ecx);
+            // 0x49f75b: mov dword ptr [esp + 0x3c], eax
+            wd((esp.wrapping_add(0x3c)) as usize, eax);
+            // 0x49f75f: mov dword ptr [esp + 0x38], edx
+            wd((esp.wrapping_add(0x38)) as usize, edx);
+            // 0x49f763: call 0x4912d0
+            callx!(0x4912d0, 2, 0, 0, 0.0, 0.0);
+            // 0x49f768: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49f76b: call 0xda0140
+            callx!(0xda0140, 1, 0, 0, 0.0, 0.0);
+            // 0x49f770: cmp eax, 0x1e
+            fl = f_sub(eax, 0x1eu32, 32);
+            // 0x49f773: jge 0x49f78c
+            if fl.sf == fl.of { pc = 0x49f78c; } else { pc = 0x49f775; } continue;
+        }
+        0x49f775 => {
+            // 0x49f775: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49f779: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49f77a: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f77d: call 0x4912d0
+            callx!(0x4912d0, 2, 0, 0, 0.0, 0.0);
+            // 0x49f782: add esp, 4
+            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49f785: call 0xda0140
+            callx!(0xda0140, 1, 0, 0, 0.0, 0.0);
+            // 0x49f78a: jmp 0x49f791
+            pc = 0x49f791; continue;
+        }
+        0x49f78c => {
+            // 0x49f78c: mov eax, 0x1e
+            eax = 0x1eu32;
+            pc = 0x49f791; continue;
+        }
+        0x49f791 => {
+            bump(C::Cam49f320B49F791);
+            // 0x49f791: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49f795: lea ecx, [eax - 1]
+            ecx = (eax.wrapping_add(0xffffffff));
+            // 0x49f798: mov dword ptr [esp + 0x28], ecx
+            wd((esp.wrapping_add(0x28)) as usize, ecx);
+            // 0x49f79c: fidiv dword ptr [esp + 0x28]
+            { let v = fx.s(0) / (rd((esp.wrapping_add(0x28)) as usize) as i32 as f64); fx.set(0, v); }
+            // 0x49f7a0: mov ebp, 1
+            ebp = 0x1u32;
+            // 0x49f7a5: cmp eax, ebp
+            fl = f_sub(eax, ebp, 32);
+            // 0x49f7a7: mov dword ptr [esi], eax
+            wd((esi) as usize, eax);
+            // 0x49f7a9: mov dword ptr [esp + 0x28], 0
+            wd((esp.wrapping_add(0x28)) as usize, 0x0u32);
+            // 0x49f7b1: fstp dword ptr [esi + 4]
+            wf((esi.wrapping_add(0x4)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f7b4: fldz 
+            fx.push(0.0);
+            // 0x49f7b6: fst dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            // 0x49f7ba: jle 0x49f88e
+            if fl.zf || fl.sf != fl.of { pc = 0x49f88e; } else { pc = 0x49f7c0; } continue;
+        }
+        0x49f7c0 => {
+            // 0x49f7c0: mov edi, dword ptr [esp + 0x4c8]
+            edi = rd((esp.wrapping_add(0x4c8)) as usize);
+            // 0x49f7c7: fstp st(0)
+            fx.pop();
+            // 0x49f7c9: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49f7cd: lea edx, [esi + 0x194]
+            edx = (esi.wrapping_add(0x194));
+            // 0x49f7d3: mov dword ptr [esp + 0x2c], edx
+            wd((esp.wrapping_add(0x2c)) as usize, edx);
+            pc = 0x49f7d7; continue;
+        }
+        0x49f7d7 => {
+            bump(C::Cam49f320B49F7D7);
+            // 0x49f7d7: fdiv dword ptr [edi]
+            { let v = fx.s(0) / (rf((edi) as usize) as f64); fx.set(0, v); }
+            // 0x49f7d9: mov edx, dword ptr [esp + 0x2c]
+            edx = rd((esp.wrapping_add(0x2c)) as usize);
+            // 0x49f7dd: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49f7de: add edx, 0xfffffe80
+            { let a = edx; let b = 0xfffffe80u32; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
+            // 0x49f7e4: lea eax, [esp + 0x10]
+            eax = (esp.wrapping_add(0x10));
+            // 0x49f7e8: fiadd dword ptr [esp + 0x2c]
+            { let v = fx.s(0) + (rd((esp.wrapping_add(0x2c)) as usize) as i32 as f64); fx.set(0, v); }
+            // 0x49f7ec: fstp dword ptr [esp + 0x34]
+            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f7f0: fld dword ptr [esp + 0x34]
+            fx.push(rf((esp.wrapping_add(0x34)) as usize) as f64);
+            // 0x49f7f4: fadd qword ptr [0xe5bf40]
+            { let v = fx.s(0) + rdf64(0xe5bf40usize); fx.set(0, v); }
+            // 0x49f7fa: fstp dword ptr [esp + 0x34]
+            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f7fe: fld dword ptr [esp + 0x34]
+            fx.push(rf((esp.wrapping_add(0x34)) as usize) as f64);
+            // 0x49f802: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f805: call 0xc022c0
+            callx!(0xc022c0, 2, 1, 0, 0.0, 0.0);
+            // 0x49f80a: fld dword ptr [esp + 0x30]
+            fx.push(rf((esp.wrapping_add(0x30)) as usize) as f64);
+            // 0x49f80e: mov edx, dword ptr [esp + 0x2c]
+            edx = rd((esp.wrapping_add(0x2c)) as usize);
+            // 0x49f812: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49f813: lea eax, [esp + 0x1c]
+            eax = (esp.wrapping_add(0x1c));
+            // 0x49f817: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f81a: call 0xc022c0
+            callx!(0xc022c0, 2, 1, 0, 0.0, 0.0);
+            // 0x49f81f: fld dword ptr [esp + 0x30]
+            fx.push(rf((esp.wrapping_add(0x30)) as usize) as f64);
+            // 0x49f823: push ecx
+            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
+            // 0x49f824: add edx, 0x180
+            { let a = edx; let b = 0x180u32; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
+            // 0x49f82a: fstp dword ptr [esp]
+            wf((esp) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f82d: lea eax, [esp + 0x38]
+            eax = (esp.wrapping_add(0x38));
+            // 0x49f831: call 0xc022c0
+            callx!(0xc022c0, 2, 1, 0, 0.0, 0.0);
+            // 0x49f836: fld dword ptr [esi + 4]
+            fx.push(rf((esi.wrapping_add(0x4)) as usize) as f64);
+            // 0x49f839: fadd dword ptr [esp + 0x24]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
+            // 0x49f83d: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f841: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49f845: fld dword ptr [edi]
+            fx.push(rf((edi) as usize) as f64);
+            // 0x49f847: fcomp st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop();
+            // 0x49f849: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49f84b: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49f84e: jp 0x49f87a
+            if fl.pf { pc = 0x49f87a; } else { pc = 0x49f850; } continue;
+        }
+        0x49f850 => {
+            bump(C::Cam49f320B49F850);
+            // 0x49f850: fsub dword ptr [edi]
+            { let v = fx.s(0) - (rf((edi) as usize) as f64); fx.set(0, v); }
+            // 0x49f852: mov eax, dword ptr [esp + 0x28]
+            eax = rd((esp.wrapping_add(0x28)) as usize);
+            // 0x49f856: mov ecx, dword ptr [esp + 0x4c8]
+            ecx = rd((esp.wrapping_add(0x4c8)) as usize);
+            // 0x49f85d: add eax, 1
+            { let a = eax; let b = 0x1u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x49f860: fstp dword ptr [esp + 0x24]
+            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f864: lea edi, [ecx + eax*4]
+            edi = (ecx.wrapping_add(eax.wrapping_mul(4)));
+            // 0x49f867: fld dword ptr [esp + 0x24]
+            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
+            // 0x49f86b: mov dword ptr [esp + 0x28], eax
+            wd((esp.wrapping_add(0x28)) as usize, eax);
+            // 0x49f86f: fld dword ptr [edi]
+            fx.push(rf((edi) as usize) as f64);
+            // 0x49f871: fcomp st(1)
+            fx.sw = fcmp(fx.s(0), fx.s(1));
+            fx.pop();
+            // 0x49f873: fnstsw ax
+            eax = (eax & 0xffff0000) | fx.sw as u32;
+            // 0x49f875: test ah, 5
+            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
+            // 0x49f878: jnp 0x49f850
+            if !fl.pf { pc = 0x49f850; } else { pc = 0x49f87a; } continue;
+        }
+        0x49f87a => {
+            // 0x49f87a: add dword ptr [esp + 0x2c], 0xc
+            { let a = rd((esp.wrapping_add(0x2c)) as usize); let b = 0xcu32; fl = f_add(a, b, 32); wd((esp.wrapping_add(0x2c)) as usize, a.wrapping_add(b)); }
+            // 0x49f87f: add ebp, 1
+            { let a = ebp; let b = 0x1u32; fl = f_add(a, b, 32); ebp = a.wrapping_add(b); }
+            // 0x49f882: cmp ebp, dword ptr [esi]
+            fl = f_sub(ebp, rd((esi) as usize), 32);
+            // 0x49f884: jl 0x49f7d7
+            if fl.sf != fl.of { pc = 0x49f7d7; } else { pc = 0x49f88a; } continue;
+        }
+        0x49f88a => {
+            // 0x49f88a: fstp st(0)
+            fx.pop();
+            // 0x49f88c: fldz 
+            fx.push(0.0);
+            pc = 0x49f88e; continue;
+        }
+        0x49f88e => {
+            bump(C::Cam49f320B49F88E);
+            // 0x49f88e: mov ecx, dword ptr [esp + ebx + 0x40]
+            ecx = rd((esp.wrapping_add(ebx).wrapping_add(0x40)) as usize);
+            // 0x49f892: lea edx, [ebp + ebp*2]
+            edx = (ebp.wrapping_add(ebp.wrapping_mul(2)));
+            // 0x49f896: mov dword ptr [esi + edx*4 + 8], ecx
+            wd((esi.wrapping_add(edx.wrapping_mul(4)).wrapping_add(0x8)) as usize, ecx);
+            // 0x49f89a: mov ecx, dword ptr [esp + ebx + 0x48]
+            ecx = rd((esp.wrapping_add(ebx).wrapping_add(0x48)) as usize);
+            // 0x49f89e: lea eax, [esi + edx*4]
+            eax = (esi.wrapping_add(edx.wrapping_mul(4)));
+            // 0x49f8a1: mov edx, dword ptr [esp + ebx + 0x44]
+            edx = rd((esp.wrapping_add(ebx).wrapping_add(0x44)) as usize);
+            // 0x49f8a5: mov dword ptr [eax + 0xc], edx
+            wd((eax.wrapping_add(0xc)) as usize, edx);
+            // 0x49f8a8: mov edx, dword ptr [esp + ebx + 0x1c0]
+            edx = rd((esp.wrapping_add(ebx).wrapping_add(0x1c0)) as usize);
+            // 0x49f8af: mov dword ptr [eax + 0x188], edx
+            wd((eax.wrapping_add(0x188)) as usize, edx);
+            // 0x49f8b5: mov edx, dword ptr [esp + ebx + 0x1c8]
+            edx = rd((esp.wrapping_add(ebx).wrapping_add(0x1c8)) as usize);
+            // 0x49f8bc: mov dword ptr [eax + 0x10], ecx
+            wd((eax.wrapping_add(0x10)) as usize, ecx);
+            // 0x49f8bf: mov ecx, dword ptr [esp + ebx + 0x1c4]
+            ecx = rd((esp.wrapping_add(ebx).wrapping_add(0x1c4)) as usize);
+            // 0x49f8c6: mov dword ptr [eax + 0x18c], ecx
+            wd((eax.wrapping_add(0x18c)) as usize, ecx);
+            // 0x49f8cc: mov dword ptr [eax + 0x190], edx
+            wd((eax.wrapping_add(0x190)) as usize, edx);
+            // 0x49f8d2: mov edx, dword ptr [esp + ebx + 0x340]
+            edx = rd((esp.wrapping_add(ebx).wrapping_add(0x340)) as usize);
+            // 0x49f8d9: mov dword ptr [eax + 0x308], edx
+            wd((eax.wrapping_add(0x308)) as usize, edx);
+            // 0x49f8df: mov edx, dword ptr [esp + ebx + 0x344]
+            edx = rd((esp.wrapping_add(ebx).wrapping_add(0x344)) as usize);
+            // 0x49f8e6: mov dword ptr [eax + 0x30c], edx
+            wd((eax.wrapping_add(0x30c)) as usize, edx);
+            // 0x49f8ec: lea ecx, [esp + ebx + 0x340]
+            ecx = (esp.wrapping_add(ebx).wrapping_add(0x340));
+            // 0x49f8f3: mov ecx, dword ptr [ecx + 8]
+            ecx = rd((ecx.wrapping_add(0x8)) as usize);
+            // 0x49f8f6: mov dword ptr [eax + 0x310], ecx
+            wd((eax.wrapping_add(0x310)) as usize, ecx);
+            // 0x49f8fc: fld dword ptr [esi + 0x14]
+            fx.push(rf((esi.wrapping_add(0x14)) as usize) as f64);
+            // 0x49f8ff: fsub dword ptr [esi + 0x20]
+            { let v = fx.s(0) - (rf((esi.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49f902: lea ecx, [esi + 8]
+            ecx = (esi.wrapping_add(0x8));
+            // 0x49f905: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f909: fld dword ptr [esi + 0x18]
+            fx.push(rf((esi.wrapping_add(0x18)) as usize) as f64);
+            // 0x49f90c: fsub dword ptr [esi + 0x24]
+            { let v = fx.s(0) - (rf((esi.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
+            // 0x49f90f: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f913: fld dword ptr [esi + 0x1c]
+            fx.push(rf((esi.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49f916: fsub dword ptr [esi + 0x28]
+            { let v = fx.s(0) - (rf((esi.wrapping_add(0x28)) as usize) as f64); fx.set(0, v); }
+            // 0x49f919: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f91d: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49f921: fld qword ptr [0xdd50e8]
+            fx.push(rdf64(0xdd50e8usize));
+            // 0x49f927: fmul st(1), st(0)
+            { let v = fx.s(1) * fx.s(0); fx.set(1, v); }
+            // 0x49f929: fxch st(1)
+            fx.xch(1);
+            // 0x49f92b: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f92f: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49f933: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f935: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f939: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x49f93d: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f93f: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f943: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49f947: fadd dword ptr [esi + 0x14]
+            { let v = fx.s(0) + (rf((esi.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
+            // 0x49f94a: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f94e: mov edx, dword ptr [esp + 0xc]
+            edx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49f952: fld dword ptr [esi + 0x18]
+            fx.push(rf((esi.wrapping_add(0x18)) as usize) as f64);
+            // 0x49f955: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f959: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f95d: fld dword ptr [esi + 0x1c]
+            fx.push(rf((esi.wrapping_add(0x1c)) as usize) as f64);
+            // 0x49f960: mov dword ptr [ecx], edx
+            wd((ecx) as usize, edx);
+            // 0x49f962: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49f966: mov edx, dword ptr [esp + 0x10]
+            edx = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49f96a: mov dword ptr [ecx + 4], edx
+            wd((ecx.wrapping_add(0x4)) as usize, edx);
+            // 0x49f96d: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f971: mov edx, dword ptr [esp + 0x14]
+            edx = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49f975: mov dword ptr [ecx + 8], edx
+            wd((ecx.wrapping_add(0x8)) as usize, edx);
+            // 0x49f978: fld dword ptr [esi + 0x194]
+            fx.push(rf((esi.wrapping_add(0x194)) as usize) as f64);
+            // 0x49f97e: fsub dword ptr [esi + 0x1a0]
+            { let v = fx.s(0) - (rf((esi.wrapping_add(0x1a0)) as usize) as f64); fx.set(0, v); }
+            // 0x49f984: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f988: fld dword ptr [esi + 0x198]
+            fx.push(rf((esi.wrapping_add(0x198)) as usize) as f64);
+            // 0x49f98e: fsub dword ptr [esi + 0x1a4]
+            { let v = fx.s(0) - (rf((esi.wrapping_add(0x1a4)) as usize) as f64); fx.set(0, v); }
+            // 0x49f994: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f998: fld dword ptr [esi + 0x19c]
+            fx.push(rf((esi.wrapping_add(0x19c)) as usize) as f64);
+            // 0x49f99e: fsub dword ptr [esi + 0x1a8]
+            { let v = fx.s(0) - (rf((esi.wrapping_add(0x1a8)) as usize) as f64); fx.set(0, v); }
+            // 0x49f9a4: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f9a8: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49f9ac: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f9ae: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f9b2: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49f9b6: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f9b8: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f9bc: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x49f9c0: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49f9c2: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f9c6: fld dword ptr [esi + 0x194]
+            fx.push(rf((esi.wrapping_add(0x194)) as usize) as f64);
+            // 0x49f9cc: fadd dword ptr [esp + 0x18]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
+            // 0x49f9d0: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f9d4: fld dword ptr [esi + 0x198]
+            fx.push(rf((esi.wrapping_add(0x198)) as usize) as f64);
+            // 0x49f9da: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49f9de: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49f9e2: fld dword ptr [esi + 0x19c]
+            fx.push(rf((esi.wrapping_add(0x19c)) as usize) as f64);
+            // 0x49f9e8: mov edi, dword ptr [esp + 0xc]
+            edi = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49f9ec: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49f9f0: mov dword ptr [esi + 0x188], edi
+            wd((esi.wrapping_add(0x188)) as usize, edi);
+            // 0x49f9f6: mov edi, dword ptr [esp + 0x10]
+            edi = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49f9fa: mov dword ptr [esi + 0x18c], edi
+            wd((esi.wrapping_add(0x18c)) as usize, edi);
+            // 0x49fa00: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fa04: mov edi, dword ptr [esp + 0x14]
+            edi = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49fa08: mov dword ptr [esi + 0x190], edi
+            wd((esi.wrapping_add(0x190)) as usize, edi);
+            // 0x49fa0e: fld dword ptr [esi + 0x314]
+            fx.push(rf((esi.wrapping_add(0x314)) as usize) as f64);
+            // 0x49fa14: fsub dword ptr [esi + 0x320]
+            { let v = fx.s(0) - (rf((esi.wrapping_add(0x320)) as usize) as f64); fx.set(0, v); }
+            // 0x49fa1a: lea edx, [esi + 0x188]
+            edx = (esi.wrapping_add(0x188));
+            // 0x49fa20: lea edi, [esi + 0x308]
+            edi = (esi.wrapping_add(0x308));
+            // 0x49fa26: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fa2a: fld dword ptr [esi + 0x318]
+            fx.push(rf((esi.wrapping_add(0x318)) as usize) as f64);
+            // 0x49fa30: fsub dword ptr [esi + 0x324]
+            { let v = fx.s(0) - (rf((esi.wrapping_add(0x324)) as usize) as f64); fx.set(0, v); }
+            // 0x49fa36: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fa3a: fld dword ptr [esi + 0x31c]
+            fx.push(rf((esi.wrapping_add(0x31c)) as usize) as f64);
+            // 0x49fa40: fsub dword ptr [esi + 0x328]
+            { let v = fx.s(0) - (rf((esi.wrapping_add(0x328)) as usize) as f64); fx.set(0, v); }
+            // 0x49fa46: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fa4a: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49fa4e: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fa50: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fa54: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49fa58: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fa5a: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fa5e: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x49fa62: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fa64: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fa68: fld dword ptr [esi + 0x314]
+            fx.push(rf((esi.wrapping_add(0x314)) as usize) as f64);
+            // 0x49fa6e: fadd dword ptr [esp + 0x18]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
+            // 0x49fa72: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fa76: mov ebx, dword ptr [esp + 0xc]
+            ebx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49fa7a: fld dword ptr [esi + 0x318]
+            fx.push(rf((esi.wrapping_add(0x318)) as usize) as f64);
+            // 0x49fa80: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49fa84: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fa88: fld dword ptr [esi + 0x31c]
+            fx.push(rf((esi.wrapping_add(0x31c)) as usize) as f64);
+            // 0x49fa8e: mov dword ptr [edi], ebx
+            wd((edi) as usize, ebx);
+            // 0x49fa90: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49fa94: mov ebx, dword ptr [esp + 0x10]
+            ebx = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49fa98: mov dword ptr [edi + 4], ebx
+            wd((edi.wrapping_add(0x4)) as usize, ebx);
+            // 0x49fa9b: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fa9f: mov ebx, dword ptr [esp + 0x14]
+            ebx = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49faa3: mov dword ptr [edi + 8], ebx
+            wd((edi.wrapping_add(0x8)) as usize, ebx);
+            // 0x49faa6: fld dword ptr [eax + 8]
+            fx.push(rf((eax.wrapping_add(0x8)) as usize) as f64);
+            // 0x49faa9: fsub dword ptr [eax - 4]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0xfffffffc)) as usize) as f64); fx.set(0, v); }
+            // 0x49faac: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fab0: fld dword ptr [eax + 0xc]
+            fx.push(rf((eax.wrapping_add(0xc)) as usize) as f64);
+            // 0x49fab3: fsub dword ptr [eax]
+            { let v = fx.s(0) - (rf((eax) as usize) as f64); fx.set(0, v); }
+            // 0x49fab5: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fab9: fld dword ptr [eax + 0x10]
+            fx.push(rf((eax.wrapping_add(0x10)) as usize) as f64);
+            // 0x49fabc: fsub dword ptr [eax + 4]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x4)) as usize) as f64); fx.set(0, v); }
+            // 0x49fabf: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fac3: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49fac7: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fac9: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49facd: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49fad1: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fad3: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fad7: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x49fadb: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fadd: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fae1: fld dword ptr [eax + 8]
+            fx.push(rf((eax.wrapping_add(0x8)) as usize) as f64);
+            // 0x49fae4: fadd dword ptr [esp + 0x18]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
+            // 0x49fae8: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49faec: mov ebx, dword ptr [esp + 0xc]
+            ebx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49faf0: fld dword ptr [eax + 0xc]
+            fx.push(rf((eax.wrapping_add(0xc)) as usize) as f64);
+            // 0x49faf3: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49faf7: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fafb: fld dword ptr [eax + 0x10]
+            fx.push(rf((eax.wrapping_add(0x10)) as usize) as f64);
+            // 0x49fafe: mov dword ptr [eax + 0x14], ebx
+            wd((eax.wrapping_add(0x14)) as usize, ebx);
+            // 0x49fb01: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49fb05: mov ebx, dword ptr [esp + 0x10]
+            ebx = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49fb09: mov dword ptr [eax + 0x18], ebx
+            wd((eax.wrapping_add(0x18)) as usize, ebx);
+            // 0x49fb0c: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fb10: mov ebx, dword ptr [esp + 0x14]
+            ebx = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49fb14: mov dword ptr [eax + 0x1c], ebx
+            wd((eax.wrapping_add(0x1c)) as usize, ebx);
+            // 0x49fb17: fld dword ptr [eax + 0x188]
+            fx.push(rf((eax.wrapping_add(0x188)) as usize) as f64);
+            // 0x49fb1d: fsub dword ptr [eax + 0x17c]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x17c)) as usize) as f64); fx.set(0, v); }
+            // 0x49fb23: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fb27: fld dword ptr [eax + 0x18c]
+            fx.push(rf((eax.wrapping_add(0x18c)) as usize) as f64);
+            // 0x49fb2d: fsub dword ptr [eax + 0x180]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x180)) as usize) as f64); fx.set(0, v); }
+            // 0x49fb33: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fb37: fld dword ptr [eax + 0x190]
+            fx.push(rf((eax.wrapping_add(0x190)) as usize) as f64);
+            // 0x49fb3d: fsub dword ptr [eax + 0x184]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x184)) as usize) as f64); fx.set(0, v); }
+            // 0x49fb43: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fb47: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49fb4b: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fb4d: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fb51: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49fb55: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fb57: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fb5b: fld dword ptr [esp + 0x14]
+            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
+            // 0x49fb5f: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fb61: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fb65: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49fb69: fadd dword ptr [eax + 0x188]
+            { let v = fx.s(0) + (rf((eax.wrapping_add(0x188)) as usize) as f64); fx.set(0, v); }
+            // 0x49fb6f: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fb73: mov ebx, dword ptr [esp + 0xc]
+            ebx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49fb77: fld dword ptr [eax + 0x18c]
+            fx.push(rf((eax.wrapping_add(0x18c)) as usize) as f64);
+            // 0x49fb7d: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49fb81: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fb85: fld dword ptr [eax + 0x190]
+            fx.push(rf((eax.wrapping_add(0x190)) as usize) as f64);
+            // 0x49fb8b: mov dword ptr [eax + 0x194], ebx
+            wd((eax.wrapping_add(0x194)) as usize, ebx);
+            // 0x49fb91: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49fb95: mov ebx, dword ptr [esp + 0x10]
+            ebx = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49fb99: mov dword ptr [eax + 0x198], ebx
+            wd((eax.wrapping_add(0x198)) as usize, ebx);
+            // 0x49fb9f: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fba3: mov ebx, dword ptr [esp + 0x14]
+            ebx = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49fba7: mov dword ptr [eax + 0x19c], ebx
+            wd((eax.wrapping_add(0x19c)) as usize, ebx);
+            // 0x49fbad: fld dword ptr [eax + 0x308]
+            fx.push(rf((eax.wrapping_add(0x308)) as usize) as f64);
+            // 0x49fbb3: fsub dword ptr [eax + 0x2fc]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x2fc)) as usize) as f64); fx.set(0, v); }
+            // 0x49fbb9: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fbbd: fld dword ptr [eax + 0x30c]
+            fx.push(rf((eax.wrapping_add(0x30c)) as usize) as f64);
+            // 0x49fbc3: fsub dword ptr [eax + 0x300]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x300)) as usize) as f64); fx.set(0, v); }
+            // 0x49fbc9: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fbcd: fld dword ptr [eax + 0x310]
+            fx.push(rf((eax.wrapping_add(0x310)) as usize) as f64);
+            // 0x49fbd3: fsub dword ptr [eax + 0x304]
+            { let v = fx.s(0) - (rf((eax.wrapping_add(0x304)) as usize) as f64); fx.set(0, v); }
+            // 0x49fbd9: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fbdd: fld dword ptr [esp + 0xc]
+            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
+            // 0x49fbe1: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fbe3: fstp dword ptr [esp + 0x18]
+            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fbe7: fld dword ptr [esp + 0x10]
+            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
+            // 0x49fbeb: fmul st(1)
+            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
+            // 0x49fbed: fstp dword ptr [esp + 0x1c]
+            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fbf1: fmul dword ptr [esp + 0x14]
+            { let v = fx.s(0) * (rf((esp.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
+            // 0x49fbf5: fstp dword ptr [esp + 0x20]
+            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fbf9: fld dword ptr [esp + 0x18]
+            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
+            // 0x49fbfd: fadd dword ptr [eax + 0x308]
+            { let v = fx.s(0) + (rf((eax.wrapping_add(0x308)) as usize) as f64); fx.set(0, v); }
+            // 0x49fc03: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fc07: mov ebx, dword ptr [esp + 0xc]
+            ebx = rd((esp.wrapping_add(0xc)) as usize);
+            // 0x49fc0b: fld dword ptr [eax + 0x30c]
+            fx.push(rf((eax.wrapping_add(0x30c)) as usize) as f64);
+            // 0x49fc11: fadd dword ptr [esp + 0x1c]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
+            // 0x49fc15: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fc19: fld dword ptr [eax + 0x310]
+            fx.push(rf((eax.wrapping_add(0x310)) as usize) as f64);
+            // 0x49fc1f: mov dword ptr [eax + 0x314], ebx
+            wd((eax.wrapping_add(0x314)) as usize, ebx);
+            // 0x49fc25: fadd dword ptr [esp + 0x20]
+            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
+            // 0x49fc29: mov ebx, dword ptr [esp + 0x10]
+            ebx = rd((esp.wrapping_add(0x10)) as usize);
+            // 0x49fc2d: mov dword ptr [eax + 0x318], ebx
+            wd((eax.wrapping_add(0x318)) as usize, ebx);
+            // 0x49fc33: fstp dword ptr [esp + 0x14]
+            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fc37: mov ebx, dword ptr [esp + 0x14]
+            ebx = rd((esp.wrapping_add(0x14)) as usize);
+            // 0x49fc3b: mov dword ptr [eax + 0x31c], ebx
+            wd((eax.wrapping_add(0x31c)) as usize, ebx);
+            // 0x49fc41: mov eax, dword ptr [esi]
+            eax = rd((esi) as usize);
+            // 0x49fc43: mov dword ptr [esi + 0x488], ecx
+            wd((esi.wrapping_add(0x488)) as usize, ecx);
+            // 0x49fc49: add eax, 2
+            { let a = eax; let b = 0x2u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
+            // 0x49fc4c: mov dword ptr [esi + 0x48c], eax
+            wd((esi.wrapping_add(0x48c)) as usize, eax);
+            // 0x49fc52: fst dword ptr [esi + 0x490]
+            wf((esi.wrapping_add(0x490)) as usize, fx.s(0) as f32);
+            // 0x49fc58: mov ecx, dword ptr [esi]
+            ecx = rd((esi) as usize);
+            // 0x49fc5a: mov dword ptr [esi + 0x494], edx
+            wd((esi.wrapping_add(0x494)) as usize, edx);
+            // 0x49fc60: add ecx, 2
+            { let a = ecx; let b = 0x2u32; fl = f_add(a, b, 32); ecx = a.wrapping_add(b); }
+            // 0x49fc63: mov dword ptr [esi + 0x498], ecx
+            wd((esi.wrapping_add(0x498)) as usize, ecx);
+            // 0x49fc69: fst dword ptr [esi + 0x49c]
+            wf((esi.wrapping_add(0x49c)) as usize, fx.s(0) as f32);
+            // 0x49fc6f: mov edx, dword ptr [esi]
+            edx = rd((esi) as usize);
+            // 0x49fc71: mov dword ptr [esi + 0x4a0], edi
+            wd((esi.wrapping_add(0x4a0)) as usize, edi);
+            // 0x49fc77: pop edi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
+            // 0x49fc78: add edx, 2
+            { let a = edx; let b = 0x2u32; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
+            // 0x49fc7b: mov dword ptr [esi + 0x4a4], edx
+            wd((esi.wrapping_add(0x4a4)) as usize, edx);
+            // 0x49fc81: fst dword ptr [esi + 0x4a8]
+            wf((esi.wrapping_add(0x4a8)) as usize, fx.s(0) as f32);
+            // 0x49fc87: pop ebp
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
+            // 0x49fc88: fstp dword ptr [esi + 0x4ac]
+            wf((esi.wrapping_add(0x4ac)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49fc8e: pop ebx
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
+            // 0x49fc8f: add esp, 0x4b4
+            { let a = esp; let b = 0x4b4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49fc95: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn cam_49f320_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { cam_49f320_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_49f320_thunk, cam_49f320_entry, 0);
+
+const CAM_49F320_BODY: [u8; 2422] = [
+    0x81, 0xEC, 0xB4, 0x04, 0x00, 0x00, 0x53, 0x55, 0x8B, 0xAC, 0x24, 0xC0, 0x04, 0x00, 0x00, 0x57,
+    0x68, 0xB0, 0x04, 0x00, 0x00, 0x6A, 0x00, 0x56, 0x8B, 0xF8, 0xE8, 0x81, 0x18, 0x80, 0x00, 0xD9,
+    0xEE, 0x8B, 0x84, 0x24, 0xD4, 0x04, 0x00, 0x00, 0xD9, 0x54, 0x24, 0x30, 0x8D, 0x4F, 0xFF, 0x83,
+    0xC4, 0x0C, 0x33, 0xDB, 0x83, 0xF9, 0x04, 0x7C, 0x43, 0x8D, 0x51, 0xFC, 0xC1, 0xEA, 0x02, 0x83,
+    0xC2, 0x01, 0x8D, 0x1C, 0x95, 0x00, 0x00, 0x00, 0x00, 0xD9, 0x00, 0x83, 0xC0, 0x10, 0x83, 0xEA,
+    0x01, 0xD8, 0x44, 0x24, 0x24, 0xD9, 0x5C, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x28, 0xD8, 0x40, 0xF4,
+    0xD9, 0x5C, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x28, 0xD8, 0x40, 0xF8, 0xD9, 0x5C, 0x24, 0x28, 0xD9,
+    0x44, 0x24, 0x28, 0xD8, 0x40, 0xFC, 0xD9, 0x5C, 0x24, 0x24, 0x75, 0xCD, 0x3B, 0xD9, 0x7D, 0x14,
+    0x2B, 0xCB, 0xD9, 0x00, 0x83, 0xC0, 0x04, 0x83, 0xE9, 0x01, 0xD8, 0x44, 0x24, 0x24, 0xD9, 0x5C,
+    0x24, 0x24, 0x75, 0xEE, 0x8B, 0x45, 0x00, 0x8B, 0x4D, 0x04, 0xD9, 0x40, 0x1C, 0xD8, 0x61, 0x1C,
+    0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x40, 0x20, 0xD8, 0x61, 0x20, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x40,
+    0x24, 0xD8, 0x61, 0x24, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xDD, 0x05, 0xE8, 0x50,
+    0xDD, 0x00, 0xDC, 0xC9, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x1C, 0xD8, 0xC9,
+    0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x40,
+    0x1C, 0xD8, 0x44, 0x24, 0x0C, 0xD9, 0x5C, 0x24, 0x18, 0x8B, 0x54, 0x24, 0x18, 0xD9, 0x40, 0x20,
+    0xD8, 0x44, 0x24, 0x10, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x40, 0x24, 0x89, 0x54, 0x24, 0x40, 0xD8,
+    0x44, 0x24, 0x14, 0x8B, 0x54, 0x24, 0x1C, 0x89, 0x54, 0x24, 0x44, 0xD9, 0x5C, 0x24, 0x20, 0x8B,
+    0x54, 0x24, 0x20, 0x89, 0x54, 0x24, 0x48, 0xD9, 0x40, 0x40, 0xD8, 0x61, 0x40, 0xD9, 0x5C, 0x24,
+    0x0C, 0xD9, 0x40, 0x44, 0xD8, 0x61, 0x44, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x40, 0x48, 0xD8, 0x61,
+    0x48, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9,
+    0x44, 0x24, 0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0xC9, 0xD9,
+    0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0x40, 0x40, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x54,
+    0x24, 0x0C, 0xD9, 0x40, 0x44, 0xD8, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x40, 0x48,
+    0x89, 0x94, 0x24, 0xC0, 0x01, 0x00, 0x00, 0xD8, 0x44, 0x24, 0x20, 0x8B, 0x54, 0x24, 0x10, 0x89,
+    0x94, 0x24, 0xC4, 0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0x8B, 0x54, 0x24, 0x14, 0x89, 0x94,
+    0x24, 0xC8, 0x01, 0x00, 0x00, 0xD9, 0x40, 0x28, 0xD8, 0x61, 0x28, 0xD9, 0x5C, 0x24, 0x0C, 0xD9,
+    0x40, 0x2C, 0xD8, 0x61, 0x2C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x40, 0x30, 0xD8, 0x61, 0x30, 0xD9,
+    0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24,
+    0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0xC9, 0xD9, 0x5C, 0x24,
+    0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0x40, 0x28, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x40, 0x2C, 0xD8,
+    0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0x8B, 0x4C, 0x24, 0x10, 0xD9, 0x40, 0x30, 0x8B, 0x44,
+    0x24, 0x0C, 0xD8, 0x44, 0x24, 0x20, 0x89, 0x84, 0x24, 0x40, 0x03, 0x00, 0x00, 0x89, 0x8C, 0x24,
+    0x44, 0x03, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0x8B, 0x54, 0x24, 0x14, 0x89, 0x94, 0x24, 0x48,
+    0x03, 0x00, 0x00, 0x33, 0xD2, 0x85, 0xFF, 0x7E, 0x63, 0x33, 0xC0, 0x8B, 0x4C, 0x95, 0x00, 0x8B,
+    0x59, 0x1C, 0x89, 0x5C, 0x04, 0x4C, 0x8B, 0x59, 0x20, 0x89, 0x5C, 0x04, 0x50, 0x8B, 0x59, 0x24,
+    0x89, 0x5C, 0x04, 0x54, 0x8B, 0x59, 0x40, 0x89, 0x9C, 0x04, 0xCC, 0x01, 0x00, 0x00, 0x8B, 0x59,
+    0x44, 0x89, 0x9C, 0x04, 0xD0, 0x01, 0x00, 0x00, 0x8B, 0x59, 0x48, 0x83, 0xC1, 0x28, 0x89, 0x9C,
+    0x04, 0xD4, 0x01, 0x00, 0x00, 0x8B, 0x19, 0x89, 0x9C, 0x04, 0x4C, 0x03, 0x00, 0x00, 0x8B, 0x59,
+    0x04, 0x89, 0x9C, 0x04, 0x50, 0x03, 0x00, 0x00, 0x8B, 0x49, 0x08, 0x89, 0x8C, 0x04, 0x54, 0x03,
+    0x00, 0x00, 0x83, 0xC2, 0x01, 0x83, 0xC0, 0x0C, 0x3B, 0xD7, 0x7C, 0x9F, 0x8B, 0x44, 0xBD, 0xF8,
+    0x8B, 0x4C, 0xBD, 0xFC, 0xD9, 0x41, 0x1C, 0x8D, 0x1C, 0x7F, 0xD8, 0x60, 0x1C, 0x03, 0xDB, 0x03,
+    0xDB, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x41, 0x20, 0xD8, 0x60, 0x20, 0xD9, 0x5C, 0x24, 0x10, 0xD9,
+    0x41, 0x24, 0xD8, 0x60, 0x24, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xC9, 0xD9,
+    0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24,
+    0x14, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0x41, 0x1C, 0xD9, 0x5C,
+    0x24, 0x0C, 0x8B, 0x54, 0x24, 0x0C, 0xD9, 0x41, 0x20, 0xD8, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24,
+    0x10, 0xD9, 0x41, 0x24, 0x8B, 0x4C, 0x24, 0x10, 0xD8, 0x44, 0x24, 0x20, 0x89, 0x54, 0x1C, 0x4C,
+    0x89, 0x4C, 0x1C, 0x50, 0x8B, 0x4C, 0xBD, 0xFC, 0xD9, 0x5C, 0x24, 0x14, 0x8B, 0x54, 0x24, 0x14,
+    0x89, 0x54, 0x1C, 0x54, 0xD9, 0x41, 0x40, 0xD8, 0x60, 0x40, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x41,
+    0x44, 0xD8, 0x60, 0x44, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x41, 0x48, 0xD8, 0x60, 0x48, 0xD9, 0x5C,
+    0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x10,
+    0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x20,
+    0xD9, 0x41, 0x40, 0xD8, 0x44, 0x24, 0x18, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x41, 0x44, 0xD8, 0x44,
+    0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0x8B, 0x54, 0x24, 0x10, 0xD9, 0x41, 0x48, 0x8B, 0x4C, 0x24,
+    0x0C, 0xD8, 0x44, 0x24, 0x20, 0x89, 0x8C, 0x1C, 0xCC, 0x01, 0x00, 0x00, 0x89, 0x94, 0x1C, 0xD0,
+    0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0x8B, 0x4C, 0x24, 0x14, 0x89, 0x8C, 0x1C, 0xD4, 0x01,
+    0x00, 0x00, 0x8B, 0x4C, 0xBD, 0xFC, 0xD9, 0x41, 0x28, 0xD8, 0x60, 0x28, 0xD9, 0x5C, 0x24, 0x0C,
+    0xD9, 0x41, 0x2C, 0xD8, 0x60, 0x2C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x41, 0x30, 0xD8, 0x60, 0x30,
+    0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44,
+    0x24, 0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD8, 0x4C, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x20,
+    0xD9, 0x41, 0x28, 0xD8, 0x44, 0x24, 0x18, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x54, 0x24, 0x0C, 0xD9,
+    0x41, 0x2C, 0xD8, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0x8B, 0x44, 0x24, 0x10, 0xD9, 0x41,
+    0x30, 0x89, 0x94, 0x1C, 0x4C, 0x03, 0x00, 0x00, 0xD8, 0x44, 0x24, 0x20, 0x89, 0x84, 0x1C, 0x50,
+    0x03, 0x00, 0x00, 0x8D, 0x54, 0x24, 0x40, 0x8D, 0x47, 0x02, 0xD9, 0x5C, 0x24, 0x14, 0x8B, 0x4C,
+    0x24, 0x14, 0x89, 0x8C, 0x1C, 0x54, 0x03, 0x00, 0x00, 0xD9, 0x54, 0x24, 0x14, 0x8D, 0x8C, 0x24,
+    0xC0, 0x01, 0x00, 0x00, 0xD9, 0x54, 0x24, 0x20, 0x89, 0x54, 0x24, 0x0C, 0xD9, 0x5C, 0x24, 0x3C,
+    0x8D, 0x94, 0x24, 0x40, 0x03, 0x00, 0x00, 0xD9, 0x44, 0x24, 0x24, 0x51, 0xD9, 0x1C, 0x24, 0x89,
+    0x44, 0x24, 0x14, 0x89, 0x44, 0x24, 0x20, 0x89, 0x4C, 0x24, 0x1C, 0x89, 0x44, 0x24, 0x3C, 0x89,
+    0x54, 0x24, 0x38, 0xE8, 0x68, 0x1B, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0xE8, 0xD0, 0x09, 0x90, 0x00,
+    0x83, 0xF8, 0x1E, 0x7D, 0x17, 0xD9, 0x44, 0x24, 0x24, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0x4E, 0x1B,
+    0xFF, 0xFF, 0x83, 0xC4, 0x04, 0xE8, 0xB6, 0x09, 0x90, 0x00, 0xEB, 0x05, 0xB8, 0x1E, 0x00, 0x00,
+    0x00, 0xD9, 0x44, 0x24, 0x24, 0x8D, 0x48, 0xFF, 0x89, 0x4C, 0x24, 0x28, 0xDA, 0x74, 0x24, 0x28,
+    0xBD, 0x01, 0x00, 0x00, 0x00, 0x3B, 0xC5, 0x89, 0x06, 0xC7, 0x44, 0x24, 0x28, 0x00, 0x00, 0x00,
+    0x00, 0xD9, 0x5E, 0x04, 0xD9, 0xEE, 0xD9, 0x54, 0x24, 0x24, 0x0F, 0x8E, 0xCE, 0x00, 0x00, 0x00,
+    0x8B, 0xBC, 0x24, 0xC8, 0x04, 0x00, 0x00, 0xDD, 0xD8, 0xD9, 0x44, 0x24, 0x24, 0x8D, 0x96, 0x94,
+    0x01, 0x00, 0x00, 0x89, 0x54, 0x24, 0x2C, 0xD8, 0x37, 0x8B, 0x54, 0x24, 0x2C, 0x51, 0x81, 0xC2,
+    0x80, 0xFE, 0xFF, 0xFF, 0x8D, 0x44, 0x24, 0x10, 0xDA, 0x44, 0x24, 0x2C, 0xD9, 0x5C, 0x24, 0x34,
+    0xD9, 0x44, 0x24, 0x34, 0xDC, 0x05, 0x40, 0xBF, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x34, 0xD9, 0x44,
+    0x24, 0x34, 0xD9, 0x1C, 0x24, 0xE8, 0xB6, 0x2A, 0x76, 0x00, 0xD9, 0x44, 0x24, 0x30, 0x8B, 0x54,
+    0x24, 0x2C, 0x51, 0x8D, 0x44, 0x24, 0x1C, 0xD9, 0x1C, 0x24, 0xE8, 0xA1, 0x2A, 0x76, 0x00, 0xD9,
+    0x44, 0x24, 0x30, 0x51, 0x81, 0xC2, 0x80, 0x01, 0x00, 0x00, 0xD9, 0x1C, 0x24, 0x8D, 0x44, 0x24,
+    0x38, 0xE8, 0x8A, 0x2A, 0x76, 0x00, 0xD9, 0x46, 0x04, 0xD8, 0x44, 0x24, 0x24, 0xD9, 0x5C, 0x24,
+    0x24, 0xD9, 0x44, 0x24, 0x24, 0xD9, 0x07, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x2A,
+    0xD8, 0x27, 0x8B, 0x44, 0x24, 0x28, 0x8B, 0x8C, 0x24, 0xC8, 0x04, 0x00, 0x00, 0x83, 0xC0, 0x01,
+    0xD9, 0x5C, 0x24, 0x24, 0x8D, 0x3C, 0x81, 0xD9, 0x44, 0x24, 0x24, 0x89, 0x44, 0x24, 0x28, 0xD9,
+    0x07, 0xD8, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7B, 0xD6, 0x83, 0x44, 0x24, 0x2C, 0x0C, 0x83,
+    0xC5, 0x01, 0x3B, 0x2E, 0x0F, 0x8C, 0x4D, 0xFF, 0xFF, 0xFF, 0xDD, 0xD8, 0xD9, 0xEE, 0x8B, 0x4C,
+    0x1C, 0x40, 0x8D, 0x54, 0x6D, 0x00, 0x89, 0x4C, 0x96, 0x08, 0x8B, 0x4C, 0x1C, 0x48, 0x8D, 0x04,
+    0x96, 0x8B, 0x54, 0x1C, 0x44, 0x89, 0x50, 0x0C, 0x8B, 0x94, 0x1C, 0xC0, 0x01, 0x00, 0x00, 0x89,
+    0x90, 0x88, 0x01, 0x00, 0x00, 0x8B, 0x94, 0x1C, 0xC8, 0x01, 0x00, 0x00, 0x89, 0x48, 0x10, 0x8B,
+    0x8C, 0x1C, 0xC4, 0x01, 0x00, 0x00, 0x89, 0x88, 0x8C, 0x01, 0x00, 0x00, 0x89, 0x90, 0x90, 0x01,
+    0x00, 0x00, 0x8B, 0x94, 0x1C, 0x40, 0x03, 0x00, 0x00, 0x89, 0x90, 0x08, 0x03, 0x00, 0x00, 0x8B,
+    0x94, 0x1C, 0x44, 0x03, 0x00, 0x00, 0x89, 0x90, 0x0C, 0x03, 0x00, 0x00, 0x8D, 0x8C, 0x1C, 0x40,
+    0x03, 0x00, 0x00, 0x8B, 0x49, 0x08, 0x89, 0x88, 0x10, 0x03, 0x00, 0x00, 0xD9, 0x46, 0x14, 0xD8,
+    0x66, 0x20, 0x8D, 0x4E, 0x08, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x46, 0x18, 0xD8, 0x66, 0x24, 0xD9,
+    0x5C, 0x24, 0x10, 0xD9, 0x46, 0x1C, 0xD8, 0x66, 0x28, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24,
+    0x0C, 0xDD, 0x05, 0xE8, 0x50, 0xDD, 0x00, 0xDC, 0xC9, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9,
+    0x44, 0x24, 0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0xC9, 0xD9,
+    0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0x46, 0x14, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x54,
+    0x24, 0x0C, 0xD9, 0x46, 0x18, 0xD8, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x46, 0x1C,
+    0x89, 0x11, 0xD8, 0x44, 0x24, 0x20, 0x8B, 0x54, 0x24, 0x10, 0x89, 0x51, 0x04, 0xD9, 0x5C, 0x24,
+    0x14, 0x8B, 0x54, 0x24, 0x14, 0x89, 0x51, 0x08, 0xD9, 0x86, 0x94, 0x01, 0x00, 0x00, 0xD8, 0xA6,
+    0xA0, 0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x86, 0x98, 0x01, 0x00, 0x00, 0xD8, 0xA6,
+    0xA4, 0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x86, 0x9C, 0x01, 0x00, 0x00, 0xD8, 0xA6,
+    0xA8, 0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xC9, 0xD9, 0x5C,
+    0x24, 0x18, 0xD9, 0x44, 0x24, 0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x14,
+    0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x86, 0x94, 0x01, 0x00, 0x00, 0xD8, 0x44, 0x24, 0x18,
+    0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x86, 0x98, 0x01, 0x00, 0x00, 0xD8, 0x44, 0x24, 0x1C, 0xD9, 0x5C,
+    0x24, 0x10, 0xD9, 0x86, 0x9C, 0x01, 0x00, 0x00, 0x8B, 0x7C, 0x24, 0x0C, 0xD8, 0x44, 0x24, 0x20,
+    0x89, 0xBE, 0x88, 0x01, 0x00, 0x00, 0x8B, 0x7C, 0x24, 0x10, 0x89, 0xBE, 0x8C, 0x01, 0x00, 0x00,
+    0xD9, 0x5C, 0x24, 0x14, 0x8B, 0x7C, 0x24, 0x14, 0x89, 0xBE, 0x90, 0x01, 0x00, 0x00, 0xD9, 0x86,
+    0x14, 0x03, 0x00, 0x00, 0xD8, 0xA6, 0x20, 0x03, 0x00, 0x00, 0x8D, 0x96, 0x88, 0x01, 0x00, 0x00,
+    0x8D, 0xBE, 0x08, 0x03, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x86, 0x18, 0x03, 0x00, 0x00,
+    0xD8, 0xA6, 0x24, 0x03, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x86, 0x1C, 0x03, 0x00, 0x00,
+    0xD8, 0xA6, 0x28, 0x03, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xC9,
+    0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44,
+    0x24, 0x14, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x86, 0x14, 0x03, 0x00, 0x00, 0xD8, 0x44,
+    0x24, 0x18, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x5C, 0x24, 0x0C, 0xD9, 0x86, 0x18, 0x03, 0x00, 0x00,
+    0xD8, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x86, 0x1C, 0x03, 0x00, 0x00, 0x89, 0x1F,
+    0xD8, 0x44, 0x24, 0x20, 0x8B, 0x5C, 0x24, 0x10, 0x89, 0x5F, 0x04, 0xD9, 0x5C, 0x24, 0x14, 0x8B,
+    0x5C, 0x24, 0x14, 0x89, 0x5F, 0x08, 0xD9, 0x40, 0x08, 0xD8, 0x60, 0xFC, 0xD9, 0x5C, 0x24, 0x0C,
+    0xD9, 0x40, 0x0C, 0xD8, 0x20, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x40, 0x10, 0xD8, 0x60, 0x04, 0xD9,
+    0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24,
+    0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0xC9, 0xD9, 0x5C, 0x24,
+    0x20, 0xD9, 0x40, 0x08, 0xD8, 0x44, 0x24, 0x18, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x5C, 0x24, 0x0C,
+    0xD9, 0x40, 0x0C, 0xD8, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x40, 0x10, 0x89, 0x58,
+    0x14, 0xD8, 0x44, 0x24, 0x20, 0x8B, 0x5C, 0x24, 0x10, 0x89, 0x58, 0x18, 0xD9, 0x5C, 0x24, 0x14,
+    0x8B, 0x5C, 0x24, 0x14, 0x89, 0x58, 0x1C, 0xD9, 0x80, 0x88, 0x01, 0x00, 0x00, 0xD8, 0xA0, 0x7C,
+    0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x80, 0x8C, 0x01, 0x00, 0x00, 0xD8, 0xA0, 0x80,
+    0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x80, 0x90, 0x01, 0x00, 0x00, 0xD8, 0xA0, 0x84,
+    0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xC9, 0xD9, 0x5C, 0x24,
+    0x18, 0xD9, 0x44, 0x24, 0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x14, 0xD8,
+    0xC9, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0x80, 0x88, 0x01, 0x00, 0x00, 0xD9,
+    0x5C, 0x24, 0x0C, 0x8B, 0x5C, 0x24, 0x0C, 0xD9, 0x80, 0x8C, 0x01, 0x00, 0x00, 0xD8, 0x44, 0x24,
+    0x1C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x80, 0x90, 0x01, 0x00, 0x00, 0x89, 0x98, 0x94, 0x01, 0x00,
+    0x00, 0xD8, 0x44, 0x24, 0x20, 0x8B, 0x5C, 0x24, 0x10, 0x89, 0x98, 0x98, 0x01, 0x00, 0x00, 0xD9,
+    0x5C, 0x24, 0x14, 0x8B, 0x5C, 0x24, 0x14, 0x89, 0x98, 0x9C, 0x01, 0x00, 0x00, 0xD9, 0x80, 0x08,
+    0x03, 0x00, 0x00, 0xD8, 0xA0, 0xFC, 0x02, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x80, 0x0C,
+    0x03, 0x00, 0x00, 0xD8, 0xA0, 0x00, 0x03, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x80, 0x10,
+    0x03, 0x00, 0x00, 0xD8, 0xA0, 0x04, 0x03, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24,
+    0x0C, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x10, 0xD8, 0xC9, 0xD9, 0x5C, 0x24,
+    0x1C, 0xD8, 0x4C, 0x24, 0x14, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x18, 0xD8, 0x80, 0x08,
+    0x03, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x5C, 0x24, 0x0C, 0xD9, 0x80, 0x0C, 0x03, 0x00,
+    0x00, 0xD8, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0xD9, 0x80, 0x10, 0x03, 0x00, 0x00, 0x89,
+    0x98, 0x14, 0x03, 0x00, 0x00, 0xD8, 0x44, 0x24, 0x20, 0x8B, 0x5C, 0x24, 0x10, 0x89, 0x98, 0x18,
+    0x03, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0x8B, 0x5C, 0x24, 0x14, 0x89, 0x98, 0x1C, 0x03, 0x00,
+    0x00, 0x8B, 0x06, 0x89, 0x8E, 0x88, 0x04, 0x00, 0x00, 0x83, 0xC0, 0x02, 0x89, 0x86, 0x8C, 0x04,
+    0x00, 0x00, 0xD9, 0x96, 0x90, 0x04, 0x00, 0x00, 0x8B, 0x0E, 0x89, 0x96, 0x94, 0x04, 0x00, 0x00,
+    0x83, 0xC1, 0x02, 0x89, 0x8E, 0x98, 0x04, 0x00, 0x00, 0xD9, 0x96, 0x9C, 0x04, 0x00, 0x00, 0x8B,
+    0x16, 0x89, 0xBE, 0xA0, 0x04, 0x00, 0x00, 0x5F, 0x83, 0xC2, 0x02, 0x89, 0x96, 0xA4, 0x04, 0x00,
+    0x00, 0xD9, 0x96, 0xA8, 0x04, 0x00, 0x00, 0x5D, 0xD9, 0x9E, 0xAC, 0x04, 0x00, 0x00, 0x5B, 0x81,
+    0xC4, 0xB4, 0x04, 0x00, 0x00, 0xC3,
+];
+
+
+// --- cam_49d7a0 (0x49d7a0..0x49d8ac, 268 bytes) ----------------------------------------
+
+#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
+unsafe fn cam_49d7a0_body(ent: &mut Ent, args: *const u32) {
+    let mut stk = [0u64; 512];
+    #[cfg(not(test))]
+    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
+    #[cfg(test)]
+    let stk_p = difftest::STK_P;
+    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
+    wd(esp as usize, 0);
+    for k in 0..16 {
+        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
+    }
+    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
+    let mut xmm0 = ent.xmm0;
+    let mut fl = Fl::default();
+    let mut fx = X87::new();
+    macro_rules! callx {
+        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
+            let mut b = Blk {
+                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
+                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
+            };
+            #[cfg(test)]
+            difftest::pre_call(&b, &fx, $pop);
+            let n = callx_raw(&mut b);
+            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
+            for k in (0..n).rev() {
+                fx.push(b.st_out[k]);
+            }
+            esp = esp.wrapping_add(4 * $pop);
+        }};
+    }
+    let mut pc: usize = 0x49d7a0;
+    loop {
+        #[cfg(test)]
+        difftest::cov(pc);
+        match pc {
+        0x49d7a0 => {
+            bump(C::Cam49d7a0Calls);
+            // 0x49d7a0: mov eax, dword ptr [0x25f5bb0]
+            eax = rd(0x25f5bb0usize);
+            // 0x49d7a5: sub esp, 0x10
+            { let a = esp; let b = 0x10u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
+            // 0x49d7a8: test eax, eax
+            fl = f_logic((eax) & (eax), 32);
+            // 0x49d7aa: push esi
+            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
+            // 0x49d7ab: je 0x49d88d
+            if fl.zf { pc = 0x49d88d; } else { pc = 0x49d7b1; } continue;
+        }
+        0x49d7b1 => {
+            // 0x49d7b1: mov ecx, eax
+            ecx = eax;
+            // 0x49d7b3: and ecx, 0xfff
+            { let r = (ecx) & (0xfffu32); fl = f_logic(r, 32); ecx = r; }
+            // 0x49d7b9: shl ecx, 4
+            { let r = ecx << 4; fl = f_logic(r, 32); ecx = r; }
+            // 0x49d7bc: mov esi, dword ptr [ecx + 0x2149c64]
+            esi = rd((ecx.wrapping_add(0x2149c64)) as usize);
+            // 0x49d7c2: test esi, esi
+            fl = f_logic((esi) & (esi), 32);
+            // 0x49d7c4: je 0x49d88d
+            if fl.zf { pc = 0x49d88d; } else { pc = 0x49d7ca; } continue;
+        }
+        0x49d7ca => {
+            // 0x49d7ca: cmp dword ptr [esi + 0x44], eax
+            fl = f_sub(rd((esi.wrapping_add(0x44)) as usize), eax, 32);
+            // 0x49d7cd: jne 0x49d88d
+            if !fl.zf { pc = 0x49d88d; } else { pc = 0x49d7d3; } continue;
+        }
+        0x49d7d3 => {
+            // 0x49d7d3: mov eax, dword ptr [0x25f5d3c]
+            eax = rd(0x25f5d3cusize);
+            // 0x49d7d8: cmp edi, eax
+            fl = f_sub(edi, eax, 32);
+            // 0x49d7da: je 0x49d88d
+            if fl.zf { pc = 0x49d88d; } else { pc = 0x49d7e0; } continue;
+        }
+        0x49d7e0 => {
+            // 0x49d7e0: sub eax, 1
+            { let a = eax; let b = 0x1u32; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
+            // 0x49d7e3: je 0x49d7f7
+            if fl.zf { pc = 0x49d7f7; } else { pc = 0x49d7e5; } continue;
+        }
+        0x49d7e5 => {
+            // 0x49d7e5: lea eax, [esi + 0x38]
+            eax = (esi.wrapping_add(0x38));
+            // 0x49d7e8: call 0x49df50
+            callx!(0x49df50, 5, 0, 0, 0.0, 0.0);
+            // 0x49d7ed: fldz 
+            fx.push(0.0);
+            // 0x49d7ef: fstp dword ptr [0x25f5c78]
+            wf(0x25f5c78usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49d7f5: jmp 0x49d7fe
+            pc = 0x49d7fe; continue;
+        }
+        0x49d7f7 => {
+            // 0x49d7f7: mov byte ptr [0x25f5d34], 1
+            wb(0x25f5d34usize, (0x1u32) as u8);
+            pc = 0x49d7fe; continue;
+        }
+        0x49d7fe => {
+            // 0x49d7fe: cmp edi, 5
+            fl = f_sub(edi, 0x5u32, 32);
+            // 0x49d801: ja 0x49d887
+            if !fl.cf && !fl.zf { pc = 0x49d887; } else { pc = 0x49d807; } continue;
+        }
+        0x49d807 => {
+            // 0x49d807: jmp dword ptr [edi*4 + 0x49d894]
+            pc = rd((0x49d894u32.wrapping_add(edi.wrapping_mul(4))) as usize) as usize; continue;
+        }
+        0x49d80e => {
+            // 0x49d80e: mov dword ptr [0x25f5c54], 0
+            wd(0x25f5c54usize, 0x0u32);
+            // 0x49d818: mov dword ptr [0x25f5d3c], edi
+            wd(0x25f5d3cusize, edi);
+            // 0x49d81e: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x49d81f: add esp, 0x10
+            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49d822: ret 
+            break;
+        }
+        0x49d823 => {
+            // 0x49d823: mov dword ptr [0x25f5c54], 3
+            wd(0x25f5c54usize, 0x3u32);
+            // 0x49d82d: mov dword ptr [0x25f5d3c], edi
+            wd(0x25f5d3cusize, edi);
+            // 0x49d833: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x49d834: add esp, 0x10
+            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49d837: ret 
+            break;
+        }
+        0x49d838 => {
+            // 0x49d838: lea eax, [esi + 0x20]
+            eax = (esi.wrapping_add(0x20));
+            // 0x49d83b: jmp 0x49d878
+            pc = 0x49d878; continue;
+        }
+        0x49d83d => {
+            // 0x49d83d: fld dword ptr [esi + 0x20]
+            fx.push(rf((esi.wrapping_add(0x20)) as usize) as f64);
+            // 0x49d840: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49d842: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49d846: fld dword ptr [esi + 0x24]
+            fx.push(rf((esi.wrapping_add(0x24)) as usize) as f64);
+            // 0x49d849: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49d84b: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49d84f: fld dword ptr [esi + 0x28]
+            fx.push(rf((esi.wrapping_add(0x28)) as usize) as f64);
+            // 0x49d852: jmp 0x49d86e
+            pc = 0x49d86e; continue;
+        }
+        0x49d854 => {
+            // 0x49d854: lea eax, [esi + 0x38]
+            eax = (esi.wrapping_add(0x38));
+            // 0x49d857: jmp 0x49d878
+            pc = 0x49d878; continue;
+        }
+        0x49d859 => {
+            // 0x49d859: fld dword ptr [esi + 0x38]
+            fx.push(rf((esi.wrapping_add(0x38)) as usize) as f64);
+            // 0x49d85c: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49d85e: fstp dword ptr [esp + 8]
+            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49d862: fld dword ptr [esi + 0x3c]
+            fx.push(rf((esi.wrapping_add(0x3c)) as usize) as f64);
+            // 0x49d865: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49d867: fstp dword ptr [esp + 0xc]
+            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
+            fx.pop();
+            // 0x49d86b: fld dword ptr [esi + 0x40]
+            fx.push(rf((esi.wrapping_add(0x40)) as usize) as f64);
+            pc = 0x49d86e; continue;
+        }
+        0x49d86e => {
+            // 0x49d86e: fchs 
+            { let v = -fx.s(0); fx.set(0, v); }
+            // 0x49d870: lea eax, [esp + 8]
+            eax = (esp.wrapping_add(0x8));
+            // 0x49d874: fstp dword ptr [esp + 0x10]
+            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
+            fx.pop();
+            pc = 0x49d878; continue;
+        }
+        0x49d878 => {
+            // 0x49d878: call 0x49df50
+            callx!(0x49df50, 5, 0, 0, 0.0, 0.0);
+            // 0x49d87d: mov dword ptr [0x25f5c54], 4
+            wd(0x25f5c54usize, 0x4u32);
+            pc = 0x49d887; continue;
+        }
+        0x49d887 => {
+            // 0x49d887: mov dword ptr [0x25f5d3c], edi
+            wd(0x25f5d3cusize, edi);
+            pc = 0x49d88d; continue;
+        }
+        0x49d88d => {
+            // 0x49d88d: pop esi
+            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
+            // 0x49d88e: add esp, 0x10
+            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
+            // 0x49d891: ret 
+            break;
+        }
+            _ => unreachable!(),
+        }
+    }
+    #[cfg(test)]
+    {
+        ent.ebp = ebp;
+        ent.pad = esp;
+    }
+    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
+    let depth = (8 - fx.top) & 7;
+    ent.nst = (depth >= 1) as u32;
+    if depth >= 1 {
+        ent.st0 = fx.s(0);
+    }
+    std::hint::black_box(&stk);
+}
+
+extern "C" fn cam_49d7a0_entry(ent: *mut Ent, args: *const u32) {
+    unsafe { cam_49d7a0_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_49d7a0_thunk, cam_49d7a0_entry, 0);
+
+const CAM_49D7A0_BODY: [u8; 268] = [
+    0xA1, 0xB0, 0x5B, 0x5F, 0x02, 0x83, 0xEC, 0x10, 0x85, 0xC0, 0x56, 0x0F, 0x84, 0xDC, 0x00, 0x00,
+    0x00, 0x8B, 0xC8, 0x81, 0xE1, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE1, 0x04, 0x8B, 0xB1, 0x64, 0x9C,
+    0x14, 0x02, 0x85, 0xF6, 0x0F, 0x84, 0xC3, 0x00, 0x00, 0x00, 0x39, 0x46, 0x44, 0x0F, 0x85, 0xBA,
+    0x00, 0x00, 0x00, 0xA1, 0x3C, 0x5D, 0x5F, 0x02, 0x3B, 0xF8, 0x0F, 0x84, 0xAD, 0x00, 0x00, 0x00,
+    0x83, 0xE8, 0x01, 0x74, 0x12, 0x8D, 0x46, 0x38, 0xE8, 0x63, 0x07, 0x00, 0x00, 0xD9, 0xEE, 0xD9,
+    0x1D, 0x78, 0x5C, 0x5F, 0x02, 0xEB, 0x07, 0xC6, 0x05, 0x34, 0x5D, 0x5F, 0x02, 0x01, 0x83, 0xFF,
+    0x05, 0x0F, 0x87, 0x80, 0x00, 0x00, 0x00, 0xFF, 0x24, 0xBD, 0x94, 0xD8, 0x49, 0x00, 0xC7, 0x05,
+    0x54, 0x5C, 0x5F, 0x02, 0x00, 0x00, 0x00, 0x00, 0x89, 0x3D, 0x3C, 0x5D, 0x5F, 0x02, 0x5E, 0x83,
+    0xC4, 0x10, 0xC3, 0xC7, 0x05, 0x54, 0x5C, 0x5F, 0x02, 0x03, 0x00, 0x00, 0x00, 0x89, 0x3D, 0x3C,
+    0x5D, 0x5F, 0x02, 0x5E, 0x83, 0xC4, 0x10, 0xC3, 0x8D, 0x46, 0x20, 0xEB, 0x3B, 0xD9, 0x46, 0x20,
+    0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x46, 0x24, 0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x0C, 0xD9,
+    0x46, 0x28, 0xEB, 0x1A, 0x8D, 0x46, 0x38, 0xEB, 0x1F, 0xD9, 0x46, 0x38, 0xD9, 0xE0, 0xD9, 0x5C,
+    0x24, 0x08, 0xD9, 0x46, 0x3C, 0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x46, 0x40, 0xD9, 0xE0,
+    0x8D, 0x44, 0x24, 0x08, 0xD9, 0x5C, 0x24, 0x10, 0xE8, 0xD3, 0x06, 0x00, 0x00, 0xC7, 0x05, 0x54,
+    0x5C, 0x5F, 0x02, 0x04, 0x00, 0x00, 0x00, 0x89, 0x3D, 0x3C, 0x5D, 0x5F, 0x02, 0x5E, 0x83, 0xC4,
+    0x10, 0xC3, 0x8B, 0xFF, 0x0E, 0xD8, 0x49, 0x00, 0x23, 0xD8, 0x49, 0x00, 0x59, 0xD8, 0x49, 0x00,
+    0x54, 0xD8, 0x49, 0x00, 0x3D, 0xD8, 0x49, 0x00, 0x38, 0xD8, 0x49, 0x00,
+];
+
+#[cfg(test)]
+#[path = "port_big_difftest.rs"]
+mod difftest;

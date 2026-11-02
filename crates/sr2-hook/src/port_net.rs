@@ -3599,6 +3599,917 @@ fn round2_patch_copies() {
 }
 
 
+// ===== round 3: the object core, join_req and the session action dispatcher =========================================
+// These functions allocate pool records, call virtual methods of the per-type managers (table 0x212E25C), and send
+// packets, so a shadow would double their side effects. They are checked with per-branch counters only (the summary
+// line lists, per port, the calls and then the hit count of every numbered branch), and offline against the
+// original bytes with the callees stubbed (see the `tests3` module). Callees are called by address with the
+// registers and stack arguments the original sets up. Thread: every one of them runs on the game thread
+// (sim_frame / packet receive); the network thread (0x814320) calls none of them.
+// EBX / EBP are never inputs of a callee here: `call_regs` leaves them to the Rust frame.
+
+/// The address a callee is called at: the game's own, except in the offline tests, which put stubs there.
+#[cfg(not(test))]
+#[inline(always)]
+fn cal(a: usize) -> usize {
+    a
+}
+#[cfg(test)]
+fn cal(a: usize) -> usize {
+    tests3::redirect(a)
+}
+
+const OBJ_HEAD: usize = 0x0212_E2AC;
+const TYPE_LISTS: usize = 0x0212_E284;
+const FREE_LIST: usize = 0x0212_C254;
+const FREE_COUNT: usize = 0x0212_BA34;
+const SNAP_FLAG: usize = 0x0144_E9B6;
+const LOCAL_FLAG_B: usize = 0x0252_8B9D;
+
+struct Port3 {
+    name: &'static str,
+    addr: usize,
+    calls: AtomicU32,
+    br: [AtomicU32; 24],
+}
+
+const fn p3(name: &'static str, addr: usize) -> Port3 {
+    Port3 { name, addr, calls: AtomicU32::new(0), br: [const { AtomicU32::new(0) }; 24] }
+}
+
+const DISPATCH_ACTION: usize = 0;
+const ADD_FIELD: usize = 1;
+const REGS_RESET: usize = 2;
+const DESTROY_FROM_PACKET: usize = 3;
+const SEND_NEW_OWNER: usize = 4;
+const OBJ_UNREGISTER: usize = 5;
+const DEACTIVATE_SEND: usize = 6;
+const REGISTER_LOCAL: usize = 7;
+const REGISTER_FROM_CREATE: usize = 8;
+const SEND_JOIN_REQ: usize = 9;
+const COUNT3: usize = 10;
+
+static P3S: [Port3; COUNT3] = [
+    p3("session_dispatch_action", 0x0080_ED70),
+    p3("net_registration_add_field", 0x0080_7780),
+    p3("net_registrations_reset", 0x0080_6E30),
+    p3("net_object_destroy_from_packet", 0x0080_4550),
+    p3("net_object_send_new_owner", 0x0080_67D0),
+    p3("net_object_unregister", 0x0080_4140),
+    p3("net_object_deactivate_send", 0x0080_53B0),
+    p3("net_object_register_local", 0x0080_5000),
+    p3("net_object_register_from_create", 0x0080_4320),
+    p3("net_send_join_req", 0x0081_5930),
+];
+
+fn enter(id: usize) {
+    P3S[id].calls.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Count a branch (numbered per port, see the comments of each port).
+fn br(id: usize, k: usize) {
+    P3S[id].br[k].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The handle slot of `h` (the object, or 0 when the slot is empty); no staleness check.
+unsafe fn slot_of(h: u32) -> u32 {
+    unsafe { rd(HANDLES + ((h & 0xFFF) as usize) * 16) }
+}
+
+/// Append `rec` at the tail of the circular list of `ty` (0x212E284 + ty * 4), as the registration code does.
+unsafe fn type_list_append(rec: u32, ty: u32) {
+    unsafe {
+        let head_slot = TYPE_LISTS + ty as usize * 4;
+        let r = rec as usize;
+        let head = rd(head_slot);
+        if head == 0 {
+            wd(r + 0x674, rec);
+            wd(r + 0x678, rec);
+        } else {
+            let tail = rd(head as usize + 0x678);
+            wd(tail as usize + 0x674, rec);
+            let head = rd(head_slot);
+            let tail = rd(head as usize + 0x678);
+            wd(r + 0x678, tail);
+            let head = rd(head_slot);
+            wd(head as usize + 0x678, rec);
+            let head = rd(head_slot);
+            wd(r + 0x674, head);
+        }
+        wd(head_slot, rec);
+    }
+}
+
+// --- 0x80ED70 session_dispatch_action (EAX = action, ESI = session) -----------------------------------------------------
+// Branches: 1 = action 0xFF or > 5 (EAX = 2); 2 = actions 0 / 3 / 5 (EAX = 0); 3 / 4 / 5 = actions 1 / 2 / 4, which call the
+// session vtable slot +0xC / +0x10 / +0x14 (ECX = this = ESI, EDX = the method, EAX = the vtable) and set byte +0xC00;
+// EAX is the method's.
+unsafe fn h_dispatch_action(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        enter(id);
+        let act = r.eax;
+        let s = r.esi;
+        if act == 0xFF || act > 5 {
+            br(id, 1);
+            r.eax = 2;
+            return;
+        }
+        let (slot, b) = match act {
+            1 => (0xC, 3),
+            2 => (0x10, 4),
+            4 => (0x14, 5),
+            _ => {
+                br(id, 2);
+                r.eax = 0;
+                return;
+            }
+        };
+        br(id, b);
+        let vt = rd(s as usize);
+        let f = rd(vt as usize + slot);
+        r.eax = call_regs(f as usize, vt, s, f, s, r.edi, &[]);
+        wb(s as usize + 0xC00, 1);
+    }
+}
+port_thunk!(dispatch_action_thunk, dispatch_action_entry, DISPATCH_ACTION, h_dispatch_action);
+
+// --- 0x807780 net_registration_add_field (EDX = registration, stack: a, b, c, d; `ret 0x10`) ----------------------------------
+// Entry n = [reg + 0x18] at reg + 0x20 + n * 0x44; its index is stored at +8, the arguments at +0 (a), +4 (b), +0x40 (c),
+// +0x3C (d). The bit width [reg + 0x1C] grows until count >> width is 0. Branches: 1 = full (EAX = 0); 2 = the index equals the
+// all-ones mask of the new width (EAX = 0, the entry stays half written); 3 = added (EAX = entry + 8, not 1).
+unsafe fn h_add_field(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        enter(id);
+        let reg = r.edx as usize;
+        let n = rd(reg + 0x18);
+        if n >= 0x10 {
+            br(id, 1);
+            r.eax = 0;
+            return;
+        }
+        let f = reg + 0x20 + n as usize * 0x44;
+        let e = f + 8;
+        wd(e + 0x10, 0);
+        wd(e + 8, 0);
+        ww(e + 0xC, 0);
+        wd(e + 4, 0);
+        wd(e, 0xFFFF_FFFF);
+        wd(e, rd(reg + 0x18));
+        wd(f + 0x3C, *a.add(3));
+        wd(reg + 0x18, rd(reg + 0x18).wrapping_add(1));
+        let bits = rd(reg + 0x1C);
+        if rd(reg + 0x18) >> (bits & 31) != 0 {
+            loop {
+                wd(reg + 0x1C, rd(reg + 0x1C).wrapping_add(1));
+                if rd(reg + 0x18) >> (rd(reg + 0x1C) & 31) == 0 {
+                    break;
+                }
+            }
+        }
+        let mask = (1u32 << (rd(reg + 0x1C) & 31)).wrapping_sub(1);
+        if rd(e) == mask {
+            br(id, 2);
+            r.eax = 0;
+            return;
+        }
+        br(id, 3);
+        wd(f, *a);
+        wd(f + 4, *a.add(1));
+        wd(f + 0x40, *a.add(2));
+        r.eax = e as u32;
+    }
+}
+port_thunk!(add_field_thunk, add_field_entry, ADD_FIELD, h_add_field, "ret 16");
+
+// --- 0x804140 net_object_unregister (ESI = record) ------------------------------------------------------------------------
+// Unlinks the record from its type list, drops its snapshot data (0x7FFB70, when byte 0x144E9B6 is set), detaches the
+// object (the manager's vtable +0x10 with the handle, then clears bit 7 of [obj + 0x80] and [obj + 0xB0]), frees the
+// net-id mapping (0x807AA0), unlinks it from the global list (0x212E2AC) and pushes it on the free list (0x212C254).
+// Branches: 1 = null record (EAX unchanged); 2 = type out of 0..9 (EAX = the type); 3 = it headed its type list alone;
+// 4 = it headed a longer list; 5 = not the list head; 6 = snapshot data freed; 7 = object found and detached;
+// 8 = it headed the global list alone; 9 = it headed a longer global list; 10 = free list empty; 11 = free list non-empty.
+// EAX at the end: the old free-list head (0 or the head), the type, or the entry EAX.
+unsafe fn unregister(id: usize, esi: u32, edi_in: u32, eax_in: u32) -> u32 {
+    unsafe {
+        if esi == 0 {
+            br(id, 1);
+            return eax_in;
+        }
+        let s = esi as usize;
+        let ty = rd(s + 8);
+        if (ty as i32) < 0 || (ty as i32) >= 10 {
+            br(id, 2);
+            return ty;
+        }
+        let head_slot = TYPE_LISTS + ty as usize * 4;
+        let mut skip_unlink = false;
+        if rd(head_slot) == esi {
+            let next = rd(s + 0x674);
+            if next == esi {
+                br(id, 3);
+                wd(s + 0x674, 0);
+                wd(s + 0x678, 0);
+                wd(head_slot, 0);
+                skip_unlink = true;
+            } else {
+                br(id, 4);
+                wd(head_slot, next);
+            }
+        } else {
+            br(id, 5);
+        }
+        let mut eax_cur = ty;
+        if !skip_unlink {
+            let prev = rd(s + 0x678);
+            eax_cur = prev;
+            let next = rd(s + 0x674);
+            wd(prev as usize + 0x674, next);
+            let next = rd(s + 0x674);
+            let prev = rd(s + 0x678);
+            wd(next as usize + 0x678, prev);
+            wd(s + 0x674, 0);
+            wd(s + 0x678, 0);
+        }
+        if rb(SNAP_FLAG) != 0 {
+            br(id, 6);
+            call_regs(cal(0x007F_FB70), (eax_cur & 0xFFFF_0000) | rw(s + 2) as u32, 0, 0, esi, edi_in, &[]);
+        }
+        let h = rd(s + 4);
+        if h != 0 {
+            let obj = slot_of(h);
+            if obj != 0 && rd(obj as usize + 0x44) == h {
+                br(id, 7);
+                let mgr = rd(MANAGERS + rd(s + 8) as usize * 4);
+                let vt = rd(mgr as usize);
+                let f = rd(vt as usize + 0x10);
+                call_regs(f as usize, f, mgr, vt, esi, obj, &[h]);
+                wd(obj as usize + 0x80, rd(obj as usize + 0x80) & 0xFFFF_FF7F);
+                wd(obj as usize + 0xB0, 0);
+            }
+        }
+        call_regs(cal(0x0080_7AA0), rw(s + 2) as u32, 0, 0, esi, edi_in, &[]);
+        if rd(OBJ_HEAD) == esi {
+            let next = rd(s + 0x66C);
+            if next == esi {
+                br(id, 8);
+                wd(OBJ_HEAD, 0);
+                return unregister_free_list(id, s, esi);
+            }
+            br(id, 9);
+            wd(OBJ_HEAD, next);
+        }
+        let prev = rd(s + 0x670);
+        if prev != 0 {
+            wd(prev as usize + 0x66C, rd(s + 0x66C));
+        }
+        let next = rd(s + 0x66C);
+        if next != 0 {
+            wd(next as usize + 0x670, rd(s + 0x670));
+        }
+        unregister_free_list(id, s, esi)
+    }
+}
+
+/// The tail of 0x804140: the record goes on the free list; EAX = the old head.
+unsafe fn unregister_free_list(id: usize, s: usize, esi: u32) -> u32 {
+    unsafe {
+        let head = rd(FREE_LIST);
+        wd(s + 0x670, 0);
+        wd(s + 0x66C, 0);
+        if head == 0 {
+            br(id, 10);
+            wd(FREE_COUNT, rd(FREE_COUNT).wrapping_sub(1));
+            wd(s + 0x66C, esi);
+            wd(s + 0x670, esi);
+            wd(FREE_LIST, esi);
+            return 0;
+        }
+        br(id, 11);
+        let tail = rd(head as usize + 0x670);
+        wd(FREE_COUNT, rd(FREE_COUNT).wrapping_sub(1));
+        wd(tail as usize + 0x66C, esi);
+        wd(s + 0x670, rd(head as usize + 0x670));
+        wd(head as usize + 0x670, esi);
+        wd(s + 0x66C, head);
+        wd(FREE_LIST, esi);
+        head
+    }
+}
+
+unsafe fn h_obj_unregister(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        enter(id);
+        r.eax = unregister(id, r.esi, r.edi, r.eax);
+    }
+}
+port_thunk!(obj_unregister_thunk, obj_unregister_entry, OBJ_UNREGISTER, h_obj_unregister);
+
+// --- 0x806E30 net_registrations_reset (no arguments) ----------------------------------------------------------------------
+// Walks the global record list (head 0x212E2AC) unregistering each record with 0x804140 (ESI = record; the next link is read
+// before the call and is 0 when it points back at the head), then clears the per-type heads and tails and sets byte 0xE8860A.
+// Branches: 1 = list empty; 2 = at least one record unregistered. EAX = the last 0x804140's.
+unsafe fn h_regs_reset(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        enter(id);
+        let mut eax = r.eax;
+        let mut esi = rd(OBJ_HEAD);
+        br(id, if esi == 0 { 1 } else { 2 });
+        while esi != 0 {
+            let next = rd(esi as usize + 0x66C);
+            let edi = if next != rd(OBJ_HEAD) { next } else { 0 };
+            eax = call_regs(cal(0x0080_4140), next, r.ecx, r.edx, esi, edi, &[]);
+            esi = edi;
+        }
+        wd(OBJ_HEAD, 0);
+        wd(0x0212_B518, 0);
+        wd(0x0212_E284, 0);
+        wd(0x0212_B4F0, 0);
+        wd(0x0212_E288, 0);
+        wd(0x0212_B4F4, 0);
+        wd(0x0212_E28C, 0);
+        wd(0x0212_B4F8, 0);
+        wd(0x0212_E290, 0);
+        wd(0x0212_B4FC, 0);
+        wd(0x0212_E294, 0);
+        wd(0x0212_B500, 0);
+        wd(0x0212_E298, 0);
+        wd(0x0212_B504, 0);
+        wd(0x0212_E29C, 0);
+        wd(0x0212_B508, 0);
+        wd(0x0212_E2A0, 0);
+        wd(0x0212_B50C, 0);
+        wd(0x0212_E2A4, 0);
+        wd(0x0212_B510, 0);
+        wd(0x0212_E2A8, 0);
+        wd(0x0212_B514, 0);
+        wd(FREE_COUNT, 0);
+        wb(0x00E8_860A, 1);
+        r.eax = eax;
+    }
+}
+port_thunk!(regs_reset_thunk, regs_reset_entry, REGS_RESET, h_regs_reset);
+
+// --- 0x804550 net_object_destroy_from_packet (stack: packet {i32 type, u16 id at +4, ...}; AL = 1 / the 0x836DD0 flag) -------
+// Branches: 1 = type outside 0..10 or no manager (AL = 1); 2 = id not in the map (0x836DD0 decides: AL = (AL == 1));
+// 3 = map node with a null record (the same); 4 = record found: 0x8044C0, the manager's vtable +0x18 (handle, &0, packet + 6),
+// 0x804140, AL = 1.
+unsafe fn h_destroy_from_packet(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        enter(id);
+        let pkt = *a;
+        let ty = rd(pkt as usize);
+        if (ty as i32) < 0 || (ty as i32) > 10 || rd(MANAGERS + ty as usize * 4) == 0 {
+            br(id, 1);
+            r.eax = lo(ty, 1);
+            return;
+        }
+        let key = rw(pkt as usize + 4) as u32;
+        let map = rd(NET_ID_MAP);
+        let node = call_regs(cal(0x0080_8E30), key, r.ecx, r.edx, map, pkt + 4, &[key, 0]);
+        let mut esi = map;
+        let mut have = false;
+        if node != 0 {
+            esi = rd(node as usize);
+            have = esi != 0;
+        }
+        if !have {
+            br(id, if node == 0 { 2 } else { 3 });
+            let v = call_regs(cal(0x0083_6DD0), node, pkt + 4, r.edx, esi, pkt + 4, &[]);
+            r.eax = lo(v, ((v as u8) == 1) as u32);
+            return;
+        }
+        br(id, 4);
+        let s = esi as usize;
+        let h = rd(s + 4);
+        let cx = rw(s + 2) as u32;
+        call_regs(cal(0x0080_44C0), node, cx, h, esi, pkt + 4, &[0]);
+        let mgr = rd(MANAGERS + rd(s + 8) as usize * 4);
+        let vt = rd(mgr as usize);
+        let f = rd(vt as usize + 0x18);
+        let mut out = 0u32;
+        call_regs(f as usize, rd(s + 4), mgr, vt, esi, pkt + 4, &[rd(s + 4), &mut out as *mut u32 as u32, pkt + 6]);
+        let e = call_regs(cal(0x0080_4140), f, mgr, vt, esi, pkt + 4, &[]);
+        r.eax = lo(e, 1);
+    }
+}
+port_thunk!(destroy_from_packet_thunk, destroy_from_packet_entry, DESTROY_FROM_PACKET, h_destroy_from_packet);
+
+// --- 0x8067D0 net_object_send_new_owner (stack: packet {u16 id, u8 owner at +2, u8 flag at +3, ... +4 payload, u16 size at +0x204}) ---
+// Branches: 1 = id not mapped, no record or no session (AL = 1); 2 = no connection and no fallback: packet is passed to 0x804710 (ECX = &6)
+// (AL = 1); 3 = connection found; then 4 = the object cannot migrate (EAX = the check's), 5 = migrates: owner byte stored, the payload
+// sent to the connection (0x814670) and the manager's vtable +0x50 (handle, connection) called (AL = 1).
+unsafe fn h_send_new_owner(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        enter(id);
+        let pkt = *a;
+        let p = pkt as usize;
+        let key = rw(p) as u32;
+        let map = rd(NET_ID_MAP);
+        let node = call_regs(cal(0x0080_8E30), key, r.ecx, r.edx, map, r.edi, &[key, 0]);
+        if node == 0 {
+            br(id, 1);
+            r.eax = lo(node, 1);
+            return;
+        }
+        let rec = rd(node as usize);
+        if rec == 0 {
+            br(id, 1);
+            r.eax = lo(node, 1);
+            return;
+        }
+        let sess = rd(SESSION);
+        if sess == 0 {
+            br(id, 1);
+            r.eax = lo(node, 1);
+            return;
+        }
+        let edx = (pkt & !0xFF) | rb(p + 2) as u32;
+        let local = rd(sess as usize + 0x408);
+        let mut esi = call_regs(cal(0x0080_FE80), sess, r.ecx, edx, map, rec, &[]);
+        let found;
+        if esi != 0 {
+            found = true;
+        } else {
+            let mut walk = false;
+            if rb(p + 3) != 0 {
+                let ecx = rd(local as usize + 0x1AC);
+                if local == rd(ecx as usize + 0x404) {
+                    walk = true;
+                } else {
+                    esi = rd(sess as usize + 0x404);
+                }
+            }
+            if walk {
+                // the connection list of the session, starting at its head: the first entry other than the local one
+                let head = rd(sess as usize + 0x400);
+                esi = head;
+                if esi == 0 {
+                    found = false;
+                } else {
+                    loop {
+                        if esi != local {
+                            found = true;
+                            break;
+                        }
+                        esi = rd(esi as usize + 0x22CC);
+                        if esi == head || esi == 0 {
+                            found = false;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                found = esi != 0;
+            }
+        }
+        if !found {
+            br(id, 2);
+            let mut six = 6u32;
+            let e = call_regs(cal(0x0080_4710), node, &mut six as *mut u32 as u32, edx, esi, rec, &[pkt + 4]);
+            r.eax = lo(e, 1);
+            return;
+        }
+        br(id, 3);
+        let h = rd(rec as usize + 4);
+        let obj = if h == 0 {
+            0
+        } else {
+            let o = slot_of(h);
+            if o != 0 && rd(o as usize + 0x44) == h { o } else { 0 }
+        };
+        let can = call_regs(cal(0x0080_6D50), obj, r.ecx, edx, esi, rec, &[]);
+        if can as u8 == 0 {
+            br(id, 4);
+            r.eax = can;
+            return;
+        }
+        br(id, 5);
+        wb(rec as usize, rb(esi as usize + 0x1B0));
+        let size = rw(p + 0x204) as u32;
+        call_regs(cal(0x0081_4670), can, r.ecx, edx, esi, rec, &[pkt + 4, size, 0, 0]);
+        let mgr = rd(MANAGERS + rd(rec as usize + 8) as usize * 4);
+        let vt = rd(mgr as usize);
+        let f = rd(vt as usize + 0x50);
+        let hh = rd(rec as usize + 4);
+        let e = call_regs(f as usize, f, mgr, hh, esi, rec, &[hh, esi]);
+        r.eax = lo(e, 1);
+    }
+}
+port_thunk!(send_new_owner_thunk, send_new_owner_entry, SEND_NEW_OWNER, h_send_new_owner);
+
+// --- 0x8053B0 net_object_deactivate_send (ECX = handle) ----------------------------------------------------------------------
+// If the object's record belongs to the local connection, packet 0x0F {u32 [session + 8], u8 [rec + 8], u16 [rec + 2], manager payload
+// (vtable +0x14: handle, &buffer, &cursor)} goes to every connection of the session whose state is > 7, whose byte +0 is 0 and that
+// does not hold the handle in its owner list (0x804960 removes it there; EAX = connection, EDI = handle); finally the record is
+// unregistered (0x804140, ESI = record). Branches: 1 = no object / record / session, or the record is not the local connection's;
+// 2 = the connection list is empty; 3 = sent to a connection (0x814670, ESI = connection); 4 = a connection skipped (state or byte
+// test); 5 = skipped because 0x804960 found the handle. EAX = the final 0x804140's, or what the original leaves on the early exits.
+unsafe fn h_deactivate_send(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        enter(id);
+        let h = r.ecx;
+        if h == 0 {
+            br(id, 1);
+            return;
+        }
+        let obj = slot_of(h);
+        if obj == 0 || rd(obj as usize + 0x44) != h {
+            br(id, 1);
+            r.eax = obj;
+            return;
+        }
+        let rec = rd(obj as usize + 0xB0);
+        if rec == 0 {
+            br(id, 1);
+            r.eax = obj;
+            return;
+        }
+        let sess = rd(SESSION);
+        if sess == 0 {
+            br(id, 1);
+            r.eax = obj;
+            return;
+        }
+        let local = rd(sess as usize + 0x408);
+        if rb(rec as usize) != rb(local as usize + 0x1B0) {
+            br(id, 1);
+            r.eax = lo(obj, rb(rec as usize) as u32);
+            return;
+        }
+        let mgr = rd(MANAGERS + rd(rec as usize + 8) as usize * 4);
+        let mut buf = [0u8; 0x520];
+        buf[0] = 0x0F;
+        let mut cur = if rb(0x00E8_C084) == 0 { 3u32 } else { 4 };
+        let stamp = rd(sess as usize + 8);
+        buf[(cur as u16) as usize..][..4].copy_from_slice(&stamp.to_le_bytes());
+        cur += 4;
+        buf[(cur as u16) as usize] = rb(rec as usize + 8);
+        cur += 1;
+        buf[(cur as u16) as usize..][..2].copy_from_slice(&rw(rec as usize + 2).to_le_bytes());
+        cur += 2;
+        let vt = rd(mgr as usize);
+        let f = rd(vt as usize + 0x14);
+        let hh = rd(rec as usize + 4);
+        let cur_slot = &mut cur as *mut u32 as u32;
+        let e = call_regs(f as usize, vt, mgr, f, mgr, r.edi, &[hh, buf.as_mut_ptr() as u32, cur_slot]);
+        let cur = std::ptr::read_volatile(&cur);
+        buf[1..3].copy_from_slice(&(cur.wrapping_sub(3) as u16).to_le_bytes());
+        let list = rd(sess as usize + 0x400);
+        if list == 0 {
+            br(id, 2);
+        } else {
+            let mut c = list;
+            loop {
+                let cp = c as usize;
+                if (rd(cp + 0x3C) as i32) > 7 && rb(cp) == 0 {
+                    let a = call_regs(cal(0x0080_4960), c, e, mgr, c, hh, &[]);
+                    if a as u8 == 0 {
+                        br(id, 3);
+                        call_regs(cal(0x0081_4670), a, (cur as u16) as u32, mgr, c, hh, &[buf.as_mut_ptr() as u32, (cur as u16) as u32, 0, 0]);
+                    } else {
+                        br(id, 5);
+                    }
+                } else {
+                    br(id, 4);
+                }
+                c = rd(cp + 0x22CC);
+                if c == rd(sess as usize + 0x400) || c == 0 {
+                    break;
+                }
+            }
+        }
+        r.eax = call_regs(cal(0x0080_4140), e, mgr, f, rec, r.edi, &[]);
+    }
+}
+port_thunk!(deactivate_send_thunk, deactivate_send_entry, DEACTIVATE_SEND, h_deactivate_send);
+
+// --- 0x805000 net_object_register_local (EDI = handle, stack: type) ----------------------------------------------------------
+// Allocates a record (0x804050), maps its net id (0x807A20), links it into the type list, attaches it to the object ([obj + 0xB0]),
+// calls the manager's vtable +4 (handle), clears the connection's bit in [rec + 0x67E] for every connection with state > 7 and byte 0 = 0
+// (appending the handle to their owner list) and finally points the object that 0x925030 finds at the record.
+// Branches: 1 = the object already has a record; 2 = type != 6 with [0x2528BB4] > 0; 3 = no session; 4 = no object or object flag
+// bit 0 (EAX = the virtual call's, or [0x27B3C60]); 5 = allocation failed; 6 = registered; 7 = 0x925030 found no object; 8 = the
+// virtual call through [0x27B3C60] (its state is 1, slot +4 of the object at +0x90) was made.
+unsafe fn h_register_local(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        enter(id);
+        let edi = r.edi;
+        let ty = *a;
+        let mut eax = r.eax;
+        if edi != 0 {
+            eax = slot_of(edi);
+            if eax != 0 && rd(eax as usize + 0x44) == edi && rd(eax as usize + 0xB0) != 0 {
+                br(id, 1);
+                r.eax = eax;
+                return;
+            }
+        }
+        if ty != 6 && (rd(0x0252_8BB4) as i32) > 0 {
+            br(id, 2);
+            r.eax = eax;
+            return;
+        }
+        let sess = rd(SESSION);
+        if sess == 0 {
+            br(id, 3);
+            r.eax = 0;
+            return;
+        }
+        let local = rd(sess as usize + 0x408);
+        let mut ebp = 0;
+        if edi != 0 {
+            let o = slot_of(edi);
+            if o != 0 && rd(o as usize + 0x44) == edi {
+                ebp = o;
+            }
+        }
+        let o = rd(0x027B_3C60);
+        eax = o;
+        if o != 0 && rd(o as usize + 0x3C) == 1 {
+            br(id, 8);
+            let c = rd(o as usize + 0x90);
+            let vt = rd(c as usize);
+            let f = rd(vt as usize + 4);
+            eax = call_regs(f as usize, vt, c, f, r.esi, edi, &[]);
+        }
+        if ebp == 0 || rb(ebp as usize + 0x80) & 1 != 0 {
+            br(id, 4);
+            r.eax = eax;
+            return;
+        }
+        let rec = call_regs(cal(0x0080_4050), eax, r.ecx, r.edx, r.esi, edi, &[]);
+        if rec == 0 {
+            br(id, 5);
+            r.eax = 0;
+            return;
+        }
+        br(id, 6);
+        let rp = rec as usize;
+        ww(rp + 2, edi as u16);
+        call_regs(cal(0x0080_7A20), edi & 0xFFFF, r.ecx, r.edx, rec, edi, &[rec]);
+        wd(rp + 4, edi);
+        wd(rp + 8, ty);
+        wb(rp, rb(local as usize + 0x1B0));
+        wb(rp + 0x67C, 0);
+        type_list_append(rec, ty);
+        wd(ebp as usize + 0xB0, rec);
+        let mgr = rd(MANAGERS + ty as usize * 4);
+        let vt = rd(mgr as usize);
+        let f = rd(vt as usize + 4);
+        call_regs(f as usize, f, mgr, vt, rec, edi, &[edi]);
+        ww(rp + 0x67E, 0xFFFF);
+        let head = rd(sess as usize + 0x400);
+        if head != 0 {
+            let mut c = head;
+            loop {
+                let cp = c as usize;
+                if (rd(cp + 0x3C) as i32) > 7 && rb(cp) == 0 {
+                    let n = rd(cp + 0x21F0);
+                    wd(cp + n as usize * 4 + 0x1DF0, edi);
+                    let cl = rb(cp + 0x1B0);
+                    wd(cp + 0x21F0, rd(cp + 0x21F0).wrapping_add(1));
+                    let bit = !(1u32 << (cl & 31));
+                    ww(rp + 0x67E, rw(rp + 0x67E) & bit as u16);
+                }
+                c = rd(cp + 0x22CC);
+                if c == rd(sess as usize + 0x400) || c == 0 {
+                    break;
+                }
+            }
+        }
+        if rb(SNAP_FLAG) != 0 {
+            call_regs(cal(0x007F_FAC0), 0, 0, 0, rec, edi, &[rw(rp + 2) as u32]);
+        }
+        let obj = call_regs(cal(0x0092_5030), 0, edi, 0, rec, edi, &[]);
+        if obj == 0 {
+            br(id, 7);
+            r.eax = 0;
+            return;
+        }
+        wd(obj as usize + 0xB0, rec);
+        r.eax = obj;
+    }
+}
+port_thunk!(register_local_thunk, register_local_entry, REGISTER_LOCAL, h_register_local);
+
+// --- 0x804320 net_object_register_from_create (stack: create packet {u16 id, i32 type at +4, payload at +8, u8 owner at +0x208}) ----
+// AL = 1 unless allocation fails (0). Branches: 1 = type out of 0..9, no manager or no connection for the owner byte (AL = 1);
+// 2 = the manager's vtable +0xC (5 args, byte 0x2528B9D set around it) produced no handle: AL = (0x804F00(id) != 0); 3 = allocation
+// failed (AL = 0); 4 = record built and registered (0x925030, 0x807A20, 0x7FFAC0, manager vtable +4, 0x803FA0; AL = 1).
+unsafe fn h_register_from_create(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        enter(id);
+        let pkt = *a;
+        let p = pkt as usize;
+        let ty = rd(p + 4);
+        if (ty as i32) < 0 || (ty as i32) >= 10 {
+            br(id, 1);
+            r.eax = lo(ty, 1);
+            return;
+        }
+        let mgr = rd(MANAGERS + ty as usize * 4);
+        if mgr == 0 {
+            br(id, 1);
+            r.eax = lo(ty, 1);
+            return;
+        }
+        let sess = rd(SESSION);
+        let edx = (r.edx & !0xFF) | rb(p + 0x208) as u32;
+        let conn = call_regs(cal(0x0080_FE80), sess, r.ecx, edx, r.esi, pkt, &[]);
+        if conn == 0 {
+            br(id, 1);
+            r.eax = 1;
+            return;
+        }
+        let mut l0 = 0u32;
+        let mut l1 = 0u32;
+        let vt = rd(mgr as usize);
+        let f = rd(vt as usize + 0xC);
+        wb(LOCAL_FLAG_B, 1);
+        let e = call_regs(
+            f as usize,
+            conn,
+            mgr,
+            f,
+            r.esi,
+            pkt,
+            &[&mut l1 as *mut u32 as u32, &mut l0 as *mut u32 as u32, pkt + 8, rw(p) as u32, rb(conn as usize + 0x1B0) as u32],
+        );
+        wb(LOCAL_FLAG_B, 0);
+        let l1 = std::ptr::read_volatile(&l1);
+        if l1 == 0 {
+            br(id, 2);
+            let v = call_regs(cal(0x0080_4F00), rw(p) as u32, 0, 0, r.esi, pkt, &[]);
+            r.eax = lo(v, (v != 0) as u32);
+            return;
+        }
+        let rec = call_regs(cal(0x0080_4050), e, 0, 0, r.esi, pkt, &[]);
+        if rec == 0 {
+            br(id, 3);
+            r.eax = 0;
+            return;
+        }
+        br(id, 4);
+        let rp = rec as usize;
+        wd(rp + 4, l1);
+        ww(rp + 2, rw(p));
+        wd(rp + 8, rd(p + 4));
+        wb(rp, rb(p + 0x208));
+        wb(rp + 0x67C, 0);
+        type_list_append(rec, rd(p + 4));
+        let obj = call_regs(cal(0x0092_5030), 0, l1, 0, rec, pkt, &[]);
+        if obj != 0 {
+            wd(obj as usize + 0xB0, rec);
+        }
+        call_regs(cal(0x0080_7A20), rw(rp + 2) as u32, l1, 0, rec, pkt, &[rec]);
+        if rb(SNAP_FLAG) != 0 {
+            call_regs(cal(0x007F_FAC0), obj, rw(p) as u32, 0, rec, pkt, &[rw(p) as u32]);
+        }
+        let vt = rd(mgr as usize);
+        let f2 = rd(vt as usize + 4);
+        call_regs(f2 as usize, l1, mgr, f2, rec, pkt, &[l1]);
+        let e = call_regs(cal(0x0080_3FA0), f2, rec, vt, rec, pkt, &[]);
+        r.eax = lo(e, 1);
+    }
+}
+port_thunk!(register_from_create_thunk, register_from_create_entry, REGISTER_FROM_CREATE, h_register_from_create);
+
+// --- 0x815930 net_send_join_req (stack: connection to the host, requester object, session-like object; `ret`) --------------------
+// Packet 0x02 {string 0x212AA48 + NUL, u32 0xC9, u32 [0xE8C3E8], <0x7FB3D0 record of the local player (ESI = player + 0x28)>,
+// u64 [player + 0x14C], u64 [+0x154], u32 [+0x170], <requester's vtable +0x28 (&buffer, &cursor)>, u8 [requester + 0xC + 0x48],
+// wide string [player + 0x4C] with its NUL, u8 [player + 0x44], u8 [player + 0x45], then either one byte 0 or (when the third
+// argument is set, [0x2528B56] is clear or [0x2528B2B] is set, and its byte +0x3F8 is set) a byte [arg + 0x30] - 1 followed by 20 bytes
+// (u64, u64, u32 at +0x14C, +0x154, +0x170) for each state-0 connection of its list (+0x400)}; the length word at buffer + 1 is the
+// size - 3 and the packet goes to the host with 0x814670 (ESI = host). EAX = the send's.
+// Branches: 1 = no third argument or gated off (a byte 0 is appended); 2 = the connection list was walked; 3 = a list entry
+// contributed its 20 bytes.
+unsafe fn h_send_join_req(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        enter(id);
+        let (host, req, third) = (*a, *a.add(1), *a.add(2));
+        let mut buf = [0u8; 0x520];
+        buf[0] = 2;
+        let mut cur: u32 = if rb(0x00E8_BF4C) == 0 { 3 } else { 4 };
+        let s0 = 0x0212_AA48usize;
+        let mut n = 0usize;
+        while rb(s0 + n) != 0 {
+            n += 1;
+        }
+        let n16 = n as u16 as u32;
+        let hdr = cur;
+        std::ptr::copy_nonoverlapping(s0 as *const u8, buf.as_mut_ptr().add((hdr as u16) as usize), n16 as usize);
+        cur += n16;
+        let player = rd(req as usize + 0x408);
+        buf[(cur as u16) as usize] = 0;
+        cur += 1;
+        buf[(cur as u16) as usize..][..4].copy_from_slice(&0xC9u32.to_le_bytes());
+        cur += 4;
+        buf[(cur as u16) as usize..][..4].copy_from_slice(&rd(0x00E8_C3E8).to_le_bytes());
+        cur += 4;
+        let bp = buf.as_mut_ptr() as u32;
+        let cp = &mut cur as *mut u32 as u32;
+        call_regs(cal(0x007F_B3D0), cp, bp, 0, player + 0x28, player, &[]);
+        cur = std::ptr::read_volatile(&cur);
+        let put8 = |buf: &mut [u8; 0x520], cur: &mut u32, p: usize| {
+            buf[(*cur as u16) as usize..][..4].copy_from_slice(&rd(p).to_le_bytes());
+            buf[((*cur as u16) as usize) + 4..][..4].copy_from_slice(&rd(p + 4).to_le_bytes());
+            *cur += 8;
+        };
+        put8(&mut buf, &mut cur, player as usize + 0x14C);
+        put8(&mut buf, &mut cur, player as usize + 0x154);
+        buf[(cur as u16) as usize..][..4].copy_from_slice(&rd(player as usize + 0x170).to_le_bytes());
+        cur += 4;
+        let obj = rd(req as usize + 0xC);
+        let vt = rd(obj as usize);
+        let f = rd(vt as usize + 0x28);
+        call_regs(f as usize, vt, obj, f, rd(player as usize + 0x158), player, &[bp, cp]);
+        cur = std::ptr::read_volatile(&cur);
+        buf[(cur as u16) as usize] = rb(rd(req as usize + 0xC) as usize + 0x48);
+        cur += 1;
+        let ws = player as usize + 0x4C;
+        let mut wn = 0usize;
+        while rw(ws + wn * 2) != 0 {
+            wn += 1;
+        }
+        let wl = ((wn * 2 + 2) as u16) as u32;
+        std::ptr::copy_nonoverlapping(ws as *const u8, buf.as_mut_ptr().add((cur as u16) as usize), wl as usize);
+        cur += wl;
+        buf[(cur as u16) as usize] = rb(player as usize + 0x44);
+        cur += 1;
+        buf[(cur as u16) as usize] = rb(player as usize + 0x45);
+        cur += 1;
+        let gated = third != 0 && (rb(0x0252_8B56) == 0 || rb(0x0252_8B2B) != 0) && rb(third as usize + 0x3F8) != 0;
+        if !gated {
+            br(id, 1);
+            buf[(cur as u16) as usize] = 0;
+            cur += 1;
+        } else {
+            br(id, 2);
+            buf[(cur as u16) as usize] = rb(third as usize + 0x30).wrapping_sub(1);
+            cur += 1;
+            let head = rd(third as usize + 0x400);
+            if head != 0 {
+                let mut c = head;
+                loop {
+                    let cp2 = c as usize;
+                    if rb(cp2) == 0 {
+                        br(id, 3);
+                        put8(&mut buf, &mut cur, cp2 + 0x14C);
+                        put8(&mut buf, &mut cur, cp2 + 0x154);
+                        buf[(cur as u16) as usize..][..4].copy_from_slice(&rd(cp2 + 0x170).to_le_bytes());
+                        cur += 4;
+                    }
+                    c = rd(cp2 + 0x22CC);
+                    if c == head || c == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+        buf[1..3].copy_from_slice(&(cur.wrapping_sub(3) as u16).to_le_bytes());
+        r.eax = call_regs(cal(0x0081_4670), 0, 0, 0, host, player, &[bp, (cur as u16) as u32, 0, 0]);
+    }
+}
+port_thunk!(send_join_req_thunk, send_join_req_entry, SEND_JOIN_REQ, h_send_join_req);
+
+fn install3() -> usize {
+    let list: [(usize, &[u8], extern "C" fn()); COUNT3] = [
+        (DISPATCH_ACTION, &B_DISPATCH_ACTION, dispatch_action_thunk),
+        (ADD_FIELD, &B_ADD_FIELD, add_field_thunk),
+        (REGS_RESET, &B_REGS_RESET, regs_reset_thunk),
+        (DESTROY_FROM_PACKET, &B_DESTROY_FROM_PACKET, destroy_from_packet_thunk),
+        (SEND_NEW_OWNER, &B_SEND_NEW_OWNER, send_new_owner_thunk),
+        (OBJ_UNREGISTER, &B_OBJ_UNREGISTER, obj_unregister_thunk),
+        (DEACTIVATE_SEND, &B_DEACTIVATE_SEND, deactivate_send_thunk),
+        (REGISTER_LOCAL, &B_REGISTER_LOCAL, register_local_thunk),
+        (REGISTER_FROM_CREATE, &B_REGISTER_FROM_CREATE, register_from_create_thunk),
+        (SEND_JOIN_REQ, &B_SEND_JOIN_REQ, send_join_req_thunk),
+    ];
+    let mut ok = 0;
+    for &(id, body, thunk) in &list {
+        if replace_pinned(P3S[id].name, P3S[id].addr, body, thunk as usize) {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+fn summary3() -> Vec<String> {
+    P3S.iter()
+        .filter_map(|p| {
+            let c = p.calls.load(Ordering::Relaxed);
+            (c > 0).then(|| {
+                let b: Vec<String> = p.br.iter().enumerate().filter_map(|(i, x)| {
+                    let v = x.load(Ordering::Relaxed);
+                    (v > 0).then(|| format!("b{i}={v}"))
+                }).collect();
+                format!("{} {c} [{}]", p.name, b.join(" "))
+            })
+        })
+        .collect()
+}
+
+
 // --- install ------------------------------------------------------------------------------------------------------------------
 
 /// Re-aim the rel32 of the `call` / `jmp` at `off` in a relocated copy.
@@ -3777,7 +4688,8 @@ pub fn install() {
             ok += 1;
         }
     }
-    log(&format!("port_net: replaced {ok}/{COUNT} with Rust"));
+    let ok3 = install3();
+    log(&format!("port_net: replaced {}/{} with Rust", ok + ok3, COUNT + COUNT3));
 }
 
 /// One line for the periodic log.
@@ -3789,6 +4701,8 @@ pub fn summary() -> String {
             (c > 0).then(|| format!("{} {c} ({})", p.name, p.mismatches.load(Ordering::Relaxed)))
         })
         .collect();
+    let mut parts = parts;
+    parts.extend(summary3());
     if parts.is_empty() { String::new() } else { format!("port_net: {}", parts.join(", ")) }
 }
 
@@ -4804,6 +5718,232 @@ const B_REQUEST_OWNERSHIP: [u8; 328] = [
 ];
 const B_REQUEST_OWNERSHIP_CALLS: [usize; 5] = [0x68, 0x87, 0xee, 0xf5, 0x13c];
 
+// --- original bodies, round 3 (tools/body_bytes.py) ---------------------------------------------------------------------------
+
+const B_DISPATCH_ACTION: [u8; 104] = [
+    0x3D, 0xFF, 0x00, 0x00, 0x00, 0x74, 0x42, 0x83, 0xF8, 0x05, 0x77, 0x3D, 0xFF, 0x24, 0x85, 0xC0,
+    0xED, 0x80, 0x00, 0x8B, 0x06, 0x8B, 0x50, 0x0C, 0x8B, 0xCE, 0xFF, 0xD2, 0xC6, 0x86, 0x00, 0x0C,
+    0x00, 0x00, 0x01, 0xC3, 0x8B, 0x06, 0x8B, 0x50, 0x10, 0x8B, 0xCE, 0xFF, 0xD2, 0xC6, 0x86, 0x00,
+    0x0C, 0x00, 0x00, 0x01, 0xC3, 0x8B, 0x06, 0x8B, 0x50, 0x14, 0x8B, 0xCE, 0xFF, 0xD2, 0xC6, 0x86,
+    0x00, 0x0C, 0x00, 0x00, 0x01, 0xC3, 0x33, 0xC0, 0xC3, 0xB8, 0x02, 0x00, 0x00, 0x00, 0xC3, 0x90,
+    0xB6, 0xED, 0x80, 0x00, 0x83, 0xED, 0x80, 0x00, 0x94, 0xED, 0x80, 0x00, 0xB6, 0xED, 0x80, 0x00,
+    0xA5, 0xED, 0x80, 0x00, 0xB6, 0xED, 0x80, 0x00,
+];
+const B_ADD_FIELD: [u8; 145] = [
+    0x8B, 0x42, 0x18, 0x83, 0xF8, 0x10, 0x72, 0x05, 0x33, 0xC0, 0xC2, 0x10, 0x00, 0x8B, 0xC8, 0xC1,
+    0xE1, 0x04, 0x03, 0xC8, 0x56, 0x8D, 0x74, 0x8A, 0x20, 0x33, 0xC9, 0x8D, 0x46, 0x08, 0x89, 0x48,
+    0x10, 0x89, 0x48, 0x08, 0x66, 0x89, 0x48, 0x0C, 0x89, 0x48, 0x04, 0xC7, 0x00, 0xFF, 0xFF, 0xFF,
+    0xFF, 0x8B, 0x4A, 0x18, 0x89, 0x08, 0x8B, 0x4C, 0x24, 0x14, 0x89, 0x4E, 0x3C, 0x83, 0x42, 0x18,
+    0x01, 0x8B, 0x4A, 0x1C, 0x57, 0x8B, 0x7A, 0x18, 0xD3, 0xEF, 0x85, 0xFF, 0x76, 0x12, 0x8B, 0xFF,
+    0x83, 0x42, 0x1C, 0x01, 0x8B, 0x7A, 0x18, 0x8B, 0x4A, 0x1C, 0xD3, 0xEF, 0x85, 0xFF, 0x77, 0xF0,
+    0x8B, 0x4A, 0x1C, 0xBF, 0x01, 0x00, 0x00, 0x00, 0xD3, 0xE7, 0x83, 0xEF, 0x01, 0x39, 0x38, 0x75,
+    0x07, 0x5F, 0x33, 0xC0, 0x5E, 0xC2, 0x10, 0x00, 0x8B, 0x54, 0x24, 0x0C, 0x8B, 0x4C, 0x24, 0x10,
+    0x89, 0x16, 0x8B, 0x54, 0x24, 0x14, 0x5F, 0x89, 0x4E, 0x04, 0x89, 0x56, 0x40, 0x5E, 0xC2, 0x10,
+    0x00,
+];
+const B_REGS_RESET: [u8; 198] = [
+    0x53, 0x56, 0x8B, 0x35, 0xAC, 0xE2, 0x12, 0x02, 0x57, 0x33, 0xDB, 0xEB, 0x03, 0x8D, 0x49, 0x00,
+    0x3B, 0xF3, 0x74, 0x1D, 0x8B, 0x86, 0x6C, 0x06, 0x00, 0x00, 0x8B, 0xF8, 0x2B, 0x3D, 0xAC, 0xE2,
+    0x12, 0x02, 0xF7, 0xDF, 0x1B, 0xFF, 0x23, 0xF8, 0xE8, 0xE3, 0xD2, 0xFF, 0xFF, 0x8B, 0xF7, 0xEB,
+    0xDF, 0x5F, 0x5E, 0x89, 0x1D, 0xAC, 0xE2, 0x12, 0x02, 0x89, 0x1D, 0x18, 0xB5, 0x12, 0x02, 0x89,
+    0x1D, 0x84, 0xE2, 0x12, 0x02, 0x89, 0x1D, 0xF0, 0xB4, 0x12, 0x02, 0x89, 0x1D, 0x88, 0xE2, 0x12,
+    0x02, 0x89, 0x1D, 0xF4, 0xB4, 0x12, 0x02, 0x89, 0x1D, 0x8C, 0xE2, 0x12, 0x02, 0x89, 0x1D, 0xF8,
+    0xB4, 0x12, 0x02, 0x89, 0x1D, 0x90, 0xE2, 0x12, 0x02, 0x89, 0x1D, 0xFC, 0xB4, 0x12, 0x02, 0x89,
+    0x1D, 0x94, 0xE2, 0x12, 0x02, 0x89, 0x1D, 0x00, 0xB5, 0x12, 0x02, 0x89, 0x1D, 0x98, 0xE2, 0x12,
+    0x02, 0x89, 0x1D, 0x04, 0xB5, 0x12, 0x02, 0x89, 0x1D, 0x9C, 0xE2, 0x12, 0x02, 0x89, 0x1D, 0x08,
+    0xB5, 0x12, 0x02, 0x89, 0x1D, 0xA0, 0xE2, 0x12, 0x02, 0x89, 0x1D, 0x0C, 0xB5, 0x12, 0x02, 0x89,
+    0x1D, 0xA4, 0xE2, 0x12, 0x02, 0x89, 0x1D, 0x10, 0xB5, 0x12, 0x02, 0x89, 0x1D, 0xA8, 0xE2, 0x12,
+    0x02, 0x89, 0x1D, 0x14, 0xB5, 0x12, 0x02, 0x89, 0x1D, 0x34, 0xBA, 0x12, 0x02, 0xC6, 0x05, 0x0A,
+    0x86, 0xE8, 0x00, 0x01, 0x5B, 0xC3,
+];
+const B_DESTROY_FROM_PACKET: [u8; 156] = [
+    0x53, 0x8B, 0x5C, 0x24, 0x08, 0x8B, 0x03, 0x85, 0xC0, 0x0F, 0x8C, 0x89, 0x00, 0x00, 0x00, 0x83,
+    0xF8, 0x0A, 0x0F, 0x8F, 0x80, 0x00, 0x00, 0x00, 0x83, 0x3C, 0x85, 0x5C, 0xE2, 0x12, 0x02, 0x00,
+    0x74, 0x76, 0x0F, 0xB7, 0x43, 0x04, 0x56, 0x8B, 0x35, 0x58, 0xE2, 0x12, 0x02, 0x57, 0x8D, 0x7B,
+    0x04, 0x0F, 0xB7, 0xC0, 0x6A, 0x00, 0x50, 0xE8, 0xA4, 0x48, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x06,
+    0x8B, 0x30, 0x85, 0xF6, 0x75, 0x10, 0x8B, 0xCF, 0xE8, 0x33, 0x28, 0x03, 0x00, 0x5F, 0x3C, 0x01,
+    0x5E, 0x0F, 0x94, 0xC0, 0x5B, 0xC3, 0x8B, 0x56, 0x04, 0x66, 0x8B, 0x4E, 0x02, 0x6A, 0x00, 0xE8,
+    0x0C, 0xFF, 0xFF, 0xFF, 0x8B, 0x4E, 0x08, 0x8B, 0x0C, 0x8D, 0x5C, 0xE2, 0x12, 0x02, 0x83, 0xC4,
+    0x04, 0x83, 0xC3, 0x06, 0x53, 0x8D, 0x44, 0x24, 0x14, 0xC7, 0x44, 0x24, 0x14, 0x00, 0x00, 0x00,
+    0x00, 0x8B, 0x11, 0x8B, 0x52, 0x18, 0x50, 0x8B, 0x46, 0x04, 0x50, 0xFF, 0xD2, 0xE8, 0x5E, 0xFB,
+    0xFF, 0xFF, 0x5F, 0x5E, 0xB0, 0x01, 0x5B, 0xC3, 0xB0, 0x01, 0x5B, 0xC3,
+];
+const B_SEND_NEW_OWNER: [u8; 301] = [
+    0x8B, 0x44, 0x24, 0x04, 0x0F, 0xB7, 0x00, 0x53, 0x55, 0x56, 0x8B, 0x35, 0x58, 0xE2, 0x12, 0x02,
+    0x57, 0x0F, 0xB7, 0xC8, 0x6A, 0x00, 0x51, 0xE8, 0x44, 0x26, 0x00, 0x00, 0x85, 0xC0, 0x0F, 0x84,
+    0x02, 0x01, 0x00, 0x00, 0x8B, 0x38, 0x85, 0xFF, 0x0F, 0x84, 0xF8, 0x00, 0x00, 0x00, 0x8B, 0x1D,
+    0x14, 0x8C, 0x52, 0x02, 0x85, 0xDB, 0x0F, 0x84, 0xEA, 0x00, 0x00, 0x00, 0x8B, 0x54, 0x24, 0x14,
+    0x8A, 0x52, 0x02, 0x8B, 0xAB, 0x08, 0x04, 0x00, 0x00, 0x8B, 0xC3, 0xE8, 0x60, 0x96, 0x00, 0x00,
+    0x8B, 0xF0, 0x85, 0xF6, 0x75, 0x61, 0x8B, 0x44, 0x24, 0x14, 0x80, 0x78, 0x03, 0x00, 0x74, 0x14,
+    0x8B, 0x8D, 0xAC, 0x01, 0x00, 0x00, 0x3B, 0xA9, 0x04, 0x04, 0x00, 0x00, 0x74, 0x29, 0x8B, 0xB3,
+    0x04, 0x04, 0x00, 0x00, 0x85, 0xF6, 0x75, 0x3F, 0x83, 0xC0, 0x04, 0x50, 0x8D, 0x4C, 0x24, 0x18,
+    0xC7, 0x44, 0x24, 0x18, 0x06, 0x00, 0x00, 0x00, 0xE8, 0xB3, 0xDE, 0xFF, 0xFF, 0x83, 0xC4, 0x04,
+    0xB0, 0x01, 0x5F, 0x5E, 0x5D, 0x5B, 0xC3, 0x8B, 0x9B, 0x00, 0x04, 0x00, 0x00, 0x8B, 0xF3, 0x85,
+    0xF6, 0x74, 0xD5, 0x3B, 0xF5, 0x75, 0xCD, 0x8B, 0xB6, 0xCC, 0x22, 0x00, 0x00, 0x3B, 0xF3, 0x74,
+    0xC7, 0x85, 0xF6, 0x75, 0xEE, 0xEB, 0xC1, 0x8B, 0x47, 0x04, 0x85, 0xC0, 0x74, 0x1E, 0x8B, 0xD0,
+    0x81, 0xE2, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE2, 0x04, 0x8B, 0x8A, 0x64, 0x9C, 0x14, 0x02, 0x85,
+    0xC9, 0x74, 0x09, 0x39, 0x41, 0x44, 0x75, 0x04, 0x8B, 0xC1, 0xEB, 0x02, 0x33, 0xC0, 0xE8, 0x9D,
+    0x04, 0x00, 0x00, 0x84, 0xC0, 0x75, 0x05, 0x5F, 0x5E, 0x5D, 0x5B, 0xC3, 0x8A, 0x86, 0xB0, 0x01,
+    0x00, 0x00, 0x88, 0x07, 0x8B, 0x44, 0x24, 0x14, 0x0F, 0xB7, 0x88, 0x04, 0x02, 0x00, 0x00, 0x6A,
+    0x00, 0x6A, 0x00, 0x51, 0x83, 0xC0, 0x04, 0x50, 0xE8, 0x93, 0xDD, 0x00, 0x00, 0x8B, 0x57, 0x08,
+    0x8B, 0x0C, 0x95, 0x5C, 0xE2, 0x12, 0x02, 0x8B, 0x01, 0x8B, 0x57, 0x04, 0x8B, 0x40, 0x50, 0x83,
+    0xC4, 0x10, 0x56, 0x52, 0xFF, 0xD0, 0x5F, 0x5E, 0x5D, 0xB0, 0x01, 0x5B, 0xC3,
+];
+const B_OBJ_UNREGISTER: [u8; 399] = [
+    0x51, 0x53, 0x33, 0xDB, 0x3B, 0xF3, 0x57, 0x0F, 0x84, 0x7E, 0x01, 0x00, 0x00, 0x8B, 0x46, 0x08,
+    0x3B, 0xC3, 0x0F, 0x8C, 0x73, 0x01, 0x00, 0x00, 0x83, 0xF8, 0x0A, 0x0F, 0x8D, 0x6A, 0x01, 0x00,
+    0x00, 0x39, 0x34, 0x85, 0x84, 0xE2, 0x12, 0x02, 0x75, 0x26, 0x8B, 0x8E, 0x74, 0x06, 0x00, 0x00,
+    0x3B, 0xCE, 0x75, 0x15, 0x89, 0x9E, 0x74, 0x06, 0x00, 0x00, 0x89, 0x9E, 0x78, 0x06, 0x00, 0x00,
+    0x89, 0x1C, 0x85, 0x84, 0xE2, 0x12, 0x02, 0xEB, 0x37, 0x89, 0x0C, 0x85, 0x84, 0xE2, 0x12, 0x02,
+    0x8B, 0x86, 0x78, 0x06, 0x00, 0x00, 0x8B, 0x8E, 0x74, 0x06, 0x00, 0x00, 0x89, 0x88, 0x74, 0x06,
+    0x00, 0x00, 0x8B, 0x96, 0x74, 0x06, 0x00, 0x00, 0x8B, 0x86, 0x78, 0x06, 0x00, 0x00, 0x89, 0x82,
+    0x78, 0x06, 0x00, 0x00, 0x89, 0x9E, 0x74, 0x06, 0x00, 0x00, 0x89, 0x9E, 0x78, 0x06, 0x00, 0x00,
+    0x38, 0x1D, 0xB6, 0xE9, 0x44, 0x01, 0x74, 0x09, 0x66, 0x8B, 0x46, 0x02, 0xE8, 0x9F, 0xB9, 0xFF,
+    0xFF, 0x8B, 0x46, 0x04, 0x3B, 0xC3, 0x74, 0x3C, 0x8B, 0xC8, 0x81, 0xE1, 0xFF, 0x0F, 0x00, 0x00,
+    0xC1, 0xE1, 0x04, 0x8B, 0xB9, 0x64, 0x9C, 0x14, 0x02, 0x3B, 0xFB, 0x74, 0x27, 0x39, 0x47, 0x44,
+    0x75, 0x22, 0x8B, 0x56, 0x08, 0x8B, 0x0C, 0x95, 0x5C, 0xE2, 0x12, 0x02, 0x8B, 0x11, 0x50, 0x8B,
+    0x42, 0x10, 0xFF, 0xD0, 0x81, 0xA7, 0x80, 0x00, 0x00, 0x00, 0x7F, 0xFF, 0xFF, 0xFF, 0x89, 0x9F,
+    0xB0, 0x00, 0x00, 0x00, 0x0F, 0xB7, 0x46, 0x02, 0xE8, 0x83, 0x38, 0x00, 0x00, 0x39, 0x35, 0xAC,
+    0xE2, 0x12, 0x02, 0x75, 0x17, 0x8B, 0x86, 0x6C, 0x06, 0x00, 0x00, 0x3B, 0xC6, 0x75, 0x08, 0x89,
+    0x1D, 0xAC, 0xE2, 0x12, 0x02, 0xEB, 0x31, 0xA3, 0xAC, 0xE2, 0x12, 0x02, 0x8B, 0x86, 0x70, 0x06,
+    0x00, 0x00, 0x3B, 0xC3, 0x74, 0x0C, 0x8B, 0x8E, 0x6C, 0x06, 0x00, 0x00, 0x89, 0x88, 0x6C, 0x06,
+    0x00, 0x00, 0x8B, 0x86, 0x6C, 0x06, 0x00, 0x00, 0x3B, 0xC3, 0x74, 0x0C, 0x8B, 0x96, 0x70, 0x06,
+    0x00, 0x00, 0x89, 0x90, 0x70, 0x06, 0x00, 0x00, 0xA1, 0x54, 0xC2, 0x12, 0x02, 0x3B, 0xC3, 0x89,
+    0x9E, 0x70, 0x06, 0x00, 0x00, 0x89, 0x9E, 0x6C, 0x06, 0x00, 0x00, 0x75, 0x1D, 0x83, 0x2D, 0x34,
+    0xBA, 0x12, 0x02, 0x01, 0x89, 0xB6, 0x6C, 0x06, 0x00, 0x00, 0x89, 0xB6, 0x70, 0x06, 0x00, 0x00,
+    0x89, 0x35, 0x54, 0xC2, 0x12, 0x02, 0x5F, 0x5B, 0x59, 0xC3, 0x8B, 0x88, 0x70, 0x06, 0x00, 0x00,
+    0x83, 0x2D, 0x34, 0xBA, 0x12, 0x02, 0x01, 0x89, 0xB1, 0x6C, 0x06, 0x00, 0x00, 0x8B, 0x90, 0x70,
+    0x06, 0x00, 0x00, 0x89, 0x96, 0x70, 0x06, 0x00, 0x00, 0x89, 0xB0, 0x70, 0x06, 0x00, 0x00, 0x89,
+    0x86, 0x6C, 0x06, 0x00, 0x00, 0x89, 0x35, 0x54, 0xC2, 0x12, 0x02, 0x5F, 0x5B, 0x59, 0xC3,
+];
+const B_DEACTIVATE_SEND: [u8; 345] = [
+    0x81, 0xEC, 0x1C, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x18, 0x05, 0x00, 0x00, 0x85, 0xC9, 0x0F, 0x84, 0x28, 0x01, 0x00, 0x00, 0x8B, 0xC1, 0x25, 0xFF,
+    0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x0F, 0x84,
+    0x10, 0x01, 0x00, 0x00, 0x39, 0x48, 0x44, 0x0F, 0x85, 0x07, 0x01, 0x00, 0x00, 0x53, 0x8B, 0x98,
+    0xB0, 0x00, 0x00, 0x00, 0x85, 0xDB, 0x0F, 0x84, 0xF7, 0x00, 0x00, 0x00, 0x8B, 0x0D, 0x14, 0x8C,
+    0x52, 0x02, 0x85, 0xC9, 0x55, 0x8B, 0xE9, 0x0F, 0x84, 0xE5, 0x00, 0x00, 0x00, 0x8B, 0x91, 0x08,
+    0x04, 0x00, 0x00, 0x8A, 0x03, 0x3A, 0x82, 0xB0, 0x01, 0x00, 0x00, 0x0F, 0x85, 0xD1, 0x00, 0x00,
+    0x00, 0x80, 0x3D, 0x84, 0xC0, 0xE8, 0x00, 0x00, 0x8B, 0x53, 0x08, 0x56, 0x8B, 0x34, 0x95, 0x5C,
+    0xE2, 0x12, 0x02, 0xC6, 0x44, 0x24, 0x10, 0x0F, 0xB8, 0x03, 0x00, 0x00, 0x00, 0x74, 0x05, 0xB8,
+    0x04, 0x00, 0x00, 0x00, 0x8B, 0x49, 0x08, 0x0F, 0xB7, 0xD0, 0x89, 0x4C, 0x14, 0x10, 0x83, 0xC0,
+    0x04, 0x89, 0x44, 0x24, 0x0C, 0x8A, 0x53, 0x08, 0x0F, 0xB7, 0xC8, 0x88, 0x54, 0x0C, 0x10, 0x83,
+    0xC0, 0x01, 0x89, 0x44, 0x24, 0x0C, 0x66, 0x8B, 0x53, 0x02, 0x0F, 0xB7, 0xC8, 0x66, 0x89, 0x54,
+    0x0C, 0x10, 0x83, 0xC0, 0x02, 0x8D, 0x4C, 0x24, 0x0C, 0x51, 0x89, 0x44, 0x24, 0x10, 0x8B, 0x4B,
+    0x04, 0x8B, 0x06, 0x8D, 0x54, 0x24, 0x14, 0x52, 0x8B, 0x50, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0xD2,
+    0x8B, 0x44, 0x24, 0x0C, 0x8B, 0xB5, 0x00, 0x04, 0x00, 0x00, 0x83, 0xC0, 0xFD, 0x85, 0xF6, 0x66,
+    0x89, 0x44, 0x24, 0x11, 0x74, 0x44, 0x57, 0x83, 0x7E, 0x3C, 0x07, 0x7E, 0x2A, 0x80, 0x3E, 0x00,
+    0x75, 0x25, 0x8B, 0x7B, 0x04, 0x8B, 0xC6, 0xE8, 0xA4, 0xF4, 0xFF, 0xFF, 0x84, 0xC0, 0x75, 0x17,
+    0x0F, 0xB7, 0x4C, 0x24, 0x10, 0x6A, 0x00, 0x6A, 0x00, 0x51, 0x8D, 0x54, 0x24, 0x20, 0x52, 0xE8,
+    0x9C, 0xF1, 0x00, 0x00, 0x83, 0xC4, 0x10, 0x8B, 0xB6, 0xCC, 0x22, 0x00, 0x00, 0x3B, 0xB5, 0x00,
+    0x04, 0x00, 0x00, 0x74, 0x04, 0x85, 0xF6, 0x75, 0xBE, 0x5F, 0x8B, 0xF3, 0xE8, 0x4F, 0xEC, 0xFF,
+    0xFF, 0x5E, 0x5D, 0x5B, 0x8B, 0x8C, 0x24, 0x18, 0x05, 0x00, 0x00, 0x33, 0xCC, 0xE8, 0x4D, 0x0B,
+    0x49, 0x00, 0x81, 0xC4, 0x1C, 0x05, 0x00, 0x00, 0xC3,
+];
+const B_REGISTER_LOCAL: [u8; 489] = [
+    0x83, 0xEC, 0x08, 0x85, 0xFF, 0x53, 0x8B, 0x5C, 0x24, 0x10, 0x74, 0x26, 0x8B, 0xC7, 0x25, 0xFF,
+    0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x74, 0x12,
+    0x39, 0x78, 0x44, 0x75, 0x0D, 0x83, 0xB8, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x85, 0xB2, 0x01,
+    0x00, 0x00, 0x83, 0xFB, 0x06, 0x74, 0x0D, 0x83, 0x3D, 0xB4, 0x8B, 0x52, 0x02, 0x00, 0x0F, 0x8F,
+    0xA0, 0x01, 0x00, 0x00, 0xA1, 0x14, 0x8C, 0x52, 0x02, 0x85, 0xC0, 0x89, 0x44, 0x24, 0x08, 0x0F,
+    0x84, 0x8F, 0x01, 0x00, 0x00, 0x85, 0xFF, 0x8B, 0x88, 0x08, 0x04, 0x00, 0x00, 0x55, 0x89, 0x4C,
+    0x24, 0x08, 0x74, 0x1E, 0x8B, 0xD7, 0x81, 0xE2, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE2, 0x04, 0x8B,
+    0x82, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x74, 0x09, 0x39, 0x78, 0x44, 0x75, 0x04, 0x8B, 0xE8,
+    0xEB, 0x02, 0x33, 0xED, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x13, 0x83, 0x78, 0x3C,
+    0x01, 0x75, 0x0D, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x01, 0x8B, 0x50, 0x04, 0xFF, 0xD2,
+    0x85, 0xED, 0x0F, 0x84, 0x3B, 0x01, 0x00, 0x00, 0xF6, 0x85, 0x80, 0x00, 0x00, 0x00, 0x01, 0x0F,
+    0x85, 0x2E, 0x01, 0x00, 0x00, 0x56, 0xE8, 0x95, 0xEF, 0xFF, 0xFF, 0x8B, 0xF0, 0x85, 0xF6, 0x0F,
+    0x84, 0x1D, 0x01, 0x00, 0x00, 0x0F, 0xB7, 0xC7, 0x56, 0x66, 0x89, 0x7E, 0x02, 0xE8, 0x4E, 0x29,
+    0x00, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0x89, 0x7E, 0x04, 0x89, 0x5E, 0x08, 0x8A, 0x88, 0xB0, 0x01,
+    0x00, 0x00, 0x88, 0x0E, 0xC6, 0x86, 0x7C, 0x06, 0x00, 0x00, 0x00, 0x8B, 0x04, 0x9D, 0x84, 0xE2,
+    0x12, 0x02, 0x85, 0xC0, 0x75, 0x0E, 0x89, 0xB6, 0x74, 0x06, 0x00, 0x00, 0x89, 0xB6, 0x78, 0x06,
+    0x00, 0x00, 0xEB, 0x39, 0x8B, 0x90, 0x78, 0x06, 0x00, 0x00, 0x89, 0xB2, 0x74, 0x06, 0x00, 0x00,
+    0x8B, 0x04, 0x9D, 0x84, 0xE2, 0x12, 0x02, 0x8B, 0x88, 0x78, 0x06, 0x00, 0x00, 0x89, 0x8E, 0x78,
+    0x06, 0x00, 0x00, 0x8B, 0x14, 0x9D, 0x84, 0xE2, 0x12, 0x02, 0x89, 0xB2, 0x78, 0x06, 0x00, 0x00,
+    0x8B, 0x04, 0x9D, 0x84, 0xE2, 0x12, 0x02, 0x89, 0x86, 0x74, 0x06, 0x00, 0x00, 0x89, 0x34, 0x9D,
+    0x84, 0xE2, 0x12, 0x02, 0x89, 0xB5, 0xB0, 0x00, 0x00, 0x00, 0x8B, 0x0C, 0x9D, 0x5C, 0xE2, 0x12,
+    0x02, 0x8B, 0x11, 0x8B, 0x42, 0x04, 0x57, 0xFF, 0xD0, 0x8B, 0x54, 0x24, 0x10, 0x66, 0xC7, 0x86,
+    0x7E, 0x06, 0x00, 0x00, 0xFF, 0xFF, 0x8B, 0x82, 0x00, 0x04, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x4B,
+    0xBB, 0x07, 0x00, 0x00, 0x00, 0x39, 0x58, 0x3C, 0x7E, 0x2F, 0x80, 0x38, 0x00, 0x75, 0x2A, 0x8B,
+    0x88, 0xF0, 0x21, 0x00, 0x00, 0x89, 0xBC, 0x88, 0xF0, 0x1D, 0x00, 0x00, 0x8A, 0x88, 0xB0, 0x01,
+    0x00, 0x00, 0x83, 0x80, 0xF0, 0x21, 0x00, 0x00, 0x01, 0xBD, 0x01, 0x00, 0x00, 0x00, 0xD3, 0xE5,
+    0xF7, 0xD5, 0x66, 0x21, 0xAE, 0x7E, 0x06, 0x00, 0x00, 0x8B, 0x80, 0xCC, 0x22, 0x00, 0x00, 0x3B,
+    0x82, 0x00, 0x04, 0x00, 0x00, 0x74, 0x04, 0x85, 0xC0, 0x75, 0xBA, 0x80, 0x3D, 0xB6, 0xE9, 0x44,
+    0x01, 0x00, 0x74, 0x0D, 0x0F, 0xB7, 0x56, 0x02, 0x52, 0xE8, 0xF2, 0xA8, 0xFF, 0xFF, 0x83, 0xC4,
+    0x04, 0x8B, 0xCF, 0xE8, 0x58, 0xFE, 0x11, 0x00, 0x85, 0xC0, 0x74, 0x06, 0x89, 0xB0, 0xB0, 0x00,
+    0x00, 0x00, 0x5E, 0x5D, 0x5B, 0x83, 0xC4, 0x08, 0xC3,
+];
+const B_REGISTER_FROM_CREATE: [u8; 385] = [
+    0x51, 0x53, 0x55, 0x57, 0x8B, 0x7C, 0x24, 0x14, 0x8B, 0x47, 0x04, 0x33, 0xDB, 0x3B, 0xC3, 0x7C,
+    0x24, 0x83, 0xF8, 0x0A, 0x7D, 0x1F, 0x8B, 0x2C, 0x85, 0x5C, 0xE2, 0x12, 0x02, 0x3B, 0xEB, 0x74,
+    0x14, 0x8A, 0x97, 0x08, 0x02, 0x00, 0x00, 0xA1, 0x14, 0x8C, 0x52, 0x02, 0xE8, 0x2F, 0xBB, 0x00,
+    0x00, 0x3B, 0xC3, 0x75, 0x07, 0x5F, 0x5D, 0xB0, 0x01, 0x5B, 0x59, 0xC3, 0x0F, 0xB7, 0x0F, 0x89,
+    0x5C, 0x24, 0x14, 0x89, 0x5C, 0x24, 0x0C, 0x0F, 0xB6, 0x80, 0xB0, 0x01, 0x00, 0x00, 0x8B, 0x55,
+    0x00, 0x8B, 0x52, 0x0C, 0x50, 0x51, 0x8D, 0x47, 0x08, 0x50, 0x8D, 0x4C, 0x24, 0x18, 0x51, 0x8D,
+    0x44, 0x24, 0x24, 0x50, 0x8B, 0xCD, 0xC6, 0x05, 0x9D, 0x8B, 0x52, 0x02, 0x01, 0xFF, 0xD2, 0x39,
+    0x5C, 0x24, 0x14, 0x88, 0x1D, 0x9D, 0x8B, 0x52, 0x02, 0x75, 0x12, 0x66, 0x8B, 0x07, 0xE8, 0x5D,
+    0x0B, 0x00, 0x00, 0x5F, 0x85, 0xC0, 0x5D, 0x0F, 0x95, 0xC0, 0x5B, 0x59, 0xC3, 0x56, 0xE8, 0x9D,
+    0xFC, 0xFF, 0xFF, 0x8B, 0xF0, 0x3B, 0xF3, 0x75, 0x08, 0x5E, 0x5F, 0x5D, 0x32, 0xC0, 0x5B, 0x59,
+    0xC3, 0x8B, 0x44, 0x24, 0x18, 0x89, 0x46, 0x04, 0x66, 0x8B, 0x0F, 0x66, 0x89, 0x4E, 0x02, 0x8B,
+    0x57, 0x04, 0x89, 0x56, 0x08, 0x8A, 0x87, 0x08, 0x02, 0x00, 0x00, 0x88, 0x06, 0x88, 0x9E, 0x7C,
+    0x06, 0x00, 0x00, 0x8B, 0x4F, 0x04, 0x39, 0x1C, 0x8D, 0x84, 0xE2, 0x12, 0x02, 0x75, 0x0E, 0x89,
+    0xB6, 0x74, 0x06, 0x00, 0x00, 0x89, 0xB6, 0x78, 0x06, 0x00, 0x00, 0xEB, 0x4B, 0x8B, 0xD1, 0x8B,
+    0x04, 0x95, 0x84, 0xE2, 0x12, 0x02, 0x8B, 0x88, 0x78, 0x06, 0x00, 0x00, 0x89, 0xB1, 0x74, 0x06,
+    0x00, 0x00, 0x8B, 0x57, 0x04, 0x8B, 0x04, 0x95, 0x84, 0xE2, 0x12, 0x02, 0x8B, 0x88, 0x78, 0x06,
+    0x00, 0x00, 0x89, 0x8E, 0x78, 0x06, 0x00, 0x00, 0x8B, 0x57, 0x04, 0x8B, 0x04, 0x95, 0x84, 0xE2,
+    0x12, 0x02, 0x89, 0xB0, 0x78, 0x06, 0x00, 0x00, 0x8B, 0x4F, 0x04, 0x8B, 0x14, 0x8D, 0x84, 0xE2,
+    0x12, 0x02, 0x89, 0x96, 0x74, 0x06, 0x00, 0x00, 0x8B, 0x47, 0x04, 0x8B, 0x4C, 0x24, 0x18, 0x89,
+    0x34, 0x85, 0x84, 0xE2, 0x12, 0x02, 0xE8, 0xD5, 0x0B, 0x12, 0x00, 0x3B, 0xC3, 0x74, 0x06, 0x89,
+    0xB0, 0xB0, 0x00, 0x00, 0x00, 0x0F, 0xB7, 0x46, 0x02, 0x56, 0xE8, 0xB1, 0x35, 0x00, 0x00, 0x38,
+    0x1D, 0xB6, 0xE9, 0x44, 0x01, 0x74, 0x0C, 0x0F, 0xB7, 0x0F, 0x51, 0xE8, 0x40, 0xB6, 0xFF, 0xFF,
+    0x83, 0xC4, 0x04, 0x8B, 0x55, 0x00, 0x8B, 0x44, 0x24, 0x18, 0x8B, 0x52, 0x04, 0x50, 0x8B, 0xCD,
+    0xFF, 0xD2, 0x8B, 0xCE, 0xE8, 0x07, 0xFB, 0xFF, 0xFF, 0x5E, 0x5F, 0x5D, 0xB0, 0x01, 0x5B, 0x59,
+    0xC3,
+];
+const B_SEND_JOIN_REQ: [u8; 654] = [
+    0x81, 0xEC, 0x28, 0x05, 0x00, 0x00, 0xA1, 0x50, 0x0B, 0xE8, 0x00, 0x33, 0xC4, 0x89, 0x84, 0x24,
+    0x24, 0x05, 0x00, 0x00, 0x80, 0x3D, 0x4C, 0xBF, 0xE8, 0x00, 0x00, 0x8B, 0x84, 0x24, 0x2C, 0x05,
+    0x00, 0x00, 0x53, 0x8B, 0x9C, 0x24, 0x38, 0x05, 0x00, 0x00, 0x55, 0x8B, 0xAC, 0x24, 0x38, 0x05,
+    0x00, 0x00, 0x56, 0x57, 0x89, 0x44, 0x24, 0x14, 0xC6, 0x44, 0x24, 0x18, 0x02, 0xBE, 0x03, 0x00,
+    0x00, 0x00, 0x74, 0x05, 0xBE, 0x04, 0x00, 0x00, 0x00, 0xB8, 0x48, 0xAA, 0x12, 0x02, 0x8D, 0x48,
+    0x01, 0x8A, 0x10, 0x83, 0xC0, 0x01, 0x84, 0xD2, 0x75, 0xF7, 0x2B, 0xC1, 0x0F, 0xB7, 0xF8, 0x0F,
+    0xB7, 0xCF, 0x0F, 0xB7, 0xD6, 0x51, 0x8D, 0x44, 0x14, 0x1C, 0x68, 0x48, 0xAA, 0x12, 0x02, 0x50,
+    0xE8, 0xAB, 0xAE, 0x48, 0x00, 0x03, 0xF7, 0x8B, 0xBD, 0x08, 0x04, 0x00, 0x00, 0x0F, 0xB7, 0xCE,
+    0x83, 0xC6, 0x01, 0x0F, 0xB7, 0xD6, 0x83, 0xC6, 0x04, 0xC6, 0x44, 0x0C, 0x24, 0x00, 0x8B, 0x0D,
+    0xE8, 0xC3, 0xE8, 0x00, 0x0F, 0xB7, 0xC6, 0x83, 0xC6, 0x04, 0xC7, 0x44, 0x14, 0x24, 0xC9, 0x00,
+    0x00, 0x00, 0x89, 0x4C, 0x04, 0x24, 0x89, 0x74, 0x24, 0x1C, 0x83, 0xC4, 0x0C, 0x8D, 0x77, 0x28,
+    0x8D, 0x44, 0x24, 0x10, 0x8D, 0x4C, 0x24, 0x18, 0xE8, 0xE3, 0x59, 0xFE, 0xFF, 0x8B, 0x97, 0x4C,
+    0x01, 0x00, 0x00, 0x8B, 0x44, 0x24, 0x10, 0x8B, 0xB7, 0x50, 0x01, 0x00, 0x00, 0x0F, 0xB7, 0xC8,
+    0x89, 0x54, 0x0C, 0x18, 0x89, 0x74, 0x0C, 0x1C, 0x83, 0xC0, 0x08, 0x89, 0x44, 0x24, 0x10, 0x8B,
+    0x97, 0x54, 0x01, 0x00, 0x00, 0x8B, 0xB7, 0x58, 0x01, 0x00, 0x00, 0x0F, 0xB7, 0xC8, 0x89, 0x54,
+    0x0C, 0x18, 0x83, 0xC0, 0x08, 0x89, 0x44, 0x24, 0x10, 0x0F, 0xB7, 0xD0, 0x89, 0x74, 0x0C, 0x1C,
+    0x8B, 0x8F, 0x70, 0x01, 0x00, 0x00, 0x83, 0xC0, 0x04, 0x89, 0x44, 0x24, 0x10, 0x89, 0x4C, 0x14,
+    0x18, 0x8B, 0x4D, 0x0C, 0x8B, 0x11, 0x8B, 0x52, 0x28, 0x8D, 0x44, 0x24, 0x10, 0x50, 0x8D, 0x44,
+    0x24, 0x1C, 0x50, 0xFF, 0xD2, 0x8B, 0x74, 0x24, 0x10, 0x8B, 0x45, 0x0C, 0x8A, 0x50, 0x48, 0x0F,
+    0xB7, 0xCE, 0x88, 0x54, 0x0C, 0x18, 0x8D, 0x4F, 0x4C, 0x83, 0xC6, 0x01, 0x8B, 0xC1, 0x89, 0x74,
+    0x24, 0x10, 0x8D, 0x50, 0x02, 0x66, 0x8B, 0x28, 0x83, 0xC0, 0x02, 0x66, 0x85, 0xED, 0x75, 0xF5,
+    0x2B, 0xC2, 0xD1, 0xF8, 0x8D, 0x44, 0x00, 0x02, 0x0F, 0xB7, 0xE8, 0x0F, 0xB7, 0xD5, 0x52, 0x0F,
+    0xB7, 0xC6, 0x51, 0x8D, 0x4C, 0x04, 0x20, 0x51, 0xE8, 0xB3, 0xAD, 0x48, 0x00, 0x03, 0xF5, 0x89,
+    0x74, 0x24, 0x1C, 0x8A, 0x47, 0x44, 0x0F, 0xB7, 0xD6, 0x83, 0xC6, 0x01, 0x0F, 0xB7, 0xCE, 0x88,
+    0x44, 0x14, 0x24, 0x89, 0x74, 0x24, 0x1C, 0x8A, 0x57, 0x45, 0x83, 0xC4, 0x0C, 0x83, 0xC6, 0x01,
+    0x85, 0xDB, 0x88, 0x54, 0x0C, 0x18, 0x0F, 0x84, 0xA9, 0x00, 0x00, 0x00, 0x80, 0x3D, 0x56, 0x8B,
+    0x52, 0x02, 0x00, 0x74, 0x0D, 0x80, 0x3D, 0x2B, 0x8B, 0x52, 0x02, 0x00, 0x0F, 0x84, 0x93, 0x00,
+    0x00, 0x00, 0x80, 0xBB, 0xF8, 0x03, 0x00, 0x00, 0x00, 0x0F, 0x84, 0x86, 0x00, 0x00, 0x00, 0x8A,
+    0x43, 0x30, 0x8B, 0xAB, 0x00, 0x04, 0x00, 0x00, 0x0F, 0xB7, 0xCE, 0x2C, 0x01, 0x88, 0x44, 0x0C,
+    0x18, 0x83, 0xC6, 0x01, 0x8B, 0xC5, 0x85, 0xC0, 0x89, 0x74, 0x24, 0x10, 0x74, 0x76, 0x8B, 0xFF,
+    0x80, 0x38, 0x00, 0x75, 0x50, 0x8B, 0x90, 0x4C, 0x01, 0x00, 0x00, 0x8B, 0xB8, 0x50, 0x01, 0x00,
+    0x00, 0x0F, 0xB7, 0xCE, 0x89, 0x54, 0x0C, 0x18, 0x89, 0x7C, 0x0C, 0x1C, 0x83, 0xC6, 0x08, 0x89,
+    0x74, 0x24, 0x10, 0x8B, 0x90, 0x54, 0x01, 0x00, 0x00, 0x8B, 0xB8, 0x58, 0x01, 0x00, 0x00, 0x0F,
+    0xB7, 0xCE, 0x89, 0x54, 0x0C, 0x18, 0x83, 0xC6, 0x08, 0x89, 0x74, 0x24, 0x10, 0x0F, 0xB7, 0xD6,
+    0x89, 0x7C, 0x0C, 0x1C, 0x8B, 0x88, 0x70, 0x01, 0x00, 0x00, 0x83, 0xC6, 0x04, 0x89, 0x4C, 0x14,
+    0x18, 0x89, 0x74, 0x24, 0x10, 0x8B, 0x80, 0xCC, 0x22, 0x00, 0x00, 0x3B, 0xC5, 0x74, 0x15, 0x85,
+    0xC0, 0x75, 0x9D, 0xEB, 0x0F, 0x0F, 0xB7, 0xD6, 0x83, 0xC6, 0x01, 0xC6, 0x44, 0x14, 0x18, 0x00,
+    0x89, 0x74, 0x24, 0x10, 0x6A, 0x00, 0x0F, 0xB7, 0xCE, 0x6A, 0x00, 0x8D, 0x46, 0xFD, 0x8B, 0x74,
+    0x24, 0x1C, 0x51, 0x8D, 0x54, 0x24, 0x24, 0x52, 0x66, 0x89, 0x44, 0x24, 0x29, 0xE8, 0xCE, 0xEA,
+    0xFF, 0xFF, 0x8B, 0x8C, 0x24, 0x44, 0x05, 0x00, 0x00, 0x83, 0xC4, 0x10, 0x5F, 0x5E, 0x5D, 0x5B,
+    0x33, 0xCC, 0xE8, 0x98, 0x04, 0x48, 0x00, 0x81, 0xC4, 0x28, 0x05, 0x00, 0x00, 0xC3,
+];
+
 // --- differential tests: the Rust bodies against the original machine code, on random data ---------------------------------
 
 #[cfg(test)]
@@ -5245,6 +6385,825 @@ mod tests {
             }
             drop(nodes);
             drop(slots);
+        }
+    }
+}
+
+// --- round 3: the object core against the original bytes, callees stubbed -----------------------------------------------------
+// The whole exe image is mapped at its real addresses, so the original functions run where they are and the Rust ports run
+// beside them. Every callee (and every virtual method of the managers / connections) is replaced by a stub that logs its
+// registers and arguments and returns a deterministic value; the original and the Rust version run on the same memory (a world of
+// sessions, connections, records, objects and managers rebuilt at random for each call) and must produce the same EAX, the same
+// memory and the same call log.
+
+#[cfg(test)]
+mod tests3 {
+    use super::*;
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+
+    const HB: usize = 0x2A0_0000;
+    const WINDOWS: [(usize, usize); 7] = [
+        (0x214_9000, 0x1_1000),
+        (0x212_A000, 0x6000),
+        (0x252_8000, 0x1000),
+        (0x27B_3000, 0x1000),
+        (0xE8_8000, 0x5000),
+        (0x144_E000, 0x1000),
+        (HB, 0x4_0000),
+    ];
+    const SESS: usize = HB;
+    const CONN0: usize = HB + 0x3000;
+    const REC0: usize = HB + 0xC000;
+    const OBJ0: usize = HB + 0x10000;
+    const MGR0: usize = HB + 0x11000;
+    const VTM: usize = HB + 0x11400;
+    const VTS: usize = HB + 0x11500;
+    const VTR: usize = HB + 0x11600;
+    const VTO: usize = HB + 0x11700;
+    const NODE0: usize = HB + 0x12000;
+    const PKT: usize = HB + 0x13000;
+    const REQ: usize = HB + 0x14000;
+    const REQOBJ: usize = HB + 0x14400;
+    const SPECIAL: usize = HB + 0x14800;
+    const SPECIAL90: usize = HB + 0x14900;
+    const POOLNEXT: usize = HB + 0x15000;
+
+    struct Rng(u64);
+    impl Rng {
+        fn u32(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 16) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.u32() % n
+        }
+        fn chance(&mut self, pct: u32) -> bool {
+            self.below(100) < pct
+        }
+    }
+
+    fn h32(vals: &[u32]) -> u32 {
+        let mut h = 0x811C_9DC5u32;
+        for v in vals {
+            for b in v.to_le_bytes() {
+                h = (h ^ b as u32).wrapping_mul(0x0100_0193);
+            }
+        }
+        h
+    }
+
+    // ---- the data windows --------------------------------------------------------------------------------------------
+    // The game's globals are mapped at their real addresses (the test exe sits at 0x10000000); the code is not: the original
+    // functions run from relocated copies whose calls are re-aimed at the stubs, and the Rust ports reach the same stubs through
+    // `cal` (the identity outside the tests).
+    fn map_windows() {
+        for &(a, l) in WINDOWS.iter().chain(&[(0xE8_0000usize, 0x1000usize)]) {
+            let base = a & !0xFFFF;
+            let len = (a + l - base).div_ceil(0x1_0000) * 0x1_0000;
+            unsafe {
+                let mut p = VirtualAlloc(base as *const c_void, len, MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+                if p.is_null() {
+                    p = base as *mut c_void; // reserved by an earlier window of the same 64 KB block
+                }
+                assert_eq!(p as usize, base, "cannot reserve {base:#x}: error {}", windows_sys::Win32::Foundation::GetLastError());
+                let c = VirtualAlloc(a as *const c_void, l, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                assert_eq!(c as usize, a, "cannot map {a:#x}: error {}", windows_sys::Win32::Foundation::GetLastError());
+            }
+        }
+    }
+
+    pub(super) fn redirect(a: usize) -> usize {
+        STUB_ADDR.with(|m| *m.borrow().get(&a).unwrap_or_else(|| panic!("no stub for {a:#x}")))
+    }
+
+    /// A relocated copy of an original body: its `call rel32`s (at `calls`) go to the stubs.
+    unsafe fn copy_body(body: &[u8], orig: usize, calls: &[usize]) -> usize {
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), body.len() + 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+            std::ptr::copy_nonoverlapping(body.as_ptr(), p as *mut u8, body.len());
+            for &off in calls {
+                let rel = i32::from_le_bytes(body[off + 1..off + 5].try_into().unwrap());
+                let target = (orig + off + 5).wrapping_add(rel as usize);
+                let to = redirect(target);
+                let r2 = (to as i32).wrapping_sub((p + off + 5) as i32);
+                std::ptr::write_unaligned((p + off + 1) as *mut i32, r2);
+            }
+            p
+        }
+    }
+
+    // ---- stubs ---------------------------------------------------------------------------------------------------------
+    struct StubInfo {
+        addr: usize,
+        name: &'static str,
+        slot: bool,
+    }
+
+    thread_local! {
+        static STUBS: RefCell<Vec<StubInfo>> = const { RefCell::new(Vec::new()) };
+        static LOG: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        static STUB_ADDR: RefCell<std::collections::HashMap<usize, usize>> = RefCell::new(std::collections::HashMap::new());
+    }
+
+    /// The length word (and the 4th header byte of a 4-byte header) is written after the payload: stack garbage until then.
+    fn mask_hdr(data: &mut [u8]) {
+        for b in data.iter_mut().skip(1).take(2) {
+            *b = 0;
+        }
+        if MASK3.get() != 0 && unsafe { rb(MASK3.get()) } != 0 && data.len() > 3 {
+            data[3] = 0;
+        }
+    }
+
+    fn log(s: String) {
+        LOG.with(|l| l.borrow_mut().push(s));
+    }
+
+    fn take_log() -> Vec<String> {
+        LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    }
+
+    extern "C" fn stub_dispatch(id: u32, r: &mut Pushad, a: *const u32) {
+        unsafe {
+            let (addr, name, slot) = STUBS.with(|s| {
+                let s = s.borrow();
+                (s[id as usize].addr, s[id as usize].name, s[id as usize].slot)
+            });
+            let ar = |i: usize| *a.add(i);
+            let all = format!("eax={:x} ecx={:x} edx={:x} esi={:x} edi={:x}", r.eax, r.ecx, r.edx, r.esi, r.edi);
+            let _ = slot;
+            match addr {
+                0x00C9_604F => {}
+                0x00CA_0850 => {
+                    std::ptr::copy_nonoverlapping(ar(1) as *const u8, ar(0) as *mut u8, ar(2) as usize);
+                    r.eax = ar(0);
+                }
+                // net_remote_handle_map_find (EAX = key, ESI = map; key, create)
+                0x0080_8E30 => {
+                    let key = ar(0);
+                    log(format!("{name} eax={:x} esi={:x} key={:x} create={:x}", r.eax, r.esi, key, ar(1)));
+                    let i = (key & 15) as usize;
+                    r.eax = if rb(NODE0 + 0x100 + i) & 3 != 0 { (NODE0 + i * 8) as u32 } else { 0 };
+                }
+                // session_find_conn_by_id (EAX = session, DL = owner)
+                0x0080_FE80 => {
+                    log(format!("{name} eax={:x} dl={:x}", r.eax, r.edx as u8));
+                    let i = (r.edx & 3) as usize;
+                    r.eax = if rb(SESS + 0x1000 + i) & 3 != 0 { (CONN0 + i * 0x2400) as u32 } else { 0 };
+                }
+                // net_pool_alloc 0x804050: the next record of the pool
+                0x0080_4050 => {
+                    log(format!("{name}"));
+                    let n = rd(POOLNEXT);
+                    wd(POOLNEXT, n + 1);
+                    r.eax = if n < 2 && rb(POOLNEXT + 0x10 + n as usize) & 1 != 0 { (REC0 + (7 - n as usize) * 0x700) as u32 } else { 0 };
+                }
+                // 0x925030: the object of a handle (ECX), or 0
+                0x0092_5030 => {
+                    log(format!("{name} ecx={:x}", r.ecx));
+                    let h = r.ecx;
+                    r.eax = if h == 0 {
+                        0
+                    } else {
+                        let o = rd(0x0214_9C64 + ((h & 0xFFF) as usize) * 16);
+                        if o != 0 && rd(o as usize + 0x44) == h { o } else { 0 }
+                    };
+                }
+                // 0x806D50 can_migrate: EAX = object
+                0x0080_6D50 => {
+                    log(format!("{name} eax={:x}", r.eax));
+                    r.eax = h32(&[r.eax, 1]) & 0x0100_01FF;
+                }
+                0x0080_4F00 => {
+                    log(format!("{name} ax={:x}", r.eax as u16));
+                    r.eax = h32(&[r.eax & 0xFFFF, 2]) & 0xFF00_0001;
+                }
+                0x0083_6DD0 => {
+                    log(format!("{name} ecx={:x}", r.ecx));
+                    r.eax = h32(&[r.ecx, 3]) & 0x0101_0102;
+                }
+                0x0080_44C0 => {
+                    log(format!("{name} cx={:x} edx={:x} arg0={:x}", r.ecx as u16, r.edx, ar(0)));
+                    r.eax = h32(&[r.ecx & 0xFFFF, 4]);
+                }
+                0x0080_4710 => {
+                    log(format!("{name} ecx*={:x} edi={:x} arg0={:x}", rd(r.ecx as usize), r.edi, ar(0)));
+                    r.eax = h32(&[ar(0), 5]);
+                }
+                0x0080_4140 => {
+                    log(format!("{name} esi={:x}", r.esi));
+                    r.eax = h32(&[r.esi, 6]);
+                }
+                0x0080_4960 => {
+                    log(format!("{name} eax={:x} edi={:x}", r.eax, r.edi));
+                    r.eax = h32(&[r.eax, r.edi, 7]) & 0xFFFF_FF01;
+                }
+                0x0080_7A20 => {
+                    log(format!("{name} ax={:x} arg0={:x}", r.eax as u16, ar(0)));
+                    r.eax = h32(&[r.eax, 8]);
+                }
+                0x0080_7AA0 => {
+                    log(format!("{name} eax={:x}", r.eax));
+                    r.eax = h32(&[r.eax, 9]);
+                }
+                0x007F_FB70 | 0x007F_FAC0 => {
+                    let nargs = if addr == 0x007F_FAC0 { format!(" arg0={:x}", ar(0)) } else { format!(" eax={:x}", r.eax) };
+                    log(format!("{name}{nargs}"));
+                    r.eax = h32(&[addr as u32, 10]);
+                }
+                0x0080_3FA0 => {
+                    log(format!("{name} ecx={:x}", r.ecx));
+                    r.eax = h32(&[r.ecx, 11]);
+                }
+                // 0x814670: ESI = connection; (buf, size, 0, 0)
+                0x0081_4670 => {
+                    let size = ar(1) as usize;
+                    let mut data: Vec<u8> = (0..size.min(0x520)).map(|i| rb(ar(0) as usize + i)).collect();
+                    if MASK3.get() != 0 && unsafe { rb(MASK3.get()) } != 0 && data.len() > 3 {
+                        data[3] = 0; // the sequence byte of a 4-byte header is written by the send helper
+                    }
+                    log(format!("{name} esi={:x} size={:x} a2={:x} a3={:x} data={:02x?}", r.esi, size, ar(2), ar(3), data));
+                    r.eax = h32(&[size as u32, 12]);
+                }
+                // 0x7FB3D0: EAX = &cursor (word), ECX = buf, ESI = source; writes 12 bytes
+                0x007F_B3D0 => {
+                    let cur = rw(r.eax as usize) as usize;
+                    log(format!("{name} esi={:x} cur={:x}", r.esi, cur));
+                    for i in 0..12 {
+                        wb(r.ecx as usize + cur + i, (h32(&[r.esi, i as u32]) & 0xFF) as u8);
+                    }
+                    ww(r.eax as usize, (cur + 12) as u16);
+                }
+                // ---- virtual methods: fake addresses 0xF0000000 + 0x100 * table + slot ----
+                _ if addr >= 0xF000_0000 => {
+                    let table = (addr >> 8) & 0xFF;
+                    let slot = addr & 0xFF;
+                    match (table, slot) {
+                        // manager slot 3 (+0xC): (&L1, &L0, pkt + 8, id, owner)
+                        (1, 3) => {
+                            log(format!("{name} ecx={:x} edx={:x} esi={:x} edi={:x} l1={:x} l0={:x} a2={:x} a3={:x} a4={:x}", r.ecx, r.edx, r.esi, r.edi, rd(ar(0) as usize), rd(ar(1) as usize), ar(2), ar(3), ar(4)));
+                            wd(ar(0) as usize, if h32(&[ar(3), 20]) & 1 != 0 { h32(&[ar(3), 21]) | 0x1000 } else { 0 });
+                            wd(ar(1) as usize, h32(&[ar(3), 22]));
+                            r.eax = h32(&[ar(3), 23]);
+                        }
+                        // manager slot 5 (+0x14): (handle, &buf, &cursor): writes 6 bytes
+                        (1, 5) => {
+                            let cur = rd(ar(2) as usize) as usize;
+                            let mut data: Vec<u8> = (0..cur).map(|i| rb(ar(1) as usize + i)).collect();
+                            mask_hdr(&mut data);
+                            log(format!("{name} {all} h={:x} cur={:x} data={:02x?}", ar(0), cur, data));
+                            for i in 0..6 {
+                                wb(ar(1) as usize + cur + i, (h32(&[ar(0), i as u32]) & 0xFF) as u8);
+                            }
+                            wd(ar(2) as usize, (cur + 6) as u32);
+                            r.eax = h32(&[ar(0), 24]);
+                        }
+                        // manager slot 6 (+0x18): (handle, &out, pkt + 6)
+                        (1, 6) => {
+                            log(format!("{name} {all} h={:x} out={:x} a2={:x}", ar(0), rd(ar(1) as usize), ar(2)));
+                            wd(ar(1) as usize, 0x77);
+                            r.eax = h32(&[ar(0), 25]);
+                        }
+                        // manager slots 1 / 4 (+4 / +0x10): (handle)
+                        (1, 1) | (1, 4) => {
+                            log(format!("{name} {all} h={:x}", ar(0)));
+                            r.eax = h32(&[ar(0), slot as u32]);
+                        }
+                        // manager slot 0x14 (+0x50): (handle, conn)
+                        (1, 0x14) => {
+                            log(format!("{name} {all} h={:x} conn={:x}", ar(0), ar(1)));
+                            r.eax = h32(&[ar(0), ar(1), 26]);
+                        }
+                        // session slots 3 / 4 / 5: no arguments
+                        (2, _) | (4, _) => {
+                            log(format!("{name} {all}"));
+                            r.eax = h32(&[addr as u32, r.ecx, 27]);
+                        }
+                        // requester slot 0xA (+0x28): (&buf, &cursor): writes 5 bytes
+                        (3, 0xA) => {
+                            let cur = rd(ar(1) as usize) as usize;
+                            let mut data: Vec<u8> = (0..cur).map(|i| rb(ar(0) as usize + i)).collect();
+                            mask_hdr(&mut data);
+                            log(format!("{name} ecx={:x} edx={:x} esi={:x} edi={:x} cur={:x} data={:02x?}", r.ecx, r.edx, r.esi, r.edi, cur, data));
+                            for i in 0..5 {
+                                wb(ar(0) as usize + cur + i, (h32(&[r.ecx, i as u32]) & 0xFF) as u8);
+                            }
+                            wd(ar(1) as usize, (cur + 5) as u32);
+                            r.eax = h32(&[r.ecx, 28]);
+                        }
+                        _ => panic!("unexpected virtual stub {name}"),
+                    }
+                }
+                _ => panic!("unexpected stub {name} ({addr:#x})"),
+            }
+        }
+    }
+
+    unsafe fn make_stub(id: usize, ret: u16) -> usize {
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+            let mut c: Vec<u8> = vec![0x60, 0x89, 0xE0, 0x8D, 0x4C, 0x24, 0x24, 0x51, 0x50, 0x68];
+            c.extend((id as u32).to_le_bytes());
+            let call_at = p + c.len();
+            c.push(0xE8);
+            c.extend(((stub_dispatch as *const () as usize).wrapping_sub(call_at + 5) as u32).to_le_bytes());
+            c.extend([0x83, 0xC4, 0x0C, 0x61]);
+            if ret == 0 {
+                c.push(0xC3);
+            } else {
+                c.push(0xC2);
+                c.extend(ret.to_le_bytes());
+            }
+            std::ptr::copy_nonoverlapping(c.as_ptr(), p as *mut u8, c.len());
+            p
+        }
+    }
+
+    /// Register a stub for `addr` (a real function: its first bytes become a jump) or a fake slot address.
+    unsafe fn stub(name: &'static str, addr: usize, ret: u16) -> usize {
+        unsafe {
+            let id = STUBS.with(|s| {
+                let mut s = s.borrow_mut();
+                s.push(StubInfo { addr, name, slot: addr >= 0xF000_0000 });
+                s.len() - 1
+            });
+            let code = make_stub(id, ret);
+            STUB_ADDR.with(|m| m.borrow_mut().insert(addr, code));
+            code
+        }
+    }
+
+    fn setup_stubs() {
+        thread_local! { static DONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        if DONE.get() {
+            return;
+        }
+        DONE.set(true);
+        map_windows();
+        unsafe {
+            for (n, a, r) in [
+                ("map_find", 0x0080_8E30usize, 8u16),
+                ("find_conn", 0x0080_FE80, 0),
+                ("pool_alloc", 0x0080_4050, 0),
+                ("obj_of_handle", 0x0092_5030, 0),
+                ("can_migrate", 0x0080_6D50, 0),
+                ("lookup_id", 0x0080_4F00, 0),
+                ("destroy_check", 0x0083_6DD0, 0),
+                ("pending_del", 0x0080_44C0, 0),
+                ("fallback_send", 0x0080_4710, 0),
+                ("unregister", 0x0080_4140, 0),
+                ("owner_list_remove", 0x0080_4960, 0),
+                ("map_set", 0x0080_7A20, 4),
+                ("map_free", 0x0080_7AA0, 0),
+                ("snapshot_free", 0x007F_FB70, 0),
+                ("snapshot_add", 0x007F_FAC0, 0),
+                ("create_ack", 0x0080_3FA0, 0),
+                ("send_conn", 0x0081_4670, 0),
+                ("write_player", 0x007F_B3D0, 0),
+                ("cookie", 0x00C9_604F, 0),
+                ("memcpy", 0x00CA_0850, 0),
+            ] {
+                stub(n, a, r);
+            }
+            let set = |table: usize, slot: usize, ret: u16, name: &'static str, vt: usize| {
+                let fake = 0xF000_0000 + table * 0x100 + slot;
+                let code = stub(name, fake, ret);
+                wd(vt + slot * 4, code as u32);
+            };
+            // all the vtables are rewritten with the stub entry points once; the world builder only points objects at them
+            for (vt, tab) in [(VTM, 1usize), (VTS, 2), (VTR, 3), (VTO, 4)] {
+                match tab {
+                    1 => {
+                        set(1, 1, 4, "mgr.create", vt);
+                        set(1, 3, 0x14, "mgr.read_create", vt);
+                        set(1, 4, 4, "mgr.detach", vt);
+                        set(1, 5, 0xC, "mgr.write_payload", vt);
+                        set(1, 6, 0xC, "mgr.destroy", vt);
+                        set(1, 0x14, 8, "mgr.new_owner", vt);
+                    }
+                    2 => {
+                        set(2, 3, 0, "sess.slot3", vt);
+                        set(2, 4, 0, "sess.slot4", vt);
+                        set(2, 5, 0, "sess.slot5", vt);
+                    }
+                    3 => set(3, 0xA, 8, "req.write", vt),
+                    _ => set(4, 1, 0, "special.slot1", vt),
+                }
+            }
+            // the vtables sit in the world window, which every iteration refills: keep a copy to restore
+            VT_COPY.with(|v| {
+                let mut v = v.borrow_mut();
+                for vt in [VTM, VTS, VTR, VTO] {
+                    v.push((vt, (0..0x80).map(|i| rb(vt + i)).collect()));
+                }
+            });
+        }
+    }
+
+    thread_local! { static IGNORE_EAX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+    thread_local! { static MASK3: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { static VT_COPY: RefCell<Vec<(usize, Vec<u8>)>> = const { RefCell::new(Vec::new()) }; }
+
+    // ---- the world ------------------------------------------------------------------------------------------------------
+    fn snapshot() -> Vec<Vec<u8>> {
+        WINDOWS.iter().map(|&(a, l)| unsafe { std::slice::from_raw_parts(a as *const u8, l) }.to_vec()).collect()
+    }
+
+    fn restore(s: &[Vec<u8>]) {
+        for (&(a, _), b) in WINDOWS.iter().zip(s) {
+            unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), a as *mut u8, b.len()) };
+        }
+    }
+
+    fn fill_random(rng: &mut Rng) {
+        for &(a, l) in &WINDOWS {
+            for i in (0..l).step_by(4) {
+                unsafe { wd(a + i, rng.u32()) };
+            }
+        }
+        VT_COPY.with(|v| {
+            for (vt, b) in v.borrow().iter() {
+                unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), *vt as *mut u8, b.len()) };
+            }
+        });
+    }
+
+    struct World {
+        /// handles of the 8 objects
+        handles: [u32; 8],
+        /// indices of the registered records
+        reg: Vec<usize>,
+    }
+
+    fn rec(i: usize) -> usize {
+        REC0 + i * 0x700
+    }
+    fn obj(i: usize) -> usize {
+        OBJ0 + i * 0x100
+    }
+    fn conn(i: usize) -> usize {
+        CONN0 + i * 0x2400
+    }
+
+    /// A consistent world: session, 4 connections (circular list), 8 records (global list / free list / loose), 8 objects with handles,
+    /// the 10 managers, the id nodes.
+    unsafe fn build_world(rng: &mut Rng) -> World {
+        unsafe {
+            fill_random(rng);
+            // handle table: every slot starts empty
+            for i in 0..0x1000usize {
+                wd(0x0214_9C64 + i * 16, 0);
+            }
+            let mut handles = [0u32; 8];
+            for j in 0..8 {
+                let h = (j as u32 + 1) | ((rng.below(0x200) + 1) << 12);
+                handles[j] = h;
+                let o = obj(j);
+                wd(o + 0x44, h);
+                wd(0x0214_9C64 + ((h & 0xFFF) as usize) * 16, o as u32);
+                wd(o + 0x80, if rng.chance(30) { rng.u32() } else { rng.u32() & !1 });
+                wd(o + 0xB0, 0);
+            }
+            // session + connections
+            wd(0x0252_8C14, if rng.chance(90) { SESS as u32 } else { 0 });
+            wd(SESS + 8, rng.u32());
+            let order: Vec<usize> = {
+                let mut v = vec![0usize, 1, 2, 3];
+                for i in (1..4).rev() {
+                    v.swap(i, rng.below(i as u32 + 1) as usize);
+                }
+                v.truncate(1 + rng.below(4) as usize);
+                v
+            };
+            for (k, &c) in order.iter().enumerate() {
+                let next = order[(k + 1) % order.len()];
+                wd(conn(c) + 0x22CC, conn(next) as u32);
+            }
+            for c in 0..4 {
+                if !order.contains(&c) {
+                    wd(conn(c) + 0x22CC, conn(order[rng.below(order.len() as u32) as usize]) as u32);
+                }
+            }
+            wd(SESS + 0x400, if rng.chance(90) { conn(order[0]) as u32 } else { 0 });
+            wd(SESS + 0x404, if rng.chance(70) { conn(rng.below(4) as usize) as u32 } else { 0 });
+            let local = conn(rng.below(4) as usize);
+            wd(SESS + 0x408, local as u32);
+            for c in 0..4 {
+                let cp = conn(c);
+                wd(cp + 0x1AC, SESS as u32);
+                wd(cp + 0x3C, if rng.chance(70) { 8 + rng.below(3) } else { rng.below(8) });
+                wb(cp, if rng.chance(70) { 0 } else { 1 });
+                wb(cp + 0x1B0, rng.below(32) as u8);
+                wd(cp + 0x21F0, rng.below(4));
+                for k in 0..4 {
+                    wd(cp + 0x1DF0 + k * 4, if rng.chance(40) { handles[rng.below(8) as usize] } else { rng.u32() });
+                }
+                wd(cp + 0x404, if rng.chance(50) { local as u32 } else { conn(rng.below(4) as usize) as u32 });
+            }
+            // the local connection: its session pointer's +0x404 decides some paths
+            for i in 0..4 {
+                wb(SESS + 0x1000 + i, rng.u32() as u8);
+            }
+            // managers: all types, one shared vtable
+            for t in 0..11usize {
+                let m = MGR0 + t * 0x20;
+                wd(m, VTM as u32);
+                wd(0x0212_E25C + t * 4, m as u32);
+            }
+            wd(0x0212_E258, rng.u32());
+            // records: state 0 = registered (global + type lists), 1 = free list, 2 = loose
+            let mut state = [2u8; 8];
+            for s in state.iter_mut() {
+                *s = rng.below(3) as u8;
+            }
+            let reg: Vec<usize> = (0..8).filter(|&i| state[i] == 0).collect();
+            let free: Vec<usize> = (0..8).filter(|&i| state[i] == 1).collect();
+            for i in 0..8usize {
+                let r = rec(i);
+                wb(r, rng.u32() as u8);
+                ww(r + 2, rng.u32() as u16);
+                // a record usually refers to the handle of one of the objects
+                wd(r + 4, if rng.chance(75) { handles[rng.below(8) as usize] } else if rng.chance(50) { 0 } else { rng.u32() });
+                wd(r + 8, if state[i] != 0 || rng.chance(92) { rng.below(10) } else { rng.u32() });
+                wd(r + 0x66C, 0);
+                wd(r + 0x670, 0);
+                wd(r + 0x674, 0);
+                wd(r + 0x678, 0);
+                wb(r + 0x67C, rng.u32() as u8);
+            }
+            // objects point at some records
+            for j in 0..8 {
+                let k = rng.below(8) as usize;
+                if rng.chance(50) && rd(rec(k) + 8) < 10 {
+                    wd(obj(j) + 0xB0, rec(k) as u32);
+                }
+            }
+            // nodes: [node] = a record (or 0)
+            for i in 0..16usize {
+                let n = NODE0 + i * 8;
+                let k = rng.below(8) as usize;
+                wd(n, if rng.chance(85) && rd(rec(k) + 8) < 10 { rec(k) as u32 } else { 0 });
+            }
+            let link = |list: &[usize], next: usize, prev: usize| {
+                for (k, &i) in list.iter().enumerate() {
+                    wd(rec(i) + next, rec(list[(k + 1) % list.len()]) as u32);
+                    wd(rec(i) + prev, rec(list[(k + list.len() - 1) % list.len()]) as u32);
+                }
+            };
+            link(&reg, 0x66C, 0x670);
+            wd(0x0212_E2AC, if reg.is_empty() { 0 } else { rec(reg[rng.below(reg.len() as u32) as usize]) as u32 });
+            link(&free, 0x66C, 0x670);
+            wd(0x0212_C254, if free.is_empty() { 0 } else { rec(free[rng.below(free.len() as u32) as usize]) as u32 });
+            wd(0x0212_BA34, rng.below(100));
+            for t in 0..10usize {
+                let mem: Vec<usize> = reg.iter().copied().filter(|&i| rd(rec(i) + 8) == t as u32).collect();
+                link(&mem, 0x674, 0x678);
+                wd(0x0212_E284 + t * 4, if mem.is_empty() { 0 } else { rec(mem[rng.below(mem.len() as u32) as usize]) as u32 });
+            }
+            for &i in &reg {
+                let t = rd(rec(i) + 8) as usize;
+                if t < 11 {
+                    wd(0x0212_E25C + t * 4, (MGR0 + t * 0x20) as u32);
+                }
+            }
+            // the pool allocator
+            wd(POOLNEXT, 0);
+            // flags the functions read
+            wb(0x0144_E9B6, rng.u32() as u8);
+            wd(0x0252_8BB4, rng.below(3).wrapping_sub(1));
+            wd(0x0252_8BAC, rng.below(5));
+            wd(0x027B_3C60, if rng.chance(50) { SPECIAL as u32 } else { 0 });
+            wd(SPECIAL + 0x3C, rng.below(3));
+            wd(SPECIAL + 0x90, SPECIAL90 as u32);
+            wd(SPECIAL90, VTO as u32);
+            // the packet and the requester
+            for i in 0..0x300 {
+                wb(PKT + i, rng.u32() as u8);
+            }
+            wd(PKT + 4, if rng.chance(85) { rng.below(11) } else { rng.u32() });
+            wd(REQ + 0x408, SESS as u32);
+            wd(REQ + 0xC, REQOBJ as u32);
+            wd(REQOBJ, VTR as u32);
+            World { handles, reg }
+        }
+    }
+
+    struct Out {
+        eax: u32,
+        mem: Vec<Vec<u8>>,
+        log: Vec<String>,
+    }
+
+    fn compare(what: &str, iter: u32, o: &Out, r: &Out) {
+        let skip_eax = IGNORE_EAX.get();
+        if (o.eax != r.eax && !skip_eax) || o.log != r.log || o.mem != r.mem {
+            let mut why = String::new();
+            if o.eax != r.eax && !skip_eax {
+                why += &format!("eax: original {:#x}, Rust {:#x}\n", o.eax, r.eax);
+            }
+            for (k, (x, y)) in o.log.iter().zip(&r.log).enumerate() {
+                if x != y {
+                    why += &format!("call {k}:\n  original {x}\n  Rust     {y}\n");
+                    break;
+                }
+            }
+            if o.log.len() != r.log.len() {
+                why += &format!("{} calls in the original, {} in Rust\n", o.log.len(), r.log.len());
+            }
+            for (w, (x, y)) in WINDOWS.iter().zip(o.mem.iter().zip(&r.mem)) {
+                if let Some(i) = (0..x.len()).find(|&i| x[i] != y[i]) {
+                    why += &format!("memory differs at {:#x}: original {:#x}, Rust {:#x}\n", w.0 + i, x[i], y[i]);
+                }
+            }
+            panic!("{what} iter {iter}: {why}");
+        }
+    }
+
+    type Handler = unsafe fn(usize, &mut Pushad, *const u32);
+
+    /// Run the original at `addr` and the Rust handler on the same memory and compare everything.
+    unsafe fn differential(what: &str, iter: u32, addr: usize, h: Handler, id: usize, regs: Regs, args: &[u32]) {
+        unsafe {
+            if iter < 2 || std::env::var("NET3_TRACE").is_ok() {
+                eprintln!("{what} iter {iter}");
+            }
+            let s0 = snapshot();
+            take_log();
+            let oeax = call_regs(addr, regs.eax, regs.ecx, regs.edx, regs.esi, regs.edi, args);
+            if iter < 2 || std::env::var("NET3_TRACE").is_ok() {
+                eprintln!("  original done");
+            }
+            let o = Out { eax: oeax, log: take_log(), mem: snapshot() };
+            restore(&s0);
+            let mut p = Pushad { edi: regs.edi, esi: regs.esi, ebp: regs.ebp, esp: 0, ebx: regs.ebx, edx: regs.edx, ecx: regs.ecx, eax: regs.eax };
+            h(id, &mut p, args.as_ptr());
+            let ru = Out { eax: p.eax, log: take_log(), mem: snapshot() };
+            restore(&s0);
+            compare(what, iter, &o, &ru);
+        }
+    }
+
+    /// Sometimes no manager for the packet's type.
+    unsafe fn null_manager(rng: &mut Rng) {
+        unsafe {
+            let t = rd(PKT + 4);
+            if t < 11 && rng.chance(15) {
+                wd(0x0212_E25C + t as usize * 4, 0);
+            }
+        }
+    }
+
+    fn regs(rng: &mut Rng) -> Regs {
+        Regs { eax: rng.u32(), ecx: rng.u32(), edx: rng.u32(), ebx: 0xB1B1_B1B1, esi: rng.u32(), edi: rng.u32(), ebp: 0xE9E9_E9E9 }
+    }
+
+    /// Makes the test exe link at a free base (see `rust_matches_original`), then:
+    /// RUSTFLAGS="-C link-arg=/DYNAMICBASE:NO -C link-arg=/BASE:0x10000000" cargo test --release -p sr2-hook --target i686-pc-windows-msvc
+    /// object_core_matches_original -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs the test exe linked at /BASE:0x10000000 (see the doc comment)"]
+    fn object_core_matches_original() {
+        unsafe extern "system" fn on_crash(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+            unsafe {
+                let rec = &*(*info).ExceptionRecord;
+                let c = &*(*info).ContextRecord;
+                eprintln!(
+                    "CRASH code {:#x} at {:#x} (fault address {:#x}); eax={:x} ecx={:x} edx={:x} esi={:x} edi={:x} ebx={:x} ebp={:x} esp={:x}",
+                    rec.ExceptionCode, rec.ExceptionAddress as usize, rec.ExceptionInformation[1], c.Eax, c.Ecx, c.Edx, c.Esi, c.Edi, c.Ebx, c.Ebp, c.Esp
+                );
+            }
+            0
+        }
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(on_crash)) };
+        setup_stubs();
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        struct Orig {
+            dispatch: usize,
+            add_field: usize,
+            unreg: usize,
+            reset: usize,
+            destroy: usize,
+            new_owner: usize,
+            deact: usize,
+            reg_local: usize,
+            reg_create: usize,
+            join_req: usize,
+        }
+        let orig = unsafe {
+            let j = |a: usize, l: &mut [u8]| {
+                let _ = (a, &l);
+            };
+            let _ = j;
+            // the jump table of 0x80ED70 holds absolute addresses: re-aim the table and the `jmp [eax*4 + table]`
+            let d = copy_body(&B_DISPATCH_ACTION, 0x0080_ED70, &[]);
+            let delta = d.wrapping_sub(0x0080_ED70);
+            std::ptr::write_unaligned((d + 0xF) as *mut u32, (d + 0x50) as u32);
+            for k in 0..6 {
+                let e = (d + 0x50 + k * 4) as *mut u32;
+                std::ptr::write_unaligned(e, std::ptr::read_unaligned(e).wrapping_add(delta as u32));
+            }
+            Orig {
+                dispatch: d,
+                add_field: copy_body(&B_ADD_FIELD, 0x0080_7780, &[]),
+                unreg: copy_body(&B_OBJ_UNREGISTER, 0x0080_4140, &[0x8c, 0xd8]),
+                reset: copy_body(&B_REGS_RESET, 0x0080_6E30, &[0x28]),
+                destroy: copy_body(&B_DESTROY_FROM_PACKET, 0x0080_4550, &[0x37, 0x48, 0x5f, 0x8d]),
+                new_owner: copy_body(&B_SEND_NEW_OWNER, 0x0080_67D0, &[0x17, 0x4b, 0x88, 0xde, 0x108]),
+                deact: copy_body(&B_DEACTIVATE_SEND, 0x0080_53B0, &[0x107, 0x11f, 0x13c, 0x14d]),
+                reg_local: copy_body(&B_REGISTER_LOCAL, 0x0080_5000, &[0xb6, 0xcd, 0x1c9, 0x1d3]),
+                reg_create: copy_body(&B_REGISTER_FROM_CREATE, 0x0080_4320, &[0x2c, 0x7e, 0x8e, 0x136, 0x14a, 0x15b, 0x174]),
+                join_req: copy_body(&B_SEND_JOIN_REQ, 0x0081_5930, &[0x70, 0xb8, 0x168, 0x26d, 0x282]),
+            }
+        };
+        let iters: u32 = std::env::var("NET3_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(4000);
+        unsafe {
+            for iter in 0..iters {
+                let w = build_world(&mut rng);
+                let _ = &w.handles;
+                let o = &orig;
+                // session_dispatch_action: ESI = a session object whose vtable is VTS
+                {
+                    let mut g = regs(&mut rng);
+                    g.esi = (HB + 0x16000) as u32;
+                    wd(HB + 0x16000, VTS as u32);
+                    wb(HB + 0x16000 + 0xC00, 0);
+                    g.eax = if rng.chance(15) { 0xFF } else { rng.below(8) };
+                    differential("dispatch_action", iter, o.dispatch, h_dispatch_action, DISPATCH_ACTION, g, &[]);
+                }
+                // net_registration_add_field: EDX = registration
+                {
+                    let reg = HB + 0x18000;
+                    let mut g = regs(&mut rng);
+                    g.edx = reg as u32;
+                    wd(reg + 0x18, if rng.chance(10) { 0x10 + rng.below(3) } else { rng.below(17) });
+                    wd(reg + 0x1C, if rng.chance(10) { rng.u32() } else { rng.below(6) });
+                    differential("add_field", iter, o.add_field, h_add_field, ADD_FIELD, g, &[rng.u32(), rng.u32(), rng.u32(), rng.u32()]);
+                }
+                // net_object_unregister: ESI = a record (or null)
+                {
+                    let mut g = regs(&mut rng);
+                    g.esi = if rng.chance(8) || w.reg.is_empty() { 0 } else { rec(w.reg[rng.below(w.reg.len() as u32) as usize]) as u32 };
+                    differential("unregister", iter, o.unreg, h_obj_unregister, OBJ_UNREGISTER, g, &[]);
+                }
+                // net_registrations_reset
+                differential("regs_reset", iter, o.reset, h_regs_reset, REGS_RESET, regs(&mut rng), &[]);
+                // net_object_destroy_from_packet
+                null_manager(&mut rng);
+                differential("destroy_from_packet", iter, o.destroy, h_destroy_from_packet, DESTROY_FROM_PACKET, regs(&mut rng), &[PKT as u32]);
+                // net_object_send_new_owner
+                {
+                    wb(PKT + 3, rng.u32() as u8);
+                    differential("send_new_owner", iter, o.new_owner, h_send_new_owner, SEND_NEW_OWNER, regs(&mut rng), &[PKT as u32]);
+                }
+                // net_object_deactivate_send: ECX = handle
+                {
+                    let mut g = regs(&mut rng);
+                    g.ecx = if rng.chance(10) { 0 } else if rng.chance(10) { rng.u32() } else { w.handles[rng.below(8) as usize] };
+                    MASK3.set(0x00E8_C084);
+                    // handle 0: the original leaves cookie ^ ESP in EAX (no meaning); the port returns the input EAX
+                    IGNORE_EAX.set(g.ecx == 0);
+                    differential("deactivate_send", iter, o.deact, h_deactivate_send, DEACTIVATE_SEND, g, &[]);
+                }
+                IGNORE_EAX.set(false);
+                // net_object_register_local: EDI = handle, stack: type
+                {
+                    let mut g = regs(&mut rng);
+                    g.edi = if rng.chance(8) { 0 } else if rng.chance(8) { rng.u32() } else { w.handles[rng.below(8) as usize] };
+                    for k in 0..2 {
+                        wb(POOLNEXT + 0x10 + k, rng.u32() as u8);
+                    }
+                    let ty = if rng.chance(25) { 6 } else { rng.below(10) };
+                    differential("register_local", iter, o.reg_local, h_register_local, REGISTER_LOCAL, g, &[ty]);
+                }
+                // net_object_register_from_create: stack: packet
+                {
+                    for k in 0..2 {
+                        wb(POOLNEXT + 0x10 + k, rng.u32() as u8);
+                    }
+                    wb(PKT + 0x208, rng.u32() as u8);
+                null_manager(&mut rng);
+                    differential("register_from_create", iter, o.reg_create, h_register_from_create, REGISTER_FROM_CREATE, regs(&mut rng), &[PKT as u32]);
+                }
+                // net_send_join_req: stack: host connection, requester, third
+                {
+                    let third = if rng.chance(25) { 0 } else { SESS as u32 };
+                    for i in 0..0x40 {
+                        wb(0x0212_AA48 + i, if i < 12 { b'a' + (rng.u32() % 26) as u8 } else { 0 });
+                    }
+                    wb(REQOBJ + 0x48, rng.u32() as u8);
+                    let pl = HB + 0x2C000;
+                    wd(REQ + 0x408, pl as u32);
+                    for i in 0..0x30 {
+                        ww(pl + 0x4C + i * 2, if i < 5 { 0x41 + rng.below(20) as u16 } else { 0 });
+                    }
+                    MASK3.set(0x00E8_BF4C);
+                    differential("send_join_req", iter, o.join_req, h_send_join_req, SEND_JOIN_REQ, regs(&mut rng), &[conn(0) as u32, REQ as u32, third]);
+                }
+            }
         }
     }
 }

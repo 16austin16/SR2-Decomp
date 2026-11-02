@@ -2169,19 +2169,19 @@ impl Mem for RealMem {
 
 /// Dry-run memory: reads see earlier writes of the same run, nothing reaches the real memory.
 struct Rec {
-    over: Vec<(usize, u8)>,
+    over: std::collections::HashMap<usize, u8>,
 }
 
 impl Rec {
     fn get(&self, a: usize) -> u8 {
-        match self.over.iter().rev().find(|e| e.0 == a) {
-            Some(e) => e.1,
+        match self.over.get(&a) {
+            Some(e) => *e,
             None => unsafe { rb(a) },
         }
     }
     fn put(&mut self, a: usize, n: usize, v: u32) {
         for i in 0..n {
-            self.over.push((a.wrapping_add(i), (v >> (8 * i)) as u8));
+            self.over.insert(a.wrapping_add(i), (v >> (8 * i)) as u8);
         }
     }
     fn read(&self, a: usize, n: usize) -> u32 {
@@ -2221,9 +2221,9 @@ static SPAN_OVERFLOW: AtomicU32 = AtomicU32::new(0);
 /// (the gap is snapshotted and restored unchanged); more than four after that is counted in
 /// `SPAN_OVERFLOW` and the closest ranges are joined too.
 fn rec_writes(f: impl FnOnce(&mut Rec)) -> [(usize, usize); 4] {
-    let mut r = Rec { over: Vec::new() };
+    let mut r = Rec { over: std::collections::HashMap::new() };
     f(&mut r);
-    let mut addrs: Vec<usize> = r.over.iter().map(|e| e.0).collect();
+    let mut addrs: Vec<usize> = r.over.keys().copied().collect();
     addrs.sort_unstable();
     addrs.dedup();
     let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -2346,6 +2346,113 @@ macro_rules! leaf_rw {
             })
         }
     };
+}
+
+// --- vhashtable<>::clear_buckets, hand-written (the machine translation was ~100x too slow) ----------
+// Original: eax = 0; if [ecx+4] != 0 { do { edx = [ecx+8]; elem(edx, eax) = fill; eax += 1 } while eax < [ecx+4] }.
+// Count and bucket pointer are re-read every iteration, like the original.
+
+#[inline(always)]
+unsafe fn cb_rd(a: u32) -> u32 {
+    unsafe { std::ptr::read_volatile(a as usize as *const u32) }
+}
+
+/// Fills 16-bit buckets with 0xFFFF; ends with eax = index, edx = bucket pointer (if it looped).
+unsafe fn cb_fill16(p: &mut Pushad) {
+    unsafe {
+        let c = p.ecx;
+        let mut i = 0u32;
+        if cb_rd(c.wrapping_add(4)) != 0 {
+            let mut d;
+            loop {
+                d = cb_rd(c.wrapping_add(8));
+                std::ptr::write_volatile(d.wrapping_add(i.wrapping_mul(2)) as usize as *mut u16, 0xFFFF);
+                i = i.wrapping_add(1);
+                if i >= cb_rd(c.wrapping_add(4)) {
+                    break;
+                }
+            }
+            p.edx = d;
+        }
+        p.eax = i;
+    }
+}
+
+/// 32-bit buckets filled with `v`.
+unsafe fn cb_fill32(p: &mut Pushad, v: u32) {
+    unsafe {
+        let c = p.ecx;
+        let mut i = 0u32;
+        if cb_rd(c.wrapping_add(4)) != 0 {
+            let mut d;
+            loop {
+                d = cb_rd(c.wrapping_add(8));
+                std::ptr::write_volatile(d.wrapping_add(i.wrapping_mul(4)) as usize as *mut u32, v);
+                i = i.wrapping_add(1);
+                if i >= cb_rd(c.wrapping_add(4)) {
+                    break;
+                }
+            }
+            p.edx = d;
+        }
+        p.eax = i;
+    }
+}
+
+/// 8-byte buckets filled from the global pair at 0xEB80F0 / 0xEB80F4 (read every iteration);
+/// esi is saved and restored by the original.
+unsafe fn cb_fill64(p: &mut Pushad) {
+    unsafe {
+        let c = p.ecx;
+        let mut i = 0u32;
+        if cb_rd(c.wrapping_add(4)) != 0 {
+            let mut d;
+            loop {
+                let lo = cb_rd(0x00EB_80F0);
+                d = cb_rd(c.wrapping_add(8));
+                std::ptr::write_volatile(d.wrapping_add(i.wrapping_mul(8)) as usize as *mut u32, lo);
+                let hi = cb_rd(0x00EB_80F4);
+                std::ptr::write_volatile(d.wrapping_add(i.wrapping_mul(8)).wrapping_add(4) as usize as *mut u32, hi);
+                i = i.wrapping_add(1);
+                if i >= cb_rd(c.wrapping_add(4)) {
+                    break;
+                }
+            }
+            p.edx = d;
+        }
+        p.eax = i;
+    }
+}
+
+/// The bytes a clear_buckets call writes: count buckets of `elem` bytes at [ecx+8].
+fn cb_writes(p: &Pushad, elem: usize) -> [(usize, usize); 4] {
+    unsafe {
+        let n = cb_rd(p.ecx.wrapping_add(4)) as usize;
+        let d = cb_rd(p.ecx.wrapping_add(8)) as usize;
+        [(d, n * elem), (0, 0), (0, 0), (0, 0)]
+    }
+}
+
+fn r_cb16(p: &mut Pushad, _a: *const u32) {
+    unsafe { cb_fill16(p) }
+}
+fn r_cb32_0(p: &mut Pushad, _a: *const u32) {
+    unsafe { cb_fill32(p, 0) }
+}
+fn r_cb32_ffff(p: &mut Pushad, _a: *const u32) {
+    unsafe { cb_fill32(p, 0xFFFF) }
+}
+fn r_cb64(p: &mut Pushad, _a: *const u32) {
+    unsafe { cb_fill64(p) }
+}
+fn w_cb2(p: &Pushad, _a: *const u32) -> [(usize, usize); 4] {
+    cb_writes(p, 2)
+}
+fn w_cb4(p: &Pushad, _a: *const u32) -> [(usize, usize); 4] {
+    cb_writes(p, 4)
+}
+fn w_cb8(p: &Pushad, _a: *const u32) -> [(usize, usize); 4] {
+    cb_writes(p, 8)
 }
 
 #[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
@@ -2477,46 +2584,6 @@ fn f_493860(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
 }
 leaf_rw!(f_493860, r_493860, w_493860);
 
-#[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
-fn f_4ac100(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
-    let (mut zf, mut sf, mut cf, mut of) = (false, false, false, false);
-    let mut pc = 0u32;
-    loop {
-        match pc {
-            0 => {
-                let r = (p.eax) ^ (p.eax);
-                p.eax = r;
-                let t = fl_logic(r, 32); (zf, sf, cf, of) = (t.zf, t.sf, false, false);
-                let x = m.rd((p.ecx.wrapping_add(0x4)) as usize); let y = p.eax; let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if (cf || zf) { pc = 4; continue; }
-                pc = 1; continue;
-            }
-            1 => {
-                pc = 3; continue;
-            }
-            2 => {
-                return; // unreachable
-            }
-            3 => {
-                p.edx = m.rd((p.ecx.wrapping_add(0x8)) as usize);
-                m.ww((p.edx.wrapping_add(p.eax.wrapping_mul(2))) as usize, 0xFFFFu32);
-                let x = p.eax; let y = 0x1u32; let t = fl_add(x, y, 0, 32);
-                p.eax = t.r;
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                let x = p.eax; let y = m.rd((p.ecx.wrapping_add(0x4)) as usize); let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if cf { pc = 3; continue; }
-                pc = 4; continue;
-            }
-            4 => {
-                return;
-            }
-            _ => return,
-        }
-    }
-}
-leaf_rw!(f_4ac100, r_4ac100, w_4ac100);
 
 #[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
 fn f_4b26e0(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
@@ -2991,87 +3058,7 @@ fn f_6dfc60(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
 }
 leaf_rw!(f_6dfc60, r_6dfc60, w_6dfc60);
 
-#[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
-fn f_70bc20(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
-    let (mut zf, mut sf, mut cf, mut of) = (false, false, false, false);
-    let mut pc = 0u32;
-    loop {
-        match pc {
-            0 => {
-                let r = (p.eax) ^ (p.eax);
-                p.eax = r;
-                let t = fl_logic(r, 32); (zf, sf, cf, of) = (t.zf, t.sf, false, false);
-                let x = m.rd((p.ecx.wrapping_add(0x4)) as usize); let y = p.eax; let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if (cf || zf) { pc = 4; continue; }
-                pc = 1; continue;
-            }
-            1 => {
-                pc = 3; continue;
-            }
-            2 => {
-                return; // unreachable
-            }
-            3 => {
-                p.edx = m.rd((p.ecx.wrapping_add(0x8)) as usize);
-                m.ww((p.edx.wrapping_add(p.eax.wrapping_mul(2))) as usize, 0xFFFFu32);
-                let x = p.eax; let y = 0x1u32; let t = fl_add(x, y, 0, 32);
-                p.eax = t.r;
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                let x = p.eax; let y = m.rd((p.ecx.wrapping_add(0x4)) as usize); let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if cf { pc = 3; continue; }
-                pc = 4; continue;
-            }
-            4 => {
-                return;
-            }
-            _ => return,
-        }
-    }
-}
-leaf_rw!(f_70bc20, r_70bc20, w_70bc20);
 
-#[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
-fn f_70be50(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
-    let (mut zf, mut sf, mut cf, mut of) = (false, false, false, false);
-    let mut pc = 0u32;
-    loop {
-        match pc {
-            0 => {
-                let r = (p.eax) ^ (p.eax);
-                p.eax = r;
-                let t = fl_logic(r, 32); (zf, sf, cf, of) = (t.zf, t.sf, false, false);
-                let x = m.rd((p.ecx.wrapping_add(0x4)) as usize); let y = p.eax; let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if (cf || zf) { pc = 4; continue; }
-                pc = 1; continue;
-            }
-            1 => {
-                pc = 3; continue;
-            }
-            2 => {
-                return; // unreachable
-            }
-            3 => {
-                p.edx = m.rd((p.ecx.wrapping_add(0x8)) as usize);
-                m.ww((p.edx.wrapping_add(p.eax.wrapping_mul(2))) as usize, 0xFFFFu32);
-                let x = p.eax; let y = 0x1u32; let t = fl_add(x, y, 0, 32);
-                p.eax = t.r;
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                let x = p.eax; let y = m.rd((p.ecx.wrapping_add(0x4)) as usize); let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if cf { pc = 3; continue; }
-                pc = 4; continue;
-            }
-            4 => {
-                return;
-            }
-            _ => return,
-        }
-    }
-}
-leaf_rw!(f_70be50, r_70be50, w_70be50);
 
 #[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
 fn f_7683b0(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
@@ -5268,87 +5255,7 @@ fn f_9c6060(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
 }
 leaf_ro!(f_9c6060, r_9c6060);
 
-#[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
-fn f_9fe7d0(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
-    let (mut zf, mut sf, mut cf, mut of) = (false, false, false, false);
-    let mut pc = 0u32;
-    loop {
-        match pc {
-            0 => {
-                let r = (p.eax) ^ (p.eax);
-                p.eax = r;
-                let t = fl_logic(r, 32); (zf, sf, cf, of) = (t.zf, t.sf, false, false);
-                let x = m.rd((p.ecx.wrapping_add(0x4)) as usize); let y = p.eax; let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if (cf || zf) { pc = 4; continue; }
-                pc = 1; continue;
-            }
-            1 => {
-                pc = 3; continue;
-            }
-            2 => {
-                return; // unreachable
-            }
-            3 => {
-                p.edx = m.rd((p.ecx.wrapping_add(0x8)) as usize);
-                m.ww((p.edx.wrapping_add(p.eax.wrapping_mul(2))) as usize, 0xFFFFu32);
-                let x = p.eax; let y = 0x1u32; let t = fl_add(x, y, 0, 32);
-                p.eax = t.r;
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                let x = p.eax; let y = m.rd((p.ecx.wrapping_add(0x4)) as usize); let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if cf { pc = 3; continue; }
-                pc = 4; continue;
-            }
-            4 => {
-                return;
-            }
-            _ => return,
-        }
-    }
-}
-leaf_rw!(f_9fe7d0, r_9fe7d0, w_9fe7d0);
 
-#[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
-fn f_9feb30(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
-    let (mut zf, mut sf, mut cf, mut of) = (false, false, false, false);
-    let mut pc = 0u32;
-    loop {
-        match pc {
-            0 => {
-                let r = (p.eax) ^ (p.eax);
-                p.eax = r;
-                let t = fl_logic(r, 32); (zf, sf, cf, of) = (t.zf, t.sf, false, false);
-                let x = m.rd((p.ecx.wrapping_add(0x4)) as usize); let y = p.eax; let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if (cf || zf) { pc = 4; continue; }
-                pc = 1; continue;
-            }
-            1 => {
-                pc = 3; continue;
-            }
-            2 => {
-                return; // unreachable
-            }
-            3 => {
-                p.edx = m.rd((p.ecx.wrapping_add(0x8)) as usize);
-                m.ww((p.edx.wrapping_add(p.eax.wrapping_mul(2))) as usize, 0xFFFFu32);
-                let x = p.eax; let y = 0x1u32; let t = fl_add(x, y, 0, 32);
-                p.eax = t.r;
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                let x = p.eax; let y = m.rd((p.ecx.wrapping_add(0x4)) as usize); let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if cf { pc = 3; continue; }
-                pc = 4; continue;
-            }
-            4 => {
-                return;
-            }
-            _ => return,
-        }
-    }
-}
-leaf_rw!(f_9feb30, r_9feb30, w_9feb30);
 
 #[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
 fn f_a57b30(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
@@ -5386,46 +5293,6 @@ fn f_a57b30(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
 }
 leaf_rw!(f_a57b30, r_a57b30, w_a57b30);
 
-#[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
-fn f_a5fdf0(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
-    let (mut zf, mut sf, mut cf, mut of) = (false, false, false, false);
-    let mut pc = 0u32;
-    loop {
-        match pc {
-            0 => {
-                let r = (p.eax) ^ (p.eax);
-                p.eax = r;
-                let t = fl_logic(r, 32); (zf, sf, cf, of) = (t.zf, t.sf, false, false);
-                let x = m.rd((p.ecx.wrapping_add(0x4)) as usize); let y = p.eax; let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if (cf || zf) { pc = 4; continue; }
-                pc = 1; continue;
-            }
-            1 => {
-                pc = 3; continue;
-            }
-            2 => {
-                return; // unreachable
-            }
-            3 => {
-                p.edx = m.rd((p.ecx.wrapping_add(0x8)) as usize);
-                m.wd((p.edx.wrapping_add(p.eax.wrapping_mul(4))) as usize, 0x0u32);
-                let x = p.eax; let y = 0x1u32; let t = fl_add(x, y, 0, 32);
-                p.eax = t.r;
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                let x = p.eax; let y = m.rd((p.ecx.wrapping_add(0x4)) as usize); let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if cf { pc = 3; continue; }
-                pc = 4; continue;
-            }
-            4 => {
-                return;
-            }
-            _ => return,
-        }
-    }
-}
-leaf_rw!(f_a5fdf0, r_a5fdf0, w_a5fdf0);
 
 #[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
 fn f_a63700(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
@@ -5497,96 +5364,7 @@ fn f_a63740(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
 }
 leaf_rw!(f_a63740, r_a63740, w_a63740);
 
-#[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
-fn f_a77940(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
-    let (mut zf, mut sf, mut cf, mut of) = (false, false, false, false);
-    let mut stk = [0u32; 1];
-    let mut pc = 0u32;
-    loop {
-        match pc {
-            0 => {
-                let r = (p.eax) ^ (p.eax);
-                p.eax = r;
-                let t = fl_logic(r, 32); (zf, sf, cf, of) = (t.zf, t.sf, false, false);
-                let x = m.rd((p.ecx.wrapping_add(0x4)) as usize); let y = p.eax; let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if (cf || zf) { pc = 5; continue; }
-                pc = 1; continue;
-            }
-            1 => {
-                stk[0] = p.esi;
-                pc = 3; continue;
-            }
-            2 => {
-                return; // unreachable
-            }
-            3 => {
-                p.esi = m.rd((0xEB80F0u32) as usize);
-                p.edx = m.rd((p.ecx.wrapping_add(0x8)) as usize);
-                m.wd((p.edx.wrapping_add(p.eax.wrapping_mul(8))) as usize, p.esi);
-                p.esi = m.rd((0xEB80F4u32) as usize);
-                m.wd((p.edx.wrapping_add(p.eax.wrapping_mul(8)).wrapping_add(0x4)) as usize, p.esi);
-                let x = p.eax; let y = 0x1u32; let t = fl_add(x, y, 0, 32);
-                p.eax = t.r;
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                let x = p.eax; let y = m.rd((p.ecx.wrapping_add(0x4)) as usize); let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if cf { pc = 3; continue; }
-                pc = 4; continue;
-            }
-            4 => {
-                p.esi = stk[0];
-                pc = 5; continue;
-            }
-            5 => {
-                return;
-            }
-            _ => return,
-        }
-    }
-}
-leaf_rw!(f_a77940, r_a77940, w_a77940);
 
-#[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
-fn f_ad33d0(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
-    let (mut zf, mut sf, mut cf, mut of) = (false, false, false, false);
-    let mut pc = 0u32;
-    loop {
-        match pc {
-            0 => {
-                let r = (p.eax) ^ (p.eax);
-                p.eax = r;
-                let t = fl_logic(r, 32); (zf, sf, cf, of) = (t.zf, t.sf, false, false);
-                let x = m.rd((p.ecx.wrapping_add(0x4)) as usize); let y = p.eax; let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if (cf || zf) { pc = 4; continue; }
-                pc = 1; continue;
-            }
-            1 => {
-                pc = 3; continue;
-            }
-            2 => {
-                return; // unreachable
-            }
-            3 => {
-                p.edx = m.rd((p.ecx.wrapping_add(0x8)) as usize);
-                m.ww((p.edx.wrapping_add(p.eax.wrapping_mul(2))) as usize, 0xFFFFu32);
-                let x = p.eax; let y = 0x1u32; let t = fl_add(x, y, 0, 32);
-                p.eax = t.r;
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                let x = p.eax; let y = m.rd((p.ecx.wrapping_add(0x4)) as usize); let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if cf { pc = 3; continue; }
-                pc = 4; continue;
-            }
-            4 => {
-                return;
-            }
-            _ => return,
-        }
-    }
-}
-leaf_rw!(f_ad33d0, r_ad33d0, w_ad33d0);
 
 #[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
 fn f_ad5780(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
@@ -6249,46 +6027,6 @@ fn f_b73ca0(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
 }
 leaf_ro!(f_b73ca0, r_b73ca0);
 
-#[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
-fn f_b8a070(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
-    let (mut zf, mut sf, mut cf, mut of) = (false, false, false, false);
-    let mut pc = 0u32;
-    loop {
-        match pc {
-            0 => {
-                let r = (p.eax) ^ (p.eax);
-                p.eax = r;
-                let t = fl_logic(r, 32); (zf, sf, cf, of) = (t.zf, t.sf, false, false);
-                let x = m.rd((p.ecx.wrapping_add(0x4)) as usize); let y = p.eax; let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if (cf || zf) { pc = 4; continue; }
-                pc = 1; continue;
-            }
-            1 => {
-                pc = 3; continue;
-            }
-            2 => {
-                return; // unreachable
-            }
-            3 => {
-                p.edx = m.rd((p.ecx.wrapping_add(0x8)) as usize);
-                m.wd((p.edx.wrapping_add(p.eax.wrapping_mul(4))) as usize, 0xFFFFu32);
-                let x = p.eax; let y = 0x1u32; let t = fl_add(x, y, 0, 32);
-                p.eax = t.r;
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                let x = p.eax; let y = m.rd((p.ecx.wrapping_add(0x4)) as usize); let t = fl_sub(x, y, 0, 32);
-                (zf, sf, cf, of) = (t.zf, t.sf, t.cf, t.of);
-                if cf { pc = 3; continue; }
-                pc = 4; continue;
-            }
-            4 => {
-                return;
-            }
-            _ => return,
-        }
-    }
-}
-leaf_rw!(f_b8a070, r_b8a070, w_b8a070);
 
 #[allow(unused_assignments, unused_variables, unused_mut, unused_parens)]
 fn f_b8d100(p: &mut Pushad, a: *const u32, m: &mut dyn Mem) {
@@ -9175,7 +8913,7 @@ static PORTS: [Port; COUNT] = [
     port("human_slowmo_rise_list_find", 0x00493860, &B256, 0, 0, r_493860 as Run, Some(w_493860 as Writes), t256),
     port("string_pool::vf0", 0x004a4a80, &B257, 0, 0, nop as Run, None, t257),
     port("string_pool::size", 0x004a4b00, &B258, 0, 0, load_ecx::<0x3c> as Run, None, t258),
-    port("vhashtable<>::clear_buckets", 0x004ac100, &B259, 0, 0, r_4ac100 as Run, Some(w_4ac100 as Writes), t259),
+    port("vhashtable<>::clear_buckets", 0x004ac100, &B259, 0, 0, r_cb16 as Run, Some(w_cb2 as Writes), t259),
     port("lighting_ambient_debug_print", 0x004b26e0, &B260, 1, 4, r_4b26e0 as Run, Some(w_4b26e0 as Writes), t260),
     port("std::codecvt_base::scalar_deleting_dtor", 0x004e8380, &B261, 0, 0, eax_const::<1> as Run, None, t261),
     port("input_action_set", 0x004ff4b0, &B262, 0, 0, r_4ff4b0 as Run, Some(w_4ff4b0 as Writes), t262),
@@ -9288,8 +9026,8 @@ static PORTS: [Port; COUNT] = [
     port("critical_locked_msg::is_topmost", 0x0069d1f0, &B369, 0, 0, al_const::<1> as Run, None, t369),
     port("character_table_load", 0x006dfc60, &B370, 1, 4, r_6dfc60 as Run, Some(w_6dfc60 as Writes), t370),
     port("string_hash_table::vf0", 0x006f2d30, &B371, 0, 0, nop as Run, None, t371),
-    port("vhashtable<>::clear_buckets_2", 0x0070bc20, &B372, 0, 0, r_70bc20 as Run, Some(w_70bc20 as Writes), t372),
-    port("vhashtable<>::clear_buckets_3", 0x0070be50, &B373, 0, 0, r_70be50 as Run, Some(w_70be50 as Writes), t373),
+    port("vhashtable<>::clear_buckets_2", 0x0070bc20, &B372, 0, 0, r_cb16 as Run, Some(w_cb2 as Writes), t372),
+    port("vhashtable<>::clear_buckets_3", 0x0070be50, &B373, 0, 0, r_cb16 as Run, Some(w_cb2 as Writes), t373),
     port("ovl_buysell::show", 0x0075c640, &B374, 0, 0, nop as Run, None, t374),
     port("ovl_buysell::hide", 0x0075c650, &B375, 0, 0, nop as Run, None, t375),
     port("ovl_buysell::update", 0x0075c660, &B376, 0, 0, al_const::<0> as Run, None, t376),
@@ -9367,23 +9105,23 @@ static PORTS: [Port; COUNT] = [
     port("rl_container_inst::compute_pass_data", 0x009af500, &B448, 3, 12, al_const::<0> as Run, None, t448),
     port("rl_container_inst::pre_render", 0x009af510, &B449, 1, 4, nop as Run, None, t449),
     port("human_has_thrown_weapon", 0x009c6060, &B450, 0, 0, r_9c6060 as Run, None, t450),
-    port("vhashtable<>::clear_buckets_4", 0x009fe7d0, &B451, 0, 0, r_9fe7d0 as Run, Some(w_9fe7d0 as Writes), t451),
-    port("vhashtable<>::clear_buckets_5", 0x009feb30, &B452, 0, 0, r_9feb30 as Run, Some(w_9feb30 as Writes), t452),
+    port("vhashtable<>::clear_buckets_4", 0x009fe7d0, &B451, 0, 0, r_cb16 as Run, Some(w_cb2 as Writes), t451),
+    port("vhashtable<>::clear_buckets_5", 0x009feb30, &B452, 0, 0, r_cb16 as Run, Some(w_cb2 as Writes), t452),
     port("script_object::dtor_2", 0x00a57b30, &B453, 0, 0, r_a57b30 as Run, Some(w_a57b30 as Writes), t453),
     port("script_interior::parse", 0x00a58aa0, &B454, 1, 4, al_const::<0> as Run, None, t454),
-    port("vhashtable<>::clear_buckets_6", 0x00a5fdf0, &B455, 0, 0, r_a5fdf0 as Run, Some(w_a5fdf0 as Writes), t455),
+    port("vhashtable<>::clear_buckets_6", 0x00a5fdf0, &B455, 0, 0, r_cb32_0 as Run, Some(w_cb4 as Writes), t455),
     port("script_positionable_object::set_transform", 0x00a63700, &B456, 3, 12, r_a63700 as Run, Some(w_a63700 as Writes), t456),
     port("script_positionable_object::copy_transform_from", 0x00a63740, &B457, 1, 4, r_a63740 as Run, Some(w_a63740 as Writes), t457),
     port("script_respawn::parse", 0x00a64240, &B458, 1, 4, al_const::<0> as Run, None, t458),
     port("script_searchlight::on_object_spawned", 0x00a64370, &B459, 2, 8, nop as Run, None, t459),
-    port("vhashtable<>::clear_buckets_7", 0x00a77940, &B460, 0, 0, r_a77940 as Run, Some(w_a77940 as Writes), t460),
+    port("vhashtable<>::clear_buckets_7", 0x00a77940, &B460, 0, 0, r_cb64 as Run, Some(w_cb8 as Writes), t460),
     port("r_tree_inst::compute_pass_data", 0x00a8da50, &B461, 3, 12, al_const::<1> as Run, None, t461),
     port("r_tree_inst::pre_render", 0x00a8da60, &B462, 1, 4, nop as Run, None, t462),
     port("r_tree_inst::prepare_pass", 0x00a8da70, &B463, 3, 12, al_const::<1> as Run, None, t463),
     port("r_tree_inst::render_shadow", 0x00a8da80, &B464, 2, 8, nop as Run, None, t464),
     port("r_tree_inst::is_ready", 0x00a8da90, &B465, 0, 0, al_const::<1> as Run, None, t465),
     port("r_tree_inst::get_env_handle", 0x00a8daa0, &B466, 0, 0, zero_eax as Run, None, t466),
-    port("vhashtable<>::clear_buckets_8", 0x00ad33d0, &B467, 0, 0, r_ad33d0 as Run, Some(w_ad33d0 as Writes), t467),
+    port("vhashtable<>::clear_buckets_8", 0x00ad33d0, &B467, 0, 0, r_cb16 as Run, Some(w_cb2 as Writes), t467),
     port("vehicle_light_manager::get_light_name", 0x00ad4d60, &B468, 0, 0, zero_eax as Run, None, t468),
     port("vehicle_light_manager::update", 0x00ad4f50, &B469, 1, 4, nop as Run, None, t469),
     port("vehicle_light_manager::update_time_of_day", 0x00ad5780, &B470, 1, 4, r_ad5780 as Run, Some(w_ad5780 as Writes), t470),
@@ -9428,7 +9166,7 @@ static PORTS: [Port; COUNT] = [
     port("r_distant_vehicle_headlight_inst::render_shadow", 0x00b7ee80, &B509, 2, 8, nop as Run, None, t509),
     port("r_distant_vehicle_headlight_inst::is_ready", 0x00b7ee90, &B510, 0, 0, al_const::<1> as Run, None, t510),
     port("r_distant_vehicle_headlight_inst::get_env_handle", 0x00b7eea0, &B511, 0, 0, zero_eax as Run, None, t511),
-    port("vhashtable<>::clear_buckets_9", 0x00b8a070, &B512, 0, 0, r_b8a070 as Run, Some(w_b8a070 as Writes), t512),
+    port("vhashtable<>::clear_buckets_9", 0x00b8a070, &B512, 0, 0, r_cb32_ffff as Run, Some(w_cb4 as Writes), t512),
     port("vint_subscription_event_name", 0x00b8d100, &B513, 0, 0, r_b8d100 as Run, None, t513),
     port("vint_parse_decimal_wide", 0x00b91e70, &B514, 0, 0, r_b91e70 as Run, None, t514),
     port("vint_datagroup_close", 0x00b93b40, &B515, 0, 0, r_b93b40 as Run, Some(w_b93b40 as Writes), t515),
@@ -9510,10 +9248,12 @@ const OWNED_ELSEWHERE: [usize; 5] = [0x00b6_93e0, 0x0046_60b0, 0x00b6_8c20, 0x00
 
 pub fn install() {
     let mut ok = 0;
-    for port in PORTS.iter() {
-        if OWNED_ELSEWHERE.contains(&port.addr) || port.name.starts_with("vhashtable<>::clear_buckets") {
-            // clear_buckets: the translated loop is ~100x slower than the original on big tables
-            // (0.15 s a call in gameplay); left to the original, see docs/skipped_ports.md.
+    for (id, port) in PORTS.iter().enumerate() {
+        if port.name.starts_with("vhashtable<>::clear_buckets") {
+            // Bulk clears: shadow only the first BIG_SHADOW_CALLS calls.
+            BIG[id].store(true, Ordering::Relaxed);
+        }
+        if OWNED_ELSEWHERE.contains(&port.addr) {
             continue;
         }
         // The shadow copy first: replacing patches the entry.

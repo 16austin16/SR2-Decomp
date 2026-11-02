@@ -1,14 +1,1863 @@
-//! Ported functions (filled by a porting agent).
+//! Port module: the cutscene shot functions (table 0xDD28A0) and cutscene actions (table 0xDD2B28)
+//! of doc 51, each checked against the disassembly.
+//!
+//! Every port is a cdecl thunk that keeps ECX / EDX (`keep_ecx_edx_arg1`) around the Rust body,
+//! which is a superset of what each original preserves (the originals are cdecl, void, and callers
+//! of the tables ignore EAX).
+//!
+//! Checks:
+//! - `shadow`: for the first `SHADOW_CALLS` calls a relocated copy of the original runs first on
+//!   the real record, the bytes it wrote (the regions listed per port) are saved and restored, then
+//!   the Rust version runs and the regions are compared; on a mismatch the original's bytes are
+//!   put back (and counted). Used for the shot functions that only write globals / player fields
+//!   and call nothing.
+//! - counters: ports that call the game's functions (whose side effects cannot be run twice) keep
+//!   a per-port call counter and per-branch counters, no shadow.
 
-#![allow(unused_imports)]
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::portlib::*;
 use crate::{detour, log};
 
+const SHADOW_CALLS: u32 = 3000;
+const PLAYER_PTR: usize = 0x0252_7D10; // cutscene player object
+const GAME_NOW: usize = 0x00E8_43AC;
+const WRAP: i32 = 0x6B49_D200;
+
+struct St {
+    calls: AtomicU32,
+    mism: AtomicU32,
+    orig: AtomicUsize,
+}
+#[allow(clippy::declare_interior_mutable_const)]
+const ST0: St = St { calls: AtomicU32::new(0), mism: AtomicU32::new(0), orig: AtomicUsize::new(0) };
+static ST: [St; NPORTS] = [ST0; NPORTS];
+
+type Regions = unsafe fn(u32) -> Vec<(usize, usize)>;
+
+/// Run the original and the Rust body on the same state (first SHADOW_CALLS calls) and keep the
+/// original's writes on a mismatch.
+unsafe fn shadow(i: usize, rec: u32, rust: unsafe fn(u32), regions: Regions) {
+    let st = &ST[i];
+    let n = st.calls.fetch_add(1, Ordering::Relaxed);
+    if n >= SHADOW_CALLS {
+        unsafe { rust(rec) };
+        return;
+    }
+    let orig = st.orig.load(Ordering::Relaxed);
+    if orig == 0 {
+        unsafe { rust(rec) };
+        return;
+    }
+    unsafe {
+        let regs = regions(rec);
+        let snap: Vec<Vec<u8>> =
+            regs.iter().map(|&(a, l)| std::slice::from_raw_parts(a as *const u8, l).to_vec()).collect();
+        call_regs(orig, 0, 0, 0, 0, 0, &[rec]);
+        let after: Vec<Vec<u8>> =
+            regs.iter().map(|&(a, l)| std::slice::from_raw_parts(a as *const u8, l).to_vec()).collect();
+        for (k, &(a, l)) in regs.iter().enumerate() {
+            std::ptr::copy_nonoverlapping(snap[k].as_ptr(), a as *mut u8, l);
+        }
+        rust(rec);
+        let mut bad = false;
+        for (k, &(a, l)) in regs.iter().enumerate() {
+            let now = std::slice::from_raw_parts(a as *const u8, l);
+            if now != &after[k][..] {
+                bad = true;
+                std::ptr::copy_nonoverlapping(after[k].as_ptr(), a as *mut u8, l);
+            }
+        }
+        if bad {
+            st.mism.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// `fld dword; fstp dword`: quiets a signalling NaN.
+fn q(x: f32) -> f32 {
+    std::hint::black_box(x as f64) as f32
+}
+
+unsafe fn pl() -> usize {
+    unsafe { rd(PLAYER_PTR) as usize }
+}
+
+unsafe fn b8(rec: u32) -> u8 {
+    unsafe { rb(rec as usize + 8) }
+}
+
+unsafe fn f8(rec: u32) -> f32 {
+    unsafe { rf(rec as usize + 8) }
+}
+
+/// `now + ms`, wrapped with the signed `jle` test the shot functions use.
+fn now_plus(ms: i32) -> i32 {
+    let v = unsafe { rd(GAME_NOW) } as i32 + ms;
+    if v > WRAP { v - WRAP } else { v }
+}
+
+/// Defines the extern wrapper and the ECX / EDX keeping thunk of a shadowed port.
+macro_rules! sp {
+    ($w:ident, $t:ident, $idx:expr, $rust:ident, $reg:ident) => {
+        extern "C" fn $w(rec: u32) {
+            unsafe { shadow($idx, rec, $rust, $reg) }
+        }
+        keep_ecx_edx_arg1!($t, $w);
+    };
+}
+
+// === level_lights 0x6D7590 =========================================================================
+unsafe fn level_lights(rec: u32) {
+    unsafe { wb(0x0252_95C9, (b8(rec) == 0) as u8) }
+}
+unsafe fn level_lights_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x0252_95C9, 1)]
+}
+sp!(level_lights_w, level_lights_t, 0, level_lights, level_lights_r);
+
+// === tree_shadows 0x6D75B0 =========================================================================
+unsafe fn tree_shadows(rec: u32) {
+    unsafe { wd(0x00E9_8994, (b8(rec) != 0) as u32 + 1) }
+}
+unsafe fn tree_shadows_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x00E9_8994, 4)]
+}
+sp!(tree_shadows_w, tree_shadows_t, 1, tree_shadows, tree_shadows_r);
+
+// === tod_character_shadows 0x6D75D0 ================================================================
+unsafe fn tod_char_shadows(rec: u32) {
+    unsafe { wb(0x00E9_7D4E, b8(rec)) }
+}
+unsafe fn tod_char_shadows_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x00E9_7D4E, 1)]
+}
+sp!(tod_char_shadows_w, tod_char_shadows_t, 2, tod_char_shadows, tod_char_shadows_r);
+
+// === motion_blur 0x6D75E0 ==========================================================================
+unsafe fn motion_blur(rec: u32) {
+    unsafe {
+        let b = (b8(rec) == 0) as u8;
+        wb(pl() + 0x15E0, b);
+    }
+}
+unsafe fn motion_blur_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(unsafe { pl() } + 0x15E0, 1)]
+}
+sp!(motion_blur_w, motion_blur_t, 3, motion_blur, motion_blur_r);
+
+// === motion_blur_override 0x6D7600 =================================================================
+unsafe fn motion_blur_override(rec: u32) {
+    unsafe {
+        let p = rd(rec as usize + 8) as usize;
+        let d = pl() + 0x15E4;
+        let (a, b, c) = (rd(p), rd(p + 4), rd(p + 8));
+        wd(d, a);
+        wd(d + 4, b);
+        wd(d + 8, c);
+    }
+}
+unsafe fn motion_blur_override_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(unsafe { pl() } + 0x15E4, 12)]
+}
+sp!(motion_blur_override_w, motion_blur_override_t, 4, motion_blur_override, motion_blur_override_r);
+
+// === camera_moves_with_target 0x6D7630 =============================================================
+unsafe fn camera_moves(rec: u32) {
+    unsafe { wb(0x025F_5D90, b8(rec)) }
+}
+unsafe fn camera_moves_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x025F_5D90, 1)]
+}
+sp!(camera_moves_w, camera_moves_t, 5, camera_moves, camera_moves_r);
+
+// === disable_trees 0x6D7640 ========================================================================
+unsafe fn disable_trees(rec: u32) {
+    unsafe { wb(0x00E8_78BB, (b8(rec) == 0) as u8) }
+}
+unsafe fn disable_trees_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x00E8_78BB, 1)]
+}
+sp!(disable_trees_w, disable_trees_t, 6, disable_trees, disable_trees_r);
+
+// === city_no_render_al 0x6D7660 ====================================================================
+unsafe fn city_no_render_al(rec: u32) {
+    unsafe { wb(0x0252_6CC5, b8(rec)) }
+}
+unsafe fn city_no_render_al_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x0252_6CC5, 1)]
+}
+sp!(city_no_render_al_w, city_no_render_al_t, 7, city_no_render_al, city_no_render_al_r);
+
+// === shader_lod_force_highest 0x6D7670 =============================================================
+unsafe fn shader_lod_force(rec: u32) {
+    unsafe {
+        if b8(rec) == 1 {
+            let p = pl();
+            if rd(p + 0x165C) as i32 == -2 {
+                wd(p + 0x165C, rd(0x00E8_49D0));
+            }
+            wb(0x0252_6DC4, 0);
+            wd(0x00E8_49D0, 0);
+        }
+    }
+}
+unsafe fn shader_lod_force_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(unsafe { pl() } + 0x165C, 4), (0x0252_6DC4, 1), (0x00E8_49D0, 4)]
+}
+sp!(shader_lod_force_w, shader_lod_force_t, 8, shader_lod_force, shader_lod_force_r);
+
+// === city_shadow_dist 0x6D76B0 =====================================================================
+unsafe fn city_shadow_dist(rec: u32) {
+    unsafe { wf(0x00E8_49A0, q(f8(rec))) }
+}
+unsafe fn city_shadow_dist_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x00E8_49A0, 4)]
+}
+sp!(city_shadow_dist_w, city_shadow_dist_t, 9, city_shadow_dist, city_shadow_dist_r);
+
+// === far_clip 0x6D7720 =============================================================================
+// fldz; fcomp [v]; test ah, 5; jp skip -> stores only when 0.0 < v.
+unsafe fn far_clip(rec: u32) {
+    unsafe {
+        let v = f8(rec);
+        if 0.0f64 < v as f64 {
+            wf(0x00E9_8988, q(v));
+        }
+    }
+}
+unsafe fn far_clip_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x00E9_8988, 4)]
+}
+sp!(far_clip_w, far_clip_t, 10, far_clip, far_clip_r);
+
+// === near_clip_danger 0x6D7740 =====================================================================
+unsafe fn near_clip(rec: u32) {
+    unsafe { wf(0x00E9_898C, q(f8(rec))) }
+}
+unsafe fn near_clip_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x00E9_898C, 4)]
+}
+sp!(near_clip_w, near_clip_t, 11, near_clip, near_clip_r);
+
+// === shot_fade_out 0x6D77A0 ========================================================================
+unsafe fn shot_fade_out(rec: u32) {
+    unsafe {
+        let v = f8(rec);
+        if 0.0f64 < v as f64 {
+            let s = rd(pl() + 0x1540) as usize;
+            wf(s + 0x164, q(v));
+            let s = rd(pl() + 0x1540) as usize;
+            wf(s + 0x168, q(v));
+        }
+    }
+}
+unsafe fn shot_fade_out_r(_: u32) -> Vec<(usize, usize)> {
+    unsafe { vec![(rd(pl() + 0x1540) as usize + 0x164, 8)] }
+}
+sp!(shot_fade_out_w, shot_fade_out_t, 12, shot_fade_out, shot_fade_out_r);
+
+/// `([0x27E6714] - [0x27E6710])` stored as f32, minus `v` stored as f32 (the midway fades).
+unsafe fn midway_value(v: f32) -> f32 {
+    unsafe {
+        let a = (rf(0x027E_6714) as f64 - rf(0x027E_6710) as f64) as f32;
+        (a as f64 - v as f64) as f32
+    }
+}
+
+// === shot_fade_out_midway 0x6D77E0 =================================================================
+unsafe fn shot_fade_out_midway(rec: u32) {
+    unsafe {
+        let v = f8(rec);
+        if 0.0f64 < v as f64 {
+            let p = pl();
+            let b = midway_value(v);
+            let s = rd(p + 0x1540) as usize;
+            wf(s + 0x164, b);
+            let s = rd(p + 0x1540) as usize;
+            wf(s + 0x168, q(rf(0x00DD_1C8C)));
+        }
+    }
+}
+unsafe fn shot_fade_out_midway_r(_: u32) -> Vec<(usize, usize)> {
+    unsafe { vec![(rd(pl() + 0x1540) as usize + 0x164, 8)] }
+}
+sp!(shot_fade_out_midway_w, shot_fade_out_midway_t, 13, shot_fade_out_midway, shot_fade_out_midway_r);
+
+// === shot_cut_out_midway 0x6D7840 ==================================================================
+// Same, but the second field gets the 0.0 still on the x87 stack.
+unsafe fn shot_cut_out_midway(rec: u32) {
+    unsafe {
+        let v = f8(rec);
+        if 0.0f64 < v as f64 {
+            let p = pl();
+            let b = midway_value(v);
+            let s = rd(p + 0x1540) as usize;
+            wf(s + 0x164, b);
+            let s = rd(p + 0x1540) as usize;
+            wf(s + 0x168, 0.0);
+        }
+    }
+}
+sp!(shot_cut_out_midway_w, shot_cut_out_midway_t, 14, shot_cut_out_midway, shot_fade_out_midway_r);
+
+// === letterbox_fade_in 0x6D7890 ====================================================================
+unsafe fn letterbox_fade_in(rec: u32) {
+    unsafe {
+        if b8(rec) == 1 {
+            wb(0x0140_C85A, 1);
+            wf(0x01F7_6904, 0.0);
+            wd(0x00EA_C468, now_plus(0x3E8) as u32);
+        }
+    }
+}
+unsafe fn letterbox_fade_in_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x0140_C85A, 1), (0x01F7_6904, 4), (0x00EA_C468, 4)]
+}
+sp!(letterbox_fade_in_w, letterbox_fade_in_t, 15, letterbox_fade_in, letterbox_fade_in_r);
+
+// === letterbox_fade_out 0x6D78D0 ===================================================================
+unsafe fn letterbox_fade_out(rec: u32) {
+    unsafe {
+        if b8(rec) == 1 {
+            let s = rd(pl() + 0x1540) as usize;
+            wb(s + 0x16C, 1);
+        }
+    }
+}
+unsafe fn letterbox_fade_out_r(_: u32) -> Vec<(usize, usize)> {
+    unsafe { vec![(rd(pl() + 0x1540) as usize + 0x16C, 1)] }
+}
+sp!(letterbox_fade_out_w, letterbox_fade_out_t, 16, letterbox_fade_out, letterbox_fade_out_r);
+
+// === framebuffer_tint 0x6D78F0 =====================================================================
+// Builds a 9-dword record on the stack and `rep movsd`s it to player+0x155C. The record's byte at
+// +4 is 1 and its other three bytes are stale stack: only that byte is written here (the shadow
+// leaves the three bytes out of the comparison).
+unsafe fn framebuffer_tint(rec: u32) {
+    unsafe {
+        let p = rd(rec as usize + 8) as usize;
+        let (r, g, b) = (rb(p), rb(p + 1), rb(p + 2));
+        if r == 0 && g == 0 && b == 0 {
+            return;
+        }
+        let k = *(0x00E5_C038 as *const f64);
+        let a = q(rf(p + 4));
+        let rf_ = (r as f64 / k) as f32;
+        let gf_ = (g as f64 / k) as f32;
+        let bf_ = (b as f64 / k) as f32;
+        let big_r = (rf_ as f64 * a as f64) as f32;
+        let big_g = (gf_ as f64 * a as f64) as f32;
+        let big_b = (a as f64 * bf_ as f64) as f32;
+        let d = pl() + 0x155C;
+        wd(d, 3);
+        wb(d + 4, 1);
+        wf(d + 8, big_r);
+        wf(d + 0xC, big_g);
+        wf(d + 0x10, big_b);
+        wf(d + 0x14, 1.0);
+        wf(d + 0x18, q(rf(p + 0xC)));
+        wf(d + 0x1C, q(rf(p + 8)));
+        wf(d + 0x20, q(rf(p + 0x10)));
+    }
+}
+unsafe fn framebuffer_tint_r(_: u32) -> Vec<(usize, usize)> {
+    let d = unsafe { pl() } + 0x155C;
+    vec![(d, 4), (d + 4, 1), (d + 8, 0x1C)]
+}
+sp!(framebuffer_tint_w, framebuffer_tint_t, 17, framebuffer_tint, framebuffer_tint_r);
+
+// === force_tod_lights 0x6D79E0 =====================================================================
+unsafe fn force_tod_lights(rec: u32) {
+    unsafe {
+        let c = b8(rec);
+        wb(0x0252_6CC3, 1);
+        wb(0x0252_6CC4, c);
+    }
+}
+unsafe fn force_tod_lights_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x0252_6CC3, 2)]
+}
+sp!(force_tod_lights_w, force_tod_lights_t, 18, force_tod_lights, force_tod_lights_r);
+
+// === lightning 0x6D7D70 ============================================================================
+unsafe fn lightning(rec: u32) {
+    unsafe {
+        if b8(rec) != 0 {
+            wd(0x00E9_A848, now_plus(0x1388) as u32);
+        } else {
+            wd(0x00E9_A848, 0xFFFF_FFFF);
+        }
+    }
+}
+unsafe fn lightning_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x00E9_A848, 4)]
+}
+sp!(lightning_w, lightning_t, 19, lightning, lightning_r);
+
+// === glares 0x6D8120 ===============================================================================
+unsafe fn glares(rec: u32) {
+    unsafe { wb(0x00E9_7D56, (b8(rec) != 0) as u8) }
+}
+unsafe fn glares_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x00E9_7D56, 1)]
+}
+sp!(glares_w, glares_t, 20, glares, glares_r);
+
+// === fog_distance 0x6D8170 =========================================================================
+// Each of the three floats is tested with `fcom`; `test ah, 0x41 / jp` falls through when
+// 0.0 <= x (ordered), otherwise the enable byte is cleared.
+unsafe fn fog_distance(rec: u32) {
+    unsafe {
+        let p = rd(rec as usize + 8) as usize;
+        let (x, y, z) = (rf(p) as f64, rf(p + 4) as f64, rf(p + 8) as f64);
+        if 0.0f64 <= x && 0.0f64 <= y && 0.0f64 <= z {
+            let (a, b, c) = (rd(p), rd(p + 4), rd(p + 8));
+            wb(0x0265_8CA4, 1);
+            wd(0x0265_8CA8, a);
+            wd(0x0265_8CAC, b);
+            wd(0x0265_8CB0, c);
+        } else {
+            wb(0x0265_8CA4, 0);
+        }
+    }
+}
+unsafe fn fog_distance_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x0265_8CA4, 1), (0x0265_8CA8, 12)]
+}
+sp!(fog_distance_w, fog_distance_t, 21, fog_distance, fog_distance_r);
+
+// === city_region_blend 0x6D81E0 ====================================================================
+unsafe fn city_region_blend(rec: u32) {
+    unsafe { wb(0x00E9_96E6, b8(rec)) }
+}
+unsafe fn city_region_blend_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x00E9_96E6, 1)]
+}
+sp!(city_region_blend_w, city_region_blend_t, 22, city_region_blend, city_region_blend_r);
+
+// === city_render_fade_dist_scale 0x6D81F0 ==========================================================
+unsafe fn city_render_fade(rec: u32) {
+    unsafe { wf(0x00E9_96B4, q(f8(rec))) }
+}
+unsafe fn city_render_fade_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x00E9_96B4, 4)]
+}
+sp!(city_render_fade_w, city_render_fade_t, 23, city_render_fade, city_render_fade_r);
+
+// === drug_effect 0x6D8200 ==========================================================================
+unsafe fn drug_effect(rec: u32) {
+    unsafe {
+        let p = rd(rec as usize + 8) as usize;
+        let pp = pl();
+        wf(pp + 0x15D8, q(rf(p)));
+        wf(pp + 0x15DC, q(rf(p + 4)));
+    }
+}
+unsafe fn drug_effect_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(unsafe { pl() } + 0x15D8, 8)]
+}
+sp!(drug_effect_w, drug_effect_t, 24, drug_effect, drug_effect_r);
+
+// === rain_override 0x6D8240 ========================================================================
+// v < 0.0 or NaN (the `test ah, 1` of an fcom with 0.0 under it): flag 0 and 0.0, else flag 1 and v.
+unsafe fn rain_override(rec: u32) {
+    unsafe {
+        let v = q(f8(rec));
+        if v < 0.0 || v.is_nan() {
+            wb(0x0252_6D78, 0);
+            wf(0x0252_6D7C, 0.0);
+        } else {
+            wb(0x0252_6D78, 1);
+            wf(0x0252_6D7C, v);
+        }
+    }
+}
+unsafe fn rain_override_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(0x0252_6D78, 1), (0x0252_6D7C, 4)]
+}
+sp!(rain_override_w, rain_override_t, 25, rain_override, rain_override_r);
+
+// === credits_roll 0x6D82D0 =========================================================================
+unsafe fn credits_roll(rec: u32) {
+    unsafe {
+        let v = (f8(rec) as f64 + rf(0x027E_66FC) as f64) as f32;
+        wf(pl() + 0xB08, v);
+    }
+}
+unsafe fn credits_roll_r(_: u32) -> Vec<(usize, usize)> {
+    vec![(unsafe { pl() } + 0xB08, 4)]
+}
+sp!(credits_roll_w, credits_roll_t, 26, credits_roll, credits_roll_r);
+
+
+// ====================================================================================================
+// Ports that call the game's functions (counters only)
+// ====================================================================================================
+
+/// Per-port branch counters (four per port).
+static BR: [AtomicU32; NPORTS * 4] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicU32 = AtomicU32::new(0);
+    [Z; NPORTS * 4]
+};
+
+fn hit(i: usize, k: usize) {
+    BR[i * 4 + k].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Entry counter + wrapper + ECX / EDX keeping thunk of a counter port taking the record.
+macro_rules! cp {
+    ($w:ident, $t:ident, $idx:expr, $rust:ident) => {
+        extern "C" fn $w(rec: u32) {
+            ST[$idx].calls.fetch_add(1, Ordering::Relaxed);
+            unsafe { $rust(rec) }
+        }
+        keep_ecx_edx_arg1!($t, $w);
+    };
+}
+
+/// `call_regs` for a callee that returns on the x87 stack: the result is popped as a qword.
+unsafe fn call_regs_st0(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> f64 {
+    let mut out = 0f64;
+    let block: [u32; 9] =
+        [f as u32, ecx, edx, esi, edi, args.as_ptr() as u32, args.len() as u32, eax, &mut out as *mut f64 as u32];
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "mov ebp, esp",
+            "mov ebx, eax",
+            "mov ecx, [ebx + 24]",
+            "mov esi, [ebx + 20]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]", "mov esi, [ebx + 12]", "mov edi, [ebx + 16]",
+            "mov eax, [ebx + 28]",
+            "call dword ptr [ebx]",
+            "mov ecx, [ebx + 32]",
+            "fstp qword ptr [ecx]",
+            "mov esp, ebp",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("eax") block.as_ptr() => _, lateout("ecx") _, lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    out
+}
+
+/// `fld qword [x]; call 0xDA0140` (the game's float -> int, truncating): the int result in EAX.
+unsafe fn ftol(x: f64) -> i32 {
+    let r: i32;
+    unsafe {
+        std::arch::asm!(
+            "fld qword ptr [ecx]",
+            "call edx",
+            in("ecx") &x as *const f64,
+            in("edx") 0x00DA_0140usize,
+            lateout("eax") r,
+            clobber_abi("C"),
+        );
+    }
+    r
+}
+
+/// `push s; call _atof (0xC984F5); add esp, 4` with the result popped from ST0.
+unsafe fn atof(s: u32) -> f64 {
+    let mut out = 0f64;
+    unsafe {
+        std::arch::asm!(
+            "push ecx",
+            "call eax",
+            "add esp, 4",
+            "fstp qword ptr [edi]",
+            in("ecx") s,
+            in("eax") 0x00C9_84F5usize,
+            in("edi") &mut out as *mut f64,
+            clobber_abi("C"),
+        );
+    }
+    out
+}
+
+/// `script_find_object_by_name` (0xA52BB0, ECX = name, EAX = &found) and, when it did not find
+/// it, `script_object_to_human` (0xA52C70, ESI = name). Returns EAX as the callers test it.
+unsafe fn find_obj(name: u32) -> u32 {
+    unsafe {
+        let mut found = 0u32;
+        let o = call_regs(0x00A5_2BB0, &mut found as *mut u32 as u32, name, 0, 0, 0, &[]);
+        if found & 0xFF != 0 {
+            o
+        } else {
+            call_regs(0x00A5_2C70, o, 0, 0, name, 0, &[])
+        }
+    }
+}
+
+/// `string_crc32` (0xBDCA30, stdcall, EAX = &out, EDX = 0) then `navpoint_find` (0xA5EB50,
+/// EAX = &hash, still the pointer the crc call received).
+unsafe fn navpoint(name: u32) -> u32 {
+    unsafe {
+        let mut h = 0u32;
+        let pa = &mut h as *mut u32 as u32;
+        call_regs(0x00BD_CA30, pa, 0, 0, 0, 0, &[name]);
+        call_regs(0x00A5_EB50, pa, 0, 0, 0, 0, &[])
+    }
+}
+
+/// A virtual call `this->vtable[slot](...)`: ECX = this, EDX = vtable, EAX = the function.
+unsafe fn vcall(this: u32, slot: usize) -> u32 {
+    unsafe {
+        let vt = rd(this as usize);
+        let f = rd(vt as usize + slot * 4);
+        call_regs(f as usize, f, this, vt, 0, 0, &[])
+    }
+}
+
+// --- shot functions with callees ------------------------------------------------------------------
+
+// 0x6D7510 spawning_peds_disabled: b8 == 1 -> clear the ped flags, run b7da30, set the dirty byte.
+unsafe fn spawning_peds(rec: u32) {
+    unsafe {
+        if b8(rec) == 1 {
+            hit(27, 0);
+            wb(0x0215_DA25, 0);
+            wb(0x0215_DA05, 0);
+            call(0x00B7_DA30);
+            wb(0x0252_9620, 1);
+        } else {
+            hit(27, 1);
+            wb(0x0215_DA25, 1);
+            wb(0x0215_DA05, 1);
+            call(0x00B7_DA30);
+        }
+    }
+}
+cp!(spawning_peds_w, spawning_peds_t, 27, spawning_peds);
+
+// 0x6D7550 spawning_cars_disabled
+unsafe fn spawning_cars(rec: u32) {
+    unsafe {
+        if b8(rec) == 1 {
+            hit(28, 0);
+            wb(0x0215_DA1D, 0);
+            call(0x0093_C660);
+            wb(0x0215_D9FD, 0);
+            call(0x00B8_1130);
+            wb(0x0252_9620, 1);
+        } else {
+            hit(28, 1);
+            wb(0x0215_D9FD, 1);
+            call(0x00B8_1130);
+            wb(0x0252_9620, 1);
+        }
+    }
+}
+cp!(spawning_cars_w, spawning_cars_t, 28, spawning_cars);
+
+// 0x6D76D0 spawning_remove_all
+unsafe fn spawning_remove_all(rec: u32) {
+    unsafe {
+        if b8(rec) == 1 {
+            hit(29, 0);
+            wb(0x0215_DA25, 0);
+            wb(0x0215_DA1D, 0);
+            call(0x0093_C660);
+            wb(0x0215_DA05, 0);
+            call(0x00B7_DA30);
+            wb(0x0215_D9FD, 0);
+            call(0x00B8_1130);
+            wb(0x0252_9620, 1);
+        }
+    }
+}
+cp!(spawning_remove_all_w, spawning_remove_all_t, 29, spawning_remove_all);
+
+// 0x6D7A60 hide_player_compnt: EDI = name -> 0x9E7530 (index or -1); then 0x9EA4E0 / 0x9EA660.
+unsafe fn hide_player_compnt(rec: u32) {
+    unsafe {
+        let name = rd(rec as usize + 8);
+        let idx = call_regs(0x009E_7530, 0, 0, 0, 0, name, &[]);
+        if idx != 0xFFFF_FFFF {
+            hit(30, 0);
+            let p = rd(0x0217_03D4);
+            let v = rd(p as usize + 0x13B0);
+            call_regs(0x009E_A4E0, idx, p, v, 0, 0, &[v, idx]);
+        } else {
+            hit(30, 1);
+            let p = rd(0x0217_03D4);
+            let v = rd(p as usize + 0x13B0);
+            call_regs(0x009E_A660, p, v, 0, 0, 0, &[v]);
+        }
+    }
+}
+cp!(hide_player_compnt_w, hide_player_compnt_t, 30, hide_player_compnt);
+
+// 0x6D8140 time_of_day_set: ECX = int(v) for 0x68A5C0.
+unsafe fn time_of_day_set(rec: u32) {
+    unsafe {
+        let n = ftol(f8(rec) as f64) as u32;
+        call_regs(0x0068_A5C0, n, n, 0, 0, 0, &[]);
+    }
+}
+cp!(time_of_day_set_w, time_of_day_set_t, 31, time_of_day_set);
+
+// 0x6D7AA0 bink_play: n = int(v); n >= 1 -> set volume (import 0xDB8400) and pause(0)
+// (0xDB83D0); n < 0 -> pause(1); n == 0 -> nothing. Handle at 0x140E670.
+unsafe fn bink_play(rec: u32) {
+    unsafe {
+        let n = ftol(f8(rec) as f64);
+        let h = rd(0x0140_E670);
+        if n >= 1 {
+            hit(32, 0);
+            if h != 0 {
+                call_regs(import(0x00DB_8400), 0, 0, 0, 0, 0, &[h, n as u32, 1]);
+                call_regs(import(0x00DB_83D0), 0, 0, 0, 0, 0, &[h, 0]);
+            }
+        } else if n < 0 {
+            hit(32, 1);
+            if h != 0 {
+                call_regs(import(0x00DB_83D0), 0, 0, 0, 0, 0, &[h, 1]);
+            }
+        }
+    }
+}
+cp!(bink_play_w, bink_play_t, 32, bink_play);
+
+// 0x6D7AF0 / 0x6D7B10 mesh_mover_hide / show: door by name (0xA5B6E0, EAX = name) -> ESI = door.
+unsafe fn mesh_mover_hide(rec: u32) {
+    unsafe {
+        let name = rd(rec as usize + 8);
+        if name != 0 {
+            let d = call_regs(0x00A5_B6E0, name, 0, 0, 0, 0, &[]);
+            if d != 0 {
+                hit(33, 0);
+                call_regs(0x00A5_B800, d, 0, 0, d, 0, &[]);
+            }
+        }
+    }
+}
+cp!(mesh_mover_hide_w, mesh_mover_hide_t, 33, mesh_mover_hide);
+
+unsafe fn mesh_mover_show(rec: u32) {
+    unsafe {
+        let name = rd(rec as usize + 8);
+        if name != 0 {
+            let d = call_regs(0x00A5_B6E0, name, 0, 0, 0, 0, &[]);
+            if d != 0 {
+                hit(34, 0);
+                call_regs(0x00A5_B970, d, 0, 0, d, 0, &[]);
+            }
+        }
+    }
+}
+cp!(mesh_mover_show_w, mesh_mover_show_t, 34, mesh_mover_show);
+
+// 0x6D8280 chunk_hide: EDI = name -> 0x4A9770 (chunk); bit 0 of chunk+0x1D set; the name pointer
+// (rec + 8) is added to the player's list at +0x1EE4 (0x6D8A10, ECX = list, stdcall 1 arg).
+unsafe fn chunk_hide(rec: u32) {
+    unsafe {
+        let name = rd(rec as usize + 8);
+        let c = call_regs(0x004A_9770, 0, 0, 0, 0, name, &[]);
+        if c != 0 {
+            hit(35, 0);
+            let list = rd(PLAYER_PTR) + 0x1EE4;
+            wb(c as usize + 0x1D, rb(c as usize + 0x1D) | 1);
+            call_regs(0x006D_8A10, c, list, 0, 0, 0, &[rec + 8]);
+        }
+    }
+}
+cp!(chunk_hide_w, chunk_hide_t, 35, chunk_hide);
+
+// 0x6D82B0 chunk_show
+unsafe fn chunk_show(rec: u32) {
+    unsafe {
+        let name = rd(rec as usize + 8);
+        let c = call_regs(0x004A_9770, 0, 0, 0, 0, name, &[]);
+        if c != 0 {
+            hit(36, 0);
+            wb(c as usize + 0x1D, rb(c as usize + 0x1D) & 0xFE);
+        }
+    }
+}
+cp!(chunk_show_w, chunk_show_t, 36, chunk_show);
+
+// 0x6D7DB0 weather_stage: index = 0x4DEE30(name) (-1 when unknown); player+0x43D4 = 1; the forced
+// weather is applied through 0x4DEC00 (EAX = index, CL = 1).
+unsafe fn weather_stage(rec: u32) {
+    unsafe {
+        let name = rd(rec as usize + 8);
+        if name != 0 {
+            let idx = call_regs(0x004D_EE30, 0, 0, 0, 0, 0, &[name]);
+            if idx != 0xFFFF_FFFF {
+                hit(37, 0);
+                wb(rd(PLAYER_PTR) as usize + 0x43D4, 1);
+                call_regs(0x004D_EC00, idx, 1, 0, 0, 0, &[]);
+            }
+        }
+    }
+}
+cp!(weather_stage_w, weather_stage_t, 37, weather_stage);
+
+// 0x6D7750 shot_fade_in: when 0.0 < v: 0x4D1270(int(v * 1000.0), 0.0f) with DL = 0, then
+// player+0xB03 = 1 unless player+0xB02 is set.
+unsafe fn shot_fade_in(rec: u32) {
+    unsafe {
+        let v = f8(rec);
+        if 0.0f64 < v as f64 {
+            hit(38, 0);
+            let ms = ftol(v as f64 * *(0x00E5_C0D8 as *const f64));
+            call_regs(0x004D_1270, 0, 0, 0, 0, 0, &[ms as u32, 0]);
+            let p = pl();
+            if rb(p + 0xB02) == 0 {
+                hit(38, 1);
+                wb(p + 0xB03, 1);
+            }
+        }
+    }
+}
+cp!(shot_fade_in_w, shot_fade_in_t, 38, shot_fade_in);
+
+// --- actions --------------------------------------------------------------------------------------
+
+const CAM_SET: usize = 0x004A_29E0; // EAX = pos ptr, ECX = flag/ptr, ESI = target object, EDI = orient ptr
+const CAM_POS: u32 = 0x025F_5B20;
+
+// 0x6CB680 cam_stop_track
+unsafe fn act_cam_stop_track(_rec: u32) {
+    unsafe {
+        call_regs(CAM_SET, CAM_POS, 0, 0, 0, 0, &[]);
+    }
+}
+cp!(act_cam_stop_track_w, act_cam_stop_track_t, 39, act_cam_stop_track);
+
+// 0x6CB2E0 cam_track_char
+unsafe fn act_cam_track_char(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 0xC);
+        if n != 0 {
+            let o = find_obj(n);
+            if o != 0 {
+                hit(40, 0);
+                call_regs(CAM_SET, CAM_POS, 0x00DD_80C8, 0, o, 0, &[]);
+            }
+        }
+    }
+}
+cp!(act_cam_track_char_w, act_cam_track_char_t, 40, act_cam_track_char);
+
+// 0x6CB330 cam_look_at_char
+unsafe fn act_cam_look_at_char(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 0xC);
+        if n != 0 {
+            let o = find_obj(n);
+            if o != 0 {
+                hit(41, 0);
+                call_regs(CAM_SET, CAM_POS, 0x00DD_80C8, 0, o, 0, &[]);
+                call_regs(CAM_SET, CAM_POS, 0, 0, 0, 0, &[]);
+            }
+        }
+    }
+}
+cp!(act_cam_look_at_char_w, act_cam_look_at_char_t, 41, act_cam_look_at_char);
+
+// 0x6CB6E0 / 0x6CB730 hide_character / show_character: 0x926860 (ECX = human, args (a, 1, b)).
+unsafe fn act_hide_character(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        if n != 0 {
+            let o = find_obj(n);
+            if o != 0 {
+                hit(42, 0);
+                call_regs(0x0092_6860, 0, o, 0, n, 0, &[1, 1, 0]);
+            }
+        }
+    }
+}
+cp!(act_hide_character_w, act_hide_character_t, 42, act_hide_character);
+
+unsafe fn act_show_character(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        if n != 0 {
+            let o = find_obj(n);
+            if o != 0 {
+                hit(43, 0);
+                call_regs(0x0092_6860, 0, o, 0, n, 0, &[0, 1, 0]);
+            }
+        }
+    }
+}
+cp!(act_show_character_w, act_show_character_t, 43, act_show_character);
+
+// 0x6CB780 disable_physics
+unsafe fn act_disable_physics(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        if n != 0 {
+            let o = find_obj(n);
+            if o != 0 {
+                hit(44, 0);
+                call_regs(0x006F_C610, 0, 0, 0, o, 0, &[0x14, 0]);
+                let e = rd(o as usize + 0x570);
+                if e != 0 {
+                    wb(e as usize + 0x130, rb(e as usize + 0x130) | 2);
+                }
+                wd(o as usize + 0xCC, rd(o as usize + 0xCC) | 0x40_0000);
+            }
+        }
+    }
+}
+cp!(act_disable_physics_w, act_disable_physics_t, 44, act_disable_physics);
+
+// 0x6CB7E0 enable_physics
+unsafe fn act_enable_physics(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        if n != 0 {
+            let o = find_obj(n);
+            if o != 0 {
+                hit(45, 0);
+                call_regs(0x006F_C610, 0, 0, 0, o, 0, &[0xF, 0]);
+                let e = rd(o as usize + 0x570);
+                if e != 0 {
+                    wb(e as usize + 0x130, rb(e as usize + 0x130) & 0xFD);
+                }
+                call_regs(0x0095_F090, o, 0, 0, 0, 0, &[o + 0x14, 0, 0xFFFF_FFFF, 0]);
+                wd(o as usize + 0xCC, rd(o as usize + 0xCC) & 0xFFBF_FFFF);
+            }
+        }
+    }
+}
+cp!(act_enable_physics_w, act_enable_physics_t, 45, act_enable_physics);
+
+// 0x6CB850 hide_vehicle: 0xA70030 (EAX = name) -> object; vslot 0x2C (is-vehicle-like, AL) then
+// vslot 0x34 -> the vehicle; 0xAACC60(handle, 1, 0).
+unsafe fn act_hide_vehicle(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        let o = call_regs(0x00A7_0030, n, 0, 0, 0, 0, &[]);
+        if o != 0 && (vcall(o, 0x2C / 4) & 0xFF) != 0 {
+            hit(46, 0);
+            let v = vcall(o, 0x34 / 4);
+            let h = rd(v as usize + 0x44);
+            call_regs(0x00AA_CC60, 0, 0, 0, 0, 0, &[h, 1, 0]);
+        }
+    }
+}
+cp!(act_hide_vehicle_w, act_hide_vehicle_t, 46, act_hide_vehicle);
+
+// 0x6CB890 show_vehicle: as hide, 0xAACC60(handle, 0, 0), then a tail call of vslot 0x20 of the vehicle.
+unsafe fn act_show_vehicle(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        let o = call_regs(0x00A7_0030, n, 0, 0, 0, 0, &[]);
+        if o != 0 && (vcall(o, 0x2C / 4) & 0xFF) != 0 {
+            hit(47, 0);
+            let v = vcall(o, 0x34 / 4);
+            let h = rd(v as usize + 0x44);
+            call_regs(0x00AA_CC60, 0, 0, 0, 0, 0, &[h, 0, 0]);
+            vcall(v, 0x20 / 4);
+        }
+    }
+}
+cp!(act_show_vehicle_w, act_show_vehicle_t, 47, act_show_vehicle);
+
+// 0x6CB8E0 / 0x6CB900 hide_group / show_group: 0xA57730 (EAX = name) -> group; 0xA58070 (EDI = group, 1 arg).
+unsafe fn act_hide_group(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        if n != 0 {
+            let g = call_regs(0x00A5_7730, n, 0, 0, 0, 0, &[]);
+            if g != 0 {
+                hit(48, 0);
+                call_regs(0x00A5_8070, 0, 0, 0, 0, g, &[1]);
+            }
+        }
+    }
+}
+cp!(act_hide_group_w, act_hide_group_t, 48, act_hide_group);
+
+unsafe fn act_show_group(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        if n != 0 {
+            let g = call_regs(0x00A5_7730, n, 0, 0, 0, 0, &[]);
+            if g != 0 {
+                hit(49, 0);
+                call_regs(0x00A5_8070, 0, 0, 0, 0, g, &[0]);
+            }
+        }
+    }
+}
+cp!(act_show_group_w, act_show_group_t, 49, act_show_group);
+
+// 0x6CB250 look_at_nothing
+unsafe fn act_look_at_nothing(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        if n != 0 {
+            let o = find_obj(n);
+            if o != 0 {
+                hit(50, 0);
+                wd(o as usize + 0x758, rd(o as usize + 0x758) | 1);
+                if rb(o as usize + 0x3CC) == 2 {
+                    hit(50, 1);
+                    wb(o as usize + 0x140, rb(o as usize + 0x140) & 0xFB);
+                }
+            }
+        }
+    }
+}
+cp!(act_look_at_nothing_w, act_look_at_nothing_t, 50, act_look_at_nothing);
+
+// 0x6CB6A0 cam_follow_target: v = f32(_atof(rec[+0x10])); [25F5D90] = (v > 0.0); [25F5D94] = v.
+unsafe fn act_cam_follow_target(rec: u32) {
+    unsafe {
+        let v = atof(rd(rec as usize + 0x10)) as f32;
+        wb(0x025F_5D90, 1);
+        wf(0x025F_5D94, v);
+        if !(v as f64 > 0.0) {
+            hit(51, 0);
+            wb(0x025F_5D90, 0);
+        }
+    }
+}
+cp!(act_cam_follow_target_w, act_cam_follow_target_t, 51, act_cam_follow_target);
+
+// 0x6CB2A0 cam_cut_to: navpoint (rec[+0xC]) -> camera set (EAX = nav+0x1C, EDI = nav+0x28, ECX =
+// ESI = 0), then cam_stop_slide (0x6CB5E0) with the record as its (ignored) argument.
+unsafe fn act_cam_cut_to(rec: u32) {
+    unsafe {
+        let nav = navpoint(rd(rec as usize + 0xC));
+        if nav != 0 {
+            hit(52, 0);
+            call_regs(CAM_SET, nav + 0x1C, 0, 0, 0, nav + 0x28, &[]);
+            call_regs(0x006C_B5E0, 0, 0, 0, 0, 0, &[rec]);
+        }
+    }
+}
+cp!(act_cam_cut_to_w, act_cam_cut_to_t, 52, act_cam_cut_to);
+
+// 0x6CB110 look_at: both objects by name; fields of the first's look record at +0x730.
+unsafe fn act_look_at(rec: u32) {
+    unsafe {
+        let n1 = rd(rec as usize + 8);
+        if n1 == 0 {
+            return;
+        }
+        let a = find_obj(n1);
+        if a == 0 {
+            return;
+        }
+        let n2 = rd(rec as usize + 0xC);
+        if n2 == 0 {
+            return;
+        }
+        let b = find_obj(n2);
+        if b == 0 {
+            return;
+        }
+        hit(53, 0);
+        let (a, b) = (a as usize, b as usize);
+        wd(a + 0x758, rd(a + 0x758) & 0xFFFF_FFFE);
+        let h = rd(b + 0x44);
+        let p = a + 0x730;
+        wd(p + 0x30, rd(p + 0x30) & 0xFFFF_FFFE);
+        wf(p, 0.0);
+        wd(p + 0xC, h);
+        wf(p + 4, 0.0);
+        wf(p + 8, 0.0);
+        wb(p + 0x2C, rb(p + 0x2C) | 1);
+        wf(p + 0x1C, q(rf(0x00DD_0C54)));
+        wd(p + 0x18, 0xFFFF_FFFF);
+        if rb(a + 0x3CC) == 2 {
+            hit(53, 1);
+            wb(a + 0x140, rb(a + 0x140) | 4);
+        }
+    }
+}
+cp!(act_look_at_w, act_look_at_t, 53, act_look_at);
+
+// 0x6CB1D0 look_at_nav: object + navpoint; 0x9B5C00(obj, -1.0f) with EAX = nav & ~0xFF,
+// EDX = nav + 0x1C, ESI = 0.
+unsafe fn act_look_at_nav(rec: u32) {
+    unsafe {
+        let n1 = rd(rec as usize + 8);
+        if n1 == 0 {
+            return;
+        }
+        let a = find_obj(n1);
+        if a == 0 {
+            return;
+        }
+        let n2 = rd(rec as usize + 0xC);
+        if n2 == 0 {
+            return;
+        }
+        let nav = navpoint(n2);
+        if nav == 0 {
+            return;
+        }
+        hit(54, 0);
+        let m1 = q(rf(0x00E8_7998));
+        wd(a as usize + 0x758, rd(a as usize + 0x758) & 0xFFFF_FFFE);
+        call_regs(0x009B_5C00, nav & !0xFF, 0, nav + 0x1C, 0, 0, &[a, m1.to_bits()]);
+    }
+}
+cp!(act_look_at_nav_w, act_look_at_nav_t, 54, act_look_at_nav);
+
+// 0x6CAA80 teleports_to
+unsafe fn act_teleports_to(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        if n == 0 {
+            return;
+        }
+        let o = find_obj(n);
+        if o == 0 {
+            return;
+        }
+        let nav = navpoint(rd(rec as usize + 0xC));
+        if nav == 0 {
+            return;
+        }
+        hit(55, 0);
+        let mut eax = nav;
+        if rb(o as usize + 0x3CC) == 2 {
+            hit(55, 1);
+            eax = call_regs(0x0044_7CD0, 0, 0, 0, 0, 0, &[o, 0, 0]);
+        }
+        call_regs(0x009A_0B00, eax, nav + 0x28, nav + 0x1C, nav, o, &[o, 0, 1, 0, 0]);
+    }
+}
+cp!(act_teleports_to_w, act_teleports_to_t, 55, act_teleports_to);
+
+// 0x6CAB00 walk_to / 0x6CAB70 run_to: object, navpoint; [0x2527D28] = 3 / 7; 0x6CA560(nav, 1 / 2)
+// with ESI = object, EDI = the record.
+unsafe fn walk_run(rec: u32, idx: usize, state: u32, mode: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        if n == 0 {
+            return;
+        }
+        let o = find_obj(n);
+        if o == 0 {
+            return;
+        }
+        let nav = navpoint(rd(rec as usize + 0xC));
+        if nav == 0 {
+            return;
+        }
+        hit(idx, 0);
+        wd(0x0252_7D28, state);
+        call_regs(0x006C_A560, nav, 0, 0, o, rec, &[nav, mode]);
+    }
+}
+unsafe fn act_walk_to(rec: u32) {
+    unsafe { walk_run(rec, 56, 3, 1) }
+}
+cp!(act_walk_to_w, act_walk_to_t, 56, act_walk_to);
+unsafe fn act_run_to(rec: u32) {
+    unsafe { walk_run(rec, 57, 7, 2) }
+}
+cp!(act_run_to_w, act_run_to_t, 57, act_run_to);
+
+// 0x6CACD0 suicides: 0x9847A0(obj, -1.0f, 0, 0) with EDX = ECX = 0; its ST0 result is popped.
+unsafe fn act_suicides(rec: u32) {
+    unsafe {
+        let n = rd(rec as usize + 8);
+        if n == 0 {
+            return;
+        }
+        let o = find_obj(n);
+        if o == 0 {
+            return;
+        }
+        hit(58, 0);
+        let m1 = q(rf(0x00E8_7998));
+        call_regs_st0(0x0098_47A0, o, 0, 0, n, 0, &[o, m1.to_bits(), 0, 0]);
+    }
+}
+cp!(act_suicides_w, act_suicides_t, 58, act_suicides);
+
+// 0x6CB5E0 cam_stop_slide: resets the camera-slide record (player+0x1540 + 0x1C) and the two
+// 9-dword blocks at player+0x158C / +0x15B4. Shadowed.
+unsafe fn act_cam_stop_slide(_rec: u32) {
+    unsafe {
+        let p = rd(PLAYER_PTR) as usize;
+        if p == 0 {
+            return;
+        }
+        let s = rd(p + 0x1540) as usize + 0x1C;
+        wb(s, 0);
+        let (a, b, c) = (rd(0x025F_5B20), rd(0x025F_5B24), rd(0x025F_5B28));
+        wd(s + 0xC, a);
+        wd(s + 0x10, b);
+        wd(s + 0x14, c);
+        wd(s + 0x1C, a);
+        wd(s + 0x20, b);
+        wd(s + 0x24, c);
+        wf(s + 0x18, 0.0);
+        wf(s + 8, 0.0);
+        wb(p + 0x1580, 0);
+        copy_dwords(p + 0x158C, 0x025F_5B5C, 9);
+        copy_dwords(p + 0x15B4, 0x025F_5B5C, 9);
+        wf(p + 0x15B0, 0.0);
+        wf(p + 0x1588, 0.0);
+    }
+}
+unsafe fn act_cam_stop_slide_r(_: u32) -> Vec<(usize, usize)> {
+    unsafe {
+        let p = rd(PLAYER_PTR) as usize;
+        if p == 0 {
+            return vec![];
+        }
+        vec![(rd(p + 0x1540) as usize + 0x1C, 0x28), (p + 0x1580, 0x58)]
+    }
+}
+sp!(act_cam_stop_slide_w, act_cam_stop_slide_t, 59, act_cam_stop_slide, act_cam_stop_slide_r);
+
+// 0x6CB590 cam_slide_to_update: AL = 0 only when the slide is active and [s+0x18] > [0x27E6710]
+// (or unordered); EAX is exactly 0 / 1.
+unsafe fn act_cam_slide_update(_rec: u32) -> u32 {
+    unsafe {
+        let p = rd(PLAYER_PTR) as usize;
+        if p == 0 {
+            return 1;
+        }
+        let s = rd(p + 0x1540) as usize + 0x1C;
+        if rb(s) == 0 {
+            return 1;
+        }
+        let a = rf(s + 0x18) as f64;
+        let b = rf(0x027E_6710) as f64;
+        // fcompp ST0 = [s+0x18], ST1 = [..6710]; test ah, 0x41; jnp -> 1: not greater and ordered.
+        if a > b || a.is_nan() || b.is_nan() { 0 } else { 1 }
+    }
+}
+extern "C" fn act_cam_slide_update_w(rec: u32) -> u32 {
+    let st = &ST[60];
+    let n = st.calls.fetch_add(1, Ordering::Relaxed);
+    unsafe {
+        let r = act_cam_slide_update(rec);
+        if n < SHADOW_CALLS {
+            let orig = st.orig.load(Ordering::Relaxed);
+            if orig != 0 {
+                let o = call_regs(orig, 0, 0, 0, 0, 0, &[rec]);
+                if o != r {
+                    st.mism.fetch_add(1, Ordering::Relaxed);
+                    return o;
+                }
+            }
+        }
+        r
+    }
+}
+keep_ecx_edx_arg1!(act_cam_slide_update_t, act_cam_slide_update_w);
+
+// level_lights 0x6d7590..0x6d75a2 size 0x12
+const B_LEVEL_LIGHTS: [u8; 18] = [
+    0x8B, 0x44, 0x24, 0x04, 0x80, 0x78, 0x08, 0x00, 0x0F, 0x94, 0xC1, 0x88, 0x0D, 0xC9, 0x95, 0x52,
+    0x02, 0xC3,
+];
+const B_LEVEL_LIGHTS_CALLS: [usize; 0] = [];
+// tree_shadows 0x6d75b0..0x6d75c5 size 0x15
+const B_TREE_SHADOWS: [u8; 21] = [
+    0x8B, 0x4C, 0x24, 0x04, 0x33, 0xC0, 0x38, 0x41, 0x08, 0x0F, 0x95, 0xC0, 0x83, 0xC0, 0x01, 0xA3,
+    0x94, 0x89, 0xE9, 0x00, 0xC3,
+];
+const B_TREE_SHADOWS_CALLS: [usize; 0] = [];
+// tod_char_shadows 0x6d75d0..0x6d75de size 0xe
+const B_TOD_CHAR_SHADOWS: [u8; 14] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8A, 0x48, 0x08, 0x88, 0x0D, 0x4E, 0x7D, 0xE9, 0x00, 0xC3,
+];
+const B_TOD_CHAR_SHADOWS_CALLS: [usize; 0] = [];
+// motion_blur 0x6d75e0..0x6d75f8 size 0x18
+const B_MOTION_BLUR: [u8; 24] = [
+    0x8B, 0x44, 0x24, 0x04, 0x80, 0x78, 0x08, 0x00, 0x8B, 0x15, 0x10, 0x7D, 0x52, 0x02, 0x0F, 0x94,
+    0xC1, 0x88, 0x8A, 0xE0, 0x15, 0x00, 0x00, 0xC3,
+];
+const B_MOTION_BLUR_CALLS: [usize; 0] = [];
+// motion_blur_override 0x6d7600..0x6d7624 size 0x24
+const B_MOTION_BLUR_OVERRIDE: [u8; 36] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x40, 0x08, 0x8B, 0x10, 0x8B, 0x0D, 0x10, 0x7D, 0x52, 0x02, 0x81,
+    0xC1, 0xE4, 0x15, 0x00, 0x00, 0x89, 0x11, 0x8B, 0x50, 0x04, 0x89, 0x51, 0x04, 0x8B, 0x40, 0x08,
+    0x89, 0x41, 0x08, 0xC3,
+];
+const B_MOTION_BLUR_OVERRIDE_CALLS: [usize; 0] = [];
+// camera_moves 0x6d7630..0x6d763e size 0xe
+const B_CAMERA_MOVES: [u8; 14] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8A, 0x48, 0x08, 0x88, 0x0D, 0x90, 0x5D, 0x5F, 0x02, 0xC3,
+];
+const B_CAMERA_MOVES_CALLS: [usize; 0] = [];
+// disable_trees 0x6d7640..0x6d7652 size 0x12
+const B_DISABLE_TREES: [u8; 18] = [
+    0x8B, 0x44, 0x24, 0x04, 0x80, 0x78, 0x08, 0x00, 0x0F, 0x94, 0xC1, 0x88, 0x0D, 0xBB, 0x78, 0xE8,
+    0x00, 0xC3,
+];
+const B_DISABLE_TREES_CALLS: [usize; 0] = [];
+// city_no_render_al 0x6d7660..0x6d766e size 0xe
+const B_CITY_NO_RENDER_AL: [u8; 14] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8A, 0x48, 0x08, 0x88, 0x0D, 0xC5, 0x6C, 0x52, 0x02, 0xC3,
+];
+const B_CITY_NO_RENDER_AL_CALLS: [usize; 0] = [];
+// shader_lod_force 0x6d7670..0x6d76a1 size 0x31
+const B_SHADER_LOD_FORCE: [u8; 49] = [
+    0x8B, 0x44, 0x24, 0x04, 0x80, 0x78, 0x08, 0x01, 0x75, 0x26, 0xA1, 0x10, 0x7D, 0x52, 0x02, 0x83,
+    0xB8, 0x5C, 0x16, 0x00, 0x00, 0xFE, 0x75, 0x0C, 0x8B, 0x0D, 0xD0, 0x49, 0xE8, 0x00, 0x89, 0x88,
+    0x5C, 0x16, 0x00, 0x00, 0x33, 0xC0, 0xA2, 0xC4, 0x6D, 0x52, 0x02, 0xA3, 0xD0, 0x49, 0xE8, 0x00,
+    0xC3,
+];
+const B_SHADER_LOD_FORCE_CALLS: [usize; 0] = [];
+// city_shadow_dist 0x6d76b0..0x6d76be size 0xe
+const B_CITY_SHADOW_DIST: [u8; 14] = [
+    0x8B, 0x44, 0x24, 0x04, 0xD9, 0x40, 0x08, 0xD9, 0x1D, 0xA0, 0x49, 0xE8, 0x00, 0xC3,
+];
+const B_CITY_SHADOW_DIST_CALLS: [usize; 0] = [];
+// far_clip 0x6d7720..0x6d773a size 0x1a
+const B_FAR_CLIP: [u8; 26] = [
+    0xD9, 0xEE, 0x8B, 0x4C, 0x24, 0x04, 0xD8, 0x59, 0x08, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x09,
+    0xD9, 0x41, 0x08, 0xD9, 0x1D, 0x88, 0x89, 0xE9, 0x00, 0xC3,
+];
+const B_FAR_CLIP_CALLS: [usize; 0] = [];
+// near_clip 0x6d7740..0x6d774e size 0xe
+const B_NEAR_CLIP: [u8; 14] = [
+    0x8B, 0x44, 0x24, 0x04, 0xD9, 0x40, 0x08, 0xD9, 0x1D, 0x8C, 0x89, 0xE9, 0x00, 0xC3,
+];
+const B_NEAR_CLIP_CALLS: [usize; 0] = [];
+// shot_fade_out 0x6d77a0..0x6d77d4 size 0x34
+const B_SHOT_FADE_OUT: [u8; 52] = [
+    0xD9, 0xEE, 0x8B, 0x4C, 0x24, 0x04, 0xD8, 0x59, 0x08, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x23,
+    0xA1, 0x10, 0x7D, 0x52, 0x02, 0xD9, 0x41, 0x08, 0x8B, 0x90, 0x40, 0x15, 0x00, 0x00, 0xD9, 0x9A,
+    0x64, 0x01, 0x00, 0x00, 0x8B, 0x80, 0x40, 0x15, 0x00, 0x00, 0xD9, 0x41, 0x08, 0xD9, 0x98, 0x68,
+    0x01, 0x00, 0x00, 0xC3,
+];
+const B_SHOT_FADE_OUT_CALLS: [usize; 0] = [];
+// shot_fade_out_midway 0x6d77e0..0x6d7833 size 0x53
+const B_SHOT_FADE_OUT_MIDWAY: [u8; 83] = [
+    0xD9, 0xEE, 0x8B, 0x4C, 0x24, 0x04, 0xD8, 0x59, 0x08, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x42,
+    0xD9, 0x05, 0x14, 0x67, 0x7E, 0x02, 0xA1, 0x10, 0x7D, 0x52, 0x02, 0xD8, 0x25, 0x10, 0x67, 0x7E,
+    0x02, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0x61, 0x08, 0x8B, 0x88, 0x40, 0x15,
+    0x00, 0x00, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x99, 0x64, 0x01, 0x00, 0x00,
+    0x8B, 0x90, 0x40, 0x15, 0x00, 0x00, 0xD9, 0x05, 0x8C, 0x1C, 0xDD, 0x00, 0xD9, 0x9A, 0x68, 0x01,
+    0x00, 0x00, 0xC3,
+];
+const B_SHOT_FADE_OUT_MIDWAY_CALLS: [usize; 0] = [];
+// shot_cut_out_midway 0x6d7840..0x6d7890 size 0x50
+const B_SHOT_CUT_OUT_MIDWAY: [u8; 80] = [
+    0xD9, 0xEE, 0x8B, 0x4C, 0x24, 0x04, 0xD8, 0x51, 0x08, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x3D,
+    0xD9, 0x05, 0x14, 0x67, 0x7E, 0x02, 0xA1, 0x10, 0x7D, 0x52, 0x02, 0xD8, 0x25, 0x10, 0x67, 0x7E,
+    0x02, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD8, 0x61, 0x08, 0x8B, 0x88, 0x40, 0x15,
+    0x00, 0x00, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xD9, 0x99, 0x64, 0x01, 0x00, 0x00,
+    0x8B, 0x90, 0x40, 0x15, 0x00, 0x00, 0xD9, 0x9A, 0x68, 0x01, 0x00, 0x00, 0xC3, 0xDD, 0xD8, 0xC3,
+];
+const B_SHOT_CUT_OUT_MIDWAY_CALLS: [usize; 0] = [];
+// letterbox_fade_in 0x6d7890..0x6d78c9 size 0x39
+const B_LETTERBOX_FADE_IN: [u8; 57] = [
+    0x8B, 0x4C, 0x24, 0x04, 0xB0, 0x01, 0x38, 0x41, 0x08, 0x75, 0x2D, 0xD9, 0xEE, 0xA2, 0x5A, 0xC8,
+    0x40, 0x01, 0xA1, 0xAC, 0x43, 0xE8, 0x00, 0xD9, 0x1D, 0x04, 0x69, 0xF7, 0x01, 0x05, 0xE8, 0x03,
+    0x00, 0x00, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0x68, 0xC4, 0xEA, 0x00, 0x7E, 0x0A, 0x2D, 0x00,
+    0xD2, 0x49, 0x6B, 0xA3, 0x68, 0xC4, 0xEA, 0x00, 0xC3,
+];
+const B_LETTERBOX_FADE_IN_CALLS: [usize; 0] = [];
+// letterbox_fade_out 0x6d78d0..0x6d78ee size 0x1e
+const B_LETTERBOX_FADE_OUT: [u8; 30] = [
+    0x8B, 0x4C, 0x24, 0x04, 0xB0, 0x01, 0x38, 0x41, 0x08, 0x75, 0x12, 0x8B, 0x15, 0x10, 0x7D, 0x52,
+    0x02, 0x8B, 0x8A, 0x40, 0x15, 0x00, 0x00, 0x88, 0x81, 0x6C, 0x01, 0x00, 0x00, 0xC3,
+];
+const B_LETTERBOX_FADE_OUT_CALLS: [usize; 0] = [];
+// framebuffer_tint 0x6d78f0..0x6d79da size 0xea
+const B_FRAMEBUFFER_TINT: [u8; 234] = [
+    0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x41, 0x08, 0x83, 0xEC, 0x34, 0x80, 0x38, 0x00, 0x75, 0x10, 0x80,
+    0x78, 0x01, 0x00, 0x75, 0x0A, 0x80, 0x78, 0x02, 0x00, 0x0F, 0x84, 0xC7, 0x00, 0x00, 0x00, 0x0F,
+    0xB6, 0x10, 0xD9, 0x40, 0x04, 0xD9, 0x1C, 0x24, 0x89, 0x54, 0x24, 0x38, 0x0F, 0xB6, 0x50, 0x01,
+    0xDB, 0x44, 0x24, 0x38, 0xDD, 0x05, 0x38, 0xC0, 0xE5, 0x00, 0x0F, 0xB6, 0x40, 0x02, 0xDC, 0xF9,
+    0x56, 0x57, 0x8B, 0x3D, 0x10, 0x7D, 0x52, 0x02, 0x81, 0xC7, 0x5C, 0x15, 0x00, 0x00, 0x8D, 0x74,
+    0x24, 0x18, 0xC6, 0x44, 0x24, 0x1C, 0x01, 0xC7, 0x44, 0x24, 0x18, 0x03, 0x00, 0x00, 0x00, 0xD9,
+    0xC9, 0xD9, 0x5C, 0x24, 0x40, 0xD9, 0x44, 0x24, 0x40, 0xD9, 0x44, 0x24, 0x08, 0xD9, 0xC0, 0x89,
+    0x54, 0x24, 0x40, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x0C, 0x8B, 0x54, 0x24, 0x0C, 0xDB,
+    0x44, 0x24, 0x40, 0x89, 0x54, 0x24, 0x20, 0xD8, 0xF2, 0xD9, 0x5C, 0x24, 0x40, 0xD9, 0x44, 0x24,
+    0x40, 0xD8, 0xC9, 0x89, 0x44, 0x24, 0x40, 0xD9, 0x5C, 0x24, 0x10, 0x8B, 0x44, 0x24, 0x10, 0xDB,
+    0x44, 0x24, 0x40, 0x89, 0x44, 0x24, 0x24, 0x8B, 0x41, 0x08, 0xB9, 0x09, 0x00, 0x00, 0x00, 0xDE,
+    0xF2, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x40, 0xD8, 0x4C, 0x24, 0x40, 0xD9, 0x5C, 0x24, 0x14, 0x8B,
+    0x54, 0x24, 0x14, 0xD9, 0xE8, 0x89, 0x54, 0x24, 0x28, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x40, 0x0C,
+    0xD9, 0x5C, 0x24, 0x30, 0xD9, 0x40, 0x08, 0xD9, 0x5C, 0x24, 0x34, 0xD9, 0x40, 0x10, 0xD9, 0x5C,
+    0x24, 0x38, 0xF3, 0xA5, 0x5F, 0x5E, 0x83, 0xC4, 0x34, 0xC3,
+];
+const B_FRAMEBUFFER_TINT_CALLS: [usize; 0] = [];
+// force_tod_lights 0x6d79e0..0x6d79f5 size 0x15
+const B_FORCE_TOD_LIGHTS: [u8; 21] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8A, 0x48, 0x08, 0xC6, 0x05, 0xC3, 0x6C, 0x52, 0x02, 0x01, 0x88, 0x0D,
+    0xC4, 0x6C, 0x52, 0x02, 0xC3,
+];
+const B_FORCE_TOD_LIGHTS_CALLS: [usize; 0] = [];
+// lightning 0x6d7d70..0x6d7da6 size 0x36
+const B_LIGHTNING: [u8; 54] = [
+    0x8B, 0x44, 0x24, 0x04, 0x80, 0x78, 0x08, 0x00, 0x74, 0x21, 0xA1, 0xAC, 0x43, 0xE8, 0x00, 0x05,
+    0x88, 0x13, 0x00, 0x00, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0x48, 0xA8, 0xE9, 0x00, 0x7E, 0x15,
+    0x2D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0x48, 0xA8, 0xE9, 0x00, 0xC3, 0xC7, 0x05, 0x48, 0xA8, 0xE9,
+    0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xC3,
+];
+const B_LIGHTNING_CALLS: [usize; 0] = [];
+// glares 0x6d8120..0x6d8132 size 0x12
+const B_GLARES: [u8; 18] = [
+    0x8B, 0x44, 0x24, 0x04, 0x80, 0x78, 0x08, 0x00, 0x0F, 0x95, 0xC1, 0x88, 0x0D, 0x56, 0x7D, 0xE9,
+    0x00, 0xC3,
+];
+const B_GLARES_CALLS: [usize; 0] = [];
+// fog_distance 0x6d8170..0x6d81e0 size 0x70
+const B_FOG_DISTANCE: [u8; 112] = [
+    0x8B, 0x44, 0x24, 0x04, 0xD9, 0xEE, 0x8B, 0x48, 0x08, 0xD8, 0x11, 0x83, 0xEC, 0x0C, 0xDF, 0xE0,
+    0xF6, 0xC4, 0x41, 0x7A, 0x4E, 0xD8, 0x51, 0x04, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x7A, 0x44, 0xD8,
+    0x59, 0x08, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x7A, 0x3C, 0xD9, 0x01, 0xD9, 0x1C, 0x24, 0xD9, 0x41,
+    0x04, 0xD9, 0x5C, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x04, 0xD9, 0x41, 0x08, 0x8B, 0x0C, 0x24, 0xD9,
+    0x5C, 0x24, 0x08, 0x8B, 0x44, 0x24, 0x08, 0xC6, 0x05, 0xA4, 0x8C, 0x65, 0x02, 0x01, 0x89, 0x0D,
+    0xA8, 0x8C, 0x65, 0x02, 0x89, 0x15, 0xAC, 0x8C, 0x65, 0x02, 0xA3, 0xB0, 0x8C, 0x65, 0x02, 0x83,
+    0xC4, 0x0C, 0xC3, 0xDD, 0xD8, 0xC6, 0x05, 0xA4, 0x8C, 0x65, 0x02, 0x00, 0x83, 0xC4, 0x0C, 0xC3,
+];
+const B_FOG_DISTANCE_CALLS: [usize; 0] = [];
+// city_region_blend 0x6d81e0..0x6d81ee size 0xe
+const B_CITY_REGION_BLEND: [u8; 14] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8A, 0x48, 0x08, 0x88, 0x0D, 0xE6, 0x96, 0xE9, 0x00, 0xC3,
+];
+const B_CITY_REGION_BLEND_CALLS: [usize; 0] = [];
+// city_render_fade 0x6d81f0..0x6d81fe size 0xe
+const B_CITY_RENDER_FADE: [u8; 14] = [
+    0x8B, 0x44, 0x24, 0x04, 0xD9, 0x40, 0x08, 0xD9, 0x1D, 0xB4, 0x96, 0xE9, 0x00, 0xC3,
+];
+const B_CITY_RENDER_FADE_CALLS: [usize; 0] = [];
+// drug_effect 0x6d8200..0x6d8222 size 0x22
+const B_DRUG_EFFECT: [u8; 34] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x48, 0x08, 0xD9, 0x01, 0x8B, 0x0D, 0x10, 0x7D, 0x52, 0x02, 0xD9,
+    0x99, 0xD8, 0x15, 0x00, 0x00, 0x8B, 0x50, 0x08, 0xD9, 0x42, 0x04, 0xD9, 0x99, 0xDC, 0x15, 0x00,
+    0x00, 0xC3,
+];
+const B_DRUG_EFFECT_CALLS: [usize; 0] = [];
+// rain_override 0x6d8240..0x6d827a size 0x3a
+const B_RAIN_OVERRIDE: [u8; 58] = [
+    0x8B, 0x44, 0x24, 0x04, 0xD9, 0x40, 0x08, 0xD9, 0x5C, 0x24, 0x04, 0xD9, 0xEE, 0xD9, 0x44, 0x24,
+    0x04, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x01, 0x75, 0x10, 0xDD, 0xD9, 0xC6, 0x05, 0x78, 0x6D,
+    0x52, 0x02, 0x01, 0xD9, 0x1D, 0x7C, 0x6D, 0x52, 0x02, 0xC3, 0xDD, 0xD8, 0xC6, 0x05, 0x78, 0x6D,
+    0x52, 0x02, 0x00, 0xD9, 0x1D, 0x7C, 0x6D, 0x52, 0x02, 0xC3,
+];
+const B_RAIN_OVERRIDE_CALLS: [usize; 0] = [];
+// credits_roll 0x6d82d0..0x6d82ea size 0x1a
+const B_CREDITS_ROLL: [u8; 26] = [
+    0x8B, 0x44, 0x24, 0x04, 0xD9, 0x40, 0x08, 0x8B, 0x0D, 0x10, 0x7D, 0x52, 0x02, 0xD8, 0x05, 0xFC,
+    0x66, 0x7E, 0x02, 0xD9, 0x99, 0x08, 0x0B, 0x00, 0x00, 0xC3,
+];
+const B_CREDITS_ROLL_CALLS: [usize; 0] = [];
+// spawning_peds 0x6d7510..0x6d7547 size 0x37
+const B_SPAWNING_PEDS: [u8; 55] = [
+    0x8B, 0x44, 0x24, 0x04, 0x53, 0xB3, 0x01, 0x38, 0x58, 0x08, 0x75, 0x19, 0x32, 0xC0, 0xA2, 0x25,
+    0xDA, 0x15, 0x02, 0xA2, 0x05, 0xDA, 0x15, 0x02, 0xE8, 0x03, 0x65, 0x4A, 0x00, 0x88, 0x1D, 0x20,
+    0x96, 0x52, 0x02, 0x5B, 0xC3, 0x88, 0x1D, 0x25, 0xDA, 0x15, 0x02, 0x88, 0x1D, 0x05, 0xDA, 0x15,
+    0x02, 0x5B, 0xE9, 0xE9, 0x64, 0x4A, 0x00,
+];
+const B_SPAWNING_PEDS_CALLS: [usize; 1] = [0x18];
+// spawning_cars 0x6d7550..0x6d758f size 0x3f
+const B_SPAWNING_CARS: [u8; 63] = [
+    0x8B, 0x44, 0x24, 0x04, 0x53, 0xB3, 0x01, 0x38, 0x58, 0x08, 0x75, 0x20, 0xC6, 0x05, 0x1D, 0xDA,
+    0x15, 0x02, 0x00, 0xE8, 0xF8, 0x50, 0x26, 0x00, 0xC6, 0x05, 0xFD, 0xD9, 0x15, 0x02, 0x00, 0xE8,
+    0xBC, 0x9B, 0x4A, 0x00, 0x88, 0x1D, 0x20, 0x96, 0x52, 0x02, 0x5B, 0xC3, 0x88, 0x1D, 0xFD, 0xD9,
+    0x15, 0x02, 0xE8, 0xA9, 0x9B, 0x4A, 0x00, 0x88, 0x1D, 0x20, 0x96, 0x52, 0x02, 0x5B, 0xC3,
+];
+const B_SPAWNING_CARS_CALLS: [usize; 3] = [0x13, 0x1f, 0x32];
+// spawning_remove_all 0x6d76d0..0x6d7711 size 0x41
+const B_SPAWNING_REMOVE_ALL: [u8; 65] = [
+    0x8B, 0x44, 0x24, 0x04, 0x80, 0x78, 0x08, 0x01, 0x75, 0x36, 0x53, 0x32, 0xDB, 0x88, 0x1D, 0x25,
+    0xDA, 0x15, 0x02, 0x88, 0x1D, 0x1D, 0xDA, 0x15, 0x02, 0xE8, 0x72, 0x4F, 0x26, 0x00, 0x88, 0x1D,
+    0x05, 0xDA, 0x15, 0x02, 0xE8, 0x37, 0x63, 0x4A, 0x00, 0x88, 0x1D, 0xFD, 0xD9, 0x15, 0x02, 0xE8,
+    0x2C, 0x9A, 0x4A, 0x00, 0xC6, 0x05, 0x20, 0x96, 0x52, 0x02, 0x01, 0x5B, 0x8D, 0x64, 0x24, 0x00,
+    0xC3,
+];
+const B_SPAWNING_REMOVE_ALL_CALLS: [usize; 3] = [0x19, 0x24, 0x2f];
+// hide_player_compnt 0x6d7a60..0x6d7a9e size 0x3e
+const B_HIDE_PLAYER_COMPNT: [u8; 62] = [
+    0x8B, 0x44, 0x24, 0x04, 0x57, 0x8B, 0x78, 0x08, 0xE8, 0xC3, 0xFA, 0x30, 0x00, 0x83, 0xF8, 0xFF,
+    0x5F, 0x74, 0x17, 0x8B, 0x0D, 0xD4, 0x03, 0x17, 0x02, 0x8B, 0x91, 0xB0, 0x13, 0x00, 0x00, 0x50,
+    0x52, 0xE8, 0x5A, 0x2A, 0x31, 0x00, 0x83, 0xC4, 0x08, 0xC3, 0xA1, 0xD4, 0x03, 0x17, 0x02, 0x8B,
+    0x88, 0xB0, 0x13, 0x00, 0x00, 0x89, 0x4C, 0x24, 0x04, 0xE9, 0xC2, 0x2B, 0x31, 0x00,
+];
+const B_HIDE_PLAYER_COMPNT_CALLS: [usize; 2] = [0x8, 0x21];
+// time_of_day_set 0x6d8140..0x6d8153 size 0x13
+const B_TIME_OF_DAY_SET: [u8; 19] = [
+    0x8B, 0x44, 0x24, 0x04, 0xD9, 0x40, 0x08, 0xE8, 0xF4, 0x7F, 0x6C, 0x00, 0x8B, 0xC8, 0xE9, 0x6D,
+    0x24, 0xFB, 0xFF,
+];
+const B_TIME_OF_DAY_SET_CALLS: [usize; 1] = [0x7];
+// bink_play 0x6d7aa0..0x6d7aea size 0x4a
+const B_BINK_PLAY: [u8; 74] = [
+    0x8B, 0x44, 0x24, 0x04, 0xD9, 0x40, 0x08, 0xE8, 0x94, 0x86, 0x6C, 0x00, 0x83, 0xF8, 0x01, 0x7C,
+    0x22, 0x8B, 0x0D, 0x70, 0xE6, 0x40, 0x01, 0x85, 0xC9, 0x56, 0x8B, 0xF1, 0x74, 0x13, 0x6A, 0x01,
+    0x50, 0x51, 0xFF, 0x15, 0x00, 0x84, 0xDB, 0x00, 0x6A, 0x00, 0x56, 0xFF, 0x15, 0xD0, 0x83, 0xDB,
+    0x00, 0x5E, 0xC3, 0x85, 0xC0, 0x7D, 0xFB, 0xA1, 0x70, 0xE6, 0x40, 0x01, 0x85, 0xC0, 0x74, 0xF2,
+    0x6A, 0x01, 0x50, 0xFF, 0x15, 0xD0, 0x83, 0xDB, 0x00, 0xC3,
+];
+const B_BINK_PLAY_CALLS: [usize; 1] = [0x7];
+// mesh_mover_hide 0x6d7af0..0x6d7b0e size 0x1e
+const B_MESH_MOVER_HIDE: [u8; 30] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x40, 0x08, 0x85, 0xC0, 0x74, 0x12, 0xE8, 0xE0, 0x3B, 0x38, 0x00,
+    0x85, 0xC0, 0x74, 0x09, 0x56, 0x8B, 0xF0, 0xE8, 0xF4, 0x3C, 0x38, 0x00, 0x5E, 0xC3,
+];
+const B_MESH_MOVER_HIDE_CALLS: [usize; 2] = [0xb, 0x17];
+// mesh_mover_show 0x6d7b10..0x6d7b2e size 0x1e
+const B_MESH_MOVER_SHOW: [u8; 30] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x40, 0x08, 0x85, 0xC0, 0x74, 0x12, 0xE8, 0xC0, 0x3B, 0x38, 0x00,
+    0x85, 0xC0, 0x74, 0x09, 0x56, 0x8B, 0xF0, 0xE8, 0x44, 0x3E, 0x38, 0x00, 0x5E, 0xC3,
+];
+const B_MESH_MOVER_SHOW_CALLS: [usize; 2] = [0xb, 0x17];
+// chunk_hide 0x6d8280..0x6d82ae size 0x2e
+const B_CHUNK_HIDE: [u8; 46] = [
+    0x56, 0x8B, 0x74, 0x24, 0x08, 0x57, 0x8B, 0x7E, 0x08, 0x83, 0xC6, 0x08, 0xE8, 0xDF, 0x14, 0xDD,
+    0xFF, 0x85, 0xC0, 0x74, 0x16, 0x8B, 0x0D, 0x10, 0x7D, 0x52, 0x02, 0x80, 0x48, 0x1D, 0x01, 0x56,
+    0x81, 0xC1, 0xE4, 0x1E, 0x00, 0x00, 0xE8, 0x65, 0x07, 0x00, 0x00, 0x5F, 0x5E, 0xC3,
+];
+const B_CHUNK_HIDE_CALLS: [usize; 2] = [0xc, 0x26];
+// chunk_show 0x6d82b0..0x6d82c7 size 0x17
+const B_CHUNK_SHOW: [u8; 23] = [
+    0x8B, 0x44, 0x24, 0x04, 0x57, 0x8B, 0x78, 0x08, 0xE8, 0xB3, 0x14, 0xDD, 0xFF, 0x85, 0xC0, 0x5F,
+    0x74, 0x04, 0x80, 0x60, 0x1D, 0xFE, 0xC3,
+];
+const B_CHUNK_SHOW_CALLS: [usize; 1] = [0x8];
+// weather_stage 0x6d7db0..0x6d7ddd size 0x2d
+const B_WEATHER_STAGE: [u8; 45] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x40, 0x08, 0x85, 0xC0, 0x74, 0x21, 0x50, 0xE8, 0x6F, 0x70, 0xE0,
+    0xFF, 0x83, 0xC4, 0x04, 0x83, 0xF8, 0xFF, 0x74, 0x13, 0x8B, 0x15, 0x10, 0x7D, 0x52, 0x02, 0xB1,
+    0x01, 0x88, 0x8A, 0xD4, 0x43, 0x00, 0x00, 0xE9, 0x24, 0x6E, 0xE0, 0xFF, 0xC3,
+];
+const B_WEATHER_STAGE_CALLS: [usize; 1] = [0xc];
+// shot_fade_in 0x6d7750..0x6d7796 size 0x46
+const B_SHOT_FADE_IN: [u8; 70] = [
+    0xD9, 0xEE, 0x8B, 0x4C, 0x24, 0x04, 0xD8, 0x51, 0x08, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x33,
+    0x51, 0xD9, 0x1C, 0x24, 0xD9, 0x41, 0x08, 0xDC, 0x0D, 0xD8, 0xC0, 0xE5, 0x00, 0xE8, 0xCE, 0x89,
+    0x6C, 0x00, 0x50, 0x32, 0xD2, 0xE8, 0xF6, 0x9A, 0xDF, 0xFF, 0xA1, 0x10, 0x7D, 0x52, 0x02, 0x83,
+    0xC4, 0x08, 0x80, 0xB8, 0x02, 0x0B, 0x00, 0x00, 0x00, 0x75, 0x0A, 0xC6, 0x80, 0x03, 0x0B, 0x00,
+    0x00, 0x01, 0xC3, 0xDD, 0xD8, 0xC3,
+];
+const B_SHOT_FADE_IN_CALLS: [usize; 2] = [0x1d, 0x25];
+// act_cam_stop_track 0x6cb680..0x6cb695 size 0x15
+const B_ACT_CAM_STOP_TRACK: [u8; 21] = [
+    0x56, 0x57, 0x33, 0xFF, 0xB8, 0x20, 0x5B, 0x5F, 0x02, 0x33, 0xC9, 0x33, 0xF6, 0xE8, 0x4E, 0x73,
+    0xDD, 0xFF, 0x5F, 0x5E, 0xC3,
+];
+const B_ACT_CAM_STOP_TRACK_CALLS: [usize; 1] = [0xd];
+// act_cam_track_char 0x6cb2e0..0x6cb327 size 0x47
+const B_ACT_CAM_TRACK_CHAR: [u8; 71] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x8B, 0x70, 0x0C, 0x85, 0xF6, 0x74, 0x39, 0x8D, 0x44, 0x24, 0x08,
+    0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x08, 0x00, 0xE8, 0xB4, 0x78, 0x38, 0x00, 0x80, 0x7C, 0x24, 0x08,
+    0x00, 0x75, 0x09, 0xE8, 0x68, 0x79, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x19, 0x8B, 0xF0, 0x85, 0xF6,
+    0x74, 0x13, 0x57, 0x33, 0xFF, 0xB8, 0x20, 0x5B, 0x5F, 0x02, 0xB9, 0xC8, 0x80, 0xDD, 0x00, 0xE8,
+    0xBC, 0x76, 0xDD, 0xFF, 0x5F, 0x5E, 0xC3,
+];
+const B_ACT_CAM_TRACK_CHAR_CALLS: [usize; 3] = [0x17, 0x23, 0x3f];
+// act_cam_look_at_char 0x6cb330..0x6cb390 size 0x60
+const B_ACT_CAM_LOOK_AT_CHAR: [u8; 96] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x8B, 0x45, 0x08, 0x83, 0xEC, 0x08, 0x56, 0x8B, 0x70, 0x0C,
+    0x85, 0xF6, 0x57, 0x74, 0x45, 0x8D, 0x44, 0x24, 0x0F, 0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x0F, 0x00,
+    0xE8, 0x5B, 0x78, 0x38, 0x00, 0x80, 0x7C, 0x24, 0x0F, 0x00, 0x75, 0x09, 0xE8, 0x0F, 0x79, 0x38,
+    0x00, 0x85, 0xC0, 0x74, 0x25, 0x8B, 0xF0, 0x85, 0xF6, 0x74, 0x1F, 0x33, 0xFF, 0xB8, 0x20, 0x5B,
+    0x5F, 0x02, 0xB9, 0xC8, 0x80, 0xDD, 0x00, 0xE8, 0x64, 0x76, 0xDD, 0xFF, 0xB8, 0x20, 0x5B, 0x5F,
+    0x02, 0x33, 0xC9, 0x33, 0xF6, 0xE8, 0x56, 0x76, 0xDD, 0xFF, 0x5F, 0x5E, 0x8B, 0xE5, 0x5D, 0xC3,
+];
+const B_ACT_CAM_LOOK_AT_CHAR_CALLS: [usize; 4] = [0x20, 0x2c, 0x47, 0x55];
+// act_hide_character 0x6cb6e0..0x6cb722 size 0x42
+const B_ACT_HIDE_CHARACTER: [u8; 66] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x8B, 0x70, 0x08, 0x85, 0xF6, 0x74, 0x34, 0x8D, 0x44, 0x24, 0x08,
+    0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x08, 0x00, 0xE8, 0xB4, 0x74, 0x38, 0x00, 0x80, 0x7C, 0x24, 0x08,
+    0x00, 0x75, 0x09, 0xE8, 0x68, 0x75, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x14, 0x8B, 0xC8, 0x85, 0xC9,
+    0x74, 0x0E, 0x6A, 0x00, 0x6A, 0x01, 0x6A, 0x01, 0xE8, 0x43, 0xB1, 0x25, 0x00, 0x83, 0xC4, 0x0C,
+    0x5E, 0xC3,
+];
+const B_ACT_HIDE_CHARACTER_CALLS: [usize; 3] = [0x17, 0x23, 0x38];
+// act_show_character 0x6cb730..0x6cb772 size 0x42
+const B_ACT_SHOW_CHARACTER: [u8; 66] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x8B, 0x70, 0x08, 0x85, 0xF6, 0x74, 0x34, 0x8D, 0x44, 0x24, 0x08,
+    0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x08, 0x00, 0xE8, 0x64, 0x74, 0x38, 0x00, 0x80, 0x7C, 0x24, 0x08,
+    0x00, 0x75, 0x09, 0xE8, 0x18, 0x75, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x14, 0x8B, 0xC8, 0x85, 0xC9,
+    0x74, 0x0E, 0x6A, 0x00, 0x6A, 0x01, 0x6A, 0x00, 0xE8, 0xF3, 0xB0, 0x25, 0x00, 0x83, 0xC4, 0x0C,
+    0x5E, 0xC3,
+];
+const B_ACT_SHOW_CHARACTER_CALLS: [usize; 3] = [0x17, 0x23, 0x38];
+// act_disable_physics 0x6cb780..0x6cb7db size 0x5b
+const B_ACT_DISABLE_PHYSICS: [u8; 91] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x8B, 0x70, 0x08, 0x85, 0xF6, 0x74, 0x4D, 0x8D, 0x44, 0x24, 0x08,
+    0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x08, 0x00, 0xE8, 0x14, 0x74, 0x38, 0x00, 0x80, 0x7C, 0x24, 0x08,
+    0x00, 0x75, 0x09, 0xE8, 0xC8, 0x74, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x2D, 0x8B, 0xF0, 0x85, 0xF6,
+    0x74, 0x27, 0x6A, 0x00, 0x6A, 0x14, 0xE8, 0x55, 0x0E, 0x03, 0x00, 0x8B, 0x86, 0x70, 0x05, 0x00,
+    0x00, 0x83, 0xC4, 0x08, 0x85, 0xC0, 0x74, 0x07, 0x80, 0x88, 0x30, 0x01, 0x00, 0x00, 0x02, 0x81,
+    0x8E, 0xCC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x5E, 0xC3,
+];
+const B_ACT_DISABLE_PHYSICS_CALLS: [usize; 3] = [0x17, 0x23, 0x36];
+// act_enable_physics 0x6cb7e0..0x6cb84f size 0x6f
+const B_ACT_ENABLE_PHYSICS: [u8; 111] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x8B, 0x70, 0x08, 0x85, 0xF6, 0x74, 0x61, 0x8D, 0x44, 0x24, 0x08,
+    0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x08, 0x00, 0xE8, 0xB4, 0x73, 0x38, 0x00, 0x80, 0x7C, 0x24, 0x08,
+    0x00, 0x75, 0x09, 0xE8, 0x68, 0x74, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x41, 0x8B, 0xF0, 0x85, 0xF6,
+    0x74, 0x3B, 0x6A, 0x00, 0x6A, 0x0F, 0xE8, 0xF5, 0x0D, 0x03, 0x00, 0x8B, 0x86, 0x70, 0x05, 0x00,
+    0x00, 0x83, 0xC4, 0x08, 0x85, 0xC0, 0x74, 0x07, 0x80, 0xA0, 0x30, 0x01, 0x00, 0x00, 0xFD, 0x6A,
+    0x00, 0x6A, 0xFF, 0x8D, 0x4E, 0x14, 0x6A, 0x00, 0x51, 0x8B, 0xC6, 0xE8, 0x50, 0x38, 0x29, 0x00,
+    0x83, 0xC4, 0x10, 0x81, 0xA6, 0xCC, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xBF, 0xFF, 0x5E, 0xC3,
+];
+const B_ACT_ENABLE_PHYSICS_CALLS: [usize; 4] = [0x17, 0x23, 0x36, 0x5b];
+// act_hide_vehicle 0x6cb850..0x6cb88b size 0x3b
+const B_ACT_HIDE_VEHICLE: [u8; 59] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x40, 0x08, 0x56, 0xE8, 0xD3, 0x47, 0x3A, 0x00, 0x8B, 0xF0, 0x85,
+    0xF6, 0x74, 0x26, 0x8B, 0x16, 0x8B, 0x42, 0x2C, 0x8B, 0xCE, 0xFF, 0xD0, 0x84, 0xC0, 0x74, 0x19,
+    0x8B, 0x16, 0x8B, 0x42, 0x34, 0x8B, 0xCE, 0xFF, 0xD0, 0x8B, 0x48, 0x44, 0x6A, 0x00, 0x6A, 0x01,
+    0x51, 0xE8, 0xDA, 0x13, 0x3E, 0x00, 0x83, 0xC4, 0x0C, 0x5E, 0xC3,
+];
+const B_ACT_HIDE_VEHICLE_CALLS: [usize; 2] = [0x8, 0x31];
+// act_show_vehicle 0x6cb890..0x6cb8d7 size 0x47
+const B_ACT_SHOW_VEHICLE: [u8; 71] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x40, 0x08, 0x56, 0xE8, 0x93, 0x47, 0x3A, 0x00, 0x8B, 0xF0, 0x85,
+    0xF6, 0x74, 0x32, 0x8B, 0x16, 0x8B, 0x42, 0x2C, 0x8B, 0xCE, 0xFF, 0xD0, 0x84, 0xC0, 0x74, 0x25,
+    0x8B, 0x16, 0x8B, 0x42, 0x34, 0x8B, 0xCE, 0xFF, 0xD0, 0x8B, 0xF0, 0x8B, 0x4E, 0x44, 0x6A, 0x00,
+    0x6A, 0x00, 0x51, 0xE8, 0x98, 0x13, 0x3E, 0x00, 0x8B, 0x16, 0x8B, 0x42, 0x20, 0x83, 0xC4, 0x0C,
+    0x8B, 0xCE, 0x5E, 0xFF, 0xE0, 0x5E, 0xC3,
+];
+const B_ACT_SHOW_VEHICLE_CALLS: [usize; 2] = [0x8, 0x33];
+// act_hide_group 0x6cb8e0..0x6cb900 size 0x20
+const B_ACT_HIDE_GROUP: [u8; 32] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x40, 0x08, 0x85, 0xC0, 0x74, 0x14, 0xE8, 0x40, 0xBE, 0x38, 0x00,
+    0x85, 0xC0, 0x74, 0x0B, 0x57, 0x6A, 0x01, 0x8B, 0xF8, 0xE8, 0x72, 0xC7, 0x38, 0x00, 0x5F, 0xC3,
+];
+const B_ACT_HIDE_GROUP_CALLS: [usize; 2] = [0xb, 0x19];
+// act_show_group 0x6cb900..0x6cb920 size 0x20
+const B_ACT_SHOW_GROUP: [u8; 32] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x40, 0x08, 0x85, 0xC0, 0x74, 0x14, 0xE8, 0x20, 0xBE, 0x38, 0x00,
+    0x85, 0xC0, 0x74, 0x0B, 0x57, 0x6A, 0x00, 0x8B, 0xF8, 0xE8, 0x52, 0xC7, 0x38, 0x00, 0x5F, 0xC3,
+];
+const B_ACT_SHOW_GROUP_CALLS: [usize; 2] = [0xb, 0x19];
+// act_look_at_nothing 0x6cb250..0x6cb299 size 0x49
+const B_ACT_LOOK_AT_NOTHING: [u8; 73] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x8B, 0x70, 0x08, 0x85, 0xF6, 0x74, 0x3B, 0x8D, 0x44, 0x24, 0x08,
+    0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x08, 0x00, 0xE8, 0x44, 0x79, 0x38, 0x00, 0x80, 0x7C, 0x24, 0x08,
+    0x00, 0x75, 0x09, 0xE8, 0xF8, 0x79, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x1B, 0x85, 0xC0, 0x74, 0x17,
+    0x83, 0x88, 0x58, 0x07, 0x00, 0x00, 0x01, 0x80, 0xB8, 0xCC, 0x03, 0x00, 0x00, 0x02, 0x75, 0x07,
+    0x80, 0xA0, 0x40, 0x01, 0x00, 0x00, 0xFB, 0x5E, 0xC3,
+];
+const B_ACT_LOOK_AT_NOTHING_CALLS: [usize; 2] = [0x17, 0x23];
+// act_cam_follow_target 0x6cb6a0..0x6cb6da size 0x3a
+const B_ACT_CAM_FOLLOW_TARGET: [u8; 58] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x48, 0x10, 0x51, 0xE8, 0x48, 0xCE, 0x5C, 0x00, 0xD9, 0x5C, 0x24,
+    0x08, 0xD9, 0xEE, 0x83, 0xC4, 0x04, 0xD9, 0x44, 0x24, 0x04, 0xC6, 0x05, 0x90, 0x5D, 0x5F, 0x02,
+    0x01, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0xD9, 0x1D, 0x94, 0x5D, 0x5F, 0x02,
+    0x74, 0x07, 0xC6, 0x05, 0x90, 0x5D, 0x5F, 0x02, 0x00, 0xC3,
+];
+const B_ACT_CAM_FOLLOW_TARGET_CALLS: [usize; 1] = [0x8];
+// act_cam_cut_to 0x6cb2a0..0x6cb2db size 0x3b
+const B_ACT_CAM_CUT_TO: [u8; 59] = [
+    0x53, 0x8B, 0x5C, 0x24, 0x08, 0x8B, 0x43, 0x0C, 0x50, 0x33, 0xD2, 0x8D, 0x44, 0x24, 0x0C, 0xE8,
+    0x7C, 0x17, 0x51, 0x00, 0xE8, 0x97, 0x38, 0x39, 0x00, 0x85, 0xC0, 0x74, 0x1C, 0x56, 0x57, 0x8D,
+    0x78, 0x28, 0x83, 0xC0, 0x1C, 0x33, 0xC9, 0x33, 0xF6, 0xE8, 0x12, 0x77, 0xDD, 0xFF, 0x53, 0xE8,
+    0x0C, 0x03, 0x00, 0x00, 0x83, 0xC4, 0x04, 0x5F, 0x5E, 0x5B, 0xC3,
+];
+const B_ACT_CAM_CUT_TO_CALLS: [usize; 4] = [0xf, 0x14, 0x29, 0x2f];
+// act_look_at 0x6cb110..0x6cb1c3 size 0xb3
+const B_ACT_LOOK_AT: [u8; 179] = [
+    0x55, 0x8B, 0x6C, 0x24, 0x08, 0x56, 0x8B, 0x75, 0x08, 0x85, 0xF6, 0x0F, 0x84, 0x9F, 0x00, 0x00,
+    0x00, 0x57, 0x8D, 0x44, 0x24, 0x10, 0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x10, 0x00, 0xE8, 0x7E, 0x7A,
+    0x38, 0x00, 0x80, 0x7C, 0x24, 0x10, 0x00, 0x75, 0x09, 0xE8, 0x32, 0x7B, 0x38, 0x00, 0x85, 0xC0,
+    0x74, 0x7D, 0x8B, 0xF8, 0x85, 0xFF, 0x74, 0x77, 0x8B, 0x75, 0x0C, 0x85, 0xF6, 0x74, 0x70, 0x8D,
+    0x44, 0x24, 0x10, 0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x10, 0x00, 0xE8, 0x51, 0x7A, 0x38, 0x00, 0x80,
+    0x7C, 0x24, 0x10, 0x00, 0x75, 0x09, 0xE8, 0x05, 0x7B, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x50, 0x85,
+    0xC0, 0x74, 0x4C, 0xBA, 0xFE, 0xFF, 0xFF, 0xFF, 0x21, 0x97, 0x58, 0x07, 0x00, 0x00, 0x8B, 0x48,
+    0x44, 0x8D, 0x87, 0x30, 0x07, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x24, 0xD9, 0xEE, 0x21, 0x50, 0x30,
+    0xD9, 0x10, 0x89, 0x48, 0x0C, 0xD9, 0x50, 0x04, 0xD9, 0x58, 0x08, 0xD9, 0x05, 0x54, 0x0C, 0xDD,
+    0x00, 0x80, 0x48, 0x2C, 0x01, 0xD9, 0x58, 0x1C, 0xC7, 0x40, 0x18, 0xFF, 0xFF, 0xFF, 0xFF, 0x80,
+    0xBF, 0xCC, 0x03, 0x00, 0x00, 0x02, 0x75, 0x07, 0x80, 0x8F, 0x40, 0x01, 0x00, 0x00, 0x04, 0x5F,
+    0x5E, 0x5D, 0xC3,
+];
+const B_ACT_LOOK_AT_CALLS: [usize; 4] = [0x1d, 0x29, 0x4a, 0x56];
+// act_look_at_nav 0x6cb1d0..0x6cb243 size 0x73
+const B_ACT_LOOK_AT_NAV: [u8; 115] = [
+    0x56, 0x57, 0x8B, 0x7C, 0x24, 0x0C, 0x8B, 0x77, 0x08, 0x85, 0xF6, 0x74, 0x63, 0x8D, 0x44, 0x24,
+    0x0C, 0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x0C, 0x00, 0xE8, 0xC3, 0x79, 0x38, 0x00, 0x80, 0x7C, 0x24,
+    0x0C, 0x00, 0x75, 0x09, 0xE8, 0x77, 0x7A, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x43, 0x8B, 0xF0, 0x85,
+    0xF6, 0x74, 0x3D, 0x8B, 0x47, 0x0C, 0x85, 0xC0, 0x74, 0x36, 0x50, 0x33, 0xD2, 0x8D, 0x44, 0x24,
+    0x10, 0xE8, 0x1A, 0x18, 0x51, 0x00, 0xE8, 0x35, 0x39, 0x39, 0x00, 0x85, 0xC0, 0x74, 0x21, 0xD9,
+    0x05, 0x98, 0x79, 0xE8, 0x00, 0x83, 0xA6, 0x58, 0x07, 0x00, 0x00, 0xFE, 0x51, 0xD9, 0x1C, 0x24,
+    0x8D, 0x50, 0x1C, 0x56, 0x32, 0xC0, 0x33, 0xF6, 0xE8, 0xC3, 0xA9, 0x2E, 0x00, 0x83, 0xC4, 0x08,
+    0x5F, 0x5E, 0xC3,
+];
+const B_ACT_LOOK_AT_NAV_CALLS: [usize; 5] = [0x18, 0x24, 0x41, 0x46, 0x68];
+// act_teleports_to 0x6caa80..0x6caaff size 0x7f
+const B_ACT_TELEPORTS_TO: [u8; 127] = [
+    0x53, 0x8B, 0x5C, 0x24, 0x08, 0x56, 0x8B, 0x73, 0x08, 0x85, 0xF6, 0x74, 0x6F, 0x57, 0x8D, 0x44,
+    0x24, 0x10, 0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x10, 0x00, 0xE8, 0x12, 0x81, 0x38, 0x00, 0x80, 0x7C,
+    0x24, 0x10, 0x00, 0x75, 0x09, 0xE8, 0xC6, 0x81, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x4D, 0x8B, 0xF8,
+    0x85, 0xFF, 0x74, 0x47, 0x8B, 0x43, 0x0C, 0x50, 0x33, 0xD2, 0x8D, 0x44, 0x24, 0x14, 0xE8, 0x6D,
+    0x1F, 0x51, 0x00, 0xE8, 0x88, 0x40, 0x39, 0x00, 0x8B, 0xF0, 0x85, 0xF6, 0x74, 0x2D, 0x80, 0xBF,
+    0xCC, 0x03, 0x00, 0x00, 0x02, 0x75, 0x0D, 0x6A, 0x00, 0x6A, 0x00, 0x57, 0xE8, 0xEF, 0xD1, 0xD7,
+    0xFF, 0x83, 0xC4, 0x0C, 0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x01, 0x6A, 0x00, 0x8D, 0x4E, 0x28, 0x8D,
+    0x56, 0x1C, 0x57, 0xE8, 0x08, 0x60, 0x2D, 0x00, 0x83, 0xC4, 0x14, 0x5F, 0x5E, 0x5B, 0xC3,
+];
+const B_ACT_TELEPORTS_TO_CALLS: [usize; 6] = [0x19, 0x25, 0x3e, 0x43, 0x5c, 0x73];
+// act_walk_to 0x6cab00..0x6cab63 size 0x63
+const B_ACT_WALK_TO: [u8; 99] = [
+    0x56, 0x57, 0x8B, 0x7C, 0x24, 0x0C, 0x8B, 0x77, 0x08, 0x85, 0xF6, 0x74, 0x53, 0x8D, 0x44, 0x24,
+    0x0C, 0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x0C, 0x00, 0xE8, 0x93, 0x80, 0x38, 0x00, 0x80, 0x7C, 0x24,
+    0x0C, 0x00, 0x75, 0x09, 0xE8, 0x47, 0x81, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x33, 0x8B, 0xF0, 0x85,
+    0xF6, 0x74, 0x2D, 0x8B, 0x47, 0x0C, 0x50, 0x33, 0xD2, 0x8D, 0x44, 0x24, 0x10, 0xE8, 0xEE, 0x1E,
+    0x51, 0x00, 0xE8, 0x09, 0x40, 0x39, 0x00, 0x85, 0xC0, 0x74, 0x15, 0x6A, 0x01, 0x50, 0xC7, 0x05,
+    0x28, 0x7D, 0x52, 0x02, 0x03, 0x00, 0x00, 0x00, 0xE8, 0x03, 0xFA, 0xFF, 0xFF, 0x83, 0xC4, 0x08,
+    0x5F, 0x5E, 0xC3,
+];
+const B_ACT_WALK_TO_CALLS: [usize; 5] = [0x18, 0x24, 0x3d, 0x42, 0x58];
+// act_run_to 0x6cab70..0x6cabd3 size 0x63
+const B_ACT_RUN_TO: [u8; 99] = [
+    0x56, 0x57, 0x8B, 0x7C, 0x24, 0x0C, 0x8B, 0x77, 0x08, 0x85, 0xF6, 0x74, 0x53, 0x8D, 0x44, 0x24,
+    0x0C, 0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x0C, 0x00, 0xE8, 0x23, 0x80, 0x38, 0x00, 0x80, 0x7C, 0x24,
+    0x0C, 0x00, 0x75, 0x09, 0xE8, 0xD7, 0x80, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x33, 0x8B, 0xF0, 0x85,
+    0xF6, 0x74, 0x2D, 0x8B, 0x47, 0x0C, 0x50, 0x33, 0xD2, 0x8D, 0x44, 0x24, 0x10, 0xE8, 0x7E, 0x1E,
+    0x51, 0x00, 0xE8, 0x99, 0x3F, 0x39, 0x00, 0x85, 0xC0, 0x74, 0x15, 0x6A, 0x02, 0x50, 0xC7, 0x05,
+    0x28, 0x7D, 0x52, 0x02, 0x07, 0x00, 0x00, 0x00, 0xE8, 0x93, 0xF9, 0xFF, 0xFF, 0x83, 0xC4, 0x08,
+    0x5F, 0x5E, 0xC3,
+];
+const B_ACT_RUN_TO_CALLS: [usize; 5] = [0x18, 0x24, 0x3d, 0x42, 0x58];
+// act_suicides 0x6cacd0..0x6cad1f size 0x4f
+const B_ACT_SUICIDES: [u8; 79] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x8B, 0x70, 0x08, 0x85, 0xF6, 0x74, 0x41, 0x8D, 0x44, 0x24, 0x08,
+    0x8B, 0xCE, 0xC6, 0x44, 0x24, 0x08, 0x00, 0xE8, 0xC4, 0x7E, 0x38, 0x00, 0x80, 0x7C, 0x24, 0x08,
+    0x00, 0x75, 0x09, 0xE8, 0x78, 0x7F, 0x38, 0x00, 0x85, 0xC0, 0x74, 0x21, 0x85, 0xC0, 0x74, 0x1D,
+    0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0x6A, 0x00, 0x6A, 0x00, 0x51, 0xD9, 0x1C, 0x24, 0x50, 0x33,
+    0xD2, 0x33, 0xC9, 0xE8, 0x88, 0x9A, 0x2B, 0x00, 0xDD, 0xD8, 0x83, 0xC4, 0x10, 0x5E, 0xC3,
+];
+const B_ACT_SUICIDES_CALLS: [usize; 3] = [0x17, 0x23, 0x43];
+// act_cam_stop_slide 0x6cb5e0..0x6cb674 size 0x94
+const B_ACT_CAM_STOP_SLIDE: [u8; 148] = [
+    0x8B, 0x15, 0x10, 0x7D, 0x52, 0x02, 0x85, 0xD2, 0x0F, 0x84, 0x85, 0x00, 0x00, 0x00, 0x8B, 0x82,
+    0x40, 0x15, 0x00, 0x00, 0xD9, 0xEE, 0x83, 0xC0, 0x1C, 0xC6, 0x00, 0x00, 0x8B, 0x0D, 0x20, 0x5B,
+    0x5F, 0x02, 0x89, 0x48, 0x0C, 0x8B, 0x0D, 0x24, 0x5B, 0x5F, 0x02, 0x89, 0x48, 0x10, 0x8B, 0x0D,
+    0x28, 0x5B, 0x5F, 0x02, 0x89, 0x48, 0x14, 0x8B, 0x0D, 0x20, 0x5B, 0x5F, 0x02, 0x89, 0x48, 0x1C,
+    0x8B, 0x0D, 0x24, 0x5B, 0x5F, 0x02, 0x89, 0x48, 0x20, 0x8B, 0x0D, 0x28, 0x5B, 0x5F, 0x02, 0xD9,
+    0x50, 0x18, 0x56, 0xD9, 0x50, 0x08, 0x89, 0x48, 0x24, 0x57, 0xC6, 0x82, 0x80, 0x15, 0x00, 0x00,
+    0x00, 0x8D, 0xBA, 0x8C, 0x15, 0x00, 0x00, 0xB9, 0x09, 0x00, 0x00, 0x00, 0xBE, 0x5C, 0x5B, 0x5F,
+    0x02, 0xF3, 0xA5, 0x8D, 0xBA, 0xB4, 0x15, 0x00, 0x00, 0xB9, 0x09, 0x00, 0x00, 0x00, 0xBE, 0x5C,
+    0x5B, 0x5F, 0x02, 0xF3, 0xA5, 0xD9, 0x92, 0xB0, 0x15, 0x00, 0x00, 0xD9, 0x9A, 0x88, 0x15, 0x00,
+    0x00, 0x5F, 0x5E, 0xC3,
+];
+const B_ACT_CAM_STOP_SLIDE_CALLS: [usize; 0] = [];
+// act_cam_slide_update 0x6cb590..0x6cb5d7 size 0x47
+const B_ACT_CAM_SLIDE_UPDATE: [u8; 71] = [
+    0xA1, 0x10, 0x7D, 0x52, 0x02, 0x85, 0xC0, 0x75, 0x03, 0xB0, 0x01, 0xC3, 0x8B, 0x80, 0x40, 0x15,
+    0x00, 0x00, 0x83, 0xC0, 0x1C, 0x80, 0x38, 0x00, 0x74, 0x1E, 0xD9, 0x05, 0x10, 0x67, 0x7E, 0x02,
+    0xD9, 0x40, 0x18, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x7B, 0x0C, 0x33, 0xC0, 0x33, 0xC9,
+    0x3C, 0x01, 0x0F, 0x94, 0xC1, 0x8A, 0xC1, 0xC3, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x33, 0xC9, 0x3A,
+    0xC0, 0x0F, 0x94, 0xC1, 0x8A, 0xC1, 0xC3,
+];
+const B_ACT_CAM_SLIDE_UPDATE_CALLS: [usize; 0] = [];
+pub const NPORTS: usize = 61;
+struct Entry { name: &'static str, addr: usize, body: &'static [u8], calls: &'static [usize], thunk: extern "C" fn(), kind: u8 }
+static ENTRIES: [Entry; NPORTS] = [
+    Entry { name: "level_lights", addr: 0x6d7590, body: &B_LEVEL_LIGHTS, calls: &B_LEVEL_LIGHTS_CALLS, thunk: level_lights_t, kind: b'S' },
+    Entry { name: "tree_shadows", addr: 0x6d75b0, body: &B_TREE_SHADOWS, calls: &B_TREE_SHADOWS_CALLS, thunk: tree_shadows_t, kind: b'S' },
+    Entry { name: "tod_char_shadows", addr: 0x6d75d0, body: &B_TOD_CHAR_SHADOWS, calls: &B_TOD_CHAR_SHADOWS_CALLS, thunk: tod_char_shadows_t, kind: b'S' },
+    Entry { name: "motion_blur", addr: 0x6d75e0, body: &B_MOTION_BLUR, calls: &B_MOTION_BLUR_CALLS, thunk: motion_blur_t, kind: b'S' },
+    Entry { name: "motion_blur_override", addr: 0x6d7600, body: &B_MOTION_BLUR_OVERRIDE, calls: &B_MOTION_BLUR_OVERRIDE_CALLS, thunk: motion_blur_override_t, kind: b'S' },
+    Entry { name: "camera_moves", addr: 0x6d7630, body: &B_CAMERA_MOVES, calls: &B_CAMERA_MOVES_CALLS, thunk: camera_moves_t, kind: b'S' },
+    Entry { name: "disable_trees", addr: 0x6d7640, body: &B_DISABLE_TREES, calls: &B_DISABLE_TREES_CALLS, thunk: disable_trees_t, kind: b'S' },
+    Entry { name: "city_no_render_al", addr: 0x6d7660, body: &B_CITY_NO_RENDER_AL, calls: &B_CITY_NO_RENDER_AL_CALLS, thunk: city_no_render_al_t, kind: b'S' },
+    Entry { name: "shader_lod_force", addr: 0x6d7670, body: &B_SHADER_LOD_FORCE, calls: &B_SHADER_LOD_FORCE_CALLS, thunk: shader_lod_force_t, kind: b'S' },
+    Entry { name: "city_shadow_dist", addr: 0x6d76b0, body: &B_CITY_SHADOW_DIST, calls: &B_CITY_SHADOW_DIST_CALLS, thunk: city_shadow_dist_t, kind: b'S' },
+    Entry { name: "far_clip", addr: 0x6d7720, body: &B_FAR_CLIP, calls: &B_FAR_CLIP_CALLS, thunk: far_clip_t, kind: b'S' },
+    Entry { name: "near_clip", addr: 0x6d7740, body: &B_NEAR_CLIP, calls: &B_NEAR_CLIP_CALLS, thunk: near_clip_t, kind: b'S' },
+    Entry { name: "shot_fade_out", addr: 0x6d77a0, body: &B_SHOT_FADE_OUT, calls: &B_SHOT_FADE_OUT_CALLS, thunk: shot_fade_out_t, kind: b'S' },
+    Entry { name: "shot_fade_out_midway", addr: 0x6d77e0, body: &B_SHOT_FADE_OUT_MIDWAY, calls: &B_SHOT_FADE_OUT_MIDWAY_CALLS, thunk: shot_fade_out_midway_t, kind: b'S' },
+    Entry { name: "shot_cut_out_midway", addr: 0x6d7840, body: &B_SHOT_CUT_OUT_MIDWAY, calls: &B_SHOT_CUT_OUT_MIDWAY_CALLS, thunk: shot_cut_out_midway_t, kind: b'S' },
+    Entry { name: "letterbox_fade_in", addr: 0x6d7890, body: &B_LETTERBOX_FADE_IN, calls: &B_LETTERBOX_FADE_IN_CALLS, thunk: letterbox_fade_in_t, kind: b'S' },
+    Entry { name: "letterbox_fade_out", addr: 0x6d78d0, body: &B_LETTERBOX_FADE_OUT, calls: &B_LETTERBOX_FADE_OUT_CALLS, thunk: letterbox_fade_out_t, kind: b'S' },
+    Entry { name: "framebuffer_tint", addr: 0x6d78f0, body: &B_FRAMEBUFFER_TINT, calls: &B_FRAMEBUFFER_TINT_CALLS, thunk: framebuffer_tint_t, kind: b'S' },
+    Entry { name: "force_tod_lights", addr: 0x6d79e0, body: &B_FORCE_TOD_LIGHTS, calls: &B_FORCE_TOD_LIGHTS_CALLS, thunk: force_tod_lights_t, kind: b'S' },
+    Entry { name: "lightning", addr: 0x6d7d70, body: &B_LIGHTNING, calls: &B_LIGHTNING_CALLS, thunk: lightning_t, kind: b'S' },
+    Entry { name: "glares", addr: 0x6d8120, body: &B_GLARES, calls: &B_GLARES_CALLS, thunk: glares_t, kind: b'S' },
+    Entry { name: "fog_distance", addr: 0x6d8170, body: &B_FOG_DISTANCE, calls: &B_FOG_DISTANCE_CALLS, thunk: fog_distance_t, kind: b'S' },
+    Entry { name: "city_region_blend", addr: 0x6d81e0, body: &B_CITY_REGION_BLEND, calls: &B_CITY_REGION_BLEND_CALLS, thunk: city_region_blend_t, kind: b'S' },
+    Entry { name: "city_render_fade", addr: 0x6d81f0, body: &B_CITY_RENDER_FADE, calls: &B_CITY_RENDER_FADE_CALLS, thunk: city_render_fade_t, kind: b'S' },
+    Entry { name: "drug_effect", addr: 0x6d8200, body: &B_DRUG_EFFECT, calls: &B_DRUG_EFFECT_CALLS, thunk: drug_effect_t, kind: b'S' },
+    Entry { name: "rain_override", addr: 0x6d8240, body: &B_RAIN_OVERRIDE, calls: &B_RAIN_OVERRIDE_CALLS, thunk: rain_override_t, kind: b'S' },
+    Entry { name: "credits_roll", addr: 0x6d82d0, body: &B_CREDITS_ROLL, calls: &B_CREDITS_ROLL_CALLS, thunk: credits_roll_t, kind: b'S' },
+    Entry { name: "spawning_peds", addr: 0x6d7510, body: &B_SPAWNING_PEDS, calls: &B_SPAWNING_PEDS_CALLS, thunk: spawning_peds_t, kind: b'C' },
+    Entry { name: "spawning_cars", addr: 0x6d7550, body: &B_SPAWNING_CARS, calls: &B_SPAWNING_CARS_CALLS, thunk: spawning_cars_t, kind: b'C' },
+    Entry { name: "spawning_remove_all", addr: 0x6d76d0, body: &B_SPAWNING_REMOVE_ALL, calls: &B_SPAWNING_REMOVE_ALL_CALLS, thunk: spawning_remove_all_t, kind: b'C' },
+    Entry { name: "hide_player_compnt", addr: 0x6d7a60, body: &B_HIDE_PLAYER_COMPNT, calls: &B_HIDE_PLAYER_COMPNT_CALLS, thunk: hide_player_compnt_t, kind: b'C' },
+    Entry { name: "time_of_day_set", addr: 0x6d8140, body: &B_TIME_OF_DAY_SET, calls: &B_TIME_OF_DAY_SET_CALLS, thunk: time_of_day_set_t, kind: b'C' },
+    Entry { name: "bink_play", addr: 0x6d7aa0, body: &B_BINK_PLAY, calls: &B_BINK_PLAY_CALLS, thunk: bink_play_t, kind: b'C' },
+    Entry { name: "mesh_mover_hide", addr: 0x6d7af0, body: &B_MESH_MOVER_HIDE, calls: &B_MESH_MOVER_HIDE_CALLS, thunk: mesh_mover_hide_t, kind: b'C' },
+    Entry { name: "mesh_mover_show", addr: 0x6d7b10, body: &B_MESH_MOVER_SHOW, calls: &B_MESH_MOVER_SHOW_CALLS, thunk: mesh_mover_show_t, kind: b'C' },
+    Entry { name: "chunk_hide", addr: 0x6d8280, body: &B_CHUNK_HIDE, calls: &B_CHUNK_HIDE_CALLS, thunk: chunk_hide_t, kind: b'C' },
+    Entry { name: "chunk_show", addr: 0x6d82b0, body: &B_CHUNK_SHOW, calls: &B_CHUNK_SHOW_CALLS, thunk: chunk_show_t, kind: b'C' },
+    Entry { name: "weather_stage", addr: 0x6d7db0, body: &B_WEATHER_STAGE, calls: &B_WEATHER_STAGE_CALLS, thunk: weather_stage_t, kind: b'C' },
+    Entry { name: "shot_fade_in", addr: 0x6d7750, body: &B_SHOT_FADE_IN, calls: &B_SHOT_FADE_IN_CALLS, thunk: shot_fade_in_t, kind: b'C' },
+    Entry { name: "act_cam_stop_track", addr: 0x6cb680, body: &B_ACT_CAM_STOP_TRACK, calls: &B_ACT_CAM_STOP_TRACK_CALLS, thunk: act_cam_stop_track_t, kind: b'C' },
+    Entry { name: "act_cam_track_char", addr: 0x6cb2e0, body: &B_ACT_CAM_TRACK_CHAR, calls: &B_ACT_CAM_TRACK_CHAR_CALLS, thunk: act_cam_track_char_t, kind: b'C' },
+    Entry { name: "act_cam_look_at_char", addr: 0x6cb330, body: &B_ACT_CAM_LOOK_AT_CHAR, calls: &B_ACT_CAM_LOOK_AT_CHAR_CALLS, thunk: act_cam_look_at_char_t, kind: b'C' },
+    Entry { name: "act_hide_character", addr: 0x6cb6e0, body: &B_ACT_HIDE_CHARACTER, calls: &B_ACT_HIDE_CHARACTER_CALLS, thunk: act_hide_character_t, kind: b'C' },
+    Entry { name: "act_show_character", addr: 0x6cb730, body: &B_ACT_SHOW_CHARACTER, calls: &B_ACT_SHOW_CHARACTER_CALLS, thunk: act_show_character_t, kind: b'C' },
+    Entry { name: "act_disable_physics", addr: 0x6cb780, body: &B_ACT_DISABLE_PHYSICS, calls: &B_ACT_DISABLE_PHYSICS_CALLS, thunk: act_disable_physics_t, kind: b'C' },
+    Entry { name: "act_enable_physics", addr: 0x6cb7e0, body: &B_ACT_ENABLE_PHYSICS, calls: &B_ACT_ENABLE_PHYSICS_CALLS, thunk: act_enable_physics_t, kind: b'C' },
+    Entry { name: "act_hide_vehicle", addr: 0x6cb850, body: &B_ACT_HIDE_VEHICLE, calls: &B_ACT_HIDE_VEHICLE_CALLS, thunk: act_hide_vehicle_t, kind: b'C' },
+    Entry { name: "act_show_vehicle", addr: 0x6cb890, body: &B_ACT_SHOW_VEHICLE, calls: &B_ACT_SHOW_VEHICLE_CALLS, thunk: act_show_vehicle_t, kind: b'C' },
+    Entry { name: "act_hide_group", addr: 0x6cb8e0, body: &B_ACT_HIDE_GROUP, calls: &B_ACT_HIDE_GROUP_CALLS, thunk: act_hide_group_t, kind: b'C' },
+    Entry { name: "act_show_group", addr: 0x6cb900, body: &B_ACT_SHOW_GROUP, calls: &B_ACT_SHOW_GROUP_CALLS, thunk: act_show_group_t, kind: b'C' },
+    Entry { name: "act_look_at_nothing", addr: 0x6cb250, body: &B_ACT_LOOK_AT_NOTHING, calls: &B_ACT_LOOK_AT_NOTHING_CALLS, thunk: act_look_at_nothing_t, kind: b'C' },
+    Entry { name: "act_cam_follow_target", addr: 0x6cb6a0, body: &B_ACT_CAM_FOLLOW_TARGET, calls: &B_ACT_CAM_FOLLOW_TARGET_CALLS, thunk: act_cam_follow_target_t, kind: b'C' },
+    Entry { name: "act_cam_cut_to", addr: 0x6cb2a0, body: &B_ACT_CAM_CUT_TO, calls: &B_ACT_CAM_CUT_TO_CALLS, thunk: act_cam_cut_to_t, kind: b'C' },
+    Entry { name: "act_look_at", addr: 0x6cb110, body: &B_ACT_LOOK_AT, calls: &B_ACT_LOOK_AT_CALLS, thunk: act_look_at_t, kind: b'C' },
+    Entry { name: "act_look_at_nav", addr: 0x6cb1d0, body: &B_ACT_LOOK_AT_NAV, calls: &B_ACT_LOOK_AT_NAV_CALLS, thunk: act_look_at_nav_t, kind: b'C' },
+    Entry { name: "act_teleports_to", addr: 0x6caa80, body: &B_ACT_TELEPORTS_TO, calls: &B_ACT_TELEPORTS_TO_CALLS, thunk: act_teleports_to_t, kind: b'C' },
+    Entry { name: "act_walk_to", addr: 0x6cab00, body: &B_ACT_WALK_TO, calls: &B_ACT_WALK_TO_CALLS, thunk: act_walk_to_t, kind: b'C' },
+    Entry { name: "act_run_to", addr: 0x6cab70, body: &B_ACT_RUN_TO, calls: &B_ACT_RUN_TO_CALLS, thunk: act_run_to_t, kind: b'C' },
+    Entry { name: "act_suicides", addr: 0x6cacd0, body: &B_ACT_SUICIDES, calls: &B_ACT_SUICIDES_CALLS, thunk: act_suicides_t, kind: b'C' },
+    Entry { name: "act_cam_stop_slide", addr: 0x6cb5e0, body: &B_ACT_CAM_STOP_SLIDE, calls: &B_ACT_CAM_STOP_SLIDE_CALLS, thunk: act_cam_stop_slide_t, kind: b'S' },
+    Entry { name: "act_cam_slide_update", addr: 0x6cb590, body: &B_ACT_CAM_SLIDE_UPDATE, calls: &B_ACT_CAM_SLIDE_UPDATE_CALLS, thunk: act_cam_slide_update_t, kind: b'R' },
+];
+// total bytes 3554
+
 /// Install this module's replacements (called from hooks::install_all).
-pub fn install() {}
+pub fn install() {
+    let mut ok = 0;
+    for (i, e) in ENTRIES.iter().enumerate() {
+        unsafe {
+            if e.kind == b'S' || e.kind == b'R' {
+                match detour::relocate(e.addr, e.body, e.calls) {
+                    Ok(c) => ST[i].orig.store(c, Ordering::Relaxed),
+                    Err(err) => {
+                        log(&format!("port_cutscene: relocating {} @ {:#x} failed: {err:?}", e.name, e.addr));
+                        continue;
+                    }
+                }
+            }
+            if replace_pinned(e.name, e.addr, e.body, e.thunk as usize) {
+                ok += 1;
+            }
+        }
+    }
+    log(&format!("port_cutscene: replaced {ok}/{NPORTS} with Rust"));
+}
 
 /// Per-function call counts for the periodic log.
 pub fn summary() -> String {
-    String::new()
+    let mut parts = Vec::new();
+    for (i, e) in ENTRIES.iter().enumerate() {
+        let n = ST[i].calls.load(Ordering::Relaxed);
+        if n == 0 {
+            continue;
+        }
+        let m = ST[i].mism.load(Ordering::Relaxed);
+        if e.kind == b'C' {
+            let b: Vec<u32> = (0..4).map(|k| BR[i * 4 + k].load(Ordering::Relaxed)).collect();
+            parts.push(format!("{} {} [{},{},{},{}]", e.name, n, b[0], b[1], b[2], b[3]));
+        } else {
+            parts.push(format!("{} {} ({})", e.name, n, m));
+        }
+    }
+    if parts.is_empty() { String::new() } else { format!("port_cutscene: {}", parts.join(", ")) }
 }

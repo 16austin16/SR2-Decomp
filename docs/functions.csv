@@ -11428,7 +11428,7 @@ address,name,subsystem,status,notes
 0x00b73cc0,weapon_clip_size,weapons,documented,"EAX = human, ESI = instance: info+0xDC, doubled when dual-wielding (38)"
 0x0055adf0,inventory_find_weapon,weapons,rust,"Rust (frame.rs, EAX / ESI thunk): inventory item whose weapon's slot (+0x3C) matches (40)"
 0x00558db0,weapon_refill_after_add,weapons,documented,"cdecl (human, item), EAX = amount: adds reserve, clamps the magazine to the clip size, thrown weapons keep 1 in the magazine (38)"
-0x00926600,human_is_local_player,humans,documented,"ECX = human: +0x4C == 1 and +0x3CC == 1 (38)"
+0x00926600,human_ptr_is_player_human,humans,documented,"ECX = object pointer -> AL: type +0x4C == 1 and kind byte +0x3CC == 1; does not compare with the local player (that is 0x926650); was misnamed human_is_local_player (53)"
 0x00b69150,ammo_store_add,weapons,documented,"ECX = instance, cdecl (store, alt, ...): adds to the player ammo store entry for the weapon ammo type (38)"
 0x00773eb0,options_commit_display,ui,documented,"cdecl (bool accept): accept copies the display working copy 0x1F7A9A0.. into the live config 0x22FD848 (sets +0 for a device reset when mode / fullscreen / vsync change), then 0x7735C0 and options_store_display; revert copies it back (28)"
 0x00773c70,options_store_display,ui,documented,"copies the display working copy into the settings-file image *(0x140FFAC) (+0x40 w, +0x44 h, +0x48 quality, +0x4C fullscreen, ...), then 0x696F50 (28)"
