@@ -14,3 +14,12 @@ when the function is ported (its docs/functions.csv status becomes `rust`).
 | 0x00817d80 | (pool lookup, doc 48) | port_net (round 4) | not reached in the time available; one of three pool lookups that differ only in their globals | port with 0x817F40 / 0x818020 from one body |
 | 0x00817f40 | (pool lookup, doc 48) | port_net (round 4) | as 0x817D80 | as 0x817D80 |
 | 0x00818020 | (pool lookup, doc 48) | port_net (round 4) | as 0x817D80 | as 0x817D80 |
+
+## Groups left for a later pass
+
+| Group | Skipped in | Reason | What it needs |
+|---|---|---|---|
+| ~60 vint property getters with two `ret`s (pattern: vint_element_base::get_alpha 0xB96860, doc 49 section 5) | port_leaves_fp | the sweep only took single-ret bodies | a two-exit leaf template |
+| ~55 more trivial stubs (constant returns, `xor eax,eax`, flags, no-ops) | port_leaves (sweep 2) | cut to keep the batch reviewable | the same template as the 255 already ported |
+| transcendental vint_ease_* (sin / pow / sqrt / bounce) | port_leaves_fp | they call the CRT maths functions | call the CRT by address |
+| coop_wait_text, script_positionable_object copy_transform_from / set_transform | port_leaves (sweep 2) | `rep movsd` | reproduce the copy |
