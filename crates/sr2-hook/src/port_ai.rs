@@ -45,7 +45,7 @@
 //! event-cancelling exits leave (the table dispatchers `ai_order_net_write` / `ai_order_net_read` do
 //! not read it after `call eax`), and ECX / EDX after calls (clobbered in the originals).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::portlib::*;
@@ -288,7 +288,19 @@ const NR_K1F: usize = 81;
 const NR_K15: usize = 82;
 const NR_K21: usize = 83;
 const PX_K00: usize = 84;
-const COUNT: usize = 85;
+const EX_K23: usize = 85;
+const EX_K1D: usize = 86;
+const EX_K0A: usize = 87;
+const EX_K08: usize = 88;
+const EX_K1A: usize = 89;
+const NR_K20: usize = 90;
+const NR_K08: usize = 91;
+const UP_K16: usize = 92;
+const UP_K1A: usize = 93;
+const EN_K17: usize = 94;
+const EN_K1A: usize = 95;
+const SETACT: usize = 96;
+const COUNT: usize = 97;
 
 static PORTS: [Port; COUNT] = [
     port("ai_event_find", 0x0040_20F0, EDX | SAVED),
@@ -376,6 +388,18 @@ static PORTS: [Port; COUNT] = [
     port("ai_order_k15_net_read", 0x0045_7F00, SAVED),
     port("ai_order_k21_net_read", 0x0046_3380, SAVED),
     port("ai_order_k00_payload_init", 0x0044_69A0, SAVED),
+    port("ai_order_k23_exit", 0x0045_86B0, SAVED),
+    port("ai_order_k1d_exit", 0x0046_0A00, SAVED),
+    port("ai_order_k0a_exit", 0x0041_C380, SAVED),
+    port("ai_order_k08_exit", 0x0041_65C0, SAVED),
+    port("ai_order_k1a_exit", 0x0045_C070, SAVED),
+    port("ai_order_k20_net_read", 0x0046_2A80, SAVED),
+    port("ai_order_k08_net_read", 0x0041_5EC0, SAVED),
+    port("ai_order_k16_update", 0x0045_93A0, SAVED),
+    port("ai_order_k1a_update", 0x0045_C0C0, SAVED),
+    port("ai_order_k17_enter", 0x0045_9800, SAVED),
+    port("ai_order_k1a_enter", 0x0045_C020, SAVED),
+    port("ai_order_set_action", 0x0043_75B0, SAVED),
 ];
 
 /// Count a call; `Some((call number, original copy))` while it should be shadowed.
@@ -2451,6 +2475,815 @@ extern "C" fn px_k00_entry(r: &mut Pushad, args: *const u32) {
 }
 regs_thunk!(px_k00_thunk, px_k00_entry);
 
+// --- the handlers round 3 skipped (exits, updates, enters, two net readers, ai_order_set_action) ------------------------
+//
+// Checks used here, besides the recording-stub shadow of `seq_port`:
+// - callees whose result drives the next step (`0x6AC360`, `0x963540`, `0x806720`, `0x735FB0`, the mission getter and
+//   `vehicle_interaction_rider_find`) are pure lookups: the copy and Rust both run them for real, and the registers
+//   they leave (ECX / EDX) are captured with `call_full` and carried to the next call;
+// - every mutating callee is pointed at a recording stub in the copy (`ret N` stubs for the callees that pop their
+//   arguments; a stack-local pointer argument is recorded as the value it points to) and made once, for real, by Rust;
+// - `0x415DA0` (k08 net_read) creates the record the handler then writes, so it runs once for real before the shadow and
+//   the copy's call is a recording stub; the record's two dwords, the position and the payload are the snapshot;
+// - `ai_order_set_action` runs its decisions twice (the copy with stubs, Rust as a dry run on the same state) and compares
+//   the recorded calls, the dwords it writes and its EAX; a mismatch runs a second, unmodified copy of the original.
+
+/// A mutating callee: (address, stack arguments, index of an argument that points at the caller's stack local or -1).
+const G2: [(usize, usize, i32); 16] = [
+    (0x006A_E560, 3, -1), // 0: (human, 0x1F4, 0)
+    (0x006A_E180, 4, -1), // 1: EAX = human; (0x1D8, f32, 0xFFFF, 1)
+    (0x0095_BF60, 2, -1), // 2: ECX = human; (-1, 0), ret 8
+    (0x0096_0A80, 2, -1), // 3: ESI = human; (1, 0)
+    (0x0096_CB70, 5, -1), // 4: human_anim_set_update(human, -1, 1, 1, 0)
+    (0x0096_95F0, 1, 0),  // 5: ECX = human; (&value), ret 4
+    (0x0096_8A70, 2, 1),  // 6: (human, &value), ret 8
+    (0x0096_90E0, 2, 1),  // 7: (human, &value), ret 8
+    (0x0045_9400, 1, -1), // 8: EAX = human
+    (0x0045_9190, 1, -1), // 9: EAX = human
+    (0x0045_B890, 1, -1), // 10: EAX = human
+    (0x0045_AF10, 1, -1), // 11: (human)
+    (0x0045_B9E0, 0, -1), // 12: ESI = human
+    (0x0041_5DA0, 0, -1), // 13: ESI = buffer, EDI = human
+    (0x0073_5EF0, 1, -1), // 14: ECX = object, EDI = 0, (1), ret 4
+    (0x0096_3090, 2, -1), // 15: EAX = human, (1, 0)
+];
+const G2_6AE560: u32 = 0;
+const G2_6AE180: u32 = 1;
+const G2_95BF60: u32 = 2;
+const G2_960A80: u32 = 3;
+const G2_96CB70: u32 = 4;
+const G2_9695F0: u32 = 5;
+const G2_968A70: u32 = 6;
+const G2_9690E0: u32 = 7;
+const G2_459400: u32 = 8;
+const G2_459190: u32 = 9;
+const G2_45B890: u32 = 10;
+const G2_45AF10: u32 = 11;
+const G2_45B9E0: u32 = 12;
+const G2_415DA0: u32 = 13;
+const G2_735EF0: u32 = 14;
+const G2_963090: u32 = 15;
+
+/// [tag, callee, eax, ecx, edx, esi, edi, args...]; a pointer to the caller's stack local is `LOCAL_MARK` in a
+/// register and the value it points at in the argument.
+const T_GEN2: u32 = 30;
+/// [tag, address, mask]: `byte &= mask` / `dword &= mask` done by the handler itself.
+const T_AND8: u32 = 31;
+const T_AND32: u32 = 32;
+const LOCAL_MARK: u32 = 0xFFFF_FFF8;
+
+thread_local! {
+    static STACK_TOP: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Remember the top of the stack region the copy runs below (a register in that region is a pointer to the copy's own
+/// stack local).
+fn set_top(marker: &u8) {
+    STACK_TOP.with(|c| c.set(std::hint::black_box(marker) as *const u8 as u32));
+}
+
+fn g2_rec(idx: u32, r: &mut Pushad, args: *const u32) {
+    let (_, n, dref) = G2[idx as usize];
+    let top = STACK_TOP.with(|c| c.get());
+    let norm = |v: u32| if v > r.esp && v < top { LOCAL_MARK } else { v };
+    let mut v = vec![T_GEN2, idx, norm(r.eax), norm(r.ecx), norm(r.edx), r.esi, r.edi];
+    for i in 0..n {
+        let x = unsafe { *args.add(i) };
+        v.push(if i as i32 == dref { unsafe { rdu(x as usize) } } else { x });
+    }
+    tape_push(v);
+}
+
+macro_rules! regs_thunk_ret {
+    ($name:ident, $f:ident, $n:literal) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "pushad",
+                "mov eax, esp",
+                "lea ecx, [esp + 36]",
+                "push ecx",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "popad",
+                "ret {n}",
+                f = sym $f,
+                n = const $n,
+            )
+        }
+    };
+}
+
+macro_rules! g2_stub {
+    ($entry:ident, $thunk:ident, $idx:expr) => {
+        extern "C" fn $entry(r: &mut Pushad, args: *const u32) {
+            g2_rec($idx, r, args);
+        }
+        regs_thunk!($thunk, $entry);
+    };
+    ($entry:ident, $thunk:ident, $idx:expr, ret $n:literal) => {
+        extern "C" fn $entry(r: &mut Pushad, args: *const u32) {
+            g2_rec($idx, r, args);
+        }
+        regs_thunk_ret!($thunk, $entry, $n);
+    };
+}
+
+g2_stub!(g2_6ae560_entry, g2_6ae560_stub, G2_6AE560);
+g2_stub!(g2_6ae180_entry, g2_6ae180_stub, G2_6AE180);
+g2_stub!(g2_95bf60_entry, g2_95bf60_stub, G2_95BF60, ret 8);
+g2_stub!(g2_960a80_entry, g2_960a80_stub, G2_960A80);
+g2_stub!(g2_96cb70_entry, g2_96cb70_stub, G2_96CB70);
+g2_stub!(g2_9695f0_entry, g2_9695f0_stub, G2_9695F0, ret 4);
+g2_stub!(g2_968a70_entry, g2_968a70_stub, G2_968A70, ret 8);
+g2_stub!(g2_9690e0_entry, g2_9690e0_stub, G2_9690E0, ret 8);
+g2_stub!(g2_459400_entry, g2_459400_stub, G2_459400);
+g2_stub!(g2_459190_entry, g2_459190_stub, G2_459190);
+g2_stub!(g2_45b890_entry, g2_45b890_stub, G2_45B890);
+g2_stub!(g2_45af10_entry, g2_45af10_stub, G2_45AF10);
+g2_stub!(g2_45b9e0_entry, g2_45b9e0_stub, G2_45B9E0);
+g2_stub!(g2_415da0_entry, g2_415da0_stub, G2_415DA0);
+g2_stub!(g2_735ef0_entry, g2_735ef0_stub, G2_735EF0, ret 4);
+g2_stub!(g2_963090_entry, g2_963090_stub, G2_963090);
+
+/// `ai_gaze_clear` (0x9B5FF0) is idempotent (it stores the default gaze block), so the copy runs the real one after
+/// recording the call: the ECX / EDX it leaves are then exactly what the next callee sees.
+static GAZE_REAL: AtomicU32 = AtomicU32::new(GAZE_CLEAR as u32);
+
+extern "C" fn gaze_fwd_rec(eax: u32) {
+    tape_push(vec![T_GAZE_CLEAR, eax]);
+}
+
+#[unsafe(naked)]
+extern "C" fn gaze_fwd_stub() {
+    std::arch::naked_asm!(
+        "pushad",
+        "push eax",
+        "call {f}",
+        "add esp, 4",
+        "popad",
+        "jmp dword ptr [{t}]",
+        f = sym gaze_fwd_rec,
+        t = sym GAZE_REAL,
+    )
+}
+
+/// ECX / EDX after `ai_gaze_clear(human)`: the last values it loads (a null human returns before loading any).
+unsafe fn gaze_clobber(h: u32, ecx: u32, edx: u32) -> (u32, u32) {
+    if h == 0 { (ecx, edx) } else { unsafe { (rd(0x0252_A6D8), rd(0x0252_A6D4)) } }
+}
+
+fn gcall2(idx: u32, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> Vec<u32> {
+    let mut v = vec![T_GEN2, idx, eax, ecx, edx, esi, edi];
+    v.extend_from_slice(args);
+    v
+}
+
+/// Make the entries of a plan for real in order: `T_GEN2` calls (a `LOCAL_MARK` register or pointer argument gets the
+/// address of a local holding the recorded value), the handler's own masked stores, and the older entry kinds.
+unsafe fn replay2(tape: &[Vec<u32>], esi: u32, edi: u32) -> Option<u32> {
+    let mut last = None;
+    for e in tape {
+        unsafe {
+            match e[0] {
+                T_GEN2 => {
+                    let (f, n, dref) = G2[e[1] as usize];
+                    let mut local = 0u32;
+                    let mut args: Vec<u32> = e[7..7 + n].to_vec();
+                    if dref >= 0 {
+                        local = args[dref as usize];
+                        args[dref as usize] = &mut local as *mut u32 as u32;
+                    }
+                    let ptr = &mut local as *mut u32 as u32;
+                    let fix = |v: u32| if v == LOCAL_MARK { ptr } else { v };
+                    last = Some(call_regs(f, fix(e[2]), fix(e[3]), fix(e[4]), e[5], e[6], &args));
+                }
+                T_AND8 => wb(e[1] as usize, rb(e[1] as usize) & e[2] as u8),
+                T_AND32 => wd(e[1] as usize, rd(e[1] as usize) & e[2]),
+                _ => {
+                    if let Some(v) = replay(std::slice::from_ref(e), esi, edi) {
+                        last = Some(v);
+                    }
+                }
+            }
+        }
+    }
+    last
+}
+
+fn is_local(t: &[u32]) -> bool {
+    matches!(t[0], T_CANCEL | T_AND8 | T_AND32)
+}
+
+/// `seq_port` with a plan that also carries the handler's masked stores in order. The copy (callees recorded) decides
+/// first; Rust's dry run (stores and event cancels, no calls) must give the same recorded calls, the same `watch`
+/// dwords, the same event nodes and, when `ret` is given, the same EAX; the plan is then made for real in order.
+unsafe fn seq2(id: usize, p: &Pushad, args: *const u32, nargs: usize, watch: &[usize], plan: Vec<Vec<u32>>, ret: Option<u32>) -> Option<u32> {
+    unsafe {
+        let mut tape = plan.clone();
+        let mut eax = ret;
+        if let Some((n, orig)) = shadowing(id) {
+            let nodes = event_nodes();
+            let n0 = node_types(&nodes);
+            let w0: Vec<u32> = watch.iter().map(|&a| rdu(a)).collect();
+            tape_take();
+            let av: Vec<u32> = (0..nargs).map(|i| *args.add(i)).collect();
+            let mark = 0u8;
+            set_top(&mark);
+            let e = call_regs(orig, p.eax, p.ecx, p.edx, p.esi, p.edi, &av);
+            let rec = tape_take();
+            let n_theirs = node_types(&nodes);
+            let w_theirs: Vec<u32> = watch.iter().map(|&a| rdu(a)).collect();
+            restore_types(&nodes, &n0);
+            for (&a, &v) in watch.iter().zip(&w0) {
+                wdu(a, v);
+            }
+            for t in plan.iter().filter(|t| is_local(t)) {
+                match t[0] {
+                    T_CANCEL => event_cancel(t[1], t[2], t[3]),
+                    T_AND8 => wb(t[1] as usize, rb(t[1] as usize) & t[2] as u8),
+                    _ => wd(t[1] as usize, rd(t[1] as usize) & t[2]),
+                }
+            }
+            let n_ours = node_types(&nodes);
+            let w_ours: Vec<u32> = watch.iter().map(|&a| rdu(a)).collect();
+            let plan_calls: Vec<Vec<u32>> = plan.iter().filter(|t| !is_local(t)).cloned().collect();
+            let mut bad = Vec::new();
+            if rec != plan_calls {
+                bad.push(format!("calls: original {rec:x?}, Rust {plan_calls:x?}"));
+            }
+            if n_theirs != n_ours {
+                bad.push("event nodes differ".to_string());
+            }
+            if w_theirs != w_ours {
+                bad.push(format!("fields: original {w_theirs:x?}, Rust {w_ours:x?}"));
+            }
+            if ret.is_some_and(|r| r != e) {
+                bad.push(format!("eax: original {e:#x}, Rust {:#x}", ret.unwrap_or(0)));
+            }
+            if bad.is_empty() {
+                // Undo the dry run; the real run below repeats the stores in the original's order.
+                restore_types(&nodes, &n0);
+                for (&a, &v) in watch.iter().zip(&w0) {
+                    wdu(a, v);
+                }
+            } else {
+                // The copy already did its own stores and cancels; only its calls are left to make.
+                mismatch(id, n, bad.join("; "));
+                restore_types(&nodes, &n_theirs);
+                for (&a, &v) in watch.iter().zip(&w_theirs) {
+                    wdu(a, v);
+                }
+                tape = rec;
+                eax = Some(e);
+            }
+        }
+        let last = replay2(&tape, p.esi, p.edi);
+        eax.or(last)
+    }
+}
+
+// --- exits ---------------------------------------------------------------------------------------------------------
+
+/// Kind 0x23 exit (0x4586B0), cdecl (human, new kind): `0x6AC360` (ECX = human, ESI = human; a pure table lookup)
+/// gives an index; unless it is negative and the dword at `0x27D83CC + index * 24` is 0x1E9,
+/// `0x6AE560(human, 0x1F4, 0)` with EAX = index * 3 and the ECX / EDX the lookup left. Shadow: stub copy, the lookup real
+/// in both. EAX is index (negative), index * 3 (no call) or the callee's.
+extern "C" fn ex_k23_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let h = *args;
+        let mut o = Regs { eax: p.eax, ecx: h, edx: p.edx, ebx: p.ebx, esi: h, edi: p.edi, ebp: p.ebp };
+        call_full(0x006A_C360, &mut o, 0, false);
+        let idx = o.eax;
+        let (plan, ret) = if (idx as i32) < 0 {
+            (vec![], Some(idx))
+        } else {
+            let e3 = idx.wrapping_mul(3);
+            if rd(0x027D_83CCu32.wrapping_add(e3.wrapping_mul(8)) as usize) == 0x1E9 {
+                (vec![gcall2(G2_6AE560, e3, o.ecx, o.edx, h, p.edi, &[h, 0x1F4, 0])], None)
+            } else {
+                (vec![], Some(e3))
+            }
+        };
+        if let Some(e) = seq2(EX_K23, &p, args, 2, &[], plan, ret) {
+            r.eax = e;
+        }
+    }
+}
+regs_thunk!(ex_k23_thunk, ex_k23_entry);
+
+/// Kind 0x1D exit (0x460A00), cdecl (human, new kind): byte +0x140 &= 0xFB, so the following `test byte +0x140, 4` is
+/// always clear and `ai_gaze_clear(human)` always runs; unless the new kind is 0x1F then `0x6AE180` with EAX = human, ECX /
+/// EDX as the gaze clear left them (it reads only EAX) and the stack (0x1D8, the f32 at 0xE87998 through the x87, 0xFFFF, 1).
+extern "C" fn ex_k1d_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let (h, k) = (*args, *args.add(1));
+        let (c, d) = gaze_clobber(h, p.ecx, p.edx);
+        let mut plan = vec![vec![T_AND8, a(h, 0x140) as u32, 0xFB], vec![T_GAZE_CLEAR, h]];
+        let ret = if k != 0x1F {
+            plan.push(gcall2(G2_6AE180, h, c, d, p.esi, p.edi, &[0x1D8, x87_rt(rd(F_E87998)), 0xFFFF, 1]));
+            None
+        } else {
+            Some(h)
+        };
+        if let Some(e) = seq2(EX_K1D, &p, args, 2, &[a(h, 0x140)], plan, ret) {
+            r.eax = e;
+        }
+    }
+}
+regs_thunk!(ex_k1d_thunk, ex_k1d_entry);
+
+/// Kind 0x0A exit (0x41C380), cdecl (human, new kind): for the new kinds 4, 7 and 10 byte +0x140 &= 0xF7 (kind 10 then
+/// returns); else when bit 2 of byte +0x140 is clear `ai_gaze_clear(human)`; then `0x95BF60(-1, 0)` (ret 8) with
+/// EAX = ECX = human and EDX as the gaze clear left it.
+extern "C" fn ex_k0a_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let (h, k) = (*args, *args.add(1));
+        let mut plan = vec![];
+        let mut flags = rb(a(h, 0x140));
+        if k == 4 || k == 7 || k == 10 {
+            plan.push(vec![T_AND8, a(h, 0x140) as u32, 0xF7]);
+            flags &= 0xF7;
+        }
+        let ret = if k == 10 {
+            Some(h)
+        } else {
+            let mut edx = p.edx;
+            if flags & 4 == 0 {
+                plan.push(vec![T_GAZE_CLEAR, h]);
+                edx = gaze_clobber(h, p.ecx, p.edx).1;
+            }
+            plan.push(gcall2(G2_95BF60, h, h, edx, p.esi, p.edi, &[N1, 0]));
+            None
+        };
+        if let Some(e) = seq2(EX_K0A, &p, args, 2, &[a(h, 0x140)], plan, ret) {
+            r.eax = e;
+        }
+    }
+}
+regs_thunk!(ex_k0a_thunk, ex_k0a_entry);
+
+/// Kind 0x08 exit (0x4165C0), cdecl (human, new kind): byte +0x140 &= 0xFB; `ai_gaze_clear(human)` (bit 2 is now
+/// always clear); dword +0xC0 &= ~0x40; `0x960A80(1, 0)` (ESI = human); `human_anim_set_update(human, -1, 1, 1, 0)`;
+/// ai_event_cancel(type 0x4A, handle +0x44, handle +0x44). EAX = human and ECX / EDX as the gaze clear left them for
+/// both calls.
+extern "C" fn ex_k08_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let h = *args;
+        let (c, d) = gaze_clobber(h, p.ecx, p.edx);
+        let hd = rd(a(h, 0x44));
+        let plan = vec![
+            vec![T_AND8, a(h, 0x140) as u32, 0xFB],
+            vec![T_GAZE_CLEAR, h],
+            vec![T_AND32, a(h, 0xC0) as u32, 0xFFFF_FFBF],
+            gcall2(G2_960A80, h, c, d, h, p.edi, &[1, 0]),
+            gcall2(G2_96CB70, h, c, d, h, p.edi, &[h, N1, 1, 1, 0]),
+            vec![T_CANCEL, 0x4A, hd, hd],
+        ];
+        if let Some(e) = seq2(EX_K08, &p, args, 2, &[a(h, 0x140), a(h, 0xC0)], plan, None) {
+            r.eax = e;
+        }
+    }
+}
+regs_thunk!(ex_k08_thunk, ex_k08_entry);
+
+/// Kind 0x1A exit (0x45C070), cdecl (human, new kind): a four-byte stack local is -1 and passed by address to
+/// `0x9695F0` (ECX = human, ret 4), then 1 to `0x968A70(human, &local)` (ret 8, ECX = &local) and 0x55 to
+/// `0x9690E0(human, &local)` (ret 8, EDX = &local); EAX = &local throughout. The local is a plain int (no constructor);
+/// a recording stub reads the value at each call, and a register holding the local's address is the `LOCAL_MARK`.
+extern "C" fn ex_k1a_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let h = *args;
+        let plan = vec![
+            gcall2(G2_9695F0, LOCAL_MARK, h, p.edx, h, p.edi, &[N1]),
+            gcall2(G2_968A70, LOCAL_MARK, LOCAL_MARK, p.edx, h, p.edi, &[h, 1]),
+            gcall2(G2_9690E0, LOCAL_MARK, LOCAL_MARK, LOCAL_MARK, h, p.edi, &[h, 0x55]),
+        ];
+        if let Some(e) = seq2(EX_K1A, &p, args, 2, &[], plan, None) {
+            r.eax = e;
+        }
+    }
+}
+regs_thunk!(ex_k1a_thunk, ex_k1a_entry);
+
+// --- enters --------------------------------------------------------------------------------------------------------
+
+/// Kind 0x17 enter (0x459800), cdecl (human): when the human's handle (+0x44) resolves in the object table at 0x2149C64
+/// to an object with dword +0x4C == 1 and byte +0x3CC == 1 nothing happens (EAX = human); else a tail jump to `0x459400`
+/// (EAX = human; the other registers as the inline lookup left them; it reads only EAX).
+extern "C" fn en_k17_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let h = *args;
+        let (mut ecx, mut edx) = (p.ecx, p.edx);
+        let mut skip = false;
+        if h != 0 {
+            edx = rd(a(h, 0x44));
+            if edx != 0 {
+                ecx = rd(0x0214_9C64usize + (((edx & 0xFFF) << 4) as usize));
+                if ecx != 0 && rd(a(ecx, 0x44)) == edx {
+                    edx = 1;
+                    if rd(a(ecx, 0x4C)) == edx && rb(a(ecx, 0x3CC)) == 1 {
+                        skip = true;
+                    }
+                }
+            }
+        }
+        let (plan, ret) = if skip { (vec![], Some(h)) } else { (vec![gcall2(G2_459400, h, ecx, edx, p.esi, p.edi, &[h])], None) };
+        if let Some(e) = seq2(EN_K17, &p, args, 1, &[], plan, ret) {
+            r.eax = e;
+        }
+    }
+}
+regs_thunk!(en_k17_thunk, en_k17_entry);
+
+/// Kind 0x1A enter (0x45C020), cdecl (human): the same object test as kind 0x17's (then EAX = the object); else
+/// ai_order_set_action(human, 0x1A, 0xAC) with EDX = human and EAX / ECX as the inline lookup left them.
+extern "C" fn en_k1a_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let h = *args;
+        let (mut eax, mut ecx) = (p.eax, p.ecx);
+        let mut skip = false;
+        if h != 0 {
+            ecx = rd(a(h, 0x44));
+            if ecx != 0 {
+                eax = rd(0x0214_9C64usize + (((ecx & 0xFFF) << 4) as usize));
+                if eax != 0 && rd(a(eax, 0x44)) == ecx {
+                    ecx = 1;
+                    if rd(a(eax, 0x4C)) == ecx && rb(a(eax, 0x3CC)) == 1 {
+                        skip = true;
+                    }
+                }
+            }
+        }
+        let (plan, ret) = if skip { (vec![], Some(eax)) } else { (vec![gcall(G_SETACT, eax, ecx, h, p.esi, p.edi, &[h, 0x1A, 0xAC])], None) };
+        if let Some(e) = seq2(EN_K1A, &p, args, 1, &[], plan, ret) {
+            r.eax = e;
+        }
+    }
+}
+regs_thunk!(en_k1a_thunk, en_k1a_entry);
+
+// --- updates -------------------------------------------------------------------------------------------------------
+
+/// Kind 0x16 update (0x4593A0), cdecl (human): needs a non-null human whose dword +0x10CC leads (+0xC4) to a record with
+/// a non-zero dword +8 and `object_is_player_human` (0x963540, EAX = human, a pure lookup) true; then a tail jump to
+/// `0x459190` with EAX = EDX = human (the ECX the lookup left). EAX on the early returns is what the original has there.
+extern "C" fn up_k16_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let h = *args;
+        let mut plan = vec![];
+        let ret = if h == 0 {
+            Some(p.eax)
+        } else {
+            let e1 = rd(a(h, 0x10CC));
+            if e1 == 0 {
+                Some(0)
+            } else {
+                let e2 = rd(a(e1, 0xC4));
+                if e2 == 0 {
+                    Some(0)
+                } else if rd(a(e2, 8)) == 0 {
+                    Some(e2)
+                } else {
+                    let mut o = Regs { eax: h, ecx: p.ecx, edx: h, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp };
+                    call_full(0x0096_3540, &mut o, 0, false);
+                    if o.eax as u8 == 0 {
+                        Some(o.eax)
+                    } else {
+                        plan.push(gcall2(G2_459190, o.edx, o.ecx, o.edx, p.esi, p.edi, &[h]));
+                        None
+                    }
+                }
+            }
+        };
+        if let Some(e) = seq2(UP_K16, &p, args, 1, &[], plan, ret) {
+            r.eax = e;
+        }
+    }
+}
+regs_thunk!(up_k16_thunk, up_k16_entry);
+
+/// Kind 0x1A update (0x45C0C0), cdecl (human): returns (EAX = human) when the human's handle resolves to an object with
+/// dword +0x4C == 1 and byte +0x3CC == 1; else by byte +0x148: 0xAC tail jumps to `0x45AF10(human)`, 0xAD to
+/// `0x45B890(human)` (EAX = human, ECX = 0, EDX = the handle), 0xAE calls `0x45B9E0` with ESI = human; anything else returns.
+extern "C" fn up_k1a_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let h = *args;
+        let mut edx = p.edx;
+        let mut skip = false;
+        if h != 0 {
+            edx = rd(a(h, 0x44));
+            if edx != 0 {
+                let slot = rd(0x0214_9C64usize + (((edx & 0xFFF) << 4) as usize));
+                if slot != 0 && rd(a(slot, 0x44)) == edx && rd(a(slot, 0x4C)) == 1 && rb(a(slot, 0x3CC)) == 1 {
+                    skip = true;
+                }
+            }
+        }
+        let (plan, ret) = if skip {
+            (vec![], Some(h))
+        } else {
+            // A null human faults here, as the original does at `movzx ecx, byte [eax + 0x148]`.
+            let act = rb(a(h, 0x148)) as u32;
+            match act.wrapping_sub(0xAC) {
+                0 => (vec![gcall2(G2_45AF10, h, 0, edx, p.esi, p.edi, &[h])], None),
+                1 => (vec![gcall2(G2_45B890, h, 0, edx, p.esi, p.edi, &[h])], None),
+                2 => (vec![gcall2(G2_45B9E0, h, 0, edx, h, p.edi, &[])], None),
+                _ => (vec![], Some(h)),
+            }
+        };
+        if let Some(e) = seq2(UP_K1A, &p, args, 1, &[], plan, ret) {
+            r.eax = e;
+        }
+    }
+}
+regs_thunk!(up_k1a_thunk, up_k1a_entry);
+
+// --- net readers ---------------------------------------------------------------------------------------------------
+
+/// Kind 0x20 net_read (0x462A80), cdecl (human, ?, buffer, position pointer): no buffer: `vehicle_interaction_rider_find`
+/// (ESI = handle +0x44, ECX = 0; a pure lookup) gives a slot; its dword +4 (0 without a slot) of 1 sets bit 0 of byte +0x150,
+/// of 2 clears it, anything else reports through `0x447CD0(human, 0, 0)` (EAX = value - 2, ECX = 0, EDI = human); with a buffer
+/// byte +0x150 = the next byte. Shadow: the `nr` one (the copy and Rust both call the pure lookup).
+unsafe fn nr_body_k20(p: &Pushad, h: usize, _a1: u32, buf: usize, pos: usize) -> Vec<Vec<u32>> {
+    unsafe {
+        if buf == 0 {
+            let rider = call_regs(0x00B0_7A30, p.eax, 0, p.edx, rd(h + 0x44), h as u32, &[]);
+            let v = if rider != 0 { rd(a(rider, 4)) } else { rider };
+            let v1 = v.wrapping_sub(1);
+            if v1 == 0 {
+                wb(h + 0x150, rb(h + 0x150) | 1);
+                return vec![];
+            }
+            let v2 = v1.wrapping_sub(1);
+            if v2 == 0 {
+                wb(h + 0x150, rb(h + 0x150) & 0xFE);
+                return vec![];
+            }
+            return fail_call(v2, 0, p.edx, p.esi, h as u32, h as u32);
+        }
+        wb(h + 0x150, rd_b(buf, pos));
+        vec![]
+    }
+}
+nr_port!(nr_k20_entry, nr_k20_thunk, NR_K20, nr_body_k20);
+
+/// Kind 0x08 net_read, no buffer: the reporter with EDX = human and ESI = 0.
+unsafe fn nr_body_k08_fail(p: &Pushad, h: usize, _a1: u32, _buf: usize, _pos: usize) -> Vec<Vec<u32>> {
+    fail_call(p.eax, p.ecx, h as u32, 0, p.edi, h as u32)
+}
+
+/// Kind 0x08 net_read (0x415EC0), cdecl (human, ?, buffer, position pointer): no buffer: the reporter. Else
+/// `0x415DA0` (EDI = human, ESI = buffer; creates the record at +0x330) and, from the buffer: dword [record + 0x34] = the next
+/// byte (zero-extended), dword [record + 8] = the byte after it (sign-extended); position += 2 (16-bit).
+/// Shadow: `0x415DA0` runs once, for real, before the snapshot and is a recording stub in the copy; the record's two dwords,
+/// the final position and the payload bytes are compared.
+extern "C" fn nr_k08_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    let (h, a1, buf, pos) = unsafe { (*args as usize, *args.add(1), *args.add(2) as usize, *args.add(3) as usize) };
+    if buf == 0 {
+        return nr(NR_K08, r, args, nr_body_k08_fail);
+    }
+    unsafe {
+        call_regs(0x0041_5DA0, p.eax, p.ecx, p.edx, buf as u32, h as u32, &[]);
+        let rec = rd(h + 0x330) as usize;
+        let write = |pos: usize| {
+            let b0 = rd_b(buf, pos) as u32;
+            wd(rec + 0x34, b0);
+            let b1 = rd_b(buf, pos) as i8 as i32 as u32;
+            wd(rec + 8, b1);
+        };
+        let shadow = if rec != 0 { shadowing(NR_K08) } else { None };
+        let Some((n, orig)) = shadow else { return write(pos) };
+        let pos0 = pos_get(pos);
+        let sn0 = snap(h);
+        let r0 = (rd(rec + 0x34), rd(rec + 8));
+        let mut cell = pos0;
+        let cell_a = &mut cell as *mut u16 as usize;
+        tape_take();
+        let mark = 0u8;
+        set_top(&mark);
+        call_regs(orig, p.eax, p.ecx, p.edx, p.esi, p.edi, &[h as u32, a1, buf as u32, cell_a as u32]);
+        let tape = tape_take();
+        let end_t = std::ptr::read_volatile(cell_a as *const u16);
+        let (r_t, sn_t) = ((rd(rec + 0x34), rd(rec + 8)), snap(h));
+        unsnap(h, &sn0);
+        wd(rec + 0x34, r0.0);
+        wd(rec + 8, r0.1);
+        std::ptr::write_volatile(cell_a as *mut u16, pos0);
+        write(cell_a);
+        let end_o = std::ptr::read_volatile(cell_a as *const u16);
+        let r_o = (rd(rec + 0x34), rd(rec + 8));
+        let expect = vec![gcall2(G2_415DA0, p.eax, p.ecx, p.edx, buf as u32, h as u32, &[])];
+        let end = if tape != expect || end_t != end_o || r_t != r_o || sn_t != sn0 {
+            mismatch(NR_K08, n, format!("human {h:#x} pos {pos0}: original end {end_t} {tape:x?} {r_t:x?}, Rust end {end_o} {expect:x?} {r_o:x?}"));
+            wd(rec + 0x34, r_t.0);
+            wd(rec + 8, r_t.1);
+            unsnap(h, &sn_t);
+            end_t
+        } else {
+            end_o
+        };
+        std::ptr::write_unaligned(pos as *mut u16, end);
+    }
+}
+regs_thunk!(nr_k08_thunk, nr_k08_entry);
+
+// --- ai_order_set_action (0x4375B0) ----------------------------------------------------------------------------------
+
+/// A second, unrewired copy of the original, run when the shadow found a difference.
+static SETACT_PRISTINE: AtomicUsize = AtomicUsize::new(0);
+
+/// The mission record pointer; its dword +0x3C is the mission kind and its object at +0x90 has the getter in virtual slot 1.
+const MISSION: usize = 0x027B_3C60;
+
+struct Ctx {
+    dry: bool,
+    tape: Vec<Vec<u32>>,
+}
+
+impl Ctx {
+    /// A mutating callee: recorded in a dry run, made for real otherwise (its EAX returned).
+    unsafe fn mutate(&mut self, e: Vec<u32>, eax: u32) -> u32 {
+        if self.dry {
+            self.tape.push(e);
+            eax
+        } else {
+            unsafe { replay2(&[e], 0, 0) }.unwrap_or(eax)
+        }
+    }
+}
+
+/// A pure callee with the registers in `x`; the registers it leaves are written back.
+unsafe fn pure(f: usize, x: &mut Regs) {
+    unsafe { call_full(f, x, 0, false) };
+}
+
+/// One of the two flag blocks of `ai_order_set_action`: the human's flag dword +0xC0 has bit `bit` set (the shifted dword
+/// is left in ECX for the first block, EDX for the second); and `human_owned_locally` (0x806720, EAX = human) is true or
+/// byte 0x2528B9D is non-zero; then the bit is cleared (`mask`), dword +0x1130 = -1 when the human is owned locally, and
+/// for the object at +0x570: when `0x735FB0` (ECX = object) gives `state`, `0x735EF0(1)` (ECX = object, EDI = 0, ret 4);
+/// byte [object + 0x130] &= 0xFD; `0x963090(1, 0)` with EAX = human.
+unsafe fn setact_block(c: &mut Ctx, x: &mut Regs, h: u32, bit: u32, mask: u32, state: u32, first: bool) {
+    unsafe {
+        x.edi = rd(a(h, 0xC0));
+        let t = x.edi >> bit;
+        if first {
+            x.ecx = t;
+        } else {
+            x.edx = t;
+        }
+        if t & 1 == 0 {
+            return;
+        }
+        x.eax = h;
+        pure(0x0080_6720, x);
+        if x.eax as u8 == 0 && rb(0x0252_8B9D) == 0 {
+            return;
+        }
+        x.edi &= mask;
+        x.eax = h;
+        wd(a(h, 0xC0), x.edi);
+        pure(0x0080_6720, x);
+        if x.eax as u8 != 0 {
+            wd(a(h, 0x1130), N1);
+        }
+        x.ebx = rd(a(h, 0x570));
+        if x.ebx == 0 {
+            return;
+        }
+        x.ecx = x.ebx;
+        pure(0x0073_5FB0, x);
+        if x.eax == state {
+            x.edi = 0;
+            x.ecx = x.ebx;
+            c.mutate(gcall2(G2_735EF0, x.eax, x.ecx, x.edx, x.esi, x.edi, &[1]), x.eax);
+        }
+        x.eax = rd(a(h, 0x570));
+        if x.eax != 0 {
+            wb(a(x.eax, 0x130), rb(a(x.eax, 0x130)) & 0xFD);
+        }
+        x.eax = h;
+        c.mutate(gcall2(G2_963090, x.eax, x.ecx, x.edx, x.esi, x.edi, &[1, 0]), x.eax);
+    }
+}
+
+/// `ai_order_set_action(human, expected kind, new action)` cdecl, returning the EAX the original ends with. Nothing happens for
+/// a null human, one with `+0x80 & 0xB`, a current kind (signed byte +0x149) other than the expected one, or a current action
+/// (byte +0x148) equal to the new one; nor, when the mission record has kind 1 and its object's virtual slot 1 gives 3, for
+/// the action 0x6F. Otherwise byte +0x148 = the action, and for actions other than 0x1A (0x1B) bit 14 (11) of dword +0xC0
+/// is cleared by `setact_block`; then, when the old kind was 0 with action 0x11, `0x9695F0(&-1)` (ECX = human), and last
+/// `human_anim_set_update(human, -1, 1, 1, 0)`.
+unsafe fn setact_body(c: &mut Ctx, p: &Pushad, h: u32, kind: u32, act: u32) -> u32 {
+    unsafe {
+        let mut x = Regs { eax: p.eax, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: h, edi: p.edi, ebp: p.ebp };
+        if h == 0 || rb(a(h, 0x80)) & 0xB != 0 {
+            return x.eax;
+        }
+        x.eax = rb(a(h, 0x149)) as i8 as i32 as u32;
+        if x.eax != kind {
+            return x.eax;
+        }
+        x.ecx = rb(a(h, 0x148)) as u32;
+        x.ebx = act;
+        if x.ecx == x.ebx {
+            return x.eax;
+        }
+        x.eax = rd(MISSION);
+        if x.eax != 0 && rd(a(x.eax, 0x3C)) == 1 {
+            x.ecx = rd(a(x.eax, 0x90));
+            x.edx = rd(x.ecx as usize);
+            x.eax = rd(a(x.edx, 4));
+            let f = x.eax as usize;
+            call_full(f, &mut x, 0, false);
+            if x.eax == 3 && x.ebx == 0x6F {
+                return x.eax;
+            }
+        }
+        let flag = rb(a(h, 0x149)) == 0 && rb(a(h, 0x148)) == 0x11;
+        wb(a(h, 0x148), act as u8);
+        if act != 0x1A {
+            setact_block(c, &mut x, h, 14, 0xFFFF_BFFF, 0x11, true);
+            x.ebx = act;
+        }
+        if x.ebx != 0x1B {
+            setact_block(c, &mut x, h, 11, 0xFFFF_F7FF, 0x1D, false);
+        }
+        if flag {
+            x.eax = LOCAL_MARK;
+            x.ecx = h;
+            c.mutate(gcall2(G2_9695F0, x.eax, x.ecx, x.edx, x.esi, x.edi, &[N1]), x.eax);
+        }
+        c.mutate(gcall2(G2_96CB70, x.eax, x.ecx, x.edx, x.esi, x.edi, &[h, N1, 1, 1, 0]), x.eax)
+    }
+}
+
+extern "C" fn setact_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let (h, kind, act) = (*args, *args.add(1), *args.add(2));
+        let Some((n, orig)) = shadowing(SETACT) else {
+            r.eax = setact_body(&mut Ctx { dry: false, tape: Vec::new() }, &p, h, kind, act);
+            return;
+        };
+        let mut watch: Vec<usize> = Vec::new();
+        if h != 0 {
+            watch.extend([a(h, 0x148), a(h, 0xC0), a(h, 0x1130)]);
+            let obj = rd(a(h, 0x570));
+            if obj != 0 {
+                watch.push(a(obj, 0x130));
+            }
+        }
+        let w0: Vec<u32> = watch.iter().map(|&x| rdu(x)).collect();
+        tape_take();
+        let mark = 0u8;
+        set_top(&mark);
+        let e = call_regs(orig, p.eax, p.ecx, p.edx, p.esi, p.edi, &[h, kind, act]);
+        let rec = tape_take();
+        let w_theirs: Vec<u32> = watch.iter().map(|&x| rdu(x)).collect();
+        for (&x, &v) in watch.iter().zip(&w0) {
+            wdu(x, v);
+        }
+        let mut dry = Ctx { dry: true, tape: Vec::new() };
+        let e2 = setact_body(&mut dry, &p, h, kind, act);
+        let w_ours: Vec<u32> = watch.iter().map(|&x| rdu(x)).collect();
+        for (&x, &v) in watch.iter().zip(&w0) {
+            wdu(x, v);
+        }
+        let mut bad = Vec::new();
+        if rec != dry.tape {
+            bad.push(format!("calls: original {rec:x?}, Rust {:x?}", dry.tape));
+        }
+        if w_theirs != w_ours {
+            bad.push(format!("fields: original {w_theirs:x?}, Rust {w_ours:x?}"));
+        }
+        if e2 != LOCAL_MARK && e != e2 {
+            bad.push(format!("eax: original {e:#x}, Rust {e2:#x}"));
+        }
+        let pristine = SETACT_PRISTINE.load(Ordering::Relaxed);
+        if bad.is_empty() || pristine == 0 {
+            if !bad.is_empty() {
+                mismatch(SETACT, n, bad.join("; "));
+            }
+            r.eax = setact_body(&mut Ctx { dry: false, tape: Vec::new() }, &p, h, kind, act);
+        } else {
+            mismatch(SETACT, n, format!("(kind {kind:#x} action {act:#x}) {}", bad.join("; ")));
+            r.eax = call_regs(pristine, p.eax, p.ecx, p.edx, p.esi, p.edi, &[h, kind, act]);
+        }
+    }
+}
+regs_thunk!(setact_thunk, setact_entry);
+
 // --- install ------------------------------------------------------------------------------------
 
 /// Re-aim the rel32 of the `call` / `jmp` at `off` in a relocated copy (checking the opcode).
@@ -2519,6 +3352,38 @@ unsafe fn rewire(id: usize, copy: usize) -> bool {
             NR_K05 => set_rel32(copy, 0x9A, addr(gs_447cd0), 0xE8),
             NR_K14 => set_rel32(copy, 0xE, addr(gs_456070), 0xE9),
             PX_K00 => set_rel32(copy, 0xF, addr(gs_memset), 0xE8),
+            EX_K23 => set_rel32(copy, 0x28, addr(g2_6ae560_stub), 0xE8),
+            EX_K1D => set_rel32(copy, 0x14, addr(gaze_fwd_stub), 0xE8) && set_rel32(copy, 0x36, addr(g2_6ae180_stub), 0xE8),
+            EX_K0A => set_rel32(copy, 0x2C, addr(gaze_fwd_stub), 0xE8) && set_rel32(copy, 0x37, addr(g2_95bf60_stub), 0xE8),
+            EX_K08 => {
+                let cancel = PORTS[CANCEL].original.load(Ordering::Relaxed);
+                cancel != 0
+                    && set_rel32(copy, 0x17, addr(gaze_fwd_stub), 0xE8)
+                    && set_rel32(copy, 0x27, addr(g2_960a80_stub), 0xE8)
+                    && set_rel32(copy, 0x35, addr(g2_96cb70_stub), 0xE8)
+                    && set_rel32(copy, 0x44, cancel, 0xE8)
+            }
+            EX_K1A => {
+                set_rel32(copy, 0x15, addr(g2_9695f0_stub), 0xE8)
+                    && set_rel32(copy, 0x28, addr(g2_968a70_stub), 0xE8)
+                    && set_rel32(copy, 0x3B, addr(g2_9690e0_stub), 0xE8)
+            }
+            NR_K20 => set_rel32(copy, 0x2D, addr(gs_447cd0), 0xE8),
+            NR_K08 => set_rel32(copy, 0xE, addr(g2_415da0_stub), 0xE8) && set_rel32(copy, 0x52, addr(gs_447cd0), 0xE8),
+            UP_K16 => set_rel32(copy, 0x2F, addr(g2_459190_stub), 0xE9),
+            UP_K1A => {
+                set_rel32(copy, 0x54, addr(g2_45b9e0_stub), 0xE8)
+                    && set_rel32(copy, 0x5B, addr(g2_45b890_stub), 0xE9)
+                    && set_rel32(copy, 0x64, addr(g2_45af10_stub), 0xE9)
+            }
+            EN_K17 => set_rel32(copy, 0x3B, addr(g2_459400_stub), 0xE9),
+            EN_K1A => set_rel32(copy, 0x42, addr(gs_setact), 0xE8),
+            SETACT => {
+                [0xFB, 0x18B].iter().all(|&o| set_rel32(copy, o, addr(g2_735ef0_stub), 0xE8))
+                    && [0x117, 0x1A7].iter().all(|&o| set_rel32(copy, o, addr(g2_963090_stub), 0xE8))
+                    && set_rel32(copy, 0x1C5, addr(g2_9695f0_stub), 0xE8)
+                    && set_rel32(copy, 0x1D3, addr(g2_96cb70_stub), 0xE8)
+            }
             K17_EXIT | K1C_EXIT | K21_EXIT => {
                 let cancel = PORTS[CANCEL].original.load(Ordering::Relaxed);
                 cancel != 0 && set_rel32(copy, 0xF, cancel, 0xE8)
@@ -2629,7 +3494,24 @@ pub fn install() {
         (NR_K15, &NR_K15_BODY, &NR_K15_BODY_CALLS, nr_k15_thunk),
         (NR_K21, &NR_K21_BODY, &NR_K21_BODY_CALLS, nr_k21_thunk),
         (PX_K00, &PI_K00_BODY, &PI_K00_BODY_CALLS, px_k00_thunk),
+        (EX_K23, &EX_K23_BODY, &EX_K23_BODY_CALLS, ex_k23_thunk),
+        (EX_K1D, &EX_K1D_BODY, &EX_K1D_BODY_CALLS, ex_k1d_thunk),
+        (EX_K0A, &EX_K0A_BODY, &EX_K0A_BODY_CALLS, ex_k0a_thunk),
+        (EX_K08, &EX_K08_BODY, &EX_K08_BODY_CALLS, ex_k08_thunk),
+        (EX_K1A, &EX_K1A_BODY, &EX_K1A_BODY_CALLS, ex_k1a_thunk),
+        (NR_K20, &NR_K20_BODY, &NR_K20_BODY_CALLS, nr_k20_thunk),
+        (NR_K08, &NR_K08_BODY, &NR_K08_BODY_CALLS, nr_k08_thunk),
+        (UP_K16, &UP_K16_BODY, &UP_K16_BODY_CALLS, up_k16_thunk),
+        (UP_K1A, &UP_K1A_BODY, &UP_K1A_BODY_CALLS, up_k1a_thunk),
+        (EN_K17, &EN_K17_BODY, &EN_K17_BODY_CALLS, en_k17_thunk),
+        (EN_K1A, &EN_K1A_BODY, &EN_K1A_BODY_CALLS, en_k1a_thunk),
+        (SETACT, &SETACT_BODY, &SETACT_BODY_CALLS, setact_thunk),
     ];
+    // The unmodified second copy of ai_order_set_action (before its entry is replaced).
+    match unsafe { detour::relocate(PORTS[SETACT].addr, &SETACT_BODY, &SETACT_BODY_CALLS) } {
+        Ok(copy) => SETACT_PRISTINE.store(copy, Ordering::Relaxed),
+        Err(e) => log(&format!("port_ai: ai_order_set_action: no pristine copy: {e:?}")),
+    }
     let mut ok = 0;
     for &(id, body, call_offsets, thunk) in &list {
         let port = &PORTS[id];
@@ -3298,3 +4180,126 @@ const PI_K00_BODY_CALLS: [usize; 1] = [0xf];
 fn addr(f: extern "C" fn()) -> usize {
     f as usize
 }
+
+const EX_K23_BODY: [u8; 50] = [
+    0x56, 0x8B, 0x74, 0x24, 0x08, 0x8B, 0xCE, 0xE8, 0xA4, 0x3C, 0x25, 0x00, 0x85, 0xC0, 0x7C, 0x20,
+    0x8D, 0x04, 0x40, 0x81, 0x3C, 0xC5, 0xCC, 0x83, 0x7D, 0x02, 0xE9, 0x01, 0x00, 0x00, 0x75, 0x10,
+    0x6A, 0x00, 0x68, 0xF4, 0x01, 0x00, 0x00, 0x56, 0xE8, 0x83, 0x5E, 0x25, 0x00, 0x83, 0xC4, 0x0C,
+    0x5E, 0xC3,
+];
+const EX_K23_BODY_CALLS: [usize; 2] = [0x7, 0x28];
+const EX_K1D_BODY: [u8; 63] = [
+    0x8B, 0x44, 0x24, 0x04, 0x80, 0xA0, 0x40, 0x01, 0x00, 0x00, 0xFB, 0xF6, 0x80, 0x40, 0x01, 0x00,
+    0x00, 0x04, 0x75, 0x05, 0xE8, 0xD7, 0x55, 0x55, 0x00, 0x83, 0x7C, 0x24, 0x08, 0x1F, 0x74, 0x1E,
+    0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0x6A, 0x01, 0x68, 0xFF, 0xFF, 0x00, 0x00, 0x51, 0xD9, 0x1C,
+    0x24, 0x68, 0xD8, 0x01, 0x00, 0x00, 0xE8, 0x45, 0xD7, 0x24, 0x00, 0x83, 0xC4, 0x10, 0xC3,
+];
+const EX_K1D_BODY_CALLS: [usize; 2] = [0x14, 0x36];
+const EX_K0A_BODY: [u8; 61] = [
+    0x8B, 0x4C, 0x24, 0x08, 0x83, 0xF9, 0x04, 0x8B, 0x44, 0x24, 0x04, 0x74, 0x0A, 0x83, 0xF9, 0x07,
+    0x74, 0x05, 0x83, 0xF9, 0x0A, 0x75, 0x0C, 0x80, 0xA0, 0x40, 0x01, 0x00, 0x00, 0xF7, 0x83, 0xF9,
+    0x0A, 0x74, 0x19, 0xF6, 0x80, 0x40, 0x01, 0x00, 0x00, 0x04, 0x75, 0x05, 0xE8, 0x3F, 0x9C, 0x59,
+    0x00, 0x6A, 0x00, 0x6A, 0xFF, 0x8B, 0xC8, 0xE8, 0xA4, 0xFB, 0x53, 0x00, 0xC3,
+];
+const EX_K0A_BODY_CALLS: [usize; 2] = [0x2c, 0x37];
+const EX_K08_BODY: [u8; 78] = [
+    0x56, 0x8B, 0x74, 0x24, 0x08, 0x80, 0xA6, 0x40, 0x01, 0x00, 0x00, 0xFB, 0xF6, 0x86, 0x40, 0x01,
+    0x00, 0x00, 0x04, 0x75, 0x07, 0x8B, 0xC6, 0xE8, 0x14, 0xFA, 0x59, 0x00, 0x83, 0xA6, 0xC0, 0x00,
+    0x00, 0x00, 0xBF, 0x6A, 0x00, 0x6A, 0x01, 0xE8, 0x94, 0xA4, 0x54, 0x00, 0x6A, 0x00, 0x6A, 0x01,
+    0x6A, 0x01, 0x6A, 0xFF, 0x56, 0xE8, 0x76, 0x65, 0x55, 0x00, 0x8B, 0x76, 0x44, 0x56, 0x56, 0xBE,
+    0x4A, 0x00, 0x00, 0x00, 0xE8, 0x57, 0xBB, 0xFE, 0xFF, 0x83, 0xC4, 0x24, 0x5E, 0xC3,
+];
+const EX_K08_BODY_CALLS: [usize; 4] = [0x17, 0x27, 0x35, 0x44];
+const EX_K1A_BODY: [u8; 67] = [
+    0x51, 0x56, 0x8B, 0x74, 0x24, 0x0C, 0x8D, 0x44, 0x24, 0x04, 0x50, 0x8B, 0xCE, 0xC7, 0x44, 0x24,
+    0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 0x66, 0xD5, 0x50, 0x00, 0x8D, 0x4C, 0x24, 0x04, 0x51, 0x56,
+    0xC7, 0x44, 0x24, 0x0C, 0x01, 0x00, 0x00, 0x00, 0xE8, 0xD3, 0xC9, 0x50, 0x00, 0x8D, 0x54, 0x24,
+    0x04, 0x52, 0x56, 0xC7, 0x44, 0x24, 0x0C, 0x55, 0x00, 0x00, 0x00, 0xE8, 0x30, 0xD0, 0x50, 0x00,
+    0x5E, 0x59, 0xC3,
+];
+const EX_K1A_BODY_CALLS: [usize; 3] = [0x15, 0x28, 0x3b];
+const NR_K20_BODY: [u8; 95] = [
+    0x8B, 0x4C, 0x24, 0x0C, 0x85, 0xC9, 0x57, 0x8B, 0x7C, 0x24, 0x08, 0x75, 0x3C, 0x56, 0x8B, 0x77,
+    0x44, 0xE8, 0x9A, 0x4F, 0x6A, 0x00, 0x85, 0xC0, 0x5E, 0x74, 0x03, 0x8B, 0x40, 0x04, 0x83, 0xE8,
+    0x01, 0x74, 0x1D, 0x83, 0xE8, 0x01, 0x74, 0x0F, 0x6A, 0x00, 0x6A, 0x00, 0x57, 0xE8, 0x1E, 0x52,
+    0xFE, 0xFF, 0x83, 0xC4, 0x0C, 0x5F, 0xC3, 0x80, 0xA7, 0x50, 0x01, 0x00, 0x00, 0xFE, 0x5F, 0xC3,
+    0x80, 0x8F, 0x50, 0x01, 0x00, 0x00, 0x01, 0x5F, 0xC3, 0x8B, 0x44, 0x24, 0x14, 0x0F, 0xB7, 0x10,
+    0x8A, 0x0C, 0x0A, 0x88, 0x8F, 0x50, 0x01, 0x00, 0x00, 0x66, 0x83, 0x00, 0x01, 0x5F, 0xC3,
+];
+const NR_K20_BODY_CALLS: [usize; 2] = [0x11, 0x2d];
+const NR_K08_BODY: [u8; 92] = [
+    0x56, 0x8B, 0x74, 0x24, 0x10, 0x85, 0xF6, 0x74, 0x40, 0x57, 0x8B, 0x7C, 0x24, 0x0C, 0xE8, 0xCD,
+    0xFE, 0xFF, 0xFF, 0x8B, 0x44, 0x24, 0x18, 0x0F, 0xB7, 0x08, 0x0F, 0xB7, 0xD1, 0x8A, 0x14, 0x32,
+    0x83, 0xC1, 0x01, 0x66, 0x89, 0x08, 0x0F, 0xB6, 0xCA, 0x8B, 0x97, 0x30, 0x03, 0x00, 0x00, 0x89,
+    0x4A, 0x34, 0x0F, 0xB7, 0x08, 0x0F, 0xBE, 0x14, 0x31, 0x8B, 0x8F, 0x30, 0x03, 0x00, 0x00, 0x5F,
+    0x89, 0x51, 0x08, 0x66, 0x83, 0x00, 0x01, 0x5E, 0xC3, 0x8B, 0x54, 0x24, 0x08, 0x6A, 0x00, 0x6A,
+    0x00, 0x52, 0xE8, 0xB9, 0x1D, 0x03, 0x00, 0x83, 0xC4, 0x0C, 0x5E, 0xC3,
+];
+const NR_K08_BODY_CALLS: [usize; 2] = [0xe, 0x52];
+const UP_K16_BODY: [u8; 53] = [
+    0x8B, 0x54, 0x24, 0x04, 0x85, 0xD2, 0x74, 0x2C, 0x8B, 0x82, 0xCC, 0x10, 0x00, 0x00, 0x85, 0xC0,
+    0x74, 0x22, 0x8B, 0x80, 0xC4, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x18, 0x83, 0x78, 0x08, 0x00,
+    0x74, 0x12, 0x8B, 0xC2, 0xE8, 0x77, 0xA1, 0x50, 0x00, 0x84, 0xC0, 0x74, 0x07, 0x8B, 0xC2, 0xE9,
+    0xBC, 0xFD, 0xFF, 0xFF, 0xC3,
+];
+const UP_K16_BODY_CALLS: [usize; 1] = [0x24];
+const UP_K1A_BODY: [u8; 105] = [
+    0x8B, 0x44, 0x24, 0x04, 0x85, 0xC0, 0x74, 0x30, 0x8B, 0x50, 0x44, 0x85, 0xD2, 0x74, 0x29, 0x8B,
+    0xCA, 0x81, 0xE1, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE1, 0x04, 0x8B, 0x89, 0x64, 0x9C, 0x14, 0x02,
+    0x85, 0xC9, 0x74, 0x14, 0x39, 0x51, 0x44, 0x75, 0x0F, 0x83, 0x79, 0x4C, 0x01, 0x75, 0x09, 0x80,
+    0xB9, 0xCC, 0x03, 0x00, 0x00, 0x01, 0x74, 0x22, 0x0F, 0xB6, 0x88, 0x48, 0x01, 0x00, 0x00, 0x81,
+    0xE9, 0xAC, 0x00, 0x00, 0x00, 0x74, 0x19, 0x83, 0xE9, 0x01, 0x74, 0x0F, 0x83, 0xE9, 0x01, 0x75,
+    0x09, 0x56, 0x8B, 0xF0, 0xE8, 0xC7, 0xF8, 0xFF, 0xFF, 0x5E, 0xC3, 0xE9, 0x70, 0xF7, 0xFF, 0xFF,
+    0x89, 0x44, 0x24, 0x04, 0xE9, 0xE7, 0xED, 0xFF, 0xFF,
+];
+const UP_K1A_BODY_CALLS: [usize; 1] = [0x54];
+const EN_K17_BODY: [u8; 65] = [
+    0x8B, 0x44, 0x24, 0x04, 0x85, 0xC0, 0x74, 0x33, 0x8B, 0x50, 0x44, 0x85, 0xD2, 0x74, 0x2C, 0x8B,
+    0xCA, 0x81, 0xE1, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE1, 0x04, 0x8B, 0x89, 0x64, 0x9C, 0x14, 0x02,
+    0x85, 0xC9, 0x74, 0x17, 0x39, 0x51, 0x44, 0x75, 0x12, 0xBA, 0x01, 0x00, 0x00, 0x00, 0x39, 0x51,
+    0x4C, 0x75, 0x08, 0x38, 0x91, 0xCC, 0x03, 0x00, 0x00, 0x74, 0x05, 0xE9, 0xC0, 0xFB, 0xFF, 0xFF,
+    0xC3,
+];
+const EN_K17_BODY_CALLS: [usize; 0] = [];
+const EN_K1A_BODY: [u8; 75] = [
+    0x8B, 0x54, 0x24, 0x04, 0x85, 0xD2, 0x74, 0x32, 0x8B, 0x4A, 0x44, 0x85, 0xC9, 0x74, 0x2B, 0x8B,
+    0xC1, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x85,
+    0xC0, 0x74, 0x17, 0x39, 0x48, 0x44, 0x75, 0x12, 0xB9, 0x01, 0x00, 0x00, 0x00, 0x39, 0x48, 0x4C,
+    0x75, 0x08, 0x38, 0x88, 0xCC, 0x03, 0x00, 0x00, 0x74, 0x10, 0x68, 0xAC, 0x00, 0x00, 0x00, 0x6A,
+    0x1A, 0x52, 0xE8, 0x49, 0xB5, 0xFD, 0xFF, 0x83, 0xC4, 0x0C, 0xC3,
+];
+const EN_K1A_BODY_CALLS: [usize; 1] = [0x42];
+const SETACT_BODY: [u8; 482] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x0C, 0x53, 0x56, 0x8B, 0x75, 0x08, 0x85, 0xF6,
+    0x57, 0x0F, 0x84, 0xC4, 0x01, 0x00, 0x00, 0xF6, 0x86, 0x80, 0x00, 0x00, 0x00, 0x0B, 0x0F, 0x85,
+    0xB7, 0x01, 0x00, 0x00, 0x0F, 0xBE, 0x86, 0x49, 0x01, 0x00, 0x00, 0x3B, 0x45, 0x0C, 0x0F, 0x85,
+    0xA7, 0x01, 0x00, 0x00, 0x0F, 0xB6, 0x8E, 0x48, 0x01, 0x00, 0x00, 0x8B, 0x5D, 0x10, 0x3B, 0xCB,
+    0x0F, 0x84, 0x95, 0x01, 0x00, 0x00, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x74, 0x21, 0x83,
+    0x78, 0x3C, 0x01, 0x75, 0x1B, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x11, 0x8B, 0x42, 0x04,
+    0xFF, 0xD0, 0x83, 0xF8, 0x03, 0x75, 0x09, 0x83, 0xFB, 0x6F, 0x0F, 0x84, 0x6B, 0x01, 0x00, 0x00,
+    0x80, 0xBE, 0x49, 0x01, 0x00, 0x00, 0x00, 0x75, 0x0E, 0x80, 0xBE, 0x48, 0x01, 0x00, 0x00, 0x11,
+    0xC6, 0x44, 0x24, 0x13, 0x01, 0x74, 0x05, 0xC6, 0x44, 0x24, 0x13, 0x00, 0x83, 0xFB, 0x1A, 0x88,
+    0x9E, 0x48, 0x01, 0x00, 0x00, 0x0F, 0x84, 0x87, 0x00, 0x00, 0x00, 0x8B, 0xBE, 0xC0, 0x00, 0x00,
+    0x00, 0x8B, 0xCF, 0xC1, 0xE9, 0x0E, 0xF6, 0xC1, 0x01, 0x74, 0x77, 0x8B, 0xC6, 0xE8, 0xBE, 0xF0,
+    0x3C, 0x00, 0x84, 0xC0, 0x75, 0x08, 0x38, 0x05, 0x9D, 0x8B, 0x52, 0x02, 0x74, 0x64, 0x81, 0xE7,
+    0xFF, 0xBF, 0xFF, 0xFF, 0x8B, 0xC6, 0x89, 0xBE, 0xC0, 0x00, 0x00, 0x00, 0xE8, 0x9F, 0xF0, 0x3C,
+    0x00, 0x84, 0xC0, 0x74, 0x0A, 0xC7, 0x86, 0x30, 0x11, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x8B,
+    0x9E, 0x70, 0x05, 0x00, 0x00, 0x85, 0xDB, 0x74, 0x36, 0x8B, 0xCB, 0xE8, 0x10, 0xE9, 0x2F, 0x00,
+    0x83, 0xF8, 0x11, 0x75, 0x0B, 0x6A, 0x01, 0x33, 0xFF, 0x8B, 0xCB, 0xE8, 0x40, 0xE8, 0x2F, 0x00,
+    0x8B, 0x86, 0x70, 0x05, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x07, 0x80, 0xA0, 0x30, 0x01, 0x00, 0x00,
+    0xFD, 0x6A, 0x00, 0x6A, 0x01, 0x8B, 0xC6, 0xE8, 0xC4, 0xB9, 0x52, 0x00, 0x83, 0xC4, 0x08, 0x8B,
+    0x5D, 0x10, 0x83, 0xFB, 0x1B, 0x0F, 0x84, 0x84, 0x00, 0x00, 0x00, 0x8B, 0xBE, 0xC0, 0x00, 0x00,
+    0x00, 0x8B, 0xD7, 0xC1, 0xEA, 0x0B, 0xF6, 0xC2, 0x01, 0x74, 0x74, 0x8B, 0xC6, 0xE8, 0x2E, 0xF0,
+    0x3C, 0x00, 0x84, 0xC0, 0x75, 0x08, 0x38, 0x05, 0x9D, 0x8B, 0x52, 0x02, 0x74, 0x61, 0x81, 0xE7,
+    0xFF, 0xF7, 0xFF, 0xFF, 0x8B, 0xC6, 0x89, 0xBE, 0xC0, 0x00, 0x00, 0x00, 0xE8, 0x0F, 0xF0, 0x3C,
+    0x00, 0x84, 0xC0, 0x74, 0x0A, 0xC7, 0x86, 0x30, 0x11, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x8B,
+    0x9E, 0x70, 0x05, 0x00, 0x00, 0x85, 0xDB, 0x74, 0x36, 0x8B, 0xCB, 0xE8, 0x80, 0xE8, 0x2F, 0x00,
+    0x83, 0xF8, 0x1D, 0x75, 0x0B, 0x6A, 0x01, 0x33, 0xFF, 0x8B, 0xCB, 0xE8, 0xB0, 0xE7, 0x2F, 0x00,
+    0x8B, 0x86, 0x70, 0x05, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x07, 0x80, 0xA0, 0x30, 0x01, 0x00, 0x00,
+    0xFD, 0x6A, 0x00, 0x6A, 0x01, 0x8B, 0xC6, 0xE8, 0x34, 0xB9, 0x52, 0x00, 0x83, 0xC4, 0x08, 0x80,
+    0x7C, 0x24, 0x13, 0x00, 0x74, 0x14, 0x8D, 0x44, 0x24, 0x14, 0x50, 0x8B, 0xCE, 0xC7, 0x44, 0x24,
+    0x18, 0xFF, 0xFF, 0xFF, 0xFF, 0xE8, 0x76, 0x1E, 0x53, 0x00, 0x6A, 0x00, 0x6A, 0x01, 0x6A, 0x01,
+    0x6A, 0xFF, 0x56, 0xE8, 0xE8, 0x53, 0x53, 0x00, 0x83, 0xC4, 0x14, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5,
+    0x5D, 0xC3,
+];
+const SETACT_BODY_CALLS: [usize; 12] = [0xad, 0xcc, 0xeb, 0xfb, 0x117, 0x13d, 0x15c, 0x17b, 0x18b, 0x1a7, 0x1c5, 0x1d3];
