@@ -61,4 +61,4 @@ These run as Rust but are mechanical one-statement-per-instruction translations,
 | humans_post_update 0x9A7210, object_items_update 0x9305F0 and ~60 other doc-40 callees | port_frame2 | size |
 | ~50 more float leaves calling CRT maths; mesh_decals_fade_update, effect_list_expire_timed, occluder_contains_point | port_leaves_fp | not examined; game-list loops |
 | 16 esp-frame, 18 unknown-convention and 39 interior-referenced integer leaves | port_leaves | conventions |
-
+| vec3_normalize_safe_len 0xBDE340 | port_leaves_fp (ported, NOT installed) | with it installed, peds floated in the air and traffic drove on the pavement; found by bisecting in game on 2026-11-03; needs a corrected rewrite |

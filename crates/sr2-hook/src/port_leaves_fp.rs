@@ -20099,9 +20099,16 @@ static PORTS: [Port; COUNT] = [
 // --- install ------------------------------------------------------------------------------------
 
 /// Install this module's replacements (called from hooks::install_all).
+/// vec3_normalize_safe_len 0xBDE340 is left to the original: with it installed, peds floated in
+/// the air and traffic drove on the pavement (found by bisecting in game, 2026-11-03).
+const LEFT_TO_ORIGINAL: [usize; 1] = [0x00bd_e340];
+
 pub fn install() {
     let mut ok = 0;
     for port in PORTS.iter() {
+        if LEFT_TO_ORIGINAL.contains(&port.addr) {
+            continue;
+        }
         // The shadow copy first: replacing patches the entry.
         if port.no_shadow {
             // no shadow copy

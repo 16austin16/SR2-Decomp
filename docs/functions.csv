@@ -12571,7 +12571,7 @@ address,name,subsystem,status,notes
 0x00aac5c0,vehicle_part_transform,vehicles,documented,"EAX = bone slot, ECX = &mat_out, cdecl (&pos_out, vehicle): world transform of an attachment on a vehicle (0xAAC6D0 then the slot table at +0x538); role inferred (46)"
 0x00bdde20,vec3_mul_mat33,math,rust,"EAX = &out, ECX = &m, stdcall (&v) (ret 4): out = x*row0 + y*row1 + z*row2 (not in place; 0xBDE570 is the in-place twin) (46) (port_leaves_fp.rs, shadow-checked, play-tested)"
 0x00bde150,vec3_normalize_safe,math,documented,"ESI = &v: v *= 1/|v|; a zero or non-finite length gives (1,0,0) (0xDD518C = 1.0) (46)"
-0x00bde340,vec3_normalize_safe_len,math,rust,"ESI = &v: like 0xBDE150 and XMM0 = the length (the caller reads it as a scalar); role inferred (46) (ported 2026-11-02, play-tested)"
+0x00bde340,vec3_normalize_safe_len,math,documented,"ESI = &v: like 0xBDE150 and XMM0 = the length (the caller reads it as a scalar); role inferred (46) (ported 2026-11-02, play-tested) (port withdrawn 2026-11-03: made peds float and traffic drive on the pavement)"
 0x00bde750,vec3_random_unit,math,rust,"ESI = &out: random unit vector (rng_float01 on 0xEC30F8: z = 2r-1, angle = 2*pi*r2 scaled, x = sqrt(1-z^2)*cos, y = *sin) (46) (ported 2026-11-02, play-tested)"
 0x00bde7c0,vec3_random_cone,math,rust,"ESI = &out, stdcall (f32 a, f32 b) (ret 8): random unit vector with z between a and b (a cone around +Z) (46) (ported 2026-11-02, play-tested)"
 0x00be2e10,mat33_from_axis_angle,math,rust,"EDI = &unit axis, ESI = &out (9 f32), stdcall (f32 angle) (ret 4): rotation matrix (sin/cos of angle/2 products) (46) (ported 2026-11-02, play-tested)"
