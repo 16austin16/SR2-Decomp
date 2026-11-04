@@ -2466,25 +2466,34 @@ unsafe fn object_rehash(obj: u32, newh: u32) -> u32 {
     }
 }
 
-/// Everything `object_rehash` can write: the object's links and hash, the bucket table, and the
-/// link words of its ring neighbours and of the new bucket's head and tail.
+/// Everything `object_rehash` can write, and nothing it does not touch: nothing when the hash is
+/// unchanged; else the object's links and hash and the bucket table, plus the link word of each
+/// neighbour it unlinks from (none when it is the only node) and of the new bucket's head and
+/// tail. A free object's links are garbage, so they are only followed when the old hash is not 0
+/// (the original does the same), and the new ring only when its bucket is not empty.
 unsafe fn rehash_ranges(obj: u32, newh: u32, v: &mut Vec<(usize, usize)>) {
     unsafe {
         let o = obj as usize;
+        let old = rd(o + 0x2C);
+        if old == newh {
+            return;
+        }
         v.push((o + 4, 8));
         v.push((o + 0x2C, 4));
         v.push((NAME_BUCKETS, 256));
-        let mut add = |n: u32| {
-            if n != 0 {
-                v.push((n as usize + 4, 8));
+        if old != 0 {
+            let (nx, pv) = (rd(o + 4), rd(o + 8));
+            if !(rd(NAME_BUCKETS + (old & 0x3F) as usize * 4) == obj && nx == obj) {
+                v.push((pv as usize + 4, 4));
+                v.push((nx as usize + 8, 4));
             }
-        };
-        add(rd(o + 8));
-        add(rd(o + 4));
-        let head = rd(NAME_BUCKETS + (newh & 0x3F) as usize * 4);
-        if head != 0 {
-            add(head);
-            add(rd(head as usize + 8));
+        }
+        if newh != 0 {
+            let head = rd(NAME_BUCKETS + (newh & 0x3F) as usize * 4);
+            if head != 0 {
+                v.push((head as usize + 8, 4));
+                v.push((rd(head as usize + 8) as usize + 4, 4));
+            }
         }
     }
 }
@@ -2519,16 +2528,23 @@ unsafe fn object_set_name(obj: u32, name: u32, eax_in: u32) -> u32 {
     }
 }
 
+/// Everything `object_set_name` can write: nothing for a null name.
+unsafe fn set_name_ranges(obj: u32, name: u32, v: &mut Vec<(usize, usize)>) {
+    unsafe {
+        if name != 0 {
+            v.push((obj as usize + 0x34, 0x20));
+            rehash_ranges(obj, crc_lower(name), v);
+        }
+    }
+}
+
 extern "C" fn object_set_name_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let obj = unsafe { *args };
     let name = p.edi;
     r.eax = if window_open(P_OBJECT_SET_NAME) {
         let mut ranges = Vec::new();
-        if name != 0 {
-            ranges.push((obj as usize + 0x34, 0x20));
-            unsafe { rehash_ranges(obj, crc_lower(name), &mut ranges) };
-        }
+        unsafe { set_name_ranges(obj, name, &mut ranges) };
         checked_writer(P_OBJECT_SET_NAME, &p, obj, &ranges, || unsafe { object_set_name(obj, name, p.eax) })
     } else {
         unsafe { object_set_name(obj, name, p.eax) }
@@ -3012,11 +3028,6 @@ pub fn install() {
     let mut ok = 0;
     for (id, body, call_offsets, thunk) in list {
         let port = &PORTS[id];
-        // vint_object_set_name / rehash_name crashed the game at startup (2026-11-02 play test):
-        // left to the original until fixed; see docs/skipped_ports.md.
-        if port.addr == 0x00B9_7620 || port.addr == 0x00B9_7570 {
-            continue;
-        }
         // The shadow copy first: replacing patches the entry.
         match unsafe { detour::relocate(port.addr, body, call_offsets) } {
             Ok(copy) => port.original.store(copy, Ordering::Relaxed),
@@ -3645,3 +3656,221 @@ const GROUP_UNSUBSCRIBE_BODY: [u8; 236] = [
     0x89, 0x72, 0x14, 0x89, 0x70, 0x18, 0x5E, 0x5D, 0x5B, 0xC2, 0x04, 0x00,
 ];
 const GROUP_UNSUBSCRIBE_BODY_CALLS: [usize; 0] = [];
+
+// =====================================================================================================
+// Offline differential test of vint_object_rehash_name / vint_object_set_name against the original
+// bytes. Run with the test exe linked away from the game's addresses:
+//   RUSTFLAGS="-C link-arg=/DYNAMICBASE:NO -C link-arg=/BASE:0x10000000" cargo test --release
+//   -p sr2-hook --target i686-pc-windows-msvc port_vint2::obj_tests -- --ignored --nocapture
+// =====================================================================================================
+
+/// Under test the two CRT callees of `object_set_name` run on the host.
+#[cfg(test)]
+unsafe fn call_regs(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> u32 {
+    match f {
+        STRNCPY => obj_tests::host_strncpy(args[0], args[1], args[2]),
+        STRING_CRC32_LOWER => obj_tests::host_crc(ecx),
+        _ => unsafe { crate::portlib::call_regs(f, eax, ecx, edx, esi, edi, args) },
+    }
+}
+
+#[cfg(test)]
+mod obj_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+
+    pub extern "C" fn host_strncpy(dst: u32, src: u32, n: u32) -> u32 {
+        unsafe {
+            let mut end = false;
+            for i in 0..n as usize {
+                let c = if end { 0 } else { *((src as usize + i) as *const u8) };
+                if c == 0 {
+                    end = true;
+                }
+                *((dst as usize + i) as *mut u8) = c;
+            }
+        }
+        dst
+    }
+
+    /// A case-insensitive hash with only 8 distinct low-6-bit patterns (so rings collide); 0 for "".
+    pub extern "C" fn host_crc(name: u32) -> u32 {
+        if name == 0 {
+            return 0;
+        }
+        let mut h: u32 = 0;
+        let mut p = name as usize;
+        unsafe {
+            while *(p as *const u8) != 0 {
+                h = (h ^ (*(p as *const u8)).to_ascii_lowercase() as u32).wrapping_mul(0x0100_0193).rotate_left(5);
+                p += 1;
+            }
+        }
+        if h == 0 { 0 } else { (h & !0x3F) | ((h >> 3) & 7) | 0x40 }
+    }
+
+    #[unsafe(naked)]
+    extern "C" fn crc_shim() {
+        std::arch::naked_asm!("push ecx", "call {f}", "add esp, 4", "ret", f = sym host_crc)
+    }
+
+    fn exec(body: &[u8]) -> usize {
+        let p = unsafe { VirtualAlloc(std::ptr::null(), body.len() + 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
+        assert!(p != 0);
+        unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), p as *mut u8, body.len()) };
+        p
+    }
+
+    unsafe fn set_rel32(copy: usize, off: usize, dest: usize) {
+        let rel = (dest as i32).wrapping_sub((copy + off + 5) as i32);
+        unsafe { std::ptr::write_unaligned((copy + off + 1) as *mut i32, rel) };
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn u32(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 16) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.u32() % n
+        }
+    }
+
+    const OBJ: usize = 0x60;
+    const NOBJ: usize = 14;
+
+    fn snap(base: usize) -> Vec<u8> {
+        let mut v = unsafe { capture(&[(NAME_BUCKETS, 256), (base, OBJ * NOBJ)]) };
+        v.shrink_to_fit();
+        v
+    }
+    fn put(base: usize, s: &[u8]) {
+        unsafe { restore(&[(NAME_BUCKETS, 256), (base, OBJ * NOBJ)], s) };
+    }
+
+    #[test]
+    #[ignore = "needs the test exe linked at /BASE:0x10000000 (see the comment above)"]
+    fn object_name_matches_original() {
+        unsafe {
+            let p = VirtualAlloc((NAME_BUCKETS & !0xFFFF) as *const _, 0x1_0000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            assert_eq!(p as usize, NAME_BUCKETS & !0xFFFF, "cannot map the bucket table");
+        }
+        let rehash = exec(&REHASH_NAME_BODY);
+        let setname = exec(&OBJECT_SET_NAME_BODY);
+        unsafe {
+            set_rel32(setname, 0x11, host_strncpy as usize);
+            set_rel32(setname, 0x1f, crc_shim as usize);
+            set_rel32(setname, 0x28, rehash);
+        }
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let arena = vec![0u8; OBJ * NOBJ];
+        let base = arena.as_ptr() as usize;
+        let obj_at = |i: usize| (base + i * OBJ) as u32;
+        let alphabet = b"aAbBcC_ ";
+        let (mut n_rehash, mut n_name, mut n_null) = (0u32, 0u32, 0u32);
+        for iter in 0..60000u32 {
+            // a world: every object is garbage, then some are hashed into the rings by the original
+            unsafe {
+                std::ptr::write_bytes(NAME_BUCKETS as *mut u8, 0, 256);
+                std::ptr::write_bytes(base as *mut u8, 0xCD, arena.len());
+            }
+            for i in 0..NOBJ {
+                unsafe { wd(obj_at(i) as usize + 0x2C, 0) };
+                if rng.below(3) != 0 {
+                    let h = 0x40 * (1 + rng.below(3)) + rng.below(3);
+                    let mut r = Regs { eax: obj_at(i), ecx: h, edx: 0, ebx: 0, esi: 0, edi: 0, ebp: 0 };
+                    unsafe { call_full(rehash, &mut r, 0) };
+                }
+            }
+            let before = snap(base);
+            let o = obj_at(rng.below(NOBJ as u32) as usize);
+            let mut r = Regs {
+                eax: rng.u32(),
+                ecx: rng.u32(),
+                edx: rng.u32(),
+                ebx: 0xB1B1_B1B1,
+                esi: 0x5151_5151,
+                edi: 0xD0D0_D0D0,
+                ebp: 0xE9E9_E9E9,
+            };
+            let mut inp = r;
+            let mut ranges = Vec::new();
+            let (ours, orig_eax);
+            let mut name_buf: Vec<u8> = Vec::new();
+            if iter % 2 == 0 {
+                n_rehash += 1;
+                let cur = unsafe { rd(o as usize + 0x2C) };
+                let h = match rng.below(5) {
+                    0 => 0,
+                    1 => cur,
+                    2 => cur.wrapping_add(0x40),
+                    3 => (cur & !0x3F) | rng.below(8),
+                    _ => rng.u32() | 0x40,
+                };
+                r.eax = o;
+                r.ecx = h;
+                inp = r;
+                unsafe {
+                    rehash_ranges(o, h, &mut ranges);
+                    let _ = capture(&ranges);
+                    call_full(rehash, &mut r, 0);
+                }
+                orig_eax = r.eax;
+                let after_orig = snap(base);
+                put(base, &before);
+                ours = unsafe { object_rehash(o, h) };
+                let mine = snap(base);
+                check(&before, &after_orig, &mine, &ranges, base, "rehash", iter);
+            } else {
+                n_name += 1;
+                let len = if rng.below(6) == 0 { 0 } else { rng.below(45) as usize };
+                for _ in 0..len {
+                    name_buf.push(alphabet[rng.below(alphabet.len() as u32) as usize]);
+                }
+                name_buf.push(0);
+                let null = rng.below(5) == 0;
+                let name_ptr = if null { 0 } else { name_buf.as_ptr() as u32 };
+                if null {
+                    n_null += 1;
+                }
+                r.edi = name_ptr;
+                inp = Regs { edi: name_ptr, ..inp };
+                unsafe {
+                    set_name_ranges(o, name_ptr, &mut ranges);
+                    let _ = capture(&ranges);
+                    call_full(setname, &mut r, o);
+                }
+                orig_eax = r.eax;
+                let after_orig = snap(base);
+                put(base, &before);
+                ours = unsafe { object_set_name(o, name_ptr, inp.eax) };
+                let mine = snap(base);
+                check(&before, &after_orig, &mine, &ranges, base, "set_name", iter);
+            }
+            assert_eq!(ours, orig_eax, "eax iter {iter}");
+            for (n, a, b) in [("ebx", inp.ebx, r.ebx), ("esi", inp.esi, r.esi), ("edi", inp.edi, r.edi), ("ebp", inp.ebp, r.ebp)] {
+                assert_eq!(a, b, "the original changed {n} (iter {iter})");
+            }
+        }
+        eprintln!("object_name_matches_original: {n_rehash} rehash, {n_name} set_name ({n_null} null name) all matched");
+    }
+
+    /// The Rust version wrote the same bytes as the original, and the original changed nothing
+    /// outside the ranges the shadow records.
+    fn check(before: &[u8], orig: &[u8], mine: &[u8], ranges: &[(usize, usize)], base: usize, what: &str, iter: u32) {
+        if orig != mine {
+            let i = orig.iter().zip(mine).position(|(a, b)| a != b).unwrap();
+            panic!("{what} iter {iter}: memory differs at snapshot offset {i:#x} (original {:#x}, Rust {:#x})", orig[i], mine[i]);
+        }
+        let covered = |addr: usize| ranges.iter().any(|&(a, n)| addr >= a && addr < a + n);
+        for i in 0..before.len() {
+            if before[i] != orig[i] {
+                let addr = if i < 256 { NAME_BUCKETS + i } else { base + (i - 256) };
+                assert!(covered(addr), "{what} iter {iter}: the original wrote {addr:#x} outside the shadow ranges");
+            }
+        }
+    }
+}

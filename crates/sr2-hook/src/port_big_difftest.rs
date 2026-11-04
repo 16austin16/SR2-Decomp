@@ -38,7 +38,7 @@ use windows_sys::Win32::System::Memory::{
 include!("port_big_difftest_data.rs");
 
 pub const STK_P: usize = 0x0800_0000;
-const ESP0: u32 = (STK_P + 4096 - 128) as u32;
+pub(super) const ESP0: u32 = (STK_P + 4096 - 128) as u32;
 const STK_LO: usize = STK_P - 0x1_0000;
 const STK_HI: usize = STK_P + 0x1_0000;
 const ARENA: usize = 0x3000_0000;
@@ -259,6 +259,7 @@ static mut CALLEE_STATS: Vec<(u32, u32)> = Vec::new();
 static mut GUARD_ESP: u32 = 0;
 static mut IN_GUARD: u32 = 0;
 static mut DEBUG_ON: bool = false;
+static mut DEBUG_PC: bool = false;
 static mut DBG: Vec<String> = Vec::new();
 static mut ORIG_SAVED_ESP: u32 = 0;
 static mut ORIG_TARGET: u32 = 0;
@@ -271,7 +272,7 @@ static mut COV_NEW: u32 = 0;
 static mut TRACE: Vec<u32> = Vec::new();
 static RUN_START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static mut MAIN_THREAD: isize = 0;
-const RUN_LIMIT_MS: u64 = 150;
+const RUN_LIMIT_MS: u64 = 40;
 
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -289,7 +290,7 @@ unsafe fn start_watchdog() {
     MAIN_THREAD = h as isize;
     std::thread::spawn(|| unsafe {
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            std::thread::sleep(std::time::Duration::from_millis(10));
             let st = RUN_START.load(std::sync::atomic::Ordering::SeqCst);
             if st != 0 && now_ms() - st > RUN_LIMIT_MS {
                 let h = MAIN_THREAD as *mut std::ffi::c_void;
@@ -731,7 +732,16 @@ struct CallRec {
     pops: i32,
     assumed_pop: i32,
     fake: bool,
+    /// hand-written ports: the number of stack dwords the Rust side passed (only these are compared)
+    nargs: u8,
+    /// hand-written ports: the registers the Rust side declared (bit k = eax ecx edx ebx esi edi, 6 = xmm0); a call
+    /// record compares the callee's inputs, a return record the outputs the Rust code goes on to use
+    mask: u8,
 }
+
+/// Declared register inputs / outputs of the next call from a hand-written port (see `hand::hcall`).
+pub(super) static mut H_IN: u8 = 0x7F;
+pub(super) static mut H_OUT: u8 = 0x7F;
 
 static mut CALLS: Vec<CallRec> = Vec::new();
 
@@ -756,6 +766,7 @@ struct SwEnt {
     fx: [f64; 8],
     assumed_pop: i32,
     vesp: u32,
+    outm: u8,
 }
 static mut SWSTACK: Vec<SwEnt> = Vec::new();
 static mut CALL_NO: u32 = 0;
@@ -885,6 +896,9 @@ unsafe fn repair_hint(addr: u32, rng: &mut Rng) -> Option<Hint> {
 
 pub(super) fn cov(pc: usize) {
     unsafe {
+        if MODE == 2 && DEBUG_PC {
+            eprintln!("    pc {pc:#x}");
+        }
         if MODE == 2 && TRACE.len() < 30000 {
             TRACE.push(pc as u32);
         }
@@ -949,7 +963,10 @@ extern "C" fn tap_log(fr: *mut TapFrame) {
             pops: 0,
             assumed_pop: -1,
             fake: false,
+            nargs: 0,
+            mask: 0x7F,
         };
+        let mut outm = 0x7Fu8;
         let mut fxn = 0usize;
         let mut fx = [0f64; 8];
         if rust && top {
@@ -962,6 +979,11 @@ extern "C" fn tap_log(fr: *mut TapFrame) {
             fxn = PRE.fxn;
             fx = PRE.fx;
             rec.assumed_pop = PRE.pop as i32;
+            rec.nargs = PRE.nargs.min(16) as u8;
+            rec.mask = H_IN;
+            outm = H_OUT;
+            H_IN = 0x7F;
+            H_OUT = 0x7F;
             for i in 0..fxn {
                 if nreal + i < 8 {
                     rec.st[nreal + i] = fx[i];
@@ -973,11 +995,33 @@ extern "C" fn tap_log(fr: *mut TapFrame) {
         if top {
             for i in 0..16 {
                 let a = rec.vesp as usize + 4 * i;
-                rec.stack[i] = if a >= STK_LO && a + 4 <= STK_HI && a != ESP0 as usize { rd(a) } else { 0 };
+                rec.stack[i] = if HAND && rust {
+                    if i < rec.nargs as usize { std::ptr::read_unaligned(a as *const u32) } else { 0 }
+                } else if a >= STK_LO && a + 4 <= STK_HI && a != ESP0 as usize {
+                    rd(a)
+                } else {
+                    0
+                };
             }
         }
+        if std::env::var("DT_DBG2").is_ok() && top && fr.ecx > 0x10000 && idx < TAPS.len() && TAPS[idx].0 == 0xbdda80 {
+            eprintln!("bdda80 mode {} ecx {:#x} data {:x?} nreal {} st {:?} glob {:x?} sw {:#x}", MODE, fr.ecx, (0..3).map(|i| rd(fr.ecx as usize + 4 * i)).collect::<Vec<_>>(), nreal, &st[..nreal], (0..3).map(|i| rd(0xe9a664 + 4 * i)).collect::<Vec<_>>(), { let mut w: u16 = 0; std::arch::asm!("fnstsw word ptr [{p}]", p = in(reg) &mut w as *mut u16, options(nostack)); w });
+        }
         // decide: fake or real
-        let fake: Option<FakeSpec> = if idx >= TAPS.len() { Some(FAKES[idx - TAPS.len()].2) } else { None };
+        let mut fake: Option<FakeSpec> = if idx >= TAPS.len() { Some(FAKES[idx - TAPS.len()].2) } else { None };
+        if fake.is_none() {
+            // callees replaced by a fake in the targeted scenarios of this function (see FAKE_CALLEES)
+            if let Some(&(_, sp)) = FAKE_CALLEES.iter().find(|t| t.0 == TAPS[idx].0) {
+                if FAKE_ACTIVE {
+                    fake = Some(sp);
+                }
+            }
+            // callees that are always faked (their real code reads uninitialised stack, which differs between the
+            // emulated stack of the original run and the thread stack of the Rust run)
+            if let Some(&(_, sp)) = FAKE_ALWAYS.iter().find(|t| t.0 == TAPS[idx].0) {
+                fake = Some(sp);
+            }
+        }
         if let Some(f) = fake {
             rec.fake = true;
             CALLS.push(rec);
@@ -988,6 +1032,8 @@ extern "C" fn tap_log(fr: *mut TapFrame) {
             let r = call_rng(0xFA);
             match f.eax {
                 1 => fr.eax = (r >> 8) as u32 % 6,
+                4 => fr.eax = if (r >> 8) & 3 == 0 { 0 } else { arena_ptr(r) },
+                5 => fr.eax = ((r >> 8) & 1) as u32,
                 2 => fr.eax = arena_ptr(r),
                 3 => fr.eax = (r >> 8) as u32,
                 _ => {}
@@ -995,10 +1041,17 @@ extern "C" fn tap_log(fr: *mut TapFrame) {
             for k in 0..f.nout {
                 x87_push(FLOATS[((r >> (12 + 4 * k)) & 15) as usize] as f64);
             }
+            if idx < TAPS.len() && TAPS[idx].0 == 0x6fa820 && fr.eax & 0xFF != 0 {
+                // the collision query succeeded: give it a hit list (pointer, count, capacity word)
+                let res = *(args_ptr as *const u32) as usize;
+                wd(res, arena_ptr(r));
+                wd(res + 4, 1 + ((r >> 40) as u32 % 3));
+                wd(res + 8, if (r >> 50) & 1 == 0 { 0x8000_0000 | 3 } else { 3 });
+            }
             TAP_TARGET = (RETN_BASE + 8 * f.ret_dw) as u32;
         } else {
             CALLS.push(rec);
-            SWSTACK.push(SwEnt { idx: idx as u32, ret: fr.ret, args_ptr, top, fxn, fx, assumed_pop: rec.assumed_pop, vesp: rec.vesp });
+            SWSTACK.push(SwEnt { idx: idx as u32, ret: fr.ret, args_ptr, top, fxn, fx, assumed_pop: rec.assumed_pop, vesp: rec.vesp, outm });
             fr.ret = post_pad as *const () as usize as u32;
             TAP_TARGET = (TR_BASE + 64 * idx) as u32;
         }
@@ -1018,6 +1071,22 @@ extern "C" fn post_log(fr: *mut PostFrame) {
     unsafe {
         let fr = &mut *fr;
         let ent = SWSTACK.pop().expect("post without tap");
+        // targeted scenarios: a top-level callee's return value is replaced by a small number in half of the scenarios
+        if ent.top && RET_ACTIVE && (ent.idx as usize) < TAPS.len() {
+            for &(a, m) in RET_OVR.iter() {
+                if a == TAPS[ent.idx as usize].0 {
+                    fr.eax = (call_rng(0xE1) >> 8) as u32 % m;
+                    if a == 0x6fa820 && fr.eax != 0 {
+                        // the collision query succeeded: give it a hit list (pointer, count, capacity word)
+                        let res = *(ent.args_ptr as *const u32) as usize;
+                        let r = call_rng(0xE2);
+                        wd(res, arena_ptr(r));
+                        wd(res + 4, 1 + ((r >> 40) as u32 % 3));
+                        wd(res + 8, if (r >> 50) & 1 == 0 { 0x8000_0000 | 3 } else { 3 });
+                    }
+                }
+            }
+        }
         let mut st = [0f64; 8];
         let nreal = x87_dump(&mut st);
         let fr_end = (&fr.ebp as *const u32 as u32) + 4;
@@ -1035,6 +1104,8 @@ extern "C" fn post_log(fr: *mut PostFrame) {
             pops: (fr_end - ent.args_ptr) as i32,
             assumed_pop: ent.assumed_pop,
             fake: false,
+            nargs: 0,
+            mask: if rust && ent.top { ent.outm } else { 0x7F },
         };
         if rust && ent.top {
             for i in 0..ent.fxn {
@@ -1099,12 +1170,106 @@ pub struct FnSpec {
     body: unsafe fn(&mut Ent, *const u32),
     ret_n: u32,
     dt_arg: bool,
+    /// hand-written port: runs on the thread stack (stack pointers are normalised, only the declared stack
+    /// arguments of each call are compared, ESP is not compared)
+    hand: bool,
+    /// exit registers that are compared (bit k = eax ecx edx ebx esi edi ebp); the others are dead on return
+    live: u8,
 }
+
+static mut HAND: bool = false;
+/// (callee address, modulus): return values replaced by `rand % modulus` when `RET_ACTIVE` (see `RET_TABLE`)
+static mut RET_OVR: &[(u32, u32)] = &[];
+static mut RET_ACTIVE: bool = false;
+/// (function, [(address, value)]): memory values forced (each with 75% chance) into the scenarios of the function,
+/// to reach blocks that random data practically never does
+static MEM_PRESETS: &[(&str, &[(u32, u32)])] = &[
+    ("cam_4938c0", &[(0x252864c, 0)]),
+    ("cam_492df0", &[(0x25f5ae8, 0), (0x25f5c54, 1)]),
+    ("cam_497a20", &[(0x3020_009c, 0), (0x3020_009c, 1), (0x3020_009c, 2)]),
+    (
+        "cam_499480",
+        &[
+            (0x25f5bb0, 0x123),
+            (0x2149c64 + 0x1230, 0x3010_0000),
+            (0x3010_0044, 0x123),
+            (0x3010_004c, 5),
+            (0x3010_84d8, 1),
+            (0x3010_84e4, 0x3020_0000),
+            (0x3020_009c, 3),
+            (0x3020_009c, 4),
+            (0x3010_0540, 0x3030_0000),
+            (0x3010_0550, 0x3030_0100),
+            (0x21703d4, 0x3040_0000),
+            (0x3040_00c0, 0),
+            (0x2529770, 0),
+            (0xe9a5bc, 0),
+            (0xe843ac, 0x1000),
+            (0xe9a6b0, 0x4000_0000),
+        ],
+    ),
+];
+/// (function, stack argument, offset, value): `*(args[k] + offset) = value` in most scenarios (data inside a structure
+/// that is passed by pointer)
+/// (a base of 100 + k means register k instead of a stack argument)
+static REL_PRESETS: &[(&str, usize, u32, u32)] = &[
+    ("cam_499480", 0, 0xe8, 0),
+    // 0x497a20: ecx = a kind-5 human whose state record (fixed arena address) says "state 0 / 1"
+    ("cam_497a20", 101, 0x4c, 5),
+    ("cam_497a20", 101, 0x84e4, 0x3020_0000),
+    ("cam_497a20", 101, 0x8f50, 0),
+];
+/// (function, registers (bit k = eax ecx edx ebx esi edi ebp), stack arguments (bit k)) that are pointers to the
+/// function's data: forced to valid arena pointers in most scenarios
+static PTR_PRESETS: &[(&str, u8, u16)] = &[
+    ("cam_4938c0", 0x21, 0x1),
+    ("cam_497a20", 0x03, 0x1),
+    ("cam_499190", 0x00, 0x1),
+    ("cam_499480", 0x00, 0x1),
+];
+/// Callees replaced by a fake (result chosen from the call's random stream) in about 2/3 of the scenarios of the
+/// function, for callees that run over a whole world of data (the collision query): per function (address, behaviour)
+static FAKE_TABLE: &[(&str, &[(u32, FakeSpec)])] = &[
+    (
+        "cam_4938c0",
+        &[
+            (0x6fa820, FakeSpec { name: "collision query", ret_dw: 0, nin: 0, nout: 0, eax: 1 }),
+            (0x9b9320, FakeSpec { name: "world check", ret_dw: 0, nin: 0, nout: 0, eax: 1 }),
+            (0xaad320, FakeSpec { name: "hit object lookup", ret_dw: 0, nin: 0, nout: 0, eax: 4 }),
+        ],
+    ),
+];
+static FAKE_ALWAYS_TABLE: &[(&str, &[(u32, FakeSpec)])] = &[
+    (
+        "cam_497a20",
+        &[
+            (0xab5340, FakeSpec { name: "human check", ret_dw: 0, nin: 0, nout: 0, eax: 5 }),
+            (0xadd870, FakeSpec { name: "human check 2", ret_dw: 0, nin: 0, nout: 0, eax: 5 }),
+            (0xaab8e0, FakeSpec { name: "count", ret_dw: 0, nin: 0, nout: 0, eax: 1 }),
+            (0xbf1670, FakeSpec { name: "range test", ret_dw: 0, nin: 0, nout: 0, eax: 5 }),
+            (0xbe3380, FakeSpec { name: "mat33 angle (crashes the harness on some garbage)", ret_dw: 0, nin: 0, nout: 0, eax: 0 }),
+        ],
+    ),
+    (
+    "cam_499480",
+    &[
+        (0x498770, FakeSpec { name: "context counter", ret_dw: 0, nin: 0, nout: 0, eax: 0 }),
+        (0x4988c0, FakeSpec { name: "context counter 2", ret_dw: 0, nin: 0, nout: 0, eax: 0 }),
+    ],
+)];
+static mut FAKE_ALWAYS: &[(u32, FakeSpec)] = &[];
+static mut FAKE_CALLEES: &[(u32, FakeSpec)] = &[];
+static mut FAKE_ACTIVE: bool = false;
+static RET_TABLE: &[(&str, &[(u32, u32)])] = &[
+    ("cam_49ae60", &[(0x49aab0, 3)]),
+    ("cam_499480", &[(0x960c30, 2)]),
+];
 
 struct RunOut {
     aborted: u32,
     kind: u32,
     abort_addr: u32,
+    abort_in: i32,
     regs: [u32; 7],
     xmm0: u32,
     esp: u32,
@@ -1136,6 +1301,8 @@ unsafe fn prepare(s: &Scn, _spec: &FnSpec, preload: &[u32]) {
             map_dynamic(p as usize);
         }
     }
+    RET_ACTIVE = (s.seed >> 7) & 1 == 0;
+    FAKE_ACTIVE = (s.seed >> 9) % 3 != 0;
     CALLS.clear();
     TRACE.clear();
     SWSTACK.clear();
@@ -1171,6 +1338,7 @@ unsafe fn finish(aborted: u32, _spec: &FnSpec) -> RunOut {
         aborted,
         kind: ABORT_KIND,
         abort_addr: ABORT_ADDR,
+        abort_in: ABORT_IN,
         regs: [0; 7],
         xmm0: 0,
         esp: 0,
@@ -1229,13 +1397,14 @@ unsafe fn reset_pages_after(_o: &RunOut) {
 }
 
 extern "C" fn rust_runner(ent: *mut Ent, spec: *const FnSpec) {
-    unsafe { ((*spec).body)(&mut *ent, ARGS_COPY.as_ptr()) }
+    unsafe { ((*spec).body)(&mut *ent, if (*spec).hand { (ESP0 + 4) as *const u32 } else { ARGS_COPY.as_ptr() }) }
 }
 
 static mut ARGS_COPY: [u32; 16] = [0; 16];
 
 unsafe fn exec_rust(s: &Scn, spec: &FnSpec, preload: &[u32]) -> RunOut {
     prepare(s, spec, preload);
+    HAND = spec.hand;
     RING_N = 0;
     HINTS.clear();
     INIT_REGS = s.regs;
@@ -1259,7 +1428,13 @@ unsafe fn exec_rust(s: &Scn, spec: &FnSpec, preload: &[u32]) -> RunOut {
     ABORT_KIND = 0;
     ACTIVE = true;
     RUN_START.store(now_ms(), std::sync::atomic::Ordering::SeqCst);
+    if std::env::var("DT_VERBOSE").is_ok() {
+        eprintln!("  exec_rust: start (preload {} pages)", preload.len());
+    }
     let ab = guarded(rust_runner as *const () as usize, &mut ent as *mut _ as usize, spec as *const _ as usize);
+    if std::env::var("DT_VERBOSE").is_ok() {
+        eprintln!("  exec_rust: guarded returned {ab}");
+    }
     let mut o = finish(ab, spec);
     if ab == 0 {
         o.regs = [ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp];
@@ -1312,22 +1487,35 @@ unsafe fn compare(s: &Scn, spec: &FnSpec, o: &RunOut, r: &RunOut) -> Result<(), 
         // callees run on the emulated stack in the original and on the thread stack under the translation, so
         // below the first level a stack pointer in a register only has to be a stack pointer in both
         let norm = |v: u32, rust: bool| -> u32 {
-            if a.depth == 0 && a.kind == 0 {
+            if a.depth == 0 && a.kind == 0 && !spec.hand {
                 return v;
             }
             let (lo, hi) = if rust { thread_stack() } else { (STK_LO as u32, STK_HI as u32) };
-            if v >= lo && v < hi { 0x57AC_0000 } else { v }
+            if (v >= lo && v < hi) || (spec.hand && v >= STK_LO as u32 && v < STK_HI as u32) { 0x57AC_0000 } else { v }
         };
-        let ra: Vec<u32> = a.regs.iter().map(|&v| norm(v, false)).collect();
-        let rb: Vec<u32> = b.regs.iter().map(|&v| norm(v, true)).collect();
+        // (equal raw values are equal whatever they look like)
+        let mut ra: Vec<u32> = (0..6).map(|k| if a.regs[k] == b.regs[k] { a.regs[k] } else { norm(a.regs[k], false) }).collect();
+        let mut rb: Vec<u32> = (0..6).map(|k| if a.regs[k] == b.regs[k] { b.regs[k] } else { norm(b.regs[k], true) }).collect();
+        if spec.hand {
+            for k in 0..6 {
+                // below the first level the callee's registers derive from the declared inputs: dead ones may differ
+                if b.mask & (1 << k) == 0 || a.depth > 0 {
+                    // bit 7 (AL): only the low byte of eax is an output
+                    let m = if k == 0 && b.mask & 0x80 != 0 && a.depth == 0 { 0xFF } else { 0 };
+                    ra[k] &= m;
+                    rb[k] &= m;
+                }
+            }
+        }
         // eax after `fnstsw ax` carries the x87 sticky exception flags / C1, which the translation does not model
-        let (mut ra, mut rb) = (ra, rb);
-        ra[0] &= !STICKY;
-        rb[0] &= !STICKY;
+        if !(spec.hand && b.mask & 0x80 != 0 && a.depth == 0) {
+            ra[0] &= !STICKY;
+            rb[0] &= !STICKY;
+        }
         if ra != rb {
             return Err(what(&format!("registers eax ecx edx ebx esi edi: original {:x?} vs Rust {:x?}", a.regs, b.regs)));
         }
-        if a.xmm0 != b.xmm0 && !(f32::from_bits(a.xmm0).is_nan() && f32::from_bits(b.xmm0).is_nan()) {
+        if a.xmm0 != b.xmm0 && !(f32::from_bits(a.xmm0).is_nan() && f32::from_bits(b.xmm0).is_nan()) && (!spec.hand || b.mask & 0x40 != 0) {
             return Err(what(&format!("xmm0: original {:#x} vs Rust {:#x}", a.xmm0, b.xmm0)));
         }
         if a.depth == 0 {
@@ -1338,7 +1526,14 @@ unsafe fn compare(s: &Scn, spec: &FnSpec, o: &RunOut, r: &RunOut) -> Result<(), 
                     (0..b.nst as usize).map(|k| fmt_f(b.st[k])).collect::<Vec<_>>()
                 )));
             }
-            if a.kind == 0 {
+            if a.kind == 0 && spec.hand {
+                let n = b.nargs as usize;
+                let differ = |k: usize| a.stack[k] != b.stack[k] && norm(a.stack[k], false) != norm(b.stack[k], true);
+                if (0..n).any(differ) {
+                    let k = (0..n).find(|&k| differ(k)).unwrap();
+                    return Err(what(&format!("stack argument {k}: original {:#x} vs Rust {:#x} (first 8 {:x?} vs {:x?})", a.stack[k], b.stack[k], &a.stack[..8], &b.stack[..8])));
+                }
+            } else if a.kind == 0 {
                 if a.vesp != b.vesp {
                     return Err(what(&format!("ESP at the call: original {:#x} vs Rust {:#x}", a.vesp, b.vesp)));
                 }
@@ -1359,14 +1554,17 @@ unsafe fn compare(s: &Scn, spec: &FnSpec, o: &RunOut, r: &RunOut) -> Result<(), 
     if o.calls.len() != r.calls.len() {
         let (long, w) = if o.calls.len() > r.calls.len() { (&o.calls, "original") } else { (&r.calls, "Rust") };
         let c = &long[n];
-        return Err(format!("call count: original {} vs Rust {} ({w} continues with {} {:#x})", o.calls.len(), r.calls.len(), c.kind, taps_addr(c.idx as usize)));
+        let last = if n > 0 { format!(" last common record: original {:x?} vs Rust {:x?}", o.calls[n - 1].regs, r.calls[n - 1].regs) } else { String::new() };
+        return Err(format!("call count: original {} vs Rust {} ({w} continues with {} {:#x}){last}", o.calls.len(), r.calls.len(), c.kind, taps_addr(c.idx as usize)));
     }
     // abort
     if o.aborted != r.aborted {
         return Err(format!("original aborted={} (addr {:#x}) vs Rust aborted={} (addr {:#x})", o.aborted, o.abort_addr, r.aborted, r.abort_addr));
     }
-    if o.aborted != 0 && o.abort_addr != r.abort_addr {
-        return Err(format!("both abort, at different addresses: original {:#x} vs Rust {:#x}", o.abort_addr, r.abort_addr));
+    let (tlo, thi) = thread_stack();
+    let both_on_stack = spec.hand && o.abort_addr >= STK_LO as u32 && o.abort_addr < STK_HI as u32 && r.abort_addr >= tlo && r.abort_addr < thi;
+    if o.aborted != 0 && o.abort_addr != r.abort_addr && !both_on_stack {
+        return Err(format!("both abort, at different addresses: original {:#x} (in callee {}, {} calls) vs Rust {:#x} (in callee {}, {} calls)", o.abort_addr, o.abort_in, o.calls.len(), r.abort_addr, r.abort_in, r.calls.len()));
     }
     // memory
     let mut pages: Vec<u32> = o.pages.iter().map(|p| p.0).chain(r.pages.iter().map(|p| p.0)).collect();
@@ -1374,6 +1572,10 @@ unsafe fn compare(s: &Scn, spec: &FnSpec, o: &RunOut, r: &RunOut) -> Result<(), 
     pages.dedup();
     let mut pr = [0u8; 4096];
     for p in pages {
+        // the /GS failure report (__report_gsfailure, 0xCA316A) records the registers of the failing frame: stack addresses
+        if spec.hand && p == 0x00ee_0000 {
+            continue;
+        }
         let a = o.pages.iter().find(|x| x.0 == p).map(|x| x.1.as_slice());
         let b = r.pages.iter().find(|x| x.0 == p).map(|x| x.1.as_slice());
         let (a, b) = match (a, b) {
@@ -1388,13 +1590,23 @@ unsafe fn compare(s: &Scn, spec: &FnSpec, o: &RunOut, r: &RunOut) -> Result<(), 
             }
             _ => continue,
         };
-        if a != b {
+        // hand-written ports: a callee that stores a pointer into its own stack stores a different (stack) address
+        let stack_ptr_only = spec.hand && {
+            let (tlo, thi) = thread_stack();
+            (0..1024).all(|w| {
+                let (x, y) = (u32::from_le_bytes(a[4 * w..4 * w + 4].try_into().unwrap()), u32::from_le_bytes(b[4 * w..4 * w + 4].try_into().unwrap()));
+                x == y || ((x >= STK_LO as u32 && x < STK_HI as u32) && ((y >= tlo && y < thi) || (y >= STK_LO as u32 && y < STK_HI as u32)))
+            })
+        };
+        if a != b && !stack_ptr_only {
             let k = (0..4096).find(|&k| a[k] != b[k]).unwrap() & !3;
             return Err(format!(
-                "memory at {:#x}: original {:#x} vs Rust {:#x}",
+                "memory at {:#x}: original {:#x} vs Rust {:#x} (all differing dwords {:x?}; thread stack {:x?})",
                 p as usize + k,
                 u32::from_le_bytes(a[k..k + 4].try_into().unwrap()),
-                u32::from_le_bytes(b[k..k + 4].try_into().unwrap())
+                u32::from_le_bytes(b[k..k + 4].try_into().unwrap()),
+                (0..1024).filter(|&w| a[4 * w..4 * w + 4] != b[4 * w..4 * w + 4]).take(6).map(|w| (p as usize + 4 * w, u32::from_le_bytes(a[4 * w..4 * w + 4].try_into().unwrap()), u32::from_le_bytes(b[4 * w..4 * w + 4].try_into().unwrap()))).collect::<Vec<_>>(),
+                thread_stack()
             ));
         }
     }
@@ -1402,17 +1614,20 @@ unsafe fn compare(s: &Scn, spec: &FnSpec, o: &RunOut, r: &RunOut) -> Result<(), 
         return Ok(());
     }
     // exit state
-    if o.esp != r.esp || o.esp != ESP0 + 4 + spec.ret_n {
+    if (!spec.hand && o.esp != r.esp) || o.esp != ESP0 + 4 + spec.ret_n {
         return Err(format!("ESP at the return: original {:#x}, Rust {:#x}, expected {:#x}", o.esp, r.esp, ESP0 + 4 + spec.ret_n));
     }
     let names = ["eax", "ecx", "edx", "ebx", "esi", "edi", "ebp"];
     for k in 0..7 {
+        if spec.live & (1 << k) == 0 {
+            continue;
+        }
         let m = if k == 0 { !STICKY } else { u32::MAX };
         if o.regs[k] & m != r.regs[k] & m {
             return Err(format!("exit {}: original {:#x} vs Rust {:#x}", names[k], o.regs[k], r.regs[k]));
         }
     }
-    if o.xmm0 != r.xmm0 && !(f32::from_bits(o.xmm0).is_nan() && f32::from_bits(r.xmm0).is_nan()) {
+    if spec.live & 0x80 != 0 && o.xmm0 != r.xmm0 && !(f32::from_bits(o.xmm0).is_nan() && f32::from_bits(r.xmm0).is_nan()) {
         return Err(format!("exit xmm0: original {:#x} vs Rust {:#x}", o.xmm0, r.xmm0));
     }
     if o.nst != r.nst {
@@ -1433,8 +1648,12 @@ unsafe fn compare(s: &Scn, spec: &FnSpec, o: &RunOut, r: &RunOut) -> Result<(), 
 // ---------------------------------------------------------------------------------------------
 
 macro_rules! fns {
-    ($(($n:expr, $a:expr, $b:ident, $dt:expr, $rn:expr),)*) => {
-        static FNS: &[FnSpec] = &[$(FnSpec { name: $n, start: $a, body: $b, ret_n: $rn, dt_arg: $dt },)*];
+    (@h) => { false };
+    (@h $l:expr) => { true };
+    (@l) => { 0xFF };
+    (@l $l:expr) => { $l };
+    ($(($n:expr, $a:expr, $b:expr, $dt:expr, $rn:expr $(, $live:expr)?),)*) => {
+        static FNS: &[FnSpec] = &[$(FnSpec { name: $n, start: $a, body: $b, ret_n: $rn, dt_arg: $dt, hand: fns!(@h $($live)?), live: fns!(@l $($live)?) },)*];
     };
 }
 
@@ -1442,13 +1661,13 @@ fns! {
     ("camera_follow_update", 0x49b4b0, camera_follow_update_body, true, 0),
     ("camera_update", 0x4932f0, camera_update_body, false, 0),
     ("cam_498d40", 0x498d40, cam_498d40_body, false, 0),
-    ("cam_499480", 0x499480, cam_499480_body, false, 0),
-    ("cam_499190", 0x499190, cam_499190_body, false, 0),
-    ("cam_497a20", 0x497a20, cam_497a20_body, false, 0),
-    ("cam_4938c0", 0x4938c0, cam_4938c0_body, false, 0),
+    ("cam_499480", 0x499480, hand::camera_follow_idle_step_body, false, 0, 0x78),
+    ("cam_499190", 0x499190, hand::camera_orient_follow_step_body, false, 0, 0x78),
+    ("cam_497a20", 0x497a20, hand::camera_aim_pitch_step_body, false, 0, 0x78),
+    ("cam_4938c0", 0x4938c0, hand::camera_clip_segment_body, false, 0, 0x79),
     ("cam_496be0", 0x496be0, cam_496be0_body, false, 0),
-    ("cam_492df0", 0x492df0, cam_492df0_body, false, 0),
-    ("cam_49ae60", 0x49ae60, cam_49ae60_body, false, 4),
+    ("cam_492df0", 0x492df0, hand::camera_cut_body, false, 0, 0x78),
+    ("cam_49ae60", 0x49ae60, hand::camera_follow_context_update_body, false, 4, 0x78),
     ("cam_49f320", 0x49f320, cam_49f320_body, false, 0),
     ("cam_49d7a0", 0x49d7a0, cam_49d7a0_body, false, 0),
 }
@@ -1506,6 +1725,7 @@ fn camera_functions_match_original() {
             return;
         }
         init_universe();
+        DEBUG_PC = std::env::var("DT_PCTRACE").is_ok();
         let filt = std::env::var("DT_FN").unwrap_or_default();
         let nscn = env_u64("DT_N", 2000);
         let base_seed = env_u64("DT_SEED", 1);
@@ -1513,6 +1733,12 @@ fn camera_functions_match_original() {
         let verbose = std::env::var("DT_VERBOSE").is_ok();
         for spec in FNS.iter().filter(|f| filt.is_empty() || f.name.contains(&filt)) {
             install_taps(spec.start);
+            // hand-written ports: a pointer outside the data universe aborts (instead of getting a zero page that the
+            // original run and the Rust run would see differently when they replay)
+            DYN_MAP = !spec.hand;
+            FAKE_CALLEES = FAKE_TABLE.iter().find(|t| t.0 == spec.name).map(|t| t.1).unwrap_or(&[]);
+            FAKE_ALWAYS = FAKE_ALWAYS_TABLE.iter().find(|t| t.0 == spec.name).map(|t| t.1).unwrap_or(&[]);
+            RET_OVR = RET_TABLE.iter().find(|t| t.0 == spec.name).map(|t| t.1).unwrap_or(&[]);
             COVMAP.fill(0);
             let mut corpus: Vec<(Scn, Vec<u32>)> = Vec::new();
             let (mut ok, mut ab_ok, mut bad, mut calls_total, mut timeouts) = (0u32, 0u32, 0u32, 0usize, 0u32);
@@ -1529,6 +1755,35 @@ fn camera_functions_match_original() {
                 } else {
                     gen_scn(seed, spec)
                 };
+                if let Some(pp) = PTR_PRESETS.iter().find(|t| t.0 == spec.name) {
+                    for k in 0..7 {
+                        if pp.1 & (1 << k) != 0 && rng.chance(85) {
+                            s.regs[k] = arena_ptr(rng.next());
+                        }
+                    }
+                    for k in 0..16 {
+                        if pp.2 & (1 << k) != 0 && rng.chance(85) {
+                            s.args[k] = arena_ptr(rng.next());
+                        }
+                    }
+                }
+                if let Some(pr) = MEM_PRESETS.iter().find(|t| t.0 == spec.name) {
+                    // all or nothing: most presets only make sense together (a whole object graph)
+                    if rng.chance(65) {
+                        for &(a, v) in pr.1 {
+                            if rng.chance(92) {
+                                s.over.push((a, v, 4));
+                            }
+                        }
+                    }
+                }
+                for &(n, k, off, v) in REL_PRESETS.iter().filter(|t| t.0 == spec.name) {
+                    let _ = n;
+                    if rng.chance(85) {
+                        let base = if k >= 100 { s.regs[k - 100] } else { s.args[k] };
+                        s.over.push((base.wrapping_add(off), v, 4));
+                    }
+                }
                 COV_NEW = 0;
                 if verbose {
                     eprintln!("{} scenario {it}", spec.name);
@@ -1576,9 +1831,15 @@ fn camera_functions_match_original() {
                             if std::env::var("DT_TRACE").is_ok() {
                                 println!("   regs {:x?}\n   args {:x?}\n   rust trace {:x?}", s.regs, &s.args[..6], TRACE);
                             }
+                            println!("   first failure (scenario #{it}): {e}");
                             first_bad = Some((it, e));
                         }
                     }
+                }
+                if it % 400 == 399 {
+                    let arms = ARMS.iter().find(|a| a.0 == spec.name).map(|a| a.2).unwrap_or(&[]);
+                    let hit = arms.iter().filter(|&&a| COVMAP[a as usize - COV_BASE] != 0).count();
+                    println!("   progress {} after {}: pass {ok} (+{ab_ok} aborts), FAIL {bad}, timeouts {timeouts}, blocks {hit}/{}", spec.name, it + 1, arms.len());
                 }
                 if !r_hints.is_empty() && queue.len() < 200 {
                     for _ in 0..3 {

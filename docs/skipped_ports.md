@@ -46,8 +46,7 @@ These run as Rust but are mechanical one-statement-per-instruction translations,
 
 | Function(s) | Skipped in | Reason |
 |---|---|---|
-| vint_object_set_name 0xB97620, vint_object_rehash_name 0xB97570 | port_vint2 (ported, NOT installed) | crashed the game at startup in the play test; needs a fix and a differential test |
-| port_tables.rs (57 lifted startup / load functions, native-tested 57/58; xtbl_load_effects 0x50D000 failed) | not in the repo, install() commented out | one of them passes a bad pointer into 0xA7CA70 (streaming) in game; find it with the native test widened, then re-enable |
+| xtbl_load_effects 0x50D000 | port_tables (lifted, skipped in install) | fails the native differential test (argument to 0xBDCB30 differs) |
 | 9 of the 12 machine-translated camera ports (camera_follow_update 0x49B4B0, camera_update 0x4932F0, 0x499480, 0x4938C0, 0x499190, 0x497A20, 0x492DF0, 0x49AE60, 0x49F320) and 0x4969B0, 0x497220, 0x4A01B0, 0x499B50 | port_big (not installed) | whole-function test: 6 fail, 3 low coverage; the 4 never integrated. Rewrite by hand. |
 | cutscene_stop 0x6C44C0, cutscene_begin_callback 0x6BFB50, cutscene_shot_start 0x6C8130, cutscene_shot_place_characters 0x6C24E0, plus the cutscene action functions from 0x6CB920 on | port_cutscene | size and register-convention-dependent callees |
 | 4 cutscene and 1 camera-mode port | port_cutscene / port_camanim | another module already replaces the address (replace failed at install) |
@@ -62,3 +61,15 @@ These run as Rust but are mechanical one-statement-per-instruction translations,
 | ~50 more float leaves calling CRT maths; mesh_decals_fade_update, effect_list_expire_timed, occluder_contains_point | port_leaves_fp | not examined; game-list loops |
 | 16 esp-frame, 18 unknown-convention and 39 interior-referenced integer leaves | port_leaves | conventions |
 | vec3_normalize_safe_len 0xBDE340 | port_leaves_fp (ported, NOT installed) | with it installed, peds floated in the air and traffic drove on the pavement; found by bisecting in game on 2026-11-03; needs a corrected rewrite |
+
+## Skipped in the 2026-11-03 round
+
+| Function(s) | Skipped in | Reason |
+|---|---|---|
+| ai_order_k23_update 0x4586F0, ai_order_k0b_update 0x41F750 (ported, saved in the scratchpad as port_ai_round3.rs) and the changes to port_ai's record / replay shadow | port_ai (not merged) | with them installed, the k14 update's replay stub crashed the game; needs the shadow harness change reviewed |
+| ai_order_k00_update 0x448CE0, ai_order_k0d_update 0x42D2B0 | port_ai | not reached |
+| camera_follow_update 0x49B4B0, camera_update 0x4932F0, 0x49F320; cam_498d40 and cam_49d7a0 (machine-translated, mismatches in the whole-function test) | port_big | hand rewrite still to do |
+| 0x4CE230, 0x4CD640 (0x1988-byte frame, havok queries), 0x4D7160, 0x4D7E20 (render thread, sin tables) | port_weather | size |
+| physics_linear_cast 0x6FA820, object_item_create 0x931140 | port_physics | not reached |
+| 8 large activity functions (0x6A0080, 0x585C60, 0x5934B0, 0x5CC540, 0x580A40, 0x5AC6D0, 0x6740A0, 0x599F80) | port_activities | not reached; the difftest kit is in port_activities.rs |
+
