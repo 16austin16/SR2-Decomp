@@ -2166,7 +2166,7 @@ pub fn install_all() {
         crate::port_registrars::install();
         crate::port_big::install();
         crate::port_bindings3::install();
-        crate::port_tables::install();
+        // crate::port_tables::install(); // held back: lifted code poisons ECX/EDX after calls the original relies on (clothes store crash, 2026-11-04)
         crate::port_frame2::install();
         crate::port_vint2::install();
         crate::port_bindings4::install();
