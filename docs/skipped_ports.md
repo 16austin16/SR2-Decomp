@@ -8,7 +8,6 @@ ported.
 
 | Function(s) | Where | What happened | What it needs |
 |---|---|---|---|
-| vec3_normalize_safe_len 0xBDE340 | port_leaves_fp (ported, not installed) | peds floated in the air and traffic drove on the pavement: the port never returned the length in XMM0, and the shadow didn't compare XMM0 | a hand rewrite with an XMM0 thunk (in progress) |
 | ai_order_k23_update 0x4586F0, ai_order_k0b_update 0x41F750 (saved as scratchpad port_ai_round3.rs) | port_ai (not merged) | their change to the shared record / replay shadow crashed the k14 update's replay stub | review the shadow change, then re-test |
 
 ## Failed or not covered by their test

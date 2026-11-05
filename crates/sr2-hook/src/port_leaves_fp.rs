@@ -16665,160 +16665,6 @@ fn g3_ba5a50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     }
 }
 
-#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
-fn g3_bde340(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
-    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
-    let mut s = [0u32; 26];
-    let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
-    let mut fl = Fl::default();
-    let mut cc87 = 0u32;
-    let mut pc = 0xbde340u32;
-    loop {
-        match pc {
-            0xbde340 => {
-                // bde340 sub esp, 0x14
-                // bde343 fld dword ptr [esi + 4]
-                f[0] = ldq(rd((esi.wrapping_add(0x4)) as usize));
-                // bde346 push ecx
-                s[8] = ecx;
-                // bde347 fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
-                // bde34b fld dword ptr [esp + 8]
-                f[0] = ldq(s[10]);
-                // bde34f fld dword ptr [esi]
-                f[1] = ldq(rd((esi) as usize));
-                // bde351 fstp dword ptr [esp + 4]
-                s[9] = (f[1] as f32).to_bits();
-                // bde355 fld dword ptr [esp + 4]
-                f[1] = ldq(s[9]);
-                // bde359 fld dword ptr [esi + 8]
-                f[2] = ldq(rd((esi.wrapping_add(0x8)) as usize));
-                // bde35c fstp dword ptr [esp + 0xc]
-                s[11] = (f[2] as f32).to_bits();
-                // bde360 fld dword ptr [esp + 0xc]
-                f[2] = ldq(s[11]);
-                // bde364 fld st(1)
-                f[3] = f[1];
-                // bde366 fmulp st(2)
-                f[1] = xn3(f[1], f[3], f[1] * f[3]);
-                // bde368 fld st(2)
-                f[3] = f[0];
-                // bde36a fmulp st(3)
-                f[0] = xn3(f[0], f[3], f[0] * f[3]);
-                // bde36c fxch st(1)
-                f.swap(2, 1);
-                // bde36e faddp st(2)
-                f[0] = xn3(f[0], f[2], f[0] + f[2]);
-                // bde370 fmul st(0), st(0)
-                f[1] = xn3(f[1], f[1], f[1] * f[1]);
-                // bde372 faddp st(1)
-                f[0] = xn3(f[0], f[1], f[0] + f[1]);
-                // bde374 fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
-                // bde378 fld dword ptr [esp + 0x10]
-                f[0] = ldq(s[12]);
-                // bde37c fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
-                // bde37f call 0x40ea20
-                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
-                // bde384 fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
-                // bde388 add esp, 4
-                // bde38b fld dword ptr [esp + 0xc]
-                f[0] = ldq(s[12]);
-                // bde38f fld qword ptr [0xe5bfa0]
-                f[1] = f64::from_bits(q64(rq((0xe5bfa0u32) as usize)));
-                // bde395 fsubr st(1)
-                f[1] = xn3(f[1], f[0], f[0] - f[1]);
-                // bde397 fstp dword ptr [esp + 0x10]
-                s[13] = (f[1] as f32).to_bits();
-                // bde39b fld dword ptr [esp + 0x10]
-                f[1] = ldq(s[13]);
-                // bde39f fld qword ptr [0xe5bfb8]
-                f[2] = f64::from_bits(q64(rq((0xe5bfb8u32) as usize)));
-                // bde3a5 fcomi st(1)
-                fl = fl_fcomi(f[2], f[1]);
-                // bde3a7 jbe 0xbde3d4
-                pc = if (fl.cf || fl.zf) { 0xbde3d4 } else { 0xbde3a9 };
-            }
-            0xbde3a9 => {
-                // bde3a9 fxch st(1)
-                f.swap(2, 1);
-                // bde3ab fchs 
-                f[2] = -f[2];
-                // bde3ad fxch st(1)
-                f.swap(2, 1);
-                // bde3af fcompi st(1)
-                fl = fl_fcomi(f[2], f[1]);
-                // bde3b1 fstp st(0)
-                // bde3b3 jbe 0xbde3d8
-                pc = if (fl.cf || fl.zf) { 0xbde3d8 } else { 0xbde3b5 };
-            }
-            0xbde3b5 => {
-                // bde3b5 movss xmm0, dword ptr [0xdd518c]
-                x[0] = [rd((0xdd518cu32) as usize), 0, 0, 0];
-                // bde3bd fstp st(0)
-                // bde3bf movss dword ptr [esi], xmm0
-                w.d((esi) as usize, x[0][0]);
-                // bde3c3 xorps xmm0, xmm0
-                { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
-                // bde3c6 movss dword ptr [esi + 4], xmm0
-                w.d((esi.wrapping_add(0x4)) as usize, x[0][0]);
-                // bde3cb movss dword ptr [esi + 8], xmm0
-                w.d((esi.wrapping_add(0x8)) as usize, x[0][0]);
-                // bde3d0 add esp, 0x14
-                // bde3d3 ret 
-                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
-                return 0.0;
-            }
-            0xbde3d4 => {
-                // bde3d4 fstp st(1)
-                f[1] = f[2];
-                // bde3d6 fstp st(0)
-                pc = 0xbde3d8;
-            }
-            0xbde3d8 => {
-                // bde3d8 fld1 
-                f[1] = 1.0;
-                // bde3da movss xmm0, dword ptr [esp + 0xc]
-                x[0] = [s[12], 0, 0, 0];
-                // bde3e0 fdivrp st(1)
-                f[0] = xn3(f[0], f[1], f[1] / f[0]);
-                // bde3e2 fstp dword ptr [esp + 0x10]
-                s[13] = (f[0] as f32).to_bits();
-                // bde3e6 fld dword ptr [esp]
-                f[0] = ldq(s[9]);
-                // bde3e9 fld dword ptr [esp + 0x10]
-                f[1] = ldq(s[13]);
-                // bde3ed fld st(0)
-                f[2] = f[1];
-                // bde3ef fmulp st(2)
-                f[0] = xn3(f[0], f[2], f[0] * f[2]);
-                // bde3f1 fxch st(1)
-                f.swap(1, 0);
-                // bde3f3 fstp dword ptr [esi]
-                w.d((esi) as usize, (f[1] as f32).to_bits());
-                // bde3f5 fld dword ptr [esp + 4]
-                f[1] = ldq(s[10]);
-                // bde3f9 fmul st(1)
-                f[1] = xn3(f[1], f[0], f[1] * f[0]);
-                // bde3fb fstp dword ptr [esi + 4]
-                w.d((esi.wrapping_add(0x4)) as usize, (f[1] as f32).to_bits());
-                // bde3fe fmul dword ptr [esp + 8]
-                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
-                // bde402 fstp dword ptr [esi + 8]
-                w.d((esi.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
-                // bde405 add esp, 0x14
-                // bde408 ret 
-                p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
-                return 0.0;
-            }
-            _ => unreachable!(),
-        }
-    }
-}
-
 static H205: [AtomicU32; 1] = [const { AtomicU32::new(0) }; 1];
 #[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, clippy::all)]
 fn g3_bde750(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
@@ -20071,7 +19917,7 @@ static PORTS: [Port; COUNT] = [
     port_x("vint_element_bitmap::set_source_se", 0x00ba12c0, &B201, &C201, 2, 8, false, 0xffffff00, 0, false, &[], g3_ba12c0 as Run, t201),
     port_x("vint_element_bitmap_circle::set_source_nw", 0x00ba58f0, &B202, &C202, 2, 8, false, 0xffffff00, 0, false, &[], g3_ba58f0 as Run, t202),
     port_x("vint_element_bitmap_circle::set_source_se", 0x00ba5a50, &B203, &C203, 2, 8, false, 0xffffff00, 0, false, &[], g3_ba5a50 as Run, t203),
-    port_x("vec3_normalize_safe_len", 0x00bde340, &B204, &C204, 0, 0, false, 0xffffffff, 0, false, &[], g3_bde340 as Run, t204),
+    port_x("vec3_normalize_safe_len", 0x00bde340, &B204, &C204, 0, 0, false, 0xffffffff, 0, false, &[], nsl_unused as Run, t204),
     port_x("vec3_random_unit", 0x00bde750, &B205, &C205, 0, 0, false, 0xffffffff, 0, true, &H205, g3_bde750 as Run, t205),
     port_x("vec3_random_cone", 0x00bde7c0, &B206, &C206, 2, 8, false, 0xffffffff, 0, true, &H206, g3_bde7c0 as Run, t206),
     port_x("mat33_from_axis_angle", 0x00be2e10, &B207, &C207, 1, 4, false, 0xffffffff, 0, false, &[], g3_be2e10 as Run, t207),
@@ -20096,17 +19942,240 @@ static PORTS: [Port; COUNT] = [
     port_x("hkpCharacterMotion::vf5", 0x00d839d0, &B226, &C226, 1, 4, false, 0xffffffff, 0, false, &[], g3_d839d0 as Run, t226),
 ];
 
+// --- vec3_normalize_safe_len (0xBDE340), written by hand ---------------------------------------------
+//
+// The original (ESI = &vec3, no stack arguments, plain `ret`, 201 bytes) normalises the vector in
+// place and hands the LENGTH back in XMM0 (92 direct callers read it: `movss [esp+N], xmm0`):
+//   d2   = (y*y + x*x) + z*z                       x87, 53-bit, then `fstp dword`
+//   len  = sqrt(d2)                                CRT wrapper 0x40EA20 (cdecl, result in ST0, f32)
+//   len' = len - 0.0                               (the f32 spill of the `fsubr`)
+//   normal path when T <= len' or len' is NaN, or T <= -len'
+//                  (T = double at 0xE5BFB8, about 1.0e-7; fcomi + jbe = CF or ZF, and an
+//                  unordered compare sets both):
+//     inv = 1.0 / len (f64, then f32); x, y, z = x*inv, y*inv, inv*z (each `fstp dword`); XMM0 = len
+//   otherwise (|len'| < T, ordered): (x, y, z) = (1.0f [0xDD518C], 0, 0); XMM0 = 0 (`xorps`)
+// The x87 stack is EMPTY on every path, ESI / EBX / EDI / EBP are untouched; EAX / ECX / EDX are
+// whatever the CRT sqrt leaves (the original's `push ecx` slot is its argument slot).
+// The earlier machine translation had no XMM0 output at all, so every caller read garbage as
+// the length (peds floated, traffic drove on the pavement) while the shadow, which never looked at
+// XMM0, reported no mismatch.
+
+const NSL_ADDR: usize = 0x00bd_e340;
+/// The threshold double at 0xE5BFB8.
+const NSL_EPS_BITS: u64 = 0x3E7A_F2D7_A000_0000;
+/// The float 1.0 at 0xDD518C.
+const NSL_ONE_BITS: u32 = 0x3F80_0000;
+/// The cdecl sqrt wrapper the original calls (a variable only so that the native test can
+/// substitute a stub).
+static NSL_SQRT: AtomicUsize = AtomicUsize::new(0x0040_ea20);
+static NSL_CALLS: AtomicU32 = AtomicU32::new(0);
+static NSL_MISMATCHES: AtomicU32 = AtomicU32::new(0);
+static NSL_ORIG: AtomicUsize = AtomicUsize::new(0);
+
+/// Placeholder `run` of the (unused) table entry 204: the hand port below replaces it.
+fn nsl_unused(_: &mut Pushad, _: *const u32, _: &mut W) -> f64 {
+    unreachable!("vec3_normalize_safe_len is installed by nsl_install")
+}
+
+/// The Rust body: normalises the vector at `p.esi`, leaves EAX / ECX / EDX as the CRT sqrt does
+/// and returns the bits to put in XMM0 (the length, or 0 on the degenerate path).
+fn nsl_run(p: &mut Pushad) -> u32 {
+    let v = p.esi as usize;
+    let (x, y, z) = (ldq(rd(v)), ldq(rd(v + 4)), ldq(rd(v + 8)));
+    // st2 = x*x; st3 = y*y; st2 = y² + x²; st1 = (y² + x²) + z²
+    let xx = xn3(x, x, x * x);
+    let yy = xn3(y, y, y * y);
+    let xy = xn3(yy, xx, yy + xx);
+    let zz = xn3(z, z, z * z);
+    let d2 = xn3(xy, zz, xy + zz);
+    let arg = (d2 as f32).to_bits();
+    let (eax, ecx, edx, root) = crt_call1(NSL_SQRT.load(Ordering::Relaxed), arg, p.eax, p.ecx, p.edx);
+    p.eax = eax;
+    p.ecx = ecx;
+    p.edx = edx;
+    let len = (root as f32).to_bits();
+    let len_d = ldq(len);
+    // fld 0.0; fsubr: len - 0.0, spilled as f32 and reloaded.
+    let lenp = ldq(((len_d - 0.0) as f32).to_bits());
+    let eps = f64::from_bits(NSL_EPS_BITS);
+    // fcomi (eps vs len'): jbe = eps <= len' or unordered; else fchs, fcompi: jbe = eps <= -len'.
+    let normal = eps <= lenp || lenp.is_nan() || eps <= -lenp;
+    let o = v as *mut u32;
+    unsafe {
+        if !normal {
+            std::ptr::write_unaligned(o, NSL_ONE_BITS);
+            std::ptr::write_unaligned(o.add(1), 0);
+            std::ptr::write_unaligned(o.add(2), 0);
+            return 0;
+        }
+        let inv = ldq(((1.0 / len_d) as f32).to_bits());
+        std::ptr::write_unaligned(o, (xn3(x, inv, x * inv) as f32).to_bits());
+        std::ptr::write_unaligned(o.add(1), (xn3(y, inv, y * inv) as f32).to_bits());
+        std::ptr::write_unaligned(o.add(2), (xn3(inv, z, inv * z) as f32).to_bits());
+    }
+    len
+}
+
+/// Registers and results of a call to a function with the original's convention. Offsets used by
+/// the asm: f 0, eax 4, ecx 8, edx 12, ebx 16, esi 20, edi 24, ebp 28, xmm0 32, left-over x87 48.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct NslBlk {
+    f: u32,
+    eax: u32,
+    ecx: u32,
+    edx: u32,
+    ebx: u32,
+    esi: u32,
+    edi: u32,
+    ebp: u32,
+    xmm0: [u32; 4],
+    /// Values the callee left on the x87 stack (popped by the helper).
+    x87_left: u32,
+}
+
+/// Call `b.f` (plain `ret`, no arguments) with the registers of `b`; the registers after the
+/// call, XMM0 and the number of x87 values left on the stack are stored back into `b`.
+unsafe fn nsl_call(b: &mut NslBlk) {
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "mov ebx, eax",
+            // The x87 TOP before the call: only values the callee pushes are counted and popped
+            // (the caller may have its own values on the stack).
+            "fnstsw ax",
+            "and eax, 0x3800",
+            "push eax",
+            "push dword ptr [ebx]",
+            "push ebx",
+            "mov ecx, [ebx + 8]", "mov edx, [ebx + 12]", "mov esi, [ebx + 20]",
+            "mov edi, [ebx + 24]", "mov ebp, [ebx + 28]", "mov eax, [ebx + 4]",
+            "mov ebx, [ebx + 16]",
+            "call dword ptr [esp + 4]", // [esp] = b, [esp+4] = f, [esp+8] = TOP before
+            "xchg ebx, [esp]",
+            "mov [ebx + 4], eax", "mov [ebx + 8], ecx", "mov [ebx + 12], edx",
+            "mov [ebx + 20], esi", "mov [ebx + 24], edi", "mov [ebx + 28], ebp",
+            "pop dword ptr [ebx + 16]",
+            "movups [ebx + 32], xmm0",
+            "add esp, 4",
+            // pushed = (TOP before - TOP after) mod 8
+            "fnstsw ax",
+            "and eax, 0x3800",
+            "mov ecx, [esp]",
+            "sub ecx, eax",
+            "shr ecx, 11",
+            "and ecx, 7",
+            "mov [ebx + 48], ecx",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "fstp st(0)",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "add esp, 4",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("eax") b as *mut NslBlk => _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+/// The relocated original against the Rust body, from the same state: registers (ECX / EDX hold
+/// stack addresses after the real CRT call, so they are not compared), XMM0, the x87 stack
+/// depth and the three written dwords. On a mismatch the original's results are kept.
+fn nsl_shadow(p: &mut Pushad, orig: usize, n: u32) -> u32 {
+    let v = p.esi as usize;
+    let get = || [rd(v), rd(v + 4), rd(v + 8)];
+    let put = |a: [u32; 3]| {
+        for (i, w) in a.iter().enumerate() {
+            unsafe { std::ptr::write_unaligned((v + 4 * i) as *mut u32, *w) };
+        }
+    };
+    let pre = get();
+    let mut theirs =
+        NslBlk { f: orig as u32, eax: p.eax, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp, ..Default::default() };
+    unsafe { nsl_call(&mut theirs) };
+    let post_theirs = get();
+    put(pre);
+    let mut mine = *p;
+    let mine_xmm0 = nsl_run(&mut mine);
+    let post_mine = get();
+    let ok = mine.eax == theirs.eax
+        && mine.ebx == theirs.ebx
+        && mine.esi == theirs.esi
+        && mine.edi == theirs.edi
+        && mine.ebp == theirs.ebp
+        && theirs.xmm0 == [mine_xmm0, 0, 0, 0]
+        && theirs.x87_left == 0
+        && post_mine == post_theirs;
+    if ok {
+        *p = mine;
+        return mine_xmm0;
+    }
+    let m = NSL_MISMATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    if m <= 10 {
+        log(&format!(
+            "port_leaves_fp: vec3_normalize_safe_len mismatch (call {n}): in {pre:x?}: original eax {:#x} xmm0 {:x?} x87 left {} mem {post_theirs:x?}, Rust eax {:#x} xmm0 {mine_xmm0:#x} mem {post_mine:x?}",
+            theirs.eax, theirs.xmm0, theirs.x87_left, mine.eax
+        ));
+    }
+    put(post_theirs);
+    p.eax = theirs.eax;
+    p.ecx = theirs.ecx;
+    p.edx = theirs.edx;
+    theirs.xmm0[0]
+}
+
+/// Count a call; shadow the first `SHADOW_CALLS`; returns the bits for XMM0.
+extern "C" fn nsl_entry(p: &mut Pushad) -> u32 {
+    let n = NSL_CALLS.fetch_add(1, Ordering::Relaxed);
+    let orig = NSL_ORIG.load(Ordering::Relaxed);
+    if n == SHADOW_CALLS && orig != 0 {
+        log(&format!("port_leaves_fp: vec3_normalize_safe_len: {SHADOW_CALLS} calls shadowed, {} mismatched", NSL_MISMATCHES.load(Ordering::Relaxed)));
+    }
+    if orig == 0 || n >= SHADOW_CALLS {
+        return nsl_run(p);
+    }
+    nsl_shadow(p, orig, n)
+}
+
+/// The thunk: `pushad`, the Rust body, XMM0 from its result (loaded before `popad` restores the
+/// caller's EAX), the original's plain `ret`.
+#[unsafe(naked)]
+extern "C" fn nsl_thunk() {
+    std::arch::naked_asm!(
+        "pushad",
+        "push esp",
+        "call {f}",
+        "add esp, 4",
+        "movd xmm0, eax",
+        "popad",
+        "ret",
+        f = sym nsl_entry,
+    )
+}
+
+fn nsl_install() -> bool {
+    match unsafe { detour::relocate(NSL_ADDR, &B204, &C204) } {
+        Ok(copy) => NSL_ORIG.store(copy, Ordering::Relaxed),
+        Err(e) => log(&format!("port_leaves_fp: vec3_normalize_safe_len: no shadow copy: {e:?}")),
+    }
+    replace_pinned("vec3_normalize_safe_len", NSL_ADDR, &B204, nsl_thunk as *const () as usize)
+}
+
 // --- install ------------------------------------------------------------------------------------
 
-/// Install this module's replacements (called from hooks::install_all).
-/// vec3_normalize_safe_len 0xBDE340 is left to the original: with it installed, peds floated in
-/// the air and traffic drove on the pavement (found by bisecting in game, 2026-11-03).
-const LEFT_TO_ORIGINAL: [usize; 1] = [0x00bd_e340];
+/// vec3_normalize_safe_len 0xBDE340 has its own hand-written port (nsl_*), not the table entry.
+const HAND_PORTED: [usize; 1] = [NSL_ADDR];
 
+/// Install this module's replacements (called from hooks::install_all).
 pub fn install() {
     let mut ok = 0;
     for port in PORTS.iter() {
-        if LEFT_TO_ORIGINAL.contains(&port.addr) {
+        if HAND_PORTED.contains(&port.addr) {
             continue;
         }
         // The shadow copy first: replacing patches the entry.
@@ -20122,12 +20191,16 @@ pub fn install() {
             ok += 1;
         }
     }
+    if nsl_install() {
+        ok += 1;
+    }
     log(&format!("port_leaves_fp: replaced {ok}/{COUNT} with Rust"));
 }
 
 /// One line for the periodic log.
 pub fn summary() -> String {
-    let parts: Vec<String> = PORTS
+    let nsl = NSL_CALLS.load(Ordering::Relaxed);
+    let mut parts: Vec<String> = PORTS
         .iter()
         .filter_map(|p| {
             let c = p.calls.load(Ordering::Relaxed);
@@ -20141,6 +20214,9 @@ pub fn summary() -> String {
             })
         })
         .collect();
+    if nsl > 0 {
+        parts.push(format!("vec3_normalize_safe_len {nsl} ({})", NSL_MISMATCHES.load(Ordering::Relaxed)));
+    }
     if parts.is_empty() { String::new() } else { format!("port_leaves_fp: {}", parts.join(", ")) }
 }
 
@@ -22721,3 +22797,167 @@ const B226: [u8; 44] = [
     0xD9, 0x5E, 0x28, 0x5E, 0x59, 0xC2, 0x04, 0x00,
 ];
 const C226: [usize; 1] = [0x16];
+
+// --- native differential test of vec3_normalize_safe_len ---------------------------------------------
+
+#[cfg(test)]
+mod nsl_tests {
+    use super::*;
+    use std::ffi::c_void;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+
+    struct Rng(u64);
+    impl Rng {
+        fn u32(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 16) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.u32() % n
+        }
+    }
+
+    /// Stands in for the CRT sqrt wrapper 0x40EA20: cdecl, f32 argument on the stack, f32-rounded
+    /// result in ST0, and EAX / ECX / EDX left as functions of the argument (the real one leaves
+    /// scratch values there too).
+    #[unsafe(naked)]
+    extern "C" fn test_sqrt() {
+        std::arch::naked_asm!(
+            "mov eax, [esp + 4]",
+            "xor eax, 0x5a5a5a5a",
+            "mov ecx, eax",
+            "not ecx",
+            "mov edx, eax",
+            "rol edx, 7",
+            "fld dword ptr [esp + 4]",
+            "fsqrt",
+            "sub esp, 4",
+            "fstp dword ptr [esp]",
+            "fld dword ptr [esp]",
+            "add esp, 4",
+            "ret",
+        )
+    }
+
+    static ZERO_D: f64 = 0.0;
+    static EPS_D: u64 = NSL_EPS_BITS;
+    static ONE_F: u32 = NSL_ONE_BITS;
+
+    /// The original bytes in executable memory, with the three constants and the sqrt call
+    /// redirected to the test's own copies.
+    fn original_copy() -> usize {
+        let mut body = B204.to_vec();
+        let mut patch = |from: u32, to: u32| {
+            let pat = from.to_le_bytes();
+            let mut n = 0;
+            for i in 0..body.len() - 3 {
+                if body[i..i + 4] == pat {
+                    body[i..i + 4].copy_from_slice(&to.to_le_bytes());
+                    n += 1;
+                }
+            }
+            assert_eq!(n, 1, "constant {from:#x}");
+        };
+        patch(0xe5bfa0, &ZERO_D as *const f64 as u32);
+        patch(0xe5bfb8, &EPS_D as *const u64 as u32);
+        patch(0xdd518c, &ONE_F as *const u32 as u32);
+        let p = unsafe { VirtualAlloc(std::ptr::null::<c_void>(), body.len() + 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
+        unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), p as *mut u8, body.len()) };
+        // call rel32 at 0x3f -> test_sqrt
+        let rel = (test_sqrt as *const () as usize as u32).wrapping_sub((p + 0x3f + 5) as u32);
+        unsafe { std::ptr::write_unaligned((p + 0x40) as *mut u32, rel) };
+        p
+    }
+
+    fn component(rng: &mut Rng, kind: u32) -> u32 {
+        let sign = (rng.u32() & 1) << 31;
+        match kind {
+            0 => sign | ((127 - 20 + rng.below(40)) << 23) | (rng.u32() & 0x7F_FFFF),
+            1 => sign,
+            2 => sign | ((127 - 25 + rng.below(6)) << 23) | (rng.u32() & 0x7F_FFFF),
+            3 => sign | ((127 + 10 + rng.below(18)) << 23) | (rng.u32() & 0x7F_FFFF),
+            4 => sign | (rng.u32() & 0x7F_FFFF),
+            5 => sign | 0x7F80_0000,
+            6 => sign | 0x7F80_0000 | (rng.u32() & 0x7F_FFFF) | 1,
+            _ => sign | (rng.below(254) + 1) << 23 | (rng.u32() & 0x7F_FFFF),
+        }
+    }
+
+    fn vector(rng: &mut Rng) -> [u32; 3] {
+        let mode = rng.below(10);
+        match mode {
+            // around the threshold: a random direction with length 3e-8 .. 3e-7
+            0 | 1 => {
+                let s = 3e-8f32 + (rng.below(1000) as f32) * 2.7e-10;
+                let d = [rng.below(2001) as f32 - 1000.0, rng.below(2001) as f32 - 1000.0, rng.below(2001) as f32 - 1000.0];
+                let n = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1.0);
+                [(d[0] / n * s).to_bits(), (d[1] / n * s).to_bits(), (d[2] / n * s).to_bits()]
+            }
+            // one kind for all three
+            2..=4 => {
+                let k = rng.below(8);
+                [component(rng, k), component(rng, k), component(rng, k)]
+            }
+            // mixed kinds
+            5 | 6 => {
+                let (k0, k1, k2) = (rng.below(8), rng.below(8), rng.below(8));
+                [component(rng, k0), component(rng, k1), component(rng, k2)]
+            }
+            // ordinary
+            _ => [component(rng, 0), component(rng, 0), component(rng, 0)],
+        }
+    }
+
+    /// cargo test --release -p sr2-hook --target i686-pc-windows-msvc nsl -- --ignored --nocapture
+    #[test]
+    #[ignore = "native differential test against the original bytes (about a minute)"]
+    fn nsl_matches_original() {
+        NSL_SQRT.store(test_sqrt as *const () as usize, Ordering::Relaxed);
+        let orig = original_copy();
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        let (mut degenerate, mut normal, mut nonfinite) = (0u32, 0u32, 0u32);
+        for iter in 0..400_000u32 {
+            let v = vector(&mut rng);
+            let regs = [rng.u32(), rng.u32(), rng.u32(), rng.u32(), rng.u32()];
+            let mut run = |f: usize| -> (NslBlk, [u32; 5]) {
+                // guard dwords around the vector catch stray writes
+                let mut mem = [0xA5A5_A5A5u32, v[0], v[1], v[2], 0x5A5A_5A5A];
+                let mut b = NslBlk {
+                    f: f as u32,
+                    eax: regs[0],
+                    ecx: regs[1],
+                    edx: regs[2],
+                    ebx: regs[3],
+                    esi: unsafe { mem.as_mut_ptr().add(1) } as u32,
+                    edi: regs[4],
+                    ebp: 0xE9E9_E9E9,
+                    ..Default::default()
+                };
+                let esi = b.esi;
+                unsafe { nsl_call(&mut b) };
+                assert_eq!((b.ebx, b.esi, b.edi, b.ebp), (regs[3], esi, regs[4], 0xE9E9_E9E9), "preserved registers of {f:#x}");
+                (b, mem)
+            };
+            let (a, ma) = run(orig);
+            let (b, mb) = run(nsl_thunk as *const () as usize);
+            let tag = format!("iter {iter} in {v:08x?}");
+            assert_eq!(a.x87_left, 0, "original left x87 values: {tag}");
+            assert_eq!(b.x87_left, 0, "Rust left x87 values: {tag}");
+            assert_eq!(ma, mb, "memory: {tag}: original {ma:08x?}, Rust {mb:08x?}");
+            assert_eq!(a.xmm0, b.xmm0, "XMM0: {tag}: original {:08x?}, Rust {:08x?}", a.xmm0, b.xmm0);
+            assert_eq!((a.eax, a.ecx, a.edx), (b.eax, b.ecx, b.edx), "eax/ecx/edx: {tag}");
+            if a.xmm0 == [0; 4] && ma[1..4] == [NSL_ONE_BITS, 0, 0] {
+                degenerate += 1;
+            } else {
+                normal += 1;
+            }
+            if v.iter().any(|c| c & 0x7F80_0000 == 0x7F80_0000) {
+                nonfinite += 1;
+            }
+        }
+        println!("nsl: 400000 vectors, {normal} normal path, {degenerate} degenerate path, {nonfinite} with NaN / infinite components");
+        assert!(degenerate > 10_000 && normal > 10_000 && nonfinite > 10_000);
+    }
+}
