@@ -2144,6 +2144,7 @@ pub fn install_all() {
         crate::texguard::install();
         crate::vint_lua::install();
         crate::frame::install();
+        crate::controls_layout::install();
         crate::controls::install();
         crate::actions::install();
         crate::lua_bindings::install();

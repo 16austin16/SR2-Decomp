@@ -8,7 +8,7 @@ ported.
 
 | Function(s) | Where | What happened | What it needs |
 |---|---|---|---|
-| ai_order_k23_update 0x4586F0, ai_order_k0b_update 0x41F750 (saved as scratchpad port_ai_round3.rs) | port_ai (not merged) | their change to the shared record / replay shadow crashed the k14 update's replay stub | review the shadow change, then re-test |
+| ai_order_k0b_update 0x41F750 | port_ai (ported, not installed) | 26 shadow mismatches in 3000 calls in the 2026-11-04 play test | find the mismatching path |
 
 ## Failed or not covered by their test
 
@@ -57,3 +57,6 @@ These run as Rust and pass their tests, but they are one-statement-per-instructi
 |---|---|
 | 57 startup / load functions (xtbl loaders, load_from_table / init, gameplay constants, cutscene_player_create ...) | port_tables.rs |
 | the integer and float leaf sweeps' generated bodies | port_leaves.rs, port_leaves_fp.rs |
+| cutscene_shot_place_characters 0x6C24E0 | port_cutscene (ported, not installed) | crashed the game going into a cutscene: a stray write corrupted port_leaves' port table (found by switching it off, 2026-11-04) | find the bad write; its difftest passed, so the test misses something |
+| the 57 lifted startup loaders | port_tables (not installed) | they overwrite ECX / EDX after every call; tod_light_sets_parse 0x4C8B80 (reached at runtime from the clothes store through lightset_find_by_name) lost the matrix pointer between quat_to_mat33 and vec3_mul_mat33 and crashed the store | keep registers across callees that preserve them, or hand-port tod_light_sets_parse |
+

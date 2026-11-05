@@ -57,6 +57,7 @@ extern "system" fn handler(info: *const [usize; 2]) -> i32 {
             r(0xB4),
             stack.join(" ")
         ));
+        crate::missionlog::flush("a crash");
     }
     0
 }

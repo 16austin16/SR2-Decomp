@@ -836,3 +836,312 @@ fn port_physics_raycast() {
         }
     }
 }
+
+// --- physics_linear_cast ----------------------------------------------------------------------------
+
+fn h_lcast(_: &difftest::Pushad, args: *const u32) -> Option<u32> {
+    unsafe {
+        let c2 = *args.add(1) as usize;
+        let c1 = *args.add(2) as usize;
+        if get(c2) == LC_CLOSEST_VT {
+            for j in 0..12 {
+                put(c2 + 0x10 + j * 4, hook_rand());
+            }
+            if hook_rand() % 3 == 0 {
+                put(c2 + 0x30, 0);
+            }
+            if c1 != 0 && hook_rand() % 2 == 0 {
+                put(c1 + 0x10, T_HITS.load(AO::Relaxed));
+                put(c1 + 0x14, hook_rand() % 4);
+                put(c1 + 0x1A0, T_COMP.load(AO::Relaxed));
+                put(c1 + 0x1A4, hook_rand() % 4);
+            }
+        } else {
+            for c in [c2, c1] {
+                if c != 0 {
+                    put(c + 0x10, T_HITS.load(AO::Relaxed));
+                    put(c + 0x14, hook_rand() % 4);
+                    put(c + 0x1A0, T_COMP.load(AO::Relaxed));
+                    put(c + 0x1A4, hook_rand() % 4);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn h_lctor(p: &difftest::Pushad, _: *const u32) -> Option<u32> {
+    unsafe {
+        let c = p.esi as usize;
+        put(c + 0x10, 0);
+        put(c + 0x14, 0);
+        put(c + 0x1A0, 0);
+        put(c + 0x1A4, 0);
+    }
+    None
+}
+
+#[test]
+fn port_physics_linear_cast() {
+    let _g = lock();
+    begin();
+    map_data(g(0x00E8_0B00), 0x100); // cookie
+    map_data(g(0x00E1_8900), 0x300); // vtables
+    map_data(g(0x00E5_BF00), 0x400); // constants
+    map_data(g(0x031B_F200), 0x100); // heap slot
+    map_data(g(0x00DB_8000), 0x100); // import slots
+    map_data(g(0x0290_FA00), 0x100); // the world box
+    let mut cookie = callee(0x00C9_604F, 0, 0, 0, Ret::Keep);
+    cookie.silent = true;
+    let alloca = exe_bytes(0x00CA_0820, 0x2B);
+    load_orig(0x00CA_0820, &alloca, &[], &[], &[], &[]);
+    let mut clamp = callee(R_CLAMP, 1, 0, EAX | ECX | ESI, Ret::Any);
+    clamp.st0 = true;
+    clamp.fill = vec![(104, 12)];
+    let mut cast = callee(LC_CAST, 3, 12, 0, Ret::Any);
+    cast.hook = Some(h_lcast);
+    let mut alloc = callee(HEAP_ALLOC, 2, 8, ECX, Ret::Any);
+    alloc.hook = Some(h_alloc);
+    let mut grow = callee(ARRAY_GROW, 2, 0, 0, Ret::Any);
+    grow.hook = Some(h_grow);
+    let mut post = callee(HIT_POST, 10, 0x28, EAX | ECX | EDX | ESI | EDI, Ret::Any);
+    post.byte_args = 1 << 6 | 1 << 7 | 1 << 9;
+    let mut ctor = callee(LC_CTOR, 0, 0, ESI, Ret::Any);
+    ctor.hook = Some(h_lctor);
+    let mut input = callee(LC_INPUT, 2, 8, EAX | ECX, Ret::Any);
+    input.fill = vec![(100, 0x50)];
+    let mut vcall = callee(K2, 3, 12, ECX, Ret::Any);
+    vcall.fill = vec![(2, 32)];
+    let mut matfrom = callee(LC_MAT_FROM, 1, 0, ECX | EDX, Ret::Any);
+    matfrom.fill = vec![(102, 0x40)];
+    set_callees(vec![
+        cookie,
+        clamp,
+        cast,
+        alloc,
+        grow,
+        post,
+        ctor,
+        input,
+        vcall,
+        matfrom,
+        callee(LC_DTOR, 0, 0, ESI, Ret::Any),
+        callee(LC_MAT_ZERO, 0, 0, ECX, Ret::Any),
+        callee(LC_VEC_ZERO, 0, 0, ECX, Ret::Any),
+        callee(K1, 1, 4, 0, Ret::Any),
+        callee(HEAP_FREE, 3, 12, ECX, Ret::Any),
+    ]);
+    let o = orig_LINEAR_CAST();
+    let mut rng = Rng(0x5555_6666_7777_8888);
+    for it in 0..ITERS * 2 {
+        randomize(&mut rng);
+        unsafe { put(g(0xDB807C), stub_of(K1) as u32) };
+        let mut ar = Arena::new();
+        let block = ar.alloc(0x100);
+        let pool = ar.alloc(32 * 0x400 + 0x400);
+        let pool = (pool + 15) & !15;
+        T_POOL.store(pool as u32, AO::Relaxed);
+        let hits = ar.alloc(4 * 0x30 + 16);
+        let hits = (hits + 15) & !15;
+        let comp = ar.alloc(4 * 12 + 16);
+        T_HITS.store(hits as u32, AO::Relaxed);
+        T_COMP.store(comp as u32, AO::Relaxed);
+        let vt = ar.alloc(0x40);
+        let owner = ar.alloc(0x20);
+        unsafe {
+            put(owner, vt as u32);
+            put(vt + 0x1C, stub_of(K2) as u32);
+        }
+        let req = ar.alloc(0x80);
+        let out = ar.alloc(32);
+        for k in 0..CASES {
+            unsafe {
+                for j in 0..4 * 0x30 / 4 {
+                    put(hits + j * 4, rng.mix(&[0, 1, 5, 7]));
+                }
+                for j in 0..4 {
+                    put(hits + j * 0x30 + 0x1C, rng.float_bits());
+                    put(hits + j * 0x30 + 0x28, rng.mix(&[0xFFFF_FFFF, 3, 9]));
+                }
+                for j in 0..12 {
+                    put(comp + j * 4, rng.u32());
+                }
+                for j in 0..0x80 / 4 {
+                    put(req + j * 4, rng.float_bits());
+                }
+                put(req + 0x1C, if rng.one_in(2) { 0 } else { owner as u32 });
+                put(req + 0x44, rng.u32());
+                put(req + 0x48, rng.u32());
+                put(req + 0x54, rng.u32());
+                put(req + 0x4C, rng.pick(&[0x52, 0x56, 0x5D, 7, 0x52, 0x56]));
+                put(req + 0x50, rng.pick(&[0, 1, 2, 0xFFFF_FFFF, 0, 1, 1]));
+                putb(block + 0x6C, 0x55);
+                for j in 0..8 {
+                    put(out + j * 4, rng.u32());
+                }
+            }
+            let mut c = Case::new(it as u64 * 1000 + k as u64);
+            c.regs.ecx = req as u32;
+            c.tls = block as u32;
+            c.args = vec![out as u32, rng.pick(&[0, 1, 0x101, 0xFF01, 0xFFFF_FF00]), rng.pick(&[0, 1, 0x100, 0xFF, 0xFFFF_FF00])];
+            if let Err(e) = check(o, linear_cast_thunk as usize, &c) {
+                panic!("linear_cast: {e}\n  mode {} kind {:#x} owner {:#x} args {:x?}", unsafe { get(req + 0x50) }, unsafe { get(req + 0x4C) }, unsafe { get(req + 0x1C) }, c.args);
+            }
+        }
+    }
+    eprintln!("{}", summary());
+}
+
+// --- physics_shape_collect_mesh ----------------------------------------------------------------------
+
+fn log_words(p: u32, n: usize) {
+    unsafe { log_extra((0..n).map(|k| get(p as usize + k * 4)).collect()) }
+}
+
+fn h_sc_len(p: &difftest::Pushad, _: *const u32) -> Option<u32> {
+    log_words(p.esi, 3);
+    None
+}
+fn h_sc_box(p: &difftest::Pushad, _: *const u32) -> Option<u32> {
+    log_words(p.ecx, 3);
+    None
+}
+fn h_sc_vrot(p: &difftest::Pushad, _: *const u32) -> Option<u32> {
+    log_words(p.ecx, 3);
+    log_words(p.eax, 12);
+    None
+}
+fn h_sc_inplace(p: &difftest::Pushad, _: *const u32) -> Option<u32> {
+    log_words(p.edi, 16);
+    log_words(p.esi, 12);
+    None
+}
+fn h_sc_count(_: &difftest::Pushad, _: *const u32) -> Option<u32> {
+    Some(hook_rand() % 4)
+}
+
+#[test]
+fn port_physics_shape_collect() {
+    let _g = lock();
+    begin();
+    map_data(g(0x00E8_0B00), 0x100); // cookie
+    map_data(g(0x00E5_BF00), 0x400); // constants
+    map_data(g(0x00DD_5900), 0x100); // 0.001
+    map_data(g(0x031B_F200), 0x100); // identity rows
+    let mut cookie = callee(0x00C9_604F, 0, 0, 0, Ret::Keep);
+    cookie.silent = true;
+    let push = exe_bytes(SC_POINT_PUSH, 0x35);
+    load_orig(SC_POINT_PUSH, &push, &[], &[], &[], &[]);
+    let mut rot = callee(SC_ROT, 1, 0, ECX, Ret::Any);
+    rot.fill = vec![(0, 0x30)];
+    let mut boxc = callee(SC_BOX, 4, 0, ECX | EDX, Ret::Any);
+    boxc.peek = vec![(2, 12), (3, 3)];
+    boxc.hook = Some(h_sc_box);
+    let mut xpt = callee(SC_XFORM_PT, 2, 8, ECX, Ret::Any);
+    xpt.fill = vec![(101, 16)];
+    let mut len = callee(SC_LEN, 0, 0, ESI, Ret::Any);
+    len.xmm0 = true;
+    len.hook = Some(h_sc_len);
+    let mut ceil = callee(SC_CEIL, 1, 0, 0, Ret::Any);
+    ceil.st0 = true;
+    ceil.st0_small = true;
+    let mut vrot = callee(SC_VEC_ROT, 0, 0, EAX | ECX, Ret::Keep);
+    vrot.fill = vec![(101, 12)];
+    vrot.hook = Some(h_sc_vrot);
+    let mut inpl = callee(SC_XFORM_IN_PLACE, 1, 4, ESI | EDI, Ret::Any);
+    inpl.fill = vec![(105, 0x40)];
+    inpl.hook = Some(h_sc_inplace);
+    let mut vcall = callee(K2, 3, 12, ECX, Ret::Any);
+    vcall.fill = vec![(2, 32)];
+    let mut cnt = callee(K1, 0, 0, ECX, Ret::Any);
+    cnt.hook = Some(h_sc_count);
+    set_callees(vec![cookie, rot, boxc, xpt, len, ceil, vrot, inpl, vcall, cnt]);
+    let o = orig_SHAPE_COLLECT();
+    let mut rng = Rng(0x9999_AAAA_BBBB_CCCC);
+    for it in 0..ITERS * 2 {
+        randomize(&mut rng);
+        unsafe {
+            let half = 0.5f64.to_bits();
+            put(g(0x00E5_BF70), half as u32);
+            put(g(0x00E5_BF74), (half >> 32) as u32);
+            put(g(0x00E5_BFD8), 4294967296.0f32.to_bits());
+            put(g(0x00DD_5984), rng.pick(&[0.001f32.to_bits(), 100.0f32.to_bits(), 0x7FC0_0000, 0.001f32.to_bits()]));
+        }
+        let mut ar = Arena::new();
+        let vt = ar.alloc(0x40);
+        let vt10 = ar.alloc(0x20);
+        unsafe {
+            put(vt + 0x1C, stub_of(K2) as u32);
+            put(vt10 + 4, stub_of(K1) as u32);
+        }
+        // the shapes: later ones may refer to earlier ones
+        let mut shapes: Vec<(u32, u32)> = Vec::new();
+        for i in 0..24 {
+            let s = ar.alloc(0x60);
+            let ty = if i < 3 { rng.pick(&[2, 5, 6, 7]) } else { rng.pick(&[2, 5, 6, 6, 7, 10, 12, 3, 4, 8, 9, 11, 13, 0, 1, 7, 5]) };
+            let mut ty = ty;
+            unsafe {
+                for k in 0..0x60 / 4 {
+                    put(s + k * 4, rng.float_bits());
+                }
+                put(s, vt as u32);
+                put(s + 0x10, rng.mix(&[0x3F80_0000, 0x3E80_0000, 0x4000_0000]));
+                if ty == 10 || ty == 12 {
+                    let kids: Vec<u32> = shapes.iter().map(|x| x.0).collect();
+                    if kids.is_empty() {
+                        ty = 2;
+                    } else if ty == 12 {
+                        put(s + 0x18, rng.pick(&kids));
+                    } else {
+                        put(s + 0x10, vt10 as u32);
+                        let arr = ar.alloc(0x40);
+                        for k in 0..4 {
+                            put(arr + k * 0x10, rng.pick(&kids));
+                        }
+                        put(s + 0x18, arr as u32);
+                    }
+                }
+                put(s + 0xC, ty);
+            }
+            shapes.push((s as u32, ty));
+        }
+        let xf = ar.alloc(0x40);
+        let vlist = ar.alloc(0x100);
+        let plist = ar.alloc(0x20);
+        let pdata = ar.alloc(0x100);
+        for k in 0..CASES {
+            unsafe {
+                for j in 0..16 {
+                    put(xf + j * 4, rng.mix(&[0, 0x3F80_0000, 0xBF80_0000, 0x4000_0000]));
+                }
+                for j in 0..0x100 / 4 {
+                    put(vlist + j * 4, rng.u32());
+                    put(pdata + j * 4, rng.u32());
+                }
+                puth(vlist, rng.below(8) as u16);
+                let cap = rng.below(6);
+                put(plist, pdata as u32);
+                put(plist + 4, cap);
+                put(plist + 8, rng.below(cap + 1));
+            }
+            let (s, ty) = shapes[rng.below(shapes.len() as u32) as usize];
+            let mut c = Case::new(it as u64 * 1000 + k as u64);
+            c.tls = 0;
+            c.args = vec![
+                if rng.one_in(5) { 0 } else { vlist as u32 },
+                rng.u32(),
+                rng.u32() & !0xF,
+                if rng.one_in(4) { 0 } else { plist as u32 },
+                rng.u32(),
+                rng.u32(),
+                rng.u32(),
+                s,
+                xf as u32,
+            ];
+            if let Err(e) = check(o, shape_collect_thunk as usize, &c) {
+                panic!("shape_collect: {e}\n  type {ty} args {:x?}", c.args);
+            }
+        }
+    }
+    eprintln!("{}", summary());
+}

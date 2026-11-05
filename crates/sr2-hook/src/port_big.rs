@@ -1,12 +1,14 @@
 //! DIFFERENTIAL TEST (port_big_difftest.rs, ignored test, original bytes vs Rust on the same random state, callees real and tapped,
 //! a few faked; hand-written ports run with `FnSpec::hand` which compares the registers each call declares, see port_big_hand.rs).
-//! HAND-WRITTEN (port_big_hand.rs), installed, 0 mismatches, 3000 scenarios x 2 seeds each, entry blocks hit:
+//! HAND-WRITTEN (port_big_hand.rs), 0 mismatches, 3000 scenarios x 2 seeds each (block counts = the ports' coverage markers):
 //!   camera_cut 0x492DF0 (10/10), camera_follow_context_update 0x49AE60 (9-10/10), camera_aim_pitch_step 0x497A20 (13/13),
 //!   camera_orient_follow_step 0x499190 (14/17: the yaw-wrap blocks need a callee to change the camera angle mid-call),
-//!   camera_clip_segment 0x4938C0 (11-12/12), camera_follow_idle_step 0x499480 (9/9).
-//! TRANSLATED, installed: cam_498d40 (200 scenarios, 0 fail, 26/60 blocks), cam_496be0 (200, 0 fail, 7/20), cam_49d7a0 (3000, 0 fail, 14/19).
-//! TRANSLATED, NOT installed (to be rewritten by hand): camera_follow_update (1 fail, 5/303 blocks), camera_update (0 fail but 5/68),
-//! cam_49f320 (failing or unexplained), and the 4 untranslated ones (0x4969B0, 0x497220, 0x4A01B0, 0x499B50).
+//!   camera_clip_segment 0x4938C0 (11-12/12), camera_follow_idle_step 0x499480 (9/9),
+//!   camera_context_orient_step 0x498D40 (26/26), camera_set_follow_submode 0x49D7A0 (8/8), camera_push_target 0x4969B0 (10/10),
+//!   camera_chase_blend 0x497220 (17/17), camera_shake_apply 0x4A01B0 (18/18), camera_follow_compute_desired_position 0x499B50 (17/17),
+//!   camera_script_build_track 0x49F320 (12/12), camera_update 0x4932F0 (22/22).
+//! TRANSLATED, installed: cam_496be0 (200 scenarios, 0 fail, 7/20).
+//! TRANSLATED, NOT installed (still to be rewritten by hand): camera_follow_update (1 fail, 5/303 blocks).
 //! Port module: large functions as whole-function replacements.
 //!
 //! - effect_instance_update (0x50F880..0x50FD37, 1,207 bytes, no jump table): EAX = &cur_pos,
@@ -17,8 +19,8 @@
 //!   /GS security cookie (the original only checks that its own frame is intact).
 //!
 //! - camera_follow_update (0x49B4B0..0x49D06C, 7,100 bytes with any jump table): camera mode 0 update, cdecl (f32 dt), plain `ret`, game thread (camera_update)
-//! - camera_update (0x4932F0..0x49380E, 1,310 bytes with any jump table): per-frame camera update, no arguments, plain `ret`, game thread (sim_frame twice a frame)
-//! - cam_498d40 (0x498D40..0x499113, 979 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - camera_update (0x4932F0..0x49380D, 1,310 bytes): HAND-WRITTEN in port_big_hand.rs; per-frame camera update, no arguments, plain `ret`, game thread (sim_frame twice a frame)
+//! - cam_498d40 (0x498D40..0x499112, 979 bytes): HAND-WRITTEN (camera_context_orient_step), cdecl (cam, dt, mode), plain `ret`
 //! - camera_follow_idle_step (0x499480..0x4996EF, 624 bytes): HAND-WRITTEN in port_big_hand.rs, registers and arguments as documented there
 //! - camera_orient_follow_step (0x499190..0x49940F, 640 bytes): HAND-WRITTEN in port_big_hand.rs, registers and arguments as documented there
 //! - camera_aim_pitch_step (0x497A20..0x497C79, 602 bytes): HAND-WRITTEN in port_big_hand.rs, registers and arguments as documented there
@@ -26,8 +28,10 @@
 //! - cam_496be0 (0x496BE0..0x496D98, 440 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
 //! - camera_cut (0x492DF0..0x492FD2, 483 bytes): HAND-WRITTEN in port_big_hand.rs, registers and arguments as documented there
 //! - camera_follow_context_update (0x49AE60..0x49AFED, 398 bytes, stdcall ret 4): HAND-WRITTEN in port_big_hand.rs, registers and arguments as documented there
-//! - cam_49f320 (0x49F320..0x49FC96, 2,422 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
-//! - cam_49d7a0 (0x49D7A0..0x49D8AC, 268 bytes with any jump table): camera-system subroutine (unnamed), game thread; entry registers and stack arguments pass through, exit registers and ST0 / xmm0 come from the translation
+//! - camera_script_build_track (0x49F320..0x49FC95, 2,422 bytes): HAND-WRITTEN in port_big_hand.rs, EAX = node count, ESI = track block, two cdecl stack arguments
+//! - camera_set_follow_submode (0x49D7A0..0x49D8AB, 268 bytes with its jump table): HAND-WRITTEN, EDI = sub-mode
+//! - camera_push_target (0x4969B0..0x496AF6), camera_chase_blend (0x497220..0x497777), camera_shake_apply (0x4A01B0..0x4A06F5),
+//!   camera_follow_compute_desired_position (0x499B50..0x49A07C): HAND-WRITTEN in port_big_hand.rs, registers and arguments as documented there
 //!
 //! The functions after render_frame are block-by-block translations of the original machine code
 //! (see the runtime comment further down): registers, flags, the x87 stack and the stack frame are
@@ -62,6 +66,10 @@ const CAM_492DF0: usize = 0x00492df0;
 const CAM_49AE60: usize = 0x0049ae60;
 const CAM_49F320: usize = 0x0049f320;
 const CAM_49D7A0: usize = 0x0049d7a0;
+const CAM_499B50: usize = 0x00499b50;
+const CAM_4A01B0: usize = 0x004a01b0;
+const CAM_497220: usize = 0x00497220;
+const CAM_4969B0: usize = 0x004969b0;
 
 macro_rules! counters {
     ($($id:ident $name:expr,)*) => {
@@ -186,6 +194,10 @@ counters! {
     Cam49f320B49F850 "cam49f320_b49_f850",
     Cam49f320B49F88E "cam49f320_b49_f88_e",
     Cam49d7a0Calls "cam49d7a0_calls",
+    Cam499b50Calls "cam499b50_calls",
+    Cam4a01b0Calls "cam4a01b0_calls",
+    Cam497220Calls "cam497220_calls",
+    Cam4969b0Calls "cam4969b0_calls",
 }
 
 fn bump(c: C) {
@@ -195,15 +207,14 @@ fn bump(c: C) {
 /// Install this module's replacements (called from hooks::install_all).
 pub fn install() {
     let mut ok = 0u32;
-    let total = 11u32;
+    let total = 17u32;
     if replace_pinned("effect_instance_update", EIU, &EFFECT_INSTANCE_UPDATE_BODY, eiu_thunk as extern "C" fn() as usize) {
         ok += 1;
     }
     if replace_pinned("render_frame", RENDER_FRAME, &RENDER_FRAME_BODY, render_frame_entry as extern "C" fn() as usize) {
         ok += 1;
     }
-    // cam_498d40 (machine-translated) showed mismatches in the 2026-11-03 whole-function test: held back.
-    if false && replace_pinned(
+    if replace_pinned(
         "cam_498d40",
         CAM_498D40,
         &CAM_498D40_BODY,
@@ -219,8 +230,7 @@ pub fn install() {
     ) {
         ok += 1;
     }
-    // cam_49d7a0 (machine-translated) showed mismatches in the 2026-11-03 whole-function test: held back.
-    if false && replace_pinned(
+    if replace_pinned(
         "cam_49d7a0",
         CAM_49D7A0,
         &CAM_49D7A0_BODY,
@@ -273,6 +283,54 @@ pub fn install() {
         CAM_499480,
         &CAM_499480_BODY,
         cam_499480_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_4969b0",
+        CAM_4969B0,
+        &CAM_4969B0_BODY,
+        cam_4969b0_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_497220",
+        CAM_497220,
+        &CAM_497220_BODY,
+        cam_497220_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_4a01b0",
+        CAM_4A01B0,
+        &CAM_4A01B0_BODY,
+        cam_4a01b0_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_499b50",
+        CAM_499B50,
+        &CAM_499B50_BODY,
+        cam_499b50_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "camera_update",
+        CAMERA_UPDATE,
+        &CAMERA_UPDATE_BODY,
+        camera_update_thunk as extern "C" fn() as usize,
+    ) {
+        ok += 1;
+    }
+    if replace_pinned(
+        "cam_49f320",
+        CAM_49F320,
+        &CAM_49F320_BODY,
+        cam_49f320_thunk as extern "C" fn() as usize,
     ) {
         ok += 1;
     }
@@ -6276,939 +6334,9 @@ const CAMERA_FOLLOW_UPDATE_BODY: [u8; 7100] = [
 ];
 
 
-// --- camera_update (0x4932f0..0x49380e, 1310 bytes) ----------------------------------------
-//
-// Per-frame camera update, `sim_frame` twice a frame (docs 11 and 19), game thread. No arguments,
-// plain `ret`. Saves ebx / ebp / esi / edi, keeps a 0x8C-byte frame; ends by calling 0x4A9BE0
-// (region) and the optional 0x2526B5A reset. The mode update is an indirect `call eax` with the
-// dt on the stack, taken from the mode table 0xDD5250 (mode 0 is camera_follow_update).
-// - Callees returning on ST0: 0x4933F4 (0x6FF860), 0x4934CA (0xBDEA30), 0x493797 (0xBDE980).
-// - 0x493734 is the import slot 0xDB807C called with one argument it pops itself.
-// - x87 values (dt, the blend factor) live across the indirect and direct calls stay in the
-//   translation's x87 stack.
-#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
-unsafe fn camera_update_body(ent: &mut Ent, args: *const u32) {
-    let mut stk = [0u64; 512];
-    #[cfg(not(test))]
-    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
-    #[cfg(test)]
-    let stk_p = difftest::STK_P;
-    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
-    wd(esp as usize, 0);
-    for k in 0..16 {
-        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
-    }
-    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
-    let mut xmm0 = ent.xmm0;
-    let mut fl = Fl::default();
-    let mut fx = X87::new();
-    macro_rules! callx {
-        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
-            let mut b = Blk {
-                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
-                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
-            };
-            #[cfg(test)]
-            difftest::pre_call(&b, &fx, $pop);
-            let n = callx_raw(&mut b);
-            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
-            for k in (0..n).rev() {
-                fx.push(b.st_out[k]);
-            }
-            esp = esp.wrapping_add(4 * $pop);
-        }};
-    }
-    let mut pc: usize = 0x4932f0;
-    loop {
-        #[cfg(test)]
-        difftest::cov(pc);
-        match pc {
-        0x4932f0 => {
-            bump(C::CuCalls);
-            // 0x4932f0: mov eax, dword ptr [0x25f5bb0]
-            eax = rd(0x25f5bb0usize);
-            // 0x4932f5: sub esp, 0x8c
-            { let a = esp; let b = 0x8cu32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
-            // 0x4932fb: push ebx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
-            // 0x4932fc: push ebp
-            esp = esp.wrapping_sub(4); wd(esp as usize, ebp);
-            // 0x4932fd: xor ebx, ebx
-            fl = f_logic(0, 32); ebx = 0;
-            // 0x4932ff: cmp eax, ebx
-            fl = f_sub(eax, ebx, 32);
-            // 0x493301: push esi
-            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
-            // 0x493302: push edi
-            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
-            // 0x493303: je 0x493803
-            if fl.zf { pc = 0x493803; } else { pc = 0x493309; } continue;
-        }
-        0x493309 => {
-            bump(C::CuTarget);
-            // 0x493309: mov ecx, eax
-            ecx = eax;
-            // 0x49330b: and ecx, 0xfff
-            { let r = (ecx) & (0xfffu32); fl = f_logic(r, 32); ecx = r; }
-            // 0x493311: shl ecx, 4
-            { let r = ecx << 4; fl = f_logic(r, 32); ecx = r; }
-            // 0x493314: mov ebp, dword ptr [ecx + 0x2149c64]
-            ebp = rd((ecx.wrapping_add(0x2149c64)) as usize);
-            // 0x49331a: cmp ebp, ebx
-            fl = f_sub(ebp, ebx, 32);
-            // 0x49331c: mov dword ptr [esp + 0x18], ebp
-            wd((esp.wrapping_add(0x18)) as usize, ebp);
-            // 0x493320: je 0x493803
-            if fl.zf { pc = 0x493803; } else { pc = 0x493326; } continue;
-        }
-        0x493326 => {
-            // 0x493326: cmp dword ptr [ebp + 0x44], eax
-            fl = f_sub(rd((ebp.wrapping_add(0x44)) as usize), eax, 32);
-            // 0x493329: jne 0x493803
-            if !fl.zf { pc = 0x493803; } else { pc = 0x49332f; } continue;
-        }
-        0x49332f => {
-            bump(C::CuPre);
-            // 0x49332f: call 0x4a3540
-            callx!(0x4a3540, 0, 0, 0, 0.0, 0.0);
-            // 0x493334: fld dword ptr [0xe8437c]
-            fx.push(rf(0xe8437cusize) as f64);
-            // 0x49333a: cmp dword ptr [0xe96c00], 0xd
-            fl = f_sub(rd(0xe96c00usize), 0xdu32, 32);
-            // 0x493341: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x493345: jne 0x493374
-            if !fl.zf { pc = 0x493374; } else { pc = 0x493347; } continue;
-        }
-        0x493347 => {
-            // 0x493347: cmp dword ptr [0x213c444], 1
-            fl = f_sub(rd(0x213c444usize), 0x1u32, 32);
-            // 0x49334e: jne 0x493374
-            if !fl.zf { pc = 0x493374; } else { pc = 0x493350; } continue;
-        }
-        0x493350 => {
-            // 0x493350: mov eax, dword ptr [0x213b4f8]
-            eax = rd(0x213b4f8usize);
-            // 0x493355: cmp eax, ebx
-            fl = f_sub(eax, ebx, 32);
-            // 0x493357: je 0x493374
-            if fl.zf { pc = 0x493374; } else { pc = 0x493359; } continue;
-        }
-        0x493359 => {
-            // 0x493359: mov eax, dword ptr [eax + 4]
-            eax = rd((eax.wrapping_add(0x4)) as usize);
-            // 0x49335c: cmp eax, ebx
-            fl = f_sub(eax, ebx, 32);
-            // 0x49335e: je 0x493374
-            if fl.zf { pc = 0x493374; } else { pc = 0x493360; } continue;
-        }
-        0x493360 => {
-            // 0x493360: mov eax, dword ptr [eax + 4]
-            eax = rd((eax.wrapping_add(0x4)) as usize);
-            // 0x493363: cmp eax, ebx
-            fl = f_sub(eax, ebx, 32);
-            // 0x493365: je 0x493374
-            if fl.zf { pc = 0x493374; } else { pc = 0x493367; } continue;
-        }
-        0x493367 => {
-            // 0x493367: mov edx, dword ptr [eax + 4]
-            edx = rd((eax.wrapping_add(0x4)) as usize);
-            // 0x49336a: cmp dword ptr [edx], 2
-            fl = f_sub(rd((edx) as usize), 0x2u32, 32);
-            // 0x49336d: jne 0x493374
-            if !fl.zf { pc = 0x493374; } else { pc = 0x49336f; } continue;
-        }
-        0x49336f => {
-            // 0x49336f: call 0x8aaa80
-            callx!(0x8aaa80, 0, 0, 0, 0.0, 0.0);
-            pc = 0x493374; continue;
-        }
-        0x493374 => {
-            // 0x493374: mov ecx, dword ptr [0x25f5b18]
-            ecx = rd(0x25f5b18usize);
-            // 0x49337a: mov eax, dword ptr [0x25f5b14]
-            eax = rd(0x25f5b14usize);
-            // 0x49337f: mov edx, dword ptr [0x25f5b1c]
-            edx = rd(0x25f5b1cusize);
-            // 0x493385: mov dword ptr [0x25f5b30], ecx
-            wd(0x25f5b30usize, ecx);
-            // 0x49338b: mov ecx, 9
-            ecx = 0x9u32;
-            // 0x493390: mov esi, 0x25f5b38
-            esi = 0x25f5b38u32;
-            // 0x493395: mov edi, 0x25f5b80
-            edi = 0x25f5b80u32;
-            // 0x49339a: mov dword ptr [0x25f5b2c], eax
-            wd(0x25f5b2cusize, eax);
-            // 0x49339f: mov dword ptr [0x25f5b34], edx
-            wd(0x25f5b34usize, edx);
-            // 0x4933a5: rep movsd dword ptr es:[edi], dword ptr [esi]
-            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
-            // 0x4933a7: fld dword ptr [0x25f5ba4]
-            fx.push(rf(0x25f5ba4usize) as f64);
-            // 0x4933ad: fstp dword ptr [0x25f5bac]
-            wf(0x25f5bacusize, fx.s(0) as f32);
-            fx.pop();
-            // 0x4933b3: mov ecx, dword ptr [0x25f5bb0]
-            ecx = rd(0x25f5bb0usize);
-            // 0x4933b9: cmp ecx, ebx
-            fl = f_sub(ecx, ebx, 32);
-            // 0x4933bb: je 0x4933fb
-            if fl.zf { pc = 0x4933fb; } else { pc = 0x4933bd; } continue;
-        }
-        0x4933bd => {
-            // 0x4933bd: mov eax, ecx
-            eax = ecx;
-            // 0x4933bf: and eax, 0xfff
-            { let r = (eax) & (0xfffu32); fl = f_logic(r, 32); eax = r; }
-            // 0x4933c4: shl eax, 4
-            { let r = eax << 4; fl = f_logic(r, 32); eax = r; }
-            // 0x4933c7: mov eax, dword ptr [eax + 0x2149c64]
-            eax = rd((eax.wrapping_add(0x2149c64)) as usize);
-            // 0x4933cd: cmp eax, ebx
-            fl = f_sub(eax, ebx, 32);
-            // 0x4933cf: je 0x4933fb
-            if fl.zf { pc = 0x4933fb; } else { pc = 0x4933d1; } continue;
-        }
-        0x4933d1 => {
-            // 0x4933d1: cmp dword ptr [eax + 0x44], ecx
-            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
-            // 0x4933d4: jne 0x4933fb
-            if !fl.zf { pc = 0x4933fb; } else { pc = 0x4933d6; } continue;
-        }
-        0x4933d6 => {
-            // 0x4933d6: test byte ptr [0x25f5be8], 2
-            fl = f_logic(((rb(0x25f5be8usize) as u32)) & (0x2u32), 8);
-            // 0x4933dd: jne 0x4933fb
-            if !fl.zf { pc = 0x4933fb; } else { pc = 0x4933df; } continue;
-        }
-        0x4933df => {
-            // 0x4933df: mov ecx, dword ptr [eax + 0x4c]
-            ecx = rd((eax.wrapping_add(0x4c)) as usize);
-            // 0x4933e2: cmp ecx, 5
-            fl = f_sub(ecx, 0x5u32, 32);
-            // 0x4933e5: je 0x4933f4
-            if fl.zf { pc = 0x4933f4; } else { pc = 0x4933e7; } continue;
-        }
-        0x4933e7 => {
-            // 0x4933e7: cmp ecx, 1
-            fl = f_sub(ecx, 0x1u32, 32);
-            // 0x4933ea: jne 0x4933fb
-            if !fl.zf { pc = 0x4933fb; } else { pc = 0x4933ec; } continue;
-        }
-        0x4933ec => {
-            // 0x4933ec: cmp byte ptr [eax + 0x595], bl
-            fl = f_sub((rb((eax.wrapping_add(0x595)) as usize) as u32), (ebx & 0xff), 8);
-            // 0x4933f2: je 0x4933fb
-            if fl.zf { pc = 0x4933fb; } else { pc = 0x4933f4; } continue;
-        }
-        0x4933f4 => {
-            bump(C::CuPhysDt);
-            // 0x4933f4: call 0x6ff860
-            callx!(0x6ff860, 0, 0, 0, 0.0, 0.0);
-            // 0x4933f9: jmp 0x4933ff
-            pc = 0x4933ff; continue;
-        }
-        0x4933fb => {
-            // 0x4933fb: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            pc = 0x4933ff; continue;
-        }
-        0x4933ff => {
-            // 0x4933ff: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x493403: fld dword ptr [0x25f5b14]
-            fx.push(rf(0x25f5b14usize) as f64);
-            // 0x493409: fstp dword ptr [esp + 0x28]
-            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49340d: fld dword ptr [0x25f5b18]
-            fx.push(rf(0x25f5b18usize) as f64);
-            // 0x493413: fstp dword ptr [esp + 0x2c]
-            wf((esp.wrapping_add(0x2c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x493417: fld dword ptr [0x25f5b1c]
-            fx.push(rf(0x25f5b1cusize) as f64);
-            // 0x49341d: fstp dword ptr [esp + 0x30]
-            wf((esp.wrapping_add(0x30)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x493421: fldz 
-            fx.push(0.0);
-            // 0x493423: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x493427: fcom st(1)
-            fx.sw = fcmp(fx.s(0), fx.s(1));
-            // 0x493429: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x49342b: fstp st(1)
-            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
-            // 0x49342d: test ah, 0x41
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
-            // 0x493430: jne 0x493487
-            if !fl.zf { pc = 0x493487; } else { pc = 0x493432; } continue;
-        }
-        0x493432 => {
-            bump(C::CuModeUpdate);
-            // 0x493432: mov eax, dword ptr [0x25f5ae8]
-            eax = rd(0x25f5ae8usize);
-            // 0x493437: lea ecx, [eax + eax*4]
-            ecx = (eax.wrapping_add(eax.wrapping_mul(4)));
-            // 0x49343a: mov eax, dword ptr [ecx*4 + 0xdd5258]
-            eax = rd((ecx.wrapping_mul(4).wrapping_add(0xdd5258)) as usize);
-            // 0x493441: cmp eax, ebx
-            fl = f_sub(eax, ebx, 32);
-            // 0x493443: je 0x493452
-            if fl.zf { pc = 0x493452; } else { pc = 0x493445; } continue;
-        }
-        0x493445 => {
-            bump(C::CuModeCall);
-            // 0x493445: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x493446: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x493449: call eax
-            callx!(eax as usize, 1, 0, 0, 0.0, 0.0);
-            // 0x49344b: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x49344f: add esp, 4
-            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            pc = 0x493452; continue;
-        }
-        0x493452 => {
-            // 0x493452: test byte ptr [0x25f5be8], 2
-            fl = f_logic(((rb(0x25f5be8usize) as u32)) & (0x2u32), 8);
-            // 0x493459: je 0x493487
-            if fl.zf { pc = 0x493487; } else { pc = 0x49345b; } continue;
-        }
-        0x49345b => {
-            bump(C::CuSmooth);
-            // 0x49345b: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x49345c: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49345f: push 0x25f5b5c
-            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5b5cu32);
-            // 0x493464: push 0x25f5ba8
-            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5ba8u32);
-            // 0x493469: push 0x25f5b20
-            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5b20u32);
-            // 0x49346e: mov edi, 0x25f5ba8
-            edi = 0x25f5ba8u32;
-            // 0x493473: mov ecx, 0x25f5b20
-            ecx = 0x25f5b20u32;
-            // 0x493478: mov eax, 0x25f5b5c
-            eax = 0x25f5b5cu32;
-            // 0x49347d: call 0x4a33a0
-            callx!(0x4a33a0, 4, 0, 0, 0.0, 0.0);
-            // 0x493482: add esp, 0x10
-            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x493485: jmp 0x493489
-            pc = 0x493489; continue;
-        }
-        0x493487 => {
-            // 0x493487: fstp st(0)
-            fx.pop();
-            pc = 0x493489; continue;
-        }
-        0x493489 => {
-            // 0x493489: call 0x4a0ea0
-            callx!(0x4a0ea0, 0, 0, 0, 0.0, 0.0);
-            // 0x49348e: test byte ptr [0x25f5be8], 4
-            fl = f_logic(((rb(0x25f5be8usize) as u32)) & (0x4u32), 8);
-            // 0x493495: je 0x4934f0
-            if fl.zf { pc = 0x4934f0; } else { pc = 0x493497; } continue;
-        }
-        0x493497 => {
-            bump(C::CuCut);
-            // 0x493497: fld dword ptr [0x25f5b14]
-            fx.push(rf(0x25f5b14usize) as f64);
-            // 0x49349d: fstp dword ptr [esp + 0x34]
-            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x4934a1: fld dword ptr [0x25f5b18]
-            fx.push(rf(0x25f5b18usize) as f64);
-            // 0x4934a7: fstp dword ptr [esp + 0x38]
-            wf((esp.wrapping_add(0x38)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x4934ab: fld dword ptr [0x25f5b1c]
-            fx.push(rf(0x25f5b1cusize) as f64);
-            // 0x4934b1: fstp dword ptr [esp + 0x3c]
-            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x4934b5: call 0x492df0
-            callx!(0x492df0, 0, 0, 0, 0.0, 0.0);
-            // 0x4934ba: and dword ptr [0x25f5be8], 0xfffffffb
-            { let r = (rd(0x25f5be8usize)) & (0xfffffffbu32); fl = f_logic(r, 32); wd(0x25f5be8usize, r); }
-            // 0x4934c1: lea eax, [esp + 0x34]
-            eax = (esp.wrapping_add(0x34));
-            // 0x4934c5: mov ecx, 0x25f5b14
-            ecx = 0x25f5b14u32;
-            // 0x4934ca: call 0xbdea30
-            callx!(0xbdea30, 0, 0, 0, 0.0, 0.0);
-            // 0x4934cf: fcomp qword ptr [0xe5c540]
-            fx.sw = fcmp(fx.s(0), rdf64(0xe5c540usize));
-            fx.pop();
-            // 0x4934d5: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x4934d7: test ah, 0x41
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
-            // 0x4934da: jne 0x4934f0
-            if !fl.zf { pc = 0x4934f0; } else { pc = 0x4934dc; } continue;
-        }
-        0x4934dc => {
-            // 0x4934dc: mov dl, byte ptr [0x2528b48]
-            edx = (edx & 0xffffff00) | (((rb(0x2528b48usize) as u32)) & 0xff);
-            // 0x4934e2: test dl, dl
-            fl = f_logic(((edx & 0xff)) & ((edx & 0xff)), 8);
-            // 0x4934e4: jne 0x4934f0
-            if !fl.zf { pc = 0x4934f0; } else { pc = 0x4934e6; } continue;
-        }
-        0x4934e6 => {
-            // 0x4934e6: mov byte ptr [0x2529620], 1
-            wb(0x2529620usize, (0x1u32) as u8);
-            // 0x4934ed: lea ecx, [ecx]
-            // no-op
-            pc = 0x4934f0; continue;
-        }
-        0x4934f0 => {
-            // 0x4934f0: mov ecx, dword ptr [0x25f5b24]
-            ecx = rd(0x25f5b24usize);
-            // 0x4934f6: mov eax, dword ptr [0x25f5b20]
-            eax = rd(0x25f5b20usize);
-            // 0x4934fb: mov edx, dword ptr [0x25f5b28]
-            edx = rd(0x25f5b28usize);
-            // 0x493501: mov dword ptr [0x25f5b18], ecx
-            wd(0x25f5b18usize, ecx);
-            // 0x493507: mov ecx, 9
-            ecx = 0x9u32;
-            // 0x49350c: mov esi, 0x25f5b5c
-            esi = 0x25f5b5cu32;
-            // 0x493511: mov edi, 0x25f5b38
-            edi = 0x25f5b38u32;
-            // 0x493516: mov dword ptr [0x25f5b14], eax
-            wd(0x25f5b14usize, eax);
-            // 0x49351b: mov dword ptr [0x25f5b1c], edx
-            wd(0x25f5b1cusize, edx);
-            // 0x493521: rep movsd dword ptr es:[edi], dword ptr [esi]
-            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
-            // 0x493523: test byte ptr [0x25f5be8], 8
-            fl = f_logic(((rb(0x25f5be8usize) as u32)) & (0x8u32), 8);
-            // 0x49352a: je 0x49357e
-            if fl.zf { pc = 0x49357e; } else { pc = 0x49352c; } continue;
-        }
-        0x49352c => {
-            bump(C::CuFovBlend);
-            // 0x49352c: fld dword ptr [0xe84384]
-            fx.push(rf(0xe84384usize) as f64);
-            // 0x493532: fmul qword ptr [0xe5c130]
-            { let v = fx.s(0) * rdf64(0xe5c130usize); fx.set(0, v); }
-            // 0x493538: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49353c: fldz 
-            fx.push(0.0);
-            // 0x49353e: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x493542: fcom st(1)
-            fx.sw = fcmp(fx.s(0), fx.s(1));
-            // 0x493544: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x493546: test ah, 0x41
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
-            // 0x493549: jne 0x49355e
-            if !fl.zf { pc = 0x49355e; } else { pc = 0x49354b; } continue;
-        }
-        0x49354b => {
-            // 0x49354b: fstp st(1)
-            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
-            // 0x49354d: fld1 
-            fx.push(1.0);
-            // 0x49354f: fcom st(1)
-            fx.sw = fcmp(fx.s(0), fx.s(1));
-            // 0x493551: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x493553: fstp st(1)
-            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
-            // 0x493555: test ah, 0x41
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
-            // 0x493558: jne 0x493560
-            if !fl.zf { pc = 0x493560; } else { pc = 0x49355a; } continue;
-        }
-        0x49355a => {
-            // 0x49355a: fstp st(0)
-            fx.pop();
-            // 0x49355c: jmp 0x493564
-            pc = 0x493564; continue;
-        }
-        0x49355e => {
-            // 0x49355e: fstp st(0)
-            fx.pop();
-            pc = 0x493560; continue;
-        }
-        0x493560 => {
-            // 0x493560: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            pc = 0x493564; continue;
-        }
-        0x493564 => {
-            // 0x493564: fld dword ptr [0x25f5ba8]
-            fx.push(rf(0x25f5ba8usize) as f64);
-            // 0x49356a: fld dword ptr [0x25f5ba4]
-            fx.push(rf(0x25f5ba4usize) as f64);
-            // 0x493570: fld st(0)
-            { let v = fx.s(0); fx.push(v); }
-            // 0x493572: fsubp st(2)
-            { let v = fx.s(2) - fx.s(0); fx.set(2, v); }
-            fx.pop();
-            // 0x493574: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x493578: fmulp st(2)
-            { let v = fx.s(2) * fx.s(0); fx.set(2, v); }
-            fx.pop();
-            // 0x49357a: faddp st(1)
-            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
-            fx.pop();
-            // 0x49357c: jmp 0x493584
-            pc = 0x493584; continue;
-        }
-        0x49357e => {
-            // 0x49357e: fld dword ptr [0x25f5ba8]
-            fx.push(rf(0x25f5ba8usize) as f64);
-            pc = 0x493584; continue;
-        }
-        0x493584 => {
-            // 0x493584: cmp byte ptr [0xe8825f], bl
-            fl = f_sub((rb(0xe8825fusize) as u32), (ebx & 0xff), 8);
-            // 0x49358a: fstp dword ptr [0x25f5ba4]
-            wf(0x25f5ba4usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x493590: je 0x49375a
-            if fl.zf { pc = 0x49375a; } else { pc = 0x493596; } continue;
-        }
-        0x493596 => {
-            bump(C::CuFade);
-            // 0x493596: mov edx, dword ptr [0x25f5b28]
-            edx = rd(0x25f5b28usize);
-            // 0x49359c: fld dword ptr [0xe5daa0]
-            fx.push(rf(0xe5daa0usize) as f64);
-            // 0x4935a2: mov eax, dword ptr [0x25f5b20]
-            eax = rd(0x25f5b20usize);
-            // 0x4935a7: fstp dword ptr [esp + 0x58]
-            wf((esp.wrapping_add(0x58)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x4935ab: mov ecx, dword ptr [0x25f5b24]
-            ecx = rd(0x25f5b24usize);
-            // 0x4935b1: mov dword ptr [esp + 0x48], edx
-            wd((esp.wrapping_add(0x48)) as usize, edx);
-            // 0x4935b5: mov dword ptr [esp + 0x54], edx
-            wd((esp.wrapping_add(0x54)) as usize, edx);
-            // 0x4935b9: mov edx, dword ptr [0xf53908]
-            edx = rd(0xf53908usize);
-            // 0x4935bf: cmp edx, ebx
-            fl = f_sub(edx, ebx, 32);
-            // 0x4935c1: mov dword ptr [esp + 0x5c], ebx
-            wd((esp.wrapping_add(0x5c)) as usize, ebx);
-            // 0x4935c5: mov dword ptr [esp + 0x84], ebx
-            wd((esp.wrapping_add(0x84)) as usize, ebx);
-            // 0x4935cc: mov dword ptr [esp + 0x88], ebx
-            wd((esp.wrapping_add(0x88)) as usize, ebx);
-            // 0x4935d3: mov dword ptr [esp + 0x94], ebx
-            wd((esp.wrapping_add(0x94)) as usize, ebx);
-            // 0x4935da: mov dword ptr [esp + 0x1c], ebx
-            wd((esp.wrapping_add(0x1c)) as usize, ebx);
-            // 0x4935de: mov dword ptr [esp + 0x20], ebx
-            wd((esp.wrapping_add(0x20)) as usize, ebx);
-            // 0x4935e2: mov dword ptr [esp + 0x24], 0x80000000
-            wd((esp.wrapping_add(0x24)) as usize, 0x80000000u32);
-            // 0x4935ea: mov dword ptr [esp + 0x40], eax
-            wd((esp.wrapping_add(0x40)) as usize, eax);
-            // 0x4935ee: mov dword ptr [esp + 0x44], ecx
-            wd((esp.wrapping_add(0x44)) as usize, ecx);
-            // 0x4935f2: mov dword ptr [esp + 0x4c], eax
-            wd((esp.wrapping_add(0x4c)) as usize, eax);
-            // 0x4935f6: mov dword ptr [esp + 0x50], ecx
-            wd((esp.wrapping_add(0x50)) as usize, ecx);
-            // 0x4935fa: mov dword ptr [esp + 0x8c], 0x50
-            wd((esp.wrapping_add(0x8c)) as usize, 0x50u32);
-            // 0x493605: mov dword ptr [esp + 0x90], 1
-            wd((esp.wrapping_add(0x90)) as usize, 0x1u32);
-            // 0x493610: je 0x493621
-            if fl.zf { pc = 0x493621; } else { pc = 0x493612; } continue;
-        }
-        0x493612 => {
-            // 0x493612: call 0x492d40
-            callx!(0x492d40, 0, 0, 0, 0.0, 0.0);
-            // 0x493617: mov edx, dword ptr [0xf53908]
-            edx = rd(0xf53908usize);
-            // 0x49361d: cmp edx, ebx
-            fl = f_sub(edx, ebx, 32);
-            // 0x49361f: jne 0x493612
-            if !fl.zf { pc = 0x493612; } else { pc = 0x493621; } continue;
-        }
-        0x493621 => {
-            // 0x493621: push ebx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
-            // 0x493622: lea eax, [esp + 0x20]
-            eax = (esp.wrapping_add(0x20));
-            // 0x493626: push 1
-            esp = esp.wrapping_sub(4); wd(esp as usize, 0x1u32);
-            // 0x493628: push eax
-            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
-            // 0x493629: lea ecx, [esp + 0x4c]
-            ecx = (esp.wrapping_add(0x4c));
-            // 0x49362d: call 0x6fa820
-            callx!(0x6fa820, 3, 0, 0, 0.0, 0.0);
-            // 0x493632: add esp, 0xc
-            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x493635: test al, al
-            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
-            // 0x493637: je 0x493725
-            if fl.zf { pc = 0x493725; } else { pc = 0x49363d; } continue;
-        }
-        0x49363d => {
-            bump(C::CuFadeCast);
-            // 0x49363d: mov eax, dword ptr [esp + 0x20]
-            eax = rd((esp.wrapping_add(0x20)) as usize);
-            // 0x493641: cmp eax, ebx
-            fl = f_sub(eax, ebx, 32);
-            // 0x493643: jle 0x493725
-            if fl.zf || fl.sf != fl.of { pc = 0x493725; } else { pc = 0x493649; } continue;
-        }
-        0x493649 => {
-            // 0x493649: mov edi, dword ptr [esp + 0x1c]
-            edi = rd((esp.wrapping_add(0x1c)) as usize);
-            // 0x49364d: mov ebp, dword ptr [0xebcea0]
-            ebp = rd(0xebcea0usize);
-            // 0x493653: mov ebx, dword ptr [0xebce9c]
-            ebx = rd(0xebce9cusize);
-            // 0x493659: add edi, 0x28
-            { let a = edi; let b = 0x28u32; fl = f_add(a, b, 32); edi = a.wrapping_add(b); }
-            // 0x49365c: mov dword ptr [esp + 0x10], eax
-            wd((esp.wrapping_add(0x10)) as usize, eax);
-            pc = 0x493660; continue;
-        }
-        0x493660 => {
-            // 0x493660: mov eax, dword ptr [edi]
-            eax = rd((edi) as usize);
-            // 0x493662: test eax, eax
-            fl = f_logic((eax) & (eax), 32);
-            // 0x493664: je 0x493713
-            if fl.zf { pc = 0x493713; } else { pc = 0x49366a; } continue;
-        }
-        0x49366a => {
-            // 0x49366a: mov ecx, eax
-            ecx = eax;
-            // 0x49366c: and ecx, 0xfff
-            { let r = (ecx) & (0xfffu32); fl = f_logic(r, 32); ecx = r; }
-            // 0x493672: shl ecx, 4
-            { let r = ecx << 4; fl = f_logic(r, 32); ecx = r; }
-            // 0x493675: mov esi, dword ptr [ecx + 0x2149c64]
-            esi = rd((ecx.wrapping_add(0x2149c64)) as usize);
-            // 0x49367b: test esi, esi
-            fl = f_logic((esi) & (esi), 32);
-            // 0x49367d: je 0x493713
-            if fl.zf { pc = 0x493713; } else { pc = 0x493683; } continue;
-        }
-        0x493683 => {
-            // 0x493683: mov ecx, dword ptr [esi + 0x44]
-            ecx = rd((esi.wrapping_add(0x44)) as usize);
-            // 0x493686: cmp ecx, eax
-            fl = f_sub(ecx, eax, 32);
-            // 0x493688: jne 0x493713
-            if !fl.zf { pc = 0x493713; } else { pc = 0x49368e; } continue;
-        }
-        0x49368e => {
-            // 0x49368e: cmp dword ptr [esi + 0x4c], 1
-            fl = f_sub(rd((esi.wrapping_add(0x4c)) as usize), 0x1u32, 32);
-            // 0x493692: jne 0x493713
-            if !fl.zf { pc = 0x493713; } else { pc = 0x493694; } continue;
-        }
-        0x493694 => {
-            // 0x493694: test ecx, ecx
-            fl = f_logic((ecx) & (ecx), 32);
-            // 0x493696: je 0x493702
-            if fl.zf { pc = 0x493702; } else { pc = 0x493698; } continue;
-        }
-        0x493698 => {
-            // 0x493698: test ebx, ebx
-            fl = f_logic((ebx) & (ebx), 32);
-            // 0x49369a: je 0x4936ab
-            if fl.zf { pc = 0x4936ab; } else { pc = 0x49369c; } continue;
-        }
-        0x49369c => {
-            // 0x49369c: cmp ecx, dword ptr [ebx + 0x44]
-            fl = f_sub(ecx, rd((ebx.wrapping_add(0x44)) as usize), 32);
-            // 0x49369f: jne 0x4936ab
-            if !fl.zf { pc = 0x4936ab; } else { pc = 0x4936a1; } continue;
-        }
-        0x4936a1 => {
-            // 0x4936a1: cmp ebp, 7
-            fl = f_sub(ebp, 0x7u32, 32);
-            // 0x4936a4: je 0x4936ab
-            if fl.zf { pc = 0x4936ab; } else { pc = 0x4936a6; } continue;
-        }
-        0x4936a6 => {
-            // 0x4936a6: cmp ebp, 8
-            fl = f_sub(ebp, 0x8u32, 32);
-            // 0x4936a9: jne 0x493702
-            if !fl.zf { pc = 0x493702; } else { pc = 0x4936ab; } continue;
-        }
-        0x4936ab => {
-            // 0x4936ab: mov eax, esi
-            eax = esi;
-            // 0x4936ad: call 0x9b92e0
-            callx!(0x9b92e0, 0, 0, 0, 0.0, 0.0);
-            // 0x4936b2: test al, al
-            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
-            // 0x4936b4: jne 0x493702
-            if !fl.zf { pc = 0x493702; } else { pc = 0x4936b6; } continue;
-        }
-        0x4936b6 => {
-            // 0x4936b6: mov edx, dword ptr [esi + 0xd74]
-            edx = rd((esi.wrapping_add(0xd74)) as usize);
-            // 0x4936bc: mov ecx, edx
-            ecx = edx;
-            // 0x4936be: call 0xae28f0
-            callx!(0xae28f0, 0, 0, 0, 0.0, 0.0);
-            // 0x4936c3: test eax, eax
-            fl = f_logic((eax) & (eax), 32);
-            // 0x4936c5: setne al
-            eax = (eax & 0xffffff00) | (((!fl.zf) as u32) & 0xff);
-            // 0x4936c8: test al, al
-            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
-            // 0x4936ca: je 0x493702
-            if fl.zf { pc = 0x493702; } else { pc = 0x4936cc; } continue;
-        }
-        0x4936cc => {
-            // 0x4936cc: mov ecx, edx
-            ecx = edx;
-            // 0x4936ce: call 0xae28f0
-            callx!(0xae28f0, 0, 0, 0, 0.0, 0.0);
-            // 0x4936d3: test eax, eax
-            fl = f_logic((eax) & (eax), 32);
-            // 0x4936d5: je 0x493702
-            if fl.zf { pc = 0x493702; } else { pc = 0x4936d7; } continue;
-        }
-        0x4936d7 => {
-            // 0x4936d7: mov ecx, dword ptr [esi + 0xd78]
-            ecx = rd((esi.wrapping_add(0xd78)) as usize);
-            // 0x4936dd: cmp ecx, -1
-            fl = f_sub(ecx, 0xffffffffu32, 32);
-            // 0x4936e0: je 0x493702
-            if fl.zf { pc = 0x493702; } else { pc = 0x4936e2; } continue;
-        }
-        0x4936e2 => {
-            // 0x4936e2: mov edx, dword ptr [eax + 0x84e4]
-            edx = rd((eax.wrapping_add(0x84e4)) as usize);
-            // 0x4936e8: mov eax, dword ptr [edx + ecx*4 + 0x6f4]
-            eax = rd((edx.wrapping_add(ecx.wrapping_mul(4)).wrapping_add(0x6f4)) as usize);
-            // 0x4936ef: cmp eax, dword ptr [0x33d630c]
-            fl = f_sub(eax, rd(0x33d630cusize), 32);
-            // 0x4936f5: je 0x493713
-            if fl.zf { pc = 0x493713; } else { pc = 0x4936f7; } continue;
-        }
-        0x4936f7 => {
-            // 0x4936f7: mov eax, esi
-            eax = esi;
-            // 0x4936f9: call 0x926650
-            callx!(0x926650, 0, 0, 0, 0.0, 0.0);
-            // 0x4936fe: test al, al
-            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
-            // 0x493700: jne 0x493713
-            if !fl.zf { pc = 0x493713; } else { pc = 0x493702; } continue;
-        }
-        0x493702 => {
-            // 0x493702: call 0x492d90
-            callx!(0x492d90, 0, 0, 0, 0.0, 0.0);
-            // 0x493707: mov ebp, dword ptr [0xebcea0]
-            ebp = rd(0xebcea0usize);
-            // 0x49370d: mov ebx, dword ptr [0xebce9c]
-            ebx = rd(0xebce9cusize);
-            pc = 0x493713; continue;
-        }
-        0x493713 => {
-            // 0x493713: add edi, 0x3c
-            { let a = edi; let b = 0x3cu32; fl = f_add(a, b, 32); edi = a.wrapping_add(b); }
-            // 0x493716: sub dword ptr [esp + 0x10], 1
-            { let a = rd((esp.wrapping_add(0x10)) as usize); let b = 0x1u32; fl = f_sub(a, b, 32); wd((esp.wrapping_add(0x10)) as usize, a.wrapping_sub(b)); }
-            // 0x49371b: jne 0x493660
-            if !fl.zf { pc = 0x493660; } else { pc = 0x493721; } continue;
-        }
-        0x493721 => {
-            // 0x493721: mov ebp, dword ptr [esp + 0x18]
-            ebp = rd((esp.wrapping_add(0x18)) as usize);
-            pc = 0x493725; continue;
-        }
-        0x493725 => {
-            // 0x493725: mov esi, dword ptr [esp + 0x24]
-            esi = rd((esp.wrapping_add(0x24)) as usize);
-            // 0x493729: test esi, esi
-            fl = f_logic((esi) & (esi), 32);
-            // 0x49372b: js 0x49375a
-            if fl.sf { pc = 0x49375a; } else { pc = 0x49372d; } continue;
-        }
-        0x49372d => {
-            bump(C::CuTimerImport);
-            // 0x49372d: mov ecx, dword ptr [0x31bf2bc]
-            ecx = rd(0x31bf2bcusize);
-            // 0x493733: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x493734: call dword ptr [0xdb807c]
-            callx!(rd(0xdb807cusize) as usize, 1, 1, 0, 0.0, 0.0);
-            // 0x49373a: mov ecx, dword ptr [esp + 0x1c]
-            ecx = rd((esp.wrapping_add(0x1c)) as usize);
-            // 0x49373e: and esi, 0x3fffffff
-            { let r = (esi) & (0x3fffffffu32); fl = f_logic(r, 32); esi = r; }
-            // 0x493744: mov edx, esi
-            edx = esi;
-            // 0x493746: shl edx, 4
-            { let r = edx << 4; fl = f_logic(r, 32); edx = r; }
-            // 0x493749: sub edx, esi
-            { let a = edx; let b = esi; fl = f_sub(a, b, 32); edx = a.wrapping_sub(b); }
-            // 0x49374b: add edx, edx
-            { let a = edx; let b = edx; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
-            // 0x49374d: push 0x17
-            esp = esp.wrapping_sub(4); wd(esp as usize, 0x17u32);
-            // 0x49374f: add edx, edx
-            { let a = edx; let b = edx; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
-            // 0x493751: push edx
-            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
-            // 0x493752: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x493753: mov ecx, eax
-            ecx = eax;
-            // 0x493755: call 0xd2b7d0
-            callx!(0xd2b7d0, 3, 3, 0, 0.0, 0.0);
-            pc = 0x49375a; continue;
-        }
-        0x49375a => {
-            // 0x49375a: mov edx, dword ptr [ebp + 0x14]
-            edx = rd((ebp.wrapping_add(0x14)) as usize);
-            // 0x49375d: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x493761: mov dword ptr [0x25f5bb4], edx
-            wd(0x25f5bb4usize, edx);
-            // 0x493767: mov eax, dword ptr [ebp + 0x18]
-            eax = rd((ebp.wrapping_add(0x18)) as usize);
-            // 0x49376a: mov dword ptr [0x25f5bb8], eax
-            wd(0x25f5bb8usize, eax);
-            // 0x49376f: mov ecx, dword ptr [ebp + 0x1c]
-            ecx = rd((ebp.wrapping_add(0x1c)) as usize);
-            // 0x493772: mov dword ptr [0x25f5bbc], ecx
-            wd(0x25f5bbcusize, ecx);
-            // 0x493778: lea edx, [esp + 0x28]
-            edx = (esp.wrapping_add(0x28));
-            // 0x49377c: lea esi, [ebp + 0x20]
-            esi = (ebp.wrapping_add(0x20));
-            // 0x49377f: mov ecx, 9
-            ecx = 0x9u32;
-            // 0x493784: mov edi, 0x25f5bc0
-            edi = 0x25f5bc0u32;
-            // 0x493789: push 0x25f5b14
-            esp = esp.wrapping_sub(4); wd(esp as usize, 0x25f5b14u32);
-            // 0x49378e: rep movsd dword ptr es:[edi], dword ptr [esi]
-            while ecx != 0 { wd(edi as usize, rd(esi as usize)); esi = esi.wrapping_add(4); edi = edi.wrapping_add(4); ecx = ecx.wrapping_sub(1); }
-            // 0x493790: fstp dword ptr [0x25f5be4]
-            wf(0x25f5be4usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x493796: push edx
-            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
-            // 0x493797: call 0xbde980
-            callx!(0xbde980, 2, 0, 0, 0.0, 0.0);
-            // 0x49379c: add esp, 8
-            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x49379f: fadd dword ptr [0x2526be8]
-            { let v = fx.s(0) + (rf(0x2526be8usize) as f64); fx.set(0, v); }
-            // 0x4937a5: mov byte ptr [0xe996e5], 1
-            wb(0xe996e5usize, (0x1u32) as u8);
-            // 0x4937ac: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x4937b0: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x4937b4: fcomp dword ptr [0xe88be8]
-            fx.sw = fcmp(fx.s(0), (rf(0xe88be8usize) as f64));
-            fx.pop();
-            // 0x4937ba: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x4937bc: test ah, 1
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x1u32), 8);
-            // 0x4937bf: je 0x4937c8
-            if fl.zf { pc = 0x4937c8; } else { pc = 0x4937c1; } continue;
-        }
-        0x4937c1 => {
-            bump(C::CuNoMove);
-            // 0x4937c1: mov byte ptr [0xe996e5], 0
-            wb(0xe996e5usize, (0x0u32) as u8);
-            pc = 0x4937c8; continue;
-        }
-        0x4937c8 => {
-            // 0x4937c8: movzx eax, word ptr [0x25f5bec]
-            eax = (rw(0x25f5becusize) as u32);
-            // 0x4937cf: fldz 
-            fx.push(0.0);
-            // 0x4937d1: mov edi, 0x25f5b14
-            edi = 0x25f5b14u32;
-            // 0x4937d6: fstp dword ptr [0x2526be8]
-            wf(0x2526be8usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x4937dc: mov dword ptr [0x25f5bf0], eax
-            wd(0x25f5bf0usize, eax);
-            // 0x4937e1: call 0x4a9be0
-            callx!(0x4a9be0, 0, 0, 0, 0.0, 0.0);
-            // 0x4937e6: cmp byte ptr [0x2526b5a], 0
-            fl = f_sub((rb(0x2526b5ausize) as u32), 0x0u32, 8);
-            // 0x4937ed: mov word ptr [0x25f5bec], ax
-            ww(0x25f5becusize, ((eax & 0xffff)) as u16);
-            // 0x4937f3: je 0x493803
-            if fl.zf { pc = 0x493803; } else { pc = 0x4937f5; } continue;
-        }
-        0x4937f5 => {
-            bump(C::CuRegionReset);
-            // 0x4937f5: mov byte ptr [0xfa239a], 0
-            wb(0xfa239ausize, (0x0u32) as u8);
-            // 0x4937fc: mov byte ptr [0x2526b5a], 0
-            wb(0x2526b5ausize, (0x0u32) as u8);
-            pc = 0x493803; continue;
-        }
-        0x493803 => {
-            // 0x493803: pop edi
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
-            // 0x493804: pop esi
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
-            // 0x493805: pop ebp
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
-            // 0x493806: pop ebx
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
-            // 0x493807: add esp, 0x8c
-            { let a = esp; let b = 0x8cu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x49380d: ret 
-            break;
-        }
-            _ => unreachable!(),
-        }
-    }
-    #[cfg(test)]
-    {
-        ent.ebp = ebp;
-        ent.pad = esp;
-    }
-    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
-    let depth = (8 - fx.top) & 7;
-    ent.nst = (depth >= 1) as u32;
-    if depth >= 1 {
-        ent.st0 = fx.s(0);
-    }
-    std::hint::black_box(&stk);
-}
-
 extern "C" fn camera_update_entry(ent: *mut Ent, args: *const u32) {
-    unsafe { camera_update_body(&mut *ent, args) }
+    bump(C::CuCalls);
+    unsafe { hand::camera_update_body(&mut *ent, args) }
 }
 
 ent_thunk!(camera_update_thunk, camera_update_entry, 0);
@@ -7299,807 +6427,9 @@ const CAMERA_UPDATE_BODY: [u8; 1310] = [
 ];
 
 
-// --- cam_498d40 (0x498d40..0x499113, 979 bytes) ----------------------------------------
-
-#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
-unsafe fn cam_498d40_body(ent: &mut Ent, args: *const u32) {
-    let mut stk = [0u64; 512];
-    #[cfg(not(test))]
-    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
-    #[cfg(test)]
-    let stk_p = difftest::STK_P;
-    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
-    wd(esp as usize, 0);
-    for k in 0..16 {
-        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
-    }
-    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
-    let mut xmm0 = ent.xmm0;
-    let mut fl = Fl::default();
-    let mut fx = X87::new();
-    macro_rules! callx {
-        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
-            let mut b = Blk {
-                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
-                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
-            };
-            #[cfg(test)]
-            difftest::pre_call(&b, &fx, $pop);
-            let n = callx_raw(&mut b);
-            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
-            for k in (0..n).rev() {
-                fx.push(b.st_out[k]);
-            }
-            esp = esp.wrapping_add(4 * $pop);
-        }};
-    }
-    let mut pc: usize = 0x498d40;
-    loop {
-        #[cfg(test)]
-        difftest::cov(pc);
-        match pc {
-        0x498d40 => {
-            bump(C::Cam498d40Calls);
-            // 0x498d40: mov ecx, dword ptr [0x25f5bb0]
-            ecx = rd(0x25f5bb0usize);
-            // 0x498d46: sub esp, 0x68
-            { let a = esp; let b = 0x68u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
-            // 0x498d49: test ecx, ecx
-            fl = f_logic((ecx) & (ecx), 32);
-            // 0x498d4b: push ebx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
-            // 0x498d4c: push ebp
-            esp = esp.wrapping_sub(4); wd(esp as usize, ebp);
-            // 0x498d4d: push esi
-            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
-            // 0x498d4e: push edi
-            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
-            // 0x498d4f: je 0x498d6a
-            if fl.zf { pc = 0x498d6a; } else { pc = 0x498d51; } continue;
-        }
-        0x498d51 => {
-            // 0x498d51: mov eax, ecx
-            eax = ecx;
-            // 0x498d53: and eax, 0xfff
-            { let r = (eax) & (0xfffu32); fl = f_logic(r, 32); eax = r; }
-            // 0x498d58: shl eax, 4
-            { let r = eax << 4; fl = f_logic(r, 32); eax = r; }
-            // 0x498d5b: mov eax, dword ptr [eax + 0x2149c64]
-            eax = rd((eax.wrapping_add(0x2149c64)) as usize);
-            // 0x498d61: test eax, eax
-            fl = f_logic((eax) & (eax), 32);
-            // 0x498d63: je 0x498d6a
-            if fl.zf { pc = 0x498d6a; } else { pc = 0x498d65; } continue;
-        }
-        0x498d65 => {
-            // 0x498d65: cmp dword ptr [eax + 0x44], ecx
-            fl = f_sub(rd((eax.wrapping_add(0x44)) as usize), ecx, 32);
-            // 0x498d68: je 0x498d6e
-            if fl.zf { pc = 0x498d6e; } else { pc = 0x498d6a; } continue;
-        }
-        0x498d6a => {
-            // 0x498d6a: xor ebp, ebp
-            fl = f_logic(0, 32); ebp = 0;
-            // 0x498d6c: jmp 0x498d7e
-            pc = 0x498d7e; continue;
-        }
-        0x498d6e => {
-            // 0x498d6e: xor ecx, ecx
-            fl = f_logic(0, 32); ecx = 0;
-            // 0x498d70: cmp dword ptr [eax + 0x4c], 5
-            fl = f_sub(rd((eax.wrapping_add(0x4c)) as usize), 0x5u32, 32);
-            // 0x498d74: setne cl
-            ecx = (ecx & 0xffffff00) | (((!fl.zf) as u32) & 0xff);
-            // 0x498d77: sub ecx, 1
-            { let a = ecx; let b = 0x1u32; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
-            // 0x498d7a: and ecx, eax
-            { let r = (ecx) & (eax); fl = f_logic(r, 32); ecx = r; }
-            // 0x498d7c: mov ebp, ecx
-            ebp = ecx;
-            pc = 0x498d7e; continue;
-        }
-        0x498d7e => {
-            // 0x498d7e: fldz 
-            fx.push(0.0);
-            // 0x498d80: mov esi, dword ptr [esp + 0x7c]
-            esi = rd((esp.wrapping_add(0x7c)) as usize);
-            // 0x498d84: xor bl, bl
-            fl = f_logic(0, 8); ebx = (ebx & 0xffffff00) | ((0) & 0xff);
-            // 0x498d86: fstp dword ptr [esi + 0xc]
-            wf((esi.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498d89: test ebp, ebp
-            fl = f_logic((ebp) & (ebp), 32);
-            // 0x498d8b: je 0x498dcc
-            if fl.zf { pc = 0x498dcc; } else { pc = 0x498d8d; } continue;
-        }
-        0x498d8d => {
-            // 0x498d8d: mov eax, dword ptr [ebp + 0x84e4]
-            eax = rd((ebp.wrapping_add(0x84e4)) as usize);
-            // 0x498d93: cmp dword ptr [eax + 0x9c], 2
-            fl = f_sub(rd((eax.wrapping_add(0x9c)) as usize), 0x2u32, 32);
-            // 0x498d9a: jne 0x498dbe
-            if !fl.zf { pc = 0x498dbe; } else { pc = 0x498d9c; } continue;
-        }
-        0x498d9c => {
-            // 0x498d9c: mov edi, ebp
-            edi = ebp;
-            // 0x498d9e: call 0xaab6b0
-            callx!(0xaab6b0, 30, 0, 0, 0.0, 0.0);
-            // 0x498da3: test al, al
-            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
-            // 0x498da5: jne 0x498da9
-            if !fl.zf { pc = 0x498da9; } else { pc = 0x498da7; } continue;
-        }
-        0x498da7 => {
-            // 0x498da7: mov bl, 1
-            ebx = (ebx & 0xffffff00) | ((0x1u32) & 0xff);
-            pc = 0x498da9; continue;
-        }
-        0x498da9 => {
-            // 0x498da9: cmp byte ptr [ebp + 0x84d8], 1
-            fl = f_sub((rb((ebp.wrapping_add(0x84d8)) as usize) as u32), 0x1u32, 8);
-            // 0x498db0: jne 0x498dd6
-            if !fl.zf { pc = 0x498dd6; } else { pc = 0x498db2; } continue;
-        }
-        0x498db2 => {
-            // 0x498db2: mov eax, dword ptr [ebp + 0x6ce8]
-            eax = rd((ebp.wrapping_add(0x6ce8)) as usize);
-            // 0x498db8: test eax, eax
-            fl = f_logic((eax) & (eax), 32);
-            // 0x498dba: jne 0x498dd0
-            if !fl.zf { pc = 0x498dd0; } else { pc = 0x498dbc; } continue;
-        }
-        0x498dbc => {
-            // 0x498dbc: jmp 0x498de1
-            pc = 0x498de1; continue;
-        }
-        0x498dbe => {
-            // 0x498dbe: mov ebx, dword ptr [eax + 0x5b0]
-            ebx = rd((eax.wrapping_add(0x5b0)) as usize);
-            // 0x498dc4: shr ebx, 0x1e
-            { let r = ebx >> 30; fl = f_logic(r, 32); ebx = r; }
-            // 0x498dc7: and bl, 1
-            { let r = ((ebx & 0xff)) & (0x1u32); fl = f_logic(r, 8); ebx = (ebx & 0xffffff00) | ((r) & 0xff); }
-            // 0x498dca: jmp 0x498da9
-            pc = 0x498da9; continue;
-        }
-        0x498dcc => {
-            // 0x498dcc: xor bl, bl
-            fl = f_logic(0, 8); ebx = (ebx & 0xffffff00) | ((0) & 0xff);
-            // 0x498dce: jmp 0x498dee
-            pc = 0x498dee; continue;
-        }
-        0x498dd0 => {
-            // 0x498dd0: jg 0x498dd6
-            if !fl.zf && fl.sf == fl.of { pc = 0x498dd6; } else { pc = 0x498dd2; } continue;
-        }
-        0x498dd2 => {
-            // 0x498dd2: xor eax, eax
-            fl = f_logic(0, 32); eax = 0;
-            // 0x498dd4: jmp 0x498de1
-            pc = 0x498de1; continue;
-        }
-        0x498dd6 => {
-            // 0x498dd6: mov eax, dword ptr [ebp + 0x8abc]
-            eax = rd((ebp.wrapping_add(0x8abc)) as usize);
-            // 0x498ddc: call 0x960d60
-            callx!(0x960d60, 30, 0, 0, 0.0, 0.0);
-            pc = 0x498de1; continue;
-        }
-        0x498de1 => {
-            // 0x498de1: cmp eax, dword ptr [0x21703d4]
-            fl = f_sub(eax, rd(0x21703d4usize), 32);
-            // 0x498de7: mov byte ptr [esp + 0x13], 1
-            wb((esp.wrapping_add(0x13)) as usize, (0x1u32) as u8);
-            // 0x498dec: je 0x498df3
-            if fl.zf { pc = 0x498df3; } else { pc = 0x498dee; } continue;
-        }
-        0x498dee => {
-            // 0x498dee: mov byte ptr [esp + 0x13], 0
-            wb((esp.wrapping_add(0x13)) as usize, (0x0u32) as u8);
-            pc = 0x498df3; continue;
-        }
-        0x498df3 => {
-            // 0x498df3: test bl, bl
-            fl = f_logic(((ebx & 0xff)) & ((ebx & 0xff)), 8);
-            // 0x498df5: je 0x499044
-            if fl.zf { pc = 0x499044; } else { pc = 0x498dfb; } continue;
-        }
-        0x498dfb => {
-            // 0x498dfb: cmp byte ptr [esp + 0x13], 0
-            fl = f_sub((rb((esp.wrapping_add(0x13)) as usize) as u32), 0x0u32, 8);
-            // 0x498e00: je 0x49903d
-            if fl.zf { pc = 0x49903d; } else { pc = 0x498e06; } continue;
-        }
-        0x498e06 => {
-            bump(C::Cam498d40B498E06);
-            // 0x498e06: fld dword ptr [esi + 4]
-            fx.push(rf((esi.wrapping_add(0x4)) as usize) as f64);
-            // 0x498e09: sub esp, 0xc
-            { let a = esp; let b = 0xcu32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
-            // 0x498e0c: fstp dword ptr [esp + 8]
-            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498e10: lea ebx, [esi + 0x24]
-            ebx = (esi.wrapping_add(0x24));
-            // 0x498e13: fld dword ptr [esi + 0x10]
-            fx.push(rf((esi.wrapping_add(0x10)) as usize) as f64);
-            // 0x498e16: lea edx, [esp + 0x60]
-            edx = (esp.wrapping_add(0x60));
-            // 0x498e1a: fstp dword ptr [esp + 4]
-            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498e1e: fld dword ptr [ebx]
-            fx.push(rf((ebx) as usize) as f64);
-            // 0x498e20: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498e23: push edx
-            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
-            // 0x498e24: call 0xbe2d90
-            callx!(0xbe2d90, 34, 4, 0, 0.0, 0.0);
-            // 0x498e29: lea edi, [esp + 0x54]
-            edi = (esp.wrapping_add(0x54));
-            // 0x498e2d: lea eax, [esp + 0x34]
-            eax = (esp.wrapping_add(0x34));
-            // 0x498e31: call 0xc053e0
-            callx!(0xc053e0, 30, 0, 0, 0.0, 0.0);
-            // 0x498e36: test ebp, ebp
-            fl = f_logic((ebp) & (ebp), 32);
-            // 0x498e38: je 0x498eea
-            if fl.zf { pc = 0x498eea; } else { pc = 0x498e3e; } continue;
-        }
-        0x498e3e => {
-            // 0x498e3e: cmp dword ptr [esi + 0x68], 0
-            fl = f_sub(rd((esi.wrapping_add(0x68)) as usize), 0x0u32, 32);
-            // 0x498e42: lea edx, [esi + 0x68]
-            edx = (esi.wrapping_add(0x68));
-            // 0x498e45: jl 0x498eea
-            if fl.sf != fl.of { pc = 0x498eea; } else { pc = 0x498e4b; } continue;
-        }
-        0x498e4b => {
-            // 0x498e4b: mov eax, edx
-            eax = edx;
-            // 0x498e4d: call 0xbdd230
-            callx!(0xbdd230, 30, 0, 0, 0.0, 0.0);
-            // 0x498e52: test al, al
-            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
-            // 0x498e54: jne 0x498eea
-            if !fl.zf { pc = 0x498eea; } else { pc = 0x498e5a; } continue;
-        }
-        0x498e5a => {
-            // 0x498e5a: mov esi, dword ptr [ebp + 0x84e4]
-            esi = rd((ebp.wrapping_add(0x84e4)) as usize);
-            // 0x498e60: fld dword ptr [esi + 0x4d0]
-            fx.push(rf((esi.wrapping_add(0x4d0)) as usize) as f64);
-            // 0x498e66: mov eax, edx
-            eax = edx;
-            // 0x498e68: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498e6c: call 0xbdd260
-            callx!(0xbdd260, 30, 0, 0, 0.0, 0.0);
-            // 0x498e71: cmp dword ptr [esi + 0x9c], 3
-            fl = f_sub(rd((esi.wrapping_add(0x9c)) as usize), 0x3u32, 32);
-            // 0x498e78: mov dword ptr [esp + 0x14], eax
-            wd((esp.wrapping_add(0x14)) as usize, eax);
-            // 0x498e7c: fild dword ptr [esp + 0x14]
-            fx.push(rd((esp.wrapping_add(0x14)) as usize) as i32 as f64);
-            // 0x498e80: fdiv qword ptr [0xe5bf98]
-            { let v = fx.s(0) / rdf64(0xe5bf98usize); fx.set(0, v); }
-            // 0x498e86: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498e8a: jne 0x498ece
-            if !fl.zf { pc = 0x498ece; } else { pc = 0x498e8c; } continue;
-        }
-        0x498e8c => {
-            bump(C::Cam498d40B498E8C);
-            // 0x498e8c: mov ecx, ebp
-            ecx = ebp;
-            // 0x498e8e: call 0xaa6a90
-            callx!(0xaa6a90, 30, 0, 0, 0.0, 0.0);
-            // 0x498e93: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498e97: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x498e9b: mov esi, dword ptr [ebp + 0x84e4]
-            esi = rd((ebp.wrapping_add(0x84e4)) as usize);
-            // 0x498ea1: fdiv dword ptr [esi + 0x4f4]
-            { let v = fx.s(0) / (rf((esi.wrapping_add(0x4f4)) as usize) as f64); fx.set(0, v); }
-            // 0x498ea7: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498eab: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x498eaf: fcomp qword ptr [0xe5bf40]
-            fx.sw = fcmp(fx.s(0), rdf64(0xe5bf40usize));
-            fx.pop();
-            // 0x498eb5: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x498eb7: test ah, 5
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
-            // 0x498eba: jp 0x498ec2
-            if fl.pf { pc = 0x498ec2; } else { pc = 0x498ebc; } continue;
-        }
-        0x498ebc => {
-            // 0x498ebc: fld1 
-            fx.push(1.0);
-            // 0x498ebe: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            pc = 0x498ec2; continue;
-        }
-        0x498ec2 => {
-            // 0x498ec2: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x498ec6: fmul dword ptr [esp + 0x18]
-            { let v = fx.s(0) * (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
-            // 0x498eca: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            pc = 0x498ece; continue;
-        }
-        0x498ece => {
-            // 0x498ece: mov eax, dword ptr [ebp + 0x84e4]
-            eax = rd((ebp.wrapping_add(0x84e4)) as usize);
-            // 0x498ed4: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x498ed8: fsub dword ptr [eax + 0x4cc]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x4cc)) as usize) as f64); fx.set(0, v); }
-            // 0x498ede: fmul dword ptr [esp + 0x1c]
-            { let v = fx.s(0) * (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x498ee2: fadd dword ptr [eax + 0x4cc]
-            { let v = fx.s(0) + (rf((eax.wrapping_add(0x4cc)) as usize) as f64); fx.set(0, v); }
-            // 0x498ee8: jmp 0x498ef6
-            pc = 0x498ef6; continue;
-        }
-        0x498eea => {
-            // 0x498eea: mov esi, dword ptr [ebp + 0x84e4]
-            esi = rd((ebp.wrapping_add(0x84e4)) as usize);
-            // 0x498ef0: fld dword ptr [esi + 0x4cc]
-            fx.push(rf((esi.wrapping_add(0x4cc)) as usize) as f64);
-            pc = 0x498ef6; continue;
-        }
-        0x498ef6 => {
-            // 0x498ef6: test dword ptr [esi + 0x5b0], 0x80000000
-            fl = f_logic((rd((esi.wrapping_add(0x5b0)) as usize)) & (0x80000000u32), 32);
-            // 0x498f00: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498f04: fld dword ptr [0xe8437c]
-            fx.push(rf(0xe8437cusize) as f64);
-            // 0x498f0a: fld st(0)
-            { let v = fx.s(0); fx.push(v); }
-            // 0x498f0c: fmul dword ptr [esp + 0x14]
-            { let v = fx.s(0) * (rf((esp.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
-            // 0x498f10: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498f14: je 0x498fae
-            if fl.zf { pc = 0x498fae; } else { pc = 0x498f1a; } continue;
-        }
-        0x498f1a => {
-            bump(C::Cam498d40B498F1A);
-            // 0x498f1a: fmul dword ptr [esi + 0x4d4]
-            { let v = fx.s(0) * (rf((esi.wrapping_add(0x4d4)) as usize) as f64); fx.set(0, v); }
-            // 0x498f20: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498f24: fld dword ptr [ebp + 0x3c]
-            fx.push(rf((ebp.wrapping_add(0x3c)) as usize) as f64);
-            // 0x498f27: fmul dword ptr [esp + 0x70]
-            { let v = fx.s(0) * (rf((esp.wrapping_add(0x70)) as usize) as f64); fx.set(0, v); }
-            // 0x498f2b: fld dword ptr [ebp + 0x38]
-            fx.push(rf((ebp.wrapping_add(0x38)) as usize) as f64);
-            // 0x498f2e: fmul dword ptr [esp + 0x6c]
-            { let v = fx.s(0) * (rf((esp.wrapping_add(0x6c)) as usize) as f64); fx.set(0, v); }
-            // 0x498f32: faddp st(1)
-            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
-            fx.pop();
-            // 0x498f34: fld dword ptr [ebp + 0x40]
-            fx.push(rf((ebp.wrapping_add(0x40)) as usize) as f64);
-            // 0x498f37: fmul dword ptr [esp + 0x74]
-            { let v = fx.s(0) * (rf((esp.wrapping_add(0x74)) as usize) as f64); fx.set(0, v); }
-            // 0x498f3b: faddp st(1)
-            { let v = fx.s(1) + fx.s(0); fx.set(1, v); }
-            fx.pop();
-            // 0x498f3d: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498f41: fld1 
-            fx.push(1.0);
-            // 0x498f43: fld dword ptr [esp + 0x1c]
-            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
-            // 0x498f47: fcom st(1)
-            fx.sw = fcmp(fx.s(0), fx.s(1));
-            // 0x498f49: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x498f4b: fstp st(1)
-            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
-            // 0x498f4d: test ah, 1
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x1u32), 8);
-            // 0x498f50: jne 0x498f58
-            if !fl.zf { pc = 0x498f58; } else { pc = 0x498f52; } continue;
-        }
-        0x498f52 => {
-            // 0x498f52: fstp st(0)
-            fx.pop();
-            // 0x498f54: fldz 
-            fx.push(0.0);
-            // 0x498f56: jmp 0x498f6e
-            pc = 0x498f6e; continue;
-        }
-        0x498f58 => {
-            // 0x498f58: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x498f59: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498f5c: call 0x42ef30
-            callx!(0x42ef30, 31, 0, 0, 0.0, 0.0);
-            // 0x498f61: fabs 
-            { let v = fx.s(0).abs(); fx.set(0, v); }
-            // 0x498f63: add esp, 4
-            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x498f66: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498f6a: fld dword ptr [esp + 0x1c]
-            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
-            pc = 0x498f6e; continue;
-        }
-        0x498f6e => {
-            // 0x498f6e: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498f72: fld dword ptr [esp + 0x20]
-            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
-            // 0x498f76: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x498f7a: fcom st(1)
-            fx.sw = fcmp(fx.s(0), fx.s(1));
-            // 0x498f7c: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x498f7e: test ah, 5
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
-            // 0x498f81: jp 0x498f8f
-            if fl.pf { pc = 0x498f8f; } else { pc = 0x498f83; } continue;
-        }
-        0x498f83 => {
-            // 0x498f83: fstp st(1)
-            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
-            // 0x498f85: fstp st(0)
-            fx.pop();
-            // 0x498f87: fld1 
-            fx.push(1.0);
-            // 0x498f89: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498f8d: jmp 0x498fb0
-            pc = 0x498fb0; continue;
-        }
-        0x498f8f => {
-            // 0x498f8f: fdivp st(1)
-            { let v = fx.s(1) / fx.s(0); fx.set(1, v); }
-            fx.pop();
-            // 0x498f91: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498f95: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x498f99: fld dword ptr [esp + 0x20]
-            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
-            // 0x498f9d: fcom st(1)
-            fx.sw = fcmp(fx.s(0), fx.s(1));
-            // 0x498f9f: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x498fa1: fstp st(1)
-            { let v = fx.s(0); fx.set(1, v); fx.pop(); }
-            // 0x498fa3: test ah, 0x41
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x41u32), 8);
-            // 0x498fa6: jne 0x498fae
-            if !fl.zf { pc = 0x498fae; } else { pc = 0x498fa8; } continue;
-        }
-        0x498fa8 => {
-            // 0x498fa8: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498fac: jmp 0x498fb0
-            pc = 0x498fb0; continue;
-        }
-        0x498fae => {
-            // 0x498fae: fstp st(0)
-            fx.pop();
-            pc = 0x498fb0; continue;
-        }
-        0x498fb0 => {
-            bump(C::Cam498d40B498FB0);
-            // 0x498fb0: lea edi, [ebp + 0x20]
-            edi = (ebp.wrapping_add(0x20));
-            // 0x498fb3: lea eax, [esp + 0x24]
-            eax = (esp.wrapping_add(0x24));
-            // 0x498fb7: call 0xc053e0
-            callx!(0xc053e0, 30, 0, 0, 0.0, 0.0);
-            // 0x498fbc: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x498fc0: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x498fc1: lea ecx, [esp + 0x28]
-            ecx = (esp.wrapping_add(0x28));
-            // 0x498fc5: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498fc8: lea esi, [esp + 0x38]
-            esi = (esp.wrapping_add(0x38));
-            // 0x498fcc: lea edi, [esp + 0x48]
-            edi = (esp.wrapping_add(0x48));
-            // 0x498fd0: call 0xc05e80
-            callx!(0xc05e80, 31, 0, 0, 0.0, 0.0);
-            // 0x498fd5: add esp, 4
-            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x498fd8: lea ecx, [esp + 0x54]
-            ecx = (esp.wrapping_add(0x54));
-            // 0x498fdc: mov eax, edi
-            eax = edi;
-            // 0x498fde: call 0xc057d0
-            callx!(0xc057d0, 30, 0, 0, 0.0, 0.0);
-            // 0x498fe3: lea eax, [esp + 0x20]
-            eax = (esp.wrapping_add(0x20));
-            // 0x498fe7: push eax
-            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
-            // 0x498fe8: push ebx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
-            // 0x498fe9: lea edi, [esp + 0x24]
-            edi = (esp.wrapping_add(0x24));
-            // 0x498fed: mov esi, ecx
-            esi = ecx;
-            // 0x498fef: call 0xbe3150
-            callx!(0xbe3150, 32, 2, 0, 0.0, 0.0);
-            // 0x498ff4: fldz 
-            fx.push(0.0);
-            // 0x498ff6: sub esp, 8
-            { let a = esp; let b = 0x8u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
-            // 0x498ff9: fstp dword ptr [esp + 4]
-            wf((esp.wrapping_add(0x4)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x498ffd: fld dword ptr [esp + 0x28]
-            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
-            // 0x499001: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x499004: call 0xbf14d0
-            callx!(0xbf14d0, 32, 0, 0, 0.0, 0.0);
-            // 0x499009: movss dword ptr [esp + 0x28], xmm0
-            wd((esp.wrapping_add(0x28)) as usize, xmm0);
-            // 0x49900f: fld dword ptr [esp + 0x28]
-            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
-            // 0x499013: fstp dword ptr [0x25f5c58]
-            wf(0x25f5c58usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x499019: mov ecx, dword ptr [ebp + 0x84e4]
-            ecx = rd((ebp.wrapping_add(0x84e4)) as usize);
-            // 0x49901f: add esp, 8
-            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x499022: cmp dword ptr [ecx + 0x7c8], 1
-            fl = f_sub(rd((ecx.wrapping_add(0x7c8)) as usize), 0x1u32, 32);
-            // 0x499029: je 0x499061
-            if fl.zf { pc = 0x499061; } else { pc = 0x49902b; } continue;
-        }
-        0x49902b => {
-            // 0x49902b: mov eax, dword ptr [esp + 0x7c]
-            eax = rd((esp.wrapping_add(0x7c)) as usize);
-            // 0x49902f: fld dword ptr [esp + 0x1c]
-            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
-            // 0x499033: fst dword ptr [eax + 0x10]
-            wf((eax.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            // 0x499036: mov esi, eax
-            esi = eax;
-            // 0x499038: fstp dword ptr [eax + 0xc]
-            wf((eax.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49903b: jmp 0x499065
-            pc = 0x499065; continue;
-        }
-        0x49903d => {
-            // 0x49903d: fldz 
-            fx.push(0.0);
-            // 0x49903f: fstp dword ptr [esi + 0xc]
-            wf((esi.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x499042: jmp 0x499065
-            pc = 0x499065; continue;
-        }
-        0x499044 => {
-            // 0x499044: fld dword ptr [esp + 0x80]
-            fx.push(rf((esp.wrapping_add(0x80)) as usize) as f64);
-            // 0x49904b: mov eax, dword ptr [esp + 0x84]
-            eax = rd((esp.wrapping_add(0x84)) as usize);
-            // 0x499052: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x499053: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x499056: push esi
-            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
-            // 0x499057: call 0x498a20
-            callx!(0x498a20, 32, 0, 0, 0.0, 0.0);
-            // 0x49905c: add esp, 8
-            { let a = esp; let b = 0x8u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x49905f: jmp 0x499065
-            pc = 0x499065; continue;
-        }
-        0x499061 => {
-            // 0x499061: mov esi, dword ptr [esp + 0x7c]
-            esi = rd((esp.wrapping_add(0x7c)) as usize);
-            pc = 0x499065; continue;
-        }
-        0x499065 => {
-            // 0x499065: test ebp, ebp
-            fl = f_logic((ebp) & (ebp), 32);
-            // 0x499067: je 0x4990a8
-            if fl.zf { pc = 0x4990a8; } else { pc = 0x499069; } continue;
-        }
-        0x499069 => {
-            // 0x499069: mov ebx, dword ptr [ebp + 0x84e4]
-            ebx = rd((ebp.wrapping_add(0x84e4)) as usize);
-            // 0x49906f: cmp dword ptr [ebx + 0x7c8], 1
-            fl = f_sub(rd((ebx.wrapping_add(0x7c8)) as usize), 0x1u32, 32);
-            // 0x499076: jne 0x4990a8
-            if !fl.zf { pc = 0x4990a8; } else { pc = 0x499078; } continue;
-        }
-        0x499078 => {
-            // 0x499078: cmp byte ptr [esp + 0x13], 0
-            fl = f_sub((rb((esp.wrapping_add(0x13)) as usize) as u32), 0x0u32, 8);
-            // 0x49907d: je 0x4990a8
-            if fl.zf { pc = 0x4990a8; } else { pc = 0x49907f; } continue;
-        }
-        0x49907f => {
-            bump(C::Cam498d40B49907F);
-            // 0x49907f: lea edx, [esp + 0x1c]
-            edx = (esp.wrapping_add(0x1c));
-            // 0x499083: push edx
-            esp = esp.wrapping_sub(4); wd(esp as usize, edx);
-            // 0x499084: lea eax, [esp + 0x1c]
-            eax = (esp.wrapping_add(0x1c));
-            // 0x499088: push eax
-            esp = esp.wrapping_sub(4); wd(esp as usize, eax);
-            // 0x499089: lea esi, [ebp + 0x20]
-            esi = (ebp.wrapping_add(0x20));
-            // 0x49908c: lea edi, [esp + 0x28]
-            edi = (esp.wrapping_add(0x28));
-            // 0x499090: call 0xbe3150
-            callx!(0xbe3150, 32, 2, 0, 0.0, 0.0);
-            // 0x499095: fld dword ptr [ebx + 0x7cc]
-            fx.push(rf((ebx.wrapping_add(0x7cc)) as usize) as f64);
-            // 0x49909b: fmul dword ptr [esp + 0x20]
-            { let v = fx.s(0) * (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49909f: mov ecx, dword ptr [esp + 0x7c]
-            ecx = rd((esp.wrapping_add(0x7c)) as usize);
-            // 0x4990a3: mov esi, ecx
-            esi = ecx;
-            // 0x4990a5: fstp dword ptr [ecx + 0xc]
-            wf((ecx.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            pc = 0x4990a8; continue;
-        }
-        0x4990a8 => {
-            // 0x4990a8: mov eax, dword ptr [0xe9a6b0]
-            eax = rd(0xe9a6b0usize);
-            // 0x4990ad: test eax, eax
-            fl = f_logic((eax) & (eax), 32);
-            // 0x4990af: jl 0x4990d6
-            if fl.sf != fl.of { pc = 0x4990d6; } else { pc = 0x4990b1; } continue;
-        }
-        0x4990b1 => {
-            // 0x4990b1: mov ecx, dword ptr [0xe843ac]
-            ecx = rd(0xe843acusize);
-            // 0x4990b7: cmp eax, ecx
-            fl = f_sub(eax, ecx, 32);
-            // 0x4990b9: jle 0x4990c6
-            if fl.zf || fl.sf != fl.of { pc = 0x4990c6; } else { pc = 0x4990bb; } continue;
-        }
-        0x4990bb => {
-            // 0x4990bb: sub eax, ecx
-            { let a = eax; let b = ecx; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
-            // 0x4990bd: cmp eax, 0x35a4e900
-            fl = f_sub(eax, 0x35a4e900u32, 32);
-            // 0x4990c2: jl 0x4990d0
-            if fl.sf != fl.of { pc = 0x4990d0; } else { pc = 0x4990c4; } continue;
-        }
-        0x4990c4 => {
-            // 0x4990c4: jmp 0x4990d6
-            pc = 0x4990d6; continue;
-        }
-        0x4990c6 => {
-            // 0x4990c6: sub ecx, eax
-            { let a = ecx; let b = eax; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
-            // 0x4990c8: cmp ecx, 0x35a4e900
-            fl = f_sub(ecx, 0x35a4e900u32, 32);
-            // 0x4990ce: jl 0x4990d6
-            if fl.sf != fl.of { pc = 0x4990d6; } else { pc = 0x4990d0; } continue;
-        }
-        0x4990d0 => {
-            // 0x4990d0: mov dword ptr [esi], 4
-            wd((esi) as usize, 0x4u32);
-            pc = 0x4990d6; continue;
-        }
-        0x4990d6 => {
-            // 0x4990d6: test ebp, ebp
-            fl = f_logic((ebp) & (ebp), 32);
-            // 0x4990d8: je 0x49910b
-            if fl.zf { pc = 0x49910b; } else { pc = 0x4990da; } continue;
-        }
-        0x4990da => {
-            // 0x4990da: mov esi, dword ptr [0x21703d4]
-            esi = rd(0x21703d4usize);
-            // 0x4990e0: test esi, esi
-            fl = f_logic((esi) & (esi), 32);
-            // 0x4990e2: je 0x49910b
-            if fl.zf { pc = 0x49910b; } else { pc = 0x4990e4; } continue;
-        }
-        0x4990e4 => {
-            // 0x4990e4: mov edx, dword ptr [ebp + 0x84e4]
-            edx = rd((ebp.wrapping_add(0x84e4)) as usize);
-            // 0x4990ea: cmp dword ptr [edx + 0x9c], 4
-            fl = f_sub(rd((edx.wrapping_add(0x9c)) as usize), 0x4u32, 32);
-            // 0x4990f1: sete al
-            eax = (eax & 0xffffff00) | (((fl.zf) as u32) & 0xff);
-            // 0x4990f4: test al, al
-            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
-            // 0x4990f6: je 0x49910b
-            if fl.zf { pc = 0x49910b; } else { pc = 0x4990f8; } continue;
-        }
-        0x4990f8 => {
-            // 0x4990f8: call 0x960c30
-            callx!(0x960c30, 30, 0, 0, 0.0, 0.0);
-            // 0x4990fd: test al, al
-            fl = f_logic(((eax & 0xff)) & ((eax & 0xff)), 8);
-            // 0x4990ff: je 0x49910b
-            if fl.zf { pc = 0x49910b; } else { pc = 0x499101; } continue;
-        }
-        0x499101 => {
-            // 0x499101: mov eax, dword ptr [esp + 0x7c]
-            eax = rd((esp.wrapping_add(0x7c)) as usize);
-            // 0x499105: mov dword ptr [eax], 4
-            wd((eax) as usize, 0x4u32);
-            pc = 0x49910b; continue;
-        }
-        0x49910b => {
-            // 0x49910b: pop edi
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
-            // 0x49910c: pop esi
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
-            // 0x49910d: pop ebp
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
-            // 0x49910e: pop ebx
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
-            // 0x49910f: add esp, 0x68
-            { let a = esp; let b = 0x68u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x499112: ret 
-            break;
-        }
-            _ => unreachable!(),
-        }
-    }
-    #[cfg(test)]
-    {
-        ent.ebp = ebp;
-        ent.pad = esp;
-    }
-    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
-    let depth = (8 - fx.top) & 7;
-    ent.nst = (depth >= 1) as u32;
-    if depth >= 1 {
-        ent.st0 = fx.s(0);
-    }
-    std::hint::black_box(&stk);
-}
-
 extern "C" fn cam_498d40_entry(ent: *mut Ent, args: *const u32) {
-    unsafe { cam_498d40_body(&mut *ent, args) }
+    bump(C::Cam498d40Calls);
+    unsafe { hand::camera_context_orient_step_body(&mut *ent, args) }
 }
 
 ent_thunk!(cam_498d40_thunk, cam_498d40_entry, 0);
@@ -8839,1494 +7169,9 @@ const CAM_49AE60_BODY: [u8; 398] = [
 ];
 
 
-// --- cam_49f320 (0x49f320..0x49fc96, 2422 bytes) ----------------------------------------
-
-#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
-unsafe fn cam_49f320_body(ent: &mut Ent, args: *const u32) {
-    let mut stk = [0u64; 512];
-    #[cfg(not(test))]
-    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
-    #[cfg(test)]
-    let stk_p = difftest::STK_P;
-    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
-    wd(esp as usize, 0);
-    for k in 0..16 {
-        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
-    }
-    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
-    let mut xmm0 = ent.xmm0;
-    let mut fl = Fl::default();
-    let mut fx = X87::new();
-    macro_rules! callx {
-        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
-            let mut b = Blk {
-                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
-                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
-            };
-            #[cfg(test)]
-            difftest::pre_call(&b, &fx, $pop);
-            let n = callx_raw(&mut b);
-            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
-            for k in (0..n).rev() {
-                fx.push(b.st_out[k]);
-            }
-            esp = esp.wrapping_add(4 * $pop);
-        }};
-    }
-    let mut pc: usize = 0x49f320;
-    loop {
-        #[cfg(test)]
-        difftest::cov(pc);
-        match pc {
-        0x49f320 => {
-            bump(C::Cam49f320Calls);
-            // 0x49f320: sub esp, 0x4b4
-            { let a = esp; let b = 0x4b4u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
-            // 0x49f326: push ebx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ebx);
-            // 0x49f327: push ebp
-            esp = esp.wrapping_sub(4); wd(esp as usize, ebp);
-            // 0x49f328: mov ebp, dword ptr [esp + 0x4c0]
-            ebp = rd((esp.wrapping_add(0x4c0)) as usize);
-            // 0x49f32f: push edi
-            esp = esp.wrapping_sub(4); wd(esp as usize, edi);
-            // 0x49f330: push 0x4b0
-            esp = esp.wrapping_sub(4); wd(esp as usize, 0x4b0u32);
-            // 0x49f335: push 0
-            esp = esp.wrapping_sub(4); wd(esp as usize, 0x0u32);
-            // 0x49f337: push esi
-            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
-            // 0x49f338: mov edi, eax
-            edi = eax;
-            // 0x49f33a: call 0xca0bc0
-            callx!(0xca0bc0, 4, 0, 0, 0.0, 0.0);
-            // 0x49f33f: fldz 
-            fx.push(0.0);
-            // 0x49f341: mov eax, dword ptr [esp + 0x4d4]
-            eax = rd((esp.wrapping_add(0x4d4)) as usize);
-            // 0x49f348: fst dword ptr [esp + 0x30]
-            wf((esp.wrapping_add(0x30)) as usize, fx.s(0) as f32);
-            // 0x49f34c: lea ecx, [edi - 1]
-            ecx = (edi.wrapping_add(0xffffffff));
-            // 0x49f34f: add esp, 0xc
-            { let a = esp; let b = 0xcu32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x49f352: xor ebx, ebx
-            fl = f_logic(0, 32); ebx = 0;
-            // 0x49f354: cmp ecx, 4
-            fl = f_sub(ecx, 0x4u32, 32);
-            // 0x49f357: jl 0x49f39c
-            if fl.sf != fl.of { pc = 0x49f39c; } else { pc = 0x49f359; } continue;
-        }
-        0x49f359 => {
-            // 0x49f359: lea edx, [ecx - 4]
-            edx = (ecx.wrapping_add(0xfffffffc));
-            // 0x49f35c: shr edx, 2
-            { let r = edx >> 2; fl = f_logic(r, 32); edx = r; }
-            // 0x49f35f: add edx, 1
-            { let a = edx; let b = 0x1u32; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
-            // 0x49f362: lea ebx, [edx*4]
-            ebx = (edx.wrapping_mul(4));
-            pc = 0x49f369; continue;
-        }
-        0x49f369 => {
-            bump(C::Cam49f320B49F369);
-            // 0x49f369: fld dword ptr [eax]
-            fx.push(rf((eax) as usize) as f64);
-            // 0x49f36b: add eax, 0x10
-            { let a = eax; let b = 0x10u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
-            // 0x49f36e: sub edx, 1
-            { let a = edx; let b = 0x1u32; fl = f_sub(a, b, 32); edx = a.wrapping_sub(b); }
-            // 0x49f371: fadd dword ptr [esp + 0x24]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
-            // 0x49f375: fstp dword ptr [esp + 0x28]
-            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f379: fld dword ptr [esp + 0x28]
-            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
-            // 0x49f37d: fadd dword ptr [eax - 0xc]
-            { let v = fx.s(0) + (rf((eax.wrapping_add(0xfffffff4)) as usize) as f64); fx.set(0, v); }
-            // 0x49f380: fstp dword ptr [esp + 0x28]
-            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f384: fld dword ptr [esp + 0x28]
-            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
-            // 0x49f388: fadd dword ptr [eax - 8]
-            { let v = fx.s(0) + (rf((eax.wrapping_add(0xfffffff8)) as usize) as f64); fx.set(0, v); }
-            // 0x49f38b: fstp dword ptr [esp + 0x28]
-            wf((esp.wrapping_add(0x28)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f38f: fld dword ptr [esp + 0x28]
-            fx.push(rf((esp.wrapping_add(0x28)) as usize) as f64);
-            // 0x49f393: fadd dword ptr [eax - 4]
-            { let v = fx.s(0) + (rf((eax.wrapping_add(0xfffffffc)) as usize) as f64); fx.set(0, v); }
-            // 0x49f396: fstp dword ptr [esp + 0x24]
-            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f39a: jne 0x49f369
-            if !fl.zf { pc = 0x49f369; } else { pc = 0x49f39c; } continue;
-        }
-        0x49f39c => {
-            // 0x49f39c: cmp ebx, ecx
-            fl = f_sub(ebx, ecx, 32);
-            // 0x49f39e: jge 0x49f3b4
-            if fl.sf == fl.of { pc = 0x49f3b4; } else { pc = 0x49f3a0; } continue;
-        }
-        0x49f3a0 => {
-            // 0x49f3a0: sub ecx, ebx
-            { let a = ecx; let b = ebx; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
-            pc = 0x49f3a2; continue;
-        }
-        0x49f3a2 => {
-            // 0x49f3a2: fld dword ptr [eax]
-            fx.push(rf((eax) as usize) as f64);
-            // 0x49f3a4: add eax, 4
-            { let a = eax; let b = 0x4u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
-            // 0x49f3a7: sub ecx, 1
-            { let a = ecx; let b = 0x1u32; fl = f_sub(a, b, 32); ecx = a.wrapping_sub(b); }
-            // 0x49f3aa: fadd dword ptr [esp + 0x24]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
-            // 0x49f3ae: fstp dword ptr [esp + 0x24]
-            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f3b2: jne 0x49f3a2
-            if !fl.zf { pc = 0x49f3a2; } else { pc = 0x49f3b4; } continue;
-        }
-        0x49f3b4 => {
-            bump(C::Cam49f320B49F3B4);
-            // 0x49f3b4: mov eax, dword ptr [ebp]
-            eax = rd((ebp) as usize);
-            // 0x49f3b7: mov ecx, dword ptr [ebp + 4]
-            ecx = rd((ebp.wrapping_add(0x4)) as usize);
-            // 0x49f3ba: fld dword ptr [eax + 0x1c]
-            fx.push(rf((eax.wrapping_add(0x1c)) as usize) as f64);
-            // 0x49f3bd: fsub dword ptr [ecx + 0x1c]
-            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f3c0: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f3c4: fld dword ptr [eax + 0x20]
-            fx.push(rf((eax.wrapping_add(0x20)) as usize) as f64);
-            // 0x49f3c7: fsub dword ptr [ecx + 0x20]
-            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49f3ca: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f3ce: fld dword ptr [eax + 0x24]
-            fx.push(rf((eax.wrapping_add(0x24)) as usize) as f64);
-            // 0x49f3d1: fsub dword ptr [ecx + 0x24]
-            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
-            // 0x49f3d4: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f3d8: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x49f3dc: fld qword ptr [0xdd50e8]
-            fx.push(rdf64(0xdd50e8usize));
-            // 0x49f3e2: fmul st(1), st(0)
-            { let v = fx.s(1) * fx.s(0); fx.set(1, v); }
-            // 0x49f3e4: fxch st(1)
-            fx.xch(1);
-            // 0x49f3e6: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f3ea: fld dword ptr [esp + 0x1c]
-            fx.push(rf((esp.wrapping_add(0x1c)) as usize) as f64);
-            // 0x49f3ee: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f3f0: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f3f4: fld dword ptr [esp + 0x20]
-            fx.push(rf((esp.wrapping_add(0x20)) as usize) as f64);
-            // 0x49f3f8: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f3fa: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f3fe: fld dword ptr [eax + 0x1c]
-            fx.push(rf((eax.wrapping_add(0x1c)) as usize) as f64);
-            // 0x49f401: fadd dword ptr [esp + 0xc]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0xc)) as usize) as f64); fx.set(0, v); }
-            // 0x49f405: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f409: mov edx, dword ptr [esp + 0x18]
-            edx = rd((esp.wrapping_add(0x18)) as usize);
-            // 0x49f40d: fld dword ptr [eax + 0x20]
-            fx.push(rf((eax.wrapping_add(0x20)) as usize) as f64);
-            // 0x49f410: fadd dword ptr [esp + 0x10]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x10)) as usize) as f64); fx.set(0, v); }
-            // 0x49f414: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f418: fld dword ptr [eax + 0x24]
-            fx.push(rf((eax.wrapping_add(0x24)) as usize) as f64);
-            // 0x49f41b: mov dword ptr [esp + 0x40], edx
-            wd((esp.wrapping_add(0x40)) as usize, edx);
-            // 0x49f41f: fadd dword ptr [esp + 0x14]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
-            // 0x49f423: mov edx, dword ptr [esp + 0x1c]
-            edx = rd((esp.wrapping_add(0x1c)) as usize);
-            // 0x49f427: mov dword ptr [esp + 0x44], edx
-            wd((esp.wrapping_add(0x44)) as usize, edx);
-            // 0x49f42b: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f42f: mov edx, dword ptr [esp + 0x20]
-            edx = rd((esp.wrapping_add(0x20)) as usize);
-            // 0x49f433: mov dword ptr [esp + 0x48], edx
-            wd((esp.wrapping_add(0x48)) as usize, edx);
-            // 0x49f437: fld dword ptr [eax + 0x40]
-            fx.push(rf((eax.wrapping_add(0x40)) as usize) as f64);
-            // 0x49f43a: fsub dword ptr [ecx + 0x40]
-            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x40)) as usize) as f64); fx.set(0, v); }
-            // 0x49f43d: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f441: fld dword ptr [eax + 0x44]
-            fx.push(rf((eax.wrapping_add(0x44)) as usize) as f64);
-            // 0x49f444: fsub dword ptr [ecx + 0x44]
-            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x44)) as usize) as f64); fx.set(0, v); }
-            // 0x49f447: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f44b: fld dword ptr [eax + 0x48]
-            fx.push(rf((eax.wrapping_add(0x48)) as usize) as f64);
-            // 0x49f44e: fsub dword ptr [ecx + 0x48]
-            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x48)) as usize) as f64); fx.set(0, v); }
-            // 0x49f451: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f455: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49f459: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f45b: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f45f: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49f463: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f465: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f469: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x49f46d: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f46f: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f473: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x49f477: fadd dword ptr [eax + 0x40]
-            { let v = fx.s(0) + (rf((eax.wrapping_add(0x40)) as usize) as f64); fx.set(0, v); }
-            // 0x49f47a: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f47e: mov edx, dword ptr [esp + 0xc]
-            edx = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49f482: fld dword ptr [eax + 0x44]
-            fx.push(rf((eax.wrapping_add(0x44)) as usize) as f64);
-            // 0x49f485: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f489: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f48d: fld dword ptr [eax + 0x48]
-            fx.push(rf((eax.wrapping_add(0x48)) as usize) as f64);
-            // 0x49f490: mov dword ptr [esp + 0x1c0], edx
-            wd((esp.wrapping_add(0x1c0)) as usize, edx);
-            // 0x49f497: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49f49b: mov edx, dword ptr [esp + 0x10]
-            edx = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49f49f: mov dword ptr [esp + 0x1c4], edx
-            wd((esp.wrapping_add(0x1c4)) as usize, edx);
-            // 0x49f4a6: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f4aa: mov edx, dword ptr [esp + 0x14]
-            edx = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49f4ae: mov dword ptr [esp + 0x1c8], edx
-            wd((esp.wrapping_add(0x1c8)) as usize, edx);
-            // 0x49f4b5: fld dword ptr [eax + 0x28]
-            fx.push(rf((eax.wrapping_add(0x28)) as usize) as f64);
-            // 0x49f4b8: fsub dword ptr [ecx + 0x28]
-            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x28)) as usize) as f64); fx.set(0, v); }
-            // 0x49f4bb: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f4bf: fld dword ptr [eax + 0x2c]
-            fx.push(rf((eax.wrapping_add(0x2c)) as usize) as f64);
-            // 0x49f4c2: fsub dword ptr [ecx + 0x2c]
-            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x2c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f4c5: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f4c9: fld dword ptr [eax + 0x30]
-            fx.push(rf((eax.wrapping_add(0x30)) as usize) as f64);
-            // 0x49f4cc: fsub dword ptr [ecx + 0x30]
-            { let v = fx.s(0) - (rf((ecx.wrapping_add(0x30)) as usize) as f64); fx.set(0, v); }
-            // 0x49f4cf: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f4d3: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49f4d7: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f4d9: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f4dd: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49f4e1: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f4e3: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f4e7: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x49f4eb: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f4ed: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f4f1: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x49f4f5: fadd dword ptr [eax + 0x28]
-            { let v = fx.s(0) + (rf((eax.wrapping_add(0x28)) as usize) as f64); fx.set(0, v); }
-            // 0x49f4f8: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f4fc: fld dword ptr [eax + 0x2c]
-            fx.push(rf((eax.wrapping_add(0x2c)) as usize) as f64);
-            // 0x49f4ff: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f503: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f507: mov ecx, dword ptr [esp + 0x10]
-            ecx = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49f50b: fld dword ptr [eax + 0x30]
-            fx.push(rf((eax.wrapping_add(0x30)) as usize) as f64);
-            // 0x49f50e: mov eax, dword ptr [esp + 0xc]
-            eax = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49f512: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49f516: mov dword ptr [esp + 0x340], eax
-            wd((esp.wrapping_add(0x340)) as usize, eax);
-            // 0x49f51d: mov dword ptr [esp + 0x344], ecx
-            wd((esp.wrapping_add(0x344)) as usize, ecx);
-            // 0x49f524: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f528: mov edx, dword ptr [esp + 0x14]
-            edx = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49f52c: mov dword ptr [esp + 0x348], edx
-            wd((esp.wrapping_add(0x348)) as usize, edx);
-            // 0x49f533: xor edx, edx
-            fl = f_logic(0, 32); edx = 0;
-            // 0x49f535: test edi, edi
-            fl = f_logic((edi) & (edi), 32);
-            // 0x49f537: jle 0x49f59c
-            if fl.zf || fl.sf != fl.of { pc = 0x49f59c; } else { pc = 0x49f539; } continue;
-        }
-        0x49f539 => {
-            // 0x49f539: xor eax, eax
-            fl = f_logic(0, 32); eax = 0;
-            pc = 0x49f53b; continue;
-        }
-        0x49f53b => {
-            bump(C::Cam49f320B49F53B);
-            // 0x49f53b: mov ecx, dword ptr [ebp + edx*4]
-            ecx = rd((ebp.wrapping_add(edx.wrapping_mul(4))) as usize);
-            // 0x49f53f: mov ebx, dword ptr [ecx + 0x1c]
-            ebx = rd((ecx.wrapping_add(0x1c)) as usize);
-            // 0x49f542: mov dword ptr [esp + eax + 0x4c], ebx
-            wd((esp.wrapping_add(eax).wrapping_add(0x4c)) as usize, ebx);
-            // 0x49f546: mov ebx, dword ptr [ecx + 0x20]
-            ebx = rd((ecx.wrapping_add(0x20)) as usize);
-            // 0x49f549: mov dword ptr [esp + eax + 0x50], ebx
-            wd((esp.wrapping_add(eax).wrapping_add(0x50)) as usize, ebx);
-            // 0x49f54d: mov ebx, dword ptr [ecx + 0x24]
-            ebx = rd((ecx.wrapping_add(0x24)) as usize);
-            // 0x49f550: mov dword ptr [esp + eax + 0x54], ebx
-            wd((esp.wrapping_add(eax).wrapping_add(0x54)) as usize, ebx);
-            // 0x49f554: mov ebx, dword ptr [ecx + 0x40]
-            ebx = rd((ecx.wrapping_add(0x40)) as usize);
-            // 0x49f557: mov dword ptr [esp + eax + 0x1cc], ebx
-            wd((esp.wrapping_add(eax).wrapping_add(0x1cc)) as usize, ebx);
-            // 0x49f55e: mov ebx, dword ptr [ecx + 0x44]
-            ebx = rd((ecx.wrapping_add(0x44)) as usize);
-            // 0x49f561: mov dword ptr [esp + eax + 0x1d0], ebx
-            wd((esp.wrapping_add(eax).wrapping_add(0x1d0)) as usize, ebx);
-            // 0x49f568: mov ebx, dword ptr [ecx + 0x48]
-            ebx = rd((ecx.wrapping_add(0x48)) as usize);
-            // 0x49f56b: add ecx, 0x28
-            { let a = ecx; let b = 0x28u32; fl = f_add(a, b, 32); ecx = a.wrapping_add(b); }
-            // 0x49f56e: mov dword ptr [esp + eax + 0x1d4], ebx
-            wd((esp.wrapping_add(eax).wrapping_add(0x1d4)) as usize, ebx);
-            // 0x49f575: mov ebx, dword ptr [ecx]
-            ebx = rd((ecx) as usize);
-            // 0x49f577: mov dword ptr [esp + eax + 0x34c], ebx
-            wd((esp.wrapping_add(eax).wrapping_add(0x34c)) as usize, ebx);
-            // 0x49f57e: mov ebx, dword ptr [ecx + 4]
-            ebx = rd((ecx.wrapping_add(0x4)) as usize);
-            // 0x49f581: mov dword ptr [esp + eax + 0x350], ebx
-            wd((esp.wrapping_add(eax).wrapping_add(0x350)) as usize, ebx);
-            // 0x49f588: mov ecx, dword ptr [ecx + 8]
-            ecx = rd((ecx.wrapping_add(0x8)) as usize);
-            // 0x49f58b: mov dword ptr [esp + eax + 0x354], ecx
-            wd((esp.wrapping_add(eax).wrapping_add(0x354)) as usize, ecx);
-            // 0x49f592: add edx, 1
-            { let a = edx; let b = 0x1u32; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
-            // 0x49f595: add eax, 0xc
-            { let a = eax; let b = 0xcu32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
-            // 0x49f598: cmp edx, edi
-            fl = f_sub(edx, edi, 32);
-            // 0x49f59a: jl 0x49f53b
-            if fl.sf != fl.of { pc = 0x49f53b; } else { pc = 0x49f59c; } continue;
-        }
-        0x49f59c => {
-            bump(C::Cam49f320B49F59C);
-            // 0x49f59c: mov eax, dword ptr [ebp + edi*4 - 8]
-            eax = rd((ebp.wrapping_add(edi.wrapping_mul(4)).wrapping_add(0xfffffff8)) as usize);
-            // 0x49f5a0: mov ecx, dword ptr [ebp + edi*4 - 4]
-            ecx = rd((ebp.wrapping_add(edi.wrapping_mul(4)).wrapping_add(0xfffffffc)) as usize);
-            // 0x49f5a4: fld dword ptr [ecx + 0x1c]
-            fx.push(rf((ecx.wrapping_add(0x1c)) as usize) as f64);
-            // 0x49f5a7: lea ebx, [edi + edi*2]
-            ebx = (edi.wrapping_add(edi.wrapping_mul(2)));
-            // 0x49f5aa: fsub dword ptr [eax + 0x1c]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f5ad: add ebx, ebx
-            { let a = ebx; let b = ebx; fl = f_add(a, b, 32); ebx = a.wrapping_add(b); }
-            // 0x49f5af: add ebx, ebx
-            { let a = ebx; let b = ebx; fl = f_add(a, b, 32); ebx = a.wrapping_add(b); }
-            // 0x49f5b1: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f5b5: fld dword ptr [ecx + 0x20]
-            fx.push(rf((ecx.wrapping_add(0x20)) as usize) as f64);
-            // 0x49f5b8: fsub dword ptr [eax + 0x20]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49f5bb: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f5bf: fld dword ptr [ecx + 0x24]
-            fx.push(rf((ecx.wrapping_add(0x24)) as usize) as f64);
-            // 0x49f5c2: fsub dword ptr [eax + 0x24]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
-            // 0x49f5c5: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f5c9: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49f5cd: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f5cf: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f5d3: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49f5d7: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f5d9: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f5dd: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x49f5e1: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f5e3: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f5e7: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x49f5eb: fadd dword ptr [ecx + 0x1c]
-            { let v = fx.s(0) + (rf((ecx.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f5ee: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f5f2: mov edx, dword ptr [esp + 0xc]
-            edx = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49f5f6: fld dword ptr [ecx + 0x20]
-            fx.push(rf((ecx.wrapping_add(0x20)) as usize) as f64);
-            // 0x49f5f9: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f5fd: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f601: fld dword ptr [ecx + 0x24]
-            fx.push(rf((ecx.wrapping_add(0x24)) as usize) as f64);
-            // 0x49f604: mov ecx, dword ptr [esp + 0x10]
-            ecx = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49f608: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49f60c: mov dword ptr [esp + ebx + 0x4c], edx
-            wd((esp.wrapping_add(ebx).wrapping_add(0x4c)) as usize, edx);
-            // 0x49f610: mov dword ptr [esp + ebx + 0x50], ecx
-            wd((esp.wrapping_add(ebx).wrapping_add(0x50)) as usize, ecx);
-            // 0x49f614: mov ecx, dword ptr [ebp + edi*4 - 4]
-            ecx = rd((ebp.wrapping_add(edi.wrapping_mul(4)).wrapping_add(0xfffffffc)) as usize);
-            // 0x49f618: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f61c: mov edx, dword ptr [esp + 0x14]
-            edx = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49f620: mov dword ptr [esp + ebx + 0x54], edx
-            wd((esp.wrapping_add(ebx).wrapping_add(0x54)) as usize, edx);
-            // 0x49f624: fld dword ptr [ecx + 0x40]
-            fx.push(rf((ecx.wrapping_add(0x40)) as usize) as f64);
-            // 0x49f627: fsub dword ptr [eax + 0x40]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x40)) as usize) as f64); fx.set(0, v); }
-            // 0x49f62a: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f62e: fld dword ptr [ecx + 0x44]
-            fx.push(rf((ecx.wrapping_add(0x44)) as usize) as f64);
-            // 0x49f631: fsub dword ptr [eax + 0x44]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x44)) as usize) as f64); fx.set(0, v); }
-            // 0x49f634: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f638: fld dword ptr [ecx + 0x48]
-            fx.push(rf((ecx.wrapping_add(0x48)) as usize) as f64);
-            // 0x49f63b: fsub dword ptr [eax + 0x48]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x48)) as usize) as f64); fx.set(0, v); }
-            // 0x49f63e: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f642: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49f646: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f648: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f64c: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49f650: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f652: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f656: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x49f65a: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f65c: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f660: fld dword ptr [ecx + 0x40]
-            fx.push(rf((ecx.wrapping_add(0x40)) as usize) as f64);
-            // 0x49f663: fadd dword ptr [esp + 0x18]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
-            // 0x49f667: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f66b: fld dword ptr [ecx + 0x44]
-            fx.push(rf((ecx.wrapping_add(0x44)) as usize) as f64);
-            // 0x49f66e: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f672: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f676: mov edx, dword ptr [esp + 0x10]
-            edx = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49f67a: fld dword ptr [ecx + 0x48]
-            fx.push(rf((ecx.wrapping_add(0x48)) as usize) as f64);
-            // 0x49f67d: mov ecx, dword ptr [esp + 0xc]
-            ecx = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49f681: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49f685: mov dword ptr [esp + ebx + 0x1cc], ecx
-            wd((esp.wrapping_add(ebx).wrapping_add(0x1cc)) as usize, ecx);
-            // 0x49f68c: mov dword ptr [esp + ebx + 0x1d0], edx
-            wd((esp.wrapping_add(ebx).wrapping_add(0x1d0)) as usize, edx);
-            // 0x49f693: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f697: mov ecx, dword ptr [esp + 0x14]
-            ecx = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49f69b: mov dword ptr [esp + ebx + 0x1d4], ecx
-            wd((esp.wrapping_add(ebx).wrapping_add(0x1d4)) as usize, ecx);
-            // 0x49f6a2: mov ecx, dword ptr [ebp + edi*4 - 4]
-            ecx = rd((ebp.wrapping_add(edi.wrapping_mul(4)).wrapping_add(0xfffffffc)) as usize);
-            // 0x49f6a6: fld dword ptr [ecx + 0x28]
-            fx.push(rf((ecx.wrapping_add(0x28)) as usize) as f64);
-            // 0x49f6a9: fsub dword ptr [eax + 0x28]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x28)) as usize) as f64); fx.set(0, v); }
-            // 0x49f6ac: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f6b0: fld dword ptr [ecx + 0x2c]
-            fx.push(rf((ecx.wrapping_add(0x2c)) as usize) as f64);
-            // 0x49f6b3: fsub dword ptr [eax + 0x2c]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x2c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f6b6: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f6ba: fld dword ptr [ecx + 0x30]
-            fx.push(rf((ecx.wrapping_add(0x30)) as usize) as f64);
-            // 0x49f6bd: fsub dword ptr [eax + 0x30]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x30)) as usize) as f64); fx.set(0, v); }
-            // 0x49f6c0: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f6c4: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49f6c8: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f6ca: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f6ce: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49f6d2: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f6d4: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f6d8: fmul dword ptr [esp + 0x14]
-            { let v = fx.s(0) * (rf((esp.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
-            // 0x49f6dc: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f6e0: fld dword ptr [ecx + 0x28]
-            fx.push(rf((ecx.wrapping_add(0x28)) as usize) as f64);
-            // 0x49f6e3: fadd dword ptr [esp + 0x18]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
-            // 0x49f6e7: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f6eb: mov edx, dword ptr [esp + 0xc]
-            edx = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49f6ef: fld dword ptr [ecx + 0x2c]
-            fx.push(rf((ecx.wrapping_add(0x2c)) as usize) as f64);
-            // 0x49f6f2: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f6f6: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f6fa: mov eax, dword ptr [esp + 0x10]
-            eax = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49f6fe: fld dword ptr [ecx + 0x30]
-            fx.push(rf((ecx.wrapping_add(0x30)) as usize) as f64);
-            // 0x49f701: mov dword ptr [esp + ebx + 0x34c], edx
-            wd((esp.wrapping_add(ebx).wrapping_add(0x34c)) as usize, edx);
-            // 0x49f708: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49f70c: mov dword ptr [esp + ebx + 0x350], eax
-            wd((esp.wrapping_add(ebx).wrapping_add(0x350)) as usize, eax);
-            // 0x49f713: lea edx, [esp + 0x40]
-            edx = (esp.wrapping_add(0x40));
-            // 0x49f717: lea eax, [edi + 2]
-            eax = (edi.wrapping_add(0x2));
-            // 0x49f71a: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f71e: mov ecx, dword ptr [esp + 0x14]
-            ecx = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49f722: mov dword ptr [esp + ebx + 0x354], ecx
-            wd((esp.wrapping_add(ebx).wrapping_add(0x354)) as usize, ecx);
-            // 0x49f729: fst dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            // 0x49f72d: lea ecx, [esp + 0x1c0]
-            ecx = (esp.wrapping_add(0x1c0));
-            // 0x49f734: fst dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            // 0x49f738: mov dword ptr [esp + 0xc], edx
-            wd((esp.wrapping_add(0xc)) as usize, edx);
-            // 0x49f73c: fstp dword ptr [esp + 0x3c]
-            wf((esp.wrapping_add(0x3c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f740: lea edx, [esp + 0x340]
-            edx = (esp.wrapping_add(0x340));
-            // 0x49f747: fld dword ptr [esp + 0x24]
-            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
-            // 0x49f74b: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x49f74c: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f74f: mov dword ptr [esp + 0x14], eax
-            wd((esp.wrapping_add(0x14)) as usize, eax);
-            // 0x49f753: mov dword ptr [esp + 0x20], eax
-            wd((esp.wrapping_add(0x20)) as usize, eax);
-            // 0x49f757: mov dword ptr [esp + 0x1c], ecx
-            wd((esp.wrapping_add(0x1c)) as usize, ecx);
-            // 0x49f75b: mov dword ptr [esp + 0x3c], eax
-            wd((esp.wrapping_add(0x3c)) as usize, eax);
-            // 0x49f75f: mov dword ptr [esp + 0x38], edx
-            wd((esp.wrapping_add(0x38)) as usize, edx);
-            // 0x49f763: call 0x4912d0
-            callx!(0x4912d0, 2, 0, 0, 0.0, 0.0);
-            // 0x49f768: add esp, 4
-            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x49f76b: call 0xda0140
-            callx!(0xda0140, 1, 0, 0, 0.0, 0.0);
-            // 0x49f770: cmp eax, 0x1e
-            fl = f_sub(eax, 0x1eu32, 32);
-            // 0x49f773: jge 0x49f78c
-            if fl.sf == fl.of { pc = 0x49f78c; } else { pc = 0x49f775; } continue;
-        }
-        0x49f775 => {
-            // 0x49f775: fld dword ptr [esp + 0x24]
-            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
-            // 0x49f779: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x49f77a: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f77d: call 0x4912d0
-            callx!(0x4912d0, 2, 0, 0, 0.0, 0.0);
-            // 0x49f782: add esp, 4
-            { let a = esp; let b = 0x4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x49f785: call 0xda0140
-            callx!(0xda0140, 1, 0, 0, 0.0, 0.0);
-            // 0x49f78a: jmp 0x49f791
-            pc = 0x49f791; continue;
-        }
-        0x49f78c => {
-            // 0x49f78c: mov eax, 0x1e
-            eax = 0x1eu32;
-            pc = 0x49f791; continue;
-        }
-        0x49f791 => {
-            bump(C::Cam49f320B49F791);
-            // 0x49f791: fld dword ptr [esp + 0x24]
-            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
-            // 0x49f795: lea ecx, [eax - 1]
-            ecx = (eax.wrapping_add(0xffffffff));
-            // 0x49f798: mov dword ptr [esp + 0x28], ecx
-            wd((esp.wrapping_add(0x28)) as usize, ecx);
-            // 0x49f79c: fidiv dword ptr [esp + 0x28]
-            { let v = fx.s(0) / (rd((esp.wrapping_add(0x28)) as usize) as i32 as f64); fx.set(0, v); }
-            // 0x49f7a0: mov ebp, 1
-            ebp = 0x1u32;
-            // 0x49f7a5: cmp eax, ebp
-            fl = f_sub(eax, ebp, 32);
-            // 0x49f7a7: mov dword ptr [esi], eax
-            wd((esi) as usize, eax);
-            // 0x49f7a9: mov dword ptr [esp + 0x28], 0
-            wd((esp.wrapping_add(0x28)) as usize, 0x0u32);
-            // 0x49f7b1: fstp dword ptr [esi + 4]
-            wf((esi.wrapping_add(0x4)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f7b4: fldz 
-            fx.push(0.0);
-            // 0x49f7b6: fst dword ptr [esp + 0x24]
-            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
-            // 0x49f7ba: jle 0x49f88e
-            if fl.zf || fl.sf != fl.of { pc = 0x49f88e; } else { pc = 0x49f7c0; } continue;
-        }
-        0x49f7c0 => {
-            // 0x49f7c0: mov edi, dword ptr [esp + 0x4c8]
-            edi = rd((esp.wrapping_add(0x4c8)) as usize);
-            // 0x49f7c7: fstp st(0)
-            fx.pop();
-            // 0x49f7c9: fld dword ptr [esp + 0x24]
-            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
-            // 0x49f7cd: lea edx, [esi + 0x194]
-            edx = (esi.wrapping_add(0x194));
-            // 0x49f7d3: mov dword ptr [esp + 0x2c], edx
-            wd((esp.wrapping_add(0x2c)) as usize, edx);
-            pc = 0x49f7d7; continue;
-        }
-        0x49f7d7 => {
-            bump(C::Cam49f320B49F7D7);
-            // 0x49f7d7: fdiv dword ptr [edi]
-            { let v = fx.s(0) / (rf((edi) as usize) as f64); fx.set(0, v); }
-            // 0x49f7d9: mov edx, dword ptr [esp + 0x2c]
-            edx = rd((esp.wrapping_add(0x2c)) as usize);
-            // 0x49f7dd: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x49f7de: add edx, 0xfffffe80
-            { let a = edx; let b = 0xfffffe80u32; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
-            // 0x49f7e4: lea eax, [esp + 0x10]
-            eax = (esp.wrapping_add(0x10));
-            // 0x49f7e8: fiadd dword ptr [esp + 0x2c]
-            { let v = fx.s(0) + (rd((esp.wrapping_add(0x2c)) as usize) as i32 as f64); fx.set(0, v); }
-            // 0x49f7ec: fstp dword ptr [esp + 0x34]
-            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f7f0: fld dword ptr [esp + 0x34]
-            fx.push(rf((esp.wrapping_add(0x34)) as usize) as f64);
-            // 0x49f7f4: fadd qword ptr [0xe5bf40]
-            { let v = fx.s(0) + rdf64(0xe5bf40usize); fx.set(0, v); }
-            // 0x49f7fa: fstp dword ptr [esp + 0x34]
-            wf((esp.wrapping_add(0x34)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f7fe: fld dword ptr [esp + 0x34]
-            fx.push(rf((esp.wrapping_add(0x34)) as usize) as f64);
-            // 0x49f802: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f805: call 0xc022c0
-            callx!(0xc022c0, 2, 1, 0, 0.0, 0.0);
-            // 0x49f80a: fld dword ptr [esp + 0x30]
-            fx.push(rf((esp.wrapping_add(0x30)) as usize) as f64);
-            // 0x49f80e: mov edx, dword ptr [esp + 0x2c]
-            edx = rd((esp.wrapping_add(0x2c)) as usize);
-            // 0x49f812: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x49f813: lea eax, [esp + 0x1c]
-            eax = (esp.wrapping_add(0x1c));
-            // 0x49f817: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f81a: call 0xc022c0
-            callx!(0xc022c0, 2, 1, 0, 0.0, 0.0);
-            // 0x49f81f: fld dword ptr [esp + 0x30]
-            fx.push(rf((esp.wrapping_add(0x30)) as usize) as f64);
-            // 0x49f823: push ecx
-            esp = esp.wrapping_sub(4); wd(esp as usize, ecx);
-            // 0x49f824: add edx, 0x180
-            { let a = edx; let b = 0x180u32; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
-            // 0x49f82a: fstp dword ptr [esp]
-            wf((esp) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f82d: lea eax, [esp + 0x38]
-            eax = (esp.wrapping_add(0x38));
-            // 0x49f831: call 0xc022c0
-            callx!(0xc022c0, 2, 1, 0, 0.0, 0.0);
-            // 0x49f836: fld dword ptr [esi + 4]
-            fx.push(rf((esi.wrapping_add(0x4)) as usize) as f64);
-            // 0x49f839: fadd dword ptr [esp + 0x24]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
-            // 0x49f83d: fstp dword ptr [esp + 0x24]
-            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f841: fld dword ptr [esp + 0x24]
-            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
-            // 0x49f845: fld dword ptr [edi]
-            fx.push(rf((edi) as usize) as f64);
-            // 0x49f847: fcomp st(1)
-            fx.sw = fcmp(fx.s(0), fx.s(1));
-            fx.pop();
-            // 0x49f849: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x49f84b: test ah, 5
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
-            // 0x49f84e: jp 0x49f87a
-            if fl.pf { pc = 0x49f87a; } else { pc = 0x49f850; } continue;
-        }
-        0x49f850 => {
-            bump(C::Cam49f320B49F850);
-            // 0x49f850: fsub dword ptr [edi]
-            { let v = fx.s(0) - (rf((edi) as usize) as f64); fx.set(0, v); }
-            // 0x49f852: mov eax, dword ptr [esp + 0x28]
-            eax = rd((esp.wrapping_add(0x28)) as usize);
-            // 0x49f856: mov ecx, dword ptr [esp + 0x4c8]
-            ecx = rd((esp.wrapping_add(0x4c8)) as usize);
-            // 0x49f85d: add eax, 1
-            { let a = eax; let b = 0x1u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
-            // 0x49f860: fstp dword ptr [esp + 0x24]
-            wf((esp.wrapping_add(0x24)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f864: lea edi, [ecx + eax*4]
-            edi = (ecx.wrapping_add(eax.wrapping_mul(4)));
-            // 0x49f867: fld dword ptr [esp + 0x24]
-            fx.push(rf((esp.wrapping_add(0x24)) as usize) as f64);
-            // 0x49f86b: mov dword ptr [esp + 0x28], eax
-            wd((esp.wrapping_add(0x28)) as usize, eax);
-            // 0x49f86f: fld dword ptr [edi]
-            fx.push(rf((edi) as usize) as f64);
-            // 0x49f871: fcomp st(1)
-            fx.sw = fcmp(fx.s(0), fx.s(1));
-            fx.pop();
-            // 0x49f873: fnstsw ax
-            eax = (eax & 0xffff0000) | (fx.sw | ((fx.top as u16) << 11)) as u32;
-            // 0x49f875: test ah, 5
-            fl = f_logic((((eax >> 8) & 0xff)) & (0x5u32), 8);
-            // 0x49f878: jnp 0x49f850
-            if !fl.pf { pc = 0x49f850; } else { pc = 0x49f87a; } continue;
-        }
-        0x49f87a => {
-            // 0x49f87a: add dword ptr [esp + 0x2c], 0xc
-            { let a = rd((esp.wrapping_add(0x2c)) as usize); let b = 0xcu32; fl = f_add(a, b, 32); wd((esp.wrapping_add(0x2c)) as usize, a.wrapping_add(b)); }
-            // 0x49f87f: add ebp, 1
-            { let a = ebp; let b = 0x1u32; fl = f_add(a, b, 32); ebp = a.wrapping_add(b); }
-            // 0x49f882: cmp ebp, dword ptr [esi]
-            fl = f_sub(ebp, rd((esi) as usize), 32);
-            // 0x49f884: jl 0x49f7d7
-            if fl.sf != fl.of { pc = 0x49f7d7; } else { pc = 0x49f88a; } continue;
-        }
-        0x49f88a => {
-            // 0x49f88a: fstp st(0)
-            fx.pop();
-            // 0x49f88c: fldz 
-            fx.push(0.0);
-            pc = 0x49f88e; continue;
-        }
-        0x49f88e => {
-            bump(C::Cam49f320B49F88E);
-            // 0x49f88e: mov ecx, dword ptr [esp + ebx + 0x40]
-            ecx = rd((esp.wrapping_add(ebx).wrapping_add(0x40)) as usize);
-            // 0x49f892: lea edx, [ebp + ebp*2]
-            edx = (ebp.wrapping_add(ebp.wrapping_mul(2)));
-            // 0x49f896: mov dword ptr [esi + edx*4 + 8], ecx
-            wd((esi.wrapping_add(edx.wrapping_mul(4)).wrapping_add(0x8)) as usize, ecx);
-            // 0x49f89a: mov ecx, dword ptr [esp + ebx + 0x48]
-            ecx = rd((esp.wrapping_add(ebx).wrapping_add(0x48)) as usize);
-            // 0x49f89e: lea eax, [esi + edx*4]
-            eax = (esi.wrapping_add(edx.wrapping_mul(4)));
-            // 0x49f8a1: mov edx, dword ptr [esp + ebx + 0x44]
-            edx = rd((esp.wrapping_add(ebx).wrapping_add(0x44)) as usize);
-            // 0x49f8a5: mov dword ptr [eax + 0xc], edx
-            wd((eax.wrapping_add(0xc)) as usize, edx);
-            // 0x49f8a8: mov edx, dword ptr [esp + ebx + 0x1c0]
-            edx = rd((esp.wrapping_add(ebx).wrapping_add(0x1c0)) as usize);
-            // 0x49f8af: mov dword ptr [eax + 0x188], edx
-            wd((eax.wrapping_add(0x188)) as usize, edx);
-            // 0x49f8b5: mov edx, dword ptr [esp + ebx + 0x1c8]
-            edx = rd((esp.wrapping_add(ebx).wrapping_add(0x1c8)) as usize);
-            // 0x49f8bc: mov dword ptr [eax + 0x10], ecx
-            wd((eax.wrapping_add(0x10)) as usize, ecx);
-            // 0x49f8bf: mov ecx, dword ptr [esp + ebx + 0x1c4]
-            ecx = rd((esp.wrapping_add(ebx).wrapping_add(0x1c4)) as usize);
-            // 0x49f8c6: mov dword ptr [eax + 0x18c], ecx
-            wd((eax.wrapping_add(0x18c)) as usize, ecx);
-            // 0x49f8cc: mov dword ptr [eax + 0x190], edx
-            wd((eax.wrapping_add(0x190)) as usize, edx);
-            // 0x49f8d2: mov edx, dword ptr [esp + ebx + 0x340]
-            edx = rd((esp.wrapping_add(ebx).wrapping_add(0x340)) as usize);
-            // 0x49f8d9: mov dword ptr [eax + 0x308], edx
-            wd((eax.wrapping_add(0x308)) as usize, edx);
-            // 0x49f8df: mov edx, dword ptr [esp + ebx + 0x344]
-            edx = rd((esp.wrapping_add(ebx).wrapping_add(0x344)) as usize);
-            // 0x49f8e6: mov dword ptr [eax + 0x30c], edx
-            wd((eax.wrapping_add(0x30c)) as usize, edx);
-            // 0x49f8ec: lea ecx, [esp + ebx + 0x340]
-            ecx = (esp.wrapping_add(ebx).wrapping_add(0x340));
-            // 0x49f8f3: mov ecx, dword ptr [ecx + 8]
-            ecx = rd((ecx.wrapping_add(0x8)) as usize);
-            // 0x49f8f6: mov dword ptr [eax + 0x310], ecx
-            wd((eax.wrapping_add(0x310)) as usize, ecx);
-            // 0x49f8fc: fld dword ptr [esi + 0x14]
-            fx.push(rf((esi.wrapping_add(0x14)) as usize) as f64);
-            // 0x49f8ff: fsub dword ptr [esi + 0x20]
-            { let v = fx.s(0) - (rf((esi.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49f902: lea ecx, [esi + 8]
-            ecx = (esi.wrapping_add(0x8));
-            // 0x49f905: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f909: fld dword ptr [esi + 0x18]
-            fx.push(rf((esi.wrapping_add(0x18)) as usize) as f64);
-            // 0x49f90c: fsub dword ptr [esi + 0x24]
-            { let v = fx.s(0) - (rf((esi.wrapping_add(0x24)) as usize) as f64); fx.set(0, v); }
-            // 0x49f90f: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f913: fld dword ptr [esi + 0x1c]
-            fx.push(rf((esi.wrapping_add(0x1c)) as usize) as f64);
-            // 0x49f916: fsub dword ptr [esi + 0x28]
-            { let v = fx.s(0) - (rf((esi.wrapping_add(0x28)) as usize) as f64); fx.set(0, v); }
-            // 0x49f919: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f91d: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49f921: fld qword ptr [0xdd50e8]
-            fx.push(rdf64(0xdd50e8usize));
-            // 0x49f927: fmul st(1), st(0)
-            { let v = fx.s(1) * fx.s(0); fx.set(1, v); }
-            // 0x49f929: fxch st(1)
-            fx.xch(1);
-            // 0x49f92b: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f92f: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49f933: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f935: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f939: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x49f93d: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f93f: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f943: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x49f947: fadd dword ptr [esi + 0x14]
-            { let v = fx.s(0) + (rf((esi.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
-            // 0x49f94a: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f94e: mov edx, dword ptr [esp + 0xc]
-            edx = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49f952: fld dword ptr [esi + 0x18]
-            fx.push(rf((esi.wrapping_add(0x18)) as usize) as f64);
-            // 0x49f955: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f959: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f95d: fld dword ptr [esi + 0x1c]
-            fx.push(rf((esi.wrapping_add(0x1c)) as usize) as f64);
-            // 0x49f960: mov dword ptr [ecx], edx
-            wd((ecx) as usize, edx);
-            // 0x49f962: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49f966: mov edx, dword ptr [esp + 0x10]
-            edx = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49f96a: mov dword ptr [ecx + 4], edx
-            wd((ecx.wrapping_add(0x4)) as usize, edx);
-            // 0x49f96d: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f971: mov edx, dword ptr [esp + 0x14]
-            edx = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49f975: mov dword ptr [ecx + 8], edx
-            wd((ecx.wrapping_add(0x8)) as usize, edx);
-            // 0x49f978: fld dword ptr [esi + 0x194]
-            fx.push(rf((esi.wrapping_add(0x194)) as usize) as f64);
-            // 0x49f97e: fsub dword ptr [esi + 0x1a0]
-            { let v = fx.s(0) - (rf((esi.wrapping_add(0x1a0)) as usize) as f64); fx.set(0, v); }
-            // 0x49f984: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f988: fld dword ptr [esi + 0x198]
-            fx.push(rf((esi.wrapping_add(0x198)) as usize) as f64);
-            // 0x49f98e: fsub dword ptr [esi + 0x1a4]
-            { let v = fx.s(0) - (rf((esi.wrapping_add(0x1a4)) as usize) as f64); fx.set(0, v); }
-            // 0x49f994: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f998: fld dword ptr [esi + 0x19c]
-            fx.push(rf((esi.wrapping_add(0x19c)) as usize) as f64);
-            // 0x49f99e: fsub dword ptr [esi + 0x1a8]
-            { let v = fx.s(0) - (rf((esi.wrapping_add(0x1a8)) as usize) as f64); fx.set(0, v); }
-            // 0x49f9a4: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f9a8: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49f9ac: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f9ae: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f9b2: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49f9b6: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f9b8: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f9bc: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x49f9c0: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49f9c2: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f9c6: fld dword ptr [esi + 0x194]
-            fx.push(rf((esi.wrapping_add(0x194)) as usize) as f64);
-            // 0x49f9cc: fadd dword ptr [esp + 0x18]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
-            // 0x49f9d0: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f9d4: fld dword ptr [esi + 0x198]
-            fx.push(rf((esi.wrapping_add(0x198)) as usize) as f64);
-            // 0x49f9da: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49f9de: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49f9e2: fld dword ptr [esi + 0x19c]
-            fx.push(rf((esi.wrapping_add(0x19c)) as usize) as f64);
-            // 0x49f9e8: mov edi, dword ptr [esp + 0xc]
-            edi = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49f9ec: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49f9f0: mov dword ptr [esi + 0x188], edi
-            wd((esi.wrapping_add(0x188)) as usize, edi);
-            // 0x49f9f6: mov edi, dword ptr [esp + 0x10]
-            edi = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49f9fa: mov dword ptr [esi + 0x18c], edi
-            wd((esi.wrapping_add(0x18c)) as usize, edi);
-            // 0x49fa00: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fa04: mov edi, dword ptr [esp + 0x14]
-            edi = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49fa08: mov dword ptr [esi + 0x190], edi
-            wd((esi.wrapping_add(0x190)) as usize, edi);
-            // 0x49fa0e: fld dword ptr [esi + 0x314]
-            fx.push(rf((esi.wrapping_add(0x314)) as usize) as f64);
-            // 0x49fa14: fsub dword ptr [esi + 0x320]
-            { let v = fx.s(0) - (rf((esi.wrapping_add(0x320)) as usize) as f64); fx.set(0, v); }
-            // 0x49fa1a: lea edx, [esi + 0x188]
-            edx = (esi.wrapping_add(0x188));
-            // 0x49fa20: lea edi, [esi + 0x308]
-            edi = (esi.wrapping_add(0x308));
-            // 0x49fa26: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fa2a: fld dword ptr [esi + 0x318]
-            fx.push(rf((esi.wrapping_add(0x318)) as usize) as f64);
-            // 0x49fa30: fsub dword ptr [esi + 0x324]
-            { let v = fx.s(0) - (rf((esi.wrapping_add(0x324)) as usize) as f64); fx.set(0, v); }
-            // 0x49fa36: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fa3a: fld dword ptr [esi + 0x31c]
-            fx.push(rf((esi.wrapping_add(0x31c)) as usize) as f64);
-            // 0x49fa40: fsub dword ptr [esi + 0x328]
-            { let v = fx.s(0) - (rf((esi.wrapping_add(0x328)) as usize) as f64); fx.set(0, v); }
-            // 0x49fa46: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fa4a: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49fa4e: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fa50: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fa54: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49fa58: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fa5a: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fa5e: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x49fa62: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fa64: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fa68: fld dword ptr [esi + 0x314]
-            fx.push(rf((esi.wrapping_add(0x314)) as usize) as f64);
-            // 0x49fa6e: fadd dword ptr [esp + 0x18]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
-            // 0x49fa72: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fa76: mov ebx, dword ptr [esp + 0xc]
-            ebx = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49fa7a: fld dword ptr [esi + 0x318]
-            fx.push(rf((esi.wrapping_add(0x318)) as usize) as f64);
-            // 0x49fa80: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49fa84: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fa88: fld dword ptr [esi + 0x31c]
-            fx.push(rf((esi.wrapping_add(0x31c)) as usize) as f64);
-            // 0x49fa8e: mov dword ptr [edi], ebx
-            wd((edi) as usize, ebx);
-            // 0x49fa90: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49fa94: mov ebx, dword ptr [esp + 0x10]
-            ebx = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49fa98: mov dword ptr [edi + 4], ebx
-            wd((edi.wrapping_add(0x4)) as usize, ebx);
-            // 0x49fa9b: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fa9f: mov ebx, dword ptr [esp + 0x14]
-            ebx = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49faa3: mov dword ptr [edi + 8], ebx
-            wd((edi.wrapping_add(0x8)) as usize, ebx);
-            // 0x49faa6: fld dword ptr [eax + 8]
-            fx.push(rf((eax.wrapping_add(0x8)) as usize) as f64);
-            // 0x49faa9: fsub dword ptr [eax - 4]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0xfffffffc)) as usize) as f64); fx.set(0, v); }
-            // 0x49faac: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fab0: fld dword ptr [eax + 0xc]
-            fx.push(rf((eax.wrapping_add(0xc)) as usize) as f64);
-            // 0x49fab3: fsub dword ptr [eax]
-            { let v = fx.s(0) - (rf((eax) as usize) as f64); fx.set(0, v); }
-            // 0x49fab5: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fab9: fld dword ptr [eax + 0x10]
-            fx.push(rf((eax.wrapping_add(0x10)) as usize) as f64);
-            // 0x49fabc: fsub dword ptr [eax + 4]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x4)) as usize) as f64); fx.set(0, v); }
-            // 0x49fabf: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fac3: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49fac7: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fac9: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49facd: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49fad1: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fad3: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fad7: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x49fadb: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fadd: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fae1: fld dword ptr [eax + 8]
-            fx.push(rf((eax.wrapping_add(0x8)) as usize) as f64);
-            // 0x49fae4: fadd dword ptr [esp + 0x18]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x18)) as usize) as f64); fx.set(0, v); }
-            // 0x49fae8: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49faec: mov ebx, dword ptr [esp + 0xc]
-            ebx = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49faf0: fld dword ptr [eax + 0xc]
-            fx.push(rf((eax.wrapping_add(0xc)) as usize) as f64);
-            // 0x49faf3: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49faf7: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fafb: fld dword ptr [eax + 0x10]
-            fx.push(rf((eax.wrapping_add(0x10)) as usize) as f64);
-            // 0x49fafe: mov dword ptr [eax + 0x14], ebx
-            wd((eax.wrapping_add(0x14)) as usize, ebx);
-            // 0x49fb01: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49fb05: mov ebx, dword ptr [esp + 0x10]
-            ebx = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49fb09: mov dword ptr [eax + 0x18], ebx
-            wd((eax.wrapping_add(0x18)) as usize, ebx);
-            // 0x49fb0c: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fb10: mov ebx, dword ptr [esp + 0x14]
-            ebx = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49fb14: mov dword ptr [eax + 0x1c], ebx
-            wd((eax.wrapping_add(0x1c)) as usize, ebx);
-            // 0x49fb17: fld dword ptr [eax + 0x188]
-            fx.push(rf((eax.wrapping_add(0x188)) as usize) as f64);
-            // 0x49fb1d: fsub dword ptr [eax + 0x17c]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x17c)) as usize) as f64); fx.set(0, v); }
-            // 0x49fb23: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fb27: fld dword ptr [eax + 0x18c]
-            fx.push(rf((eax.wrapping_add(0x18c)) as usize) as f64);
-            // 0x49fb2d: fsub dword ptr [eax + 0x180]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x180)) as usize) as f64); fx.set(0, v); }
-            // 0x49fb33: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fb37: fld dword ptr [eax + 0x190]
-            fx.push(rf((eax.wrapping_add(0x190)) as usize) as f64);
-            // 0x49fb3d: fsub dword ptr [eax + 0x184]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x184)) as usize) as f64); fx.set(0, v); }
-            // 0x49fb43: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fb47: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49fb4b: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fb4d: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fb51: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49fb55: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fb57: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fb5b: fld dword ptr [esp + 0x14]
-            fx.push(rf((esp.wrapping_add(0x14)) as usize) as f64);
-            // 0x49fb5f: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fb61: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fb65: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x49fb69: fadd dword ptr [eax + 0x188]
-            { let v = fx.s(0) + (rf((eax.wrapping_add(0x188)) as usize) as f64); fx.set(0, v); }
-            // 0x49fb6f: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fb73: mov ebx, dword ptr [esp + 0xc]
-            ebx = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49fb77: fld dword ptr [eax + 0x18c]
-            fx.push(rf((eax.wrapping_add(0x18c)) as usize) as f64);
-            // 0x49fb7d: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49fb81: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fb85: fld dword ptr [eax + 0x190]
-            fx.push(rf((eax.wrapping_add(0x190)) as usize) as f64);
-            // 0x49fb8b: mov dword ptr [eax + 0x194], ebx
-            wd((eax.wrapping_add(0x194)) as usize, ebx);
-            // 0x49fb91: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49fb95: mov ebx, dword ptr [esp + 0x10]
-            ebx = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49fb99: mov dword ptr [eax + 0x198], ebx
-            wd((eax.wrapping_add(0x198)) as usize, ebx);
-            // 0x49fb9f: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fba3: mov ebx, dword ptr [esp + 0x14]
-            ebx = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49fba7: mov dword ptr [eax + 0x19c], ebx
-            wd((eax.wrapping_add(0x19c)) as usize, ebx);
-            // 0x49fbad: fld dword ptr [eax + 0x308]
-            fx.push(rf((eax.wrapping_add(0x308)) as usize) as f64);
-            // 0x49fbb3: fsub dword ptr [eax + 0x2fc]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x2fc)) as usize) as f64); fx.set(0, v); }
-            // 0x49fbb9: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fbbd: fld dword ptr [eax + 0x30c]
-            fx.push(rf((eax.wrapping_add(0x30c)) as usize) as f64);
-            // 0x49fbc3: fsub dword ptr [eax + 0x300]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x300)) as usize) as f64); fx.set(0, v); }
-            // 0x49fbc9: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fbcd: fld dword ptr [eax + 0x310]
-            fx.push(rf((eax.wrapping_add(0x310)) as usize) as f64);
-            // 0x49fbd3: fsub dword ptr [eax + 0x304]
-            { let v = fx.s(0) - (rf((eax.wrapping_add(0x304)) as usize) as f64); fx.set(0, v); }
-            // 0x49fbd9: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fbdd: fld dword ptr [esp + 0xc]
-            fx.push(rf((esp.wrapping_add(0xc)) as usize) as f64);
-            // 0x49fbe1: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fbe3: fstp dword ptr [esp + 0x18]
-            wf((esp.wrapping_add(0x18)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fbe7: fld dword ptr [esp + 0x10]
-            fx.push(rf((esp.wrapping_add(0x10)) as usize) as f64);
-            // 0x49fbeb: fmul st(1)
-            { let v = fx.s(0) * fx.s(1); fx.set(0, v); }
-            // 0x49fbed: fstp dword ptr [esp + 0x1c]
-            wf((esp.wrapping_add(0x1c)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fbf1: fmul dword ptr [esp + 0x14]
-            { let v = fx.s(0) * (rf((esp.wrapping_add(0x14)) as usize) as f64); fx.set(0, v); }
-            // 0x49fbf5: fstp dword ptr [esp + 0x20]
-            wf((esp.wrapping_add(0x20)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fbf9: fld dword ptr [esp + 0x18]
-            fx.push(rf((esp.wrapping_add(0x18)) as usize) as f64);
-            // 0x49fbfd: fadd dword ptr [eax + 0x308]
-            { let v = fx.s(0) + (rf((eax.wrapping_add(0x308)) as usize) as f64); fx.set(0, v); }
-            // 0x49fc03: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fc07: mov ebx, dword ptr [esp + 0xc]
-            ebx = rd((esp.wrapping_add(0xc)) as usize);
-            // 0x49fc0b: fld dword ptr [eax + 0x30c]
-            fx.push(rf((eax.wrapping_add(0x30c)) as usize) as f64);
-            // 0x49fc11: fadd dword ptr [esp + 0x1c]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x1c)) as usize) as f64); fx.set(0, v); }
-            // 0x49fc15: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fc19: fld dword ptr [eax + 0x310]
-            fx.push(rf((eax.wrapping_add(0x310)) as usize) as f64);
-            // 0x49fc1f: mov dword ptr [eax + 0x314], ebx
-            wd((eax.wrapping_add(0x314)) as usize, ebx);
-            // 0x49fc25: fadd dword ptr [esp + 0x20]
-            { let v = fx.s(0) + (rf((esp.wrapping_add(0x20)) as usize) as f64); fx.set(0, v); }
-            // 0x49fc29: mov ebx, dword ptr [esp + 0x10]
-            ebx = rd((esp.wrapping_add(0x10)) as usize);
-            // 0x49fc2d: mov dword ptr [eax + 0x318], ebx
-            wd((eax.wrapping_add(0x318)) as usize, ebx);
-            // 0x49fc33: fstp dword ptr [esp + 0x14]
-            wf((esp.wrapping_add(0x14)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fc37: mov ebx, dword ptr [esp + 0x14]
-            ebx = rd((esp.wrapping_add(0x14)) as usize);
-            // 0x49fc3b: mov dword ptr [eax + 0x31c], ebx
-            wd((eax.wrapping_add(0x31c)) as usize, ebx);
-            // 0x49fc41: mov eax, dword ptr [esi]
-            eax = rd((esi) as usize);
-            // 0x49fc43: mov dword ptr [esi + 0x488], ecx
-            wd((esi.wrapping_add(0x488)) as usize, ecx);
-            // 0x49fc49: add eax, 2
-            { let a = eax; let b = 0x2u32; fl = f_add(a, b, 32); eax = a.wrapping_add(b); }
-            // 0x49fc4c: mov dword ptr [esi + 0x48c], eax
-            wd((esi.wrapping_add(0x48c)) as usize, eax);
-            // 0x49fc52: fst dword ptr [esi + 0x490]
-            wf((esi.wrapping_add(0x490)) as usize, fx.s(0) as f32);
-            // 0x49fc58: mov ecx, dword ptr [esi]
-            ecx = rd((esi) as usize);
-            // 0x49fc5a: mov dword ptr [esi + 0x494], edx
-            wd((esi.wrapping_add(0x494)) as usize, edx);
-            // 0x49fc60: add ecx, 2
-            { let a = ecx; let b = 0x2u32; fl = f_add(a, b, 32); ecx = a.wrapping_add(b); }
-            // 0x49fc63: mov dword ptr [esi + 0x498], ecx
-            wd((esi.wrapping_add(0x498)) as usize, ecx);
-            // 0x49fc69: fst dword ptr [esi + 0x49c]
-            wf((esi.wrapping_add(0x49c)) as usize, fx.s(0) as f32);
-            // 0x49fc6f: mov edx, dword ptr [esi]
-            edx = rd((esi) as usize);
-            // 0x49fc71: mov dword ptr [esi + 0x4a0], edi
-            wd((esi.wrapping_add(0x4a0)) as usize, edi);
-            // 0x49fc77: pop edi
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); edi = v; }
-            // 0x49fc78: add edx, 2
-            { let a = edx; let b = 0x2u32; fl = f_add(a, b, 32); edx = a.wrapping_add(b); }
-            // 0x49fc7b: mov dword ptr [esi + 0x4a4], edx
-            wd((esi.wrapping_add(0x4a4)) as usize, edx);
-            // 0x49fc81: fst dword ptr [esi + 0x4a8]
-            wf((esi.wrapping_add(0x4a8)) as usize, fx.s(0) as f32);
-            // 0x49fc87: pop ebp
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebp = v; }
-            // 0x49fc88: fstp dword ptr [esi + 0x4ac]
-            wf((esi.wrapping_add(0x4ac)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49fc8e: pop ebx
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); ebx = v; }
-            // 0x49fc8f: add esp, 0x4b4
-            { let a = esp; let b = 0x4b4u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x49fc95: ret 
-            break;
-        }
-            _ => unreachable!(),
-        }
-    }
-    #[cfg(test)]
-    {
-        ent.ebp = ebp;
-        ent.pad = esp;
-    }
-    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
-    let depth = (8 - fx.top) & 7;
-    ent.nst = (depth >= 1) as u32;
-    if depth >= 1 {
-        ent.st0 = fx.s(0);
-    }
-    std::hint::black_box(&stk);
-}
-
 extern "C" fn cam_49f320_entry(ent: *mut Ent, args: *const u32) {
-    unsafe { cam_49f320_body(&mut *ent, args) }
+    bump(C::Cam49f320Calls);
+    unsafe { hand::camera_script_build_track_body(&mut *ent, args) }
 }
 
 ent_thunk!(cam_49f320_thunk, cam_49f320_entry, 0);
@@ -10487,244 +7332,9 @@ const CAM_49F320_BODY: [u8; 2422] = [
 ];
 
 
-// --- cam_49d7a0 (0x49d7a0..0x49d8ac, 268 bytes) ----------------------------------------
-
-#[allow(unused_assignments, unused_variables, unused_mut, unused_macros, unused_unsafe, unused_parens, clippy::all)]
-unsafe fn cam_49d7a0_body(ent: &mut Ent, args: *const u32) {
-    let mut stk = [0u64; 512];
-    #[cfg(not(test))]
-    let stk_p = std::hint::black_box(stk.as_mut_ptr()) as usize;
-    #[cfg(test)]
-    let stk_p = difftest::STK_P;
-    let mut esp: u32 = (stk_p + 4096 - 128) as u32;
-    wd(esp as usize, 0);
-    for k in 0..16 {
-        wd(esp as usize + 4 + 4 * k, rd(args as usize + 4 * k));
-    }
-    let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (ent.eax, ent.ecx, ent.edx, ent.ebx, ent.esi, ent.edi, ent.ebp);
-    let mut xmm0 = ent.xmm0;
-    let mut fl = Fl::default();
-    let mut fx = X87::new();
-    macro_rules! callx {
-        ($t:expr, $na:expr, $pop:expr, $nin:expr, $i0:expr, $i1:expr) => {{
-            let mut b = Blk {
-                f: ($t) as u32, eax, ecx, edx, ebx, esi, edi, args: esp, nargs: $na, xmm0,
-                sw_before: 0, sw_after: 0, has_in: $nin, pad: 0, st_in: [$i0, $i1], st_out: [0.0; 4],
-            };
-            #[cfg(test)]
-            difftest::pre_call(&b, &fx, $pop);
-            let n = callx_raw(&mut b);
-            eax = b.eax; ecx = b.ecx; edx = b.edx; ebx = b.ebx; esi = b.esi; edi = b.edi; xmm0 = b.xmm0;
-            for k in (0..n).rev() {
-                fx.push(b.st_out[k]);
-            }
-            esp = esp.wrapping_add(4 * $pop);
-        }};
-    }
-    let mut pc: usize = 0x49d7a0;
-    loop {
-        #[cfg(test)]
-        difftest::cov(pc);
-        match pc {
-        0x49d7a0 => {
-            bump(C::Cam49d7a0Calls);
-            // 0x49d7a0: mov eax, dword ptr [0x25f5bb0]
-            eax = rd(0x25f5bb0usize);
-            // 0x49d7a5: sub esp, 0x10
-            { let a = esp; let b = 0x10u32; fl = f_sub(a, b, 32); esp = a.wrapping_sub(b); }
-            // 0x49d7a8: test eax, eax
-            fl = f_logic((eax) & (eax), 32);
-            // 0x49d7aa: push esi
-            esp = esp.wrapping_sub(4); wd(esp as usize, esi);
-            // 0x49d7ab: je 0x49d88d
-            if fl.zf { pc = 0x49d88d; } else { pc = 0x49d7b1; } continue;
-        }
-        0x49d7b1 => {
-            // 0x49d7b1: mov ecx, eax
-            ecx = eax;
-            // 0x49d7b3: and ecx, 0xfff
-            { let r = (ecx) & (0xfffu32); fl = f_logic(r, 32); ecx = r; }
-            // 0x49d7b9: shl ecx, 4
-            { let r = ecx << 4; fl = f_logic(r, 32); ecx = r; }
-            // 0x49d7bc: mov esi, dword ptr [ecx + 0x2149c64]
-            esi = rd((ecx.wrapping_add(0x2149c64)) as usize);
-            // 0x49d7c2: test esi, esi
-            fl = f_logic((esi) & (esi), 32);
-            // 0x49d7c4: je 0x49d88d
-            if fl.zf { pc = 0x49d88d; } else { pc = 0x49d7ca; } continue;
-        }
-        0x49d7ca => {
-            // 0x49d7ca: cmp dword ptr [esi + 0x44], eax
-            fl = f_sub(rd((esi.wrapping_add(0x44)) as usize), eax, 32);
-            // 0x49d7cd: jne 0x49d88d
-            if !fl.zf { pc = 0x49d88d; } else { pc = 0x49d7d3; } continue;
-        }
-        0x49d7d3 => {
-            // 0x49d7d3: mov eax, dword ptr [0x25f5d3c]
-            eax = rd(0x25f5d3cusize);
-            // 0x49d7d8: cmp edi, eax
-            fl = f_sub(edi, eax, 32);
-            // 0x49d7da: je 0x49d88d
-            if fl.zf { pc = 0x49d88d; } else { pc = 0x49d7e0; } continue;
-        }
-        0x49d7e0 => {
-            // 0x49d7e0: sub eax, 1
-            { let a = eax; let b = 0x1u32; fl = f_sub(a, b, 32); eax = a.wrapping_sub(b); }
-            // 0x49d7e3: je 0x49d7f7
-            if fl.zf { pc = 0x49d7f7; } else { pc = 0x49d7e5; } continue;
-        }
-        0x49d7e5 => {
-            // 0x49d7e5: lea eax, [esi + 0x38]
-            eax = (esi.wrapping_add(0x38));
-            // 0x49d7e8: call 0x49df50
-            callx!(0x49df50, 5, 0, 0, 0.0, 0.0);
-            // 0x49d7ed: fldz 
-            fx.push(0.0);
-            // 0x49d7ef: fstp dword ptr [0x25f5c78]
-            wf(0x25f5c78usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49d7f5: jmp 0x49d7fe
-            pc = 0x49d7fe; continue;
-        }
-        0x49d7f7 => {
-            // 0x49d7f7: mov byte ptr [0x25f5d34], 1
-            wb(0x25f5d34usize, (0x1u32) as u8);
-            pc = 0x49d7fe; continue;
-        }
-        0x49d7fe => {
-            // 0x49d7fe: cmp edi, 5
-            fl = f_sub(edi, 0x5u32, 32);
-            // 0x49d801: ja 0x49d887
-            if !fl.cf && !fl.zf { pc = 0x49d887; } else { pc = 0x49d807; } continue;
-        }
-        0x49d807 => {
-            // 0x49d807: jmp dword ptr [edi*4 + 0x49d894]
-            pc = rd((0x49d894u32.wrapping_add(edi.wrapping_mul(4))) as usize) as usize; continue;
-        }
-        0x49d80e => {
-            // 0x49d80e: mov dword ptr [0x25f5c54], 0
-            wd(0x25f5c54usize, 0x0u32);
-            // 0x49d818: mov dword ptr [0x25f5d3c], edi
-            wd(0x25f5d3cusize, edi);
-            // 0x49d81e: pop esi
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
-            // 0x49d81f: add esp, 0x10
-            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x49d822: ret 
-            break;
-        }
-        0x49d823 => {
-            // 0x49d823: mov dword ptr [0x25f5c54], 3
-            wd(0x25f5c54usize, 0x3u32);
-            // 0x49d82d: mov dword ptr [0x25f5d3c], edi
-            wd(0x25f5d3cusize, edi);
-            // 0x49d833: pop esi
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
-            // 0x49d834: add esp, 0x10
-            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x49d837: ret 
-            break;
-        }
-        0x49d838 => {
-            // 0x49d838: lea eax, [esi + 0x20]
-            eax = (esi.wrapping_add(0x20));
-            // 0x49d83b: jmp 0x49d878
-            pc = 0x49d878; continue;
-        }
-        0x49d83d => {
-            // 0x49d83d: fld dword ptr [esi + 0x20]
-            fx.push(rf((esi.wrapping_add(0x20)) as usize) as f64);
-            // 0x49d840: fchs 
-            { let v = -fx.s(0); fx.set(0, v); }
-            // 0x49d842: fstp dword ptr [esp + 8]
-            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49d846: fld dword ptr [esi + 0x24]
-            fx.push(rf((esi.wrapping_add(0x24)) as usize) as f64);
-            // 0x49d849: fchs 
-            { let v = -fx.s(0); fx.set(0, v); }
-            // 0x49d84b: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49d84f: fld dword ptr [esi + 0x28]
-            fx.push(rf((esi.wrapping_add(0x28)) as usize) as f64);
-            // 0x49d852: jmp 0x49d86e
-            pc = 0x49d86e; continue;
-        }
-        0x49d854 => {
-            // 0x49d854: lea eax, [esi + 0x38]
-            eax = (esi.wrapping_add(0x38));
-            // 0x49d857: jmp 0x49d878
-            pc = 0x49d878; continue;
-        }
-        0x49d859 => {
-            // 0x49d859: fld dword ptr [esi + 0x38]
-            fx.push(rf((esi.wrapping_add(0x38)) as usize) as f64);
-            // 0x49d85c: fchs 
-            { let v = -fx.s(0); fx.set(0, v); }
-            // 0x49d85e: fstp dword ptr [esp + 8]
-            wf((esp.wrapping_add(0x8)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49d862: fld dword ptr [esi + 0x3c]
-            fx.push(rf((esi.wrapping_add(0x3c)) as usize) as f64);
-            // 0x49d865: fchs 
-            { let v = -fx.s(0); fx.set(0, v); }
-            // 0x49d867: fstp dword ptr [esp + 0xc]
-            wf((esp.wrapping_add(0xc)) as usize, fx.s(0) as f32);
-            fx.pop();
-            // 0x49d86b: fld dword ptr [esi + 0x40]
-            fx.push(rf((esi.wrapping_add(0x40)) as usize) as f64);
-            pc = 0x49d86e; continue;
-        }
-        0x49d86e => {
-            // 0x49d86e: fchs 
-            { let v = -fx.s(0); fx.set(0, v); }
-            // 0x49d870: lea eax, [esp + 8]
-            eax = (esp.wrapping_add(0x8));
-            // 0x49d874: fstp dword ptr [esp + 0x10]
-            wf((esp.wrapping_add(0x10)) as usize, fx.s(0) as f32);
-            fx.pop();
-            pc = 0x49d878; continue;
-        }
-        0x49d878 => {
-            // 0x49d878: call 0x49df50
-            callx!(0x49df50, 5, 0, 0, 0.0, 0.0);
-            // 0x49d87d: mov dword ptr [0x25f5c54], 4
-            wd(0x25f5c54usize, 0x4u32);
-            pc = 0x49d887; continue;
-        }
-        0x49d887 => {
-            // 0x49d887: mov dword ptr [0x25f5d3c], edi
-            wd(0x25f5d3cusize, edi);
-            pc = 0x49d88d; continue;
-        }
-        0x49d88d => {
-            // 0x49d88d: pop esi
-            { let v = rd(esp as usize); esp = esp.wrapping_add(4); esi = v; }
-            // 0x49d88e: add esp, 0x10
-            { let a = esp; let b = 0x10u32; fl = f_add(a, b, 32); esp = a.wrapping_add(b); }
-            // 0x49d891: ret 
-            break;
-        }
-            _ => unreachable!(),
-        }
-    }
-    #[cfg(test)]
-    {
-        ent.ebp = ebp;
-        ent.pad = esp;
-    }
-    ent.eax = eax; ent.ecx = ecx; ent.edx = edx; ent.ebx = ebx; ent.esi = esi; ent.edi = edi; ent.xmm0 = xmm0;
-    let depth = (8 - fx.top) & 7;
-    ent.nst = (depth >= 1) as u32;
-    if depth >= 1 {
-        ent.st0 = fx.s(0);
-    }
-    std::hint::black_box(&stk);
-}
-
 extern "C" fn cam_49d7a0_entry(ent: *mut Ent, args: *const u32) {
-    unsafe { cam_49d7a0_body(&mut *ent, args) }
+    bump(C::Cam49d7a0Calls);
+    unsafe { hand::camera_set_follow_submode_body(&mut *ent, args) }
 }
 
 ent_thunk!(cam_49d7a0_thunk, cam_49d7a0_entry, 0);
@@ -10755,3 +7365,605 @@ mod hand;
 #[cfg(test)]
 #[path = "port_big_difftest.rs"]
 mod difftest;
+
+// --- cam_4969b0 (0x4969b0..0x496af7) ----------------------------------------
+
+extern "C" fn cam_4969b0_entry(ent: *mut Ent, args: *const u32) {
+    bump(C::Cam4969b0Calls);
+    unsafe { hand::camera_push_target_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_4969b0_thunk, cam_4969b0_entry, 0);
+
+const CAM_4969B0_BODY: [u8; 327] = [
+
+    0x83, 0xEC, 0x08, 0x57, 0x8B, 0xF8, 0x8B, 0x47, 0x4C, 0x83, 0xE8, 0x01, 0x0F, 0x84, 0x25, 0x01,
+
+    0x00, 0x00, 0x83, 0xE8, 0x04, 0x74, 0x10, 0x8B, 0x07, 0x8B, 0x10, 0x6A, 0xFF, 0x56, 0x8B, 0xCF,
+
+    0xFF, 0xD2, 0x5F, 0x83, 0xC4, 0x08, 0xC3, 0x8B, 0x47, 0x44, 0x8B, 0xD6, 0xE8, 0x6F, 0x00, 0x61,
+
+    0x00, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0x0F, 0x84, 0x04, 0x01, 0x00, 0x00, 0x83, 0x78,
+
+    0x3C, 0x01, 0x0F, 0x85, 0xFA, 0x00, 0x00, 0x00, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x01,
+
+    0x8B, 0x50, 0x04, 0xFF, 0xD2, 0x85, 0xC0, 0x0F, 0x85, 0xE5, 0x00, 0x00, 0x00, 0x38, 0x05, 0x9A,
+
+    0x6B, 0x52, 0x02, 0x0F, 0x84, 0xD9, 0x00, 0x00, 0x00, 0x8B, 0x57, 0x44, 0x8B, 0xCA, 0xE8, 0xCD,
+
+    0xBE, 0x64, 0x00, 0x8B, 0xF8, 0x8B, 0xCA, 0x83, 0xC7, 0x38, 0xE8, 0xC1, 0xBE, 0x64, 0x00, 0xE8,
+
+    0x3C, 0xF5, 0x60, 0x00, 0xD9, 0x47, 0x04, 0xD8, 0x4E, 0x04, 0xD9, 0x07, 0xD8, 0x0E, 0xDE, 0xC1,
+
+    0xD9, 0x47, 0x08, 0xD8, 0x4E, 0x08, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x08, 0xD8, 0x4C, 0x24, 0x08,
+
+    0xDC, 0x1D, 0xA0, 0xBF, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x1C, 0xD9, 0x06, 0xDD,
+
+    0x05, 0x80, 0xC1, 0xE5, 0x00, 0xDC, 0xC9, 0xD9, 0xC9, 0xD9, 0x1E, 0xD9, 0x46, 0x04, 0xD8, 0xC9,
+
+    0xD9, 0x5E, 0x04, 0xD8, 0x4E, 0x08, 0xD9, 0x5E, 0x08, 0xD9, 0x46, 0x04, 0xD9, 0x06, 0xD9, 0x46,
+
+    0x08, 0xD9, 0xC1, 0xDE, 0xCA, 0xD9, 0xC2, 0xDE, 0xCB, 0xD9, 0xC9, 0xDE, 0xC2, 0xDC, 0xC8, 0xDE,
+
+    0xC1, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x44, 0x24, 0x08, 0xDC, 0x1D, 0x88, 0xC6, 0xE5, 0x00, 0xDF,
+
+    0xE0, 0xF6, 0xC4, 0x05, 0x7A, 0x4C, 0x8B, 0xC6, 0xE8, 0xB3, 0x7F, 0xF7, 0xFF, 0xDC, 0x1D, 0x38,
+
+    0xCF, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x38, 0x8B, 0xC6, 0xE8, 0x9F, 0x7F, 0xF7,
+
+    0xFF, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0x56, 0x7F, 0xF7, 0xFF, 0xDC, 0x3D, 0x28, 0xC3, 0xE5, 0x00,
+
+    0x8B, 0xC6, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x1C, 0x24, 0xE8, 0xAE, 0x4C,
+
+    0xF7, 0xFF, 0x5F, 0x83, 0xC4, 0x08, 0xC3, 0x56, 0x8B, 0xCF, 0xE8, 0x51, 0xCA, 0x4E, 0x00, 0x83,
+
+    0xC4, 0x04, 0x5F, 0x83, 0xC4, 0x08, 0xC3,
+
+];
+
+// --- cam_497220 (0x497220..0x497778) ----------------------------------------
+
+extern "C" fn cam_497220_entry(ent: *mut Ent, args: *const u32) {
+    bump(C::Cam497220Calls);
+    unsafe { hand::camera_chase_blend_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_497220_thunk, cam_497220_entry, 0);
+
+const CAM_497220_BODY: [u8; 1368] = [
+
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x8B, 0x0D, 0xB0, 0x5B, 0x5F, 0x02, 0x83, 0xEC, 0x4C, 0x85,
+
+    0xC9, 0x53, 0x56, 0x57, 0x74, 0x19, 0x8B, 0xC1, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04,
+
+    0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x74, 0x05, 0x39, 0x48, 0x44, 0x74, 0x71, 0x33,
+
+    0xFF, 0x32, 0xDB, 0x84, 0xDB, 0xD9, 0x05, 0x50, 0x5B, 0x5F, 0x02, 0xD9, 0x05, 0x54, 0xA6, 0xE9,
+
+    0x00, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x05, 0x54, 0x5B, 0x5F,
+
+    0x02, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x20, 0xD8, 0x0D, 0x58, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24,
+
+    0x24, 0xD9, 0x02, 0xD8, 0x25, 0x14, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x28, 0xD9, 0x42, 0x04,
+
+    0xD8, 0x25, 0x18, 0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x42, 0x08, 0xD8, 0x25, 0x1C,
+
+    0x5B, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x30, 0x74, 0x39, 0x8B, 0x57, 0x38, 0x8B, 0x47, 0x3C, 0x8B,
+
+    0x4F, 0x40, 0x89, 0x55, 0x0C, 0x89, 0x45, 0x10, 0x89, 0x4D, 0x14, 0xE9, 0x60, 0x01, 0x00, 0x00,
+
+    0x83, 0x78, 0x4C, 0x05, 0x75, 0x89, 0x8B, 0x88, 0xE4, 0x84, 0x00, 0x00, 0x8B, 0xF8, 0x8B, 0x81,
+
+    0x9C, 0x00, 0x00, 0x00, 0x83, 0xC0, 0xFE, 0x83, 0xF8, 0x02, 0x0F, 0x96, 0xC3, 0xE9, 0x71, 0xFF,
+
+    0xFF, 0xFF, 0xD9, 0xE8, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0, 0xD9, 0x5C, 0x24, 0x0C, 0x74,
+
+    0x29, 0x83, 0x78, 0x3C, 0x01, 0x75, 0x23, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x11, 0x8B,
+
+    0x42, 0x04, 0xFF, 0xD0, 0x85, 0xC0, 0x75, 0x12, 0x38, 0x05, 0x9A, 0x6B, 0x52, 0x02, 0x74, 0x0A,
+
+    0xD9, 0x05, 0xC4, 0x14, 0xDD, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x45, 0x0C, 0xD9, 0xC0, 0xDC,
+
+    0xC8, 0xD9, 0x45, 0x14, 0xD9, 0xC0, 0xDC, 0xC8, 0xD9, 0xEE, 0xDC, 0xC8, 0xD8, 0xC3, 0xD8, 0xC1,
+
+    0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0x1D, 0x84, 0x05, 0xDD, 0x00, 0xDF, 0xE0,
+
+    0xF6, 0xC4, 0x05, 0x7A, 0x22, 0x8B, 0x4C, 0x24, 0x1C, 0xDD, 0xD8, 0x8B, 0x54, 0x24, 0x20, 0xDD,
+
+    0xD9, 0x8B, 0x44, 0x24, 0x24, 0xDD, 0xD9, 0xDD, 0xD8, 0x89, 0x4D, 0x0C, 0x89, 0x55, 0x10, 0x89,
+
+    0x45, 0x14, 0xE9, 0xDD, 0x00, 0x00, 0x00, 0xD9, 0x45, 0x10, 0xD9, 0xC0, 0xDC, 0xC8, 0xDE, 0xC4,
+
+    0xD9, 0xCB, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x0C,
+
+    0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x0F, 0x85, 0x89, 0x00, 0x00, 0x00, 0xD9, 0xC9, 0xD9,
+
+    0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24,
+
+    0x14, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xC0, 0xD8, 0x4C, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x40, 0xD9,
+
+    0x44, 0x24, 0x20, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x44, 0xD8, 0x4C, 0x24, 0x24, 0xD9, 0x5C, 0x24,
+
+    0x48, 0xD9, 0xC0, 0xDE, 0xCC, 0xD9, 0xCB, 0xD9, 0x5C, 0x24, 0x34, 0xD9, 0xC2, 0xDE, 0xCA, 0xD9,
+
+    0xC9, 0xD9, 0x5C, 0x24, 0x38, 0xDE, 0xC9, 0xD9, 0x5C, 0x24, 0x3C, 0xD9, 0x44, 0x24, 0x34, 0xD8,
+
+    0x44, 0x24, 0x40, 0xD9, 0x5C, 0x24, 0x4C, 0x8B, 0x4C, 0x24, 0x4C, 0xD9, 0x44, 0x24, 0x38, 0x89,
+
+    0x4D, 0x0C, 0xD8, 0x44, 0x24, 0x44, 0xD9, 0x5C, 0x24, 0x50, 0x8B, 0x54, 0x24, 0x50, 0xD9, 0x44,
+
+    0x24, 0x3C, 0x89, 0x55, 0x10, 0xD8, 0x44, 0x24, 0x48, 0xD9, 0x5C, 0x24, 0x54, 0x8B, 0x44, 0x24,
+
+    0x54, 0x89, 0x45, 0x14, 0xEB, 0x0A, 0xDD, 0xD9, 0xDD, 0xD8, 0xDD, 0xD9, 0xDD, 0xD9, 0xDD, 0xD8,
+
+    0x8D, 0x75, 0x0C, 0xE8, 0x28, 0x6D, 0x74, 0x00, 0xD9, 0x05, 0x54, 0xA6, 0xE9, 0x00, 0xD9, 0xC0,
+
+    0xD8, 0x4D, 0x0C, 0xD9, 0x5D, 0x0C, 0xD9, 0x45, 0x10, 0xD8, 0xC9, 0xD9, 0x5D, 0x10, 0xD8, 0x4D,
+
+    0x14, 0xD9, 0x5D, 0x14, 0x85, 0xFF, 0xD9, 0xEE, 0x74, 0x59, 0x8B, 0x8F, 0xE4, 0x84, 0x00, 0x00,
+
+    0xDD, 0xD8, 0x83, 0xB9, 0x9C, 0x00, 0x00, 0x00, 0x04, 0x8B, 0xCF, 0x75, 0x22, 0xE8, 0x2E, 0x0E,
+
+    0x61, 0x00, 0x84, 0xC0, 0x74, 0x3B, 0x8B, 0x47, 0x44, 0xE8, 0x32, 0xEF, 0x60, 0x00, 0xD9, 0xEE,
+
+    0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x41, 0x75, 0x28, 0xB2, 0x01, 0xEB, 0x26, 0xE8,
+
+    0x0C, 0x0E, 0x61, 0x00, 0x84, 0xC0, 0x74, 0x19, 0x8B, 0x47, 0x44, 0xE8, 0x10, 0xEF, 0x60, 0x00,
+
+    0xD9, 0xEE, 0xDD, 0xE1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x44, 0x7B, 0x06, 0xB2, 0x01, 0xEB,
+
+    0x04, 0xD9, 0xEE, 0x32, 0xD2, 0x84, 0xDB, 0x74, 0x34, 0x84, 0xD2, 0x74, 0x30, 0xD9, 0x45, 0x0C,
+
+    0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x4C, 0x8B, 0x44, 0x24, 0x4C, 0xD9, 0x45, 0x10, 0x89, 0x45, 0x0C,
+
+    0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x50, 0x8B, 0x4C, 0x24, 0x50, 0xD9, 0x45, 0x14, 0x89, 0x4D, 0x10,
+
+    0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x54, 0x8B, 0x44, 0x24, 0x54, 0x89, 0x45, 0x14, 0x83, 0x3D, 0x08,
+
+    0x7C, 0x52, 0x02, 0x00, 0xD9, 0x45, 0x18, 0xDC, 0x35, 0xA8, 0xCC, 0xE5, 0x00, 0xD9, 0x5C, 0x24,
+
+    0x14, 0x7E, 0x08, 0xD9, 0x05, 0xB4, 0x5C, 0x5F, 0x02, 0xEB, 0x06, 0xD9, 0x05, 0xB0, 0x5C, 0x5F,
+
+    0x02, 0x85, 0xFF, 0xD9, 0x5C, 0x24, 0x10, 0x74, 0x1C, 0xA1, 0xBC, 0x5C, 0x5F, 0x02, 0x85, 0xC0,
+
+    0x7C, 0x13, 0x8B, 0x0D, 0xAC, 0x43, 0xE8, 0x00, 0x3B, 0xC1, 0x7E, 0x4E, 0x2B, 0xC1, 0x3D, 0x00,
+
+    0xE9, 0xA4, 0x35, 0x7C, 0x4F, 0xD9, 0x05, 0xB8, 0x5C, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x0C, 0xD9,
+
+    0x44, 0x24, 0x10, 0xD8, 0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x0F, 0x8A, 0x50, 0x01, 0x00, 0x00,
+
+    0xD9, 0xE0, 0xD8, 0x4C, 0x24, 0x0C, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xD1,
+
+    0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x76, 0xDD, 0xD9, 0xD9, 0xE8, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD,
+
+    0xD9, 0xF6, 0xC4, 0x41, 0x75, 0x69, 0xDD, 0xD8, 0xEB, 0x69, 0x2B, 0xC8, 0x81, 0xF9, 0x00, 0xE9,
+
+    0xA4, 0x35, 0x7C, 0xB1, 0x84, 0xD2, 0x74, 0x0E, 0x8B, 0x8F, 0xE4, 0x84, 0x00, 0x00, 0xD9, 0x81,
+
+    0xDC, 0x04, 0x00, 0x00, 0xEB, 0x0C, 0x8B, 0x97, 0xE4, 0x84, 0x00, 0x00, 0xD9, 0x82, 0xD8, 0x04,
+
+    0x00, 0x00, 0xB8, 0xBC, 0x5C, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x0C, 0xE8, 0xC0, 0x5C, 0x74, 0x00,
+
+    0x89, 0x44, 0x24, 0x18, 0xDB, 0x44, 0x24, 0x18, 0xDC, 0x35, 0x98, 0xBF, 0xE5, 0x00, 0xD9, 0x5C,
+
+    0x24, 0x18, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x05, 0xB8, 0x5C, 0x5F, 0x02, 0xD9, 0xC0, 0xDE, 0xEA,
+
+    0xD9, 0xC9, 0xD8, 0x4C, 0x24, 0x18, 0xDE, 0xC1, 0xE9, 0x5E, 0xFF, 0xFF, 0xFF, 0xDD, 0xD8, 0xD9,
+
+    0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0xE8, 0xDE, 0xE1, 0xD9, 0x5C, 0x24, 0x18, 0xD9,
+
+    0x44, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x14, 0xE8, 0xE4, 0x8F, 0x80, 0x00, 0xD9, 0x5C, 0x24, 0x18,
+
+    0xD9, 0x44, 0x24, 0x18, 0x8B, 0x45, 0x08, 0xD9, 0xE8, 0xDE, 0xE1, 0xD9, 0x5C, 0x24, 0x18, 0xD9,
+
+    0x44, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x28, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24,
+
+    0x4C, 0xD9, 0x44, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9,
+
+    0x5C, 0x24, 0x50, 0xD9, 0x44, 0x24, 0x24, 0xD9, 0x44, 0x24, 0x30, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9,
+
+    0xC9, 0xD9, 0x5C, 0x24, 0x54, 0xD9, 0x44, 0x24, 0x4C, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0xC0, 0xDE,
+
+    0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x40, 0xD9, 0x44, 0x24, 0x50, 0xD8, 0xC9, 0xD9, 0x5C, 0x24,
+
+    0x44, 0xD8, 0x4C, 0x24, 0x54, 0xD9, 0x5C, 0x24, 0x48, 0xD9, 0x44, 0x24, 0x40, 0xDE, 0xC3, 0xD9,
+
+    0xCA, 0xD9, 0x5C, 0x24, 0x4C, 0x8B, 0x4C, 0x24, 0x4C, 0x89, 0x08, 0xD8, 0x44, 0x24, 0x44, 0xD9,
+
+    0x5C, 0x24, 0x50, 0x8B, 0x54, 0x24, 0x50, 0x89, 0x50, 0x04, 0xD8, 0x44, 0x24, 0x48, 0xD9, 0x5C,
+
+    0x24, 0x54, 0x8B, 0x4C, 0x24, 0x54, 0x89, 0x48, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3,
+
+    0xD8, 0x4C, 0x24, 0x0C, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xD1, 0xDF, 0xE0,
+
+    0xF6, 0xC4, 0x41, 0x75, 0x13, 0xDD, 0xD9, 0xD9, 0xE8, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6,
+
+    0xC4, 0x41, 0x75, 0x06, 0xDD, 0xD8, 0xEB, 0x06, 0xDD, 0xD8, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x44,
+
+    0x24, 0x0C, 0xD9, 0xE8, 0xDE, 0xE1, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x18, 0xD9, 0x44,
+
+    0x24, 0x14, 0xE8, 0xF9, 0x8E, 0x80, 0x00, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x18, 0x8B,
+
+    0x45, 0x08, 0xD9, 0xE8, 0x5F, 0xDE, 0xE1, 0x5E, 0x5B, 0xD9, 0x5C, 0x24, 0x0C, 0xD9, 0x45, 0x0C,
+
+    0xD9, 0x44, 0x24, 0x1C, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x40, 0xD9, 0x45,
+
+    0x10, 0xD9, 0x44, 0x24, 0x20, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x44, 0xD9,
+
+    0x45, 0x14, 0xD9, 0x44, 0x24, 0x24, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x48,
+
+    0xD9, 0x44, 0x24, 0x40, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C,
+
+    0x24, 0x34, 0xD9, 0x44, 0x24, 0x44, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x38, 0xD8, 0x4C, 0x24, 0x48,
+
+    0xD9, 0x5C, 0x24, 0x3C, 0xD9, 0x44, 0x24, 0x34, 0xDE, 0xC3, 0xD9, 0xCA, 0xD9, 0x5C, 0x24, 0x40,
+
+    0x8B, 0x54, 0x24, 0x40, 0x89, 0x10, 0xD8, 0x44, 0x24, 0x38, 0xD9, 0x5C, 0x24, 0x44, 0x8B, 0x4C,
+
+    0x24, 0x44, 0x89, 0x48, 0x04, 0xD8, 0x44, 0x24, 0x3C, 0xD9, 0x5C, 0x24, 0x48, 0x8B, 0x54, 0x24,
+
+    0x48, 0x89, 0x50, 0x08, 0x8B, 0xE5, 0x5D, 0xC3,
+
+];
+
+// --- cam_4a01b0 (0x4a01b0..0x4a06f6) ----------------------------------------
+
+extern "C" fn cam_4a01b0_entry(ent: *mut Ent, args: *const u32) {
+    bump(C::Cam4a01b0Calls);
+    unsafe { hand::camera_shake_apply_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_4a01b0_thunk, cam_4a01b0_entry, 0);
+
+const CAM_4A01B0_BODY: [u8; 1350] = [
+
+    0x83, 0xEC, 0x18, 0xD9, 0xEE, 0xA1, 0xBC, 0xA6, 0xE9, 0x00, 0x85, 0xC0, 0xD9, 0x15, 0x50, 0x5C,
+
+    0x5F, 0x02, 0x53, 0xD9, 0x15, 0x68, 0x5C, 0x5F, 0x02, 0x56, 0x57, 0x8B, 0x3D, 0xAC, 0x43, 0xE8,
+
+    0x00, 0xC6, 0x44, 0x24, 0x13, 0x00, 0xB3, 0x01, 0x0F, 0x8C, 0xCE, 0x00, 0x00, 0x00, 0x3B, 0xC7,
+
+    0x7E, 0x2B, 0x2B, 0xC7, 0x3D, 0x00, 0xE9, 0xA4, 0x35, 0x7D, 0x2E, 0xA1, 0xC4, 0xA6, 0xE9, 0x00,
+
+    0xDD, 0xD8, 0x85, 0xC0, 0x0F, 0x8C, 0xF5, 0x04, 0x00, 0x00, 0x3B, 0xC7, 0x7E, 0x35, 0x2B, 0xC7,
+
+    0x3D, 0x00, 0xE9, 0xA4, 0x35, 0x0F, 0x8C, 0xE4, 0x04, 0x00, 0x00, 0xEB, 0x36, 0x8B, 0xCF, 0x2B,
+
+    0xC8, 0x81, 0xF9, 0x00, 0xE9, 0xA4, 0x35, 0x7D, 0xD2, 0x83, 0xC8, 0xFF, 0xD9, 0x1D, 0x68, 0x5C,
+
+    0x5F, 0x02, 0xA3, 0xBC, 0xA6, 0xE9, 0x00, 0xA3, 0xC4, 0xA6, 0xE9, 0x00, 0x5F, 0x5E, 0x5B, 0x83,
+
+    0xC4, 0x18, 0xC3, 0x8B, 0xD7, 0x2B, 0xD0, 0x81, 0xFA, 0x00, 0xE9, 0xA4, 0x35, 0x0F, 0x8D, 0xAC,
+
+    0x04, 0x00, 0x00, 0x83, 0x3D, 0xB4, 0x3A, 0xF5, 0x00, 0x00, 0x74, 0x52, 0xD9, 0x05, 0x8C, 0x1C,
+
+    0xDD, 0x00, 0x83, 0xEC, 0x08, 0xD9, 0x5C, 0x24, 0x04, 0xB8, 0xBC, 0xA6, 0xE9, 0x00, 0xD9, 0xE8,
+
+    0xD9, 0x1C, 0x24, 0xE8, 0xF8, 0xCF, 0x73, 0x00, 0x89, 0x44, 0x24, 0x20, 0xDB, 0x44, 0x24, 0x20,
+
+    0x51, 0xDA, 0x35, 0xB4, 0x3A, 0xF5, 0x00, 0xD9, 0x5C, 0x24, 0x24, 0xD9, 0x44, 0x24, 0x24, 0xD9,
+
+    0x1C, 0x24, 0xE8, 0xC9, 0x0C, 0x75, 0x00, 0xD8, 0x0D, 0xB8, 0x3A, 0xF5, 0x00, 0x8B, 0x35, 0x24,
+
+    0x6C, 0x52, 0x02, 0x83, 0xC4, 0x0C, 0xD8, 0x05, 0xBC, 0x3A, 0xF5, 0x00, 0xEB, 0x53, 0xD9, 0x05,
+
+    0xBC, 0x3A, 0xF5, 0x00, 0x8B, 0x35, 0x24, 0x6C, 0x52, 0x02, 0xEB, 0x45, 0x8B, 0x0D, 0xD4, 0x03,
+
+    0x17, 0x02, 0xDD, 0xD8, 0x8B, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x8B, 0xD0, 0xC1, 0xEA, 0x1D, 0x84,
+
+    0xD3, 0x74, 0x10, 0xC1, 0xE8, 0x1E, 0x84, 0xC3, 0x75, 0x09, 0xE8, 0xA1, 0xFF, 0x4F, 0x00, 0x33,
+
+    0xF6, 0xEB, 0x1E, 0x8B, 0xF1, 0xE8, 0x46, 0xFE, 0x4B, 0x00, 0x84, 0xC0, 0x0F, 0x84, 0x0D, 0x04,
+
+    0x00, 0x00, 0xD9, 0x05, 0xFC, 0x97, 0xE9, 0x00, 0xBE, 0xFA, 0x00, 0x00, 0x00, 0x88, 0x5C, 0x24,
+
+    0x13, 0xA1, 0x88, 0x68, 0x5F, 0x02, 0xD9, 0x5C, 0x24, 0x14, 0x85, 0xC0, 0xD9, 0x44, 0x24, 0x14,
+
+    0x89, 0x74, 0x24, 0x18, 0x7C, 0x1B, 0x3B, 0xC7, 0x7E, 0x0B, 0x2B, 0xC7, 0x3D, 0x00, 0xE9, 0xA4,
+
+    0x35, 0x7C, 0x6E, 0xEB, 0x0C, 0x8B, 0xCF, 0x2B, 0xC8, 0x81, 0xF9, 0x00, 0xE9, 0xA4, 0x35, 0x7D,
+
+    0x60, 0xD9, 0x05, 0x28, 0x6C, 0x52, 0x02, 0xB8, 0xF8, 0x30, 0xEC, 0x00, 0xD9, 0x1D, 0x38, 0x6C,
+
+    0x52, 0x02, 0xD9, 0xE0, 0xD9, 0x5C, 0x24, 0x1C, 0xE8, 0xF3, 0xCA, 0x73, 0x00, 0x85, 0xF6, 0xD9,
+
+    0x44, 0x24, 0x14, 0xD9, 0xC0, 0x8D, 0x04, 0x37, 0xD9, 0x44, 0x24, 0x1C, 0xA3, 0x88, 0x68, 0x5F,
+
+    0x02, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xCB, 0xDE, 0xC9, 0xDE, 0xC2, 0xD9, 0xC9, 0xD9, 0x1D, 0x28,
+
+    0x6C, 0x52, 0x02, 0x7C, 0x0E, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0x7E, 0x15, 0x2D, 0x00, 0xD2, 0x49,
+
+    0x6B, 0xEB, 0x09, 0x85, 0xC0, 0x7D, 0x0A, 0x05, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0x88, 0x68, 0x5F,
+
+    0x02, 0x85, 0xF6, 0x74, 0x1C, 0xB8, 0x88, 0x68, 0x5F, 0x02, 0xE8, 0xD1, 0xCE, 0x73, 0x00, 0x89,
+
+    0x44, 0x24, 0x1C, 0xDB, 0x44, 0x24, 0x1C, 0xDA, 0x74, 0x24, 0x18, 0xD9, 0xE8, 0xDE, 0xE1, 0xEB,
+
+    0x02, 0xD9, 0xE8, 0xD9, 0x05, 0x28, 0x6C, 0x52, 0x02, 0xA1, 0x8C, 0x68, 0x5F, 0x02, 0x85, 0xC0,
+
+    0xD9, 0x05, 0x38, 0x6C, 0x52, 0x02, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xCA, 0xD9, 0x5C, 0x24, 0x1C,
+
+    0xD8, 0x4C, 0x24, 0x1C, 0xDE, 0xC1, 0xD9, 0x1D, 0x50, 0x5C, 0x5F, 0x02, 0x7C, 0x3F, 0x3B, 0xC7,
+
+    0x7E, 0x2F, 0x2B, 0xC7, 0x3D, 0x00, 0xE9, 0xA4, 0x35, 0x7D, 0x32, 0xDD, 0xD8, 0x85, 0xF6, 0x0F,
+
+    0x84, 0x95, 0x00, 0x00, 0x00, 0xB8, 0x8C, 0x68, 0x5F, 0x02, 0xE8, 0x71, 0xCE, 0x73, 0x00, 0x89,
+
+    0x44, 0x24, 0x1C, 0xDB, 0x44, 0x24, 0x1C, 0xDA, 0x74, 0x24, 0x18, 0xD9, 0xE8, 0xDE, 0xE1, 0xEB,
+
+    0x7B, 0x8B, 0xD7, 0x2B, 0xD0, 0x81, 0xFA, 0x00, 0xE9, 0xA4, 0x35, 0x7D, 0xCE, 0xD9, 0x05, 0x2C,
+
+    0x6C, 0x52, 0x02, 0xB8, 0xF8, 0x30, 0xEC, 0x00, 0xD9, 0x1D, 0x3C, 0x6C, 0x52, 0x02, 0xD9, 0xE0,
+
+    0xD9, 0x5C, 0x24, 0x1C, 0xE8, 0x07, 0xCA, 0x73, 0x00, 0x85, 0xF6, 0xD9, 0x44, 0x24, 0x14, 0xD9,
+
+    0x44, 0x24, 0x1C, 0x8D, 0x04, 0x37, 0xD9, 0xC0, 0xA3, 0x8C, 0x68, 0x5F, 0x02, 0xDE, 0xEA, 0xD9,
+
+    0xCA, 0xDE, 0xC9, 0xDE, 0xC1, 0xD9, 0x1D, 0x2C, 0x6C, 0x52, 0x02, 0x7C, 0x16, 0x3D, 0x00, 0xD2,
+
+    0x49, 0x6B, 0x7E, 0x89, 0x2D, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0x8C, 0x68, 0x5F, 0x02, 0xE9, 0x7A,
+
+    0xFF, 0xFF, 0xFF, 0x85, 0xC0, 0x0F, 0x8D, 0x72, 0xFF, 0xFF, 0xFF, 0x05, 0x00, 0xD2, 0x49, 0x6B,
+
+    0xA3, 0x8C, 0x68, 0x5F, 0x02, 0xE9, 0x63, 0xFF, 0xFF, 0xFF, 0xD9, 0xE8, 0xD9, 0x05, 0x2C, 0x6C,
+
+    0x52, 0x02, 0x51, 0xD9, 0x05, 0x3C, 0x6C, 0x52, 0x02, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xCA, 0xD9,
+
+    0x5C, 0x24, 0x20, 0xD8, 0x4C, 0x24, 0x20, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24,
+
+    0x20, 0xD9, 0x1C, 0x24, 0x68, 0x2C, 0x5C, 0x5F, 0x02, 0xE8, 0x42, 0x4C, 0x74, 0x00, 0xA1, 0x90,
+
+    0x68, 0x5F, 0x02, 0x85, 0xC0, 0x7C, 0x1F, 0x3B, 0xC7, 0x7E, 0x0F, 0x2B, 0xC7, 0x3D, 0x00, 0xE9,
+
+    0xA4, 0x35, 0x0F, 0x8C, 0x82, 0x00, 0x00, 0x00, 0xEB, 0x0C, 0x8B, 0xCF, 0x2B, 0xC8, 0x81, 0xF9,
+
+    0x00, 0xE9, 0xA4, 0x35, 0x7D, 0x74, 0xD9, 0x05, 0x30, 0x6C, 0x52, 0x02, 0xB8, 0xF8, 0x30, 0xEC,
+
+    0x00, 0xD9, 0x1D, 0x40, 0x6C, 0x52, 0x02, 0xD9, 0x44, 0x24, 0x14, 0xD9, 0xE0, 0xDC, 0x0D, 0x70,
+
+    0xBF, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x20, 0xE8, 0x34, 0xC9, 0x73, 0x00, 0x85, 0xF6, 0xD9, 0x44,
+
+    0x24, 0x14, 0xDC, 0x0D, 0x70, 0xBF, 0xE5, 0x00, 0x8D, 0x04, 0x37, 0xA3, 0x90, 0x68, 0x5F, 0x02,
+
+    0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x20, 0xD9, 0xC0, 0xDE, 0xEA,
+
+    0xD9, 0xCA, 0xDE, 0xC9, 0xDE, 0xC1, 0xD9, 0x1D, 0x30, 0x6C, 0x52, 0x02, 0x7C, 0x0E, 0x3D, 0x00,
+
+    0xD2, 0x49, 0x6B, 0x7E, 0x15, 0x2D, 0x00, 0xD2, 0x49, 0x6B, 0xEB, 0x09, 0x85, 0xC0, 0x7D, 0x0A,
+
+    0x05, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0x90, 0x68, 0x5F, 0x02, 0x85, 0xF6, 0x74, 0x1C, 0xB8, 0x90,
+
+    0x68, 0x5F, 0x02, 0xE8, 0x08, 0xCD, 0x73, 0x00, 0x89, 0x44, 0x24, 0x20, 0xDB, 0x44, 0x24, 0x20,
+
+    0xDA, 0x74, 0x24, 0x18, 0xD9, 0xE8, 0xDE, 0xE1, 0xEB, 0x02, 0xD9, 0xE8, 0xD9, 0x05, 0x30, 0x6C,
+
+    0x52, 0x02, 0x51, 0xD9, 0x05, 0x40, 0x6C, 0x52, 0x02, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xCA, 0xD9,
+
+    0x5C, 0x24, 0x24, 0xD8, 0x4C, 0x24, 0x24, 0xDE, 0xC1, 0xD9, 0x5C, 0x24, 0x24, 0xD9, 0x44, 0x24,
+
+    0x24, 0xD9, 0x1C, 0x24, 0x68, 0x2C, 0x5C, 0x5F, 0x02, 0xE8, 0x52, 0x4B, 0x74, 0x00, 0xA1, 0x94,
+
+    0x68, 0x5F, 0x02, 0x85, 0xC0, 0x7C, 0x23, 0x3B, 0xC7, 0x7E, 0x0F, 0x2B, 0xC7, 0x3D, 0x00, 0xE9,
+
+    0xA4, 0x35, 0x0F, 0x8C, 0xF3, 0x00, 0x00, 0x00, 0xEB, 0x10, 0x8B, 0xD7, 0x2B, 0xD0, 0x81, 0xFA,
+
+    0x00, 0xE9, 0xA4, 0x35, 0x0F, 0x8D, 0xE1, 0x00, 0x00, 0x00, 0xD9, 0x44, 0x24, 0x14, 0xDC, 0x15,
+
+    0xC0, 0xC2, 0xE5, 0x00, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x08, 0xDD, 0xD8, 0xD9, 0x05, 0x48,
+
+    0xB0, 0xE8, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x05, 0x34, 0x6C, 0x52, 0x02, 0xD9, 0x15, 0x44,
+
+    0x6C, 0x52, 0x02, 0xD9, 0xEE, 0xDE, 0xD9, 0xDF, 0xE0, 0xF6, 0xC4, 0x05, 0x7B, 0x02, 0x32, 0xDB,
+
+    0xD9, 0x44, 0x24, 0x14, 0xB8, 0xF8, 0x30, 0xEC, 0x00, 0xD9, 0xE0, 0xDC, 0x0D, 0x20, 0xC1, 0xE5,
+
+    0x00, 0xD9, 0x5C, 0x24, 0x1C, 0xE8, 0x16, 0xC8, 0x73, 0x00, 0x80, 0x7C, 0x24, 0x13, 0x00, 0xD9,
+
+    0x44, 0x24, 0x14, 0xDC, 0x0D, 0x20, 0xC1, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24,
+
+    0x20, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xCA, 0xDE, 0xC9, 0xDE, 0xC1, 0xD9,
+
+    0x1D, 0x34, 0x6C, 0x52, 0x02, 0x74, 0x3C, 0xD9, 0xEE, 0xD9, 0x05, 0x34, 0x6C, 0x52, 0x02, 0xD8,
+
+    0xD1, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x10, 0x84, 0xDB, 0x74, 0x0C, 0xDD, 0xD9, 0xD9, 0xE0,
+
+    0xD9, 0x1D, 0x34, 0x6C, 0x52, 0x02, 0xEB, 0x1B, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4,
+
+    0x05, 0x7A, 0x0E, 0x84, 0xDB, 0x75, 0x0A, 0xD9, 0xE0, 0xD9, 0x1D, 0x34, 0x6C, 0x52, 0x02, 0xEB,
+
+    0x02, 0xDD, 0xD8, 0x85, 0xF6, 0x8D, 0x04, 0x37, 0xA3, 0x94, 0x68, 0x5F, 0x02, 0x7C, 0x0E, 0x3D,
+
+    0x00, 0xD2, 0x49, 0x6B, 0x7E, 0x15, 0x2D, 0x00, 0xD2, 0x49, 0x6B, 0xEB, 0x09, 0x85, 0xC0, 0x7D,
+
+    0x0A, 0x05, 0x00, 0xD2, 0x49, 0x6B, 0xA3, 0x94, 0x68, 0x5F, 0x02, 0x85, 0xF6, 0x74, 0x1C, 0xB8,
+
+    0x94, 0x68, 0x5F, 0x02, 0xE8, 0xA7, 0xCB, 0x73, 0x00, 0x89, 0x44, 0x24, 0x20, 0xDB, 0x44, 0x24,
+
+    0x20, 0xDA, 0x74, 0x24, 0x18, 0xD9, 0xE8, 0xDE, 0xE1, 0xEB, 0x02, 0xD9, 0xE8, 0xD9, 0x05, 0x34,
+
+    0x6C, 0x52, 0x02, 0xD9, 0x05, 0x44, 0x6C, 0x52, 0x02, 0xD9, 0xC0, 0xDE, 0xEA, 0xD9, 0xCA, 0xD9,
+
+    0x5C, 0x24, 0x20, 0xD8, 0x4C, 0x24, 0x20, 0xDE, 0xC1, 0xD9, 0x1D, 0x68, 0x5C, 0x5F, 0x02, 0x5F,
+
+    0x5E, 0x5B, 0x83, 0xC4, 0x18, 0xC3,
+
+];
+
+// --- cam_499b50 (0x499b50..0x49a07d) ----------------------------------------
+
+extern "C" fn cam_499b50_entry(ent: *mut Ent, args: *const u32) {
+    bump(C::Cam499b50Calls);
+    unsafe { hand::camera_follow_compute_desired_body(&mut *ent, args) }
+}
+
+ent_thunk!(cam_499b50_thunk, cam_499b50_entry, 0);
+
+const CAM_499B50_BODY: [u8; 1325] = [
+
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0xD9, 0xEE, 0x81, 0xEC, 0xA0, 0x00, 0x00, 0x00, 0xD9, 0x05,
+
+    0x4C, 0x6A, 0x7A, 0x02, 0x53, 0xD8, 0xD1, 0x55, 0x56, 0x57, 0xDF, 0xE0, 0xD9, 0x05, 0x40, 0xA6,
+
+    0xE9, 0x00, 0xF6, 0xC4, 0x41, 0xD9, 0x05, 0x3C, 0xA6, 0xE9, 0x00, 0xD9, 0x05, 0x38, 0xA6, 0xE9,
+
+    0x00, 0x75, 0x1A, 0xD9, 0x54, 0x24, 0x20, 0x8D, 0x44, 0x24, 0x20, 0xD9, 0xC1, 0xDE, 0xCC, 0xD9,
+
+    0xCB, 0xD9, 0x5C, 0x24, 0x24, 0xD9, 0xC9, 0xD9, 0x54, 0x24, 0x28, 0xEB, 0x09, 0xDD, 0xDB, 0xB8,
+
+    0x38, 0xA6, 0xE9, 0x00, 0xD9, 0xC9, 0x8B, 0x08, 0xD9, 0x05, 0x50, 0x6A, 0x7A, 0x02, 0x89, 0x0D,
+
+    0x64, 0xA6, 0xE9, 0x00, 0xD8, 0xD4, 0x8B, 0x50, 0x04, 0x89, 0x15, 0x68, 0xA6, 0xE9, 0x00, 0x8B,
+
+    0x40, 0x08, 0xA3, 0x6C, 0xA6, 0xE9, 0x00, 0xDF, 0xE0, 0xDD, 0xDC, 0xF6, 0xC4, 0x41, 0x75, 0x18,
+
+    0xD9, 0xCA, 0x8D, 0x44, 0x24, 0x20, 0xD9, 0x5C, 0x24, 0x20, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C,
+
+    0x24, 0x24, 0xD9, 0x5C, 0x24, 0x28, 0xEB, 0x0D, 0xDD, 0xDB, 0xB8, 0x64, 0xA6, 0xE9, 0x00, 0xDD,
+
+    0xDA, 0xDD, 0xD9, 0xDD, 0xD8, 0x8B, 0x28, 0x8B, 0x35, 0xB8, 0xA5, 0xE9, 0x00, 0x89, 0x2D, 0x64,
+
+    0xA6, 0xE9, 0x00, 0x8B, 0x48, 0x04, 0x89, 0x0D, 0x68, 0xA6, 0xE9, 0x00, 0x8B, 0x50, 0x08, 0x33,
+
+    0xFF, 0x3B, 0xF7, 0x89, 0x15, 0x6C, 0xA6, 0xE9, 0x00, 0x75, 0x09, 0x89, 0x7C, 0x24, 0x2C, 0xE9,
+
+    0xC7, 0x00, 0x00, 0x00, 0x8B, 0xC6, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80,
+
+    0x64, 0x9C, 0x14, 0x02, 0x3B, 0xC7, 0x74, 0xE3, 0x39, 0x70, 0x44, 0x75, 0xDE, 0x8A, 0x0D, 0x84,
+
+    0xA6, 0xE9, 0x00, 0xF6, 0xC1, 0x08, 0x89, 0x44, 0x24, 0x2C, 0x75, 0x50, 0xF6, 0xC1, 0x10, 0x74,
+
+    0x05, 0x83, 0xC0, 0x20, 0xEB, 0x36, 0x8D, 0x48, 0x20, 0xE8, 0x22, 0x97, 0x74, 0x00, 0x83, 0xEC,
+
+    0x0C, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x28, 0x8D, 0x8C, 0x24, 0x98, 0x00,
+
+    0x00, 0x00, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0xEE, 0xD9, 0x54, 0x24, 0x04, 0xD9, 0x1C, 0x24, 0x51,
+
+    0xE8, 0x0B, 0x91, 0x74, 0x00, 0x8D, 0x84, 0x24, 0x8C, 0x00, 0x00, 0x00, 0xB9, 0x64, 0xA6, 0xE9,
+
+    0x00, 0xE8, 0xDA, 0x48, 0x74, 0x00, 0x8B, 0x35, 0xB8, 0xA5, 0xE9, 0x00, 0x8D, 0x54, 0x24, 0x20,
+
+    0x52, 0xE8, 0x3A, 0xCC, 0xFF, 0xFF, 0xD9, 0x44, 0x24, 0x24, 0xD8, 0x05, 0x64, 0xA6, 0xE9, 0x00,
+
+    0x8B, 0x35, 0xB8, 0xA5, 0xE9, 0x00, 0x83, 0xC4, 0x04, 0xD9, 0x1D, 0x64, 0xA6, 0xE9, 0x00, 0x8B,
+
+    0x2D, 0x64, 0xA6, 0xE9, 0x00, 0xD9, 0x05, 0x68, 0xA6, 0xE9, 0x00, 0xD8, 0x44, 0x24, 0x24, 0xD9,
+
+    0x1D, 0x68, 0xA6, 0xE9, 0x00, 0xD9, 0x05, 0x6C, 0xA6, 0xE9, 0x00, 0xD8, 0x44, 0x24, 0x28, 0xD9,
+
+    0x1D, 0x6C, 0xA6, 0xE9, 0x00, 0x8B, 0x15, 0x6C, 0xA6, 0xE9, 0x00, 0x3B, 0xF7, 0x74, 0x19, 0x8B,
+
+    0xC6, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x3B,
+
+    0xC7, 0x74, 0x05, 0x39, 0x70, 0x44, 0x74, 0x04, 0x33, 0xDB, 0xEB, 0x0E, 0x8B, 0x58, 0x4C, 0x83,
+
+    0xEB, 0x01, 0xF7, 0xDB, 0x1B, 0xDB, 0xF7, 0xD3, 0x23, 0xD8, 0xF6, 0x05, 0x84, 0xA6, 0xE9, 0x00,
+
+    0x01, 0x0F, 0x84, 0xF4, 0x00, 0x00, 0x00, 0x39, 0x7C, 0x24, 0x2C, 0x0F, 0x84, 0xEA, 0x00, 0x00,
+
+    0x00, 0x8D, 0x4C, 0x24, 0x20, 0x51, 0x89, 0x7C, 0x24, 0x50, 0x89, 0x7C, 0x24, 0x78, 0x89, 0x7C,
+
+    0x24, 0x7C, 0x89, 0xBC, 0x24, 0x84, 0x00, 0x00, 0x00, 0x89, 0xBC, 0x24, 0x88, 0x00, 0x00, 0x00,
+
+    0x89, 0x7C, 0x24, 0x14, 0x89, 0x7C, 0x24, 0x18, 0xC7, 0x44, 0x24, 0x1C, 0x00, 0x00, 0x00, 0x80,
+
+    0xE8, 0x7B, 0xCB, 0xFF, 0xFF, 0xD9, 0x44, 0x24, 0x28, 0x8B, 0x54, 0x24, 0x24, 0xDC, 0x05, 0x08,
+
+    0xC1, 0xE5, 0x00, 0x8B, 0x4C, 0x24, 0x2C, 0x8B, 0x44, 0x24, 0x28, 0x89, 0x54, 0x24, 0x34, 0x8B,
+
+    0x15, 0x64, 0xA6, 0xE9, 0x00, 0x89, 0x4C, 0x24, 0x3C, 0x8B, 0x0D, 0x6C, 0xA6, 0xE9, 0x00, 0x83,
+
+    0xC4, 0x04, 0x89, 0x44, 0x24, 0x34, 0xD9, 0x5C, 0x24, 0x34, 0xA1, 0x68, 0xA6, 0xE9, 0x00, 0xD9,
+
+    0x05, 0x44, 0x19, 0xDD, 0x00, 0x89, 0x54, 0x24, 0x3C, 0xD9, 0x5C, 0x24, 0x48, 0x8D, 0x54, 0x24,
+
+    0x10, 0x89, 0x4C, 0x24, 0x44, 0x6A, 0x01, 0x52, 0x8D, 0x4C, 0x24, 0x38, 0x89, 0x44, 0x24, 0x48,
+
+    0xC7, 0x84, 0x24, 0x84, 0x00, 0x00, 0x00, 0x5D, 0x00, 0x00, 0x00, 0xE8, 0x60, 0x05, 0x26, 0x00,
+
+    0x83, 0xC4, 0x08, 0x84, 0xC0, 0x74, 0x2F, 0x8B, 0x44, 0x24, 0x10, 0x8B, 0x08, 0x89, 0x0D, 0x64,
+
+    0xA6, 0xE9, 0x00, 0x8B, 0x50, 0x04, 0x89, 0x15, 0x68, 0xA6, 0xE9, 0x00, 0xD9, 0x05, 0x68, 0xA6,
+
+    0xE9, 0x00, 0xDC, 0x25, 0x08, 0xC1, 0xE5, 0x00, 0x8B, 0x40, 0x08, 0xA3, 0x6C, 0xA6, 0xE9, 0x00,
+
+    0xD9, 0x1D, 0x68, 0xA6, 0xE9, 0x00, 0x8D, 0x4C, 0x24, 0x10, 0xE8, 0xA1, 0xE2, 0xF6, 0xFF, 0x8B,
+
+    0x15, 0x6C, 0xA6, 0xE9, 0x00, 0x8B, 0x2D, 0x64, 0xA6, 0xE9, 0x00, 0x3B, 0xDF, 0x0F, 0x84, 0x36,
+
+    0x01, 0x00, 0x00, 0x8B, 0x8B, 0xC0, 0x00, 0x00, 0x00, 0xC1, 0xE9, 0x07, 0xF6, 0xC1, 0x01, 0x75,
+
+    0x2A, 0x8B, 0x8B, 0xE0, 0x05, 0x00, 0x00, 0x8B, 0x41, 0x40, 0xE8, 0x81, 0xAE, 0x4F, 0x00, 0x84,
+
+    0xC0, 0x75, 0x18, 0x81, 0x79, 0x14, 0x70, 0x01, 0x00, 0x00, 0x74, 0x0F, 0x8B, 0xC3, 0xE8, 0x1D,
+
+    0xB0, 0x4F, 0x00, 0x84, 0xC0, 0x0F, 0x84, 0xFE, 0x00, 0x00, 0x00, 0xF6, 0x05, 0x84, 0xA6, 0xE9,
+
+    0x00, 0x02, 0x0F, 0x84, 0xD1, 0x00, 0x00, 0x00, 0xA1, 0x68, 0xA6, 0xE9, 0x00, 0xD9, 0xEE, 0xD9,
+
+    0x5C, 0x24, 0x48, 0x89, 0x44, 0x24, 0x40, 0xD9, 0x44, 0x24, 0x40, 0x89, 0x54, 0x24, 0x38, 0xD9,
+
+    0x05, 0xD4, 0x99, 0xE9, 0x00, 0x89, 0x54, 0x24, 0x44, 0xD8, 0x0D, 0x10, 0x6C, 0x52, 0x02, 0x8D,
+
+    0x54, 0x24, 0x10, 0x6A, 0x01, 0x52, 0x8D, 0x4C, 0x24, 0x38, 0xD9, 0x5C, 0x24, 0x24, 0x89, 0x7C,
+
+    0x24, 0x54, 0xD8, 0x64, 0x24, 0x24, 0x89, 0x7C, 0x24, 0x7C, 0x89, 0xBC, 0x24, 0x80, 0x00, 0x00,
+
+    0x00, 0x89, 0xBC, 0x24, 0x88, 0x00, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x48, 0x89, 0xBC, 0x24, 0x8C,
+
+    0x00, 0x00, 0x00, 0x89, 0x7C, 0x24, 0x18, 0x89, 0x7C, 0x24, 0x1C, 0xC7, 0x44, 0x24, 0x20, 0x00,
+
+    0x00, 0x00, 0x80, 0x89, 0x6C, 0x24, 0x38, 0x89, 0x44, 0x24, 0x3C, 0x89, 0x6C, 0x24, 0x44, 0xC7,
+
+    0x84, 0x24, 0x84, 0x00, 0x00, 0x00, 0x5D, 0x00, 0x00, 0x00, 0xE8, 0x41, 0x04, 0x26, 0x00, 0x83,
+
+    0xC4, 0x08, 0x84, 0xC0, 0x74, 0x2C, 0x8B, 0x44, 0x24, 0x14, 0x8B, 0x54, 0x24, 0x10, 0x8B, 0xC8,
+
+    0xC1, 0xE1, 0x04, 0x2B, 0xC8, 0x8D, 0x44, 0x8A, 0xD0, 0x8B, 0x08, 0x89, 0x0D, 0x64, 0xA6, 0xE9,
+
+    0x00, 0x8B, 0x50, 0x04, 0x89, 0x15, 0x68, 0xA6, 0xE9, 0x00, 0x8B, 0x40, 0x08, 0xA3, 0x6C, 0xA6,
+
+    0xE9, 0x00, 0x8D, 0x4C, 0x24, 0x10, 0xE8, 0x85, 0xE1, 0xF6, 0xFF, 0x8B, 0x15, 0x6C, 0xA6, 0xE9,
+
+    0x00, 0x8B, 0x2D, 0x64, 0xA6, 0xE9, 0x00, 0xEB, 0x20, 0xD9, 0x05, 0x68, 0xA6, 0xE9, 0x00, 0xD9,
+
+    0x05, 0xD4, 0x99, 0xE9, 0x00, 0xD8, 0x0D, 0x10, 0x6C, 0x52, 0x02, 0xD9, 0x5C, 0x24, 0x1C, 0xD8,
+
+    0x64, 0x24, 0x1C, 0xD9, 0x1D, 0x68, 0xA6, 0xE9, 0x00, 0xF6, 0x05, 0x84, 0xA6, 0xE9, 0x00, 0x04,
+
+    0x0F, 0x84, 0x0F, 0x01, 0x00, 0x00, 0xA1, 0x68, 0xA6, 0xE9, 0x00, 0xD9, 0xEE, 0xD9, 0x5C, 0x24,
+
+    0x48, 0x89, 0x44, 0x24, 0x34, 0xD9, 0x44, 0x24, 0x34, 0x89, 0x44, 0x24, 0x40, 0xDC, 0x25, 0x70,
+
+    0xBF, 0xE5, 0x00, 0x8D, 0x4C, 0x24, 0x10, 0x6A, 0x01, 0x51, 0x8D, 0x4C, 0x24, 0x38, 0xD9, 0x5C,
+
+    0x24, 0x3C, 0x89, 0x7C, 0x24, 0x54, 0xD9, 0x44, 0x24, 0x48, 0x89, 0x7C, 0x24, 0x7C, 0xDC, 0x05,
+
+    0xB8, 0xC1, 0xE5, 0x00, 0x89, 0xBC, 0x24, 0x80, 0x00, 0x00, 0x00, 0xC7, 0x84, 0x24, 0x84, 0x00,
+
+    0x00, 0x00, 0x4D, 0x00, 0x00, 0x00, 0x89, 0xBC, 0x24, 0x88, 0x00, 0x00, 0x00, 0xD9, 0x5C, 0x24,
+
+    0x48, 0x89, 0xBC, 0x24, 0x8C, 0x00, 0x00, 0x00, 0x89, 0x7C, 0x24, 0x18, 0x89, 0x7C, 0x24, 0x1C,
+
+    0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x80, 0x89, 0x6C, 0x24, 0x38, 0x89, 0x54, 0x24, 0x40,
+
+    0x89, 0x6C, 0x24, 0x44, 0x89, 0x54, 0x24, 0x4C, 0xE8, 0x43, 0x03, 0x26, 0x00, 0x8B, 0x5C, 0x24,
+
+    0x18, 0x83, 0xC4, 0x08, 0x84, 0xC0, 0x74, 0x4C, 0x8B, 0x4C, 0x24, 0x14, 0x3B, 0xCF, 0x7E, 0x44,
+
+    0xDD, 0x05, 0x70, 0xBF, 0xE5, 0x00, 0x8B, 0xC3, 0xBA, 0x14, 0x00, 0x00, 0x00, 0x39, 0x50, 0x38,
+
+    0x75, 0x28, 0x8B, 0x30, 0x89, 0x35, 0x64, 0xA6, 0xE9, 0x00, 0x8B, 0x70, 0x04, 0x89, 0x35, 0x68,
+
+    0xA6, 0xE9, 0x00, 0xD9, 0x05, 0x68, 0xA6, 0xE9, 0x00, 0x8B, 0x70, 0x08, 0xD8, 0xC1, 0x89, 0x35,
+
+    0x6C, 0xA6, 0xE9, 0x00, 0xD9, 0x1D, 0x68, 0xA6, 0xE9, 0x00, 0x83, 0xC0, 0x3C, 0x83, 0xE9, 0x01,
+
+    0x75, 0xCB, 0xDD, 0xD8, 0x8B, 0x74, 0x24, 0x18, 0x85, 0xF6, 0x78, 0x29, 0x8B, 0x15, 0xBC, 0xF2,
+
+    0x1B, 0x03, 0x52, 0xFF, 0x15, 0x7C, 0x80, 0xDB, 0x00, 0x81, 0xE6, 0xFF, 0xFF, 0xFF, 0x3F, 0x8B,
+
+    0xCE, 0xC1, 0xE1, 0x04, 0x2B, 0xCE, 0x03, 0xC9, 0x6A, 0x17, 0x03, 0xC9, 0x51, 0x53, 0x8B, 0xC8,
+
+    0xE8, 0x5B, 0x17, 0x89, 0x00, 0x5F, 0x5E, 0x5D, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3,
+
+];

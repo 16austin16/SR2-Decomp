@@ -221,10 +221,14 @@ pub struct Callee {
     /// Runs after the log: may write memory and replace the result.
     pub hook: Option<fn(&Pushad, *const u32) -> Option<u32>>,
     pub silent: bool,
+    /// XMM0 comes back (a random f32), not ST0.
+    pub xmm0: bool,
+    /// With `st0`: a small value (-1.9 .. 28, a few NaN / infinities).
+    pub st0_small: bool,
 }
 
 pub fn callee(addr: usize, nargs: usize, pop: u16, reads: u8, ret: Ret) -> Callee {
-    Callee { addr, nargs, pop, reads, ret, st0: false, fill: Vec::new(), peek: Vec::new(), byte_args: 0, hook: None, silent: false }
+    Callee { addr, nargs, pop, reads, ret, st0: false, fill: Vec::new(), peek: Vec::new(), byte_args: 0, hook: None, silent: false, xmm0: false, st0_small: false }
 }
 
 static CALLEES: Mutex<Vec<Callee>> = Mutex::new(Vec::new());
@@ -262,6 +266,14 @@ unsafe extern "system" fn veh(info: *mut windows_sys::Win32::System::Diagnostics
             "EXCEPTION {:#x} at eip {:#x} access {:x?} eax {:#x} ecx {:#x} edx {:#x} ebx {:#x} esi {:#x} edi {:#x} ebp {:#x} esp {:#x}",
             rec.ExceptionCode, ctx.Eip, &rec.ExceptionInformation[..2], ctx.Eax, ctx.Ecx, ctx.Edx, ctx.Ebx, ctx.Esi, ctx.Edi, ctx.Ebp, ctx.Esp
         );
+        if std::env::var("BT").is_ok() {
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
+        if std::env::var("DUMPF").is_ok() {
+            for k in 0..24usize {
+                eprintln!("  F+{:#x}: {:#x}", 0x10 + k * 4, *((ctx.Esp as usize + 12 + 0x10 + k * 4) as *const u32));
+            }
+        }
     }
     0
 }
@@ -287,7 +299,7 @@ pub fn set_callees(c: Vec<Callee>) {
         code[0] = 0x68;
         code[1..5].copy_from_slice(&(i as u32).to_le_bytes());
         code[5] = 0xE8;
-        let target = if x.st0 { stub_common_st0 as usize } else { stub_common as usize };
+        let target = if x.xmm0 { stub_common_xmm0 as usize } else if x.st0 { stub_common_st0 as usize } else { stub_common as usize };
         let rel = (target as i32).wrapping_sub((a + 10) as i32);
         code[6..10].copy_from_slice(&rel.to_le_bytes());
         if x.pop == 0 {
@@ -312,6 +324,7 @@ pub fn set_callees(c: Vec<Callee>) {
 pub fn load_orig(base: usize, body: &[u8], calls: &[usize], fixes: &[usize], tails: &[(usize, usize)], tables: &[(usize, usize)]) -> usize {
     let copy = exec_alloc(body.len() + 16);
     unsafe { std::ptr::copy_nonoverlapping(body.as_ptr(), copy as *mut u8, body.len()) };
+    REDIRECT.lock().unwrap().push((base, copy)); // recursion goes to the copy
     let rd32 = |o: usize| u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
     for &o in fixes {
         unsafe { std::ptr::write_unaligned((copy + o) as *mut u32, rd32(o).wrapping_add(DELTA as u32)) };
@@ -365,6 +378,11 @@ pub struct Pushad {
     pub eax: u32,
 }
 
+/// Add a line to the call log (a hook records memory the callee would read).
+pub fn log_extra(v: Vec<u32>) {
+    LOG.lock().unwrap().push(v);
+}
+
 /// A pseudo-random word for the hooks (the same sequence in the original's run and the port's).
 pub fn hook_rand() -> u32 {
     srng()
@@ -376,6 +394,9 @@ static STACK_HI: AtomicU32 = AtomicU32::new(0);
 extern "C" fn stub_rs(regs: *mut Pushad, idx: u32, args: *const u32) -> u32 {
     let c = CALLEES.lock().unwrap()[idx as usize].clone();
     let r = unsafe { &*regs };
+    if std::env::var("STUBV").is_ok() {
+        eprintln!("  stub {:#x} eax {:#x} ecx {:#x} edx {:#x} esi {:#x} edi {:#x} a0 {:x?}", c.addr, r.eax, r.ecx, r.edx, r.esi, r.edi, unsafe { [*args, *args.add(1), *args.add(2), *args.add(3)] });
+    }
     let (lo, hi) = (STACK_LO.load(Ordering::Relaxed), STACK_HI.load(Ordering::Relaxed));
     let mask = |v: u32| {
         if v >= lo && v < hi {
@@ -421,11 +442,20 @@ extern "C" fn stub_rs(regs: *mut Pushad, idx: u32, args: *const u32) -> u32 {
             }
         }
     }
-    if c.st0 {
+    if c.st0 || c.xmm0 {
         let mut g = Rng(srng() as u64 | 1 << 40);
-        let b = match g.below(4) {
+        let b = if c.st0_small {
+            match g.below(16) {
+                0 => f32::NAN.to_bits(),
+                1 => f32::INFINITY.to_bits(),
+                2 => f32::NEG_INFINITY.to_bits(),
+                _ => (g.below(300) as f32 / 10.0 - 1.9).to_bits(),
+            }
+        } else {
+            match g.below(4) {
             0 => g.float_bits(),
             _ => (g.below(4000) as f32 / 100.0 - 20.0).to_bits(),
+            }
         };
         ST0_VAL.store(b, Ordering::Relaxed);
     }
@@ -481,6 +511,26 @@ extern "C" fn stub_common_st0() {
         "mov [esp + 28], eax",
         "popad",
         "fld dword ptr [{v}]",
+        "ret 4",
+        f = sym stub_rs,
+        v = sym ST0_VAL,
+    )
+}
+
+#[unsafe(naked)]
+extern "C" fn stub_common_xmm0() {
+    std::arch::naked_asm!(
+        "pushad",
+        "lea eax, [esp + 44]",
+        "push eax",
+        "push dword ptr [esp + 40]",
+        "lea eax, [esp + 8]",
+        "push eax",
+        "call {f}",
+        "add esp, 12",
+        "mov [esp + 28], eax",
+        "popad",
+        "movss xmm0, dword ptr [{v}]",
         "ret 4",
         f = sym stub_rs,
         v = sym ST0_VAL,

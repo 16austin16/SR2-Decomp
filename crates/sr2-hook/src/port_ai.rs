@@ -46,6 +46,7 @@
 //! not read it after `call eax`), and ECX / EDX after calls (clobbered in the originals).
 
 use std::cell::{Cell, RefCell};
+use windows_sys::Win32::System::Memory::MEM_COMMIT;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::portlib::*;
@@ -6453,33 +6454,70 @@ struct Callee {
     pcmp: u32,
     /// Index of an argument holding the byte length of the buffer `ptr` points at (compared on entry, never written), or -1.
     pbytes: i32,
+    /// Further pointer arguments / registers (any number), see `PSpec`.
+    ps: &'static [PSpec],
+    /// Registers the callee returns unchanged: the replay stub leaves the copy's own value in them.
+    keep: u8,
+    /// The callee returns a float in XMM0.
+    xmm: bool,
+}
+
+/// A pointer the callee gets (stack argument `loc`, or register `loc - 100`: 0 = EAX .. 4 = EDI) to `len` bytes of the
+/// caller's frame. The pointer value itself is never compared; the `cmp` ranges (offset, length) of what it points at are
+/// compared on entry; with `wr` the callee's writes are recorded and re-applied to the copy; with `retptr` the callee
+/// returns the pointer in EAX (the copy gets its own pointer back).
+#[derive(Clone, Copy)]
+struct PSpec {
+    loc: i32,
+    len: usize,
+    cmp: &'static [(usize, usize)],
+    wr: bool,
+    retptr: bool,
+}
+
+const ALL3: &[(usize, usize)] = &[(0, 12)];
+
+const fn ps_in(loc: i32, len: usize, cmp: &'static [(usize, usize)]) -> PSpec {
+    PSpec { loc, len, cmp, wr: false, retptr: false }
+}
+const fn ps_out(loc: i32, len: usize) -> PSpec {
+    PSpec { loc, len, cmp: &[], wr: true, retptr: false }
+}
+const fn ps_io(loc: i32) -> PSpec {
+    PSpec { loc, len: 12, cmp: ALL3, wr: true, retptr: false }
+}
+
+/// A callee with any number of pointers, a float in XMM0, and registers it returns unchanged.
+#[allow(clippy::too_many_arguments)]
+const fn calx(name: &'static str, addr: usize, nargs: usize, pops: bool, reads: u8, keep: u8, st0: bool, xmm: bool, ps: &'static [PSpec]) -> Callee {
+    Callee { name, addr, nargs, pops, reads, st0, ptr: -1, pwords: 0, pcmp: u32::MAX, pbytes: -1, ps, keep, xmm }
 }
 
 const fn cal(name: &'static str, addr: usize, nargs: usize, pops: bool, reads: u8) -> Callee {
-    Callee { name, addr, nargs, pops, reads, st0: false, ptr: -1, pwords: 0, pcmp: u32::MAX, pbytes: -1 }
+    Callee { name, addr, nargs, pops, reads, st0: false, ptr: -1, pwords: 0, pcmp: u32::MAX, pbytes: -1, ps: &[], keep: 0, xmm: false }
 }
 
 const fn cal_ptr(name: &'static str, addr: usize, nargs: usize, pops: bool, reads: u8, ptr: i32, pwords: usize) -> Callee {
-    Callee { name, addr, nargs, pops, reads, st0: false, ptr, pwords, pcmp: u32::MAX, pbytes: -1 }
+    Callee { name, addr, nargs, pops, reads, st0: false, ptr, pwords, pcmp: u32::MAX, pbytes: -1, ps: &[], keep: 0, xmm: false }
 }
 
 /// A callee that reads only the dwords of `mask` of what its pointer register / argument points at.
 const fn cal_pm(name: &'static str, addr: usize, nargs: usize, pops: bool, reads: u8, ptr: i32, pwords: usize, mask: u32) -> Callee {
-    Callee { name, addr, nargs, pops, reads, st0: false, ptr, pwords, pcmp: mask, pbytes: -1 }
+    Callee { name, addr, nargs, pops, reads, st0: false, ptr, pwords, pcmp: mask, pbytes: -1, ps: &[], keep: 0, xmm: false }
 }
 
 /// A callee that only writes the dwords its pointer argument points at.
 const fn cal_out(name: &'static str, addr: usize, nargs: usize, pops: bool, reads: u8, ptr: i32, pwords: usize) -> Callee {
-    Callee { name, addr, nargs, pops, reads, st0: false, ptr, pwords, pcmp: 0, pbytes: -1 }
+    Callee { name, addr, nargs, pops, reads, st0: false, ptr, pwords, pcmp: 0, pbytes: -1, ps: &[], keep: 0, xmm: false }
 }
 
 /// A callee that reads a byte buffer (`ptr` argument, length in argument `len`).
 const fn cal_buf(name: &'static str, addr: usize, nargs: usize, pops: bool, reads: u8, ptr: i32, len: i32) -> Callee {
-    Callee { name, addr, nargs, pops, reads, st0: false, ptr, pwords: 0, pcmp: 0, pbytes: len }
+    Callee { name, addr, nargs, pops, reads, st0: false, ptr, pwords: 0, pcmp: 0, pbytes: len, ps: &[], keep: 0, xmm: false }
 }
 
 const fn cal_st0(name: &'static str, addr: usize, nargs: usize, pops: bool, reads: u8) -> Callee {
-    Callee { name, addr, nargs, pops, reads, st0: true, ptr: -1, pwords: 0, pcmp: u32::MAX, pbytes: -1 }
+    Callee { name, addr, nargs, pops, reads, st0: true, ptr: -1, pwords: 0, pcmp: u32::MAX, pbytes: -1, ps: &[], keep: 0, xmm: false }
 }
 
 const C_AOU_436AF0: usize = 0;
@@ -6614,6 +6652,88 @@ const CALLEES: &[Callee] = &[
     cal("AB5390", 0x00AB_5390, 0, false, R_ECX),
     cal("439FA0", 0x0043_9FA0, 1, false, R_EAX | R_ECX),
     cal("455530", 0x0045_5530, 0, false, R_EAX),
+    cal("684030", 0x0068_4030, 0, false, R_EAX | R_EDX),
+    cal("4A8370", 0x004A_8370, 3, false, 0),
+    cal("4A83C0", 0x004A_83C0, 3, false, 0),
+    calx("4A8410", 0x004A_8410, 3, false, 0, R_ECX, false, false, &[PSpec { loc: 101, len: 12, cmp: &[], wr: true, retptr: true }]),
+    calx("AB1360", 0x00AB_1360, 4, false, R_EAX, 0, false, false, &[ps_out(101, 4), ps_out(0, 4), ps_out(1, 4)]),
+    calx("BDE150", 0x00BD_E150, 0, false, 0, 0, false, false, &[ps_io(103)]),
+    calx("BDE5E0", 0x00BD_E5E0, 1, true, 0, 0, false, false, &[ps_io(103)]),
+    calx("4A84B0", 0x004A_84B0, 6, false, 0, 0, false, false, &[PSpec { loc: 104, len: 12, cmp: &[], wr: true, retptr: true }]),
+    calx("BDE340", 0x00BD_E340, 0, false, 0, 0, false, true, &[ps_io(103)]),
+    calx("vcall0", 0, 2, true, R_ECX, 0, false, false, &[ps_out(0, 12)]),
+    calx("443C30", 0x0044_3C30, 3, true, R_ECX, 0, false, false, &[ps_in(0, 12, ALL3)]),
+    calx("459110", 0x0045_9110, 0, false, 0, 0, false, false, &[ps_out(100, 0x34)]),
+    calx("99DD20", 0x0099_DD20, 4, false, R_EDX, 0, false, false, &[ps_in(100, 12, ALL3)]),
+    cal("4A2840", 0x004A_2840, 5, false, R_EAX | R_ECX),
+    cal("4A2980", 0x004A_2980, 0, false, R_ECX),
+    cal("683F40", 0x0068_3F40, 2, false, R_EAX),
+    calx("B28330", 0x00B2_8330, 5, false, R_ECX, 0, false, false, &[ps_in(102, 12, ALL3)]),
+    calx("B3B640", 0x00B3_B640, 1, false, R_ECX, 0, false, false, &[ps_in(0, 0x1C, &[(0, 8), (12, 16)])]),
+    cal("B3C8A0", 0x00B3_C8A0, 3, false, R_EAX),
+    calx("B2EE60", 0x00B2_EE60, 3, false, R_ECX, 0, false, false, &[ps_in(100, 0x34, &[(0, 1), (4, 12), (0x10, 4), (0x18, 4), (0x24, 1), (0x28, 12)])]),
+    cal("B2C220", 0x00B2_C220, 2, true, 0),
+    cal("B25C20", 0x00B2_5C20, 3, true, 0),
+    cal("B635D0", 0x00B6_35D0, 0, false, R_EAX | R_ECX),
+    cal("B681D0", 0x00B6_81D0, 1, false, R_EAX | R_ECX),
+    cal("B342C0", 0x00B3_42C0, 0, false, R_ECX),
+    cal("B345B0", 0x00B3_45B0, 1, false, R_ECX),
+    cal("AAC900", 0x00AA_C900, 1, false, R_EAX),
+    cal("AB53C0", 0x00AB_53C0, 0, false, R_EAX),
+    cal("AA7420", 0x00AA_7420, 0, false, R_ECX),
+    cal("AE28F0", 0x00AE_28F0, 0, false, R_ECX),
+    cal("B19F40", 0x00B1_9F40, 3, false, 0),
+    cal("9954C0", 0x0099_54C0, 1, false, R_ECX | R_EDX),
+    cal("794060", 0x0079_4060, 3, false, R_ECX),
+    cal("49EDB0", 0x0049_EDB0, 0, false, R_ECX),
+    cal("49D400", 0x0049_D400, 0, false, R_ECX | R_EDI),
+    cal("7F4AD0", 0x007F_4AD0, 0, false, R_ESI | R_EDI),
+    cal("79CD40", 0x0079_CD40, 0, false, R_EAX | R_EDI),
+    cal("96F3F0", 0x0096_F3F0, 0, false, R_ECX | R_ESI),
+    calx("41CB40", 0x0041_CB40, 0, false, 0, 0, false, false, &[ps_out(100, 0x38)]),
+    cal("41CBD0", 0x0041_CBD0, 0, false, R_ECX | R_ESI),
+    cal("41CCC0", 0x0041_CCC0, 0, false, R_EAX),
+    cal("41CFE0", 0x0041_CFE0, 0, false, R_EDI | R_EDX),
+    cal("41D110", 0x0041_D110, 0, false, R_EAX),
+    cal("41D130", 0x0041_D130, 0, false, R_EAX | R_ESI),
+    cal("41D250", 0x0041_D250, 0, false, R_EAX),
+    cal("41D380", 0x0041_D380, 1, false, 0),
+    cal("41D630", 0x0041_D630, 1, false, R_EAX),
+    cal("41D870", 0x0041_D870, 0, false, R_ECX | R_ESI),
+    cal("41DBB0", 0x0041_DBB0, 0, false, R_ECX | R_ESI),
+    cal("41DD70", 0x0041_DD70, 1, false, R_EAX),
+    cal("41DF70", 0x0041_DF70, 2, false, R_ECX | R_EDI | R_ESI),
+    cal("41E160", 0x0041_E160, 0, false, R_EDI | R_ESI),
+    cal("41E2D0", 0x0041_E2D0, 1, false, R_EAX),
+    cal("41E730", 0x0041_E730, 0, false, R_ECX | R_ESI),
+    cal("41EC20", 0x0041_EC20, 1, false, R_EAX),
+    cal("41F520", 0x0041_F520, 2, false, 0),
+    cal_st0("421BC0", 0x0042_1BC0, 0, false, 0),
+    cal("43F380", 0x0043_F380, 3, false, R_EAX | R_EDX),
+    cal("45ED60", 0x0045_ED60, 0, false, R_ECX | R_ESI),
+    cal("53C4D0", 0x0053_C4D0, 0, false, 0),
+    cal("667880", 0x0066_7880, 0, false, R_EAX),
+    cal("6678C0", 0x0066_78C0, 0, false, 0),
+    cal("6C6D20", 0x006C_6D20, 0, false, 0),
+    cal("783BD0", 0x0078_3BD0, 0, false, R_ECX),
+    cal("9633B0", 0x0096_33B0, 1, false, R_ECX | R_EDX),
+    cal("98F1B0", 0x0098_F1B0, 2, false, 0),
+    cal("99D260", 0x0099_D260, 0, false, R_ECX | R_ESI),
+    calx("99DF10", 0x0099_DF10, 0, false, R_EDX | R_ESI, 0, false, false, &[ps_out(100, 12)]),
+    cal("AA7380", 0x00AA_7380, 0, false, R_ECX | R_EDX),
+    cal("AA7460", 0x00AA_7460, 0, false, R_ECX | R_EDX),
+    cal("AA7500", 0x00AA_7500, 0, false, R_ECX | R_EDX),
+    cal("AB5190", 0x00AB_5190, 0, false, R_EAX),
+    cal("AB5340", 0x00AB_5340, 0, false, R_EAX),
+    calx("B07090", 0x00B0_7090, 3, false, 0, 0, false, false, &[ps_in(2, 0x38, &[(0, 0x30), (0x34, 4)])]),
+    cal("B07AB0", 0x00B0_7AB0, 1, false, R_ESI),
+    cal("B07C00", 0x00B0_7C00, 0, false, R_ESI),
+    cal("B18D90", 0x00B1_8D90, 2, false, R_ECX),
+    cal_st0("BDEA80", 0x00BD_EA80, 0, false, R_EAX | R_ECX),
+    calx("BDEA30", 0x00BD_EA30, 0, false, R_EAX, 0, true, false, &[ps_in(101, 12, ALL3)]),
+    calx("BDEA80", 0x00BD_EA80, 0, false, R_EAX, 0, true, false, &[ps_in(101, 12, ALL3)]),
+    cal("CECBC0", 0x00CE_CBC0, 2, false, R_ECX),
+    // NEWCAL-ENTRIES
 ];
 const NCAL: usize = CALLEES.len();
 const C_GAZE_CLEAR: usize = 16;
@@ -6714,6 +6834,88 @@ const C_453730: usize = 110;
 const C_AB5390: usize = 111;
 const C_439FA0: usize = 112;
 const C_455530: usize = 113;
+const C_684030: usize = 114;
+const C_4A8370: usize = 115;
+const C_4A83C0: usize = 116;
+const C_4A8410: usize = 117;
+const C_AB1360: usize = 118;
+const C_BDE150: usize = 119;
+const C_BDE5E0: usize = 120;
+const C_4A84B0: usize = 121;
+const C_BDE340: usize = 122;
+const C_VCALL0: usize = 123;
+const C_443C30: usize = 124;
+const C_459110: usize = 125;
+const C_99DD20: usize = 126;
+const C_4A2840: usize = 127;
+const C_4A2980: usize = 128;
+const C_683F40: usize = 129;
+const C_B28330: usize = 130;
+const C_B3B640: usize = 131;
+const C_B3C8A0: usize = 132;
+const C_B2EE60: usize = 133;
+const C_B2C220: usize = 134;
+const C_B25C20: usize = 135;
+const C_B635D0: usize = 136;
+const C_B681D0: usize = 137;
+const C_B342C0: usize = 138;
+const C_B345B0: usize = 139;
+const C_AAC900: usize = 140;
+const C_AB53C0: usize = 141;
+const C_AA7420: usize = 142;
+const C_AE28F0: usize = 143;
+const C_B19F40: usize = 144;
+const C_9954C0: usize = 145;
+const C_794060: usize = 146;
+const C_49EDB0: usize = 147;
+const C_49D400: usize = 148;
+const C_7F4AD0: usize = 149;
+const C_79CD40: usize = 150;
+const C_96F3F0: usize = 151;
+const C_41CB40: usize = 152;
+const C_41CBD0: usize = 153;
+const C_41CCC0: usize = 154;
+const C_41CFE0: usize = 155;
+const C_41D110: usize = 156;
+const C_41D130: usize = 157;
+const C_41D250: usize = 158;
+const C_41D380: usize = 159;
+const C_41D630: usize = 160;
+const C_41D870: usize = 161;
+const C_41DBB0: usize = 162;
+const C_41DD70: usize = 163;
+const C_41DF70: usize = 164;
+const C_41E160: usize = 165;
+const C_41E2D0: usize = 166;
+const C_41E730: usize = 167;
+const C_41EC20: usize = 168;
+const C_41F520: usize = 169;
+const C_421BC0: usize = 170;
+const C_43F380: usize = 171;
+const C_45ED60: usize = 172;
+const C_53C4D0: usize = 173;
+const C_667880: usize = 174;
+const C_6678C0: usize = 175;
+const C_6C6D20: usize = 176;
+const C_783BD0: usize = 177;
+const C_9633B0: usize = 178;
+const C_98F1B0: usize = 179;
+const C_99D260: usize = 180;
+const C_99DF10: usize = 181;
+const C_AA7380: usize = 182;
+const C_AA7460: usize = 183;
+const C_AA7500: usize = 184;
+const C_AB5190: usize = 185;
+const C_AB5340: usize = 186;
+const C_B07090: usize = 187;
+const C_B07AB0: usize = 188;
+const C_B07C00: usize = 189;
+const C_B18D90: usize = 190;
+const C_BDEA80: usize = 191;
+const C_BDEA30L: usize = 192;
+const C_BDEA80L: usize = 193;
+const C_CECBC0: usize = 194;
+// NEWCAL-CONSTS
 
 /// One recorded callee call.
 struct Rec {
@@ -6725,6 +6927,8 @@ struct Rec {
     out: Out,
     pout: Vec<u32>,
     delta: Vec<(usize, u8)>,
+    /// Per `Callee::ps` entry: the pointed-to bytes before and after the call.
+    px: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -6733,6 +6937,7 @@ struct Out {
     ecx: u32,
     edx: u32,
     st0: f64,
+    xmm: u32,
 }
 
 impl Out {
@@ -6770,6 +6975,7 @@ struct XB {
     o_edx: u32,
     want: u32,
     st0: f64,
+    xmm: u32,
 }
 
 /// Call `addr` with EAX / ECX / EDX / ESI / EDI from `r` and `args` pushed cdecl (EBX is a scratch pointer, EBP the
@@ -6789,6 +6995,7 @@ unsafe fn raw_call(addr: usize, st0: bool, r: [u32; 5], args: &[u32]) -> Out {
         o_edx: 0,
         want: st0 as u32,
         st0: 0.0,
+        xmm: 0,
     };
     unsafe {
         std::arch::asm!(
@@ -6812,6 +7019,7 @@ unsafe fn raw_call(addr: usize, st0: bool, r: [u32; 5], args: &[u32]) -> Out {
             "je 4f",
             "fstp qword ptr [ebx + 48]",
             "4:",
+            "movd dword ptr [ebx + 56], xmm0",
             "mov esp, ebp",
             "pop ebp", "pop edi", "pop esi", "pop ebx",
             inout("eax") &mut b as *mut XB => _,
@@ -6819,7 +7027,7 @@ unsafe fn raw_call(addr: usize, st0: bool, r: [u32; 5], args: &[u32]) -> Out {
             clobber_abi("C"),
         );
     }
-    Out { eax: b.o_eax, ecx: b.o_ecx, edx: b.o_edx, st0: b.st0 }
+    Out { eax: b.o_eax, ecx: b.o_ecx, edx: b.o_edx, st0: b.st0, xmm: b.xmm }
 }
 
 unsafe fn snap_watch(watch: &[(usize, usize)]) -> Vec<u8> {
@@ -6853,6 +7061,79 @@ unsafe fn dc(c: usize, r: [u32; 5], args: &[u32]) -> Out {
     unsafe { dcx(c, CALLEES[c].addr, r, args) }
 }
 
+/// True if `[addr, addr + len)` is committed memory the process may read (and, with `write`, write): the shadow reads and
+/// writes through pointers taken from registers, which must never fault or land in a stub page.
+fn mem_ok(addr: usize, len: usize, write: bool) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
+    };
+    if len == 0 {
+        return true;
+    }
+    if addr < 0x1_0000 || addr.checked_add(len).is_none_or(|e| e > 0xFFFF_0000) {
+        return false;
+    }
+    let stubs = DC_STUB_PAGE.load(Ordering::Relaxed);
+    if write && stubs != 0 && addr < stubs + DC_STUB_PAGE_LEN && addr + len > stubs {
+        return false;
+    }
+    let mut a = addr;
+    let end = addr + len;
+    while a < end {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(a as *const std::ffi::c_void, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            return false;
+        }
+        if mbi.State != MEM_COMMIT || mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 || mbi.Protect == 0 {
+            return false;
+        }
+        if write && mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY) == 0 {
+            return false;
+        }
+        a = mbi.BaseAddress as usize + mbi.RegionSize;
+    }
+    true
+}
+
+/// `len` bytes at `p` if they can be read, else zeros.
+fn read_or_zero(p: usize, len: usize) -> Vec<u8> {
+    if p != 0 && mem_ok(p, len, false) { unsafe { std::slice::from_raw_parts(p as *const u8, len).to_vec() } } else { vec![0; len] }
+}
+
+/// The pointer a `PSpec` names: a stack argument or a register (0 = EAX .. 4 = EDI).
+fn ps_ptr(sp: &PSpec, r: &[u32; 5], args: &[u32]) -> usize {
+    if sp.loc >= 100 { r[(sp.loc - 100) as usize] as usize } else { args[sp.loc as usize] as usize }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+unsafe fn call_or_gen(c: usize, addr: usize, r: [u32; 5], args: &[u32]) -> Out {
+    unsafe { raw_call(addr, CALLEES[c].st0, r, args) }
+}
+
+/// In the offline tests the callees are generated, not called (see `dc_difftest`).
+#[cfg(test)]
+unsafe fn call_or_gen(c: usize, addr: usize, r: [u32; 5], args: &[u32]) -> Out {
+    unsafe {
+        match GEN.with(|g| g.borrow_mut().take()) {
+            Some(mut g) => {
+                let o = g(c, r, args);
+                GEN.with(|x| *x.borrow_mut() = Some(g));
+                o
+            }
+            None => raw_call(addr, CALLEES[c].st0, r, args),
+        }
+    }
+}
+
+#[cfg(test)]
+type GenFn = Box<dyn FnMut(usize, [u32; 5], &[u32]) -> Out>;
+#[cfg(test)]
+thread_local! {
+    static GEN: RefCell<Option<GenFn>> = const { RefCell::new(None) };
+    static DC_WHY: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Call callee `c` at `addr` (the dispatched table handler has no fixed address). Recording while a shadow run is in
 /// progress.
 unsafe fn dcx(c: usize, addr: usize, r: [u32; 5], args: &[u32]) -> Out {
@@ -6871,14 +7152,25 @@ unsafe fn dcx(c: usize, addr: usize, r: [u32; 5], args: &[u32]) -> Out {
         let pinb: Vec<u8> = if cl.pbytes >= 0 && pv != 0 { std::slice::from_raw_parts(pv as *const u8, args[cl.pbytes as usize] as usize).to_vec() } else { vec![] };
         (pre, pin, pinb)
     };
-    let out = unsafe { raw_call(addr, cl.st0, r, args) };
+    let pxv: Vec<usize> = cl.ps.iter().map(|sp| ps_ptr(sp, &r, args)).collect();
+    let pxin: Vec<Vec<u8>> = cl.ps.iter().zip(&pxv).map(|(sp, &pv)| read_or_zero(pv, sp.len)).collect();
+    #[cfg(test)]
+    if std::env::var("DC_TRACE").is_ok() {
+        eprintln!("rust call {} regs {:x?} args {:x?}", cl.name, r, args);
+    }
+    let out = unsafe { call_or_gen(c, addr, r, args) };
+    #[cfg(test)]
+    if std::env::var("DC_TRACE").is_ok() {
+        eprintln!("   -> eax {:#x} ecx {:#x} edx {:#x}", out.eax, out.ecx, out.edx);
+    }
+    let px: Vec<(Vec<u8>, Vec<u8>)> = cl.ps.iter().zip(&pxv).zip(pxin).map(|((sp, &pv), i)| (i, read_or_zero(pv, sp.len))).collect();
     let (post, pout) = unsafe {
         let post = snap_watch(&st.watch);
         let pout: Vec<u32> = if cl.ptr >= 0 && pv != 0 { (0..cl.pwords).map(|i| rd(pv + i * 4)).collect() } else { vec![0; cl.pwords] };
         (post, pout)
     };
     let delta: Vec<(usize, u8)> = (0..pre.len()).filter(|&i| pre[i] != post[i]).map(|i| (watch_addr(&st.watch, i), post[i])).collect();
-    st.tape.push(Rec { c, inr: r, args: args.to_vec(), pin, pinb, out, pout, delta });
+    st.tape.push(Rec { c, inr: r, args: args.to_vec(), pin, pinb, out, pout, delta, px });
     st.mode = 1;
     DCS.with(|s| *s.borrow_mut() = st);
     out
@@ -6902,15 +7194,15 @@ unsafe fn replay_core(idx: u32, f: &mut Pushad, args: *const u32) -> f64 {
         } else {
             let inr = [f.eax, f.ecx, f.edx, f.esi, f.edi];
             for i in 0..5 {
-                if cl.reads & (1 << i) != 0 && inr[i] != rec.inr[i] {
+                if cl.reads & (1 << i) != 0 && inr[i] != rec.inr[i] && cl.ptr != 100 + i as i32 && !cl.ps.iter().any(|sp| sp.loc == 100 + i as i32) {
                     bad.push(format!("{} reg {} original {:#x} Rust {:#x}", cl.name, ["eax", "ecx", "edx", "esi", "edi"][i], inr[i], rec.inr[i]));
                 }
             }
             for i in 0..cl.nargs {
                 let a = unsafe { *args.add(i) };
-                if i as i32 == cl.ptr {
+                if i as i32 == cl.ptr || cl.ps.iter().any(|sp| sp.loc == i as i32) {
                     // the pointer itself differs between the two runs; its contents are compared below
-                } else if rec.args.get(i) != Some(&a) {
+                } else if rec.args.get(i).map(|&r| r & arg_mask(idx as usize, i)) != Some(a & arg_mask(idx as usize, i)) {
                     bad.push(format!("{} arg {i} original {a:#x} Rust {:?}", cl.name, rec.args.get(i)));
                 }
             }
@@ -6946,6 +7238,34 @@ unsafe fn replay_core(idx: u32, f: &mut Pushad, args: *const u32) -> f64 {
                 }
             }
         }
+        let inr = [f.eax, f.ecx, f.edx, f.esi, f.edi];
+        let mut retptr = None;
+        for (k, sp) in cl.ps.iter().enumerate() {
+            let pv = ps_ptr(sp, &inr, &(0..cl.nargs).map(|i| unsafe { *args.add(i) }).collect::<Vec<u32>>());
+            if pv == 0 {
+                continue;
+            }
+            #[cfg(test)]
+            if std::env::var("DC_TRACE").is_ok() {
+                eprintln!("replay {} pointer loc {} = {pv:#x}", cl.name, sp.loc);
+            }
+            if !mem_ok(pv, sp.len, sp.wr) {
+                bad.push(format!("{} pointer {} = {pv:#x} is not {} memory", cl.name, sp.loc, if sp.wr { "writable" } else { "readable" }));
+                continue;
+            }
+            let mine = unsafe { std::slice::from_raw_parts(pv as *const u8, sp.len) };
+            for &(o, l) in sp.cmp {
+                if mine[o..o + l] != rec.px[k].0[o..o + l] {
+                    bad.push(format!("{} pointer {} original {:02x?} Rust {:02x?}", cl.name, sp.loc, &mine[o..o + l], &rec.px[k].0[o..o + l]));
+                }
+            }
+            if sp.wr {
+                unsafe { std::ptr::copy_nonoverlapping(rec.px[k].1.as_ptr(), pv as *mut u8, sp.len) };
+            }
+            if sp.retptr {
+                retptr = Some(pv as u32);
+            }
+        }
         for &(a, v) in &rec.delta {
             unsafe { wb(a, v) };
         }
@@ -6954,9 +7274,16 @@ unsafe fn replay_core(idx: u32, f: &mut Pushad, args: *const u32) -> f64 {
                 unsafe { wd(pv + w * 4, rec.pout[w]) };
             }
         }
-        f.eax = rec.out.eax;
-        f.ecx = rec.out.ecx;
-        f.edx = rec.out.edx;
+        f.eax = retptr.unwrap_or(rec.out.eax);
+        if cl.keep & R_ECX == 0 {
+            f.ecx = rec.out.ecx;
+        }
+        if cl.keep & R_EDX == 0 {
+            f.edx = rec.out.edx;
+        }
+        if cl.xmm {
+            XMM_CELL.store(rec.out.xmm, Ordering::Relaxed);
+        }
         let st0 = rec.out.st0;
         s.bad.extend(bad);
         st0
@@ -6971,17 +7298,31 @@ extern "C" fn dc_replay_f(idx: u32, f: &mut Pushad, args: *const u32) -> f64 {
     unsafe { replay_core(idx, f, args) }
 }
 
+/// The XMM0 a replayed float-returning callee answers with.
+static XMM_CELL: AtomicU32 = AtomicU32::new(0);
+
+/// Bits of a stack argument that the callee really uses (a byte-sized flag passed in a dword whose other bytes are stack garbage).
+fn arg_mask(c: usize, i: usize) -> u32 {
+    if c == C_41F520 && i == 1 { 0xFF } else { u32::MAX }
+}
+
 /// One replay stub per callee, generated into an executable page.
+static DC_STUB_PAGE: AtomicUsize = AtomicUsize::new(0);
+const DC_STUB_PAGE_LEN: usize = NCAL * 64 + 4096;
 static DC_STUBS: [AtomicUsize; NCAL] = [const { AtomicUsize::new(0) }; NCAL];
 
 fn build_stubs() -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
-    let page = unsafe { VirtualAlloc(std::ptr::null(), NCAL * 48 + 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as *mut u8;
+    let len = NCAL * 64 + 4096;
+    let page = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as *mut u8;
     if page.is_null() {
         return false;
     }
+    // every byte that is not a stub traps
+    unsafe { std::ptr::write_bytes(page, 0xCC, len) };
+    DC_STUB_PAGE.store(page as usize, Ordering::Relaxed);
     for (i, cl) in CALLEES.iter().enumerate() {
-        let at = unsafe { page.add(i * 48) };
+        let at = unsafe { page.add(i * 64) };
         let target = if cl.st0 { dc_replay_f as *const () as usize } else { dc_replay as *const () as usize };
         let mut code: Vec<u8> = vec![0x60, 0x89, 0xE1, 0x8D, 0x44, 0x24, 0x24, 0x50, 0x51, 0x68];
         code.extend_from_slice(&(i as u32).to_le_bytes());
@@ -6989,12 +7330,18 @@ fn build_stubs() -> bool {
         let rel = (target as i32).wrapping_sub(at as i32 + code.len() as i32 + 4);
         code.extend_from_slice(&rel.to_le_bytes());
         code.extend_from_slice(&[0x83, 0xC4, 0x0C, 0x61]);
+        if cl.xmm {
+            // movd xmm0, [XMM_CELL]
+            code.extend_from_slice(&[0x66, 0x0F, 0x6E, 0x05]);
+            code.extend_from_slice(&(XMM_CELL.as_ptr() as u32).to_le_bytes());
+        }
         if cl.pops && cl.nargs > 0 {
             code.push(0xC2);
             code.extend_from_slice(&((cl.nargs * 4) as u16).to_le_bytes());
         } else {
             code.push(0xC3);
         }
+        assert!(code.len() <= 64);
         unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), at, code.len()) };
         DC_STUBS[i].store(at as usize, Ordering::Relaxed);
     }
@@ -7030,6 +7377,10 @@ unsafe fn dc_port(port: usize, p: &Pushad, args: *const u32, nargs: usize, watch
     let dp = &DCPORTS[port];
     let n = dp.calls.fetch_add(1, Ordering::Relaxed);
     let orig = dp.original.load(Ordering::Relaxed);
+    if port >= DP_K23_UP && n < 4 {
+        // a breadcrumb: if the game dies inside a new port's first shadowed calls the log says where
+        log(&format!("port_ai: {} shadowed call {n} begins", dp.name));
+    }
     if n == SHADOW_CALLS && orig != 0 {
         log(&format!("port_ai: {}: {SHADOW_CALLS} calls shadowed, {} mismatched", dp.name, dp.mismatches.load(Ordering::Relaxed)));
     }
@@ -7067,6 +7418,8 @@ unsafe fn dc_port(port: usize, p: &Pushad, args: *const u32, nargs: usize, watch
     }
     if !why.is_empty() {
         let m = dp.mismatches.fetch_add(1, Ordering::Relaxed) + 1;
+        #[cfg(test)]
+        DC_WHY.with(|v| v.borrow_mut().push(why.join("; ")));
         if m <= 10 {
             log(&format!("port_ai: {} mismatch (call {n}): {}", dp.name, why.join("; ")));
         }
@@ -7099,11 +7452,16 @@ unsafe fn rewire_dc(copy: usize, addr: usize, body: &[u8], calls: &[usize]) -> b
 /// A switch's `jmp [reg*4 + table]` in a relocated copy would jump into the original code. Give the copy its own table
 /// whose entries are the same targets inside the copy, and re-aim the instruction at it.
 unsafe fn rewire_jump_table(copy: usize, addr: usize, body: &[u8], table: u32, out: &[AtomicU32]) -> bool {
+    unsafe { rewire_jump_table_with(copy, addr, body, table, out, &|i| rd(table as usize + i * 4)) }
+}
+
+/// `rewire_jump_table` with the table's entries supplied (the tests do not have the exe's code mapped).
+unsafe fn rewire_jump_table_with(copy: usize, addr: usize, body: &[u8], table: u32, out: &[AtomicU32], entry: &dyn Fn(usize) -> u32) -> bool {
     let mut hits = 0;
     for o in 3..body.len().saturating_sub(4) {
         if body[o..o + 4] == table.to_le_bytes() && body[o - 3..o - 1] == [0xFF, 0x24] && body[o - 1] & 0xC7 == 0x85 {
             for (i, e) in out.iter().enumerate() {
-                let t = unsafe { rd(table as usize + i * 4) } as usize;
+                let t = entry(i) as usize;
                 if t < addr || t >= addr + body.len() {
                     return false;
                 }
@@ -7117,6 +7475,8 @@ unsafe fn rewire_jump_table(copy: usize, addr: usize, body: &[u8], table: u32, o
 }
 
 static K0A_JT: [AtomicU32; 19] = [const { AtomicU32::new(0) }; 19];
+static K0B_JT1: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+static K0B_JT2: [AtomicU32; 11] = [const { AtomicU32::new(0) }; 11];
 static K14_JT1: [AtomicU32; 5] = [const { AtomicU32::new(0) }; 5];
 static K14_JT2: [AtomicU32; 10] = [const { AtomicU32::new(0) }; 10];
 
@@ -7144,6 +7504,20 @@ unsafe fn rewire_table(copy: usize, body: &[u8], slot: usize) -> bool {
     hits == 1
 }
 
+
+/// A copy's `mov edx, [edi]; mov edx, [edx]; push -1; lea eax, [esp + 0x90]; push eax; mov ecx, edi; call edx` (18 bytes at
+/// `off`, the virtual call of the k23 update) becomes the same pushes and a call of the replay stub of `C_VCALL0`.
+unsafe fn patch_vcall(copy: usize, off: usize) -> bool {
+    let new: [u8; 18] = [0x6A, 0xFF, 0x8D, 0x84, 0x24, 0x90, 0, 0, 0, 0x50, 0x8B, 0xCF, 0xE8, 0, 0, 0, 0, 0x90];
+    unsafe {
+        let old = std::slice::from_raw_parts((copy + off) as *const u8, 18);
+        if old != [0x8B, 0x17, 0x8B, 0x12, 0x6A, 0xFF, 0x8D, 0x84, 0x24, 0x90, 0, 0, 0, 0x50, 0x8B, 0xCF, 0xFF, 0xD2] {
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(new.as_ptr(), (copy + off) as *mut u8, 18);
+        set_rel32(copy, off + 12, DC_STUBS[C_VCALL0].load(Ordering::Relaxed), 0xE8)
+    }
+}
 
 // --- ai_order_update 0x4372E0 (EAX = human) ----------------------------------------------------------------------------
 
@@ -8619,7 +8993,1139 @@ extern "C" fn k14_up_entry(r: &mut Pushad, args: *const u32) {
 }
 regs_thunk!(k14_up_thunk, k14_up_entry);
 
-static DCPORTS: [DcPort; 10] = [
+// --- ai_order_k23_update 0x4586F0 (cdecl (human)) -----------------------------------------------------------------------
+
+const DP_K23_UP: usize = 10;
+
+/// A quiet NaN for a signalling one, as `fld dword` does; every other value unchanged.
+fn qnan(bits: u32) -> u32 {
+    if bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x007F_FFFF != 0 { bits | 0x0040_0000 } else { bits }
+}
+
+/// A double constant of the exe.
+unsafe fn rdq(a: usize) -> f64 {
+    unsafe { f64::from_bits(rd(a) as u64 | (rd(a + 4) as u64) << 32) }
+}
+
+/// `fld dword [src]; fstp dword [dst]`.
+unsafe fn cpf(src: usize, dst: usize) {
+    unsafe { wd(dst, qnan(rd(src))) }
+}
+
+/// An x87 `op` of two f32s done at 53-bit precision and stored as f32.
+fn fs(a: f32, b: f32, op: char) -> f32 {
+    let (a, b) = (a as f64, b as f64);
+    (match op {
+        '+' => a + b,
+        '-' => a - b,
+        _ => a * b,
+    }) as f32
+}
+
+/// Registers carried between the callees: ESI / EDI plus `Cx`.
+struct K {
+    c: Cx,
+    esi: u32,
+    edi: u32,
+}
+
+impl K {
+    unsafe fn call(&mut self, id: usize, eax: u32, args: &[u32]) -> Out {
+        unsafe { self.c.call(id, eax, self.esi, self.edi, args) }
+    }
+    /// The three floats at `a`, as the arguments of a by-value vec3.
+    unsafe fn v3(a: usize) -> [u32; 3] {
+        unsafe { [qnan(rd(a)), qnan(rd(a + 4)), qnan(rd(a + 8))] }
+    }
+}
+
+/// 0x458A6A: the tail every path ends in.
+unsafe fn k23_tail(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        wd(fb + 76, 0);
+        wd(fb + 80, 0);
+        wd(fb + 84, 0);
+        k.c.ecx = h + 0xF8;
+        k.c.edx = (fb + 76) as u32;
+        k.call(C_443C30, 0, &[(fb + 76) as u32, rd(0x00E8_7998), 0]);
+    }
+}
+
+/// The six `0x794060 (index, mode, -1.0f)` calls with the indices 4, 2, 0, 3, 6, 7.
+unsafe fn k23_794060(k: &mut K, mode: u32) {
+    unsafe {
+        for idx in [4u32, 2, 0, 3, 6, 7] {
+            k.call(C_794060, 0, &[idx, mode, rd(0x00E8_7998)]);
+        }
+    }
+}
+
+/// 0x458BEA: the shared end of the 0xA5 state, then the common tail.
+unsafe fn k23_bea(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        let hh = h as usize;
+        k.call(C_4375B0, 0, &[h, 0x23, 0xA3]);
+        if h == rd(0x0217_03D4) {
+            k23_794060(k, 2);
+        }
+        k.call(C_4A2980, 0, &[]);
+        if rd(0x025F_5AE8) == 0 {
+            k.c.ecx = rd(hh + 0xD74);
+            let e = k.call(C_AE28F0, 0, &[]).eax;
+            if e != 0 {
+                k.call(C_B19F40, 0, &[h, e, 1]);
+                br!(DP_K23_UP, 22);
+            } else {
+                k.edi = k.call(C_49EDB0, 0, &[]).eax;
+                k.call(C_49D400, 0, &[]);
+                br!(DP_K23_UP, 23);
+            }
+        } else {
+            br!(DP_K23_UP, 24);
+        }
+        k23_tail(k, h, fb);
+    }
+}
+
+/// 0x458B84: release the object's 0x8554 sub-object, then 0x458BEA.
+unsafe fn k23_b84(k: &mut K, h: u32, obj: u32, fb: usize) {
+    unsafe {
+        k.call(C_B25C20, 0, &[obj + 0x8554, 1, 0]);
+        k.call(C_AAC900, obj, &[0]);
+        k23_bea(k, h, fb);
+    }
+}
+
+unsafe fn k23_up_body(p: &Pushad, h: u32) -> u32 {
+    unsafe {
+        let hh = h as usize;
+        // The original's frame, addressed by the offsets of its stack slots (`S+n`); the pointers handed to callees point here.
+        let mut frame = [0u32; 48];
+        let fb = std::hint::black_box(frame.as_mut_ptr()) as usize;
+        let mut k = K { c: Cx { ecx: p.ecx, edx: p.edx }, esi: p.esi, edi: p.edi };
+        let state = (rb(hh + 0x148) as u32).wrapping_sub(0xA3);
+        match state {
+            1 => k23_a4(&mut k, h, fb),
+            0 => k23_a3(&mut k, h, fb),
+            2 => k23_a5(&mut k, h, fb),
+            _ => {
+                br!(DP_K23_UP, 0);
+                k23_tail(&mut k, h, fb)
+            }
+        }
+        std::hint::black_box(&frame);
+        0
+    }
+}
+
+/// State 0xA4 (0x458CC7).
+unsafe fn k23_a4(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        let hh = h as usize;
+        k.esi = h;
+        let r = k.call(C_96F3F0, 0, &[]).eax;
+        if r != 0xFFFF_FFFF {
+            br!(DP_K23_UP, 1);
+            return k23_tail(k, h, fb);
+        }
+        if rb(hh + 0x591) != 1 {
+            k.c.edx = 0;
+            k.c.ecx = r.wrapping_add(2);
+            k.call(C_9954C0, 0, &[h]);
+            br!(DP_K23_UP, 2);
+        }
+        k.call(C_55A930, 0, &[h + 0x10C4, 0xA, 1, 0]);
+        k.call(C_4375B0, 0, &[h, 0x23, 0xA3]);
+        k23_tail(k, h, fb)
+    }
+}
+
+/// State 0xA3 (0x458D15).
+unsafe fn k23_a3(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        let hh = h as usize;
+        let hp = K::v3(hh + 0x14);
+        if k.call(C_4A8370, 0, &hp).al() != 0 {
+            br!(DP_K23_UP, 3);
+            return k23_tail(k, h, fb);
+        }
+        k.c.ecx = rd(hh + 0xD74);
+        let obj = k.call(C_AE28F0, 0, &[]).eax;
+        k.edi = obj;
+        if obj == 0 {
+            // 0x458FF0
+            if rd(hh + 0xE88) != 0 {
+                let e = rd(hh + 0x52C);
+                k.c.ecx = (fb + 164) as u32;
+                k.c.edx = 0;
+                let o = k.call(C_4A8410, 0, &hp);
+                k.call(C_99DD20, o.eax, &[h, 2, e, 0]);
+                k.c.edx = 0;
+                k.c.ecx = 2;
+                k.call(C_9954C0, 0, &[h]);
+                br!(DP_K23_UP, 4);
+            } else {
+                br!(DP_K23_UP, 5);
+            }
+            return k23_a3_end(k, h, fb);
+        }
+        k.c.ecx = obj;
+        if k.call(C_AA7420, 0, &[]).eax != h {
+            br!(DP_K23_UP, 6);
+            return k23_tail(k, h, fb);
+        }
+        if k.call(C_806720, obj, &[]).al() == 0 {
+            br!(DP_K23_UP, 7);
+            return k23_tail(k, h, fb);
+        }
+        let kind = k.call(C_AB53C0, obj, &[]).eax.wrapping_sub(2);
+        let o = obj as usize;
+        match kind {
+            0 => {
+                // 0x458FC9
+                k.call(C_AAC900, obj, &[1]);
+                let id = k.call(C_683F40, obj, &[2, 0]).eax & 0xFFFF;
+                k.call(C_B681D0, obj, &[id]);
+                br!(DP_K23_UP, 8);
+            }
+            1 => {
+                // 0x458E32
+                k.call(C_AAC900, obj, &[1]);
+                k.call(C_B345B0, 0, &[obj]);
+                cpf(o + 0x38, fb + 16);
+                cpf(o + 0x40, fb + 24);
+                wd(fb + 20, 0);
+                k.esi = (fb + 16) as u32;
+                k.call(C_BDE150, 0, &[]);
+                let vt = rd(rd(o) as usize);
+                let r = dcx(C_VCALL0, vt as usize, [(fb + 140) as u32, obj, vt, k.esi, k.edi], &[(fb + 140) as u32, 0xFFFF_FFFF]);
+                k.c.ecx = r.ecx;
+                k.c.edx = r.edx;
+                k.esi = (fb + 140) as u32;
+                let len = f32::from_bits(qnan(k.call(C_BDE340, 0, &[]).xmm));
+                if (len as f64) > rf(0x00DD_0794) as f64 {
+                    wd(fb + 16, rd(fb + 140));
+                    wd(fb + 20, rd(fb + 144));
+                    wd(fb + 24, rd(fb + 148));
+                    br!(DP_K23_UP, 9);
+                }
+                cpf(o + 0x14, fb + 36);
+                cpf(o + 0x18, fb + 40);
+                cpf(o + 0x1C, fb + 44);
+                for w in [96usize, 104, 108, 88, 92, 100, 112] {
+                    wd(fb + w, 0);
+                }
+                // step = len^2 / 30 * 1.25 along the direction at S+16; the position moves by it
+                let sq = (len as f64) * (len as f64);
+                wd(fb + 96, (fb + 76) as u32);
+                wf(fb + 12, (sq / rdq(0x00E5_BF68)) as f32);
+                wf(fb + 12, (rf(fb + 12) as f64 * rdq(0x00E5_BF48)) as f32);
+                let s = rf(fb + 12);
+                wd(fb + 104, 1);
+                wf(fb + 60, fs(s, rf(fb + 16), '*'));
+                wf(fb + 64, fs(s, rf(fb + 20), '*'));
+                wf(fb + 68, fs(s, rf(fb + 24), '*'));
+                wf(fb + 36, fs(rf(fb + 60), rf(fb + 36), '+'));
+                wf(fb + 40, fs(rf(fb + 64), rf(fb + 40), '+'));
+                wf(fb + 44, fs(rf(fb + 44), rf(fb + 68), '+'));
+                cpf(fb + 36, fb + 76);
+                cpf(fb + 40, fb + 80);
+                cpf(fb + 44, fb + 84);
+                wf(fb + 108, len);
+                let id = k.call(C_683F40, obj, &[2, 0]).eax;
+                k.c.ecx = obj;
+                wd(fb + 112, (rd(fb + 112) & 0xFFFF_0000) | (id & 0xFFFF));
+                k.call(C_B3B640, 0, &[(fb + 88) as u32]);
+                let neg = [qnan(rd(fb + 16)) ^ 0x8000_0000, qnan(rd(fb + 20)) ^ 0x8000_0000, qnan(rd(fb + 24)) ^ 0x8000_0000];
+                k.call(C_B3C8A0, obj, &neg);
+                br!(DP_K23_UP, 10);
+            }
+            2 => {
+                // 0x458D90
+                k.call(C_AAC900, obj, &[1]);
+                k.c.ecx = (fb + 76) as u32;
+                k.call(C_4A8410, 0, &K::v3(o + 0x14));
+                k.c.ecx = 1;
+                k.c.edx = (fb + 76) as u32;
+                k.call(C_B28330, 0, &[obj, 0, 1, 0, 0]);
+                let id = k.call(C_683F40, obj, &[2, 0]).eax & 0xFFFF;
+                k.esi = id;
+                k.call(C_459110, (fb + 88) as u32, &[]);
+                let (z, x, y) = (rd(o + 0x1C), rd(o + 0x14), rd(o + 0x18));
+                wd(fb + 112, 0);
+                wb(fb + 88, rb(fb + 88) | 0x19);
+                wd(fb + 100, z);
+                k.edi = obj + 0x8554;
+                wd(fb + 92, x);
+                wd(fb + 96, y);
+                k.c.ecx = x;
+                k.c.edx = y;
+                k.call(C_B2EE60, (fb + 88) as u32, &[obj + 0x8554, 1, id]);
+                k.call(C_B2C220, 0, &[obj + 0x8554, 1]);
+                br!(DP_K23_UP, 11);
+            }
+            _ => {
+                br!(DP_K23_UP, 12);
+            }
+        }
+        k23_a3_end(k, h, fb)
+    }
+}
+
+/// 0x45903F: the end of state 0xA3.
+unsafe fn k23_a3_end(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        k.call(C_4375B0, 0, &[h, 0x23, 0xA5]);
+        k23_794060(k, 0);
+        k.call(C_4A2840, h, &[0x025F_5B20, 0x025F_5B5C, 0, 0, 0]);
+        let e = rd(0x00EA_D20C);
+        k.c.ecx = e;
+        k.edi = 0x00DD_7884;
+        k.esi = 0x00DD_78A8;
+        let r = k.call(C_7F4AD0, 0, &[]);
+        k.edi = e;
+        k.call(C_79CD40, r.eax, &[]);
+        k23_tail(k, h, fb)
+    }
+}
+
+/// State 0xA5 (0x458726).
+unsafe fn k23_a5(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        let hh = h as usize;
+        let hd = rd(hh + 0xD74);
+        let mut obj = 0u32;
+        if hd != 0 {
+            obj = pool_obj(hd);
+            if !(obj != 0 && rd(obj as usize + 0x44) == hd && rd(obj as usize + 0x4C) == 5) {
+                obj = 0;
+            }
+        }
+        if obj == 0 {
+            // 0x458BB9
+            if k.call(C_4A83C0, 0, &K::v3(hh + 0x14)).al() == 0 {
+                br!(DP_K23_UP, 13);
+                return k23_tail(k, h, fb);
+            }
+            k.c.edx = 0;
+            k.c.ecx = 1;
+            k.call(C_9954C0, 0, &[h]);
+            br!(DP_K23_UP, 14);
+            return k23_bea(k, h, fb);
+        }
+        let o = obj as usize;
+        k.c.ecx = hd;
+        k.c.edx = obj;
+        if k.call(C_684030, 2, &[]).eax == 0 {
+            br!(DP_K23_UP, 15);
+            return k23_tail(k, h, fb);
+        }
+        let mode = rd(rd(o + 0x84E4) as usize + 0x9C);
+        match mode {
+            2 => {
+                k.call(C_B635D0, obj, &[]);
+                br!(DP_K23_UP, 16);
+                return k23_b84(k, h, obj, fb);
+            }
+            3 => {
+                if k.call(C_4A83C0, 0, &K::v3(hh + 0x14)).al() != 0 {
+                    k.c.ecx = obj;
+                    k.call(C_B342C0, 0, &[]);
+                    br!(DP_K23_UP, 17);
+                    return k23_b84(k, h, obj, fb);
+                }
+                k.c.ecx = (fb + 16) as u32;
+                let r = k.call(C_4A8410, 0, &K::v3(o + 0x14));
+                for w in [96usize, 104, 108, 88, 92, 100, 112] {
+                    wd(fb + w, 0);
+                }
+                wd(fb + 108, qnan(rd(0x00E9_9038)));
+                wd(fb + 96, r.ecx);
+                wd(fb + 104, 1);
+                let id = k.call(C_683F40, obj, &[2, 0]).eax;
+                wd(fb + 112, id & 0xFFFF);
+                k.c.ecx = obj;
+                k.call(C_B3B640, 0, &[(fb + 88) as u32]);
+                let d = [fs(rf(fb + 16), rf(o + 0x14), '-'), fs(rf(fb + 20), rf(o + 0x18), '-'), fs(rf(fb + 24), rf(o + 0x1C), '-')];
+                k.call(C_B3C8A0, obj, &[d[0].to_bits(), d[1].to_bits(), d[2].to_bits()]);
+                br!(DP_K23_UP, 18);
+                return k23_tail(k, h, fb);
+            }
+            4 => {}
+            _ => {
+                br!(DP_K23_UP, 19);
+                return k23_tail(k, h, fb);
+            }
+        }
+        // mode 4 (0x45879A)
+        if k.call(C_4A83C0, 0, &K::v3(hh + 0x14)).al() != 0 {
+            br!(DP_K23_UP, 20);
+            return k23_b84(k, h, obj, fb);
+        }
+        k.c.ecx = (fb + 36) as u32;
+        k.call(C_4A8410, 0, &K::v3(o + 0x14));
+        k.c.ecx = (fb + 28) as u32;
+        k.call(C_AB1360, rd(o + 0x44), &[(fb + 12) as u32, (fb + 32) as u32, 0, 0]);
+        // d = object position - vp
+        wf(fb + 28, fs(rf(o + 0x14), rf(fb + 36), '-'));
+        wf(fb + 56, fs(rf(o + 0x18), rf(fb + 40), '-'));
+        wf(fb + 72, fs(rf(o + 0x1C), rf(fb + 44), '-'));
+        cpf(fb + 28, fb + 16);
+        cpf(fb + 56, fb + 20);
+        cpf(fb + 72, fb + 24);
+        k.esi = (fb + 16) as u32;
+        k.call(C_BDE150, 0, &[]);
+        k.call(C_BDE5E0, 0, &[qnan(rd(0x00ED_B7F4))]);
+        // scale d by (steer * 1.5), then by 2.0 -> e
+        let scale = (rf(fb + 32) as f64 * rdq(0x00E5_C408)) as f32;
+        wf(fb + 28, scale);
+        let c2 = rdq(0x00E5_BFE8);
+        let dx = fs(rf(fb + 16), scale, '*');
+        let dy = fs(rf(fb + 20), scale, '*');
+        let dz = fs(scale, rf(fb + 24), '*');
+        wf(fb + 16, dx);
+        wf(fb + 20, dy);
+        wf(fb + 24, dz);
+        let e = [(dx as f64 * c2) as f32, (dy as f64 * c2) as f32, (c2 * dz as f64) as f32];
+        let vp = [rf(fb + 36), rf(fb + 40), rf(fb + 44)];
+        let f = [fs(vp[0], e[0], '-'), fs(vp[1], e[1], '-'), fs(vp[2], e[2], '-')];
+        let q = [fs(vp[0], e[0], '+'), fs(vp[1], e[1], '+'), fs(vp[2], e[2], '+')];
+        if k.call(C_4A83C0, 0, &[f[0].to_bits(), f[1].to_bits(), f[2].to_bits()]).al() != 0 {
+            for i in 0..3 {
+                wf(fb + 36 + 4 * i, f[i]);
+            }
+            br!(DP_K23_UP, 21);
+        } else if k.call(C_4A83C0, 0, &[q[0].to_bits(), q[1].to_bits(), q[2].to_bits()]).al() != 0 {
+            for i in 0..3 {
+                wf(fb + 36 + 4 * i, q[i]);
+            }
+            br!(DP_K23_UP, 25);
+        } else {
+            let w = [fs(vp[0], rf(o + 0x14), '-'), fs(vp[1], rf(o + 0x18), '-'), fs(vp[2], rf(o + 0x1C), '-')];
+            k.edi = (fb + 152) as u32;
+            let r = k.call(C_4A84B0, 0, &[f[0].to_bits(), f[1].to_bits(), f[2].to_bits(), w[0].to_bits(), w[1].to_bits(), w[2].to_bits()]);
+            let ra = r.eax as usize;
+            wd(fb + 36, rd(ra));
+            wd(fb + 40, rd(ra + 4));
+            wd(fb + 44, rd(ra + 8));
+            br!(DP_K23_UP, 26);
+        }
+        // 0x458A40
+        let id = k.call(C_683F40, obj, &[2, 0]).eax & 0xFFFF;
+        k.c.ecx = 1;
+        k.c.edx = (fb + 36) as u32;
+        k.call(C_B28330, 0, &[obj, 0, 1, 0, id]);
+        k23_tail(k, h, fb)
+    }
+}
+
+extern "C" fn k23_up_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let h = *args;
+        dc_port(DP_K23_UP, &p, args, 1, &[], false, || k23_up_body(&p, h));
+    }
+}
+regs_thunk!(k23_up_thunk, k23_up_entry);
+
+// --- ai_order_k0b_update 0x41F750 (cdecl (human)) -----------------------------------------------------------------------
+
+const DP_K0B_UP: usize = 11;
+
+/// The map of the first switch of the 0x41F750 body, indexed by the sub-action - 0x5D (0 -> the shortcut checks first).
+const K0B_MAP: [u8; 11] = [0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 0];
+
+/// 0x4202D6: the exit that tells the order machinery to look at the order again.
+unsafe fn k0b_tail(k: &mut K, h: u32) {
+    unsafe {
+        k.call(C_43BCC0, 0, &[h, 0]);
+    }
+}
+
+/// 0x41FAE9 / 0x41FAF0: back to the idle sub-action 0x5D.
+unsafe fn k0b_idle(k: &mut K, h: u32, first: bool) {
+    unsafe {
+        if first {
+            k.call(C_439430, h, &[]);
+        }
+        k.call(C_4375B0, 0, &[h, 0xB, 0x5D]);
+        k0b_tail(k, h);
+    }
+}
+
+/// 0x41F9EC: switch to the other human's flavour of the order, then the exit.
+unsafe fn k0b_swap(k: &mut K, h: u32) {
+    unsafe {
+        k.esi = h;
+        k.call(C_41DBB0, 0, &[]);
+        k0b_tail(k, h);
+    }
+}
+
+/// 0x41FA16: the sub-action 0x5E hand-over (also reached by the 0x63 / 0x64 states).
+unsafe fn k0b_fa16(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        if k.call(C_41D130, rd(fb + 16), &[]).al() == 0 {
+            return k0b_tail(k, h);
+        }
+        k.call(C_4375B0, 0, &[h, 0xB, 0x5E]);
+        k.call(C_41D380, 0, &[h]);
+        k0b_tail(k, h);
+    }
+}
+
+/// 0x41FB3D: the sub-action 0x5F / 0x67 shortcut.
+unsafe fn k0b_fb3d(k: &mut K, h: u32) {
+    unsafe {
+        k.esi = h;
+        k.call(C_41D870, 0, &[]);
+        k0b_tail(k, h);
+    }
+}
+
+unsafe fn k0b_up_body(p: &Pushad, h: u32) -> u32 {
+    unsafe {
+        let mut frame = [0u32; 40];
+        let fb = std::hint::black_box(frame.as_mut_ptr()) as usize;
+        let mut k = K { c: Cx { ecx: p.ecx, edx: p.edx }, esi: p.esi, edi: p.edi };
+        k0b_main(&mut k, h, fb);
+        std::hint::black_box(&frame);
+        0
+    }
+}
+
+unsafe fn k0b_main(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        let hh = h as usize;
+        if h != 0 {
+            let hd = rd(hh + 0x44);
+            if hd != 0 {
+                let o = pool_obj(hd) as usize;
+                if o != 0 && rd(o + 0x44) == hd && rd(o + 0x4C) == 1 && rb(o + 0x3CC) == 1 {
+                    br!(DP_K0B_UP, 0);
+                    return;
+                }
+            }
+        }
+        if rb(hh + 0x11C6) & 1 != 0 {
+            k.call(C_447CD0, 0, &[h, 0, 0]);
+            br!(DP_K0B_UP, 1);
+            return;
+        }
+        // Four searches of the 3 x 0x34-byte table at +0x5E0 + 0xC8 for an entry of type 0x52 / 0x53 / 0x54 / 0x55.
+        let tbl = rd(hh + 0x5E0);
+        let mut found = false;
+        'search: for ty in [0x52u32, 0x53, 0x54, 0x55] {
+            let mut i = 0u32;
+            let mut e = (tbl + 0xC8) as usize;
+            loop {
+                if rb(e + 0x1C) & 1 == 0 {
+                    if i != 0 {
+                        break;
+                    }
+                } else if rd(e) == ty {
+                    found = true;
+                    break 'search;
+                }
+                i += 1;
+                e += 0x34;
+                if i >= 3 {
+                    break;
+                }
+            }
+        }
+        if found {
+            k.c.ecx = rd(tbl as usize);
+            if k.call(C_CECBC0, 0, &[rd(0x015B_87E0), rd(tbl as usize + 0x168)]).al() == 0 {
+                br!(DP_K0B_UP, 2);
+                return;
+            }
+        }
+        // 0x41F858
+        k.edi = h;
+        let l = k.call(C_98E7C0, 0, &[]).eax;
+        k.esi = l;
+        wd(fb + 16, l);
+        if l == h {
+            k.call(C_447CD0, 0, &[h, 0, 0]);
+            br!(DP_K0B_UP, 3);
+            return;
+        }
+        k.c.ecx = l;
+        if k.call(C_926600, 0, &[]).al() != 0 {
+            if k.call(C_6C6D20, 0, &[]).al() != 0 {
+                br!(DP_K0B_UP, 4);
+                return;
+            }
+            if rd(0x0252_6D9C) != 0 && rb(hh + 0x148) != 0x60 {
+                br!(DP_K0B_UP, 5);
+                return;
+            }
+            if k.call(C_41E2D0, h, &[l]).al() != 0 {
+                k.c.ecx = rd(l as usize + 0x44);
+                k.call(C_43F5C0, h, &[0]);
+                br!(DP_K0B_UP, 6);
+            } else {
+                if rb(hh + 0x140) & 4 == 0 {
+                    k.call(C_GAZE_CLEAR, h, &[]);
+                }
+                br!(DP_K0B_UP, 7);
+            }
+        }
+        // 0x41F946: the first switch
+        let st = (rb(hh + 0x148) as u32).wrapping_sub(0x5D);
+        if st <= 10 && K0B_MAP[st as usize] == 0 {
+            k.c.ecx = h;
+            if k.call(C_420D30, l, &[]).al() != 0 {
+                k.call(C_55A930, 0, &[h + 0x10C4, 0, 1, 0]);
+                br!(DP_K0B_UP, 8);
+                return;
+            }
+            let t = k.call(C_420EB0, l, &[h]).eax;
+            if t != 0 {
+                let a = rd(rd(t as usize + 0xC4) as usize + 8) as usize;
+                k.call(C_55A930, 0, &[h + 0x10C4, rd(a + 0x3C), 1, 0]);
+                br!(DP_K0B_UP, 9);
+                return;
+            }
+        }
+        // 0x41F9BC: the second switch
+        let st = (rb(hh + 0x148) as u32).wrapping_sub(0x5D);
+        match st {
+            0 => k0b_5d(k, h, fb, l),
+            1 => k0b_5e(k, h, fb, l),
+            2 => k0b_5f(k, h, fb, l),
+            3 => k0b_60(k, h, fb, l),
+            4 => k0b_61(k, h, l),
+            5 => k0b_62(k, h, fb, l),
+            6 => k0b_63(k, h, fb, l),
+            7 => k0b_fa16_or_swap(k, h, fb, l),
+            9 => k0b_66(k, h, fb),
+            10 => k0b_67(k, h, fb),
+            _ => {
+                br!(DP_K0B_UP, 10);
+                k0b_tail(k, h)
+            }
+        }
+    }
+}
+
+/// 0x41F9D6.
+unsafe fn k0b_5d(k: &mut K, h: u32, fb: usize, l: u32) {
+    unsafe {
+        k.call(C_41EC20, l, &[h]);
+        if k.call(C_41CCC0, l, &[]).al() != 0 {
+            br!(DP_K0B_UP, 11);
+            return k0b_swap(k, h);
+        }
+        k.esi = h;
+        if k.call(C_41D110, h, &[]).al() != 0 {
+            br!(DP_K0B_UP, 12);
+            return k0b_fb3d(k, h);
+        }
+        br!(DP_K0B_UP, 13);
+        k0b_fa16(k, h, fb)
+    }
+}
+
+/// 0x41FA4F.
+unsafe fn k0b_5e(k: &mut K, h: u32, _fb: usize, l: u32) {
+    unsafe {
+        let hh = h as usize;
+        k.call(C_41EC20, l, &[h]);
+        if k.call(C_41CCC0, l, &[]).al() != 0 {
+            br!(DP_K0B_UP, 14);
+            return k0b_swap(k, h);
+        }
+        if k.call(C_41D110, h, &[]).al() != 0 {
+            br!(DP_K0B_UP, 15);
+            return k0b_fb3d(k, h);
+        }
+        if k.call(C_41D250, h, &[]).al() == 0 {
+            k.edi = l;
+            k.c.edx = h;
+            let n = k.call(C_41CFE0, 0, &[]).eax;
+            if n != 0 {
+                let ni = n as i32;
+                if ni <= 0 || ni > 3 || (rb(hh + 0x478) as i8 as i32) == ni || rb(hh + 0x479) != 0xFF {
+                    br!(DP_K0B_UP, 16);
+                    return k0b_tail(k, h);
+                }
+                k.call(C_ANIM_SET, 0, &[h, n, 1, 1, 0]);
+                wb(hh + 0x478, n as u8);
+                br!(DP_K0B_UP, 17);
+                return k0b_tail(k, h);
+            }
+        }
+        br!(DP_K0B_UP, 18);
+        k0b_idle(k, h, true)
+    }
+}
+
+/// 0x41FB56.
+unsafe fn k0b_5f(k: &mut K, h: u32, fb: usize, l: u32) {
+    unsafe {
+        let hh = h as usize;
+        if k.call(C_41CCC0, l, &[]).al() == 0 {
+            br!(DP_K0B_UP, 19);
+            return k0b_idle(k, h, false);
+        }
+        k.c.ecx = rd(l as usize + 0xD74);
+        let obj = k.call(C_AE28F0, 0, &[]).eax;
+        wd(fb + 20, obj);
+        let mut flag_b = 0u8;
+        if k.call(C_AB5190, obj, &[]).al() != 0 && k.call(C_AB5340, obj, &[]).al() != 0 {
+            flag_b = 1;
+        }
+        wb(fb + 14, flag_b);
+        k.c.ecx = 0x029D_BFE8;
+        let r = k.call(C_783BD0, 0, &[]).eax;
+        let t = rd(0x0217_03D4);
+        let cond1 = obj == r && rd(0x029D_C218) == 9;
+        wb(fb + 13, (cond1 && l == t) as u8);
+        let flag_c = l == t && t != 0 && rb(t as usize + 0x1160) & 0x40 != 0;
+        wb(fb + 15, flag_c as u8);
+        // 0x41FBD1
+        let mut edi = obj;
+        k.esi = obj;
+        k.edi = obj;
+        let mut found40 = k.call(C_45ED60, 0, &[]).eax == 0xFFFF_FFFF;
+        wb(fb + 40, found40 as u8);
+        if found40 {
+            let mut esi = 0u32;
+            let cnt: i32 = if edi == 0 {
+                0
+            } else if rb(edi as usize + 0x84D8) != 1 {
+                8
+            } else {
+                let c = rd(edi as usize + 0x6CE8) as i32;
+                if c == 2 && rd(edi as usize + 0x8F48) & 0x20000 != 0 { 1 } else { c }
+            };
+            wd(fb + 24, cnt as u32);
+            while cnt > esi as i32 {
+                k.esi = esi;
+                k.edi = edi;
+                if k.call(C_B18D90, 0, &[edi, esi]).al() != 0 {
+                    k.c.edx = esi;
+                    k.c.ecx = edi;
+                    let mut e = k.call(C_AA7380, 0, &[]).eax;
+                    if e == 0 {
+                        k.c.ecx = edi;
+                        e = k.call(C_AA7460, 0, &[]).eax;
+                        if e == 0 {
+                            k.c.ecx = edi;
+                            e = k.call(C_AA7500, 0, &[]).eax;
+                        }
+                    }
+                    edi = e;
+                    k.edi = edi;
+                    if k.call(C_98E7C0, 0, &[]).eax != rd(fb + 16) {
+                        edi = rd(fb + 20);
+                        found40 = false;
+                        wb(fb + 40, 0);
+                        break;
+                    }
+                }
+                edi = rd(fb + 20);
+                esi += 1;
+            }
+            k.esi = esi;
+            k.edi = edi;
+        }
+        // 0x41FC88: the distance to the other human's object
+        edi = edi.wrapping_add(0x14);
+        k.edi = edi;
+        k.c.ecx = h + 0x14;
+        let d = if flag_b != 0 { k.call(C_BDEA80, edi, &[]).st0 } else { k.call(C_BDEA30, edi, &[]).st0 } as f32;
+        let c1 = rf(0x00DD_0778);
+        let x = rf(0x00E5_CF58);
+        let cl: u8 = if d < c1 || d.is_nan() || c1.is_nan() {
+            if !(d > x) {
+                0
+            } else {
+                k.esi = 0;
+                k.c.edx = h;
+                if k.call(C_99DF10, (fb + 24) as u32, &[]).al() != 0 {
+                    k.c.ecx = (fb + 24) as u32;
+                    let d2 = if flag_b != 0 { k.call(C_BDEA80L, edi, &[]).st0 } else { k.call(C_BDEA30L, edi, &[]).st0 } as f32;
+                    if x > d2 || x.is_nan() || d2.is_nan() {
+                        br!(DP_K0B_UP, 20);
+                        return k0b_tail(k, h);
+                    }
+                }
+                k.c.edx = 0;
+                if k.call(C_43F380, edi, &[h, 3, 0xFFFF_FFFF]).eax == 0 {
+                    br!(DP_K0B_UP, 21);
+                    return k0b_tail(k, h);
+                }
+                1
+            }
+        } else {
+            1
+        };
+        k.c.ecx = (k.c.ecx & !0xFF) | cl as u32;
+        // 0x41FD2D
+        if found40 || rb(hh + 0x100) & 8 != 0 || cl != 0 {
+            br!(DP_K0B_UP, 22);
+            return k0b_fecc(k, h, fb);
+        }
+        k.esi = h;
+        if k.call(C_41E730, 0, &[]).al() != 0 {
+            br!(DP_K0B_UP, 23);
+            return k0b_tail(k, h);
+        }
+        let v = k.call(C_53C4D0, 0, &[]).eax;
+        let edi = rd(fb + 16);
+        k.edi = edi;
+        let esi = rd(fb + 20);
+        if v == 0xA {
+            if k.call(C_963540, edi, &[]).al() != 0 {
+                k.esi = esi;
+                if k.call(C_667880, esi, &[]).al() != 0 {
+                    k.call(C_6678C0, 0, &[]);
+                    br!(DP_K0B_UP, 24);
+                    return k0b_tail(k, h);
+                }
+            }
+        }
+        k.esi = esi;
+        // 0x41FD9F: the request record
+        let t = (fb + 52) as u32;
+        k.call(C_41CB40, t, &[]);
+        k.c.edx = 2;
+        wd(fb + 60, 2);
+        if rb(hh + 0x102) & 0x40 != 0 {
+            wd(fb + 64, 0);
+            wd(fb + 52, 0);
+        } else {
+            wd(fb + 64, 2);
+        }
+        if rb(fb + 13) == 1 || rb(fb + 15) == 1 {
+            wb(fb + 84, rb(fb + 84) | 0x10);
+        }
+        if rb(0x0252_6A30) != 0 && k.call(C_963540, edi, &[]).al() != 0 && esi != 0 {
+            let edx = k.c.edx;
+            if rb(esi as usize + 0x84D8) != 1 || (rd(esi as usize + 0x6CE8) as i32) > edx as i32 {
+                wd(fb + 56, edx);
+            }
+        }
+        if k.call(C_B07090, 0, &[h, esi, t]).al() != 0 {
+            if rb(hh + 0x149) == 0x14 {
+                br!(DP_K0B_UP, 25);
+                return;
+            }
+            k.call(C_4375B0, 0, &[h, 0xB, 0x61]);
+            k.c.ecx = esi;
+            k.esi = h;
+            k.call(C_41CBD0, 0, &[]);
+            br!(DP_K0B_UP, 26);
+            return;
+        }
+        // 0x41FE47
+        if rb(fb + 13) == 1 {
+            k.call(C_98F1B0, 0, &[edi, h]);
+            k.call(C_43BCC0, 0, &[h, 0]);
+            br!(DP_K0B_UP, 27);
+            return;
+        }
+        k.edi = h;
+        let o = k.call(C_98E7C0, 0, &[]).eax;
+        let dist = if o != h {
+            k.c.ecx = h + 0x14;
+            k.call(C_BDEA30, o + 0x14, &[]).st0 as f32
+        } else {
+            0.0
+        };
+        let a1 = k.call(C_421BC0, 0, &[]).st0;
+        let a2 = k.call(C_421BC0, 0, &[]).st0;
+        let p = a2 * a1;
+        if p < dist as f64 || p.is_nan() || dist.is_nan() {
+            br!(DP_K0B_UP, 28);
+            return k0b_tail(k, h);
+        }
+        k.call(C_439430, h, &[]);
+        k.call(C_43BCC0, 0, &[h, 0]);
+        br!(DP_K0B_UP, 29);
+    }
+}
+
+/// 0x41FECA: the near-target hand-over of the 0x5F state.
+unsafe fn k0b_fecc(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        if rb(fb + 13) == 1 {
+            k.call(C_98F1B0, 0, &[rd(fb + 16), h]);
+            k.call(C_43BCC0, 0, &[h, 0]);
+            return;
+        }
+        k.call(C_41F520, 0, &[h, rd(fb + 40)]);
+        k.call(C_43BCC0, 0, &[h, 0]);
+    }
+}
+
+/// 0x41FF11.
+unsafe fn k0b_60(k: &mut K, h: u32, fb: usize, l: u32) {
+    unsafe {
+        if k.call(C_41CCC0, l, &[]).al() == 0 {
+            br!(DP_K0B_UP, 30);
+            return k0b_idle(k, h, false);
+        }
+        k.c.ecx = rd(l as usize + 0xD74);
+        let obj = k.call(C_AE28F0, 0, &[]).eax;
+        wd(fb + 40, obj);
+        if obj == 0 {
+            br!(DP_K0B_UP, 31);
+            return k0b_idle(k, h, false);
+        }
+        let t = (fb + 52) as u32;
+        k.call(C_41CB40, t, &[]);
+        wb(fb + 84, (rb(fb + 84) & 0xEF) | 5);
+        let cnt = rd(l as usize + 0xC3C);
+        k.c.edx = 0;
+        wd(fb + 60, 2);
+        if cnt != 0 {
+            let hd = rd(h as usize + 0x44);
+            let mut e = l as usize + 0xC40;
+            for i in 0..cnt {
+                if rd(e) == hd {
+                    k.c.edx = i;
+                }
+                e += 0x18;
+            }
+        }
+        k.c.edx = k.c.edx.wrapping_add(1);
+        k.c.ecx = obj;
+        let r = k.call(C_AA7380, 0, &[]).eax;
+        if r == 0 {
+            wd(fb + 64, r);
+            wd(fb + 52, k.c.edx);
+        } else {
+            wd(fb + 64, 2);
+        }
+        if k.call(C_B07090, 0, &[h, obj, t]).al() == 0 {
+            br!(DP_K0B_UP, 32);
+            return k0b_idle(k, h, false);
+        }
+        k.call(C_4375B0, 0, &[h, 0xB, 0x61]);
+        k.call(C_43BCC0, 0, &[h, 0]);
+        br!(DP_K0B_UP, 33);
+    }
+}
+
+/// 0x41FFDA.
+unsafe fn k0b_61(k: &mut K, h: u32, l: u32) {
+    unsafe {
+        let hh = h as usize;
+        if k.call(C_41CCC0, l, &[]).al() != 0 {
+            // 0x420052
+            if k.call(C_9B9320, 0, &[h]).al() != 0 {
+                br!(DP_K0B_UP, 34);
+                return;
+            }
+            k.esi = h;
+            k.call(C_41DBB0, 0, &[]);
+            br!(DP_K0B_UP, 35);
+            return;
+        }
+        if k.call(C_9B9320, 0, &[h]).al() == 0 {
+            k.call(C_4375B0, 0, &[h, 0xB, 0x5D]);
+            br!(DP_K0B_UP, 36);
+            return;
+        }
+        k.esi = rd(hh + 0x44);
+        if k.call(C_B07AB0, 0, &[0]).al() != 0 {
+            k.call(C_B07470, 0, &[h, 1]);
+            k.call(C_4375B0, 0, &[h, 0xB, 0x5D]);
+            br!(DP_K0B_UP, 37);
+            return;
+        }
+        if k.call(C_B07C00, 0, &[]).al() == 0 {
+            br!(DP_K0B_UP, 38);
+            return;
+        }
+        k.call(C_B07470, 0, &[h, 1]);
+        br!(DP_K0B_UP, 39);
+    }
+}
+
+/// 0x420070.
+unsafe fn k0b_62(k: &mut K, h: u32, fb: usize, l: u32) {
+    unsafe {
+        let hh = h as usize;
+        let o = k.call(C_98E7C0, 0, &[]).eax;
+        let d = if o != h {
+            k.c.ecx = h + 0x14;
+            k.call(C_BDEA30, o + 0x14, &[]).st0 as f32
+        } else {
+            0.0
+        };
+        k.edi = l;
+        if k.call(C_41DF70, 0, &[h, d.to_bits()]).al() != 0 {
+            br!(DP_K0B_UP, 40);
+            return k0b_tail(k, h);
+        }
+        if rb(hh + 0x591) == 0 {
+            k.call(C_41DD70, l, &[h]);
+            k.call(C_43BCC0, 0, &[h, 0]);
+            br!(DP_K0B_UP, 41);
+            return;
+        }
+        k.edi = l;
+        k.c.edx = h;
+        let n = k.call(C_41CFE0, 0, &[]).eax;
+        let ni = n as i32;
+        let state = if rb(hh + 0x150) & 0x10 != 0 { 0x63u32 } else { 0x5D };
+        k.c.ecx = state;
+        let _ = fb;
+        if n != 0 {
+            if ni <= 0 || ni > 3 || (rb(hh + 0x478) as i8 as i32) == ni {
+                br!(DP_K0B_UP, 42);
+                return k0b_tail(k, h);
+            }
+            k.esi = h;
+            wb(hh + 0x478, n as u8);
+            k.call(C_99D260, 0, &[]);
+            k.call(C_43BCC0, 0, &[h, 0]);
+            br!(DP_K0B_UP, 43);
+            return;
+        }
+        k.esi = state;
+        k.call(C_439430, h, &[]);
+        k.call(C_4375B0, 0, &[h, 0xB, state]);
+        k.call(C_43BCC0, 0, &[h, 0]);
+        br!(DP_K0B_UP, 44);
+    }
+}
+
+/// 0x420150 (0x63): a random-timed burst, then the 0x64 hand-over.
+unsafe fn k0b_63(k: &mut K, h: u32, fb: usize, l: u32) {
+    unsafe {
+        let hh = h as usize;
+        if rb(hh + 0x470) & 4 != 0 {
+            k.c.ecx = h + 0x14;
+            let d = k.call(C_BDEA30, h + 0x170, &[]).st0 as f32;
+            let c = rf(0x00E5_CF48);
+            if d < c {
+                wb(hh + 0x150, rb(hh + 0x150) & 0xEF);
+                k.call(C_4375B0, 0, &[h, 0xB, 0x64]);
+                k.c.ecx = 0x3A98;
+                k.esi = 0x1388;
+                let r = k.call(C_RAND_RANGE, 0, &[]).eax;
+                let hd = rd(hh + 0x44);
+                k.c.ecx = 0x45;
+                k.edi = 0;
+                k.call(C_401420, r, &[hd, hd, 0xB, 0x64]);
+                k.esi = rd(fb + 16);
+                br!(DP_K0B_UP, 45);
+            } else {
+                br!(DP_K0B_UP, 46);
+            }
+        }
+        k0b_fa16_or_swap(k, h, fb, l)
+    }
+}
+
+/// 0x4201B1 (state 0x64, and where 0x63 ends).
+unsafe fn k0b_fa16_or_swap(k: &mut K, h: u32, fb: usize, _l: u32) {
+    unsafe {
+        let esi = k.esi;
+        let _ = esi;
+        let r = k.call(C_41CCC0, k.esi, &[]).al() != 0;
+        k.esi = h;
+        if r {
+            br!(DP_K0B_UP, 47);
+            return k0b_swap(k, h);
+        }
+        br!(DP_K0B_UP, 48);
+        k0b_fa16(k, h, fb)
+    }
+}
+
+/// 0x4201D9 (0x66).
+unsafe fn k0b_66(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        let hh = h as usize;
+        let edi = k.call(C_438710, rd(hh + 0x16C), &[1]).eax;
+        if edi == 0 {
+            k.call(C_4375B0, 0, &[h, 0xB, 0x5D]);
+            wd(hh + 0x100C, 0);
+            wd(hh + 0x1010, 0);
+            wd(hh + 0x1014, 0);
+            wd(hh + 0x1018, 0);
+            k.call(C_GAZE_CLEAR, h, &[]);
+            k.call(C_43BCC0, 0, &[h, edi]);
+            br!(DP_K0B_UP, 49);
+            return;
+        }
+        let flag_c = (rb(hh + 0x150) >> 2) & 1 ^ 1;
+        wb(fb + 15, flag_c);
+        k.esi = h;
+        k.edi = edi;
+        k.call(C_41E160, 0, &[]);
+        if rb(hh + 0x150) & 4 != 0 {
+            if rb(hh + 0x591) != 2 {
+                k.c.edx = 0;
+                k.call(C_43F380, edi + 0x14, &[h, 2, rd(edi as usize + 0x52C)]);
+                br!(DP_K0B_UP, 50);
+            }
+            if flag_c != 0 {
+                wd(hh + 0x100C, 0);
+                wd(hh + 0x1010, 0);
+                wd(hh + 0x1014, 0);
+                wd(hh + 0x1018, 0);
+                k.call(C_GAZE_CLEAR, h, &[]);
+                br!(DP_K0B_UP, 51);
+            }
+        } else {
+            if rb(hh + 0x591) == 2 {
+                k.call(C_439430, h, &[]);
+                br!(DP_K0B_UP, 52);
+            }
+            if flag_c == 0 {
+                k.c.ecx = rd(edi as usize + 0x44);
+                k.c.edx = 0;
+                k.call(C_9633B0, 0, &[h]);
+                br!(DP_K0B_UP, 53);
+            }
+        }
+        k.c.ecx = h;
+        k.call(C_994340, 0, &[edi + 0x14, 0, 0, 0]);
+        k0b_tail(k, h)
+    }
+}
+
+/// 0x41FB0F (0x67).
+unsafe fn k0b_67(k: &mut K, h: u32, fb: usize) {
+    unsafe {
+        let hh = h as usize;
+        if rb(hh + 0x150) & 0x20 == 0 {
+            // 0x41FA27
+            br!(DP_K0B_UP, 54);
+            k.call(C_4375B0, 0, &[h, 0xB, 0x5E]);
+            k.call(C_41D380, 0, &[h]);
+            return k0b_tail(k, h);
+        }
+        if k.call(C_41D630, h, &[0]).al() != 0 || rb(hh + 0x591) == 2 {
+            br!(DP_K0B_UP, 55);
+            return k0b_tail(k, h);
+        }
+        br!(DP_K0B_UP, 56);
+        let _ = fb;
+        k0b_fb3d(k, h)
+    }
+}
+
+extern "C" fn k0b_up_entry(r: &mut Pushad, args: *const u32) {
+    let p = *r;
+    unsafe {
+        let h = *args;
+        // what the update itself writes of the human: the move counter (+0x478), the flags (+0x150), the 4 words at +0x100C
+        let watch = [(h as usize + 0x478, 1), (h as usize + 0x150, 1), (h as usize + 0x100C, 16)];
+        dc_port(DP_K0B_UP, &p, args, 1, &watch, false, || k0b_up_body(&p, h));
+    }
+}
+regs_thunk!(k0b_up_thunk, k0b_up_entry);
+
+static DCPORTS: [DcPort; 12] = [
     dcp("ai_order_update", 0x0043_72E0),
     dcp("ai_order_k03_exit", 0x004064B0),
     dcp("ai_order_k11_exit", 0x00432CA0),
@@ -8630,6 +10136,8 @@ static DCPORTS: [DcPort; 10] = [
     dcp("ai_order_k03_net_read", 0x00405C70),
     dcp("ai_order_k0a_on_event", 0x0041C670),
     dcp("ai_order_k14_update", 0x004563D0),
+    dcp("ai_order_k23_update", 0x004586F0),
+    dcp("ai_order_k0b_update", 0x0041F750),
 ];
 
 /// Install the dependent-call ports: (ok, total).
@@ -8639,7 +10147,7 @@ fn install_dc() -> (usize, usize) {
         return (0, 0);
     }
     fill_dc_fake();
-    let list: [(usize, &[u8], &[usize], extern "C" fn()); 10] = [
+    let list: [(usize, &[u8], &[usize], extern "C" fn()); 12] = [
         (DP_AOU, &AOU_BODY, &AOU_BODY_CALLS, aou_thunk),
         (DP_K03_EXIT, &K03_EXIT_BODY, &K03_EXIT_BODY_CALLS, k03_exit_thunk),
         (DP_K11_EXIT, &K11_EXIT_BODY, &K11_EXIT_BODY_CALLS, k11_exit_thunk),
@@ -8650,9 +10158,15 @@ fn install_dc() -> (usize, usize) {
         (DP_K03_NR, &K03_NR_BODY, &K03_NR_BODY_CALLS, k03_nr_thunk),
         (DP_K0A_OE, &K0A_OE_BODY, &K0A_OE_BODY_CALLS, k0a_oe_thunk),
         (DP_K14_UP, &K14_UP_BODY, &K14_UP_BODY_CALLS, k14_up_thunk),
+        (DP_K23_UP, &K23_UP_BODY, &K23_UP_BODY_CALLS, k23_up_thunk),
+        (DP_K0B_UP, &K0B_UP_BODY, &K0B_UP_BODY_CALLS, k0b_up_thunk),
     ];
     let mut ok = 0;
     for &(id, body, calls, thunk) in &list {
+        // k0b update: 26 shadow mismatches in 3000 calls in the 2026-11-04 play test; held back.
+        if id == DP_K0B_UP {
+            continue;
+        }
         let port = &DCPORTS[id];
         match unsafe { detour::relocate(port.addr, body, calls) } {
             Ok(copy) => {
@@ -8662,6 +10176,14 @@ fn install_dc() -> (usize, usize) {
                         DP_K0A_OE => unsafe { rewire_jump_table(copy, port.addr, body, 0x0041_C988, &K0A_JT) },
                         DP_K14_UP => unsafe {
                             rewire_jump_table(copy, port.addr, body, 0x0045_6BA8, &K14_JT1) && rewire_jump_table(copy, port.addr, body, 0x0045_6BC8, &K14_JT2)
+                        },
+                        DP_K23_UP => unsafe { patch_vcall(copy, 0x774) },
+                        DP_K0B_UP => unsafe {
+                            // the two distance calls whose ECX is a pointer to a local vector
+                            set_rel32(copy, 0x59D, DC_STUBS[C_BDEA80L].load(Ordering::Relaxed), 0xE8)
+                                && set_rel32(copy, 0x5A4, DC_STUBS[C_BDEA30L].load(Ordering::Relaxed), 0xE8)
+                                && rewire_jump_table(copy, port.addr, body, 0x0042_02E8, &K0B_JT1)
+                                && rewire_jump_table(copy, port.addr, body, 0x0042_02FC, &K0B_JT2)
                         },
                         _ => true,
                     };
@@ -9081,3 +10603,1044 @@ const K14_UP_BODY: [u8; 2005] = [
     0xE9, 0x76, 0xFF, 0xFF, 0xFF,
 ];
 const K14_UP_BODY_CALLS: [usize; 80] = [0x79, 0x9c, 0xd2, 0xe4, 0xf3, 0x101, 0x115, 0x120, 0x130, 0x13e, 0x152, 0x169, 0x17d, 0x199, 0x1ad, 0x1c3, 0x1db, 0x1f0, 0x20a, 0x21c, 0x227, 0x23b, 0x24b, 0x252, 0x261, 0x27e, 0x2c7, 0x2d2, 0x2e1, 0x2f6, 0x30b, 0x322, 0x344, 0x35a, 0x36c, 0x37e, 0x38c, 0x3a0, 0x3b0, 0x3ba, 0x3e3, 0x3f4, 0x40f, 0x444, 0x471, 0x48f, 0x49f, 0x4b0, 0x4bf, 0x4cf, 0x4d9, 0x4ed, 0x520, 0x537, 0x554, 0x584, 0x590, 0x5b3, 0x5c9, 0x5d6, 0x60c, 0x62b, 0x635, 0x645, 0x655, 0x663, 0x66f, 0x680, 0x695, 0x6e7, 0x6fa, 0x713, 0x742, 0x756, 0x767, 0x77a, 0x78e, 0x79d, 0x7aa, 0x7bc];
+const K23_UP_BODY: [u8; 2590] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x81, 0xEC, 0xA4, 0x00, 0x00, 0x00, 0x53, 0x8B, 0x5D, 0x08,
+    0x0F, 0xB6, 0x83, 0x48, 0x01, 0x00, 0x00, 0x2D, 0xA3, 0x00, 0x00, 0x00, 0x56, 0x57, 0x0F, 0x84,
+    0x01, 0x06, 0x00, 0x00, 0x83, 0xE8, 0x01, 0x0F, 0x84, 0xAA, 0x05, 0x00, 0x00, 0x83, 0xE8, 0x01,
+    0x0F, 0x85, 0x44, 0x03, 0x00, 0x00, 0x8B, 0x8B, 0x74, 0x0D, 0x00, 0x00, 0x85, 0xC9, 0x0F, 0x84,
+    0x85, 0x04, 0x00, 0x00, 0x8B, 0xC1, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x98,
+    0x64, 0x9C, 0x14, 0x02, 0x85, 0xDB, 0x0F, 0x84, 0x6A, 0x04, 0x00, 0x00, 0x39, 0x4B, 0x44, 0x0F,
+    0x85, 0x61, 0x04, 0x00, 0x00, 0x83, 0x7B, 0x4C, 0x05, 0x0F, 0x85, 0x57, 0x04, 0x00, 0x00, 0xB8,
+    0x02, 0x00, 0x00, 0x00, 0x8B, 0xD3, 0xE8, 0xC5, 0xB8, 0x22, 0x00, 0x85, 0xC0, 0x0F, 0x84, 0xF4,
+    0x02, 0x00, 0x00, 0x8B, 0x83, 0xE4, 0x84, 0x00, 0x00, 0x8B, 0x80, 0x9C, 0x00, 0x00, 0x00, 0x83,
+    0xE8, 0x02, 0x0F, 0x84, 0x1A, 0x04, 0x00, 0x00, 0x83, 0xE8, 0x01, 0x0F, 0x84, 0x0A, 0x03, 0x00,
+    0x00, 0x83, 0xE8, 0x01, 0x0F, 0x85, 0xCD, 0x02, 0x00, 0x00, 0x8B, 0x4D, 0x08, 0xD9, 0x41, 0x14,
+    0x83, 0xEC, 0x0C, 0x8B, 0xC4, 0xD9, 0x18, 0xD9, 0x41, 0x18, 0xD9, 0x58, 0x04, 0xD9, 0x41, 0x1C,
+    0xD9, 0x58, 0x08, 0xE8, 0x08, 0xFC, 0x04, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x0F, 0x85, 0xC1,
+    0x03, 0x00, 0x00, 0xD9, 0x43, 0x14, 0x83, 0xEC, 0x0C, 0x8B, 0xC4, 0xD9, 0x18, 0x8D, 0x4C, 0x24,
+    0x30, 0xD9, 0x43, 0x18, 0xD9, 0x58, 0x04, 0xD9, 0x43, 0x1C, 0xD9, 0x58, 0x08, 0xE8, 0x2E, 0xFC,
+    0x04, 0x00, 0x8B, 0x43, 0x44, 0x83, 0xC4, 0x0C, 0x6A, 0x00, 0x6A, 0x00, 0x8D, 0x4C, 0x24, 0x28,
+    0x51, 0x8D, 0x54, 0x24, 0x18, 0x52, 0x8D, 0x4C, 0x24, 0x2C, 0xE8, 0x61, 0x8B, 0x65, 0x00, 0xD9,
+    0x43, 0x14, 0xD8, 0x64, 0x24, 0x34, 0x83, 0xC4, 0x10, 0x8D, 0x74, 0x24, 0x10, 0xD9, 0x5C, 0x24,
+    0x1C, 0xD9, 0x43, 0x18, 0xD8, 0x64, 0x24, 0x28, 0xD9, 0x5C, 0x24, 0x38, 0xD9, 0x43, 0x1C, 0xD8,
+    0x64, 0x24, 0x2C, 0xD9, 0x5C, 0x24, 0x48, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0x5C, 0x24, 0x10, 0xD9,
+    0x44, 0x24, 0x38, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x48, 0xD9, 0x5C, 0x24, 0x18, 0xE8,
+    0x0C, 0x59, 0x78, 0x00, 0xD9, 0x05, 0xF4, 0xB7, 0xED, 0x00, 0x51, 0xD9, 0x1C, 0x24, 0xE8, 0x8D,
+    0x5D, 0x78, 0x00, 0xD9, 0x44, 0x24, 0x20, 0xDC, 0x0D, 0x08, 0xC4, 0xE5, 0x00, 0xD9, 0x5C, 0x24,
+    0x1C, 0xD9, 0x44, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0xC0, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9,
+    0x5C, 0x24, 0x10, 0xD9, 0x44, 0x24, 0x14, 0xD8, 0xC9, 0xD9, 0x5C, 0x24, 0x14, 0xD8, 0x4C, 0x24,
+    0x18, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x44, 0x24, 0x10, 0xDD, 0x05, 0xE8, 0xBF, 0xE5, 0x00, 0xDC,
+    0xC9, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0x54, 0x24, 0x1C, 0xD9,
+    0x44, 0x24, 0x14, 0xD8, 0xCA, 0xD9, 0x5C, 0x24, 0x30, 0xD9, 0x44, 0x24, 0x30, 0xD9, 0x5C, 0x24,
+    0x38, 0xD9, 0x44, 0x24, 0x18, 0xDE, 0xCA, 0xD9, 0xC9, 0xD9, 0x5C, 0x24, 0x34, 0xD9, 0x44, 0x24,
+    0x34, 0xD9, 0x5C, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x24, 0xD9, 0xC0, 0xD8, 0x64, 0x24, 0x1C, 0xD9,
+    0x5C, 0x24, 0x48, 0xD9, 0x44, 0x24, 0x28, 0xD9, 0xC0, 0xD8, 0x64, 0x24, 0x38, 0xD9, 0x5C, 0x24,
+    0x38, 0x83, 0xEC, 0x0C, 0xD9, 0x44, 0x24, 0x38, 0x8B, 0xC4, 0xD9, 0xC0, 0xD8, 0x64, 0x24, 0x2C,
+    0xD9, 0x5C, 0x24, 0x28, 0xD9, 0x44, 0x24, 0x54, 0xD9, 0x54, 0x24, 0x1C, 0xD9, 0x44, 0x24, 0x44,
+    0xD9, 0x54, 0x24, 0x20, 0xD9, 0x44, 0x24, 0x28, 0xD9, 0x54, 0x24, 0x24, 0xD9, 0xCE, 0xD9, 0x5C,
+    0x24, 0x2C, 0xD9, 0x44, 0x24, 0x3C, 0xD9, 0x5C, 0x24, 0x3C, 0xD9, 0x44, 0x24, 0x40, 0xD9, 0x5C,
+    0x24, 0x18, 0xD9, 0x44, 0x24, 0x2C, 0xDE, 0xC5, 0xD9, 0xCC, 0xD9, 0x5C, 0x24, 0x40, 0xD9, 0x44,
+    0x24, 0x3C, 0xDE, 0xC3, 0xD9, 0xCA, 0xD9, 0x5C, 0x24, 0x3C, 0xD8, 0x44, 0x24, 0x18, 0xD9, 0x5C,
+    0x24, 0x2C, 0xD9, 0x44, 0x24, 0x40, 0xD9, 0x5C, 0x24, 0x48, 0xD9, 0x44, 0x24, 0x3C, 0xD9, 0x5C,
+    0x24, 0x4C, 0xD9, 0x44, 0x24, 0x2C, 0xD9, 0x5C, 0x24, 0x50, 0xD9, 0x18, 0xD9, 0x58, 0x04, 0xD9,
+    0x58, 0x08, 0xE8, 0x59, 0xFA, 0x04, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x74, 0x1D, 0x8B, 0x44,
+    0x24, 0x10, 0x8B, 0x4C, 0x24, 0x14, 0x8B, 0x54, 0x24, 0x18, 0x89, 0x44, 0x24, 0x24, 0x89, 0x4C,
+    0x24, 0x28, 0x89, 0x54, 0x24, 0x2C, 0xE9, 0xB5, 0x00, 0x00, 0x00, 0xD9, 0x44, 0x24, 0x34, 0x83,
+    0xEC, 0x0C, 0x8B, 0xC4, 0xD9, 0x18, 0xD9, 0x44, 0x24, 0x3C, 0xD9, 0x58, 0x04, 0xD9, 0x44, 0x24,
+    0x2C, 0xD9, 0x58, 0x08, 0xE8, 0x17, 0xFA, 0x04, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x74, 0x1A,
+    0x8B, 0x44, 0x24, 0x3C, 0x8B, 0x4C, 0x24, 0x40, 0x8B, 0x54, 0x24, 0x44, 0x89, 0x44, 0x24, 0x24,
+    0x89, 0x4C, 0x24, 0x28, 0x89, 0x54, 0x24, 0x2C, 0xEB, 0x76, 0xD9, 0x44, 0x24, 0x24, 0x83, 0xEC,
+    0x0C, 0xD8, 0x63, 0x14, 0x8B, 0xC4, 0x83, 0xEC, 0x0C, 0x8D, 0xBC, 0x24, 0xB0, 0x00, 0x00, 0x00,
+    0xD9, 0x5C, 0x24, 0x24, 0xD9, 0x44, 0x24, 0x40, 0xD8, 0x63, 0x18, 0xD9, 0x5C, 0x24, 0x38, 0xD9,
+    0x44, 0x24, 0x44, 0xD8, 0x63, 0x1C, 0xD9, 0x5C, 0x24, 0x4C, 0xD9, 0x44, 0x24, 0x24, 0xD9, 0x18,
+    0xD9, 0x44, 0x24, 0x38, 0xD9, 0x58, 0x04, 0xD9, 0x44, 0x24, 0x4C, 0xD9, 0x58, 0x08, 0x8B, 0xC4,
+    0xD9, 0x44, 0x24, 0x60, 0xD9, 0x18, 0xD9, 0x44, 0x24, 0x50, 0xD9, 0x58, 0x04, 0xD9, 0x44, 0x24,
+    0x34, 0xD9, 0x58, 0x08, 0xE8, 0x87, 0xFA, 0x04, 0x00, 0x8B, 0x08, 0x8B, 0x50, 0x04, 0x8B, 0x40,
+    0x08, 0x83, 0xC4, 0x18, 0x89, 0x4C, 0x24, 0x24, 0x89, 0x54, 0x24, 0x28, 0x89, 0x44, 0x24, 0x2C,
+    0x6A, 0x00, 0x6A, 0x02, 0x8B, 0xC3, 0xE8, 0xF5, 0xB4, 0x22, 0x00, 0x0F, 0xB7, 0xC0, 0x50, 0x6A,
+    0x00, 0x6A, 0x01, 0x6A, 0x00, 0x53, 0xB9, 0x01, 0x00, 0x00, 0x00, 0x8D, 0x54, 0x24, 0x40, 0xE8,
+    0xCC, 0xF8, 0x6C, 0x00, 0x83, 0xC4, 0x1C, 0x8B, 0x5D, 0x08, 0xD9, 0xEE, 0x6A, 0x00, 0xD9, 0x54,
+    0x24, 0x50, 0x51, 0xD9, 0x54, 0x24, 0x58, 0x8D, 0x54, 0x24, 0x54, 0xD9, 0x5C, 0x24, 0x5C, 0x8D,
+    0x8B, 0xF8, 0x00, 0x00, 0x00, 0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0xD9, 0x1C, 0x24, 0x52, 0xE8,
+    0x9C, 0xB1, 0xFE, 0xFF, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8B, 0x4D, 0x08, 0xD9, 0x41,
+    0x14, 0x83, 0xEC, 0x0C, 0x8B, 0xC4, 0xD9, 0x18, 0xD9, 0x41, 0x18, 0xD9, 0x58, 0x04, 0xD9, 0x41,
+    0x1C, 0xD9, 0x58, 0x08, 0xE8, 0x07, 0xF9, 0x04, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x0F, 0x85,
+    0xB9, 0x00, 0x00, 0x00, 0xD9, 0x43, 0x14, 0x83, 0xEC, 0x0C, 0x8B, 0xC4, 0xD9, 0x18, 0x8D, 0x4C,
+    0x24, 0x1C, 0xD9, 0x43, 0x18, 0xD9, 0x58, 0x04, 0xD9, 0x43, 0x1C, 0xD9, 0x58, 0x08, 0xE8, 0x2D,
+    0xF9, 0x04, 0x00, 0xD9, 0x05, 0x38, 0x90, 0xE9, 0x00, 0x33, 0xC0, 0x83, 0xC4, 0x0C, 0x50, 0x89,
+    0x44, 0x24, 0x64, 0x89, 0x44, 0x24, 0x6C, 0x89, 0x44, 0x24, 0x70, 0xD9, 0x5C, 0x24, 0x70, 0x89,
+    0x44, 0x24, 0x5C, 0x89, 0x44, 0x24, 0x60, 0x89, 0x44, 0x24, 0x68, 0x89, 0x44, 0x24, 0x74, 0x8B,
+    0xD1, 0x6A, 0x02, 0x8B, 0xC3, 0xC7, 0x44, 0x24, 0x70, 0x01, 0x00, 0x00, 0x00, 0x89, 0x54, 0x24,
+    0x68, 0xE8, 0x1A, 0xB4, 0x22, 0x00, 0x66, 0x89, 0x44, 0x24, 0x78, 0x8D, 0x44, 0x24, 0x60, 0x50,
+    0x8B, 0xCB, 0xE8, 0x09, 0x2B, 0x6E, 0x00, 0xD9, 0x44, 0x24, 0x1C, 0xD8, 0x63, 0x14, 0x8B, 0xC4,
+    0xD9, 0x5C, 0x24, 0x48, 0xD9, 0x44, 0x24, 0x20, 0xD8, 0x63, 0x18, 0xD9, 0x5C, 0x24, 0x4C, 0xD9,
+    0x44, 0x24, 0x24, 0xD8, 0x63, 0x1C, 0xD9, 0x5C, 0x24, 0x50, 0xD9, 0x44, 0x24, 0x48, 0xD9, 0x18,
+    0xD9, 0x44, 0x24, 0x4C, 0xD9, 0x58, 0x04, 0xD9, 0x44, 0x24, 0x50, 0xD9, 0x58, 0x08, 0x8B, 0xC3,
+    0xE8, 0x2B, 0x3D, 0x6E, 0x00, 0x83, 0xC4, 0x0C, 0xE9, 0xEA, 0xFE, 0xFF, 0xFF, 0x8B, 0xCB, 0xE8,
+    0x3C, 0xB7, 0x6D, 0x00, 0x6A, 0x00, 0x6A, 0x01, 0x8D, 0x8B, 0x54, 0x85, 0x00, 0x00, 0x51, 0xE8,
+    0x8C, 0xD0, 0x6C, 0x00, 0x6A, 0x00, 0x8B, 0xC3, 0xE8, 0x63, 0x3D, 0x65, 0x00, 0x8B, 0x5D, 0x08,
+    0xEB, 0x48, 0x8B, 0xC3, 0xE8, 0x27, 0xAA, 0x70, 0x00, 0x6A, 0x00, 0x6A, 0x01, 0x8D, 0x93, 0x54,
+    0x85, 0x00, 0x00, 0x52, 0xEB, 0xD9, 0x8B, 0x5D, 0x08, 0xD9, 0x43, 0x14, 0x83, 0xEC, 0x0C, 0x8B,
+    0xC4, 0xD9, 0x18, 0xD9, 0x43, 0x18, 0xD9, 0x58, 0x04, 0xD9, 0x43, 0x1C, 0xD9, 0x58, 0x08, 0xE8,
+    0xEC, 0xF7, 0x04, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x0F, 0x84, 0x8B, 0xFE, 0xFF, 0xFF, 0x33,
+    0xD2, 0x53, 0x8D, 0x4A, 0x01, 0xE8, 0xD6, 0xC8, 0x53, 0x00, 0x83, 0xC4, 0x04, 0x68, 0xA3, 0x00,
+    0x00, 0x00, 0x6A, 0x23, 0x53, 0xE8, 0xB6, 0xE9, 0xFD, 0xFF, 0x83, 0xC4, 0x0C, 0x3B, 0x1D, 0xD4,
+    0x03, 0x17, 0x02, 0x75, 0x7F, 0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0x51, 0xD9, 0x1C, 0x24, 0x6A,
+    0x02, 0x6A, 0x04, 0xE8, 0x48, 0xB4, 0x33, 0x00, 0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0x83, 0xC4,
+    0x08, 0xD9, 0x1C, 0x24, 0x6A, 0x02, 0x6A, 0x02, 0xE8, 0x33, 0xB4, 0x33, 0x00, 0xD9, 0x05, 0x98,
+    0x79, 0xE8, 0x00, 0x83, 0xC4, 0x08, 0xD9, 0x1C, 0x24, 0x6A, 0x02, 0x6A, 0x00, 0xE8, 0x1E, 0xB4,
+    0x33, 0x00, 0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0x83, 0xC4, 0x08, 0xD9, 0x1C, 0x24, 0x6A, 0x02,
+    0x6A, 0x03, 0xE8, 0x09, 0xB4, 0x33, 0x00, 0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0x83, 0xC4, 0x08,
+    0xD9, 0x1C, 0x24, 0x6A, 0x02, 0x6A, 0x06, 0xE8, 0xF4, 0xB3, 0x33, 0x00, 0xD9, 0x05, 0x98, 0x79,
+    0xE8, 0x00, 0x83, 0xC4, 0x08, 0xD9, 0x1C, 0x24, 0x6A, 0x02, 0x6A, 0x07, 0xE8, 0xDF, 0xB3, 0x33,
+    0x00, 0x83, 0xC4, 0x0C, 0xE8, 0xF7, 0x9C, 0x04, 0x00, 0x83, 0x3D, 0xE8, 0x5A, 0x5F, 0x02, 0x00,
+    0x0F, 0x85, 0xD4, 0xFD, 0xFF, 0xFF, 0x8B, 0x8B, 0x74, 0x0D, 0x00, 0x00, 0xE8, 0x4F, 0x9C, 0x68,
+    0x00, 0x85, 0xC0, 0x74, 0x11, 0x6A, 0x01, 0x50, 0x53, 0xE8, 0x92, 0x12, 0x6C, 0x00, 0x83, 0xC4,
+    0x0C, 0xE9, 0xB4, 0xFD, 0xFF, 0xFF, 0xE8, 0xF5, 0x60, 0x04, 0x00, 0x8B, 0xF8, 0xE8, 0x3E, 0x47,
+    0x04, 0x00, 0xE9, 0xA3, 0xFD, 0xFF, 0xFF, 0x8B, 0xF3, 0xE8, 0x22, 0x67, 0x51, 0x00, 0x83, 0xF8,
+    0xFF, 0x0F, 0x85, 0x93, 0xFD, 0xFF, 0xFF, 0x80, 0xBB, 0x91, 0x05, 0x00, 0x00, 0x01, 0x74, 0x0E,
+    0x53, 0x33, 0xD2, 0x8D, 0x48, 0x02, 0xE8, 0xD5, 0xC7, 0x53, 0x00, 0x83, 0xC4, 0x04, 0x6A, 0x00,
+    0x6A, 0x01, 0x6A, 0x0A, 0x8D, 0x83, 0xC4, 0x10, 0x00, 0x00, 0x50, 0xE8, 0x30, 0x1C, 0x10, 0x00,
+    0x68, 0xA3, 0x00, 0x00, 0x00, 0x6A, 0x23, 0x53, 0xE8, 0xA3, 0xE8, 0xFD, 0xFF, 0x83, 0xC4, 0x0C,
+    0xE9, 0x55, 0xFD, 0xFF, 0xFF, 0xD9, 0x43, 0x14, 0x83, 0xEC, 0x0C, 0x8B, 0xC4, 0xD9, 0x18, 0xD9,
+    0x43, 0x18, 0xD9, 0x58, 0x04, 0xD9, 0x43, 0x1C, 0xD9, 0x58, 0x08, 0xE8, 0x40, 0xF6, 0x04, 0x00,
+    0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x0F, 0x85, 0x2F, 0xFD, 0xFF, 0xFF, 0x8B, 0x8B, 0x74, 0x0D, 0x00,
+    0x00, 0xE8, 0xAA, 0x9B, 0x68, 0x00, 0x8B, 0xF8, 0x85, 0xFF, 0x0F, 0x84, 0xA0, 0x02, 0x00, 0x00,
+    0x8B, 0xCF, 0xE8, 0xC9, 0xE6, 0x64, 0x00, 0x3B, 0xC3, 0x0F, 0x85, 0x0B, 0xFD, 0xFF, 0xFF, 0x8B,
+    0xC7, 0xE8, 0xBA, 0xD9, 0x3A, 0x00, 0x84, 0xC0, 0x0F, 0x84, 0xFC, 0xFC, 0xFF, 0xFF, 0x8B, 0xC7,
+    0xE8, 0x4B, 0xC6, 0x65, 0x00, 0x83, 0xE8, 0x02, 0x0F, 0x84, 0x4B, 0x02, 0x00, 0x00, 0x83, 0xE8,
+    0x01, 0x0F, 0x84, 0xAB, 0x00, 0x00, 0x00, 0x83, 0xE8, 0x01, 0x0F, 0x85, 0xAF, 0x02, 0x00, 0x00,
+    0x6A, 0x01, 0x8B, 0xC7, 0xE8, 0x67, 0x3B, 0x65, 0x00, 0xD9, 0x47, 0x14, 0x83, 0xEC, 0x08, 0x8B,
+    0xC4, 0xD9, 0x18, 0x8D, 0x4C, 0x24, 0x58, 0xD9, 0x47, 0x18, 0xD9, 0x58, 0x04, 0xD9, 0x47, 0x1C,
+    0xD9, 0x58, 0x08, 0xE8, 0x58, 0xF6, 0x04, 0x00, 0x83, 0xC4, 0x0C, 0x6A, 0x00, 0x6A, 0x00, 0x6A,
+    0x01, 0x6A, 0x00, 0x57, 0xB9, 0x01, 0x00, 0x00, 0x00, 0x8D, 0x54, 0x24, 0x60, 0xE8, 0x5E, 0xF5,
+    0x6C, 0x00, 0x83, 0xC4, 0x14, 0x6A, 0x00, 0x6A, 0x02, 0x8B, 0xC7, 0xE8, 0x60, 0xB1, 0x22, 0x00,
+    0x0F, 0xB7, 0xF0, 0x83, 0xC4, 0x08, 0x8D, 0x44, 0x24, 0x58, 0xE8, 0x21, 0x03, 0x00, 0x00, 0x8B,
+    0x47, 0x1C, 0x8B, 0x4F, 0x14, 0xD9, 0xEE, 0x8B, 0x57, 0x18, 0xD9, 0x5C, 0x24, 0x70, 0x80, 0x4C,
+    0x24, 0x58, 0x19, 0x56, 0x89, 0x44, 0x24, 0x68, 0x81, 0xC7, 0x54, 0x85, 0x00, 0x00, 0x6A, 0x01,
+    0x57, 0x8D, 0x44, 0x24, 0x64, 0x89, 0x4C, 0x24, 0x68, 0x89, 0x54, 0x24, 0x6C, 0xE8, 0x3E, 0x60,
+    0x6D, 0x00, 0x83, 0xC4, 0x0C, 0x6A, 0x01, 0x57, 0xE8, 0xF3, 0x33, 0x6D, 0x00, 0xE9, 0x0D, 0x02,
+    0x00, 0x00, 0x6A, 0x01, 0x8B, 0xC7, 0xE8, 0xC5, 0x3A, 0x65, 0x00, 0x83, 0xC4, 0x04, 0x57, 0xE8,
+    0x6C, 0xB7, 0x6D, 0x00, 0xD9, 0x47, 0x38, 0xD9, 0x5C, 0x24, 0x14, 0x83, 0xC4, 0x04, 0xD9, 0x47,
+    0x40, 0x8D, 0x74, 0x24, 0x10, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0xEE, 0xD9, 0x5C, 0x24, 0x14, 0xE8,
+    0xEC, 0x52, 0x78, 0x00, 0x8B, 0x17, 0x8B, 0x12, 0x6A, 0xFF, 0x8D, 0x84, 0x24, 0x90, 0x00, 0x00,
+    0x00, 0x50, 0x8B, 0xCF, 0xFF, 0xD2, 0x8D, 0xB4, 0x24, 0x8C, 0x00, 0x00, 0x00, 0xE8, 0xBE, 0x54,
+    0x78, 0x00, 0xF3, 0x0F, 0x11, 0x44, 0x24, 0x0C, 0xD9, 0x44, 0x24, 0x0C, 0xD9, 0x5C, 0x24, 0x0C,
+    0xD9, 0x05, 0x94, 0x07, 0xDD, 0x00, 0xD9, 0x44, 0x24, 0x0C, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9,
+    0xF6, 0xC4, 0x41, 0x75, 0x21, 0x8B, 0x84, 0x24, 0x8C, 0x00, 0x00, 0x00, 0x8B, 0x8C, 0x24, 0x90,
+    0x00, 0x00, 0x00, 0x8B, 0x94, 0x24, 0x94, 0x00, 0x00, 0x00, 0x89, 0x44, 0x24, 0x10, 0x89, 0x4C,
+    0x24, 0x14, 0x89, 0x54, 0x24, 0x18, 0xD9, 0x47, 0x14, 0x33, 0xC0, 0xD9, 0x5C, 0x24, 0x24, 0x89,
+    0x44, 0x24, 0x60, 0xD9, 0x47, 0x18, 0x89, 0x44, 0x24, 0x68, 0xD9, 0x5C, 0x24, 0x28, 0x89, 0x44,
+    0x24, 0x6C, 0xD9, 0x47, 0x1C, 0x89, 0x44, 0x24, 0x58, 0xD9, 0x5C, 0x24, 0x2C, 0x89, 0x44, 0x24,
+    0x5C, 0x89, 0x44, 0x24, 0x64, 0xD9, 0xC0, 0x89, 0x44, 0x24, 0x70, 0xDC, 0xC8, 0x8D, 0x44, 0x24,
+    0x4C, 0x89, 0x44, 0x24, 0x60, 0x6A, 0x00, 0xDC, 0x35, 0x68, 0xBF, 0xE5, 0x00, 0x6A, 0x02, 0x8B,
+    0xC7, 0xC7, 0x44, 0x24, 0x70, 0x01, 0x00, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24,
+    0x14, 0xDC, 0x0D, 0x48, 0xBF, 0xE5, 0x00, 0xD9, 0x5C, 0x24, 0x14, 0xD9, 0x44, 0x24, 0x14, 0xD9,
+    0xC0, 0xD8, 0x4C, 0x24, 0x18, 0xD9, 0x5C, 0x24, 0x44, 0xD9, 0xC0, 0xD8, 0x4C, 0x24, 0x1C, 0xD9,
+    0x5C, 0x24, 0x48, 0xD8, 0x4C, 0x24, 0x20, 0xD9, 0x5C, 0x24, 0x4C, 0xD9, 0x44, 0x24, 0x44, 0xD8,
+    0x44, 0x24, 0x2C, 0xD9, 0x5C, 0x24, 0x2C, 0xD9, 0x44, 0x24, 0x48, 0xD8, 0x44, 0x24, 0x30, 0xD9,
+    0x5C, 0x24, 0x30, 0xD9, 0x44, 0x24, 0x34, 0xD8, 0x44, 0x24, 0x4C, 0xD9, 0x5C, 0x24, 0x34, 0xD9,
+    0x44, 0x24, 0x2C, 0xD9, 0x5C, 0x24, 0x54, 0xD9, 0x44, 0x24, 0x30, 0xD9, 0x5C, 0x24, 0x58, 0xD9,
+    0x44, 0x24, 0x34, 0xD9, 0x5C, 0x24, 0x5C, 0xD9, 0x5C, 0x24, 0x74, 0xE8, 0xB0, 0xAF, 0x22, 0x00,
+    0x8D, 0x4C, 0x24, 0x60, 0x51, 0x8B, 0xCF, 0x66, 0x89, 0x44, 0x24, 0x7C, 0xE8, 0x9F, 0x26, 0x6E,
+    0x00, 0xD9, 0x44, 0x24, 0x1C, 0xD9, 0xE0, 0x8B, 0xC4, 0xD9, 0x18, 0xD9, 0x44, 0x24, 0x20, 0xD9,
+    0xE0, 0xD9, 0x58, 0x04, 0xD9, 0x44, 0x24, 0x24, 0xD9, 0xE0, 0xD9, 0x58, 0x08, 0x8B, 0xC7, 0xE8,
+    0xDC, 0x38, 0x6E, 0x00, 0x83, 0xC4, 0x0C, 0xEB, 0x76, 0x6A, 0x01, 0x8B, 0xC7, 0xE8, 0x2E, 0x39,
+    0x65, 0x00, 0x83, 0xC4, 0x04, 0x6A, 0x00, 0x6A, 0x02, 0x8B, 0xC7, 0xE8, 0x60, 0xAF, 0x22, 0x00,
+    0x0F, 0xB7, 0xC0, 0x50, 0x8B, 0xC7, 0xE8, 0xE5, 0xF1, 0x70, 0x00, 0x83, 0xC4, 0x0C, 0xEB, 0x4F,
+    0x83, 0xBB, 0x88, 0x0E, 0x00, 0x00, 0x00, 0x74, 0x46, 0x8B, 0x83, 0x2C, 0x05, 0x00, 0x00, 0xD9,
+    0x43, 0x14, 0x6A, 0x00, 0x50, 0x6A, 0x02, 0x83, 0xEC, 0x0C, 0x8B, 0xC4, 0xD9, 0x18, 0x8D, 0x8C,
+    0x24, 0xBC, 0x00, 0x00, 0x00, 0xD9, 0x43, 0x18, 0x33, 0xD2, 0xD9, 0x58, 0x04, 0xD9, 0x43, 0x1C,
+    0xD9, 0x58, 0x08, 0xE8, 0xE8, 0xF3, 0x04, 0x00, 0x83, 0xC4, 0x0C, 0x53, 0xE8, 0xEF, 0x4C, 0x54,
+    0x00, 0x33, 0xD2, 0x53, 0x8D, 0x4A, 0x02, 0xE8, 0x84, 0xC4, 0x53, 0x00, 0x83, 0xC4, 0x14, 0x68,
+    0xA5, 0x00, 0x00, 0x00, 0x6A, 0x23, 0x53, 0xE8, 0x64, 0xE5, 0xFD, 0xFF, 0xD9, 0x05, 0x98, 0x79,
+    0xE8, 0x00, 0x83, 0xC4, 0x08, 0xD9, 0x1C, 0x24, 0x6A, 0x00, 0x6A, 0x04, 0xE8, 0xFF, 0xAF, 0x33,
+    0x00, 0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0x83, 0xC4, 0x08, 0xD9, 0x1C, 0x24, 0x6A, 0x00, 0x6A,
+    0x02, 0xE8, 0xEA, 0xAF, 0x33, 0x00, 0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0x83, 0xC4, 0x08, 0xD9,
+    0x1C, 0x24, 0x6A, 0x00, 0x6A, 0x00, 0xE8, 0xD5, 0xAF, 0x33, 0x00, 0xD9, 0x05, 0x98, 0x79, 0xE8,
+    0x00, 0x83, 0xC4, 0x08, 0xD9, 0x1C, 0x24, 0x6A, 0x00, 0x6A, 0x03, 0xE8, 0xC0, 0xAF, 0x33, 0x00,
+    0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0x83, 0xC4, 0x08, 0xD9, 0x1C, 0x24, 0x6A, 0x00, 0x6A, 0x06,
+    0xE8, 0xAB, 0xAF, 0x33, 0x00, 0xD9, 0x05, 0x98, 0x79, 0xE8, 0x00, 0x83, 0xC4, 0x08, 0xD9, 0x1C,
+    0x24, 0x6A, 0x00, 0x6A, 0x07, 0xE8, 0x96, 0xAF, 0x33, 0x00, 0x83, 0xC4, 0x0C, 0x6A, 0x00, 0x6A,
+    0x00, 0x6A, 0x00, 0x68, 0x5C, 0x5B, 0x5F, 0x02, 0x68, 0x20, 0x5B, 0x5F, 0x02, 0x8B, 0xC3, 0xE8,
+    0x5C, 0x97, 0x04, 0x00, 0x8B, 0x0D, 0x0C, 0xD2, 0xEA, 0x00, 0x83, 0xC4, 0x14, 0xBF, 0x84, 0x78,
+    0xDD, 0x00, 0xBE, 0xA8, 0x78, 0xDD, 0x00, 0x89, 0x4C, 0x24, 0x0C, 0xE8, 0xD0, 0xB9, 0x39, 0x00,
+    0x8B, 0x7C, 0x24, 0x0C, 0xE8, 0x37, 0x3C, 0x34, 0x00, 0xE9, 0x5C, 0xF9, 0xFF, 0xFF,
+];
+const K23_UP_BODY_CALLS: [usize; 74] = [0x76, 0xc3, 0xed, 0x10a, 0x14f, 0x15e, 0x272, 0x2b4, 0x334, 0x356, 0x36f, 0x39f, 0x3c4, 0x3ee, 0x431, 0x442, 0x480, 0x48f, 0x49f, 0x4a8, 0x4b4, 0x4df, 0x4f5, 0x505, 0x523, 0x538, 0x54d, 0x562, 0x577, 0x58c, 0x594, 0x5ac, 0x5b9, 0x5c6, 0x5cd, 0x5d9, 0x5f6, 0x60b, 0x618, 0x63b, 0x651, 0x662, 0x671, 0x680, 0x6a4, 0x6c3, 0x6dd, 0x6eb, 0x6fa, 0x72d, 0x738, 0x746, 0x74f, 0x76f, 0x78d, 0x89b, 0x8ac, 0x8cf, 0x8dd, 0x8eb, 0x8f6, 0x933, 0x93c, 0x947, 0x957, 0x96c, 0x981, 0x996, 0x9ab, 0x9c0, 0x9d5, 0x9ef, 0xa0b, 0xa14];
+
+// --- offline differential tests of the dependent-call ports ---------------------------------------------------------------
+//
+// The game's data windows (constants, the object pool, a few globals) are mapped at their real addresses with the exe's bytes;
+// the callees are generated (random registers, ST0 / XMM0, pointed-to floats) instead of called; the Rust body runs once with
+// them recorded and the original body, relocated, runs against the replay stubs: the same flow as the in-game shadow.
+#[cfg(test)]
+mod dc_difftest {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+
+    pub struct Rng(pub u64);
+    impl Rng {
+        pub fn u32(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 16) as u32
+        }
+        pub fn below(&mut self, n: u32) -> u32 {
+            self.u32() % n
+        }
+        pub fn chance(&mut self, pct: u32) -> bool {
+            self.below(100) < pct
+        }
+        pub fn f32r(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + (hi - lo) * ((self.u32() & 0xFFFFF) as f32 / 1048575.0)
+        }
+        /// Mostly sane floats, sometimes edge values.
+        pub fn fl(&mut self) -> f32 {
+            match self.below(40) {
+                0 => 0.0,
+                1 => -0.0,
+                2 => f32::NAN,
+                3 => 1e30,
+                4 => -1e30,
+                5 => f32::INFINITY,
+                6 => 1e-30,
+                _ => self.f32r(-300.0, 300.0),
+            }
+        }
+    }
+
+    fn exe() -> Vec<u8> {
+        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../bin/SR2_pc.unpacked.exe")).or_else(|_| std::fs::read("F:/Saints Row 2 Decomp/bin/SR2_pc.unpacked.exe")).expect("exe")
+    }
+
+    fn rd32(b: &[u8], o: usize) -> usize {
+        u32::from_le_bytes(b[o..o + 4].try_into().unwrap()) as usize
+    }
+
+    /// Copy the exe's bytes of `[va, va + len)` (virtual addresses) to the same addresses of this process.
+    unsafe fn copy_exe(exe: &[u8], va: usize, len: usize) {
+        let pe = rd32(exe, 0x3C);
+        let n = u16::from_le_bytes(exe[pe + 6..pe + 8].try_into().unwrap()) as usize;
+        let opt = u16::from_le_bytes(exe[pe + 20..pe + 22].try_into().unwrap()) as usize;
+        for i in 0..n {
+            let s = pe + 24 + opt + i * 40;
+            let vsz = rd32(exe, s + 8);
+            let sva = rd32(exe, s + 12) + 0x40_0000;
+            let rsz = rd32(exe, s + 16);
+            let raw = rd32(exe, s + 20);
+            let lo = va.max(sva);
+            let hi = (va + len).min(sva + vsz.min(rsz));
+            if lo < hi {
+                unsafe { std::ptr::copy_nonoverlapping(exe[raw + (lo - sva)..].as_ptr(), lo as *mut u8, hi - lo) };
+            }
+        }
+    }
+
+    /// Map the windows before `main` runs (the thread stacks of the test harness would otherwise sit on them).
+    #[used]
+    #[unsafe(link_section = ".CRT$XCU")]
+    static EARLY: extern "C" fn() = early_map;
+    extern "C" fn early_map() {
+        unsafe { alloc_windows(&DATA_WINDOWS) };
+    }
+
+    /// Commit every 64 KB block of the windows that is not committed yet. A block inside a reservation of the process (the
+    /// main thread's stack, far from its top) is committed in place.
+    unsafe fn alloc_windows(ws: &[(usize, usize, bool)]) {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        for &(a, l, _) in ws {
+            let mut b = a & !0xFFFF;
+            while b < a + l {
+                let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                unsafe { VirtualQuery(b as *const std::ffi::c_void, &mut mbi, std::mem::size_of_val(&mbi)) };
+                if mbi.State != MEM_COMMIT || mbi.RegionSize < 0x1_0000 {
+                    let mut p = unsafe { VirtualAlloc(b as *const std::ffi::c_void, 0x1_0000, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) };
+                    if p.is_null() {
+                        p = unsafe { VirtualAlloc(b as *const std::ffi::c_void, 0x1_0000, MEM_COMMIT, PAGE_EXECUTE_READWRITE) };
+                    }
+                    if p.is_null() || p as usize != b {
+                        panic!("cannot map the window at {b:#x}: region base {:#x} size {:#x} state {:#x} type {:#x}", mbi.AllocationBase as usize, mbi.RegionSize, mbi.State, mbi.Type);
+                    }
+                }
+                b += 0x1_0000;
+            }
+        }
+    }
+
+    /// Map the windows (address, length, copy the exe's bytes?).
+    pub unsafe fn map_windows(ws: &[(usize, usize, bool)]) {
+        unsafe { alloc_windows(ws) };
+        let exe = exe();
+        for &(a, l, from_exe) in ws {
+            if from_exe {
+                unsafe { copy_exe(&exe, a, l) };
+            }
+        }
+    }
+
+    /// A relocated copy of `body` whose calls go to the replay stubs.
+    pub unsafe fn make_copy(body: &[u8], addr: usize, calls: &[usize]) -> usize {
+        let copy = unsafe { VirtualAlloc(std::ptr::null(), body.len(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
+        assert!(copy != 0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(body.as_ptr(), copy as *mut u8, body.len());
+            assert!(rewire_dc(copy, addr, body, calls), "rewire");
+        }
+        copy
+    }
+
+    /// Generic generated callee results.
+    pub fn gen_default(rng: &mut Rng, c: usize, r: [u32; 5], args: &[u32], eax: Option<u32>) -> Out {
+        let cl = &CALLEES[c];
+        let mut o = Out { eax: eax.unwrap_or_else(|| match rng.below(10) { 0..=3 => 0, 4 | 5 => 1, 6 => 2 + rng.below(4), _ => rng.u32() }), ecx: if cl.keep & R_ECX != 0 { r[1] } else { rng.u32() }, edx: if cl.keep & R_EDX != 0 { r[2] } else { rng.u32() }, st0: rng.fl() as f64, xmm: rng.fl().to_bits() };
+        for sp in cl.ps {
+            let pv = ps_ptr(sp, &r, args);
+            if sp.wr && pv != 0 {
+                for i in 0..sp.len / 4 {
+                    unsafe { std::ptr::write_unaligned((pv + 4 * i) as *mut u32, rng.fl().to_bits()) };
+                }
+            }
+            if sp.retptr {
+                o.eax = pv as u32;
+            }
+        }
+        o
+    }
+
+    pub fn install_gen(f: GenFn) {
+        GEN.with(|g| *g.borrow_mut() = Some(f));
+    }
+
+    /// Run one shadowed call; the mismatches (if any) are returned.
+    pub unsafe fn shadow(dp: usize, p: &Pushad, args: &[u32], watch: &[(usize, usize)], body: impl FnOnce() -> u32) -> Vec<String> {
+        DCPORTS[dp].calls.store(0, Ordering::Relaxed);
+        DCPORTS[dp].mismatches.store(0, Ordering::Relaxed);
+        DC_WHY.with(|v| v.borrow_mut().clear());
+        unsafe { dc_port(dp, p, args.as_ptr(), args.len(), watch, false, body) };
+        GEN.with(|g| *g.borrow_mut() = None);
+        DC_WHY.with(|v| v.borrow().clone())
+    }
+
+    pub fn branches(dp: usize) -> Vec<(usize, u32)> {
+        (0..BRANCHES).filter_map(|b| {
+            let n = DC_BR[dp * BRANCHES + b].load(Ordering::Relaxed);
+            (n > 0).then_some((b, n))
+        }).collect()
+    }
+
+    pub const DATA_WINDOWS: [(usize, usize, bool); 8] = [
+        (0x015B_8000, 0x1000, false),
+        (0x0252_6000, 0x1000, false),
+        (0x029D_C000, 0x1000, false),
+        (0x00DD_0000, 0x11_0000, true),
+        (0x0214_9000, 0x2_0000, false),
+        (0x0217_0000, 0x1000, false),
+        (0x025F_5000, 0x1000, false),
+        (0x0252_8000, 0x1000, false),
+    ];
+
+    pub fn crash_handler() {
+        unsafe extern "system" fn on_crash(info: *const windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS) -> i32 {
+            unsafe {
+                let rec = &*(*info).ExceptionRecord;
+                let c = &*(*info).ContextRecord;
+                eprintln!(
+                    "CRASH code {:#x} at {:#x} (fault address {:#x}); eax={:x} ecx={:x} edx={:x} esi={:x} edi={:x} ebx={:x} ebp={:x} esp={:x}",
+                    rec.ExceptionCode, rec.ExceptionAddress as usize, rec.ExceptionInformation[1], c.Eax, c.Ecx, c.Edx, c.Esi, c.Edi, c.Ebx, c.Ebp, c.Esp
+                );
+                let sp = c.Esp as usize;
+                let v: Vec<String> = (0..12).map(|i| format!("{:x}", *((sp + 4 * i) as *const u32))).collect();
+                eprintln!("stack {}", v.join(" "));
+            }
+            0
+        }
+        unsafe { windows_sys::Win32::System::Diagnostics::Debug::SetUnhandledExceptionFilter(Some(on_crash)) };
+    }
+
+    fn pool_set(handle: u32, obj: usize) {
+        unsafe { wd(((handle & 0xFFF) as usize) * 16 + 0x0214_9C64, obj as u32) };
+    }
+
+    fn leak(n: usize) -> usize {
+        Box::leak(vec![0u64; n / 8 + 1].into_boxed_slice()).as_mut_ptr() as usize
+    }
+
+    // RUSTFLAGS="-C link-arg=/DYNAMICBASE:NO -C link-arg=/BASE:0x10000000" cargo test --release -p sr2-hook --target i686-pc-windows-msvc
+    // dc_difftest -- --ignored --test-threads=1 --nocapture
+    #[test]
+    #[ignore = "needs the test exe linked at /BASE:0x10000000 (see the comment)"]
+    fn k23_matches_original() {
+        crash_handler();
+        unsafe {
+            map_windows(&DATA_WINDOWS);
+            assert!(build_stubs());
+            let copy = make_copy(&K23_UP_BODY, 0x0045_86F0, &K23_UP_BODY_CALLS);
+            assert!(patch_vcall(copy, 0x774));
+            DCPORTS[DP_K23_UP].original.store(copy, Ordering::Relaxed);
+            let h = leak(0x1400);
+            let o1 = leak(0x9000);
+            let o2 = leak(0x9000);
+            let rec1 = leak(0x400);
+            let rec2 = leak(0x400);
+            let vt = leak(64);
+            let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+            let iters: u32 = std::env::var("DIFF_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(20000);
+            let mut bad = 0;
+            for it in 0..iters {
+                for (a, n) in [(h, 0x1400usize), (o1, 0x9000), (o2, 0x9000), (rec1, 0x400), (rec2, 0x400)] {
+                    std::ptr::write_bytes(a as *mut u8, 0, n);
+                }
+                wd(vt, 0x1234_5678);
+                for (o, rec) in [(o1, rec1), (o2, rec2)] {
+                    wd(o, vt as u32);
+                    wd(o + 0x44, if o == o1 { 0x5010 } else { 0x5020 });
+                    wd(o + 0x4C, if rng.chance(90) { 5 } else { 1 });
+                    wf(o + 0x14, rng.fl());
+                    wf(o + 0x18, rng.fl());
+                    wf(o + 0x1C, rng.fl());
+                    wf(o + 0x38, rng.fl());
+                    wf(o + 0x40, rng.fl());
+                    wd(o + 0x84E4, rec as u32);
+                    wd(rec + 0x9C, [2, 3, 4, 4, 4, 1][rng.below(6) as usize]);
+                }
+                let hd1 = rd(o1 + 0x44);
+                pool_set(hd1, o1);
+                let hd2 = rd(o2 + 0x44);
+                pool_set(hd2, o2);
+                wd(h + 0x14, rng.fl().to_bits());
+                wd(h + 0x18, rng.fl().to_bits());
+                wd(h + 0x1C, rng.fl().to_bits());
+                wb(h + 0x148, [0xA3, 0xA4, 0xA5, 0xA5, 0xA5, 0xA2, 0xA6][rng.below(7) as usize]);
+                wd(h + 0xD74, match rng.below(10) {
+                    0 => 0,
+                    1 => hd1 ^ 0x1000,
+                    _ => hd1,
+                });
+                wb(h + 0x591, rng.below(2) as u8);
+                wd(h + 0xE88, rng.below(2));
+                wd(h + 0x52C, rng.u32());
+                wd(0x0217_03D4, if rng.chance(50) { h as u32 } else { 0 });
+                wd(0x025F_5AE8, rng.below(2));
+                let o2p = o2 as u32;
+                let hp = h as u32;
+                let mut grng = Rng(rng.u32() as u64 | 1 << 40);
+                install_gen(Box::new(move |c, r, args| {
+                    let eax = match c {
+                        C_684030 => Some(grng.chance(80) as u32),
+                        C_4A8370 | C_4A83C0 | C_806720 => Some((grng.u32() & !0xFF) | grng.chance(50) as u32),
+                        C_AB53C0 => Some(2 + grng.below(4)),
+                        C_AE28F0 => Some(if grng.chance(50) { o2p } else { 0 }),
+                        C_AA7420 => Some(if grng.chance(70) { hp } else { grng.u32() }),
+                        C_96F3F0 => Some(if grng.chance(70) { 0xFFFF_FFFF } else { grng.below(5) }),
+                        _ => None,
+                    };
+                    let mut out = gen_default(&mut grng, c, r, args, eax);
+                    if c == C_BDE340 {
+                        out.xmm = [0.5f32, 4.9, 5.0, 5.1, 20.0, f32::NAN][grng.below(6) as usize].to_bits();
+                    }
+                    out
+                }));
+                let p = Pushad { edi: rng.u32(), esi: rng.u32(), ebp: 0, esp: 0, ebx: 0, edx: rng.u32(), ecx: rng.u32(), eax: rng.u32() };
+                let why = shadow(DP_K23_UP, &p, &[hp], &[], || k23_up_body(&p, hp));
+                if !why.is_empty() {
+                    bad += 1;
+                    if bad <= 5 {
+                        eprintln!("iteration {it}: {}", why.join(" | "));
+                    }
+                }
+            }
+            eprintln!("k23: {iters} runs, {bad} mismatching; branches {:?}", branches(DP_K23_UP));
+            assert_eq!(bad, 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the test exe linked at /BASE:0x10000000 (see the comment)"]
+    fn k14_matches_original() {
+        crash_handler();
+        unsafe {
+            map_windows(&DATA_WINDOWS);
+            assert!(build_stubs());
+            let copy = make_copy(&K14_UP_BODY, 0x0045_63D0, &K14_UP_BODY_CALLS);
+            let t1 = std::slice::from_raw_parts(K14_UP_BODY.as_ptr(), 0).len();
+            let _ = t1;
+            let exe_all = exe();
+            let jt = |va: usize, i: usize| -> u32 {
+                // read the table from the exe file image
+                let pe = rd32(&exe_all, 0x3C);
+                let n = u16::from_le_bytes(exe_all[pe + 6..pe + 8].try_into().unwrap()) as usize;
+                let opt = u16::from_le_bytes(exe_all[pe + 20..pe + 22].try_into().unwrap()) as usize;
+                for s in 0..n {
+                    let sh = pe + 24 + opt + s * 40;
+                    let vsz = rd32(&exe_all, sh + 8);
+                    let sva = rd32(&exe_all, sh + 12) + 0x40_0000;
+                    let raw = rd32(&exe_all, sh + 20);
+                    if va >= sva && va < sva + vsz {
+                        return rd32(&exe_all, raw + (va - sva) + i * 4) as u32;
+                    }
+                }
+                panic!("no section");
+            };
+            assert!(rewire_jump_table_with(copy, 0x0045_63D0, &K14_UP_BODY, 0x0045_6BA8, &K14_JT1, &|i| jt(0x0045_6BA8, i)));
+            assert!(rewire_jump_table_with(copy, 0x0045_63D0, &K14_UP_BODY, 0x0045_6BC8, &K14_JT2, &|i| jt(0x0045_6BC8, i)));
+            static K14MAP: [u8; 10] = [0, 4, 4, 4, 1, 2, 2, 4, 0, 3];
+            assert_eq!(K14_UP_BODY[0xC3..0xC7], 0x0045_6BBCu32.to_le_bytes());
+            std::ptr::write_unaligned((copy + 0xC3) as *mut u32, K14MAP.as_ptr() as u32);
+            {
+                // the CRT's float-to-int (0xDA0140) is not mapped here: a stand-in with the same effect
+                let fp = VirtualAlloc(std::ptr::null(), 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) as usize;
+                let code: [u8; 16] = [0x83, 0xEC, 0x08, 0xDD, 0x1C, 0x24, 0xF2, 0x0F, 0x2C, 0x04, 0x24, 0x83, 0xC4, 0x08, 0xC3, 0x90];
+                std::ptr::copy_nonoverlapping(code.as_ptr(), fp as *mut u8, 16);
+                assert_eq!(K14_UP_BODY[0x27E], 0xE8);
+                assert!(set_rel32(copy, 0x27E, fp, 0xE8));
+            }
+            DCPORTS[DP_K14_UP].original.store(copy, Ordering::Relaxed);
+            let objs: Vec<usize> = (0..8).map(|_| leak(0x9000)).collect();
+            let (h, ob, rec, tg, a, b, o, lead) = (objs[0], objs[1], objs[2], objs[3], objs[4], objs[5], objs[6], objs[7]);
+            let mut rng = Rng(0x14C0_FFEE_1234_4321);
+            let iters: u32 = std::env::var("DIFF_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(20000);
+            let mut bad = 0;
+            for it in 0..iters {
+                for &x in &objs {
+                    for i in 0..0x9000 / 4 {
+                        let v = if rng.chance(70) { 0 } else { rng.u32() };
+                        wd(x + 4 * i, v);
+                    }
+                }
+                let hd = 0x7010u32;
+                let od = 0x7020u32;
+                wd(h + 0x44, hd);
+                pool_set(hd, if rng.chance(3) { tg } else { 0 });
+                wd(tg + 0x44, hd);
+                wd(tg + 0x4C, 1);
+                wb(tg + 0x3CC, 1);
+                wd(h + 0xD74, if rng.chance(90) { od } else { 0 });
+                pool_set(od, ob);
+                wd(ob + 0x44, od);
+                wd(ob + 0x4C, if rng.chance(90) { 5 } else { 1 });
+                wd(ob + 0x84E4, rec as u32);
+                wd(rec + 0x9C, if rng.chance(60) { 3 } else { 1 });
+                wb(h + 0x148, if rng.chance(5) { rng.below(256) as u8 } else { 0x97 + rng.below(10) as u8 });
+                wb(h + 0x149, if rng.chance(50) { 0x14 } else { 1 });
+                wb(h + 0x140, rng.below(256) as u8);
+                wd(h + 0xAF0, if rng.chance(50) { lead as u32 } else { 0 });
+                wd(h + 0xD78, rng.below(4));
+                wd(h + 0x154, rng.below(5000).wrapping_sub(100));
+                wd(h + 0x10CC, if rng.chance(85) { a as u32 } else { 0 });
+                wd(a + 0xC4, if rng.chance(85) { b as u32 } else { 0 });
+                wd(b + 8, o as u32);
+                wd(b + 0xC, rng.u32());
+                wd(o + 0xCC, rng.below(2));
+                wd(o + 0xF0, if rng.chance(50) { 0xFFFF_FFFF } else { rng.u32() });
+                wb(0x0252_6A49, rng.below(2) as u8);
+                let (hp, obp, tgp, op, leadp, recp) = (h as u32, ob as u32, tg as u32, o as u32, lead as u32, rec as u32);
+                let _ = recp;
+                let mut grng = Rng(rng.u32() as u64 | 1 << 40);
+                install_gen(Box::new(move |c, r, args| {
+                    let eax = match c {
+                        C_98E7C0 => Some(if grng.chance(70) { leadp } else { hp }),
+                        C_438710 => Some(if grng.chance(70) { tgp } else { 0 }),
+                        C_43A620 => Some(if grng.chance(60) { leadp } else { 0 }),
+                        C_B716E0 => Some(obp),
+                        _ => None,
+                    };
+                    let _ = op;
+                    let mut out = gen_default(&mut grng, c, r, args, eax);
+                    if matches!(c, C_BDEA30 | C_AA6A90 | C_9C5E80 | C_B71A60) {
+                        out.st0 = [0.1f64, 1.0, 100.0, 5000.0][grng.below(4) as usize];
+                    }
+                    out
+                }));
+                let p = Pushad { edi: rng.u32(), esi: rng.u32(), ebp: 0, esp: 0, ebx: 0, edx: rng.u32(), ecx: rng.u32(), eax: rng.u32() };
+                let hp2 = h as u32;
+                let w = [(h + 0x154, 4usize)];
+                let why = shadow(DP_K14_UP, &p, &[hp2], &w, || k14_up_body(&p, hp2));
+                if !why.is_empty() {
+                    bad += 1;
+                    if bad <= 5 {
+                        eprintln!("iteration {it}: {}", why.join(" | "));
+                    }
+                }
+            }
+            eprintln!("k14: {iters} runs, {bad} mismatching; branches {:?}", branches(DP_K14_UP));
+            assert_eq!(bad, 0);
+        }
+    }
+
+    /// Every replay stub, called directly: the stack must come back exactly as the callee leaves it (`ret N` for a callee
+    /// that pops its arguments), ESI / EDI must be the caller's, ECX / EDX the recorded ones (or the caller's for a `keep`),
+    /// and ST0 balanced.
+    #[test]
+    #[ignore = "needs the test exe linked at /BASE:0x10000000 (see the comment)"]
+    fn stubs_balance() {
+        crash_handler();
+        unsafe {
+            map_windows(&DATA_WINDOWS);
+            assert!(build_stubs());
+            #[repr(C)]
+            struct SB {
+                f: u32,
+                ecx: u32,
+                edx: u32,
+                esi: u32,
+                edi: u32,
+                args: u32,
+                nargs: u32,
+                eax: u32,
+                o_eax: u32,
+                o_ecx: u32,
+                o_edx: u32,
+                want: u32,
+                st0: f64,
+                esp_delta: u32,
+                o_esi: u32,
+                o_edi: u32,
+            }
+            let bufs: Vec<usize> = (0..8).map(|_| leak(512)).collect();
+            let mut rng = Rng(0x57AB_57AB_1234_5678);
+            let mut bad = 0;
+            for c in 0..NCAL {
+                let cl = &CALLEES[c];
+                if cl.addr == 0 && cl.name != "vcall0" {
+                    continue;
+                }
+                for round in 0..40 {
+                    for &b in &bufs {
+                        for i in 0..128 {
+                            wd(b + 4 * i, rng.fl().to_bits());
+                        }
+                    }
+                    let mut r = [rng.u32(), rng.u32(), rng.u32(), 0x1357_9BDF, 0x2468_ACE0];
+                    let mut args: Vec<u32> = (0..cl.nargs).map(|_| rng.below(100)).collect();
+                    let mut used = 0;
+                    let mut put = |loc: i32, r: &mut [u32; 5], args: &mut Vec<u32>| {
+                        let b = bufs[used % bufs.len()] as u32;
+                        used += 1;
+                        if loc >= 100 {
+                            r[(loc - 100) as usize] = b;
+                        } else if loc >= 0 {
+                            args[loc as usize] = b;
+                        }
+                    };
+                    for sp in cl.ps {
+                        put(sp.loc, &mut r, &mut args);
+                    }
+                    if cl.ptr >= 0 {
+                        put(cl.ptr, &mut r, &mut args);
+                    }
+                    if cl.pbytes >= 0 {
+                        args[cl.pbytes as usize] = 16;
+                    }
+                    let mut g = Rng(rng.u32() as u64 | 1 << 40);
+                    install_gen(Box::new(move |c, r, args| gen_default(&mut g, c, r, args, None)));
+                    // record
+                    DCS.with(|s| {
+                        let mut s = s.borrow_mut();
+                        *s = DcState::default();
+                        s.mode = 1;
+                    });
+                    let want = dcx(c, if cl.addr == 0 { 0x1000 } else { cl.addr }, r, &args);
+                    GEN.with(|g| *g.borrow_mut() = None);
+                    DCS.with(|s| {
+                        let mut s = s.borrow_mut();
+                        s.mode = 2;
+                        s.pos = 0;
+                    });
+                    let mut b = SB {
+                        f: DC_STUBS[c].load(Ordering::Relaxed) as u32,
+                        ecx: r[1],
+                        edx: r[2],
+                        esi: r[3],
+                        edi: r[4],
+                        args: args.as_ptr() as u32,
+                        nargs: args.len() as u32,
+                        eax: r[0],
+                        o_eax: 0,
+                        o_ecx: 0,
+                        o_edx: 0,
+                        want: cl.st0 as u32,
+                        st0: 0.0,
+                        esp_delta: 0,
+                        o_esi: 0,
+                        o_edi: 0,
+                    };
+                    std::arch::asm!(
+                        "push ebx", "push esi", "push edi", "push ebp",
+                        "mov ebp, esp",
+                        "mov ebx, eax",
+                        "mov ecx, [ebx + 24]",
+                        "mov esi, [ebx + 20]",
+                        "2:",
+                        "test ecx, ecx",
+                        "jz 3f",
+                        "push dword ptr [esi + ecx*4 - 4]",
+                        "dec ecx",
+                        "jmp 2b",
+                        "3:",
+                        "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]", "mov esi, [ebx + 12]", "mov edi, [ebx + 16]",
+                        "mov eax, [ebx + 28]",
+                        "call dword ptr [ebx]",
+                        "mov [ebx + 32], eax", "mov [ebx + 36], ecx", "mov [ebx + 40], edx",
+                        "mov [ebx + 60], esi", "mov [ebx + 64], edi",
+                        "mov eax, ebp", "sub eax, esp", "mov [ebx + 56], eax",
+                        "cmp dword ptr [ebx + 44], 0",
+                        "je 4f",
+                        "fstp qword ptr [ebx + 48]",
+                        "4:",
+                        "mov esp, ebp",
+                        "pop ebp", "pop edi", "pop esi", "pop ebx",
+                        inout("eax") &mut b as *mut SB => _,
+                        lateout("ecx") _, lateout("edx") _,
+                        clobber_abi("C"),
+                    );
+                    let expect_delta = if cl.pops { 0 } else { 4 * cl.nargs as u32 };
+                    let mut why = Vec::new();
+                    if b.esp_delta != expect_delta {
+                        why.push(format!("esp delta {} expected {}", b.esp_delta, expect_delta));
+                    }
+                    if b.o_esi != r[3] || b.o_edi != r[4] {
+                        why.push(format!("esi/edi clobbered {:#x} {:#x}", b.o_esi, b.o_edi));
+                    }
+                    let want_ecx = if cl.keep & R_ECX != 0 { r[1] } else { want.ecx };
+                    let want_edx = if cl.keep & R_EDX != 0 { r[2] } else { want.edx };
+                    let want_eax = {
+                        let mut e = want.eax;
+                        for sp in cl.ps {
+                            if sp.retptr {
+                                e = if sp.loc >= 100 { r[(sp.loc - 100) as usize] } else { args[sp.loc as usize] };
+                            }
+                        }
+                        e
+                    };
+                    if b.o_eax != want_eax || b.o_ecx != want_ecx || b.o_edx != want_edx {
+                        why.push(format!("eax/ecx/edx {:#x} {:#x} {:#x} expected {:#x} {:#x} {:#x}", b.o_eax, b.o_ecx, b.o_edx, want_eax, want_ecx, want_edx));
+                    }
+                    if cl.st0 && b.st0.to_bits() != want.st0.to_bits() && !(b.st0.is_nan() && want.st0.is_nan()) {
+                        why.push(format!("st0 {} expected {}", b.st0, want.st0));
+                    }
+                    // the generated callee rewrote its in/out buffers after the input was recorded: the input compare is not meaningful here
+                    let st: Vec<String> = DCS.with(|s| s.borrow().bad.iter().filter(|m| !m.contains(" pointer ")).cloned().collect());
+                    if !st.is_empty() {
+                        why.push(format!("replay said {st:?}"));
+                    }
+                    if !why.is_empty() {
+                        bad += 1;
+                        if bad <= 20 {
+                            eprintln!("stub {} (#{c}) round {round}: {}", cl.name, why.join(" | "));
+                        }
+                        break;
+                    }
+                }
+            }
+            DCS.with(|s| *s.borrow_mut() = DcState::default());
+            eprintln!("stubs: {NCAL} stubs, {bad} bad");
+            assert_eq!(bad, 0);
+        }
+    }
+
+    #[test]
+    #[ignore = "needs the test exe linked at /BASE:0x10000000 (see the comment)"]
+    fn k0b_matches_original() {
+        crash_handler();
+        unsafe {
+            map_windows(&DATA_WINDOWS);
+            assert!(build_stubs());
+            let copy = make_copy(&K0B_UP_BODY, 0x0041_F750, &K0B_UP_BODY_CALLS);
+            assert!(set_rel32(copy, 0x59D, DC_STUBS[C_BDEA80L].load(Ordering::Relaxed), 0xE8));
+            assert!(set_rel32(copy, 0x5A4, DC_STUBS[C_BDEA30L].load(Ordering::Relaxed), 0xE8));
+            let t1 = [0x41F963u32, 0x41F9BC];
+            let t2 = [0x41F9D6u32, 0x41FA4F, 0x41FB56, 0x41FF11, 0x41FFDA, 0x420070, 0x420150, 0x4201B1, 0x4202D6, 0x4201D9, 0x41FB0F];
+            assert!(rewire_jump_table_with(copy, 0x0041_F750, &K0B_UP_BODY, 0x0042_02E8, &K0B_JT1, &|i| t1[i]));
+            assert!(rewire_jump_table_with(copy, 0x0041_F750, &K0B_UP_BODY, 0x0042_02FC, &K0B_JT2, &|i| t2[i]));
+            // the byte map of the first switch lives in the exe's code section, which is not mapped here: use a copy of it
+            static MAP: [u8; 11] = K0B_MAP;
+            assert_eq!(K0B_UP_BODY[0x208..0x20C], 0x0042_02F0u32.to_le_bytes());
+            std::ptr::write_unaligned((copy + 0x208) as *mut u32, MAP.as_ptr() as u32);
+            DCPORTS[DP_K0B_UP].original.store(copy, Ordering::Relaxed);
+            let objs: Vec<usize> = (0..9).map(|_| leak(0x9000)).collect();
+            let (h, l, ob, tg, tbl, x, tcur, c1, c2) = (objs[0], objs[1], objs[2], objs[3], objs[4], objs[5], objs[6], objs[7], objs[8]);
+            let mut rng = Rng(0x0BAD_5EED_1234_4321);
+            let iters: u32 = std::env::var("DIFF_ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(40000);
+            let mut bad = 0;
+            for it in 0..iters {
+                for &a in &objs {
+                    for i in 0..0x9000 / 4 {
+                        let v = if rng.chance(70) { 0 } else { rng.u32() };
+                        wd(a + 4 * i, v);
+                    }
+                }
+                let hd = 0x6010u32;
+                wd(h + 0x44, hd);
+                // the pool entry of h: sometimes a kind-1 object whose +0x3CC is 1 (the early exit)
+                pool_set(hd, if rng.chance(4) { tg } else { 0 });
+                wd(tg + 0x44, hd);
+                wd(tg + 0x4C, 1);
+                wb(tg + 0x3CC, 1);
+                wd(h + 0x5E0, tbl as u32);
+                for e in 0..3 {
+                    let ea = tbl + 0xC8 + e * 0x34;
+                    wb(ea + 0x1C, rng.below(2) as u8);
+                    wd(ea, 0x52 + rng.below(5));
+                }
+                wb(h + 0x11C6, rng.chance(5) as u8);
+                wb(h + 0x148, if rng.chance(5) { rng.below(256) as u8 } else { 0x5D + rng.below(11) as u8 });
+                wb(h + 0x591, rng.below(3) as u8);
+                wb(h + 0x149, if rng.chance(30) { 0x14 } else { 1 });
+                wb(h + 0x479, if rng.chance(70) { 0xFF } else { 0 });
+                wb(h + 0x478, rng.below(5) as u8);
+                for o in [h + 0x14, h + 0x18, h + 0x1C] {
+                    wf(o, rng.fl());
+                }
+                for &o in &[h, l, x] {
+                    wd(o + 0xC3C, rng.below(5));
+                }
+                for i in 0..5 {
+                    wd(l + 0xC40 + i * 0x18, if rng.chance(30) { rd(h + 0x44) } else { rng.u32() });
+                }
+                wd(ob + 0x6CE8, rng.below(5));
+                wb(ob + 0x84D8, rng.below(2) as u8);
+                wd(x + 0x14, 0);
+                wd(tcur + 0x1160, rng.u32());
+                // 420EB0's chain
+                wd(c1 + 0xC4, c2 as u32);
+                wd(c2 + 8, tcur as u32);
+                wd(0x015B_87E0, rng.u32());
+                wd(0x0252_6D9C, rng.chance(5) as u32);
+                wd(0x0217_03D4, if rng.chance(60) { l as u32 } else { tcur as u32 });
+                wd(0x029D_C218, if rng.chance(60) { 9 } else { 1 });
+                wb(0x0252_6A30, rng.below(2) as u8);
+                let (hp, lp, obp, tgp, xp, c1p) = (h as u32, l as u32, ob as u32, tg as u32, x as u32, c1 as u32);
+                let mut grng = Rng(rng.u32() as u64 | 1 << 40);
+                install_gen(Box::new(move |c, r, args| {
+                    let dist = |g: &mut Rng| [0.1f32, 0.17, 0.2, 100.0, 144.0, 150.0, 2400.0, 2500.0, 2600.0, f32::NAN][g.below(10) as usize] as f64;
+                    let eax = match c {
+                        C_98E7C0 => Some(match grng.below(25) { 0 => hp, 1 | 2 => xp, _ => lp }),
+                        C_6C6D20 => Some((grng.u32() & !0xFF) | grng.chance(8) as u32),
+                        C_CECBC0 | C_926600 => Some((grng.u32() & !0xFF) | grng.chance(85) as u32),
+                        C_53C4D0 => Some(if grng.chance(40) { 0xA } else { grng.u32() }),
+                        C_45ED60 => Some(if grng.chance(50) { 0xFFFF_FFFF } else { grng.u32() }),
+                        C_41CFE0 => Some(grng.below(6).wrapping_sub(1)),
+                        C_AE28F0 => Some(if grng.chance(85) { obp } else { 0 }),
+                        C_783BD0 => Some(if grng.chance(60) { obp } else { grng.u32() }),
+                        C_438710 => Some(if grng.chance(70) { tgp } else { 0 }),
+                        C_420EB0 => Some(if grng.chance(10) { c1p } else { 0 }),
+                        C_420D30 => Some((grng.u32() & !0xFF) | grng.chance(10) as u32),
+                        C_AA7380 | C_AA7460 | C_AA7500 => Some(if grng.chance(40) { 0 } else { xp }),
+                        _ => None,
+                    };
+                    let mut out = gen_default(&mut grng, c, r, args, eax);
+                    if matches!(c, C_BDEA30 | C_BDEA80 | C_BDEA30L | C_BDEA80L | C_421BC0) {
+                        out.st0 = dist(&mut grng);
+                    }
+                    out
+                }));
+                let p = Pushad { edi: rng.u32(), esi: rng.u32(), ebp: 0, esp: 0, ebx: 0, edx: rng.u32(), ecx: rng.u32(), eax: rng.u32() };
+                if std::env::var("DC_ONLY").ok().and_then(|v| v.parse::<u32>().ok()) == Some(it) {
+                    unsafe { std::env::set_var("DC_TRACE", "1") };
+                    eprintln!("h: state {:#x} +591 {} +478 {} +150 {:#x}", rb(h + 0x148), rb(h + 0x591), rb(h + 0x478), rb(h + 0x150));
+                }
+                let why = shadow(DP_K0B_UP, &p, &[hp], &[(h + 0x478, 1), (h + 0x150, 1), (h + 0x100C, 16)], || k0b_up_body(&p, hp));
+                unsafe { std::env::remove_var("DC_TRACE") };
+                if !why.is_empty() {
+                    bad += 1;
+                    if bad <= 5 {
+                        eprintln!("iteration {it}: {}", why.join(" | "));
+                    }
+                }
+            }
+            eprintln!("k0b: {iters} runs, {bad} mismatching; branches {:?}", branches(DP_K0B_UP));
+            assert_eq!(bad, 0);
+        }
+    }
+}
+const K0B_UP_BODY: [u8; 2968] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC, 0x64, 0x53, 0x8B, 0x5D, 0x08, 0x85, 0xDB, 0x56,
+    0x57, 0x74, 0x33, 0x8B, 0x4B, 0x44, 0x85, 0xC9, 0x74, 0x2C, 0x8B, 0xC1, 0x25, 0xFF, 0x0F, 0x00,
+    0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x74, 0x18, 0x39, 0x48,
+    0x44, 0x75, 0x13, 0x83, 0x78, 0x4C, 0x01, 0x75, 0x0D, 0x80, 0xB8, 0xCC, 0x03, 0x00, 0x00, 0x01,
+    0x0F, 0x84, 0x4B, 0x0B, 0x00, 0x00, 0xF6, 0x83, 0xC6, 0x11, 0x00, 0x00, 0x01, 0x74, 0x14, 0x6A,
+    0x00, 0x6A, 0x00, 0x53, 0xE8, 0x27, 0x85, 0x02, 0x00, 0x83, 0xC4, 0x0C, 0x5F, 0x5E, 0x5B, 0x8B,
+    0xE5, 0x5D, 0xC3, 0x8B, 0x93, 0xE0, 0x05, 0x00, 0x00, 0x33, 0xC0, 0x8D, 0x8A, 0xC8, 0x00, 0x00,
+    0x00, 0xF6, 0x41, 0x1C, 0x01, 0x0F, 0x84, 0xFB, 0x00, 0x00, 0x00, 0x83, 0x39, 0x52, 0x0F, 0x85,
+    0xFA, 0x00, 0x00, 0x00, 0x83, 0xF8, 0xFF, 0x75, 0x60, 0x33, 0xC0, 0x8D, 0x8A, 0xC8, 0x00, 0x00,
+    0x00, 0xF6, 0x41, 0x1C, 0x01, 0x0F, 0x84, 0xF7, 0x00, 0x00, 0x00, 0x83, 0x39, 0x53, 0x0F, 0x85,
+    0xF6, 0x00, 0x00, 0x00, 0x83, 0xF8, 0xFF, 0x75, 0x40, 0x33, 0xC0, 0x8D, 0x8A, 0xC8, 0x00, 0x00,
+    0x00, 0xF6, 0x41, 0x1C, 0x01, 0x0F, 0x84, 0xF3, 0x00, 0x00, 0x00, 0x83, 0x39, 0x54, 0x0F, 0x85,
+    0xF2, 0x00, 0x00, 0x00, 0x83, 0xF8, 0xFF, 0x75, 0x20, 0x33, 0xC0, 0x8D, 0x8A, 0xC8, 0x00, 0x00,
+    0x00, 0xF6, 0x41, 0x1C, 0x01, 0x0F, 0x84, 0xEF, 0x00, 0x00, 0x00, 0x83, 0x39, 0x55, 0x0F, 0x85,
+    0xEE, 0x00, 0x00, 0x00, 0x83, 0xF8, 0xFF, 0x74, 0x1F, 0x8B, 0x8A, 0x68, 0x01, 0x00, 0x00, 0xA1,
+    0xE0, 0x87, 0x5B, 0x01, 0x51, 0x8B, 0x0A, 0x50, 0xE8, 0x73, 0xD3, 0x8C, 0x00, 0x83, 0xC4, 0x08,
+    0x84, 0xC0, 0x0F, 0x84, 0x89, 0x0A, 0x00, 0x00, 0x8B, 0xFB, 0xE8, 0x61, 0xEF, 0x56, 0x00, 0x8B,
+    0xF0, 0x3B, 0xF3, 0x89, 0x74, 0x24, 0x10, 0x0F, 0x84, 0x32, 0xFF, 0xFF, 0xFF, 0x8B, 0xCE, 0xE8,
+    0x8C, 0x6D, 0x50, 0x00, 0x84, 0xC0, 0x0F, 0x84, 0xCA, 0x00, 0x00, 0x00, 0xE8, 0x9F, 0x74, 0x2A,
+    0x00, 0x84, 0xC0, 0x0F, 0x85, 0x58, 0x0A, 0x00, 0x00, 0x83, 0x3D, 0x9C, 0x6D, 0x52, 0x02, 0x00,
+    0x74, 0x0D, 0x80, 0xBB, 0x48, 0x01, 0x00, 0x00, 0x60, 0x0F, 0x85, 0x42, 0x0A, 0x00, 0x00, 0x56,
+    0x8B, 0xC3, 0xE8, 0x29, 0xEA, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0x84, 0xC0, 0x0F, 0x84, 0x84, 0x00,
+    0x00, 0x00, 0x8B, 0x4E, 0x44, 0x6A, 0x00, 0x8B, 0xC3, 0xE8, 0x02, 0xFD, 0x01, 0x00, 0x83, 0xC4,
+    0x04, 0xE9, 0x80, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x0F, 0x85, 0x0B, 0xFF, 0xFF, 0xFF, 0x83, 0xC0,
+    0x01, 0x83, 0xC1, 0x34, 0x83, 0xF8, 0x03, 0x0F, 0x8C, 0xE4, 0xFE, 0xFF, 0xFF, 0xE9, 0xF7, 0xFE,
+    0xFF, 0xFF, 0x85, 0xC0, 0x0F, 0x85, 0x0F, 0xFF, 0xFF, 0xFF, 0x83, 0xC0, 0x01, 0x83, 0xC1, 0x34,
+    0x83, 0xF8, 0x03, 0x0F, 0x8C, 0xE8, 0xFE, 0xFF, 0xFF, 0xE9, 0xFB, 0xFE, 0xFF, 0xFF, 0x85, 0xC0,
+    0x0F, 0x85, 0x13, 0xFF, 0xFF, 0xFF, 0x83, 0xC0, 0x01, 0x83, 0xC1, 0x34, 0x83, 0xF8, 0x03, 0x0F,
+    0x8C, 0xEC, 0xFE, 0xFF, 0xFF, 0xE9, 0xFF, 0xFE, 0xFF, 0xFF, 0x85, 0xC0, 0x0F, 0x85, 0x36, 0xFF,
+    0xFF, 0xFF, 0x83, 0xC0, 0x01, 0x83, 0xC1, 0x34, 0x83, 0xF8, 0x03, 0x0F, 0x8C, 0xF0, 0xFE, 0xFF,
+    0xFF, 0xE9, 0x22, 0xFF, 0xFF, 0xFF, 0xF6, 0x83, 0x40, 0x01, 0x00, 0x00, 0x04, 0x75, 0x07, 0x8B,
+    0xC3, 0xE8, 0xAA, 0x66, 0x59, 0x00, 0x0F, 0xB6, 0x83, 0x48, 0x01, 0x00, 0x00, 0x83, 0xC0, 0xA3,
+    0x83, 0xF8, 0x0A, 0x77, 0x67, 0x0F, 0xB6, 0x88, 0xF0, 0x02, 0x42, 0x00, 0xFF, 0x24, 0x8D, 0xE8,
+    0x02, 0x42, 0x00, 0x8B, 0xC6, 0x8B, 0xCB, 0xE8, 0xC4, 0x13, 0x00, 0x00, 0x84, 0xC0, 0x74, 0x19,
+    0x6A, 0x00, 0x6A, 0x01, 0x6A, 0x00, 0x81, 0xC3, 0xC4, 0x10, 0x00, 0x00, 0x53, 0xE8, 0xAE, 0xAF,
+    0x13, 0x00, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x53, 0x8B, 0xC6, 0xE8, 0x1F, 0x15, 0x00,
+    0x00, 0x83, 0xC4, 0x04, 0x85, 0xC0, 0x74, 0x24, 0x8B, 0x90, 0xC4, 0x00, 0x00, 0x00, 0x8B, 0x42,
+    0x08, 0x8B, 0x48, 0x3C, 0x6A, 0x00, 0x6A, 0x01, 0x51, 0x81, 0xC3, 0xC4, 0x10, 0x00, 0x00, 0x53,
+    0xE8, 0x7B, 0xAF, 0x13, 0x00, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x0F, 0xB6, 0x83, 0x48,
+    0x01, 0x00, 0x00, 0x83, 0xC0, 0xA3, 0x83, 0xF8, 0x0A, 0x0F, 0x87, 0x07, 0x09, 0x00, 0x00, 0xFF,
+    0x24, 0x85, 0xFC, 0x02, 0x42, 0x00, 0x53, 0x8B, 0xC6, 0xE8, 0x42, 0xF2, 0xFF, 0xFF, 0x83, 0xC4,
+    0x04, 0x8B, 0xC6, 0xE8, 0xD8, 0xD2, 0xFF, 0xFF, 0x84, 0xC0, 0x74, 0x19, 0x8B, 0xF3, 0xE8, 0xBD,
+    0xE1, 0xFF, 0xFF, 0x6A, 0x00, 0x53, 0xE8, 0xC5, 0xC2, 0x01, 0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E,
+    0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8B, 0xC3, 0xE8, 0x04, 0xD7, 0xFF, 0xFF, 0x84, 0xC0, 0x8B, 0xF3,
+    0x0F, 0x85, 0x29, 0x01, 0x00, 0x00, 0x8B, 0x44, 0x24, 0x10, 0xE8, 0x11, 0xD7, 0xFF, 0xFF, 0x84,
+    0xC0, 0x0F, 0x84, 0xAF, 0x08, 0x00, 0x00, 0x6A, 0x5E, 0x6A, 0x0B, 0x53, 0xE8, 0x7F, 0x7B, 0x01,
+    0x00, 0x83, 0xC4, 0x0C, 0x53, 0xE8, 0x46, 0xD9, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0x6A, 0x00, 0x53,
+    0xE8, 0x7B, 0xC2, 0x01, 0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x53,
+    0x8B, 0xC6, 0xE8, 0xC9, 0xF1, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0x8B, 0xC6, 0xE8, 0x5F, 0xD2, 0xFF,
+    0xFF, 0x84, 0xC0, 0x75, 0x87, 0x8B, 0xC3, 0xE8, 0xA4, 0xD6, 0xFF, 0xFF, 0x84, 0xC0, 0x0F, 0x85,
+    0xC9, 0x00, 0x00, 0x00, 0x8B, 0xC3, 0xE8, 0xD5, 0xD7, 0xFF, 0xFF, 0x84, 0xC0, 0x75, 0x6A, 0x8B,
+    0xFE, 0x8B, 0xD3, 0xE8, 0x58, 0xD5, 0xFF, 0xFF, 0x85, 0xC0, 0x89, 0x44, 0x24, 0x18, 0x74, 0x59,
+    0x85, 0xC0, 0x0F, 0x8E, 0x3E, 0x08, 0x00, 0x00, 0x83, 0xF8, 0x03, 0x0F, 0x8F, 0x35, 0x08, 0x00,
+    0x00, 0x0F, 0xBE, 0x93, 0x78, 0x04, 0x00, 0x00, 0x3B, 0xD0, 0x0F, 0x84, 0x26, 0x08, 0x00, 0x00,
+    0x80, 0xBB, 0x79, 0x04, 0x00, 0x00, 0xFF, 0x0F, 0x85, 0x19, 0x08, 0x00, 0x00, 0x6A, 0x00, 0x6A,
+    0x01, 0x6A, 0x01, 0x50, 0x53, 0xE8, 0xA6, 0xD0, 0x54, 0x00, 0x8A, 0x4C, 0x24, 0x2C, 0x83, 0xC4,
+    0x14, 0x6A, 0x00, 0x53, 0x88, 0x8B, 0x78, 0x04, 0x00, 0x00, 0xE8, 0xE1, 0xC1, 0x01, 0x00, 0x83,
+    0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8B, 0xC3, 0xE8, 0x40, 0x99, 0x01, 0x00,
+    0x6A, 0x5D, 0x6A, 0x0B, 0x53, 0xE8, 0xB6, 0x7A, 0x01, 0x00, 0x83, 0xC4, 0x0C, 0x6A, 0x00, 0x53,
+    0xE8, 0xBB, 0xC1, 0x01, 0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0xF6,
+    0x83, 0x50, 0x01, 0x00, 0x00, 0x20, 0x0F, 0x84, 0x0B, 0xFF, 0xFF, 0xFF, 0x6A, 0x00, 0x8B, 0xC3,
+    0xE8, 0x0B, 0xDB, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0x84, 0xC0, 0x0F, 0x85, 0xA6, 0x07, 0x00, 0x00,
+    0x80, 0xBB, 0x91, 0x05, 0x00, 0x00, 0x02, 0x0F, 0x84, 0x99, 0x07, 0x00, 0x00, 0x8B, 0xF3, 0xE8,
+    0x2C, 0xDD, 0xFF, 0xFF, 0x6A, 0x00, 0x53, 0xE8, 0x74, 0xC1, 0x01, 0x00, 0x83, 0xC4, 0x08, 0x5F,
+    0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8B, 0xC6, 0xE8, 0x63, 0xD1, 0xFF, 0xFF, 0x84, 0xC0, 0x74,
+    0x8F, 0x8B, 0x8E, 0x74, 0x0D, 0x00, 0x00, 0xE8, 0x84, 0x2D, 0x6C, 0x00, 0x8B, 0xF8, 0x89, 0x7C,
+    0x24, 0x14, 0xE8, 0x19, 0x56, 0x69, 0x00, 0x84, 0xC0, 0x74, 0x10, 0x8B, 0xC7, 0xE8, 0xBE, 0x57,
+    0x69, 0x00, 0x84, 0xC0, 0xC6, 0x44, 0x24, 0x0E, 0x01, 0x75, 0x05, 0xC6, 0x44, 0x24, 0x0E, 0x00,
+    0xB9, 0xE8, 0xBF, 0x9D, 0x02, 0xE8, 0x36, 0x40, 0x36, 0x00, 0x3B, 0xF8, 0xA1, 0xD4, 0x03, 0x17,
+    0x02, 0x75, 0x12, 0x83, 0x3D, 0x18, 0xC2, 0x9D, 0x02, 0x09, 0x75, 0x09, 0x3B, 0xF0, 0xC6, 0x44,
+    0x24, 0x0D, 0x01, 0x74, 0x09, 0x3B, 0xF0, 0xC6, 0x44, 0x24, 0x0D, 0x00, 0x75, 0x0E, 0xF6, 0x80,
+    0x60, 0x11, 0x00, 0x00, 0x40, 0xC6, 0x44, 0x24, 0x0F, 0x01, 0x75, 0x05, 0xC6, 0x44, 0x24, 0x0F,
+    0x00, 0x8B, 0x7C, 0x24, 0x14, 0x8B, 0xF7, 0xE8, 0x84, 0xF1, 0x03, 0x00, 0x83, 0xF8, 0xFF, 0x0F,
+    0x94, 0xC0, 0x84, 0xC0, 0x88, 0x44, 0x24, 0x28, 0x0F, 0x84, 0x9A, 0x00, 0x00, 0x00, 0x33, 0xF6,
+    0x3B, 0xFE, 0x75, 0x06, 0x89, 0x74, 0x24, 0x18, 0xEB, 0x36, 0x80, 0xBF, 0xD8, 0x84, 0x00, 0x00,
+    0x01, 0x74, 0x0A, 0xC7, 0x44, 0x24, 0x18, 0x08, 0x00, 0x00, 0x00, 0xEB, 0x23, 0x8B, 0x87, 0xE8,
+    0x6C, 0x00, 0x00, 0x83, 0xF8, 0x02, 0x89, 0x44, 0x24, 0x18, 0x75, 0x14, 0xF7, 0x87, 0x48, 0x8F,
+    0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x74, 0x08, 0xC7, 0x44, 0x24, 0x18, 0x01, 0x00, 0x00, 0x00,
+    0x39, 0x74, 0x24, 0x18, 0x7E, 0x52, 0x56, 0x57, 0xE8, 0x53, 0x91, 0x6F, 0x00, 0x83, 0xC4, 0x08,
+    0x84, 0xC0, 0x74, 0x2C, 0x8B, 0xD6, 0x8B, 0xCF, 0xE8, 0x33, 0x77, 0x68, 0x00, 0x85, 0xC0, 0x75,
+    0x12, 0x8B, 0xCF, 0xE8, 0x08, 0x78, 0x68, 0x00, 0x85, 0xC0, 0x75, 0x07, 0x8B, 0xCF, 0xE8, 0x9D,
+    0x78, 0x68, 0x00, 0x8B, 0xF8, 0xE8, 0x56, 0xEB, 0x56, 0x00, 0x3B, 0x44, 0x24, 0x10, 0x75, 0x0F,
+    0x8B, 0x7C, 0x24, 0x14, 0x83, 0xC6, 0x01, 0x3B, 0x74, 0x24, 0x18, 0x7C, 0xB9, 0xEB, 0x09, 0x8B,
+    0x7C, 0x24, 0x14, 0xC6, 0x44, 0x24, 0x28, 0x00, 0x83, 0xC7, 0x14, 0x80, 0x7C, 0x24, 0x0E, 0x00,
+    0x8D, 0x4B, 0x14, 0x8B, 0xC7, 0x74, 0x07, 0xE8, 0xE4, 0xED, 0x7B, 0x00, 0xEB, 0x05, 0xE8, 0x8D,
+    0xED, 0x7B, 0x00, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x05, 0x78, 0x07, 0xDD, 0x00, 0xD9, 0x44, 0x24,
+    0x18, 0xD8, 0xD1, 0xDF, 0xE0, 0xDD, 0xD9, 0xF6, 0xC4, 0x01, 0x75, 0x04, 0xDD, 0xD8, 0xEB, 0x6B,
+    0xD8, 0x1D, 0x58, 0xCF, 0xE5, 0x00, 0x32, 0xC9, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x75, 0x5E, 0x33,
+    0xF6, 0x8D, 0x44, 0x24, 0x18, 0x8B, 0xD3, 0xE8, 0x34, 0xE2, 0x57, 0x00, 0x84, 0xC0, 0x74, 0x32,
+    0x80, 0x7C, 0x24, 0x0E, 0x00, 0x8B, 0xC7, 0x8D, 0x4C, 0x24, 0x18, 0x74, 0x07, 0xE8, 0x8E, 0xED,
+    0x7B, 0x00, 0xEB, 0x05, 0xE8, 0x37, 0xED, 0x7B, 0x00, 0xD9, 0x5C, 0x24, 0x18, 0xD9, 0x05, 0x58,
+    0xCF, 0xE5, 0x00, 0xD8, 0x5C, 0x24, 0x18, 0xDF, 0xE0, 0xF6, 0xC4, 0x41, 0x0F, 0x8A, 0xC4, 0x05,
+    0x00, 0x00, 0x6A, 0xFF, 0x6A, 0x03, 0x53, 0x33, 0xD2, 0x8B, 0xC7, 0xE8, 0x60, 0xF6, 0x01, 0x00,
+    0x83, 0xC4, 0x0C, 0x85, 0xC0, 0x0F, 0x84, 0xAB, 0x05, 0x00, 0x00, 0xB1, 0x01, 0x80, 0x7C, 0x24,
+    0x28, 0x00, 0x0F, 0x85, 0x92, 0x01, 0x00, 0x00, 0xF6, 0x83, 0x00, 0x01, 0x00, 0x00, 0x08, 0x0F,
+    0x85, 0x85, 0x01, 0x00, 0x00, 0x84, 0xC9, 0x0F, 0x85, 0x7D, 0x01, 0x00, 0x00, 0x8B, 0xF3, 0xE8,
+    0xDC, 0xE9, 0xFF, 0xFF, 0x84, 0xC0, 0x0F, 0x85, 0x7A, 0x05, 0x00, 0x00, 0xE8, 0x6F, 0xC7, 0x11,
+    0x00, 0x83, 0xF8, 0x0A, 0x8B, 0x7C, 0x24, 0x10, 0x75, 0x31, 0x8B, 0xC7, 0xE8, 0xCF, 0x37, 0x54,
+    0x00, 0x84, 0xC0, 0x8B, 0x74, 0x24, 0x14, 0x74, 0x26, 0x8B, 0xC6, 0xE8, 0x00, 0x7B, 0x24, 0x00,
+    0x84, 0xC0, 0x74, 0x1B, 0xE8, 0x37, 0x7B, 0x24, 0x00, 0x6A, 0x00, 0x53, 0xE8, 0x2F, 0xBF, 0x01,
+    0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8B, 0x74, 0x24, 0x14, 0x8D,
+    0x44, 0x24, 0x34, 0xE8, 0x98, 0xCD, 0xFF, 0xFF, 0xF6, 0x83, 0x02, 0x01, 0x00, 0x00, 0x40, 0xBA,
+    0x02, 0x00, 0x00, 0x00, 0x89, 0x54, 0x24, 0x3C, 0x74, 0x0C, 0x33, 0xC0, 0x89, 0x44, 0x24, 0x40,
+    0x89, 0x44, 0x24, 0x34, 0xEB, 0x04, 0x89, 0x54, 0x24, 0x40, 0x80, 0x7C, 0x24, 0x0D, 0x01, 0x74,
+    0x07, 0x80, 0x7C, 0x24, 0x0F, 0x01, 0x75, 0x05, 0x80, 0x4C, 0x24, 0x54, 0x10, 0x80, 0x3D, 0x30,
+    0x6A, 0x52, 0x02, 0x00, 0x74, 0x24, 0x8B, 0xC7, 0xE8, 0x53, 0x37, 0x54, 0x00, 0x84, 0xC0, 0x74,
+    0x19, 0x85, 0xF6, 0x74, 0x15, 0x80, 0xBE, 0xD8, 0x84, 0x00, 0x00, 0x01, 0x75, 0x08, 0x39, 0x96,
+    0xE8, 0x6C, 0x00, 0x00, 0x7E, 0x04, 0x89, 0x54, 0x24, 0x38, 0x8D, 0x54, 0x24, 0x34, 0x52, 0x56,
+    0x53, 0xE8, 0x7A, 0x72, 0x6E, 0x00, 0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x74, 0x2A, 0x80, 0xBB, 0x49,
+    0x01, 0x00, 0x00, 0x14, 0x0F, 0x84, 0xB7, 0x04, 0x00, 0x00, 0x6A, 0x61, 0x6A, 0x0B, 0x53, 0xE8,
+    0x7C, 0x77, 0x01, 0x00, 0x8B, 0xCE, 0x83, 0xC4, 0x0C, 0x8B, 0xF3, 0xE8, 0x90, 0xCD, 0xFF, 0xFF,
+    0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x80, 0x7C, 0x24, 0x0D, 0x01, 0x75, 0x1C, 0x53, 0x57,
+    0xE8, 0x5B, 0xF3, 0x56, 0x00, 0x83, 0xC4, 0x08, 0x6A, 0x00, 0x53, 0xE8, 0x60, 0xBE, 0x01, 0x00,
+    0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8B, 0xFB, 0xE8, 0x4F, 0xE9, 0x56,
+    0x00, 0x3B, 0xC3, 0x74, 0x0D, 0x83, 0xC0, 0x14, 0x8D, 0x4B, 0x14, 0xE8, 0xB0, 0xEB, 0x7B, 0x00,
+    0xEB, 0x02, 0xD9, 0xEE, 0xD9, 0x5C, 0x24, 0x28, 0xE8, 0x33, 0x1D, 0x00, 0x00, 0xDD, 0x5C, 0x24,
+    0x18, 0xD9, 0x44, 0x24, 0x28, 0xDD, 0x5C, 0x24, 0x28, 0xE8, 0x22, 0x1D, 0x00, 0x00, 0xDC, 0x4C,
+    0x24, 0x18, 0xDC, 0x5C, 0x24, 0x28, 0xDF, 0xE0, 0xF6, 0xC4, 0x01, 0x0F, 0x85, 0x25, 0x04, 0x00,
+    0x00, 0x8B, 0xC3, 0xE8, 0x78, 0x95, 0x01, 0x00, 0x6A, 0x00, 0x53, 0xE8, 0x00, 0xBE, 0x01, 0x00,
+    0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x80, 0x7C, 0x24, 0x0D, 0x01, 0x75,
+    0x20, 0x8B, 0x44, 0x24, 0x10, 0x53, 0x50, 0xE8, 0xD4, 0xF2, 0x56, 0x00, 0x83, 0xC4, 0x08, 0x6A,
+    0x00, 0x53, 0xE8, 0xD9, 0xBD, 0x01, 0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D,
+    0xC3, 0x8B, 0x4C, 0x24, 0x28, 0x51, 0x53, 0xE8, 0x24, 0xF6, 0xFF, 0xFF, 0x83, 0xC4, 0x08, 0x6A,
+    0x00, 0x53, 0xE8, 0xB9, 0xBD, 0x01, 0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D,
+    0xC3, 0x8B, 0xC6, 0xE8, 0xA8, 0xCD, 0xFF, 0xFF, 0x84, 0xC0, 0x0F, 0x84, 0xD0, 0xFB, 0xFF, 0xFF,
+    0x8B, 0x8E, 0x74, 0x0D, 0x00, 0x00, 0xE8, 0xC5, 0x29, 0x6C, 0x00, 0x8B, 0xF8, 0x85, 0xFF, 0x89,
+    0x7C, 0x24, 0x28, 0x0F, 0x84, 0xB7, 0xFB, 0xFF, 0xFF, 0x8D, 0x44, 0x24, 0x34, 0xE8, 0xFE, 0xCB,
+    0xFF, 0xFF, 0x8A, 0x54, 0x24, 0x54, 0x8B, 0x8E, 0x3C, 0x0C, 0x00, 0x00, 0x80, 0xE2, 0xEF, 0x80,
+    0xCA, 0x05, 0x88, 0x54, 0x24, 0x54, 0x33, 0xD2, 0x33, 0xC0, 0x85, 0xC9, 0xC7, 0x44, 0x24, 0x3C,
+    0x02, 0x00, 0x00, 0x00, 0x76, 0x1E, 0x8B, 0x7B, 0x44, 0x81, 0xC6, 0x40, 0x0C, 0x00, 0x00, 0x90,
+    0x39, 0x3E, 0x75, 0x02, 0x8B, 0xD0, 0x83, 0xC0, 0x01, 0x83, 0xC6, 0x18, 0x3B, 0xC1, 0x72, 0xF0,
+    0x8B, 0x7C, 0x24, 0x28, 0x83, 0xC2, 0x01, 0x8B, 0xCF, 0xE8, 0xF2, 0x73, 0x68, 0x00, 0x85, 0xC0,
+    0x75, 0x0A, 0x89, 0x44, 0x24, 0x40, 0x89, 0x54, 0x24, 0x34, 0xEB, 0x08, 0xC7, 0x44, 0x24, 0x40,
+    0x02, 0x00, 0x00, 0x00, 0x8D, 0x44, 0x24, 0x34, 0x50, 0x57, 0x53, 0xE8, 0xE0, 0x70, 0x6E, 0x00,
+    0x83, 0xC4, 0x0C, 0x84, 0xC0, 0x0F, 0x84, 0x35, 0xFB, 0xFF, 0xFF, 0x6A, 0x61, 0x6A, 0x0B, 0x53,
+    0xE8, 0xEB, 0x75, 0x01, 0x00, 0x83, 0xC4, 0x0C, 0x6A, 0x00, 0x53, 0xE8, 0xF0, 0xBC, 0x01, 0x00,
+    0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8B, 0xC6, 0xE8, 0xDF, 0xCC, 0xFF,
+    0xFF, 0x84, 0xC0, 0x53, 0x75, 0x6C, 0xE8, 0x35, 0x93, 0x59, 0x00, 0x83, 0xC4, 0x04, 0x84, 0xC0,
+    0x74, 0x4C, 0x8B, 0x73, 0x44, 0x6A, 0x00, 0xE8, 0xB4, 0x7A, 0x6E, 0x00, 0x83, 0xC4, 0x04, 0x84,
+    0xC0, 0x74, 0x1C, 0x6A, 0x01, 0x53, 0xE8, 0x65, 0x74, 0x6E, 0x00, 0x6A, 0x5D, 0x6A, 0x0B, 0x53,
+    0xE8, 0x9B, 0x75, 0x01, 0x00, 0x83, 0xC4, 0x14, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0xE8,
+    0xDC, 0x7B, 0x6E, 0x00, 0x84, 0xC0, 0x0F, 0x84, 0xB5, 0x02, 0x00, 0x00, 0x6A, 0x01, 0x53, 0xE8,
+    0x3C, 0x74, 0x6E, 0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x6A, 0x5D,
+    0x6A, 0x0B, 0x53, 0xE8, 0x68, 0x75, 0x01, 0x00, 0x83, 0xC4, 0x0C, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5,
+    0x5D, 0xC3, 0xE8, 0xC9, 0x92, 0x59, 0x00, 0x83, 0xC4, 0x04, 0x84, 0xC0, 0x0F, 0x85, 0x7F, 0x02,
+    0x00, 0x00, 0x8B, 0xF3, 0xE8, 0x47, 0xDB, 0xFF, 0xFF, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3,
+    0xE8, 0x4B, 0xE7, 0x56, 0x00, 0x3B, 0xC3, 0x74, 0x0D, 0x83, 0xC0, 0x14, 0x8D, 0x4B, 0x14, 0xE8,
+    0xAC, 0xE9, 0x7B, 0x00, 0xEB, 0x02, 0xD9, 0xEE, 0xD9, 0x5C, 0x24, 0x28, 0x51, 0xD9, 0x44, 0x24,
+    0x2C, 0x8B, 0xFE, 0xD9, 0x1C, 0x24, 0x53, 0xE8, 0xD4, 0xDE, 0xFF, 0xFF, 0x83, 0xC4, 0x08, 0x84,
+    0xC0, 0x0F, 0x85, 0x2F, 0x02, 0x00, 0x00, 0x38, 0x83, 0x91, 0x05, 0x00, 0x00, 0x75, 0x1D, 0x53,
+    0x8B, 0xC6, 0xE8, 0xB9, 0xDC, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0x6A, 0x00, 0x53, 0xE8, 0xFE, 0xBB,
+    0x01, 0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8B, 0xFE, 0x8B, 0xD3,
+    0xE8, 0x0B, 0xCF, 0xFF, 0xFF, 0x8A, 0x8B, 0x50, 0x01, 0x00, 0x00, 0x80, 0xE1, 0x10, 0xF6, 0xD9,
+    0x1B, 0xC9, 0x83, 0xE1, 0x06, 0x83, 0xC1, 0x5D, 0x85, 0xC0, 0x8B, 0xF1, 0x74, 0x3D, 0x0F, 0x8E,
+    0xE2, 0x01, 0x00, 0x00, 0x83, 0xF8, 0x03, 0x0F, 0x8F, 0xD9, 0x01, 0x00, 0x00, 0x0F, 0xBE, 0x93,
+    0x78, 0x04, 0x00, 0x00, 0x3B, 0xD0, 0x0F, 0x84, 0xCA, 0x01, 0x00, 0x00, 0x8B, 0xF3, 0x88, 0x83,
+    0x78, 0x04, 0x00, 0x00, 0xE8, 0x47, 0xD1, 0x57, 0x00, 0x6A, 0x00, 0x53, 0xE8, 0x9F, 0xBB, 0x01,
+    0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8B, 0xC3, 0xE8, 0xFE, 0x92,
+    0x01, 0x00, 0x56, 0x6A, 0x0B, 0x53, 0xE8, 0x75, 0x74, 0x01, 0x00, 0x83, 0xC4, 0x0C, 0x6A, 0x00,
+    0x53, 0xE8, 0x7A, 0xBB, 0x01, 0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3,
+    0xF6, 0x83, 0x70, 0x04, 0x00, 0x00, 0x04, 0x74, 0x58, 0x8D, 0x83, 0x70, 0x01, 0x00, 0x00, 0x8D,
+    0x4B, 0x14, 0xE8, 0xC9, 0xE8, 0x7B, 0x00, 0xD8, 0x1D, 0x48, 0xCF, 0xE5, 0x00, 0xDF, 0xE0, 0xF6,
+    0xC4, 0x05, 0x7A, 0x3D, 0x80, 0xA3, 0x50, 0x01, 0x00, 0x00, 0xEF, 0x6A, 0x64, 0x6A, 0x0B, 0x53,
+    0xE8, 0x2B, 0x74, 0x01, 0x00, 0x83, 0xC4, 0x0C, 0xB9, 0x98, 0x3A, 0x00, 0x00, 0xBE, 0x88, 0x13,
+    0x00, 0x00, 0xE8, 0xB9, 0xCD, 0x7B, 0x00, 0x8B, 0x4B, 0x44, 0x6A, 0x64, 0x6A, 0x0B, 0x51, 0x33,
+    0xFF, 0x51, 0x8D, 0x4F, 0x45, 0xE8, 0x76, 0x12, 0xFE, 0xFF, 0x8B, 0x74, 0x24, 0x20, 0x83, 0xC4,
+    0x10, 0x8B, 0xC6, 0xE8, 0x08, 0xCB, 0xFF, 0xFF, 0x84, 0xC0, 0x8B, 0xF3, 0x0F, 0x84, 0x54, 0xF8,
+    0xFF, 0xFF, 0xE8, 0xE9, 0xD9, 0xFF, 0xFF, 0x6A, 0x00, 0x53, 0xE8, 0xF1, 0xBA, 0x01, 0x00, 0x83,
+    0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8B, 0x83, 0x6C, 0x01, 0x00, 0x00, 0x6A,
+    0x01, 0xE8, 0x2A, 0x85, 0x01, 0x00, 0x8B, 0xF8, 0x83, 0xC4, 0x04, 0x85, 0xFF, 0x75, 0x3F, 0x6A,
+    0x5D, 0x6A, 0x0B, 0x53, 0xE8, 0xB7, 0x73, 0x01, 0x00, 0xD9, 0xEE, 0x89, 0xBB, 0x0C, 0x10, 0x00,
+    0x00, 0xD9, 0x93, 0x10, 0x10, 0x00, 0x00, 0xD9, 0x93, 0x14, 0x10, 0x00, 0x00, 0x83, 0xC4, 0x0C,
+    0x8B, 0xC3, 0xD9, 0x9B, 0x18, 0x10, 0x00, 0x00, 0xE8, 0xD3, 0x5D, 0x59, 0x00, 0x57, 0x53, 0xE8,
+    0x9C, 0xBA, 0x01, 0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3, 0x8A, 0x83,
+    0x50, 0x01, 0x00, 0x00, 0xC0, 0xE8, 0x02, 0xF6, 0xD0, 0x24, 0x01, 0x8B, 0xF3, 0x88, 0x44, 0x24,
+    0x0F, 0xE8, 0x1A, 0xDF, 0xFF, 0xFF, 0xF6, 0x83, 0x50, 0x01, 0x00, 0x00, 0x04, 0x74, 0x4E, 0x80,
+    0xBB, 0x91, 0x05, 0x00, 0x00, 0x02, 0x74, 0x17, 0x8B, 0x87, 0x2C, 0x05, 0x00, 0x00, 0x50, 0x6A,
+    0x02, 0x8D, 0x47, 0x14, 0x53, 0x33, 0xD2, 0xE8, 0x14, 0xF1, 0x01, 0x00, 0x83, 0xC4, 0x0C, 0x80,
+    0x7C, 0x24, 0x0F, 0x00, 0x74, 0x4C, 0xD9, 0xEE, 0xC7, 0x83, 0x0C, 0x10, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xD9, 0x93, 0x10, 0x10, 0x00, 0x00, 0x8B, 0xC3, 0xD9, 0x93, 0x14, 0x10, 0x00, 0x00,
+    0xD9, 0x9B, 0x18, 0x10, 0x00, 0x00, 0xE8, 0x55, 0x5D, 0x59, 0x00, 0xEB, 0x25, 0x80, 0xBB, 0x91,
+    0x05, 0x00, 0x00, 0x02, 0x75, 0x07, 0x8B, 0xC3, 0xE8, 0x83, 0x91, 0x01, 0x00, 0x80, 0x7C, 0x24,
+    0x0F, 0x00, 0x75, 0x0E, 0x8B, 0x4F, 0x44, 0x53, 0x33, 0xD2, 0xE8, 0xF1, 0x30, 0x54, 0x00, 0x83,
+    0xC4, 0x04, 0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x00, 0x83, 0xC7, 0x14, 0x57, 0x8B, 0xCB, 0xE8, 0x6D,
+    0x40, 0x57, 0x00, 0x83, 0xC4, 0x10, 0x6A, 0x00, 0x53, 0xE8, 0xE2, 0xB9, 0x01, 0x00, 0x83, 0xC4,
+    0x08, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3,
+];
+const K0B_UP_BODY_CALLS: [usize; 120] = [0x54, 0xf8, 0x10a, 0x11f, 0x12c, 0x152, 0x169, 0x1f1, 0x217, 0x22d, 0x23c, 0x260, 0x289, 0x293, 0x29e, 0x2a6, 0x2b7, 0x2ca, 0x2dc, 0x2e5, 0x2f0, 0x302, 0x30c, 0x317, 0x326, 0x333, 0x375, 0x38a, 0x39b, 0x3a5, 0x3b0, 0x3d0, 0x3ef, 0x3f7, 0x408, 0x417, 0x422, 0x42d, 0x445, 0x487, 0x4e8, 0x4f8, 0x503, 0x50e, 0x515, 0x547, 0x54e, 0x587, 0x59d, 0x5a4, 0x5cb, 0x5ff, 0x60c, 0x61c, 0x62b, 0x634, 0x63c, 0x653, 0x698, 0x6c1, 0x6df, 0x6eb, 0x700, 0x70b, 0x71c, 0x72b, 0x738, 0x749, 0x763, 0x76b, 0x787, 0x792, 0x7a7, 0x7b2, 0x7c3, 0x7d6, 0x7ed, 0x839, 0x85b, 0x870, 0x87b, 0x88c, 0x896, 0x8a7, 0x8b6, 0x8c0, 0x8cf, 0x8df, 0x8f3, 0x902, 0x914, 0x920, 0x92f, 0x947, 0x962, 0x96d, 0x980, 0x9c4, 0x9cc, 0x9dd, 0x9e6, 0x9f1, 0xa12, 0xa30, 0xa42, 0xa55, 0xa63, 0xa72, 0xa7a, 0xa91, 0xaa4, 0xac8, 0xacf, 0xaf1, 0xb17, 0xb46, 0xb58, 0xb6a, 0xb7e, 0xb89];

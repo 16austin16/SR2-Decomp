@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::{HINSTANCE, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryA;
-use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
+use windows_sys::Win32::System::SystemServices::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
 
 #[cfg(feature = "caller-survey")]
 mod caller_targets;
@@ -22,6 +22,7 @@ mod caller_targets;
 mod callers;
 mod actions;
 mod controls;
+mod controls_layout;
 mod crash;
 mod detour;
 mod display;
@@ -86,6 +87,10 @@ pub fn log(msg: &str) {
 
 #[unsafe(no_mangle)]
 extern "system" fn DllMain(_module: HINSTANCE, reason: u32, _reserved: *mut c_void) -> i32 {
+    if reason == DLL_PROCESS_DETACH {
+        // The game is closing: write the mission log's open section.
+        missionlog::flush("game exit");
+    }
     if reason == DLL_PROCESS_ATTACH {
         let base = unsafe { GetModuleHandleA(std::ptr::null()) } as usize;
         log(&format!("sr2-hook attached, exe base {base:#x}"));

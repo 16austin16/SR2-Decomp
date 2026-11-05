@@ -136,6 +136,28 @@ fn write_section(s: &Section) {
     let _ = f.write_all(out.as_bytes());
 }
 
+/// Write the open section now (game crash or exit), so its samples are not lost. Stops sampling
+/// first; uses try_lock so a crash while the lock is held cannot deadlock.
+pub fn flush(reason: &str) {
+    if !ON.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    // Let the sampler finish a sample in progress (it checks ON every ~1 ms).
+    unsafe { Sleep(5) };
+    let mut s = match SECTION.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    if s.samples > 0 {
+        write_section(&s);
+        let _ = OpenOptions::new().create(true).append(true).open(LOG_FILE).and_then(|mut f| {
+            writeln!(f, "== logging stopped by {reason} | frame {}", FRAME.load(Ordering::Relaxed))
+        });
+        s.samples = 0;
+    }
+}
+
 pub fn set_on(on: bool) {
     let mut s = lock();
     if on {
