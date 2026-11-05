@@ -61,6 +61,7 @@ mod port_camanim;
 mod port_weather;
 mod port_bindings5;
 mod port_physics;
+mod port_render2;
 mod port_sim_humans;
 mod port_states;
 mod port_vehicles;
