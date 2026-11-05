@@ -9,10 +9,13 @@
 //! `sr2-mission.log` in the game folder:
 //!
 //! ```text
-//! == section 4 | mission 5 | game tss02 | point 2 | frames 1200-5400 | 4100 samples
+//! == section 4 | mission 5 | game tss02 | point 2 "boss fight starts" | frames 1200-5400 | 4100 samples
 //! g 00a3b950 12
 //! r 00d0a380 40
 //! ```
+//!
+//! The quoted label after the point number is optional (older logs have none): it is
+//! the text typed into the F8 box when the point was marked.
 //!
 //! The thread is suspended only for `GetThreadContext`; nothing allocates while it
 //! is (the game thread might hold the heap lock).
@@ -47,6 +50,7 @@ struct Section {
     mission: u32,
     game_mission: String,
     point: u32,
+    label: String,
     first_frame: u32,
     samples: u32,
     game: BTreeMap<u32, u32>,
@@ -60,6 +64,7 @@ impl Section {
             mission: 1,
             game_mission: String::new(),
             point: 0,
+            label: String::new(),
             first_frame: 0,
             samples: 0,
             game: BTreeMap::new(),
@@ -79,6 +84,10 @@ pub struct Status {
     pub point: u32,
     pub mission_label: String,
     pub samples_text: String,
+}
+
+pub fn frame() -> u32 {
+    FRAME.load(Ordering::Relaxed)
 }
 
 pub fn status() -> Status {
@@ -109,8 +118,9 @@ fn write_section(s: &Section) {
         return;
     };
     let game = if s.game_mission.is_empty() { "none" } else { &s.game_mission };
+    let label = if s.label.is_empty() { String::new() } else { format!(" \"{}\"", s.label) };
     let mut out = format!(
-        "== section {} | mission {} | game {game} | point {} | frames {}-{} | {} samples\n",
+        "== section {} | mission {} | game {game} | point {}{label} | frames {}-{} | {} samples\n",
         s.number,
         s.mission,
         s.point,
@@ -142,10 +152,13 @@ pub fn set_on(on: bool) {
     crate::log(&format!("missionlog: logging {}", if on { "on" } else { "off" }));
 }
 
-pub fn mark() {
+/// Start a new section for the next point, carrying `label` (quotes, `|` and control
+/// characters are dropped so the header stays one parseable line).
+pub fn mark_labeled(label: &str) {
     let mut s = lock();
     next_section(&mut s);
     s.point += 1;
+    s.label = label.chars().filter(|c| !c.is_control() && *c != '"' && *c != '|').collect();
 }
 
 pub fn pick_mission(d: i32) {
@@ -153,6 +166,7 @@ pub fn pick_mission(d: i32) {
     next_section(&mut s);
     s.mission = (s.mission as i32 + d).clamp(1, 99) as u32;
     s.point = 0;
+    s.label.clear();
 }
 
 fn read<T: Copy + Default>(addr: usize) -> Option<T> {
@@ -196,6 +210,7 @@ pub fn tick() {
     let mut s = lock();
     if name != s.game_mission {
         next_section(&mut s);
+        s.label.clear();
         if !name.is_empty() {
             s.point = 0;
         }

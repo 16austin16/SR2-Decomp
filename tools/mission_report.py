@@ -35,10 +35,18 @@ def owner(addr):
     return names[s]
 
 
+def pretty(head):
+    """Show the optional point label (`point 2 "text"`) as `point 2 [text]` up front."""
+    m = re.search(r'\| point (\d+) "([^"]*)"', head)
+    if not m:
+        return head  # old logs have no label
+    return head.replace(m[0], f"| point {m[1]}", 1) + f"   <-- [{m[2]}]"
+
+
 def report(head, counts):
     if not head:
         return
-    print(head)
+    print(pretty(head))
     for tag, label in (("g", "game thread"), ("r", "render thread")):
         c = Counter()
         for (t, addr), n in counts.items():

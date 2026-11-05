@@ -9,7 +9,9 @@
 //!   space the game stretches over the screen.
 //! - Player actions run on the game thread from `game_frame_tick` (`tick`).
 //!
-//! F8 marks a point in the mission log without opening the menu.
+//! F8 opens the label box: gameplay is frozen (the game's pause counter is raised, no pause
+//! menu), the player types a label, Enter marks a point in the mission log with it and
+//! Esc cancels. The F7 menu's "Mark point" item opens the same box.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,6 +74,106 @@ const WEATHERS: usize = 0x0252_6DD0; // -> 0xD8-byte records, +0 char *name
 const WEATHER_COUNT: usize = 0x0252_6DCC;
 const WEATHER_SET: usize = 0x004D_EC00; // EAX = index, CL = 1
 const WEATHER_FORCED: usize = 0x0252_6E14; // 0 = the normal weather cycle
+// The label box.
+/// The game's pause counter (> 0: `sim_frame` runs only its always-on parts and the player
+/// controls are skipped). The pause menu raises it through 0x699840 (which also pauses
+/// audio and the game clock); the box raises just the counter.
+const PAUSE_COUNT: usize = 0x0252_7C08;
+const KEY_ESC: usize = 0x01;
+const KEY_NUM_ENTER: usize = 0x9C;
+const KEY_LSHIFT: usize = 0x2A;
+const KEY_RSHIFT: usize = 0x36;
+const LABEL_MAX: usize = 60;
+/// Characters by scan code (US layout), 0 = prints nothing.
+const CHARS: &[u8; 58] = b"\0\01234567890-=\0\0qwertyuiop[]\0\0asdfghjkl;'`\0\\zxcvbnm,./\0\0\0 ";
+const CHARS_SHIFT: &[u8; 58] = b"\0\0!@#$%^&*()_+\0\0QWERTYUIOP{}\0\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0\0\0 ";
+
+struct LabelBox {
+    open: bool,
+    text: String,
+}
+
+static LABEL: Mutex<LabelBox> = Mutex::new(LabelBox { open: false, text: String::new() });
+/// We raised the pause counter and have not lowered it yet.
+static PAUSED_BY_BOX: AtomicBool = AtomicBool::new(false);
+/// Set when the label box closes; cleared once Esc and Enter are both up.
+static SWALLOW_KEYS: AtomicBool = AtomicBool::new(false);
+
+fn label_lock() -> std::sync::MutexGuard<'static, LabelBox> {
+    LABEL.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn down(scan: usize) -> bool {
+    unsafe { *((KEYS + scan * 12) as *const u8) != 0 }
+}
+
+fn open_label_box() {
+    let mut l = label_lock();
+    if l.open {
+        return;
+    }
+    l.open = true;
+    l.text.clear();
+    unsafe { *(PAUSE_COUNT as *mut i32) += 1 };
+    PAUSED_BY_BOX.store(true, Ordering::Relaxed);
+}
+
+/// Lower the counter we raised (only if it is still above zero: a level load may have reset it).
+fn release_pause() {
+    if PAUSED_BY_BOX.swap(false, Ordering::Relaxed) {
+        let c = PAUSE_COUNT as *mut i32;
+        unsafe {
+            if *c > 0 {
+                *c -= 1;
+            }
+        }
+    }
+}
+
+/// Handles the open box for one frame; true while it is open (nothing else reads keys).
+fn label_keys() -> bool {
+    // After the box closes, keep the game's input blocked until Esc / Enter are released: the game
+    // would otherwise see the still-held key as a fresh press (Esc opened its pause menu).
+    if SWALLOW_KEYS.load(Ordering::Relaxed) {
+        if down(KEY_ESC) || down(KEY_ENTER) || down(KEY_NUM_ENTER) {
+            block_game_input();
+            return true;
+        }
+        SWALLOW_KEYS.store(false, Ordering::Relaxed);
+    }
+    if !label_lock().open {
+        return false;
+    }
+    block_game_input();
+    let enter = pressed(KEY_ENTER) || pressed(KEY_NUM_ENTER);
+    let esc = pressed(KEY_ESC);
+    let mut l = label_lock();
+    if enter || esc {
+        let text = std::mem::take(&mut l.text);
+        l.open = false;
+        drop(l);
+        release_pause();
+        SWALLOW_KEYS.store(true, Ordering::Relaxed);
+        if enter {
+            missionlog::mark_labeled(text.trim());
+            let n = missionlog::status().point;
+            lock().status = format!("marked point {n}");
+        }
+        return true;
+    }
+    if pressed(KEY_BACK) {
+        l.text.pop();
+    }
+    let table = if down(KEY_LSHIFT) || down(KEY_RSHIFT) { CHARS_SHIFT } else { CHARS };
+    for scan in 2..table.len() {
+        let c = table[scan];
+        if c != 0 && pressed(scan) && l.text.len() < LABEL_MAX {
+            l.text.push(c as char);
+        }
+    }
+    true
+}
+
 /// Rows shown at once on long pages.
 const WINDOW: usize = 11;
 
@@ -195,9 +297,12 @@ pub fn input() {
 }
 
 fn keys() {
+    if label_keys() {
+        return;
+    }
     if pressed(KEY_MARK) {
-        missionlog::mark();
-        lock().status = format!("marked point {}", missionlog::status().point);
+        open_label_box();
+        return;
     }
     let mut s = lock();
     if pressed(KEY_MENU) {
@@ -287,10 +392,7 @@ fn keys() {
             0 if enter => missionlog::set_on(!missionlog::status().on),
             1 if left => missionlog::pick_mission(-1),
             1 if right || enter => missionlog::pick_mission(1),
-            2 if enter => {
-                missionlog::mark();
-                s.status = format!("marked point {}", missionlog::status().point);
-            }
+            2 if enter => open_label_box(),
             3 if enter => (s.page, s.cursor) = (Page::Main, 0),
             _ => {}
         },
@@ -587,6 +689,67 @@ fn font_height() -> f32 {
 /// thread after the list instead, its text came out black. The viewport and scissor
 /// go to the whole screen while the menu draws, then back.
 fn draw() {
+    draw_menu();
+    draw_label_box();
+}
+
+/// The label box: centred, over a dimmed screen, in the same 2D state as the menu.
+fn draw_label_box() {
+    let (typed, point) = {
+        let l = label_lock();
+        if !l.open {
+            return;
+        }
+        (l.text.clone(), missionlog::status().point + 1)
+    };
+    let (sw, sh) = unsafe { (rd(SCREEN_W) as i32, rd(SCREEN_H) as i32) };
+    if sw <= 0 || sh <= 0 {
+        return;
+    }
+    let (vw, vh) = virtual_size(sw, sh);
+    let u = vh / 480.0;
+    let ts = TEXT_SCALE * u;
+    let lh = font_height() * ts + 2.0 * u;
+    let pad = 8.0 * u;
+    let w = 400.0 * u;
+    let h = lh * 4.2 + pad * 2.0;
+    let x = (vw - w) * 0.5;
+    let y = (vh - h) * 0.5;
+    let r = |x: f32, y: f32, w: f32, h: f32| rect(x as i32, y as i32, w as i32, h as i32);
+    let ctx = crate::gfx_cmd::thread_context() as usize;
+    let saved: [i32; 10] = std::array::from_fn(|i| unsafe { rd(ctx + if i < 6 { 8 + i * 4 } else { 0x44 + (i - 6) * 4 }) } as i32);
+    let blink = (missionlog::frame() / 30) % 2 == 0;
+    unsafe {
+        call_regs(RESET_VIEWPORT, 0, 0, 0, 0, 0, &[]);
+        call_regs(SET_SCISSOR, 0, 0, 0, sw as u32, 0, &[0, sh as u32]);
+        let white = [1.0f32; 3];
+        call_regs(SET_TINT, 0, 0, 0, white.as_ptr() as u32, 0, &[]);
+        color(0, 0, 0, 110);
+        r(0.0, 0.0, vw, vh);
+        color(0, 0, 0, 225);
+        r(x, y, w, h);
+        color(60, 140, 255, 255);
+        r(x, y, w, 2.0 * u);
+        let tx = x + pad;
+        let mut ty = y + pad;
+        color(255, 255, 255, 255);
+        text(tx, ty, ts, &format!("Mission log point {point}"));
+        ty += lh * 1.4;
+        color(40, 40, 40, 255);
+        r(tx, ty - u, w - pad * 2.0, lh + 2.0 * u);
+        color(255, 255, 255, 255);
+        text(tx + 3.0 * u, ty, ts, &format!("{typed}{}", if blink { "_" } else { " " }));
+        ty += lh * 1.7;
+        color(150, 150, 150, 255);
+        text(tx, ty, ts * 0.8, "Enter = save, Esc = cancel");
+        color(255, 255, 255, 255);
+        let [x0, _x1, y0, _y1, vw, vh, l, rr, t, b] = saved;
+        call_regs(SET_VIEWPORT, 0, 0, 0, 0, y0 as u32, &[x0 as u32, vw as u32, vh as u32, 1]);
+        call_regs(SET_SCISSOR, 0, 0, 0, rr as u32, l as u32, &[t as u32, b as u32]);
+    }
+}
+
+fn draw_menu() {
     if !OPEN.load(Ordering::Acquire) {
         return;
     }
