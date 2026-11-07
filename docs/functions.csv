@@ -14357,3 +14357,191 @@ address,name,subsystem,status,notes
 0x00abd7c0,vehicle_world_point_to_local_clamped,unknown,named,"ECX = vehicle, EAX = world point vec3*, stack arg ret 4; saves ESI/EDI; subtracts vehicle position [+0x110..0x118], calls 0xBDE500 and 0xAF1ED0, uses point-box helper 0xBF65F0 with part bounds; callers vehicle_collision_damage_apply; inferred (57)"
 0x00a10110,nav_open_list_sift_down,unknown,named,"cdecl 1 stack arg (index) ret 4; binary heap over node pointers at 0x2E2E0C8 (count 0x2E2E0C4); cost = rec[+0]+rec[+4] of 0x18-byte record at 0x2E160C4 selected by node word +0x1E; picks the smaller child; inferred (57)"
 0x00da280c,crt_asin_acos_sqrt_1_minus_x2,unknown,named,"ST0 = x, plain ret; real function start containing the hot label 0xDA2845; fabs; sqrt((1-x)(1+x)) with ftst error path to 0xCB6FA6; 0xDA2845 is a label inside this CRT block (fstp/fldpi/fldz sign cases), not a function start; inferred (57)"
+0x004073d0,ai_order_k04_clear_action,ai,named,"EAX=human: [eax+0x1B0]=-1 then ai_order_set_action(human, 4, 0x3C); only k04 enter/update/on_event call it"
+0x0040b790,vec3_scale_in_place_eax,math,named,"EAX=&v, stack f32 s: v.x*=s, v.y*=s, v.z*=s (f32 stores); ret 4; hot (30 samples), 3 callers"
+0x0040b8d0,rng_chance_f32,math,named,"cdecl (p) -> AL: rng_float01(0xEC30F8) <= p (fcompp, test ah,1 clear); 17 callers (AI order updates)"
+0x0040ea60,vec3_length_sq_eax,math,named,EAX=&v -> ST0 = x^2+y^2+z^2 (f32 stored via [esp]); 52 callers in AI orders
+0x004171c0,damage_record_init,ai,named,"ESI=kind id, EDX=&pos (3 floats), ECX=&mat33 (9 floats), stack &record: fills a 0x6C-byte record (+0 id, +4 pos, +0x10 matrix, 1.0 at +0x50/+0x68, -1 at +0x3C, 0xFFFF at +0x48); 125 callers (AI orders, chunk_effects_update); role inferred"
+0x00421740,human_same_effective_leader,ai,named,"EAX=human a, stack human b -> AL: human_effective_leader(a) == human_effective_leader(b); 12 callers"
+0x0042cc50,cutscene_human_start_attack,cutscene,named,"shared by cutscene_action_attack and cutscene_action_fire_at: human_owned_locally, ai_order_k0d_payload_init, ai_order_set_action; object table 0x2149C64 lookups; inferred"
+0x0043f5f0,cutscene_begin_human_vehicle_prepare,cutscene,named,only cutscene_begin_callback: human_entering_or_exiting_vehicle / vehicle_from_handle / vehicle_interaction_rider_find / object_teleport_prepare; inferred
+0x00443b00,ai_human_data_boss_type_lookup,ai,named,"strings human_ai_data / boss_type; ai_order_net_read, k01 and k02 on_event; name inferred from the string / caller"
+0x004554c0,ai_order_k14_equip_and_set_action,ai,named,"ESI=human: inventory_equip_slot(&human+0x10C4, 1, 0) then ai_order_set_action(human, 0x14, 0x98); returns 1"
+0x00455530,ai_order_k14_can_use_firearm,ai,named,EAX=human -> AL: (+0xC8 & 0xC0000) == 0 and human_has_firearm
+0x00455550,ai_order_k14_set_action_9b,ai,named,"EAX=human: ai_order_set_action(human, 0x14, 0x9B)"
+0x00485c30,hkvector4_sub_store,havok,named,"ECX=&out, stack (&a, &b): out = a - b (subps); ret 8; hot (51 samples in the contact solver)"
+0x00485d30,hkvector4_add_in_place,havok,named,"ECX=&a, stack &b: a += b (addps), EAX=ECX on exit; ret 4"
+0x0048b1c0,store_discount_net_send,net,named,net_send_packet_to_remotes of the store discount state; called by store_discount_set_and_send
+0x00490fb0,radio_station_names_get,audio,named,strings RADIO_OFF / RADIO_POLICE / RADIO_FBI; ambient_audio_sequences_update; name inferred from the string / caller
+0x00494fe0,cs_camera_list_csc_path_resolve,cutscene,named,string .csc_pc; xtbl_load_cs_camera_list; name inferred from the string / caller
+0x00495240,camera_cutscene_mode_enter,camera,named,"no args: camera_blend_state_reset, zeroes/ones the camera blend block 0x25F624C..0x25F627C then tail-calls camera_mode_push with ECX=5; callers cutscene_begin_callback, cutscene_shot_start"
+0x0049d400,camera_restore_after_cutscene,camera,named,"called by cutscene_stop (and 19 others): camera_follow_set_target_context, camera_smooth_blend_begin, vehicle_from_handle, _ftol2_sse; 921 bytes; inferred"
+0x004a9740,chunk_object_by_id_eax,streamman,named,EAX=id -> EAX = 0xF7AAE8[id] (0 when id==0xFFFF or id>=0x866); 10 callers
+0x004ab370,zone_chunk_object_active,streamman,named,EAX=zone id: remap then 0xF7AAE8[id] exists and bit 0 of +0x1C clear -> AL
+0x004ab3a0,zone_chunk_object_loaded,streamman,named,EAX=zone id -> AL: zone_remap_word_by_id then 0xF7AAE8[id] != 0
+0x004b7fb0,cmd_parse_force_tod_lights_arg,debug,named,"parses the console argument of r_force_time_of_day_lights (""disabled"" / ""true"" / ""false"", __stricmp x7) into 0x2526CC3 / 0x2526CC4; only cmd_r_force_time_of_day_lights_print calls it"
+0x004b8e00,city_render_fading_assert_fail,render,named,string .\city\city_render_fading.cpp (assert path); city_view_batches_collect; name inferred from the string / caller
+0x004c74e0,sky_entry_by_index,world,named,"EAX=index -> EAX entry (0x84 bytes at 0x263AF58), 0 when index<0 or >= [0x2526D30]; sky_update"
+0x004d1270,screen_fade_set_alpha,ui,named,"66 callers incl. cutscene_action_fade_in, cutscene_do_frame, cutscene_play; _ftol2_sse and 0x4D1700; inferred"
+0x004d1510,cutscene_net_send_play,cutscene,named,only cutscene_play: net_send_packet_to_remotes; inferred
+0x004d21d0,world_lighting_params_init,world,named,"EAX=&params: id -1, defaults from constants 0xDD0794/0xE5C378/0xDD0550/0xDD0678, ones at +0x18/+0x1C, zeros elsewhere; only world_lighting_update calls it"
+0x004da560,fmodf_wrapper,crt,named,"cdecl (x, y) -> ST0 via x87 fprem helper 0xDA066A (_CIfmod); frame ebp, aligned"
+0x004fb4c0,hud_pushback_cancel_text_select,ui,named,"strings HUD_CANCEL_PUSHBACK / HUD_PRESS_BACK_CANCEL_TAGGING / _ACTIVITY / _STRONGHOLD; game_mode_diversion_frame, mission_fail_flow_do_frame; name inferred from the string / caller"
+0x00501e20,debug_city_plane_export_write_xml,debug,named,XML fragment with rotation and FPS tags; debug_city_plane_export_update; name inferred from the string / caller
+0x0050da10,cmd_play_effect_resolve_name,effects,named,string .effect; cmd_play_effect_delayed; name inferred from the string / caller
+0x0051f600,ui_bitmap_sheets_xtbl_load,ui,named,strings .xtbl / bitmap_sheets / tutorial; game_main_thread_proc; name inferred from the string / caller
+0x005459e0,chunk_find_by_level_number,streamman,named,string level%d: _sprintf + string_crc32 + world_chunk_find_id; called by the crib store navpoint test
+0x00548d70,crib_stash_tutorial_nag_check,progression,named,"string TUT_NAG_CRIB_STASH, cash_from_dollars, lstr_get; called by shops_do_frame"
+0x00549e10,ai_object_interaction_clear,ai,named,"resets the ai_object_interaction globals (0x1409280/0x1409274=0xFFFF/0xE9D9D4/D9DC/D9E0=-1, 0x1409268..78) and copies the position triple 0x252A6D0.. to 0x27973D0..; callers ai_object_interaction_start / update"
+0x00558be0,weapon_pickup_tutorial_check,weapon,named,"strings AR50_launcher / rpg_annihilator / satchel, string_crc32 and tutorial_trigger; called by cutscene_stop; inferred"
+0x0055a710,weapon_list_find_by_info,weapon,named,"ESI=info, EAX=&list head: walks the ring (next at +0xB4) for the entry whose [+0xC4]->+8 == ESI, else 0"
+0x0055a740,weapon_list_find_by_bc,weapon,named,"EDX=key, EAX=&list head: ring walk (next +0xB4) for the entry with +0xBC == key, else 0"
+0x0055c440,chop_shop_text_parse_record,data,named,"strings String / Texts / Text / Name / English / DisplayText / Duration with xtbl_get_float, lstr_get, string_crc32; called by xtbl_load_chop_shop_text"
+0x00565b30,pushback_phone_call_hud_text,ui,named,strings SYS_CELL_TEXTMSG / SYS_CELL_RING_1 / PUSHBACK_PHONE_CALL_HUD_TEXT; pushback_do_frame; name inferred from the string / caller
+0x005e7160,garage_upgrade_option_text,ui,named,strings Option %i / Offense / Defense / Speed Upgrade; garage_exit_tutorial; name inferred from the string / caller
+0x005fe460,chop_shop_view_list_setup,activities,named,"strings mission_chopshop / ""view Chop Shop list"" / CHOP_SHOP_VIEW_LIST / mission_car_a, effect_find_by_name, trigger_activate/deactivate; chop_shop_diversion_type::vf18"
+0x00625620,debug_temporary_hud_render,debug,named,strings TEMPORARY HUD: / Inside lines / Outside lines; render_frame; name inferred from the string / caller
+0x00680ff0,game_mode_racing_start_marker_lookup,activities,named,strings Racing / Name / $start; game_mode_racing_frame; name inferred from the string / caller
+0x006889c0,cutscene_bink_open_movie,cutscene,documented,"string bink_open_movie and ""%s: Bink movie '%s' failed.""; only cutscene_load_bink_movie calls it"
+0x00688ef0,video_path_build,app,named,strings ./videos/ and %s%s; video_frame; name inferred from the string / caller
+0x0068a5c0,game_clock_advance_to_hhmm,world,named,"ECX=time as hour*100+minute (hours >99 -> 100s digit): computes seconds from the current clock (0x140E72C hour, 0x140E72D minute) wrapping 24h and calls game_clock_advance(delta,1,0,1); cutscene_shotfn_time_of_day_set"
+0x0068dc80,intro_cutscene_start,cutscene,documented,string tssp-intro2: cutscene_play + cutscn_pkt_send_sub_5; only luafn_start_intro_cutscene calls it
+0x00696f50,settings_dat_write,save,named,"strings settings.dat and ""%s\%s"": file_open / file_write / file_close, _rand, profile_save; called by options_store_display"
+0x0069b0e0,pc_controller_disconnect_dialog,ui,named,strings PC_CTRL_DISCONNECT_TEXT / _TITLE; game_pause_do_frame; name inferred from the string / caller
+0x006a7f30,mission_current_kind,missions,named,"no args -> EAX kind (+0x3C) of the current mission record [0x27B3C60], -1 when none"
+0x006b69b0,tutorial_open_script_call,ui,named,string tutorial_open; tutorial_do_frame; name inferred from the string / caller
+0x006b6a40,tutorial_close_script_call,ui,named,"string tutorial_close (script_thread_create + resume); tutorial_do_frame, cutscene_begin_callback; name inferred from the string / caller"
+0x006bfac0,cutscene_hud_vignette_toggle,cutscene,named,strings vignette / safe_frame: vint_object_find_by_hash then vint_value_free; cutscene_begin_callback and cutscene_stop; inferred
+0x006c1770,cutscene_shot_effects_attach,cutscene,named,"986 bytes, cutscene_shot_start only: time_of_day_in_range, rig_bone_transform, effect_start, effect_stop_by_handle; inferred"
+0x006c1b50,cutscene_voice_play_prepared,cutscene,named,cutscene_shot_start: audio_voice_play_prepared + character_parse_cloth_bones; inferred
+0x006c1cb0,cutscene_audio_prepare,cutscene,named,audio_play_params_init + audio_prepare; inferred
+0x006c1ef0,cutscene_audio_stop,cutscene,named,audio_voice_stop on the cutscene voices; cutscene_shot_start / cutscene_stop
+0x006ca620,cutscene_voice_name_build,cutscene,named,"string ""player|%s_f"": builds the voice file name, audio_find_id_by_name; cutscene_action_play_voice / speak_voice"
+0x006ca7c0,cutscene_voice_play,cutscene,named,"path_basename, _strrchr, __strlwr, audio_play_params_init, audio_play; only cutscene_action_play_voice"
+0x006ca960,cutscene_anim_path_resolve,cutscene,named,"strings .anim / .anim_pc, path_change_extension; cutscene_action_animate / animate_car"
+0x006cd5f0,cutscene_anim_entries_register,cutscene,named,strings ANIMATE / ANIMATE CAR and cutscene_anim_register_basic; only cutscene_stop calls it
+0x006cfb00,cutscene_character_gender_from_name,cutscene,named,strings _female_ / _fem_ / _male_ / _mal_; cs_camera_list_parse_character; name inferred from the string / caller
+0x006d1440,cutscene_parse_character_tod_lights,cutscene,documented,strings TODs / Lights / LightsEnabled; called from cutscene_parse_characters
+0x006d2240,cutscene_parse_audio_entry,cutscene,named,"string ""player"", path_basename, path_strip_extension; cutscene_parse_audios"
+0x006d2770,cutscene_parse_chunks,cutscene,documented,strings Chunks / Enabled / Chunk1..3 / ChunkInt / Variant1..4 with xtbl_get_bool; called from cs_camera_list_parse_cutscene
+0x006d5340,cutscene_release_weapon_handles,cutscene,named,"string weapon_handle, smesh_table_release; only cutscene_stop"
+0x006d5950,cutscene_load_peg,cutscene,named,"strings .peg_pc / .g_peg_pc, path_change_extension, file_get_size, cutscene_temp_mempool_init; only cutscene_begin_callback"
+0x006d6ac0,cutscene_parse_emotions,cutscene,documented,string Emotion with xml_count_children and a vector constructor loop; cutscene_parse_characters
+0x006d6b50,cutscene_parse_audio_list,cutscene,documented,string Audio with xml_count_children; cutscene_parse_audios
+0x006d7100,cs_tween_name_to_type,cutscene,named,strings Linear / Soft Param / Hard Param / Accel; cs_shot_parse_tween_float; name inferred from the string / caller
+0x006d7230,cs_dof_tween_name_to_type,cutscene,named,strings Linear / Soft Param / Hard Param / Accel; cs_shot_parse_dof_tween; name inferred from the string / caller
+0x006de7e0,customization_table_find_index,progression,named,"ECX=kind, stack &key: index of the entry whose +4 equals *key in the table 0x145A4E4[kind] (0x34-byte entries, count 0x145A4D0[kind]), else -1"
+0x006e0b40,character_morph_load_pc,anim,named,strings .morph_pc / .g_morph_pc; character_load_body_morphs; name inferred from the string / caller
+0x006e0c30,character_morph_load_g_pc,anim,named,strings .morph_pc / .g_morph_pc (second variant); character_load_body_morphs; name inferred from the string / caller
+0x006ef270,anim_muzzle_flash_register,anim,named,string muzzle_flash; anim_pc_load_and_register; name inferred from the string / caller
+0x006ef730,action_id_flags2_test,human,named,"EAX=action id (-1 -> 0), ECX=mask -> AL: [0xE8EE98 + id*12] & mask != 0"
+0x006ef750,action_id_flags_test,human,named,"EAX=action id (-1 -> 0), ECX=mask -> AL: [0xE90E48 + id*12] & mask != 0"
+0x00701f90,physics_cast_result_copy,physics,named,"ECX=&dst, stack &src ret 4: copies a ray-cast result record (16 bytes via movaps then dwords up to +0x24); callers physics_raycast and Havok raycast helpers; role inferred"
+0x0071a0a0,hkvector4_madd_splat_x,havok,named,"ECX=&out, stack (&s, &v): out += splat(s.x) * v (shufps 0, mulps, addps); EAX=ECX on exit; ret 8"
+0x00729a60,hkvector4_dot4_store,havok,named,"ECX=&a, stack (&out, &b): out = splat(sum of the four lane products): mulps, then shufps 0x4E + addps, then shufps 0xB1 + addps; ret 8; 13 callers"
+0x0072a100,hkvector4_less_store,havok,named,"ECX=&a, stack (&out, &b): out = cmpltps(a, b) per lane (all ones where a < b), aligned frame, ret 8; 7 callers"
+0x0073c2f0,main_menu_attract_mode_script_call,ui,named,string main_menu_attract_mode; coop_load_old_text_text; name inferred from the string / caller
+0x0073c4a0,main_menu_force_to_menu_script_call,ui,named,string main_menu_force_to_menu; frontend_connection_lost_check; name inferred from the string / caller
+0x0073c7a0,main_menu_input_events_handle,ui,named,strings Main_menu_can_has_input / nav_down / nav_up / select; frontend_connection_lost_check; name inferred from the string / caller
+0x0073ee50,main_menu_can_has_input_query,ui,named,string Main_menu_can_has_input; frontend_connection_lost_check; name inferred from the string / caller
+0x00752110,dialog_box_close_script_call,ui,named,string dialog_box_close; dialog_box_do_frame; name inferred from the string / caller
+0x00752200,dialog_box_open_internal_script_call,ui,named,string dialog_box_open_internal; dialog_box_do_frame; name inferred from the string / caller
+0x00752d70,dialog_box_click_sound_play,ui,named,string SYS_MENU_CLICK_UD; dialog_box_do_frame; name inferred from the string / caller
+0x00753b80,dialog_box_close_script_call_2,ui,named,string dialog_box_close (second path); screen_fade_start; name inferred from the string / caller
+0x007540d0,dialog_pause_show_script_call,ui,named,strings pause_menu / dialog_pause_show; game_pause_do_frame; name inferred from the string / caller
+0x00754270,dialog_pause_hide_script_call,ui,named,string dialog_pause_hide; game_pause_do_frame; name inferred from the string / caller
+0x00773830,control_scheme_data_free,ui,named,frees the control scheme block [0x2528364] (0xC15720) and zeroes 0x2528360 / 0x1F7A948..0x1F7A95C; callers xtbl_load_control_scheme_text and pause menu luafns
+0x00793d60,hud_documents_close_all,vint,named,"46 callers incl. cutscene_begin_callback / do_frame / stop: strings safe_frame, mp_hud, mp_hud_lobby, hud_demo_derby, hud_btnmash, Hud_touch_combo; vint_document_destroy; inferred"
+0x00797cd0,human_ethnicity_name_to_id,human,named,strings white / hispanic / black / asian; human_update; name inferred from the string / caller
+0x0079d420,hud_msg_object_find,ui,named,string hud_msg; hud_msg_hide_region; name inferred from the string / caller
+0x007ec000,menu_base_document_open,vint,named,string menu_base; interface_screen_state_frame; name inferred from the string / caller
+0x007f4780,lstr_strings_file_load,ui,named,"string ""%s_%s.%s_strings"": file_open / file_read / file_close; only cutscene_begin_callback among the seeds; inferred"
+0x007f7830,mp_ui_peg_load,net,named,string ui_multiplayer.peg; mp_game_setup_state_frame; name inferred from the string / caller
+0x00804f20,object_net_record_from_handle,net,named,"ECX=handle -> EAX [obj+0xB0] of the live object (0x2149C64 slot check), 0 otherwise"
+0x00809be0,mp_login_status_text_logging_in,net,named,string SYSTEM_LOGGING_IN; mp_login_update; name inferred from the string / caller
+0x00809d10,mp_login_error_text_show,net,named,string SYSTEM_LOGIN_ERROR; net_do_frame; name inferred from the string / caller
+0x0081ec70,menu_warning_dialog_show,ui,named,string MENU_TITLE_WARNING; frontend_state_frame; name inferred from the string / caller
+0x0081edf0,menu_warning_dialog_show_2,ui,named,"string MENU_TITLE_WARNING (second variant); gameplay_do_frame, frontend_state_frame; name inferred from the string / caller"
+0x00830a40,coop_wait_text_show,ui,named,string COOP_WAIT; game_state_enter; name inferred from the string / caller
+0x008337d0,mp_setup_match_pools_create,net,named,strings setup_match_vpool / setup_match_pool; mp_game_setup_state_frame; name inferred from the string / caller
+0x00834960,mp_matchmaking_ui_state_update,net,named,strings no map yet / MULTI_MENU_QUICK_MATCH / sr2_matchmaking_current_state_data / MULTI_LOBBY_CUSTOM_SETTINGS; game_state_enter; name inferred from the string / caller
+0x008cbf50,gamespy_core_debug_log,gamespy,named,"format ""GAMESPY: %u] CORE: %s""; net_do_frame; name inferred from the string / caller"
+0x008cd260,gamespy_login_set_state_log,gamespy,named,"strings ""Cleared error."" / ""Set state to %u.""; mp_login_update; name inferred from the string / caller"
+0x0090b730,gamespy_motd_request,gamespy,named,URL http://motd.gamespy.com/motd/motd.asp with userid / productid / versionuniqueid; net_do_frame; name inferred from the string / caller
+0x009149a0,action_node_from_handle,ai,named,EDX=handle -> EAX record in the 0x6C-byte x 0x960 table at 0x2A4E508 (index = handle & 0xFFFF) when the record is live ([rec+0x30]->+4 nonzero and [rec+0x1C]==handle) else 0
+0x00915990,action_node_record_live,ai,named,EAX=record -> AL: [rec+0x30] nonzero and [[rec+0x30]+4] nonzero
+0x00916390,store_chains_parse_retail_sales,data,named,string RetailSales with string_crc32_lower; called by store_chains_parse
+0x00940600,spawn_nodes_gang_saints_lookup,ai,named,string Gang_Saints; spawn_nodes_service; name inferred from the string / caller
+0x00944c00,spawn_request_init,ai,named,"EAX=&req: zeroes the request, sets +3 = 1 and +0x10 = -1; callers ambient_ped_try_place and others"
+0x009491f0,parked_vehicles_gang_saints_lookup,ai,named,string Gang_Saints; parked_vehicles_spawn_update; name inferred from the string / caller
+0x00962f50,object_flag80_bit4_or_not_bit5,object,named,"EAX=object or 0 -> AL: 0 for null, else 1 unless (+0x80 bit 4 clear and bit 5 set); 52 callers"
+0x00963580,human_npc_field_1178_set,human,named,EAX=object -> AL: kind byte +0x3CC == 2 and [obj+0x1178] != 0
+0x009635d0,human_npc_flag_1170_bit7,human,named,EAX=object -> AL: kind +0x3CC == 2 and byte [+0x1170] & 0x80
+0x009636c0,human_is_non_ally_state7,human,named,"EDX=human -> AL: false for a player or player follower, else byte [+0x111C] == 7"
+0x00964560,human_flag_c8_stamp_set,human,named,"EAX=human, EDX=value: [+0xC8] = ([+0xC8] & ~0x800) | 0x400, stamps [+0xD68] with game time [0xE843AC] (same wrap), [+0xD6C]=EDX; 10 callers"
+0x009654b0,object_flag_c0_bit22_set,object,named,stack object -> AL: (obj+0xC0 & 0x400000) == 0x400000; 34 callers (AI orders)
+0x0096d880,human_action_flag_bit2,human,named,"stack human -> AL: action table 0xE90E44 (12-byte entries, flags at +4) bit 2 of human_rig_current_action; false when no action"
+0x0096d930,human_action_flag_bit4,human,named,stack human -> AL: bit 4 of the flags of the current rig action (table 0xE90E48)
+0x0096d990,human_action_flag_bit1,human,named,stack human -> AL: bit 1 of the flags of the current rig action (table 0xE90E48)
+0x0096da30,human_action_flag_bit7_or_552,human,named,"stack human -> AL: current action flag bit 7, or model word 0x552, or action 0x2ED"
+0x00971e10,human_rig_track_is_52a_or_52c,human,named,EAX=human -> AL: [[human+0x5E0]+0x164] (current rig action) is 0x52A or 0x52C
+0x0098e250,object_flag_c0_bit10_set,object,named,stack object -> AL: object non-null and bit 10 of [obj+0xC0]; 55 callers (AI orders)
+0x0098e880,human_is_follower,human,named,EAX=human -> AL: human non-null and human_effective_leader(human) != human; 13 callers
+0x00997d50,human_state591_is_5,human,named,stack object -> AL: object non-null and byte [+0x591] (human state) == 5; 7 callers incl. both multi_registration::remote_do_frame
+0x009da290,hud_zoom_in_out_text,ui,named,"strings ""Press %s and %s to zoom in and out."" / HUD_ZOOM_IN_AND_OUT; player_controls_do_frame, camera_follow_update; name inferred from the string / caller"
+0x009e7da0,component_logo_cmesh_load,streamman,named,strings component logo / .cmesh_pc / .peg_pc / .g_cmesh_pc; world_streaming_do_frame; name inferred from the string / caller
+0x009eda80,pcu_temp_morph_mesh_alloc,human,named,string temp_morph_mesh; pcu_worn_apply_part_visibility; name inferred from the string / caller
+0x009f0ba0,player_skin_blend_slots_publish,render,named,"walks the ring 0x217068c (next +0x1C): for each entry with +8 set, writes {+0x24 of its object, -1, -1, -1/3} into the per-thread render table ([[fs:2C]+0x58] + slot*16 + 0x254 / 0x304 by [obj+0x6C]+0x1C); render_frame and 0x9F0CD0; hot (88 samples); role inferred"
+0x00a0b600,nav_detour_hull_temp_mempool_init,nav,named,"string ""detour hull collection temporary mempool""; nav_detour_hulls_update; name inferred from the string / caller"
+0x00a27370,script_follower_special_name_resolve,script,named,strings #CLOSEST_ / PLAYER# / TEAM1# / TEAM2#; script_follower_get; name inferred from the string / caller
+0x00a58900,restricted_zone_hud_text,ui,named,strings RESTRICTED_ZONE_EXIT / RESTRICTED_ZONE_ENTER; restricted_zones_update; name inferred from the string / caller
+0x00a61bb0,cs_character_homies_lookup,cutscene,named,string homies; cs_camera_list_parse_character; name inferred from the string / caller
+0x00a65810,cellphone_answer_prompt,ui,named,"strings ""Press %s to answer cell"" / HUD_ANSWER_CELL; cellphone_do_frame; name inferred from the string / caller"
+0x00a8b440,render_list_entries_draw_all,render,named,"render_frame step: for each of the [0xF5BB6C] lists in 0xF6EC10 calls 0xA8D740 per 0x28-byte entry (count +0x144, array +0x148), then tail-calls gfx_invalidate_render_state_block; skipped when [0x2225B64] is 0; hot (347 samples); role inferred"
+0x00a96a70,vehicle_transform_store,vehicle,named,"EAX=vehicle, EDX=&pos (vec3), stack &mat33 (9 dwords) ret 4: copies matrix to +0xEC and pos to +0x110, and mirrors both into the 0x4C-byte slot (0x324F7C4 + [veh+0xA4]*0x4C, id 1..0x80) at +4 / +0x10; 8 callers"
+0x00aa6a50,vehicle_velocity_by_handle,vehicle,named,"EAX=handle, EDX=&out vec3: resolves a type 5 vehicle through 0x2149C64 and calls vehicle_get_velocity(out); else out = 0"
+0x00aa7420,vehicle_driver_get,vehicle,named,ECX=vehicle -> EAX occupant of the first seat (+0x8ABC) via vehicle_seat_occupant; 0 when sim state +0x84D8==1 and seat count +0x6CE8 is 0
+0x00aab2d0,object_flag80_bit4_or_not_bit5_nonnull,object,named,EAX=object (no null check) -> AL: same predicate as 0x962F50
+0x00aabc80,vehicle_flag_8f50_stamp_set,vehicle,named,"EAX=vehicle, EDX=value: [+0x8F50] = ([+0x8F50] & ~0x140) | 0x20, stamps [+0x8F78] with the game time [0xE843AC] (wrapping 0x94B62E00 when above 0x6B49D200), [+0x8F80]=EDX; 14 callers"
+0x00ab5190,vehicle_is_helicopter,vehicle,named,EAX=vehicle or 0 -> AL: info (+0x84E4) class +0x9C == 3; sibling of vehicle_is_heli_fighter
+0x00ab51b0,vehicle_class_is_1,vehicle,named,EAX=vehicle or 0 -> AL: info (+0x84E4) class +0x9C == 1
+0x00ab53c0,vehicle_class_id,vehicle,named,"EAX=vehicle -> EAX class [[veh+0x84E4]+0x9C], -1 when null"
+0x00ab6a50,vehicle_field_9060_set,vehicle,named,EAX=vehicle -> AL: [veh+0x9060] != 0
+0x00ae7ac0,vehicle_info_parse_air_control,vehicle,named,strings Air_Control / Max_Roll_Speed / Max_Roll_Accel / Max_Pitch_Speed; vehicle_info_parse_watercraft_defaults; name inferred from the string / caller
+0x00af12c0,vehicle_license_plate_setup,vehicle,named,"strings ""License Plates"" / license_plate; ring_list_notify_type7_nodes; name inferred from the string / caller"
+0x00b16980,vehicle_interaction_record_find,vehicle,named,"EDX=key: scans the 32 records (0xC84 bytes) at 0x31492B8 for [rec] == key, returns the record or 0 when absent; callers vehicle_interaction_query"
+0x00b1d190,road_path_node_list_free_all,road,named,EDI=list head: walks the circular list calling road_path_node_recycle on each node
+0x00b78150,water_reflection_plane_height_get,render,named,string Reflection_Plane_Height; render_frame; name inferred from the string / caller
+0x00bb8970,hkvector4_and_mask_table,havok,named,"ECX=&v, stack index: v &= mask 0xE538F0[index*16] (andps); ret 4"
+0x00bb8a10,hkvector4_equal_store,havok,named,"ECX=&a, stack (&out, &b): out = cmpeqps(b, a) per lane, aligned frame, ret 8; hot in the contact solver (37 samples)"
+0x00bdcd90,rng_state_fill_table,math,named,"EDI=rng state, ECX=flag (reseed when nonzero via 0xBDCC20): clears +0x9C4 and fills 0x800 dwords at +0x9C8 from 0xBDCC70; lightning_reset, game_init_systems"
+0x00bdcf90,rng_float_range,math,named,"cdecl (lo, hi) -> ST0 = lo + rng_float01(0xEC30F8) * (hi - lo); 32 callers (AI, effects)"
+0x00bde5e0,vec3_rotate_about_y_in_place,math,named,"ESI=&v, stack f32 angle (ret 4): cosf/sinf, rotates the x and z components in place; 23 callers"
+0x00bdea80,vec3_dist_sq_xz_regs,math,named,"ECX=&a, EAX=&b -> ST0 = dx^2+dz^2 (f32, x and z only); 36 callers, mostly ai_order_* (hot leaf, port candidate)"
+0x00bdeab0,vec3_dist_xz_regs,math,named,"ECX=&a, EAX=&b -> ST0 = sqrt(dx^2+dz^2) via sqrtf_wrapper; 6 callers"
+0x00be0010,vec3_sub_mul_mat33_in_place,math,named,"ECX=&v, EAX=&w, stack &mat33: v -= w then tail-calls mat33_mul_vec3_in_place"
+0x00be17c0,console_command_find_keyword,debug,named,"strings debug / help / ""Invalid keyword '%s'"" / ""Searching for command '%s'""; cmd_play_effect_delayed, debug_city_plane_export_update; name inferred from the string / caller"
+0x00be1b10,util_sprintf_scratch,util,named,"cdecl (fmt, ...): _vsprintf into the global scratch buffer 0x23460E0; 42 callers"
+0x00be1b50,console_arg_parse_number,debug,named,"strings ""Found float number! %f"" / int32 / hex; difficulty_set_message, object_teleport, lighting_ambient_debug_print; name inferred from the string / caller"
+0x00be2c60,mat33_copy_regs,math,named,"ECX=&src, EAX=&dst: copies 9 floats (f32 loads/stores); 57 callers"
+0x00be2d90,mat33_from_euler_angles,math,named,"three f32 angles on the stack (+ EAX=&out, ret 0x10): cosf/sinf of each, then 0xBE2CE0 composes; 45 callers (audio, camera)"
+0x00bf0ea0,f32_round_to_int,math,named,cdecl (x) -> EAX: (x >= 0 ? x+0.5 : x-0.5) truncated by _ftol2_sse (double 0.5 at 0xE5BF70); 15 callers
+0x00bf2c10,util_snprintf_regs,util,named,"EDI=buf, ESI=size, stack (fmt, ...) : __vsnprintf then NUL-terminates buf[size-1]; 95 callers"
+0x00bfb920,file_load_into_mempool_checked,file,named,"strings File ""%s"" does not exist / is 0 bytes / Mempool ""%s"" not large enough / Failed to read entire file; ovl_framerate::show; name inferred from the string / caller"
+0x00c0cd20,profile_node_get,debug,named,EDI=index: returns [0x252A56C]+4 base + index*0x118; calls the range-error helper 0xC9726B when index >= count
+0x00c14c40,util_snwprintf_regs,util,named,"EDI=wbuf, ESI=count, stack (fmt, ...): __vsnwprintf then NUL-terminates; 102 callers"
+0x00c4b260,hk_component_not_enabled_error,havok,named,"strings ""The following component is not enabled in Havok Prime:"" / Prime / CLIENT.Ph.volition-saintsrow; hkError_func calls; 9 callers; name inferred from the string / caller"
+0x00c95461,std_string_throw_too_long,crt,named,"string ""string too long"": builds std::logic_error and _CxxThrowException; 7 callers; name inferred from the string / caller"
+0x00c9da5f,crt_errno_ptr,crt,named,returns &ptd->terrno (ca36bc ptd + 8) or the static fallback 0xE80858 when no per-thread data; 236 callers
+0x00cdd410,script_call_unload_dynamic_globals,script,named,string _UnloadDynamicGlobals; vint_document_run_unload_script; name inferred from the string / caller
+0x00cddbd0,lua_stack_dump_print,lua,named,"strings ""--------------- Stack Dump %d"" / ""%s: line %d - file %s"" / ""local %s =""; script_thread_resume; name inferred from the string / caller"
+0x00ce0120,script_get_any_global_silent,script,named,"string _GetAnyGlobalSilent; vint_document_run_unload_script, interface_document_load, cutscene_play; name inferred from the string / caller"
+0x00ceb4a0,anim_slot_loaded,anim,named,EAX=index -> AL: index < [0x24E1864] and entry (32 bytes at 0x24F2F00) +0x1C != 0
+0x00ceb670,rig_table_get_root_and_flag,anim,named,"ECX=rig handle (slot = h mod 190 in the 0x5E8-byte table at 0x340D240), stack &out: out = [rec+4], AL = byte [rec+0x224]; 0 for negative or empty slot"
+0x00ceb6f0,rig_table_get_info_field4,anim,named,"ECX=rig handle (same table) -> EAX = [[rec+0x228]+4], 0 for negative or empty slot"
+0x00cf7760,world_mesh_record_set_instance_data,render,named,"EAX=record, ECX=u32 [+0x360], stack (u16 [+0x364], u32 [+0x584], u32 [+0x588], &src 0x80 dwords copied to +0x368) ret 0x10; then +0x568/+0x56C = -1 and +0x574/+0x578/+0x57C = 0; only world_mesh_submit_full calls it; hot (75 samples)"
+0x00d22930,view_clip_planes_sphere_outside,render,named,"EAX=count (when ECX==0 takes the thread state's list [state+0x15DC], count [state+0x1684]), ECX=planes (0x1C bytes each: normal at +4.., d at +0x10), stack (&center, f32 radius): AL=1 when any plane gives n.c + d > radius; 12 callers (glares, lights)"
+0x00d2b7d0,hkThreadMemory_deallocateChunk,havok,named,"ECX=hkThreadMemory, cdecl-like (ptr, size, mem class) ret 0xC: size <= 0x200 -> class byte table +0x104, <= 0x2000 -> table +0x308, pushes the block on the per-class free list (+0x38/+0x3C, limit +0x34) or calls the slow path 0xD2B390; larger -> allocator vtbl +0x10; null ptr ignored; 824 callers"
+0x00d2b850,hkThreadMemory_allocateChunk,havok,named,"ECX=hkThreadMemory, stack (size, mem class) ret 8: size <= 0x200 via class byte table +0x104, <= 0x2000 via table +0x308, pops the head of the per-class free list (+0x38/+0x3C) or falls to the slow path 0xD2B460; larger -> allocator vtbl +0xC; 299 callers (pairs with hkThreadMemory_deallocateChunk 0xD2B7D0)"
+0x00d91f70,script_heap_free_locked,lua,named,"ESI=block: unless flag 0x2527BF7 == 1 takes critical section 0x347ADE4, script_heap_free(EAX=block), leaves it; null ignored"
+0x00d93f20,hkrotation_from_quaternion_store,havok,named,"ECX=&out (3 rows of 16 bytes), stack &quaternion (SSE, aligned frame) ret 4: quaternion to rotation matrix rows with the constants 0xDC9C20 (1.0), 0xE57460 / 0xE57470 (sign masks); 37 callers (physics_body_set_transform, shape creation); hot (57 samples)"
