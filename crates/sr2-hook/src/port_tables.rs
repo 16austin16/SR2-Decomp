@@ -150,6 +150,15 @@ pub fn install() {
         if f.addr == 0x50d000 {
             continue; // xtbl_load_effects failed the native differential test
         }
+        if f.addr == 0x4c8b80 {
+            continue; // tod_light_sets_parse: lit the player solid red in the clothes store (play test 2026-11-07); to hand-port
+        }
+        if f.addr == 0x6bdc80 || f.addr == 0x6d16c0 {
+            continue; // cutscene_player_create / cutscene_parse_characters: cutscenes showed no characters (play test 2026-11-07); to hand-port
+        }
+        if crate::hooks::module_skipped(f.name) {
+            continue;
+        }
         entries += f.sites;
         if replace_pinned(f.name, f.addr, f.body, THUNKS[i] as usize) {
             ok += 1;
@@ -3653,7 +3662,7 @@ unsafe fn f3(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut esi
                     ecx = sp0.wrapping_add(0xffffff74u32);
                     wd((sp0.wrapping_add(0xffffff40u32)) as usize, 0x2eu32);
                     wd((sp0.wrapping_add(0xffffff3cu32)) as usize, ecx);
-                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xffffff3cu32)) as usize), rd((sp0.wrapping_add(0xffffff40u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xffffff3cu32)) as usize), rd((sp0.wrapping_add(0xffffff40u32)) as usize)]); ecx = 0xcdcdcdcd; ncalls += 1;
                     { let a = eax; let b = eax;  tr = a & b; zf = tr == 0; }
                     pc = if (!zf) { 0x47a047 } else { 0x47a02d };
                 }
@@ -4316,7 +4325,7 @@ unsafe fn f4(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut esi
                     eax = sp0.wrapping_add(0xffffff78u32);
                     wd((sp0.wrapping_add(0xffffff54u32)) as usize, 0x2eu32);
                     wd((sp0.wrapping_add(0xffffff50u32)) as usize, eax);
-                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xffffff50u32)) as usize), rd((sp0.wrapping_add(0xffffff54u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xffffff50u32)) as usize), rd((sp0.wrapping_add(0xffffff54u32)) as usize)]); ecx = 0xcdcdcdcd; ncalls += 1;
                     { let a = eax; let b = eax;  tr = a & b; zf = tr == 0; }
                     ecx = sp0.wrapping_add(0xffffff78u32);
                     pc = if (!zf) { 0x47aaa1 } else { 0x47aa8f };
@@ -5166,7 +5175,7 @@ unsafe fn f5(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut esi
                 }
                 0x48fe57 => {
                     edx = edi;
-                    eax = call_regs(0xc14df0usize, eax, ecx, edx, esi, edi, &[]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc14df0usize, eax, ecx, edx, esi, edi, &[]); ecx = 0xcdcdcdcd; ncalls += 1;
                     pc = 0x48fe5e;
                 }
                 0x48fe5e => {
@@ -9334,11 +9343,11 @@ unsafe fn f9(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut esi
                     eax = call_regs(0xc97089usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffdfcu32)) as usize), rd((sp0.wrapping_add(0xfffffe00u32)) as usize), rd((sp0.wrapping_add(0xfffffe04u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
                     ecx = sp0.wrapping_add(0xfffffec0u32);
                     eax = sp0.wrapping_add(0xfffffe94u32);
-                    eax = call_regs(0xc057d0usize, eax, ecx, edx, esi, edi, &[]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc057d0usize, eax, ecx, edx, esi, edi, &[]); ncalls += 1;
                     eax = sp0.wrapping_add(0xfffffe88u32);
                     wd((sp0.wrapping_add(0xfffffe10u32)) as usize, eax);
                     eax = sp0.wrapping_add(0xfffffeb4u32);
-                    eax = call_regs(0xbdde20usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffe10u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xbdde20usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffe10u32)) as usize)]); edx = 0xcdcdcdcd; ncalls += 1;
                     { let a = rd((sp0.wrapping_add(0xfffffe20u32)) as usize); let b = 0x0u32;  tr = a.wrapping_sub(b) & 0xffffffffu32; zf = tr == 0; }
                     ecx = rd((eax) as usize);
                     wd((ebx.wrapping_add(0x5cu32)) as usize, ecx);
@@ -12321,7 +12330,7 @@ unsafe fn f11(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                     unsafe { let a = (sp0.wrapping_add(0x8u32)) as u32; std::arch::asm!("fld dword ptr [{a}]", a = in(reg) a, options(nostack)); }
                     eax = ebp;
                     unsafe { let a = (sp0.wrapping_add(0xffffffd8u32)) as u32; std::arch::asm!("fstp dword ptr [{a}]", a = in(reg) a, options(nostack)); }
-                    eax = call_regs(0x40b790usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xffffffd8u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0x40b790usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xffffffd8u32)) as usize)]); ncalls += 1;
                     wd((sp0.wrapping_add(0xffffffd8u32)) as usize, edi);
                     esi = ebx.wrapping_add(0x224u32);
                     ecx = 0xddc200u32;
@@ -14400,7 +14409,7 @@ unsafe fn f14(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                     eax = sp0.wrapping_add(0xffffff34u32);
                     wd((sp0.wrapping_add(0xffffff00u32)) as usize, 0x2eu32);
                     wd((sp0.wrapping_add(0xfffffefcu32)) as usize, eax);
-                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffefcu32)) as usize), rd((sp0.wrapping_add(0xffffff00u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffefcu32)) as usize), rd((sp0.wrapping_add(0xffffff00u32)) as usize)]); ecx = 0xcdcdcdcd; ncalls += 1;
                     { let a = eax; let b = eax;  tr = a & b; zf = tr == 0; }
                     ecx = sp0.wrapping_add(0xffffff34u32);
                     pc = if (!zf) { 0x50d1be } else { 0x50d1a4 };
@@ -17814,7 +17823,7 @@ unsafe fn f18(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                     wd((sp0.wrapping_add(0xfffffc34u32)) as usize, edi);
                     wd((sp0.wrapping_add(0xfffffc30u32)) as usize, 0x2eu32);
                     wd((sp0.wrapping_add(0xfffffc2cu32)) as usize, 0xe99740u32);
-                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc2cu32)) as usize), rd((sp0.wrapping_add(0xfffffc30u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc2cu32)) as usize), rd((sp0.wrapping_add(0xfffffc30u32)) as usize)]); ecx = 0xcdcdcdcd; ncalls += 1;
                     { let a = eax; let b = eax;  tr = a & b; zf = tr == 0; }
                     pc = if (!zf) { 0x541f61 } else { 0x541f40 };
                 }
@@ -21065,7 +21074,7 @@ unsafe fn f20(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                 }
                 0x550fb0 => {
                     wd((sp0.wrapping_add(0xfffffdd0u32)) as usize, eax);
-                    eax = call_regs(0x80fcf0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffdd0u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0x80fcf0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffdd0u32)) as usize)]); ncalls += 1;
                     { let a = (eax & 0xffu32); let b = (eax & 0xffu32);  tr = a & b; zf = tr == 0; }
                     pc = if zf { 0x550fc6 } else { 0x550fba };
                 }
@@ -21127,7 +21136,7 @@ unsafe fn f20(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                 }
                 0x55101d => {
                     wd((sp0.wrapping_add(0xfffffdd0u32)) as usize, eax);
-                    eax = call_regs(0x80fcf0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffdd0u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0x80fcf0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffdd0u32)) as usize)]); ncalls += 1;
                     { let a = (eax & 0xffu32); let b = (eax & 0xffu32);  tr = a & b; zf = tr == 0; }
                     pc = if zf { 0x551033 } else { 0x551027 };
                 }
@@ -21222,7 +21231,7 @@ unsafe fn f20(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                 }
                 0x5510ca => {
                     wd((sp0.wrapping_add(0xfffffdd0u32)) as usize, eax);
-                    eax = call_regs(0x80fcf0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffdd0u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0x80fcf0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffdd0u32)) as usize)]); ncalls += 1;
                     { let a = (eax & 0xffu32); let b = (eax & 0xffu32);  tr = a & b; zf = tr == 0; }
                     pc = if zf { 0x5510e0 } else { 0x5510d4 };
                 }
@@ -21419,7 +21428,7 @@ unsafe fn f20(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                 }
                 0x55120d => {
                     wd((sp0.wrapping_add(0xfffffdd0u32)) as usize, eax);
-                    eax = call_regs(0x80fcf0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffdd0u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0x80fcf0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffdd0u32)) as usize)]); ncalls += 1;
                     { let a = (eax & 0xffu32); let b = (eax & 0xffu32);  tr = a & b; zf = tr == 0; }
                     pc = if zf { 0x551228 } else { 0x551217 };
                 }
@@ -46656,7 +46665,7 @@ unsafe fn f48(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                     eax = call_regs(0xca0bc0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffe30u32)) as usize), rd((sp0.wrapping_add(0xfffffe34u32)) as usize), rd((sp0.wrapping_add(0xfffffe38u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
                     wd((sp0.wrapping_add(0xfffffe38u32)) as usize, 0x2eu32);
                     wd((sp0.wrapping_add(0xfffffe34u32)) as usize, 0xe99740u32);
-                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffe34u32)) as usize), rd((sp0.wrapping_add(0xfffffe38u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffe34u32)) as usize), rd((sp0.wrapping_add(0xfffffe38u32)) as usize)]); ecx = 0xcdcdcdcd; ncalls += 1;
                     { let a = eax; let b = edi;  tr = a.wrapping_sub(b) & 0xffffffffu32; zf = tr == 0; }
                     pc = if (!zf) { 0x888951 } else { 0x888933 };
                 }
@@ -52802,7 +52811,7 @@ unsafe fn f53(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                     wd((sp0.wrapping_add(0xfffffc20u32)) as usize, 0x2eu32);
                     wd((sp0.wrapping_add(0xfffffc1cu32)) as usize, esi);
                     wd((sp0.wrapping_add(0xfffffc40u32)) as usize, eax);
-                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc1cu32)) as usize), rd((sp0.wrapping_add(0xfffffc20u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc1cu32)) as usize), rd((sp0.wrapping_add(0xfffffc20u32)) as usize)]); ecx = 0xcdcdcdcd; ncalls += 1;
                     { let a = eax; let b = ebx;  tr = a.wrapping_sub(b) & 0xffffffffu32; zf = tr == 0; }
                     pc = if (!zf) { 0xa834f4 } else { 0xa834da };
                 }
@@ -53154,7 +53163,7 @@ unsafe fn f53(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                     esi = rd((edx.wrapping_add(eax.wrapping_mul(0x4u32))) as usize);
                     wd((sp0.wrapping_add(0xfffffc20u32)) as usize, 0x2eu32);
                     wd((sp0.wrapping_add(0xfffffc1cu32)) as usize, esi);
-                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc1cu32)) as usize), rd((sp0.wrapping_add(0xfffffc20u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc1cu32)) as usize), rd((sp0.wrapping_add(0xfffffc20u32)) as usize)]); ecx = 0xcdcdcdcd; ncalls += 1;
                     { let a = eax; let b = ebx;  tr = a.wrapping_sub(b) & 0xffffffffu32; zf = tr == 0; }
                     pc = if (!zf) { 0xa838d1 } else { 0xa838b7 };
                 }
@@ -53262,7 +53271,7 @@ unsafe fn f53(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                     edx = sp0.wrapping_add(0xfffffebcu32);
                     wd((sp0.wrapping_add(0xfffffc20u32)) as usize, 0x2eu32);
                     wd((sp0.wrapping_add(0xfffffc1cu32)) as usize, edx);
-                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc1cu32)) as usize), rd((sp0.wrapping_add(0xfffffc20u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc9a9e0usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc1cu32)) as usize), rd((sp0.wrapping_add(0xfffffc20u32)) as usize)]); ecx = 0xcdcdcdcd; ncalls += 1;
                     { let a = eax; let b = ebx;  tr = a.wrapping_sub(b) & 0xffffffffu32; zf = tr == 0; }
                     pc = if (!zf) { 0xa83a18 } else { 0xa839fc };
                 }
@@ -58879,6 +58888,11 @@ mod tests {
     /// stack-argument count or register then makes the callee read garbage and the two sides diverge (the stubs only
     /// compare the words the table says are arguments, which hid the anim_list_load 0xa7ca70 bug).
     static REAL: [u32; 27] = [0x479a50, 0x47afb0, 0x4c2ab0, 0x53d650, 0x667230, 0x6a76d0, 0x6abce0, 0x6de7e0, 0x747930, 0x7a19c0, 0x7a4dc0, 0x7b12b0, 0x7c5270, 0x80fcf0, 0x88a780, 0x9b78a0, 0x9d7bd0, 0x9f2b90, 0x9f5560, 0xa7ca70, 0xae3ee0, 0xbdca30, 0xbdcf50, 0xc14df0, 0xc990f0, 0xc9acca, 0xc9b490];
+    /// Per callee: bit 0 = leaves ECX unchanged on return, bit 1 = leaves EDX unchanged, bit 2 = reads ECX on entry,
+    /// bit 3 = reads EDX on entry (own body only, nested calls not followed; from the callee's disassembly, scratchpad/tables4/pres.py). A preserving stub keeps the
+    /// register; a clobbering stub sets it to a value that differs between the original side and the Rust side, and the
+    /// logged ECX / EDX are only compared when the callee reads them.
+    static CFLAGS: [(u32, u8); 225] = [(0x402450, 0), (0x40b790, 3), (0x46eb50, 0), (0x479a50, 8), (0x47afb0, 8), (0x47bae0, 0), (0x481d20, 0), (0x487a10, 0), (0x488390, 0), (0x488640, 0), (0x48ad30, 0), (0x48f780, 0), (0x48f7d0, 0), (0x4908f0, 0), (0x491950, 0), (0x4a5f60, 0), (0x4a6430, 0), (0x4a6570, 0), (0x4a6f50, 0), (0x4a9840, 4), (0x4a9a60, 0), (0x4b0e50, 0), (0x4b19f0, 0), (0x4c2ab0, 4), (0x4c6650, 0), (0x4c8b30, 0), (0x4e4c00, 0), (0x4e4cf0, 0), (0x4e51a0, 0), (0x4e8bf0, 0), (0x4e9240, 0), (0x4ea3d0, 4), (0x50db60, 0), (0x531700, 0), (0x53c500, 0), (0x53d650, 4), (0x53ddd0, 0), (0x53f700, 4), (0x577f40, 4), (0x602a50, 4), (0x61efe0, 0), (0x65e640, 0), (0x65ef70, 4), (0x666b00, 0), (0x6671b0, 0), (0x667230, 0), (0x672390, 0), (0x6728f0, 0), (0x680220, 4), (0x6a66c0, 0), (0x6a76d0, 4), (0x6a7ed0, 0), (0x6abce0, 0), (0x6bcd20, 0), (0x6c39d0, 0), (0x6d0c00, 0), (0x6d0fe0, 0), (0x6d1190, 0), (0x6d1440, 0), (0x6d69d0, 0), (0x6d6a30, 0), (0x6d6ac0, 0), (0x6de7e0, 4), (0x6deca0, 4), (0x6e4f10, 0), (0x6e93a0, 0), (0x6ef510, 0), (0x6ef580, 0), (0x6fc9e0, 4), (0x738300, 0), (0x743650, 0), (0x7438d0, 0), (0x744290, 0), (0x744e20, 0), (0x747040, 0), (0x747930, 0), (0x77b580, 12), (0x77c2f0, 0), (0x781850, 0), (0x7a19c0, 0), (0x7a4dc0, 0), (0x7a55a0, 0), (0x7b12b0, 0), (0x7c1b80, 0), (0x7c1c00, 0), (0x7c5270, 0), (0x7f49e0, 0), (0x7f4ad0, 0), (0x7f4bc0, 4), (0x80fcf0, 3), (0x814670, 0), (0x887110, 0), (0x88a5b0, 0), (0x88a690, 0), (0x88a780, 4), (0x88a9d0, 0), (0x88aab0, 0), (0x88aea0, 0), (0x88afc0, 0), (0x8a4060, 0), (0x916390, 0), (0x931060, 0), (0x931140, 12), (0x944120, 4), (0x94e820, 0), (0x95ea00, 4), (0x960da0, 0), (0x98f460, 0), (0x9b78a0, 0), (0x9b79d0, 0), (0x9d7bd0, 0), (0x9de310, 4), (0x9e74f0, 0), (0x9f2b90, 4), (0x9f5560, 4), (0xa57080, 4), (0xa5b6e0, 0), (0xa5eb50, 0), (0xa5ed70, 4), (0xa5fe20, 0), (0xa618a0, 0), (0xa637a0, 12), (0xa63bb0, 0), (0xa6b910, 4), (0xa6bce0, 0), (0xa6bd60, 0), (0xa6c870, 0), (0xa757f0, 0), (0xa7ca70, 0), (0xa81670, 0), (0xa81f80, 0), (0xa821d0, 4), (0xa8a3f0, 0), (0xa949f0, 0), (0xa94db0, 0), (0xac4190, 0), (0xac7420, 0), (0xaca190, 0), (0xae3ee0, 4), (0xae4090, 0), (0xae5f20, 0), (0xae60f0, 4), (0xae6510, 0), (0xae75a0, 0), (0xae7780, 0), (0xae7840, 0), (0xae7ac0, 0), (0xb716e0, 0), (0xb74260, 0), (0xb743f0, 4), (0xb744f0, 0), (0xb745a0, 4), (0xb745c0, 4), (0xb747d0, 4), (0xb74860, 4), (0xb74910, 4), (0xb74990, 4), (0xb74c90, 4), (0xb74ef0, 4), (0xb74f60, 4), (0xb75050, 4), (0xb750d0, 4), (0xb75350, 0), (0xb75430, 0), (0xb75500, 0), (0xb75580, 0), (0xb755d0, 0), (0xb756b0, 0), (0xb75710, 4), (0xb75730, 4), (0xb758f0, 4), (0xb89f80, 4), (0xbd7730, 0), (0xbdc630, 0), (0xbdca30, 8), (0xbdcb30, 4), (0xbdcf50, 4), (0xbdde20, 5), (0xbf2860, 0), (0xbf28d0, 0), (0xbf2c10, 0), (0xbf8640, 0), (0xbf8890, 0), (0xbfbee0, 0), (0xbfc110, 0), (0xbfc870, 4), (0xbfca60, 4), (0xbfd880, 0), (0xbfdc20, 4), (0xbfdf30, 0), (0xbfe170, 0), (0xbff700, 0), (0xbff890, 0), (0xbff8e0, 0), (0xbff930, 4), (0xc00db0, 4), (0xc057d0, 7), (0xc06ee0, 0), (0xc07160, 0), (0xc071f0, 0), (0xc07a80, 4), (0xc07cc0, 0), (0xc093a0, 0), (0xc0ad80, 4), (0xc0b8e0, 0), (0xc14df0, 10), (0xc15d60, 4), (0xc1da80, 4), (0xc9604f, 4), (0xc96490, 0), (0xc968f6, 0), (0xc97089, 0), (0xc985a0, 0), (0xc986c0, 0), (0xc99030, 0), (0xc990f0, 0), (0xc9a45a, 0), (0xc9a917, 0), (0xc9a9e0, 2), (0xc9acca, 0), (0xc9b490, 0), (0xca0850, 0), (0xca0bc0, 0), (0xd59390, 0), (0xda0140, 0)];
     /// bytes each function's `ret` pops
     static FN_RETN: [u32; 58] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 4, 8, 8, 8, 8, 4, 4, 0, 12, 8, 12, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0];
 
@@ -58990,6 +59004,13 @@ mod tests {
                 // EBX / EBP inside call_regs are its own; the callee-saved pair is not compared
                 ev[1 + k] = if k == 3 || k == 6 { 0 } else { norm(*r, e) };
             }
+            let fl = CFLAGS.iter().find(|c| c.0 == target).map(|c| c.1).unwrap_or(0b1100);
+            if fl & 4 == 0 {
+                ev[2] = 0;
+            }
+            if fl & 8 == 0 {
+                ev[3] = 0;
+            }
             let esp = ctx.Esp;
             for k in 0..(nargs.min(12) as usize) {
                 ev[8 + k] = norm(rd(esp as usize + 4 + 4 * k), e);
@@ -59019,8 +59040,15 @@ mod tests {
                 *(target as *mut u8) = 0xCC;
             }
             ctx.Eax = r;
-            ctx.Ecx = POISON;
-            ctx.Edx = POISON;
+            // a clobbering callee leaves a value that differs between the two sides (the lifted code writes its own
+            // 0xcdcdcdcd): a lifted function that reads a register the callee clobbers then shows up as a mismatch
+            let junk = if st.mode == 0 { 0x0a0a_0a0a } else { 0x0b0b_0b0b } ^ st.hits.wrapping_mul(0x0101_0101);
+            if fl & 1 == 0 {
+                ctx.Ecx = junk;
+            }
+            if fl & 2 == 0 {
+                ctx.Edx = junk ^ 0x1111_1111;
+            }
             ctx.Eip = rd(esp as usize);
             ctx.Esp = esp.wrapping_add(4 + retn);
         }

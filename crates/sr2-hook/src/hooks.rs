@@ -49,7 +49,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if (n > 3600 && n.is_multiple_of(900)) || n == 900 || n == 1800 {
         log(&crate::actions::summary());
         log(&crate::lua_bindings::summary());
-        for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary(), crate::port_sim_leaves::summary(), crate::port_weapons_audio::summary(), crate::port_human_states::summary(), crate::port_ai::summary(), crate::port_render_func::summary(), crate::port_effects::summary(), crate::port_nav::summary(), crate::port_net::summary(), crate::port_leaves::summary(), crate::port_leaves_fp::summary(), crate::port_registrars::summary(), crate::port_big::summary(), crate::port_bindings3::summary(), crate::port_tables::summary(), crate::port_frame2::summary(), crate::port_vint2::summary(), crate::port_bindings4::summary(), crate::port_activities::summary(), crate::port_activities2::summary(), crate::port_cutscene::summary(), crate::port_camanim::summary(), crate::port_weather::summary(), crate::port_bindings5::summary(), crate::port_physics::summary(), crate::port_render2::summary(), crate::port_shops::summary()] {
+        for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary(), crate::port_sim_leaves::summary(), crate::port_weapons_audio::summary(), crate::port_human_states::summary(), crate::port_ai::summary(), crate::port_render_func::summary(), crate::port_effects::summary(), crate::port_nav::summary(), crate::port_net::summary(), crate::port_leaves::summary(), crate::port_leaves_fp::summary(), crate::port_registrars::summary(), crate::port_big::summary(), crate::port_bindings3::summary(), crate::port_tables::summary(), crate::port_frame2::summary(), crate::port_vint2::summary(), crate::port_bindings4::summary(), crate::port_activities::summary(), crate::port_activities2::summary(), crate::port_cutscene::summary(), crate::port_camanim::summary(), crate::port_weather::summary(), crate::port_bindings5::summary(), crate::port_physics::summary(), crate::port_render2::summary(), crate::port_shops::summary(), crate::port_hot57a::summary(), crate::port_hot57b::summary(), crate::port_render3::summary(), crate::port_frame3::summary(), crate::port_weather2::summary(), crate::port_cutscene2::summary()] {
             if !s.is_empty() {
                 log(&s);
             }
@@ -2167,19 +2167,25 @@ pub fn install_all() {
         crate::port_registrars::install();
         crate::port_big::install();
         crate::port_bindings3::install();
-        // crate::port_tables::install(); // held back: lifted code poisons ECX/EDX after calls the original relies on (clothes store crash, 2026-11-04)
-        crate::port_frame2::install();
+        if !module_skipped("port_tables") { crate::port_tables::install(); } // re-enabled 2026-11-04: ECX/EDX now kept across preserving callees (clothes store crash fix); needs a play test
+        if !module_skipped("port_frame2") { crate::port_frame2::install(); }
         crate::port_vint2::install();
         crate::port_bindings4::install();
         crate::port_activities::install();
         crate::port_activities2::install();
-        crate::port_cutscene::install();
+        if !module_skipped("port_cutscene") { crate::port_cutscene::install(); }
         crate::port_camanim::install();
         crate::port_weather::install();
         crate::port_bindings5::install();
         crate::port_physics::install();
         crate::port_render2::install();
-        crate::port_shops::install();
+        if !module_skipped("port_shops") { crate::port_shops::install(); }
+        if !module_skipped("port_hot57a") { crate::port_hot57a::install(); }
+        if !module_skipped("port_hot57b") { crate::port_hot57b::install(); }
+        if !module_skipped("port_render3") { crate::port_render3::install(); }
+        if !module_skipped("port_frame3") { crate::port_frame3::install(); }
+        if !module_skipped("port_weather2") { crate::port_weather2::install(); }
+        if !module_skipped("port_cutscene2") { crate::port_cutscene2::install(); }
         log(&crate::portlib::installed_list());
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
@@ -2358,5 +2364,20 @@ pub fn install_early() {
             log(&format!("hooked file_read @ 0xbfe170 ({which}), calls in sr2-fileread.log"));
         }
         Err(e) => log(&format!("hook file_read failed: {e:?}")),
+    }
+}
+
+/// Modules named (one per line) in sr2-skip-modules.txt in the game folder are not installed.
+/// Used to bisect a play-test problem without rebuilding.
+pub(crate) fn module_skipped(name: &str) -> bool {
+    match std::fs::read_to_string("sr2-skip-modules.txt") {
+        Ok(t) => {
+            let hit = t.lines().any(|l| l.trim() == name);
+            if hit {
+                log(&format!("{name}: skipped (listed in sr2-skip-modules.txt)"));
+            }
+            hit
+        }
+        Err(_) => false,
     }
 }

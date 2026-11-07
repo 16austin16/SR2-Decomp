@@ -2296,8 +2296,8 @@ fn enter_setact(id: usize, r: &mut Pushad, args: *const u32, kind: u32, act: u32
     let p = *r;
     unsafe {
         let h = *args;
-        let plan = vec![gcall(G_SETACT, p.eax, p.ecx, p.edx, p.esi, p.edi, &[h, kind, act])];
-        // ai_order_set_action(human, kind, action) cdecl with EAX = the caller's.
+        let plan = vec![gcall(G_SETACT, h, p.ecx, p.edx, p.esi, p.edi, &[h, kind, act])];
+        // ai_order_set_action(human, kind, action) cdecl; the enter loads EAX = the human (mov eax,[esp+4]) before the call.
         if let Some(e) = seq_port(id, &p, args, 1, &[], &|| {}, plan, &|| {}, None) {
             r.eax = e;
         }
@@ -7208,6 +7208,10 @@ unsafe fn replay_core(idx: u32, f: &mut Pushad, args: *const u32) -> f64 {
             }
         }
         if rec.c != idx as usize {
+            if s.bad.is_empty() {
+                let d = first_diff(pos, idx as usize, f, args, rec);
+                s.bad.push(d);
+            }
             s.bad.extend(bad);
             return 0.0;
         }
@@ -7285,9 +7289,31 @@ unsafe fn replay_core(idx: u32, f: &mut Pushad, args: *const u32) -> f64 {
             XMM_CELL.store(rec.out.xmm, Ordering::Relaxed);
         }
         let st0 = rec.out.st0;
+        if !bad.is_empty() && s.bad.is_empty() {
+            let d = first_diff(pos, idx as usize, f, args, rec);
+            s.bad.push(d);
+        }
         s.bad.extend(bad);
         st0
     })
+}
+
+/// The first differing call in full: the target, both sides' registers (eax ecx edx esi edi) and stack arguments.
+fn first_diff(pos: usize, idx: usize, f: &Pushad, args: *const u32, rec: &Rec) -> String {
+    let cl = &CALLEES[idx];
+    let rc = &CALLEES[rec.c];
+    let oa: Vec<u32> = (0..cl.nargs).map(|i| unsafe { *args.add(i) }).collect();
+    format!(
+        "first difference at call #{pos}: original calls {} @ {:#x} regs {:x?} args {:x?}; Rust calls {} @ {:#x} regs {:x?} args {:x?}",
+        cl.name,
+        cl.addr,
+        [f.eax, f.ecx, f.edx, f.esi, f.edi],
+        oa,
+        rc.name,
+        rc.addr,
+        rec.inr,
+        rec.args
+    )
 }
 
 extern "C" fn dc_replay(idx: u32, f: &mut Pushad, args: *const u32) {
@@ -10114,12 +10140,20 @@ unsafe fn k0b_67(k: &mut K, h: u32, fb: usize) {
     }
 }
 
+/// The whole human. The update itself writes only the move counter (+0x478), the flags (+0x150) and 4 words at +0x100C,
+/// but its callees (ai_order_set_action and others) write the sub-action, kind and flags (+0x148, +0x149, +0x140, ...)
+/// that the update reads again. The shadow runs Rust first with the real callees and then replays the original over the
+/// state they left, so the callees' writes must be undone before the replay and re-applied call by call: every byte the
+/// update reads has to be in the watch (0x11C7 is the last byte it touches).
+fn k0b_watch(h: u32) -> Vec<(usize, usize)> {
+    if h == 0 { Vec::new() } else { vec![(h as usize, 0x11C8)] }
+}
+
 extern "C" fn k0b_up_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     unsafe {
         let h = *args;
-        // what the update itself writes of the human: the move counter (+0x478), the flags (+0x150), the 4 words at +0x100C
-        let watch = [(h as usize + 0x478, 1), (h as usize + 0x150, 1), (h as usize + 0x100C, 16)];
+        let watch = k0b_watch(h);
         dc_port(DP_K0B_UP, &p, args, 1, &watch, false, || k0b_up_body(&p, h));
     }
 }
@@ -10163,10 +10197,6 @@ fn install_dc() -> (usize, usize) {
     ];
     let mut ok = 0;
     for &(id, body, calls, thunk) in &list {
-        // k0b update: 26 shadow mismatches in 3000 calls in the 2026-11-04 play test; held back.
-        if id == DP_K0B_UP {
-            continue;
-        }
         let port = &DCPORTS[id];
         match unsafe { detour::relocate(port.addr, body, calls) } {
             Ok(copy) => {
@@ -11321,7 +11351,7 @@ mod dc_difftest {
                         why.push(format!("st0 {} expected {}", b.st0, want.st0));
                     }
                     // the generated callee rewrote its in/out buffers after the input was recorded: the input compare is not meaningful here
-                    let st: Vec<String> = DCS.with(|s| s.borrow().bad.iter().filter(|m| !m.contains(" pointer ")).cloned().collect());
+                    let st: Vec<String> = DCS.with(|s| s.borrow().bad.iter().filter(|m| !m.contains(" pointer ") && !m.starts_with("first difference")).cloned().collect());
                     if !st.is_empty() {
                         why.push(format!("replay said {st:?}"));
                     }
@@ -11430,6 +11460,24 @@ mod dc_difftest {
                         C_AA7380 | C_AA7460 | C_AA7500 => Some(if grng.chance(40) { 0 } else { xp }),
                         _ => None,
                     };
+                    // The real callees write the human outside the four fields the update itself writes: ai_order_set_action
+                    // sets the order's sub-action (+0x148) and kind (+0x149), others change the flags the update reads next.
+                    // Without these side effects the offline run cannot tell a port from a shadow that reads the post-state.
+                    if c == C_4375B0 {
+                        wb(hp as usize + 0x148, args[2] as u8);
+                        wb(hp as usize + 0x149, args[1] as u8);
+                    }
+                    if c == C_41E160 {
+                        // it sets or clears flag bit 2 (+0x150), which the 0x66 state reads again right after
+                        let f = rb(hp as usize + 0x150);
+                        wb(hp as usize + 0x150, if grng.chance(50) { f | 4 } else { f & !4 });
+                    }
+                    if grng.chance(4) {
+                        wb(hp as usize + 0x148, 0x5D + grng.below(11) as u8);
+                        wb(hp as usize + 0x140, grng.u32() as u8);
+                        wb(hp as usize + 0x591, grng.below(3) as u8);
+                        wb(hp as usize + 0x11C6, grng.chance(10) as u8);
+                    }
                     let mut out = gen_default(&mut grng, c, r, args, eax);
                     if matches!(c, C_BDEA30 | C_BDEA80 | C_BDEA30L | C_BDEA80L | C_421BC0) {
                         out.st0 = dist(&mut grng);
@@ -11441,7 +11489,7 @@ mod dc_difftest {
                     unsafe { std::env::set_var("DC_TRACE", "1") };
                     eprintln!("h: state {:#x} +591 {} +478 {} +150 {:#x}", rb(h + 0x148), rb(h + 0x591), rb(h + 0x478), rb(h + 0x150));
                 }
-                let why = shadow(DP_K0B_UP, &p, &[hp], &[(h + 0x478, 1), (h + 0x150, 1), (h + 0x100C, 16)], || k0b_up_body(&p, hp));
+                let why = shadow(DP_K0B_UP, &p, &[hp], &k0b_watch(hp), || k0b_up_body(&p, hp));
                 unsafe { std::env::remove_var("DC_TRACE") };
                 if !why.is_empty() {
                     bad += 1;

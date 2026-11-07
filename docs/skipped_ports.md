@@ -8,29 +8,30 @@ ported.
 
 | Function(s) | Where | What happened | What it needs |
 |---|---|---|---|
-| ai_order_k0b_update 0x41F750 | port_ai (ported, not installed) | 26 shadow mismatches in 3000 calls in the 2026-11-04 play test | find the mismatching path |
+| tod_light_sets_parse 0x4C8B80 | port_tables (lifted, excluded) | lit the player solid red in the clothes store (2026-11-07) | hand port |
+| cutscene_player_create 0x6BDC80, cutscene_parse_characters 0x6D16C0 | port_tables (lifted, excluded) | cutscenes played with no characters (2026-11-07) | hand port |
 
 ## Failed or not covered by their test
 
 | Function(s) | Where | Reason |
 |---|---|---|
 | camera_follow_update 0x49B4B0, camera_update 0x4932F0, 0x49F320; cam_498d40 and cam_49d7a0 (machine-translated); 0x4969B0, 0x497220, 0x4A01B0, 0x499B50 | port_big | mismatches or low coverage in the whole-function test; to be rewritten by hand |
-| xtbl_load_effects 0x50D000 | port_tables (lifted) | fails its native differential test (an argument to 0xBDCB30 differs) |
 
 ## Too large or complex so far (port maps exist for most)
 
 | Function(s) | Area | Reason |
 |---|---|---|
-| ai_order_k00_update 0x448CE0, ai_order_k0d_update 0x42D2B0 | AI | 1,100 to 1,560 instructions of x87 and callee-driven control flow |
+| ai_order_k00_update 0x448CE0, ai_order_k0d_update 0x42D2B0 | AI | 1,100 to 1,560 instructions of x87 and callee-driven control flow; port maps in doc 59 |
 | 8 activity functions: 0x6A0080 mission_restart_from_checkpoint, 0x585C60, 0x5934B0 piracy load, 0x5CC540 hooker_revolt::update, 0x580A40, 0x5AC6D0, 0x6740A0, 0x599F80 security update (16 KB) | activities | 4 to 16 KB each; the difftest kit in port_activities.rs is ready |
-| cutscene_stop 0x6C44C0, cutscene_begin_callback 0x6BFB50, cutscene_shot_start 0x6C8130, cutscene_shot_place_characters 0x6C24E0, and cutscene action functions from 0x6CB920 on | cutscenes | 2.5 to 8.5 KB, register-convention-dependent callees |
-| 0x4CE230, 0x4CD640, 0x4D7160, 0x4D7E20 (render thread, sin tables) | weather / lighting | 3 to 4 KB each; havok queries, big stack frames |
+| cutscene_stop 0x6C44C0 (8.7 KB), cutscene_begin_callback 0x6BFB50 (6.9 KB), and cutscene action functions from 0x6CB920 on | cutscenes | long chains of unrelated subsystem setup / teardown with register-convention callees; too big for one agent session (2026-11-06) |
+| rain_start_init 0x4CE230 | weather | 3.8 KB of x87 and sin / cos; runs once per rain start |
+| glare_occlusion_query_update 0x4C5180; tree walks 0x4B6A20, 0x4B6B60, 0x4B6CC0; aabb_point_dist_sq_x87 0xBF65F0; 0xCF64A0, 0xD19E30 | render thread | D3D query polling; explicit-stack tree walks; mixed x87 / SSE with writes through ESI; last two only inferred (2026-11-06) |
 | physics_linear_cast 0x6FA820, object_item_create 0x931140, ragdoll_build_for_object 0x711D40 | physics | not reached; maps in doc 53 |
-| vehicle_ai_pathfind_to / _nodes / _navmesh, A* core 0xA121B0, polygon cut 0xA11750, job stage 0xA16650, path-request wrappers 0xA14230 / 0xA14560 / 0xA147E0, 0xA8A4F0 | navigation | 13 KB of result-driven control flow; needs a memory-peek test harness |
+| vehicle_ai_pathfind_to / _nodes / _navmesh, nav_path_search 0xA121B0, nav_cells_heuristic 0xA11750, nav_poly_link_match 0xA16650, 0xA14230 / 0xA14560 / 0xA147E0, road_query_random_lane_setup 0xA8A4F0 | navigation | 13 KB of result-driven control flow; port maps and a test-harness plan in doc 59 |
 | vehicle_camera_record_parse 0xAED2D0, anim_track_sample_vec3 0xCE3610, anim_tracks_update_frame 0xCE7520, the vehicle / camera_free xtbl parsers 0xAE5C50-0xAEE5F0 and 0x495AC0 | camera / animation | per-callee register mapping needed |
 | net_state_sync_send 0x805FC0; 17 packet receivers (drafts in scratchpad/net3/port_net_with_recv.rs) | networking | x87 distance buckets and qsort; receivers not verified |
 | weapon_info_parse_record (13.7 KB), ambient_audio_sequences_update 0x490940 (radio) | weapons / audio | size; FPU rounding-mode change, a lock and 13 callees |
-| humans_post_update 0x9A7210, object_items_update 0x9305F0 and about 60 other frame-loop callees | frame loop | size |
+| about 50 frame-loop callees (activity_hud_markers_apply, pushback_phone_call_hud_text, remote_do_frame ...) | frame loop | size; not reached yet |
 | spline_eval_tangent 0xC03AF0, spline_eval_second_derivative 0xC03DC0 | navigation | long mixed SSE / x87 code |
 | nav_detour_release_hull 0xA0AED0 | navigation | unbounded writes into hull rings |
 | luafn_explosion_create | script bindings | effect structs and x87 vectors on the stack |
@@ -57,6 +58,4 @@ These run as Rust and pass their tests, but they are one-statement-per-instructi
 |---|---|
 | 57 startup / load functions (xtbl loaders, load_from_table / init, gameplay constants, cutscene_player_create ...) | port_tables.rs |
 | the integer and float leaf sweeps' generated bodies | port_leaves.rs, port_leaves_fp.rs |
-| cutscene_shot_place_characters 0x6C24E0 | port_cutscene (ported, not installed) | crashed the game going into a cutscene: a stray write corrupted port_leaves' port table (found by switching it off, 2026-11-04) | find the bad write; its difftest passed, so the test misses something |
-| the 57 lifted startup loaders | port_tables (not installed) | they overwrite ECX / EDX after every call; tod_light_sets_parse 0x4C8B80 (reached at runtime from the clothes store through lightset_find_by_name) lost the matrix pointer between quat_to_mat33 and vec3_mul_mat33 and crashed the store | keep registers across callees that preserve them, or hand-port tod_light_sets_parse |
 

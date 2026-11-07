@@ -1841,7 +1841,7 @@ pub fn install() {
         }
     }
     log(&format!("port_cutscene: replaced {ok}/{NPORTS} with Rust"));
-    let (bok, btotal) = (0u32, 0u32); // BISECT: big::install() held back while chasing the cutscene crash
+    let (bok, btotal) = big::install();
     log(&format!("port_cutscene: replaced {bok}/{btotal} large ports with Rust"));
 }
 
@@ -2286,13 +2286,14 @@ pub(crate) mod big {
             }
             hit(3);
             let mut count = 0u32;
-            let mut buf = [0u32; 64];
+            // cec6c0 fills up to 0x80 node ids (a skeleton's worth; the original's frame holds 124).
+            let mut buf = [0u32; 128];
             call_regs(0xcec6c0, 0, id, 0, 0, 0, &[&mut count as *mut u32 as u32, buf.as_mut_ptr() as u32]);
             let id = rd(rd(d + 0x5e0) as usize) as i32;
             if id >= 0 {
                 let inst = inst_of(id);
                 if inst != 0 {
-                    let n = std::ptr::read_volatile(&count) as i32;
+                    let n = (std::ptr::read_volatile(&count) as i32).min(128);
                     let mut k = 0usize;
                     if n > 0 {
                         loop {
@@ -3006,7 +3007,13 @@ pub(crate) mod dt {
                             }
                         }
                         Out::CountBuf => {
-                            let n = srng() % 9;
+                            // A character's skeleton lists up to 0x80 nodes (the original's buffer
+                            // holds 124): mostly small counts, often a whole skeleton.
+                            let n = match srng() % 4 {
+                                0 => srng() % 9,
+                                1 => 60 + srng() % 65,
+                                _ => srng() % 125,
+                            };
                             *(p as *mut u32) = n;
                             let buf = get(r, args, Src::Arg(1)) as usize;
                             for k in 0..n as usize {
