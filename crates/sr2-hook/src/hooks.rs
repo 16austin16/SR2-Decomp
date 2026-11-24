@@ -49,7 +49,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if (n > 3600 && n.is_multiple_of(900)) || n == 900 || n == 1800 {
         log(&crate::actions::summary());
         log(&crate::lua_bindings::summary());
-        for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary(), crate::port_sim_leaves::summary(), crate::port_weapons_audio::summary(), crate::port_human_states::summary(), crate::port_ai::summary(), crate::port_render_func::summary(), crate::port_effects::summary(), crate::port_nav::summary(), crate::port_net::summary(), crate::port_leaves::summary(), crate::port_leaves_fp::summary(), crate::port_registrars::summary(), crate::port_big::summary(), crate::port_bindings3::summary(), crate::port_tables::summary(), crate::port_frame2::summary(), crate::port_vint2::summary(), crate::port_bindings4::summary(), crate::port_activities::summary(), crate::port_activities2::summary(), crate::port_cutscene::summary(), crate::port_camanim::summary(), crate::port_weather::summary(), crate::port_bindings5::summary(), crate::port_physics::summary(), crate::port_render2::summary(), crate::port_shops::summary(), crate::port_hot57a::summary(), crate::port_hot57b::summary(), crate::port_render3::summary(), crate::port_frame3::summary(), crate::port_weather2::summary(), crate::port_cutscene2::summary()] {
+        for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary(), crate::port_sim_leaves::summary(), crate::port_weapons_audio::summary(), crate::port_human_states::summary(), crate::port_ai::summary(), crate::port_render_func::summary(), crate::port_effects::summary(), crate::port_nav::summary(), crate::port_net::summary(), crate::port_leaves::summary(), crate::port_leaves_fp::summary(), crate::port_registrars::summary(), crate::port_big::summary(), crate::port_bindings3::summary(), crate::port_tables::summary(), crate::port_frame2::summary(), crate::port_vint2::summary(), crate::port_bindings4::summary(), crate::port_activities::summary(), crate::port_activities2::summary(), crate::port_cutscene::summary(), crate::port_camanim::summary(), crate::port_weather::summary(), crate::port_bindings5::summary(), crate::port_physics::summary(), crate::port_render2::summary(), crate::port_shops::summary(), crate::port_hot57a::summary(), crate::port_hot57b::summary(), crate::port_render3::summary(), crate::port_frame3::summary(), crate::port_weather2::summary(), crate::port_cutscene2::summary(), crate::port_tod_lights::summary(), crate::port_cutscene_load::summary(), crate::port_hot60::summary(), crate::port_nav2::summary(), crate::port_render4::summary(), crate::port_frame4::summary()] {
             if !s.is_empty() {
                 log(&s);
             }
@@ -2186,6 +2186,12 @@ pub fn install_all() {
         if !module_skipped("port_frame3") { crate::port_frame3::install(); }
         if !module_skipped("port_weather2") { crate::port_weather2::install(); }
         if !module_skipped("port_cutscene2") { crate::port_cutscene2::install(); }
+        if !module_skipped("port_tod_lights") { crate::port_tod_lights::install(); }
+        if !module_skipped("port_cutscene_load") { crate::port_cutscene_load::install(); }
+        if !module_skipped("port_hot60") { crate::port_hot60::install(); }
+        if !module_skipped("port_nav2") { crate::port_nav2::install(); }
+        if !module_skipped("port_render4") { crate::port_render4::install(); }
+        if !module_skipped("port_frame4") { crate::port_frame4::install(); }
         log(&crate::portlib::installed_list());
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
