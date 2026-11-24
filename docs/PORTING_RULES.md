@@ -1,0 +1,82 @@
+# Porting rules (read fully before starting)
+
+These are the rules every porting agent follows. This file is the master copy; keep it up to date when a round teaches something new.
+
+Project: Saints Row 2 PC (x86, MSVC 2005 LTCG) rewritten in Rust, one function at a time, inside a hook DLL.
+
+Where things are:
+- Repo: F:\Saints Row 2 Decomp (Windows; Bash or PowerShell).
+- Run python WITHOUT -I, because the tools need capstone.
+- Exe bytes: bin/SR2_pc.unpacked.exe (image base 0x400000).
+- Named functions: docs/functions.csv.
+- Docs: docs/analysis/.
+- Skipped or pending functions: docs/skipped_ports.md.
+
+## Exactness
+- Callees stay original. Call them BY ADDRESS through call_regs (crates/sr2-hook/src/portlib.rs), with exactly
+  the registers and stack arguments the original sets up. That includes registers that pass through unchanged to
+  a callee, so check what each callee reads on entry.
+- Pop callees that return on ST0 (see call_regs_st0 in port_humans2.rs; copy helpers into your own file).
+- Confirm EVERY comparison's polarity at the disassembly. That covers setcc / sbb / and masks, jae versus jge,
+  and x87 `fnstsw; test ah, 5 / 0x41 / 0x44`:
+  - 5 then jp: taken when ST0 >= operand, or NaN.
+  - 0x41 then jne: taken when ST0 <= operand, or NaN.
+  - 0x44 then jnp: taken on exact equality.
+  comiss / ucomiss: an unordered result sets ZF, PF and CF. A port once inverted a mask and crashed the game.
+- x87 runs at 53-bit precision. Use f64 arithmetic with `as f32` at every `fstp dword`, and read constants
+  from the exe with their exact bits (doubles stay doubles). SSE scalar ops are f32 ops. `fld dword` quiets a
+  signalling NaN.
+- Reproduce exact outputs (full EAX vs AX vs AL, ST0, XMM0) and the registers the original preserves. LTCG
+  callers may keep values in ECX / EDX / XMM registers across a call to a function that preserves them.
+- Decode jump tables from their bytes.
+- For C++ objects built on the stack, reserve a buffer of the same size and alignment, and call the
+  constructor / destructor by address on every path the original does.
+- Size every stack buffer exactly as the original does, and bound every count.
+- Keep the original's quirks, except on paths where the original corrupts memory or crashes; note any such
+  deviation in the report.
+- Never replace an address whose docs/functions.csv status is `rust`, or that appears in any other
+  crates/sr2-hook/src/*.rs file (unless your task says so explicitly). Check both forms: 0x00XX_XXXX and plain hex.
+- Pin each port to its whole original body with replace_pinned and `python tools/body_bytes.py NAME 0xADDR 0xEND`.
+  Pass the end explicitly whenever the default would run past the function.
+
+## Checks
+- Pure functions: a relocated-original shadow (detour::relocate) for the first 3000 calls, keeping the
+  original's result on a mismatch.
+- Writers with small, known writes: a snapshot shadow (run original, save, restore, run Rust, compare,
+  keep the original's writes on a mismatch).
+- Functions that write too much, or whose callees have side effects: per-branch call counters only.
+  Say which you used for each.
+- Patterns to copy: port_shops.rs, port_frame3.rs, port_hot57b.rs, port_render3.rs, port_cutscene2.rs.
+- Offline native differential testing against the original bytes is required for every port. Use ignored
+  #[cfg(test)] tests, linked at a fixed base, as in those files:
+  RUSTFLAGS="-C target-feature=+crt-static -C link-arg=/DYNAMICBASE:NO -C link-arg=/BASE:0x10000000"
+  cargo test --release -p sr2-hook --target i686-pc-windows-msvc <name> -- --ignored --test-threads=1
+  Run each test in its own process. If another agent's file breaks `cargo test`, test from a scratch copy of
+  the repo with that file stubbed.
+
+## Performance (a port once dropped the game to 5 fps)
+- After the shadow window, a port must cost about what the original does: no per-call allocation, no
+  logging, no write recording, no big copies.
+- If a shadow's writes can exceed 64 KB, shadow only the first 16 calls.
+- Mechanically translated loops can be ~100x slower than the original; hand-write any loop that runs over
+  big tables or many elements.
+- State on the render thread must be atomics.
+
+## Rules
+- Edit ONLY your own file(s), named in your task. Do not commit, do not run the game, and do not touch docs
+  or functions.csv.
+- install() logs "<module>: replaced N/M with Rust".
+- summary() returns "<module>: name calls (mismatches), ...", or an empty string if nothing ran.
+- Build with ZERO warnings from your file: `cargo build --release -p sr2-hook --target i686-pc-windows-msvc`.
+  - About 7 agents edit other files at the same time. If the build fails in someone else's file, wait a minute
+    and retry; never edit it. If it stays broken, build from a scratch copy of the repo.
+  - No cargo fmt.
+- The recursive register checker can use many GB of memory. Use depth 2, ALWAYS run it under `timeout 120`,
+  and never leave it running. Kill your own background jobs before you finish.
+- Put your scripts in your own scratchpad subfolder (the coordinator names it in your task), not in the repo.
+- FINAL REPORT (under 40 lines, no code):
+  - per function: address, true size, check type, difftest case count;
+  - discrepancies with the docs;
+  - skips with reasons;
+  - total bytes;
+  - build result.
