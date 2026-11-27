@@ -300,13 +300,21 @@ pub(crate) static PINNED: std::sync::Mutex<std::collections::BTreeMap<usize, (St
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Ports that broke the game in a play test and stay off until fixed (see docs/skipped_ports.md).
-const EXCLUDED: &[(usize, &str)] = &[
+pub(crate) const EXCLUDED: &[(usize, &str)] = &[
     (0xBF65F0, "aabb_point_dist_sq_x87: crashed loading a save (jumped to a float), 2026-11-26"),
     (0xBB8A10, "hkvector4_equal_store: crashed in the Havok contact solver, 2026-11-26"),
     (0x72A100, "hkvector4_less_store: crashed in the Havok contact solver, 2026-11-26"),
 ];
 
 pub(crate) fn replace_pinned(name: &str, addr: usize, body: &[u8], thunk: usize) -> bool {
+    if crate::registry::active() {
+        // The offline judge's registry mode: record the port, patch nothing (see registry.rs).
+        crate::registry::record(name, addr, body, thunk);
+        if let Ok(mut m) = PINNED.lock() {
+            m.entry(addr).or_insert_with(|| (name.to_string(), body.to_vec(), thunk));
+        }
+        return true;
+    }
     if EXCLUDED.iter().any(|&(x, _)| x == addr) {
         return false;
     }

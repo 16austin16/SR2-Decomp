@@ -44,6 +44,31 @@ Where things are:
 - Pin each port to its whole original body with replace_pinned and `python tools/body_bytes.py NAME 0xADDR 0xEND`.
   Pass the end explicitly whenever the default would run past the function.
 
+## The judge (the only test that accepts a port)
+- `crates/sr2-judge` is the one shared, strict judge. A port is accepted ONLY when `sr2-judge <address or name>` prints
+  PASS. Your own offline differential tests help you debug but never accept a port.
+- NEVER edit `crates/sr2-judge` (its sources, `build.rs`, `callees.toml`) or `crates/sr2-hook/src/registry.rs`, and never
+  change how `portlib::replace_pinned` behaves in registry mode. Do not work around the judge: no code that
+  detects it, no `cfg` switches for it, no thunks that behave differently under it.
+- Inline asm may only be used for thunks (entering your Rust from the game's register / stack convention). The port body
+  itself is Rust. Copying the original's bytes into asm, or running the original, is not a port.
+- Build and run (each run prints the judge's source hash on its first line; it must equal the hash below):
+  `cargo build --release -p sr2-judge --target i686-pc-windows-msvc`
+  `target/i686-pc-windows-msvc/release/sr2-judge.exe 0xADDR --cases 500` (or a port name; `--verbose` prints every case;
+  `--list` lists the registered ports; `--all [--cases N]` judges every port except portlib's EXCLUDED ones).
+- Verdicts: PASS (every non-faulting case matched and at least 20% of the cases ran without faulting), FAIL (first
+  differences are printed), INCONCLUSIVE (fewer than 20% of the cases ran clean: the function needs inputs the random
+  worlds rarely give; say so in the report, do not call it passed), ERROR (the pinned body does not match the exe).
+- What it compares on every case: all general registers (ECX / EDX too), ESP, x87 depth and ST0, XMM0-7, the stack
+  arguments, every byte of the arena and every page of the exe image that was written, and the ordered list of calls
+  to functions outside the body (target, the registers the callee reads, its stack arguments, x87 depth). A fault on
+  one side only is a FAIL. Replace nothing the judge cannot see: a call through a function pointer or a vtable is not
+  stubbed and ends the case in a fault on both sides.
+- To override a wrongly detected callee (stack size, float result, which registers it keeps), ask the coordinator; do not
+  edit `callees.toml` yourself.
+- Judge source hash (SHA-256 of `crates/sr2-judge/src/*.rs`, `build.rs`, `callees.toml` and `crates/sr2-hook/src/registry.rs`):
+  `ce94869ebf04439d24ff255fb09b7e519d55e6d8a4b738da3d3c7f6938aaf854`. If a run prints a different hash, stop and tell the coordinator.
+
 ## Checks
 - Pure functions: a relocated-original shadow (detour::relocate) for the first 3000 calls, keeping the
   original's result on a mismatch.

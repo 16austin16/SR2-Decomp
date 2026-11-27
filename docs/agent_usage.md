@@ -59,8 +59,12 @@ The lesson from these two rounds:
 | Time | 5-hour | Weekly (all models) |
 |---|---:|---:|
 | Before | 9% | 9% |
-| After | | |
+| After | 16% | 10% |
 
 | Agent | Tokens | Result |
 |---|---:|---|
-| judge builder | | |
+| judge builder | about 274k after resuming, plus an unknown amount before the app restart | crates/sr2-judge built; judged all 3,975 ports |
+
+That is about **7% of the 5-hour window and 1% of the week** for one big agent, including my own
+coordination in the same window. So about 10 to 12 agents of this size fit in one 5-hour window,
+and the weekly limit allows a few such rounds per week.

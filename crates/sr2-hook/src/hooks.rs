@@ -2071,6 +2071,62 @@ unsafe fn packfile_fingerprint(pf: *const u8) -> String {
     }
 }
 
+/// Every module that installs ports (in the order the game installs them). The judge's registry mode
+/// runs the same list.
+pub(crate) fn install_port_modules() {
+    crate::port_bindings2::install();
+    crate::port_sim_humans::install();
+    crate::port_states::install();
+    crate::port_vehicles::install();
+    crate::port_humans2::install();
+    crate::port_render::install();
+    crate::port_sim_leaves::install();
+    crate::port_weapons_audio::install();
+    crate::port_human_states::install();
+    crate::port_ai::install();
+    crate::port_render_func::install();
+    crate::port_effects::install();
+    crate::port_nav::install();
+    crate::port_net::install();
+    crate::port_leaves::install();
+    crate::port_leaves_fp::install();
+    crate::port_registrars::install();
+    crate::port_big::install();
+    crate::port_bindings3::install();
+    if !module_skipped("port_tables") { crate::port_tables::install(); } // re-enabled 2026-11-04: ECX/EDX now kept across preserving callees (clothes store crash fix); needs a play test
+    if !module_skipped("port_frame2") { crate::port_frame2::install(); }
+    crate::port_vint2::install();
+    crate::port_bindings4::install();
+    crate::port_activities::install();
+    crate::port_activities2::install();
+    if !module_skipped("port_cutscene") { crate::port_cutscene::install(); }
+    crate::port_camanim::install();
+    crate::port_weather::install();
+    crate::port_bindings5::install();
+    crate::port_physics::install();
+    crate::port_render2::install();
+    if !module_skipped("port_shops") { crate::port_shops::install(); }
+    if !module_skipped("port_hot57a") { crate::port_hot57a::install(); }
+    if !module_skipped("port_hot57b") { crate::port_hot57b::install(); }
+    if !module_skipped("port_render3") { crate::port_render3::install(); }
+    if !module_skipped("port_frame3") { crate::port_frame3::install(); }
+    if !module_skipped("port_weather2") { crate::port_weather2::install(); }
+    if !module_skipped("port_cutscene2") { crate::port_cutscene2::install(); }
+    if !module_skipped("port_tod_lights") { crate::port_tod_lights::install(); }
+    if !module_skipped("port_cutscene_load") { crate::port_cutscene_load::install(); }
+    if !module_skipped("port_hot60") { crate::port_hot60::install(); }
+    // port_nav2: held back, its agent never finished its tests (2026-11-26).
+    // if !module_skipped("port_nav2") { crate::port_nav2::install(); }
+    if !module_skipped("port_render4") { crate::port_render4::install(); }
+    if !module_skipped("port_frame4") { crate::port_frame4::install(); }
+    if !module_skipped("port_small_a") { crate::port_small_a::install(); }
+    if !module_skipped("port_small_b") { crate::port_small_b::install(); }
+    if !module_skipped("port_small_c") { crate::port_small_c::install(); }
+    if !module_skipped("port_small_vint") { crate::port_small_vint::install(); }
+    if !module_skipped("port_small_data") { crate::port_small_data::install(); }
+    if !module_skipped("port_small_game") { crate::port_small_game::install(); }
+}
+
 /// Install all hooks. Safe to call repeatedly; runs once.
 pub fn install_all() {
     static ONCE: Once = Once::new();
@@ -2148,57 +2204,7 @@ pub fn install_all() {
         crate::controls::install();
         crate::actions::install();
         crate::lua_bindings::install();
-        crate::port_bindings2::install();
-        crate::port_sim_humans::install();
-        crate::port_states::install();
-        crate::port_vehicles::install();
-        crate::port_humans2::install();
-        crate::port_render::install();
-        crate::port_sim_leaves::install();
-        crate::port_weapons_audio::install();
-        crate::port_human_states::install();
-        crate::port_ai::install();
-        crate::port_render_func::install();
-        crate::port_effects::install();
-        crate::port_nav::install();
-        crate::port_net::install();
-        crate::port_leaves::install();
-        crate::port_leaves_fp::install();
-        crate::port_registrars::install();
-        crate::port_big::install();
-        crate::port_bindings3::install();
-        if !module_skipped("port_tables") { crate::port_tables::install(); } // re-enabled 2026-11-04: ECX/EDX now kept across preserving callees (clothes store crash fix); needs a play test
-        if !module_skipped("port_frame2") { crate::port_frame2::install(); }
-        crate::port_vint2::install();
-        crate::port_bindings4::install();
-        crate::port_activities::install();
-        crate::port_activities2::install();
-        if !module_skipped("port_cutscene") { crate::port_cutscene::install(); }
-        crate::port_camanim::install();
-        crate::port_weather::install();
-        crate::port_bindings5::install();
-        crate::port_physics::install();
-        crate::port_render2::install();
-        if !module_skipped("port_shops") { crate::port_shops::install(); }
-        if !module_skipped("port_hot57a") { crate::port_hot57a::install(); }
-        if !module_skipped("port_hot57b") { crate::port_hot57b::install(); }
-        if !module_skipped("port_render3") { crate::port_render3::install(); }
-        if !module_skipped("port_frame3") { crate::port_frame3::install(); }
-        if !module_skipped("port_weather2") { crate::port_weather2::install(); }
-        if !module_skipped("port_cutscene2") { crate::port_cutscene2::install(); }
-        if !module_skipped("port_tod_lights") { crate::port_tod_lights::install(); }
-        if !module_skipped("port_cutscene_load") { crate::port_cutscene_load::install(); }
-        if !module_skipped("port_hot60") { crate::port_hot60::install(); }
-        // port_nav2: held back, its agent never finished its tests (2026-11-26).
-        // if !module_skipped("port_nav2") { crate::port_nav2::install(); }
-        if !module_skipped("port_render4") { crate::port_render4::install(); }
-        if !module_skipped("port_frame4") { crate::port_frame4::install(); }
-        if !module_skipped("port_small_a") { crate::port_small_a::install(); }
-        if !module_skipped("port_small_b") { crate::port_small_b::install(); }
-        if !module_skipped("port_small_c") { crate::port_small_c::install(); }
-        if !module_skipped("port_small_vint") { crate::port_small_vint::install(); }
-        if !module_skipped("port_small_data") { crate::port_small_data::install(); }
-        if !module_skipped("port_small_game") { crate::port_small_game::install(); }
+        install_port_modules();
         // Twins last: they reuse the thunks of the ports installed above.
         if !module_skipped("twins") {
             crate::twins::install();
@@ -2397,6 +2403,9 @@ fn skip_list() -> &'static Vec<String> {
 }
 
 pub(crate) fn module_skipped(name: &str) -> bool {
+    if crate::registry::active() {
+        return false;
+    }
     let hit = skip_list().iter().any(|l| *l == name.to_ascii_lowercase());
     if hit {
         log(&format!("{name}: skipped (listed in sr2-skip-modules.txt)"));

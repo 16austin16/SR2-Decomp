@@ -1,0 +1,9 @@
+# Overrides for callees the judge detects wrongly. One section per callee address:
+#   [0x00ABCDEF]
+#   ret_n = 8            # bytes the callee pops (default: read from its ret instructions)
+#   args = 2             # stack dwords compared at each call (default: ret_n/4, else the add esp after the call)
+#   float = true         # returns a float on ST0 (default: guessed from the call site)
+#   xmm0 = true          # returns a float in XMM0
+#   preserve = ["edx"]   # registers the callee leaves alone (the stub keeps them)
+#   clobber = ["ecx"]    # registers the callee overwrites (the stub randomises them)
+#   live_in = ["ecx"]    # registers compared at each call

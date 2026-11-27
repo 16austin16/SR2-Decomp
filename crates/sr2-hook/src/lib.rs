@@ -88,6 +88,7 @@ mod port_sim_humans;
 mod port_states;
 mod port_vehicles;
 mod portlib;
+pub mod registry;
 mod render;
 mod rsched;
 mod streamman;
@@ -101,6 +102,9 @@ mod survey;
 const SR2_IMAGE_BASE: usize = 0x0040_0000;
 
 pub fn log(msg: &str) {
+    if registry::active() {
+        return;
+    }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open("sr2-hook.log") {
         let _ = writeln!(f, "{msg}");
     }
