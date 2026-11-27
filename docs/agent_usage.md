@@ -68,3 +68,33 @@ The lesson from these two rounds:
 That is about **7% of the 5-hour window and 1% of the week** for one big agent, including my own
 coordination in the same window. So about 10 to 12 agents of this size fit in one 5-hour window,
 and the weekly limit allows a few such rounds per week.
+
+### 2026-11-26: judge fix round (9 Sonnet agents)
+
+The user was also using another session in this window, so part of the change comes from that session.
+
+| Time | 5-hour | Weekly (all models) |
+|---|---:|---:|
+| Before (agents launched) | 20% | 10% |
+| After | 77% | 18% |
+
+| Agent | Modules | FAILs given | Tokens | Now PASS |
+|---|---|---:|---:|---:|
+| fix_leaves_fp | port_leaves_fp | 202 | 280k | 175 PASS, 19 INCONCLUSIVE, 8 FAIL (judge limits) |
+| fix_ai | port_ai | 135 | 352k | 68 PASS, 8 INCONCLUSIVE, 1 FAIL (judge); 71 ports replaced by lifted code (pending decision) |
+| fix_small1 | small_vint, small_b, small_c | 168 | 365k | small_c 21/21 PASS; small_b 18 PASS; vint 109 INCONCLUSIVE (judge cannot stub vtable calls), 18 judge issues |
+| fix_small2 | small_data, small_game | 132 | 449k | 115 PASS, 12 INCONCLUSIVE, 1 FAIL (judge limit) |
+| fix_net | net, bindings2 | 100 (+26 exposed) | 558k | net 91 PASS, 15 INCONCLUSIVE, 11 FAIL (judge limits); bindings2 9 FAIL (judge) |
+| fix_bindings | bindings3/4/5 | 134 | 320k | partial: 62 pass in a scratch judge with callee overrides, 72 unfixed |
+| fix_leaves_nav | leaves, nav | 131 (116 its own) | 435k | 76 PASS, 12 INCONCLUSIVE, 28 FAIL (about 17 judge limits, 6 spline ports unfinished) |
+| fix_gameplay | weapons_audio, activities, cutscene*, camanim, humans | ~120 | 478k | partial: weapons 62 PASS, activities2 29 PASS, cutscene 27 PASS; about 60 still FAIL |
+| fix_engine | frame2-4, registrars, vint2, big, weather, physics, hot*, render*, shops, effects | ~250 | 371k | partial: about 80 PASS, most of frame3/4, hot57, render2, effects, big, weather still FAIL |
+
+Total: about 3.6M tokens across the 9 agents, plus 15 helper agents the agents started themselves (stopped after about
+30 minutes; they are counted in the plan % but not in the token totals). Plan cost: **57% of a 5-hour window and 8%
+of the week**, including the user's other session in that window.
+
+Lessons from this round:
+- Fix work costs much more than porting. An agent cost about 280k-560k tokens, and the hard modules did not finish.
+- Agents must be told not to start sub-agents; the helpers burned about 27% of a 5-hour window in 30 minutes.
+- At this cost, about 6 agents fit in one 5-hour window with room to spare, and 9 agents use most of it.
