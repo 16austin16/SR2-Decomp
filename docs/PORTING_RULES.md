@@ -28,6 +28,11 @@ Where things are:
   signalling NaN.
 - Reproduce exact outputs (full EAX vs AX vs AL, ST0, XMM0) and the registers the original preserves. LTCG
   callers may keep values in ECX / EDX / XMM registers across a call to a function that preserves them.
+- Scratch registers are outputs too: when the original leaves a value in ECX or EDX (a `sete cl`, a
+  loaded pointer, a zeroed counter), the port must leave the same value. Do NOT "safely" restore the
+  caller's ECX / EDX instead. LTCG callers can read them: vehicle_is_helicopter's port restored ECX
+  and police helicopters stopped tracking the player (2026-11-26).
+- No inline / naked asm that copies the original body. A port must be Rust; asm is only for thunks.
 - Decode jump tables from their bytes.
 - For C++ objects built on the stack, reserve a buffer of the same size and alignment, and call the
   constructor / destructor by address on every path the original does.

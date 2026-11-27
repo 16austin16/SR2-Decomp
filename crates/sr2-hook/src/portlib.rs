@@ -233,8 +233,90 @@ pub(crate) fn installed_list() -> String {
     format!("installed ({}): {}", parts.len(), parts.join(" "))
 }
 
+// ---- Port-entry trace (for crash reports) ---------------------------------------------------
+//
+// Every port installed through replace_pinned is entered through a small stub that records
+// (port id, thread id) in a 256-entry ring buffer and then jumps to the port's thunk. The stub
+// restores every register and the flags, so the thunk sees exactly what it saw before. On a crash
+// crash.rs prints the most recent entries made by the crashing thread, newest first.
+
+pub(crate) const TRACE_LEN: usize = 256;
+pub(crate) static TRACE_IDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// (port id + 1, thread id); 0 = empty.
+pub(crate) static mut TRACE_RING: [[u32; 2]; TRACE_LEN] = [[0; 2]; TRACE_LEN];
+/// Port id -> (name, original address).
+pub(crate) static TRACE_NAMES: std::sync::Mutex<Vec<(String, usize)>> = std::sync::Mutex::new(Vec::new());
+static TRACE_ARENA: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+
+/// Build the recording stub for port `id` that ends in `jmp thunk`; returns its address, or the
+/// thunk itself if no memory could be had.
+fn trace_stub(id: u32, thunk: usize) -> usize {
+    const SLOT: usize = 64;
+    let Ok(mut a) = TRACE_ARENA.lock() else { return thunk };
+    if a.0 == 0 || a.1 + SLOT > 0x10000 {
+        let p = unsafe {
+            windows_sys::Win32::System::Memory::VirtualAlloc(
+                std::ptr::null(),
+                0x10000,
+                windows_sys::Win32::System::Memory::MEM_COMMIT | windows_sys::Win32::System::Memory::MEM_RESERVE,
+                windows_sys::Win32::System::Memory::PAGE_EXECUTE_READWRITE,
+            )
+        } as usize;
+        if p == 0 {
+            return thunk;
+        }
+        *a = (p, 0);
+    }
+    let at = a.0 + a.1;
+    a.1 += SLOT;
+    let idx = &TRACE_IDX as *const _ as u32;
+    let ring = std::ptr::addr_of!(TRACE_RING) as u32;
+    let mut c: Vec<u8> = Vec::with_capacity(SLOT);
+    c.extend([0x9C, 0x50, 0x51]); // pushfd; push eax; push ecx
+    c.extend([0xB8, 1, 0, 0, 0]); // mov eax, 1
+    c.extend([0xF0, 0x0F, 0xC1, 0x05]); // lock xadd [idx], eax
+    c.extend(idx.to_le_bytes());
+    c.extend([0x25]); // and eax, TRACE_LEN-1
+    c.extend(((TRACE_LEN - 1) as u32).to_le_bytes());
+    c.extend([0xB9]); // mov ecx, id+1
+    c.extend((id + 1).to_le_bytes());
+    c.extend([0x89, 0x0C, 0xC5]); // mov [ring + eax*8], ecx
+    c.extend(ring.to_le_bytes());
+    c.extend([0x64, 0x8B, 0x0D, 0x24, 0, 0, 0]); // mov ecx, fs:[0x24] (thread id)
+    c.extend([0x89, 0x0C, 0xC5]); // mov [ring + 4 + eax*8], ecx
+    c.extend((ring + 4).to_le_bytes());
+    c.extend([0x59, 0x58, 0x9D]); // pop ecx; pop eax; popfd
+    let jmp_at = at + c.len();
+    c.push(0xE9); // jmp thunk
+    c.extend((thunk.wrapping_sub(jmp_at + 5) as u32).to_le_bytes());
+    debug_assert!(c.len() <= SLOT);
+    unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), at as *mut u8, c.len()) };
+    at
+}
+
+/// Ports that broke the game in a play test and stay off until fixed (see docs/skipped_ports.md).
+const EXCLUDED: &[(usize, &str)] = &[
+    (0xBF65F0, "aabb_point_dist_sq_x87: crashed loading a save (jumped to a float), 2026-11-26"),
+    (0xBB8A10, "hkvector4_equal_store: crashed in the Havok contact solver, 2026-11-26"),
+    (0x72A100, "hkvector4_less_store: crashed in the Havok contact solver, 2026-11-26"),
+];
+
 pub(crate) fn replace_pinned(name: &str, addr: usize, body: &[u8], thunk: usize) -> bool {
-    match unsafe { crate::detour::replace(addr, body, thunk) } {
+    if EXCLUDED.iter().any(|&(x, _)| x == addr) {
+        return false;
+    }
+    if crate::hooks::function_skipped(name, addr) {
+        return false;
+    }
+    let id = match TRACE_NAMES.lock() {
+        Ok(mut v) => {
+            v.push((name.to_string(), addr));
+            (v.len() - 1) as u32
+        }
+        Err(_) => u32::MAX,
+    };
+    let target = if id == u32::MAX { thunk } else { trace_stub(id, thunk) };
+    match unsafe { crate::detour::replace(addr, body, target) } {
         Ok(()) => {
             if let Ok(mut v) = INSTALLED.lock() {
                 v.push(addr);

@@ -46705,7 +46705,7 @@ unsafe fn f48(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                     eax = sp0.wrapping_add(0xffffffb4u32);
                     wd((sp0.wrapping_add(0xfffffe30u32)) as usize, 0xdd88dcu32);
                     wd((sp0.wrapping_add(0xfffffe2cu32)) as usize, eax);
-                    eax = call_regs(0xc968f6usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffe2cu32)) as usize), rd((sp0.wrapping_add(0xfffffe30u32)) as usize), rd((sp0.wrapping_add(0xfffffe34u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc968f6usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffe2cu32)) as usize), rd((sp0.wrapping_add(0xfffffe30u32)) as usize), rd((sp0.wrapping_add(0xfffffe34u32)) as usize), rd((sp0.wrapping_add(0xfffffe38u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1; // 4th sprintf argument: the original pushes 4 for "%s%s" (fix 2026-11-23)
                     ecx = sp0.wrapping_add(0xffffffb4u32);
                     wd((sp0.wrapping_add(0xfffffe28u32)) as usize, ecx);
                     eax = sp0.wrapping_add(0xfffffe64u32);
@@ -52851,7 +52851,7 @@ unsafe fn f53(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                     edx = sp0.wrapping_add(0xffffff04u32);
                     wd((sp0.wrapping_add(0xfffffc18u32)) as usize, 0xdd88dcu32);
                     wd((sp0.wrapping_add(0xfffffc14u32)) as usize, edx);
-                    eax = call_regs(0xc968f6usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc14u32)) as usize), rd((sp0.wrapping_add(0xfffffc18u32)) as usize), rd((sp0.wrapping_add(0xfffffc1cu32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc968f6usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc14u32)) as usize), rd((sp0.wrapping_add(0xfffffc18u32)) as usize), rd((sp0.wrapping_add(0xfffffc1cu32)) as usize), rd((sp0.wrapping_add(0xfffffc20u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1; // 4th sprintf argument: the original pushes 4 for "%s%s" (fix 2026-11-23)
                     wd((sp0.wrapping_add(0xfffffc10u32)) as usize, 0xe44650u32);
                     eax = sp0.wrapping_add(0xffffff04u32);
                     wd((sp0.wrapping_add(0xfffffc0cu32)) as usize, 0x40u32);
@@ -53204,7 +53204,7 @@ unsafe fn f53(args: *const u32, mut eax: u32, mut ecx: u32, mut edx: u32, mut es
                     eax = sp0.wrapping_add(0xffffff04u32);
                     wd((sp0.wrapping_add(0xfffffc18u32)) as usize, 0xdd88dcu32);
                     wd((sp0.wrapping_add(0xfffffc14u32)) as usize, eax);
-                    eax = call_regs(0xc968f6usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc14u32)) as usize), rd((sp0.wrapping_add(0xfffffc18u32)) as usize), rd((sp0.wrapping_add(0xfffffc1cu32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1;
+                    eax = call_regs(0xc968f6usize, eax, ecx, edx, esi, edi, &[rd((sp0.wrapping_add(0xfffffc14u32)) as usize), rd((sp0.wrapping_add(0xfffffc18u32)) as usize), rd((sp0.wrapping_add(0xfffffc1cu32)) as usize), rd((sp0.wrapping_add(0xfffffc20u32)) as usize)]); ecx = 0xcdcdcdcd; edx = 0xcdcdcdcd; ncalls += 1; // 4th sprintf argument: the original pushes 4 for "%s%s" (fix 2026-11-23)
                     wd((sp0.wrapping_add(0xfffffc10u32)) as usize, 0xe44650u32);
                     ecx = sp0.wrapping_add(0xffffff04u32);
                     wd((sp0.wrapping_add(0xfffffc0cu32)) as usize, 0x40u32);

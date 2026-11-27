@@ -18,10 +18,47 @@ unsafe extern "C" {
     static __ImageBase: u8;
 }
 
-/// This DLL's base and a generous end (its image is well under 1 MB).
+/// This DLL's base and end (SizeOfImage from its PE header).
 fn dll_range() -> (usize, usize) {
-    let base = unsafe { &__ImageBase as *const u8 as usize };
-    (base, base + 0x0010_0000)
+    unsafe {
+        let base = &__ImageBase as *const u8 as usize;
+        let pe = base + *((base + 0x3C) as *const u32) as usize;
+        let size = *((pe + 0x50) as *const u32) as usize;
+        (base, base + size)
+    }
+}
+
+/// The most recent port entries made by this thread, newest first (see portlib's trace ring).
+fn recent_ports() -> String {
+    unsafe {
+        let tid = { let t: u32; std::arch::asm!("mov {0}, fs:[0x24]", out(reg) t); t };
+        let n = crate::portlib::TRACE_LEN;
+        let end = crate::portlib::TRACE_IDX.load(Ordering::Relaxed) as usize;
+        let ring = std::ptr::addr_of!(crate::portlib::TRACE_RING);
+        let names = match crate::portlib::TRACE_NAMES.try_lock() {
+            Ok(v) => v.clone(),
+            Err(_) => Vec::new(),
+        };
+        let mut out = Vec::new();
+        for k in 1..=n.min(end) {
+            let e = (*ring)[(end - k) % n];
+            if e[0] == 0 || e[1] != tid {
+                continue;
+            }
+            let id = (e[0] - 1) as usize;
+            let s = match names.get(id) {
+                Some((nm, a)) => format!("{nm}@{a:#x}"),
+                None => format!("port#{id}"),
+            };
+            if out.last() != Some(&s) {
+                out.push(s);
+            }
+            if out.len() >= 40 {
+                break;
+            }
+        }
+        if out.is_empty() { "(none on this thread)".to_string() } else { out.join(" <- ") }
+    }
 }
 
 extern "system" fn handler(info: *const [usize; 2]) -> i32 {
@@ -36,7 +73,7 @@ extern "system" fn handler(info: *const [usize; 2]) -> i32 {
         let target = *((record + 0x18) as *const u32); // ExceptionInformation[1]
         let (lo, hi) = dll_range();
         let mut stack = Vec::new();
-        for i in 0..256usize {
+        for i in 0..1024usize {
             let p = esp as usize + i * 4;
             if IsBadReadPtr(p as *const u8, 4) != 0 {
                 break;
@@ -57,6 +94,8 @@ extern "system" fn handler(info: *const [usize; 2]) -> i32 {
             r(0xB4),
             stack.join(" ")
         ));
+        log(&format!("CRASH: last ports entered on this thread, newest first: {}", recent_ports()));
+        log("CRASH: resolve the addresses with: python tools/crash_report.py <game folder>/sr2-hook.log");
         crate::missionlog::flush("a crash");
     }
     0

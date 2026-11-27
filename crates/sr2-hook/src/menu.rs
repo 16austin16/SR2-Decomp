@@ -63,7 +63,9 @@ const GPS_TARGET: usize = 0x029B_A748;
 
 // Game flags and cheats (docs/analysis/38_cheats_and_menu_hooks.md).
 const CHEAT_FLAGS: usize = 0x027A_6A40; // u32: 0x40 infinite ammo, 0x1000 unlimited clip
-const AMMO_FLAGS: u32 = 0x40 | 0x1000;
+// Only Infinite_Ammo: with Unlimited Clip too, dual-wielded pistols fire slowly (no reload
+// rhythm), so the clip still empties and reloads from the endless reserve.
+const AMMO_FLAGS: u32 = 0x40;
 // 0x68-byte records: +0 stays on (else one-shot), +1 active, +0xC u16 *display name
 // (localized), +0x10 char *phone number.
 const CHEATS: usize = 0x027A_6A68;
@@ -192,6 +194,8 @@ enum Action {
     Cash,
     Respect,
     ClearWanted,
+    /// Police notoriety, 1-5 stars.
+    Wanted(u32),
     God(bool),
     TeleportWaypoint,
     /// Hours forward (1..23).
@@ -208,6 +212,8 @@ struct State {
     cursor: usize,
     god: bool,
     ammo: bool,
+    /// Stars for "Set wanted level".
+    wanted: u32,
     weather: i32,
     pending: Vec<Action>,
     /// The last thing done, shown at the bottom.
@@ -220,6 +226,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     cursor: 0,
     god: false,
     ammo: false,
+    wanted: 3,
     weather: -1,
     pending: Vec::new(),
     status: String::new(),
@@ -273,6 +280,7 @@ fn items(s: &State) -> Vec<String> {
             "Add $10,000".into(),
             "Add 5,000 respect".into(),
             "Clear wanted level".into(),
+            format!("Set wanted level: < {} star{} >", s.wanted, if s.wanted == 1 { "" } else { "s" }),
             "Teleport to waypoint".into(),
             format!("Time: < {} >", clock()),
             "Back".into(),
@@ -360,7 +368,10 @@ fn keys() {
                 s.pending.push(Action::Cheat(i, !cheat_active(i)));
             }
         }
-        Page::Player if s.cursor == 7 && (left || right || enter) => {
+        Page::Player if s.cursor == 6 && (left || right) => {
+            s.wanted = if left { if s.wanted <= 1 { 5 } else { s.wanted - 1 } } else if s.wanted >= 5 { 1 } else { s.wanted + 1 };
+        }
+        Page::Player if s.cursor == 8 && (left || right || enter) => {
             s.pending.push(Action::Time(if left { 23 } else { 1 }));
         }
         Page::Player if enter => {
@@ -378,7 +389,8 @@ fn keys() {
                 3 => Some(Action::Cash),
                 4 => Some(Action::Respect),
                 5 => Some(Action::ClearWanted),
-                6 => Some(Action::TeleportWaypoint),
+                6 => Some(Action::Wanted(s.wanted)),
+                7 => Some(Action::TeleportWaypoint),
                 _ => {
                     (s.page, s.cursor) = (Page::Main, 0);
                     None
@@ -457,6 +469,11 @@ pub fn tick() {
                         call_regs(NOTORIETY_SET, 0, 0, 0, 0, 0, &[team, 0.0f32.to_bits()]);
                     }
                     msg = Some("wanted level cleared".into());
+                }
+                Action::Wanted(stars) => {
+                    // Team 3 is the police (doc 43: notoriety_set's team ids).
+                    call_regs(NOTORIETY_SET, 0, 0, 0, 0, 0, &[3, (stars as f32).to_bits()]);
+                    msg = Some(format!("police wanted level set to {stars}"));
                 }
                 Action::TeleportWaypoint => {
                     let t = *(GPS_TARGET as *const [f32; 3]);

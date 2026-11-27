@@ -8,7 +8,7 @@ This repo contains no game files. You need your own copy of the game.
 
 ![Progress: functions and code running in Rust, by area](docs/img/progress.svg)
 
-- **2,392 functions run in Rust**, about 8% of the game's functions and 6% of its code.
+- **3,758 functions run in Rust**, about 13% of the game's functions and 7% of its code.
 - **14,633 functions are identified** (named), about half of the game.
 
 ## How it works

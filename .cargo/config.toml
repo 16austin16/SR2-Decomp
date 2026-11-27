@@ -1,3 +1,5 @@
 # The hook DLL must match the original 32-bit exe.
+# /MAP writes target/.../deps/dinput8.map next to every build, so tools/crash_report.py can name the
+# DLL addresses in a crash report.
 [target.i686-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=/MAP"]

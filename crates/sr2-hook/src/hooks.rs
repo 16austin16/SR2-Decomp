@@ -2189,7 +2189,8 @@ pub fn install_all() {
         if !module_skipped("port_tod_lights") { crate::port_tod_lights::install(); }
         if !module_skipped("port_cutscene_load") { crate::port_cutscene_load::install(); }
         if !module_skipped("port_hot60") { crate::port_hot60::install(); }
-        if !module_skipped("port_nav2") { crate::port_nav2::install(); }
+        // port_nav2: held back, its agent never finished its tests (2026-11-26).
+        // if !module_skipped("port_nav2") { crate::port_nav2::install(); }
         if !module_skipped("port_render4") { crate::port_render4::install(); }
         if !module_skipped("port_frame4") { crate::port_frame4::install(); }
         if !module_skipped("port_small_a") { crate::port_small_a::install(); }
@@ -2381,15 +2382,40 @@ pub fn install_early() {
 
 /// Modules named (one per line) in sr2-skip-modules.txt in the game folder are not installed.
 /// Used to bisect a play-test problem without rebuilding.
+/// Names listed in sr2-skip-modules.txt: a module (port_*), or a single function name / address
+/// (as replace_pinned sees it, e.g. `aabb_point_dist_sq_x87` or `0xbf65f0`). Read once.
+fn skip_list() -> &'static Vec<String> {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| match std::fs::read_to_string("sr2-skip-modules.txt") {
+        Ok(t) => t.lines().map(|l| l.trim().to_ascii_lowercase()).filter(|l| !l.is_empty()).collect(),
+        Err(_) => Vec::new(),
+    })
+}
+
 pub(crate) fn module_skipped(name: &str) -> bool {
-    match std::fs::read_to_string("sr2-skip-modules.txt") {
-        Ok(t) => {
-            let hit = t.lines().any(|l| l.trim() == name);
-            if hit {
-                log(&format!("{name}: skipped (listed in sr2-skip-modules.txt)"));
-            }
-            hit
-        }
-        Err(_) => false,
+    let hit = skip_list().iter().any(|l| *l == name.to_ascii_lowercase());
+    if hit {
+        log(&format!("{name}: skipped (listed in sr2-skip-modules.txt)"));
     }
+    hit
+}
+
+/// Per-function check used by portlib::replace_pinned (by name or by address).
+pub(crate) fn function_skipped(name: &str, addr: usize) -> bool {
+    let l = skip_list();
+    if l.is_empty() {
+        return false;
+    }
+    // "all_ports": install none of the pinned ports (an almost vanilla game; the menu, logger and
+    // the frame-loop / file / allocator hooks stay).
+    if l.iter().any(|x| x == "all_ports") {
+        return true;
+    }
+    let a = format!("{addr:#x}");
+    let n = name.to_ascii_lowercase();
+    let hit = l.iter().any(|x| *x == n || *x == a);
+    if hit {
+        log(&format!("{name} @ {addr:#x}: skipped (listed in sr2-skip-modules.txt)"));
+    }
+    hit
 }

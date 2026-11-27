@@ -8,6 +8,10 @@ ported.
 
 | Function(s) | Where | What happened | What it needs |
 |---|---|---|---|
+| aabb_point_dist_sq_x87 0xBF65F0 | port_render4 (excluded in portlib EXCLUDED) | crashed loading a save: a return landed on a float (2026-11-26) | find the stack / x87 imbalance |
+| hkvector4_equal_store 0xBB8A10, hkvector4_less_store 0x72A100 | port_hot60 (excluded) | crash in the Havok contact solver while loading (2026-11-26) | check the mask results and the registers the originals leave |
+| port_nav2 (doc 59 nav functions) | port_nav2 (not installed) | its agent never finished its tests | run its difftests, then play-test with a cop chase |
+| 115 IDirect3DDevice9Lost stubs | port_small_b D3D_PORTS (not installed) | were naked asm copied from the original bytes | rewrite as real Rust functions |
 | tod_light_sets_parse 0x4C8B80 | port_tables (lifted, excluded) | lit the player solid red in the clothes store (2026-11-07) | hand port |
 | cutscene_player_create 0x6BDC80, cutscene_parse_characters 0x6D16C0 | port_tables (lifted, excluded) | cutscenes played with no characters (2026-11-07) | hand port |
 
@@ -58,4 +62,18 @@ These run as Rust and pass their tests, but they are one-statement-per-instructi
 |---|---|
 | 57 startup / load functions (xtbl loaders, load_from_table / init, gameplay constants, cutscene_player_create ...) | port_tables.rs |
 | the integer and float leaf sweeps' generated bodies | port_leaves.rs, port_leaves_fp.rs |
+
+## Known issues (not tied to a port yet)
+
+| Issue | Notes |
+|---|---|
+| Police helicopters hover or only make fly-bys instead of chasing (2026-11-26) | Vanilla (all ports off) chases properly. vehicle_is_helicopter 0xAB5190 now leaves ECX like the original, which did not fix it. Not bisected; the user asked to note it for later. Use the skip file (module or function names, `all_ports`) and 5 stars from the F7 menu. |
+| Ports in port_hot60 that restore ECX / EDX where the original leaves a value | 0xCF7760 (ECX = 0), 0xA96A70 (ECX, EDX = pos.z), 0x71A0A0 (ECX = &s), 0x485D30 (ECX = &b): reproduce the original's values (rule added to docs/PORTING_RULES.md) |
+
+## Not ported in the 2026-11-23 round
+
+| Function(s) | Reason |
+|---|---|
+| remote_do_frame bodies: item 0x843C20, mover 0x84C0A0, npc 0x852580, pipebomb 0x85CCA0, player 0x8633D0, prop 0x86C0F0, rocket 0x86F310, vehicle 0x874310 | 0.9-8 KB of SSE quaternion maths on overlapping stack buffers |
+| distant_peds_update 0xB7CA80 | __alloca_probe and stack out-buffers filled by callees |
 

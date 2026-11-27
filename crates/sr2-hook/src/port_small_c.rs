@@ -1,14 +1,1382 @@
-//! Ported functions (filled by a porting agent).
+//! Port module: small class methods, names R-Z (list small_c).
+//!
+//! Families (every address is pinned to its whole original body by `replace_pinned`):
+//! - `scalar_deleting_dtor` shapes (flag in the first stack argument, `ret 4`, EAX = this):
+//!   - `sdd_v`: store the vtable, then `delete` when bit 0 of the flag is set;
+//!   - `sdd_d`: call a plain destructor (ECX = this, ESI = this), then `delete` when bit 0 is set
+//!     and `this != 0`;
+//!   - `sdd_vd`: store the vtable, call a base destructor, then `delete` on bit 0;
+//!   - `sdd_exc`: the std exception shape (`this + 8` is a std::string destroyed by 0x4E8060).
+//!   The `delete` is the CRT's locked free: if the byte at 0x2527BF7 is not 1, call the import at
+//!   0xDB80CC (lock, argument 0x347ADE4), the free routine 0xCDE870 (EAX = pointer) and the import
+//!   at 0xDB80D0 (unlock).
+//! - `vhashtable<>` `init` (ret 0x10), `remove` (virtual `find` through slot 3 with the address of
+//!   the caller's own second argument slot as its out parameter, then one slot is cleared) and
+//!   `reset` (a tail jump through vtable slot 6).
+//! - `get_title` shapes: ESI / EDI constants, a call to the string helper, EAX = its result.
+//!
+//! Checks: per-function call counters only (every body calls out: destructors, the allocator,
+//! virtual methods), plus the offline differential test (`mod tests`): the original bytes run with
+//! their callees aimed at logging test stubs, against the real thunk, on random worlds; compared
+//! are EAX, ECX / EDX where the original leaves them defined, the preserved registers, the whole
+//! arena, the stack-argument slots a callee may write, and the sequence of callee calls with the
+//! registers and arguments they read.
+//!
+//! Every thunk saves XMM0-7 (an LTCG caller may keep a value there) and `pushad`s; the Rust body
+//! edits the saved registers, `popad` restores them.
 
 #![allow(unused_imports)]
+
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::portlib::*;
 use crate::{detour, log};
 
+const COUNT: usize = 86;
+
+const CAP: u32 = 1 << 24;
+static CNT: [AtomicU32; COUNT] = [const { AtomicU32::new(0) }; COUNT];
+
+#[inline(always)]
+fn count(i: usize) {
+    let c = &CNT[i];
+    if c.load(Ordering::Relaxed) < CAP {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// --- game addresses ------------------------------------------------------------------------------
+
+const NO_FREE_FLAG: usize = 0x0252_7BF7; // byte: 1 = the CRT free is skipped
+const IMP_ENTER: usize = 0x00DB_80CC; // import slot: lock
+const IMP_LEAVE: usize = 0x00DB_80D0; // import slot: unlock
+const LOCK_ARG: u32 = 0x0347_ADE4;
+const FREE: usize = 0x00CD_E870; // EAX = pointer; clobbers ECX / EDX
+const GLOBAL_A: usize = 0x00EB_80F0; // a778d0's "empty" key
+const GLOBAL_B: usize = 0x00EB_80F4;
+
+const W16: u8 = 0; // vhashtable remove: clear a 16-bit slot to 0xFFFF
+const DFFFF: u8 = 1; // a 32-bit slot to 0xFFFF
+const D0: u8 = 2; // a 32-bit slot to 0
+const PAIR: u8 = 3; // two 32-bit slots to the globals
+
+#[cfg(test)]
+pub(crate) static T_REDIR: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// A game address (the offline test aims callees and data at test copies).
+#[inline(always)]
+fn tgt(a: usize) -> usize {
+    #[cfg(test)]
+    {
+        T_REDIR.lock().unwrap().iter().find(|e| e.0 == a).map(|e| e.1).unwrap_or(a)
+    }
+    #[cfg(not(test))]
+    {
+        a
+    }
+}
+
+#[inline(always)]
+unsafe fn cr(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> u32 {
+    unsafe { call_regs(tgt(f), eax, ecx, edx, esi, edi, args) }
+}
+
+/// A virtual-method target read from an object (already a real address).
+#[inline(always)]
+unsafe fn crv(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> u32 {
+    unsafe { call_regs(f, eax, ecx, edx, esi, edi, args) }
+}
+
+/// The CRT `delete` tail shared by every scalar deleting destructor.
+unsafe fn sdd_free(this: u32) {
+    unsafe {
+        if rb(tgt(NO_FREE_FLAG)) != 1 {
+            crv(rd(tgt(IMP_ENTER)) as usize, 0, 0, 0, 0, 0, &[LOCK_ARG]);
+            cr(FREE, this, 0, 0, 0, 0, &[]);
+            crv(rd(tgt(IMP_LEAVE)) as usize, 0, 0, 0, 0, 0, &[LOCK_ARG]);
+        }
+    }
+}
+
+// --- registers and thunks ------------------------------------------------------------------------
+
+/// The `pushad` block, lowest address first.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // not every register is read
+struct Pushad {
+    edi: u32,
+    esi: u32,
+    ebp: u32,
+    esp: u32,
+    ebx: u32,
+    edx: u32,
+    ecx: u32,
+    eax: u32,
+}
+
+/// `pushad`, XMM0-7 saved, `f(&mut block, &stack args)`, XMM0-7 restored, `popad`, `ret N`.
+macro_rules! thunk {
+    ($name:ident, $f:ident, $ret:literal) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "pushad",
+                "sub esp, 128",
+                "movups xmmword ptr [esp], xmm0",
+                "movups xmmword ptr [esp + 16], xmm1",
+                "movups xmmword ptr [esp + 32], xmm2",
+                "movups xmmword ptr [esp + 48], xmm3",
+                "movups xmmword ptr [esp + 64], xmm4",
+                "movups xmmword ptr [esp + 80], xmm5",
+                "movups xmmword ptr [esp + 96], xmm6",
+                "movups xmmword ptr [esp + 112], xmm7",
+                "lea eax, [esp + 128]",
+                "lea ecx, [esp + 164]",
+                "push ecx",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, xmmword ptr [esp]",
+                "movups xmm1, xmmword ptr [esp + 16]",
+                "movups xmm2, xmmword ptr [esp + 32]",
+                "movups xmm3, xmmword ptr [esp + 48]",
+                "movups xmm4, xmmword ptr [esp + 64]",
+                "movups xmm5, xmmword ptr [esp + 80]",
+                "movups xmm6, xmmword ptr [esp + 96]",
+                "movups xmm7, xmmword ptr [esp + 112]",
+                "add esp, 128",
+                "popad",
+                $ret,
+                f = sym $f,
+            )
+        }
+    };
+}
+
+// --- scalar deleting destructors -----------------------------------------------------------------
+// ECX = this, stack (flag), ret 4, EAX = this.
+
+macro_rules! sdd_v {
+    ($e:ident, $t:ident, $i:expr, $ret:literal, $vt:expr) => {
+        extern "C" fn $e(r: &mut Pushad, a: *const u32) {
+            unsafe {
+                count($i);
+                let this = r.ecx;
+                wd(this as usize, $vt);
+                if rb(a as usize) & 1 != 0 {
+                    sdd_free(this);
+                }
+                r.eax = this;
+            }
+        }
+        thunk!($t, $e, $ret);
+    };
+}
+
+macro_rules! sdd_d {
+    ($e:ident, $t:ident, $i:expr, $ret:literal, $dtor:expr) => {
+        extern "C" fn $e(r: &mut Pushad, a: *const u32) {
+            unsafe {
+                count($i);
+                let this = r.ecx;
+                cr($dtor, r.eax, this, r.edx, this, r.edi, &[]);
+                if rb(a as usize) & 1 != 0 && this != 0 {
+                    sdd_free(this);
+                }
+                r.eax = this;
+            }
+        }
+        thunk!($t, $e, $ret);
+    };
+}
+
+macro_rules! sdd_vd {
+    ($e:ident, $t:ident, $i:expr, $ret:literal, $vt:expr, $dtor:expr) => {
+        extern "C" fn $e(r: &mut Pushad, a: *const u32) {
+            unsafe {
+                count($i);
+                let this = r.ecx;
+                wd(this as usize, $vt);
+                cr($dtor, r.eax, this, r.edx, this, r.edi, &[]);
+                if rb(a as usize) & 1 != 0 {
+                    sdd_free(this);
+                }
+                r.eax = this;
+            }
+        }
+        thunk!($t, $e, $ret);
+    };
+}
+
+macro_rules! sdd_exc {
+    ($e:ident, $t:ident, $i:expr, $ret:literal, $vt1:expr, $dtor:expr, $vt2:expr) => {
+        extern "C" fn $e(r: &mut Pushad, a: *const u32) {
+            unsafe {
+                count($i);
+                let this = r.ecx;
+                wd(this as usize, $vt1);
+                cr($dtor, r.eax, this + 8, r.edx, this, r.edi, &[]);
+                r.ecx = this + 8; // the original leaves ECX = &this->msg (a real destructor may clobber it)
+                wd(this as usize, $vt2);
+                if rb(a as usize) & 1 != 0 {
+                    sdd_free(this);
+                }
+                r.eax = this;
+            }
+        }
+        thunk!($t, $e, $ret);
+    };
+}
+
+// --- vhashtable<> --------------------------------------------------------------------------------
+// ECX = this: [0] vtable, +4 capacity, +8 slots, +0xC count, +0x10 probe limit.
+
+// init(slots, capacity, count, probe_limit), ret 0x10. When `count` is 0 the table is reset
+// through vtable slot 6 (EAX = vtable, ECX = this, EDX = the method), whose result is returned.
+macro_rules! ht_init {
+    ($e:ident, $t:ident, $i:expr, $ret:literal) => {
+        extern "C" fn $e(r: &mut Pushad, a: *const u32) {
+            unsafe {
+                count($i);
+                let this = r.ecx as usize;
+                let (a1, a2, a3, a4) = (rd(a as usize), rd(a as usize + 4), rd(a as usize + 8), rd(a as usize + 12));
+                wd(this + 8, a1);
+                wd(this + 4, a2);
+                wd(this + 0xC, a3);
+                let v = if a4 == 0 { 1 } else { a4 };
+                wd(this + 0x10, v);
+                if a3 == 0 {
+                    let vt = rd(this);
+                    let f = rd(vt as usize + 0x18);
+                    r.eax = crv(f as usize, vt, this as u32, f, r.esi, r.edi, &[]);
+                } else {
+                    r.eax = v;
+                    r.edx = a3;
+                }
+            }
+        }
+        thunk!($t, $e, $ret);
+    };
+}
+
+// reset(): count = 0, probe limit = 1, then a tail jump through vtable slot 6.
+macro_rules! ht_reset {
+    ($e:ident, $t:ident, $i:expr, $ret:literal) => {
+        extern "C" fn $e(r: &mut Pushad, _a: *const u32) {
+            unsafe {
+                count($i);
+                let this = r.ecx as usize;
+                let vt = rd(this);
+                let f = rd(vt as usize + 0x18);
+                wd(this + 0xC, 0);
+                wd(this + 0x10, 1);
+                r.eax = crv(f as usize, vt, this as u32, f, r.esi, r.edi, &[]);
+            }
+        }
+        thunk!($t, $e, $ret);
+    };
+}
+
+// remove(key, slot_in_out), ret 8. Vtable slot 3 (find) gets (the ADDRESS OF the caller's second
+// argument slot, key, that slot's value) and leaves the found slot's address in it; on a hit that
+// slot is cleared, the count drops and AL = 1.
+macro_rules! ht_remove {
+    ($e:ident, $t:ident, $i:expr, $ret:literal, $kind:expr) => {
+        extern "C" fn $e(r: &mut Pushad, a: *const u32) {
+            unsafe {
+                count($i);
+                let this = r.ecx as usize;
+                let slot = a.add(1) as usize;
+                let (a1, a2) = (rd(a as usize), rd(slot));
+                let vt = rd(this);
+                let f = rd(vt as usize + 0xC);
+                let e = crv(f as usize, vt, this as u32, f, this as u32, r.edi, &[slot as u32, a1, a2]);
+                if e & 0xFF == 0 {
+                    r.eax = e;
+                    return;
+                }
+                let it = rd(slot) as usize;
+                match $kind {
+                    W16 => *(it as *mut u16) = 0xFFFF,
+                    DFFFF => wd(it, 0xFFFF),
+                    D0 => wd(it, 0),
+                    _ => {
+                        wd(it, rd(tgt(GLOBAL_A)));
+                        wd(it + 4, rd(tgt(GLOBAL_B)));
+                    }
+                }
+                wd(this + 0xC, rd(this + 0xC).wrapping_sub(1));
+                r.eax = (it as u32 & !0xFF) | 1;
+            }
+        }
+        thunk!($t, $e, $ret);
+    };
+}
+
+// --- get_title shapes ----------------------------------------------------------------------------
+// push esi / edi; edi = X; esi = Y; call the string helper (ESI / EDI in); pop; EAX = its result.
+
+macro_rules! gt {
+    ($e:ident, $t:ident, $i:expr, $ret:literal, $f:expr, $edi:expr, $esi:expr) => {
+        extern "C" fn $e(r: &mut Pushad, _a: *const u32) {
+            unsafe {
+                count($i);
+                r.eax = cr($f, r.eax, r.ecx, r.edx, $esi, $edi, &[]);
+            }
+        }
+        thunk!($t, $e, $ret);
+    };
+}
+
+sdd_v!(e_4abec0, t_4abec0, 0, "ret 4", 0x00DDB0BC);
+sdd_v!(e_4e3df0, t_4e3df0, 1, "ret 4", 0x00DBF220);
+sdd_v!(e_4e7a90, t_4e7a90, 2, "ret 4", 0x00DDE2C8);
+sdd_v!(e_4e80c0, t_4e80c0, 3, "ret 4", 0x00DDE2C8);
+sdd_v!(e_70b930, t_70b930, 4, "ret 4", 0x00E18B94);
+sdd_v!(e_70b970, t_70b970, 5, "ret 4", 0x00E18B94);
+sdd_v!(e_70b9b0, t_70b9b0, 6, "ret 4", 0x00E18BD8);
+sdd_v!(e_70b9f0, t_70b9f0, 7, "ret 4", 0x00E18BD8);
+sdd_v!(e_812130, t_812130, 8, "ret 4", 0x00DFFD54);
+sdd_v!(e_86ec10, t_86ec10, 9, "ret 4", 0x00E27E7C);
+sdd_v!(e_871990, t_871990, 10, "ret 4", 0x00E27E7C);
+sdd_v!(e_9fe400, t_9fe400, 11, "ret 4", 0x00E3E200);
+sdd_v!(e_9fe440, t_9fe440, 12, "ret 4", 0x00E3E200);
+sdd_v!(e_9fe480, t_9fe480, 13, "ret 4", 0x00E3E268);
+sdd_v!(e_a776f0, t_a776f0, 14, "ret 4", 0x00E441B0);
+sdd_v!(e_ad3130, t_ad3130, 15, "ret 4", 0x00E45E30);
+sdd_v!(e_b89e60, t_b89e60, 16, "ret 4", 0x00E4C734);
+sdd_v!(e_b8ceb0, t_b8ceb0, 17, "ret 4", 0x00E4CEBC);
+sdd_v!(e_b8d190, t_b8d190, 18, "ret 4", 0x00E4CEBC);
+sdd_v!(e_b9c290, t_b9c290, 19, "ret 4", 0x00E4D240);
+sdd_v!(e_b9c350, t_b9c350, 20, "ret 4", 0x00E4D240);
+sdd_v!(e_b9c410, t_b9c410, 21, "ret 4", 0x00E4D3F0);
+sdd_v!(e_b9ca10, t_b9ca10, 22, "ret 4", 0x00E4D3F0);
+sdd_v!(e_b9d320, t_b9d320, 23, "ret 4", 0x00E4D3F0);
+sdd_d!(e_4a4b30, t_4a4b30, 24, "ret 4", 0x00BF4A00);
+sdd_d!(e_5210f0, t_5210f0, 25, "ret 4", 0x00BF4A00);
+sdd_d!(e_a57b80, t_a57b80, 26, "ret 4", 0x00A57BC0);
+sdd_d!(e_a5a180, t_a5a180, 27, "ret 4", 0x00A5A1C0);
+sdd_d!(e_a5d5a0, t_a5d5a0, 28, "ret 4", 0x00A5D5E0);
+sdd_d!(e_a61770, t_a61770, 29, "ret 4", 0x00A617B0);
+sdd_d!(e_a62cc0, t_a62cc0, 30, "ret 4", 0x00A62D00);
+sdd_d!(e_a6fc10, t_a6fc10, 31, "ret 4", 0x00A6FC50);
+sdd_vd!(e_a227d0, t_a227d0, 32, "ret 4", 0x00E3E3A8, 0x00A629F0);
+sdd_vd!(e_a66f50, t_a66f50, 33, "ret 4", 0x00E4380C, 0x00A629F0);
+sdd_exc!(e_4e44b0, t_4e44b0, 34, "ret 4", 0x00DDE2E8, 0x004E8060, 0x00DDE2C8);
+sdd_exc!(e_4e7fa0, t_4e7fa0, 35, "ret 4", 0x00DDE2E8, 0x004E8060, 0x00DDE2C8);
+sdd_exc!(e_4f1910, t_4f1910, 36, "ret 4", 0x00DDE68C, 0x004E8060, 0x00DDE2C8);
+sdd_exc!(e_4f19a0, t_4f19a0, 37, "ret 4", 0x00DDE68C, 0x004E8060, 0x00DDE2C8);
+sdd_exc!(e_4f1b30, t_4f1b30, 38, "ret 4", 0x00DDE68C, 0x004E8060, 0x00DDE2C8);
+ht_init!(e_4abf20, t_4abf20, 39, "ret 16");
+ht_init!(e_70ba40, t_70ba40, 40, "ret 16");
+ht_init!(e_70bca0, t_70bca0, 41, "ret 16");
+ht_init!(e_9fe5b0, t_9fe5b0, 42, "ret 16");
+ht_init!(e_9fe960, t_9fe960, 43, "ret 16");
+ht_init!(e_a5fc60, t_a5fc60, 44, "ret 16");
+ht_init!(e_a77750, t_a77750, 45, "ret 16");
+ht_init!(e_ad31a0, t_ad31a0, 46, "ret 16");
+ht_init!(e_b89ed0, t_b89ed0, 47, "ret 16");
+ht_reset!(e_4ac0e0, t_4ac0e0, 48, "ret");
+ht_reset!(e_70bc00, t_70bc00, 49, "ret");
+ht_reset!(e_70be30, t_70be30, 50, "ret");
+ht_reset!(e_9fe7b0, t_9fe7b0, 51, "ret");
+ht_reset!(e_9feb10, t_9feb10, 52, "ret");
+ht_reset!(e_a5fdd0, t_a5fdd0, 53, "ret");
+ht_reset!(e_a77920, t_a77920, 54, "ret");
+ht_reset!(e_ad33b0, t_ad33b0, 55, "ret");
+ht_reset!(e_b8a050, t_b8a050, 56, "ret");
+ht_remove!(e_4ac0a0, t_4ac0a0, 57, "ret 8", W16);
+ht_remove!(e_70bbc0, t_70bbc0, 58, "ret 8", W16);
+ht_remove!(e_70bdf0, t_70bdf0, 59, "ret 8", W16);
+ht_remove!(e_9fe770, t_9fe770, 60, "ret 8", W16);
+ht_remove!(e_9fead0, t_9fead0, 61, "ret 8", W16);
+ht_remove!(e_ad3370, t_ad3370, 62, "ret 8", W16);
+ht_remove!(e_a5fd90, t_a5fd90, 63, "ret 8", D0);
+ht_remove!(e_b8a010, t_b8a010, 64, "ret 8", DFFFF);
+ht_remove!(e_a778d0, t_a778d0, 65, "ret 8", PAIR);
+gt!(e_6150a0, t_6150a0, 66, "ret", 0x007F49E0, 0x00DFED94, 0x00DFED4C);
+gt!(e_615df0, t_615df0, 67, "ret", 0x007F49E0, 0x00000000, 0x00DF595C);
+gt!(e_616520, t_616520, 68, "ret", 0x007F49E0, 0x00DF5AA0, 0x00DF5AB4);
+gt!(e_617010, t_617010, 69, "ret", 0x007F4AD0, 0x00DF5E18, 0x00DF5E2C);
+gt!(e_618620, t_618620, 70, "ret", 0x007F4AD0, 0x00DF5FEC, 0x00DF43A8);
+gt!(e_619ba0, t_619ba0, 71, "ret", 0x007F4AD0, 0x00DF6284, 0x00DF6290);
+gt!(e_61a460, t_61a460, 72, "ret", 0x007F4AD0, 0x00DF6474, 0x00DF6480);
+gt!(e_61be70, t_61be70, 73, "ret", 0x007F4AD0, 0x00DF6584, 0x00DF6594);
+gt!(e_61c780, t_61c780, 74, "ret", 0x007F4AD0, 0x00DF66D4, 0x00DF66E0);
+gt!(e_61d3b0, t_61d3b0, 75, "ret", 0x007F4AD0, 0x00DF67F4, 0x00DF6800);
+gt!(e_61db50, t_61db50, 76, "ret", 0x007F4AD0, 0x00DF6954, 0x00DF695C);
+gt!(e_61e2a0, t_61e2a0, 77, "ret", 0x007F4AD0, 0x00DF6A34, 0x00DF6A3C);
+gt!(e_61f0f0, t_61f0f0, 78, "ret", 0x007F4AD0, 0x00DF6CA0, 0x00DF6CAC);
+gt!(e_6207d0, t_6207d0, 79, "ret", 0x007F49E0, 0x00DF71D4, 0x00DF71F8);
+gt!(e_627340, t_627340, 80, "ret", 0x007F49E0, 0x00DF78F8, 0x00DF790C);
+gt!(e_628f80, t_628f80, 81, "ret", 0x007F49E0, 0x00DF7FDC, 0x00DF8004);
+gt!(e_62e920, t_62e920, 82, "ret", 0x007F49E0, 0x00000000, 0x00DF8E4C);
+gt!(e_633250, t_633250, 83, "ret", 0x007F49E0, 0x00000000, 0x00DF937C);
+gt!(e_638d10, t_638d10, 84, "ret", 0x007F4AD0, 0x00DF9C2C, 0x00DF9C34);
+gt!(e_63a820, t_63a820, 85, "ret", 0x007F49E0, 0x00DF9DEC, 0x00DF9E2C);
+
+// --- the originals' bytes (true ends) ------------------------------------------------------------
+
+const B_4ABEC0: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xBC, 0xB0, 0xDD, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x85, 0x29, 0x83, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_4ABEC0: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_4E3DF0: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x20, 0xF2, 0xDB, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x55, 0xAA, 0x7F, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_4E3DF0: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_4E7A90: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xC8, 0xE2, 0xDD, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xB5, 0x6D, 0x7F, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_4E7A90: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_4E80C0: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xC8, 0xE2, 0xDD, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x85, 0x67, 0x7F, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_4E80C0: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_70B930: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x94, 0x8B, 0xE1, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x15, 0x2F, 0x5D, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_70B930: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_70B970: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x94, 0x8B, 0xE1, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xD5, 0x2E, 0x5D, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_70B970: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_70B9B0: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xD8, 0x8B, 0xE1, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x95, 0x2E, 0x5D, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_70B9B0: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_70B9F0: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xD8, 0x8B, 0xE1, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x55, 0x2E, 0x5D, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_70B9F0: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_812130: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x54, 0xFD, 0xDF, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x15, 0xC7, 0x4C, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_812130: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_86EC10: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x7C, 0x7E, 0xE2, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x35, 0xFC, 0x46, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_86EC10: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_871990: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x7C, 0x7E, 0xE2, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xB5, 0xCE, 0x46, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_871990: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_9FE400: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x00, 0xE2, 0xE3, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x45, 0x04, 0x2E, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_9FE400: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_9FE440: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x00, 0xE2, 0xE3, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x05, 0x04, 0x2E, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_9FE440: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_9FE480: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x68, 0xE2, 0xE3, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xC5, 0x03, 0x2E, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_9FE480: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_A776F0: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xB0, 0x41, 0xE4, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x55, 0x71, 0x26, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_A776F0: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_AD3130: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x30, 0x5E, 0xE4, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x15, 0xB7, 0x20, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_AD3130: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_B89E60: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x34, 0xC7, 0xE4, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xE5, 0x49, 0x15, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_B89E60: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_B8CEB0: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xBC, 0xCE, 0xE4, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x95, 0x19, 0x15, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_B8CEB0: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_B8D190: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xBC, 0xCE, 0xE4, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xB5, 0x16, 0x15, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_B8D190: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_B9C290: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x40, 0xD2, 0xE4, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xB5, 0x25, 0x14, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_B9C290: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_B9C350: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x40, 0xD2, 0xE4, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xF5, 0x24, 0x14, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_B9C350: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_B9C410: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xF0, 0xD3, 0xE4, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x35, 0x24, 0x14, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_B9C410: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_B9CA10: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xF0, 0xD3, 0xE4, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x35, 0x1E, 0x14, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_B9CA10: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_B9D320: [u8; 60] = [0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xF0, 0xD3, 0xE4, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x25, 0x15, 0x14, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_B9D320: [(usize, u32); 1] = [(0x26, 0xCDE870)];
+const B_4A4B30: [u8; 63] = [0x56, 0x8B, 0xF1, 0xE8, 0xC8, 0xFE, 0x74, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x2A, 0x85, 0xF6, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x12, 0x9D, 0x83, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_4A4B30: [(usize, u32); 2] = [(0x3, 0xBF4A00), (0x29, 0xCDE870)];
+const B_5210F0: [u8; 63] = [0x56, 0x8B, 0xF1, 0xE8, 0x08, 0x39, 0x6D, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x2A, 0x85, 0xF6, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x52, 0xD7, 0x7B, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_5210F0: [(usize, u32); 2] = [(0x3, 0xBF4A00), (0x29, 0xCDE870)];
+const B_A57B80: [u8; 63] = [0x56, 0x8B, 0xF1, 0xE8, 0x38, 0x00, 0x00, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x2A, 0x85, 0xF6, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xC2, 0x6C, 0x28, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_A57B80: [(usize, u32); 2] = [(0x3, 0xA57BC0), (0x29, 0xCDE870)];
+const B_A5A180: [u8; 63] = [0x56, 0x8B, 0xF1, 0xE8, 0x38, 0x00, 0x00, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x2A, 0x85, 0xF6, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xC2, 0x46, 0x28, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_A5A180: [(usize, u32); 2] = [(0x3, 0xA5A1C0), (0x29, 0xCDE870)];
+const B_A5D5A0: [u8; 63] = [0x56, 0x8B, 0xF1, 0xE8, 0x38, 0x00, 0x00, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x2A, 0x85, 0xF6, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xA2, 0x12, 0x28, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_A5D5A0: [(usize, u32); 2] = [(0x3, 0xA5D5E0), (0x29, 0xCDE870)];
+const B_A61770: [u8; 63] = [0x56, 0x8B, 0xF1, 0xE8, 0x38, 0x00, 0x00, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x2A, 0x85, 0xF6, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xD2, 0xD0, 0x27, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_A61770: [(usize, u32); 2] = [(0x3, 0xA617B0), (0x29, 0xCDE870)];
+const B_A62CC0: [u8; 63] = [0x56, 0x8B, 0xF1, 0xE8, 0x38, 0x00, 0x00, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x2A, 0x85, 0xF6, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x82, 0xBB, 0x27, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_A62CC0: [(usize, u32); 2] = [(0x3, 0xA62D00), (0x29, 0xCDE870)];
+const B_A6FC10: [u8; 63] = [0x56, 0x8B, 0xF1, 0xE8, 0x38, 0x00, 0x00, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x2A, 0x85, 0xF6, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x32, 0xEC, 0x26, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_A6FC10: [(usize, u32); 2] = [(0x3, 0xA6FC50), (0x29, 0xCDE870)];
+const B_A227D0: [u8; 65] = [0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xA8, 0xE3, 0xE3, 0x00, 0xE8, 0x12, 0x02, 0x04, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x70, 0xC0, 0x2B, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_A227D0: [(usize, u32); 2] = [(0x9, 0xA629F0), (0x2B, 0xCDE870)];
+const B_A66F50: [u8; 65] = [0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x0C, 0x38, 0xE4, 0x00, 0xE8, 0x92, 0xBA, 0xFF, 0xFF, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xF0, 0x78, 0x27, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_A66F50: [(usize, u32); 2] = [(0x9, 0xA629F0), (0x2B, 0xCDE870)];
+const B_4E44B0: [u8; 74] = [0x56, 0x8B, 0xF1, 0x8D, 0x4E, 0x08, 0xC7, 0x06, 0xE8, 0xE2, 0xDD, 0x00, 0xE8, 0x9F, 0x3B, 0x00, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0xC7, 0x06, 0xC8, 0xE2, 0xDD, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x87, 0xA3, 0x7F, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_4E44B0: [(usize, u32); 2] = [(0xC, 0x4E8060), (0x34, 0xCDE870)];
+const B_4E7FA0: [u8; 74] = [0x56, 0x8B, 0xF1, 0x8D, 0x4E, 0x08, 0xC7, 0x06, 0xE8, 0xE2, 0xDD, 0x00, 0xE8, 0xAF, 0x00, 0x00, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0xC7, 0x06, 0xC8, 0xE2, 0xDD, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x97, 0x68, 0x7F, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_4E7FA0: [(usize, u32); 2] = [(0xC, 0x4E8060), (0x34, 0xCDE870)];
+const B_4F1910: [u8; 74] = [0x56, 0x8B, 0xF1, 0x8D, 0x4E, 0x08, 0xC7, 0x06, 0x8C, 0xE6, 0xDD, 0x00, 0xE8, 0x3F, 0x67, 0xFF, 0xFF, 0xF6, 0x44, 0x24, 0x08, 0x01, 0xC7, 0x06, 0xC8, 0xE2, 0xDD, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x27, 0xCF, 0x7E, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_4F1910: [(usize, u32); 2] = [(0xC, 0x4E8060), (0x34, 0xCDE870)];
+const B_4F19A0: [u8; 74] = [0x56, 0x8B, 0xF1, 0x8D, 0x4E, 0x08, 0xC7, 0x06, 0x8C, 0xE6, 0xDD, 0x00, 0xE8, 0xAF, 0x66, 0xFF, 0xFF, 0xF6, 0x44, 0x24, 0x08, 0x01, 0xC7, 0x06, 0xC8, 0xE2, 0xDD, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x97, 0xCE, 0x7E, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_4F19A0: [(usize, u32); 2] = [(0xC, 0x4E8060), (0x34, 0xCDE870)];
+const B_4F1B30: [u8; 74] = [0x56, 0x8B, 0xF1, 0x8D, 0x4E, 0x08, 0xC7, 0x06, 0x8C, 0xE6, 0xDD, 0x00, 0xE8, 0x1F, 0x65, 0xFF, 0xFF, 0xF6, 0x44, 0x24, 0x08, 0x01, 0xC7, 0x06, 0xC8, 0xE2, 0xDD, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x07, 0xCD, 0x7E, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00];
+#[cfg(test)]
+const K_4F1B30: [(usize, u32); 2] = [(0xC, 0x4E8060), (0x34, 0xCDE870)];
+const B_4ABF20: [u8; 51] = [0x8B, 0x44, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x41, 0x08, 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x89, 0x51, 0x04, 0x8B, 0x54, 0x24, 0x0C, 0x89, 0x51, 0x0C, 0x75, 0x05, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x89, 0x41, 0x10, 0x75, 0x07, 0x8B, 0x01, 0x8B, 0x50, 0x18, 0xFF, 0xD2, 0xC2, 0x10, 0x00];
+#[cfg(test)]
+const K_4ABF20: [(usize, u32); 0] = [];
+const B_70BA40: [u8; 51] = [0x8B, 0x44, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x41, 0x08, 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x89, 0x51, 0x04, 0x8B, 0x54, 0x24, 0x0C, 0x89, 0x51, 0x0C, 0x75, 0x05, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x89, 0x41, 0x10, 0x75, 0x07, 0x8B, 0x01, 0x8B, 0x50, 0x18, 0xFF, 0xD2, 0xC2, 0x10, 0x00];
+#[cfg(test)]
+const K_70BA40: [(usize, u32); 0] = [];
+const B_70BCA0: [u8; 51] = [0x8B, 0x44, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x41, 0x08, 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x89, 0x51, 0x04, 0x8B, 0x54, 0x24, 0x0C, 0x89, 0x51, 0x0C, 0x75, 0x05, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x89, 0x41, 0x10, 0x75, 0x07, 0x8B, 0x01, 0x8B, 0x50, 0x18, 0xFF, 0xD2, 0xC2, 0x10, 0x00];
+#[cfg(test)]
+const K_70BCA0: [(usize, u32); 0] = [];
+const B_9FE5B0: [u8; 51] = [0x8B, 0x44, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x41, 0x08, 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x89, 0x51, 0x04, 0x8B, 0x54, 0x24, 0x0C, 0x89, 0x51, 0x0C, 0x75, 0x05, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x89, 0x41, 0x10, 0x75, 0x07, 0x8B, 0x01, 0x8B, 0x50, 0x18, 0xFF, 0xD2, 0xC2, 0x10, 0x00];
+#[cfg(test)]
+const K_9FE5B0: [(usize, u32); 0] = [];
+const B_9FE960: [u8; 51] = [0x8B, 0x44, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x41, 0x08, 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x89, 0x51, 0x04, 0x8B, 0x54, 0x24, 0x0C, 0x89, 0x51, 0x0C, 0x75, 0x05, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x89, 0x41, 0x10, 0x75, 0x07, 0x8B, 0x01, 0x8B, 0x50, 0x18, 0xFF, 0xD2, 0xC2, 0x10, 0x00];
+#[cfg(test)]
+const K_9FE960: [(usize, u32); 0] = [];
+const B_A5FC60: [u8; 51] = [0x8B, 0x44, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x41, 0x08, 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x89, 0x51, 0x04, 0x8B, 0x54, 0x24, 0x0C, 0x89, 0x51, 0x0C, 0x75, 0x05, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x89, 0x41, 0x10, 0x75, 0x07, 0x8B, 0x01, 0x8B, 0x50, 0x18, 0xFF, 0xD2, 0xC2, 0x10, 0x00];
+#[cfg(test)]
+const K_A5FC60: [(usize, u32); 0] = [];
+const B_A77750: [u8; 51] = [0x8B, 0x44, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x41, 0x08, 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x89, 0x51, 0x04, 0x8B, 0x54, 0x24, 0x0C, 0x89, 0x51, 0x0C, 0x75, 0x05, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x89, 0x41, 0x10, 0x75, 0x07, 0x8B, 0x01, 0x8B, 0x50, 0x18, 0xFF, 0xD2, 0xC2, 0x10, 0x00];
+#[cfg(test)]
+const K_A77750: [(usize, u32); 0] = [];
+const B_AD31A0: [u8; 51] = [0x8B, 0x44, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x41, 0x08, 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x89, 0x51, 0x04, 0x8B, 0x54, 0x24, 0x0C, 0x89, 0x51, 0x0C, 0x75, 0x05, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x89, 0x41, 0x10, 0x75, 0x07, 0x8B, 0x01, 0x8B, 0x50, 0x18, 0xFF, 0xD2, 0xC2, 0x10, 0x00];
+#[cfg(test)]
+const K_AD31A0: [(usize, u32); 0] = [];
+const B_B89ED0: [u8; 51] = [0x8B, 0x44, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x08, 0x89, 0x41, 0x08, 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x89, 0x51, 0x04, 0x8B, 0x54, 0x24, 0x0C, 0x89, 0x51, 0x0C, 0x75, 0x05, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x85, 0xD2, 0x89, 0x41, 0x10, 0x75, 0x07, 0x8B, 0x01, 0x8B, 0x50, 0x18, 0xFF, 0xD2, 0xC2, 0x10, 0x00];
+#[cfg(test)]
+const K_B89ED0: [(usize, u32); 0] = [];
+const B_4AC0E0: [u8; 21] = [0x8B, 0x01, 0x8B, 0x50, 0x18, 0xC7, 0x41, 0x0C, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE2];
+#[cfg(test)]
+const K_4AC0E0: [(usize, u32); 0] = [];
+const B_70BC00: [u8; 21] = [0x8B, 0x01, 0x8B, 0x50, 0x18, 0xC7, 0x41, 0x0C, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE2];
+#[cfg(test)]
+const K_70BC00: [(usize, u32); 0] = [];
+const B_70BE30: [u8; 21] = [0x8B, 0x01, 0x8B, 0x50, 0x18, 0xC7, 0x41, 0x0C, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE2];
+#[cfg(test)]
+const K_70BE30: [(usize, u32); 0] = [];
+const B_9FE7B0: [u8; 21] = [0x8B, 0x01, 0x8B, 0x50, 0x18, 0xC7, 0x41, 0x0C, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE2];
+#[cfg(test)]
+const K_9FE7B0: [(usize, u32); 0] = [];
+const B_9FEB10: [u8; 21] = [0x8B, 0x01, 0x8B, 0x50, 0x18, 0xC7, 0x41, 0x0C, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE2];
+#[cfg(test)]
+const K_9FEB10: [(usize, u32); 0] = [];
+const B_A5FDD0: [u8; 21] = [0x8B, 0x01, 0x8B, 0x50, 0x18, 0xC7, 0x41, 0x0C, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE2];
+#[cfg(test)]
+const K_A5FDD0: [(usize, u32); 0] = [];
+const B_A77920: [u8; 21] = [0x8B, 0x01, 0x8B, 0x50, 0x18, 0xC7, 0x41, 0x0C, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE2];
+#[cfg(test)]
+const K_A77920: [(usize, u32); 0] = [];
+const B_AD33B0: [u8; 21] = [0x8B, 0x01, 0x8B, 0x50, 0x18, 0xC7, 0x41, 0x0C, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE2];
+#[cfg(test)]
+const K_AD33B0: [(usize, u32); 0] = [];
+const B_B8A050: [u8; 21] = [0x8B, 0x01, 0x8B, 0x50, 0x18, 0xC7, 0x41, 0x0C, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x41, 0x10, 0x01, 0x00, 0x00, 0x00, 0xFF, 0xE2];
+#[cfg(test)]
+const K_B8A050: [(usize, u32); 0] = [];
+const B_4AC0A0: [u8; 54] = [0x8B, 0x54, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x0C, 0x8B, 0x06, 0x51, 0x52, 0x8B, 0x50, 0x0C, 0x8D, 0x4C, 0x24, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0xD2, 0x84, 0xC0, 0x75, 0x04, 0x5E, 0xC2, 0x08, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0x66, 0xC7, 0x00, 0xFF, 0xFF, 0x83, 0x46, 0x0C, 0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00];
+#[cfg(test)]
+const K_4AC0A0: [(usize, u32); 0] = [];
+const B_70BBC0: [u8; 54] = [0x8B, 0x54, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x0C, 0x8B, 0x06, 0x51, 0x52, 0x8B, 0x50, 0x0C, 0x8D, 0x4C, 0x24, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0xD2, 0x84, 0xC0, 0x75, 0x04, 0x5E, 0xC2, 0x08, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0x66, 0xC7, 0x00, 0xFF, 0xFF, 0x83, 0x46, 0x0C, 0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00];
+#[cfg(test)]
+const K_70BBC0: [(usize, u32); 0] = [];
+const B_70BDF0: [u8; 54] = [0x8B, 0x54, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x0C, 0x8B, 0x06, 0x51, 0x52, 0x8B, 0x50, 0x0C, 0x8D, 0x4C, 0x24, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0xD2, 0x84, 0xC0, 0x75, 0x04, 0x5E, 0xC2, 0x08, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0x66, 0xC7, 0x00, 0xFF, 0xFF, 0x83, 0x46, 0x0C, 0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00];
+#[cfg(test)]
+const K_70BDF0: [(usize, u32); 0] = [];
+const B_9FE770: [u8; 54] = [0x8B, 0x54, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x0C, 0x8B, 0x06, 0x51, 0x52, 0x8B, 0x50, 0x0C, 0x8D, 0x4C, 0x24, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0xD2, 0x84, 0xC0, 0x75, 0x04, 0x5E, 0xC2, 0x08, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0x66, 0xC7, 0x00, 0xFF, 0xFF, 0x83, 0x46, 0x0C, 0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00];
+#[cfg(test)]
+const K_9FE770: [(usize, u32); 0] = [];
+const B_9FEAD0: [u8; 54] = [0x8B, 0x54, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x0C, 0x8B, 0x06, 0x51, 0x52, 0x8B, 0x50, 0x0C, 0x8D, 0x4C, 0x24, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0xD2, 0x84, 0xC0, 0x75, 0x04, 0x5E, 0xC2, 0x08, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0x66, 0xC7, 0x00, 0xFF, 0xFF, 0x83, 0x46, 0x0C, 0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00];
+#[cfg(test)]
+const K_9FEAD0: [(usize, u32); 0] = [];
+const B_AD3370: [u8; 54] = [0x8B, 0x54, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x0C, 0x8B, 0x06, 0x51, 0x52, 0x8B, 0x50, 0x0C, 0x8D, 0x4C, 0x24, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0xD2, 0x84, 0xC0, 0x75, 0x04, 0x5E, 0xC2, 0x08, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0x66, 0xC7, 0x00, 0xFF, 0xFF, 0x83, 0x46, 0x0C, 0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00];
+#[cfg(test)]
+const K_AD3370: [(usize, u32); 0] = [];
+const B_A5FD90: [u8; 55] = [0x8B, 0x54, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x0C, 0x8B, 0x06, 0x51, 0x52, 0x8B, 0x50, 0x0C, 0x8D, 0x4C, 0x24, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0xD2, 0x84, 0xC0, 0x75, 0x04, 0x5E, 0xC2, 0x08, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x83, 0x46, 0x0C, 0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00];
+#[cfg(test)]
+const K_A5FD90: [(usize, u32); 0] = [];
+const B_B8A010: [u8; 55] = [0x8B, 0x54, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x0C, 0x8B, 0x06, 0x51, 0x52, 0x8B, 0x50, 0x0C, 0x8D, 0x4C, 0x24, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0xD2, 0x84, 0xC0, 0x75, 0x04, 0x5E, 0xC2, 0x08, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0xC7, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x83, 0x46, 0x0C, 0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00];
+#[cfg(test)]
+const K_B8A010: [(usize, u32); 0] = [];
+const B_A778D0: [u8; 69] = [0x8B, 0x54, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x8B, 0x4C, 0x24, 0x0C, 0x8B, 0x06, 0x51, 0x52, 0x8B, 0x50, 0x0C, 0x8D, 0x4C, 0x24, 0x14, 0x51, 0x8B, 0xCE, 0xFF, 0xD2, 0x84, 0xC0, 0x75, 0x04, 0x5E, 0xC2, 0x08, 0x00, 0xA1, 0xF0, 0x80, 0xEB, 0x00, 0x8B, 0x4C, 0x24, 0x0C, 0x89, 0x01, 0x8B, 0x15, 0xF4, 0x80, 0xEB, 0x00, 0x8B, 0x44, 0x24, 0x0C, 0x89, 0x50, 0x04, 0x83, 0x46, 0x0C, 0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00];
+#[cfg(test)]
+const K_A778D0: [(usize, u32); 0] = [];
+const B_6150A0: [u8; 20] = [0x56, 0x57, 0xBF, 0x94, 0xED, 0xDF, 0x00, 0xBE, 0x4C, 0xED, 0xDF, 0x00, 0xE8, 0x2F, 0xF9, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_6150A0: [(usize, u32); 1] = [(0xC, 0x7F49E0)];
+const B_615DF0: [u8; 17] = [0x56, 0x57, 0x33, 0xFF, 0xBE, 0x5C, 0x59, 0xDF, 0x00, 0xE8, 0xE2, 0xEB, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_615DF0: [(usize, u32); 1] = [(0x9, 0x7F49E0)];
+const B_616520: [u8; 20] = [0x56, 0x57, 0xBF, 0xA0, 0x5A, 0xDF, 0x00, 0xBE, 0xB4, 0x5A, 0xDF, 0x00, 0xE8, 0xAF, 0xE4, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_616520: [(usize, u32); 1] = [(0xC, 0x7F49E0)];
+const B_617010: [u8; 20] = [0x56, 0x57, 0xBF, 0x18, 0x5E, 0xDF, 0x00, 0xBE, 0x2C, 0x5E, 0xDF, 0x00, 0xE8, 0xAF, 0xDA, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_617010: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_618620: [u8; 20] = [0x56, 0x57, 0xBF, 0xEC, 0x5F, 0xDF, 0x00, 0xBE, 0xA8, 0x43, 0xDF, 0x00, 0xE8, 0x9F, 0xC4, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_618620: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_619BA0: [u8; 20] = [0x56, 0x57, 0xBF, 0x84, 0x62, 0xDF, 0x00, 0xBE, 0x90, 0x62, 0xDF, 0x00, 0xE8, 0x1F, 0xAF, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_619BA0: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_61A460: [u8; 20] = [0x56, 0x57, 0xBF, 0x74, 0x64, 0xDF, 0x00, 0xBE, 0x80, 0x64, 0xDF, 0x00, 0xE8, 0x5F, 0xA6, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_61A460: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_61BE70: [u8; 20] = [0x56, 0x57, 0xBF, 0x84, 0x65, 0xDF, 0x00, 0xBE, 0x94, 0x65, 0xDF, 0x00, 0xE8, 0x4F, 0x8C, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_61BE70: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_61C780: [u8; 20] = [0x56, 0x57, 0xBF, 0xD4, 0x66, 0xDF, 0x00, 0xBE, 0xE0, 0x66, 0xDF, 0x00, 0xE8, 0x3F, 0x83, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_61C780: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_61D3B0: [u8; 20] = [0x56, 0x57, 0xBF, 0xF4, 0x67, 0xDF, 0x00, 0xBE, 0x00, 0x68, 0xDF, 0x00, 0xE8, 0x0F, 0x77, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_61D3B0: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_61DB50: [u8; 20] = [0x56, 0x57, 0xBF, 0x54, 0x69, 0xDF, 0x00, 0xBE, 0x5C, 0x69, 0xDF, 0x00, 0xE8, 0x6F, 0x6F, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_61DB50: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_61E2A0: [u8; 20] = [0x56, 0x57, 0xBF, 0x34, 0x6A, 0xDF, 0x00, 0xBE, 0x3C, 0x6A, 0xDF, 0x00, 0xE8, 0x1F, 0x68, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_61E2A0: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_61F0F0: [u8; 20] = [0x56, 0x57, 0xBF, 0xA0, 0x6C, 0xDF, 0x00, 0xBE, 0xAC, 0x6C, 0xDF, 0x00, 0xE8, 0xCF, 0x59, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_61F0F0: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_6207D0: [u8; 20] = [0x56, 0x57, 0xBF, 0xD4, 0x71, 0xDF, 0x00, 0xBE, 0xF8, 0x71, 0xDF, 0x00, 0xE8, 0xFF, 0x41, 0x1D, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_6207D0: [(usize, u32); 1] = [(0xC, 0x7F49E0)];
+const B_627340: [u8; 20] = [0x56, 0x57, 0xBF, 0xF8, 0x78, 0xDF, 0x00, 0xBE, 0x0C, 0x79, 0xDF, 0x00, 0xE8, 0x8F, 0xD6, 0x1C, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_627340: [(usize, u32); 1] = [(0xC, 0x7F49E0)];
+const B_628F80: [u8; 20] = [0x56, 0x57, 0xBF, 0xDC, 0x7F, 0xDF, 0x00, 0xBE, 0x04, 0x80, 0xDF, 0x00, 0xE8, 0x4F, 0xBA, 0x1C, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_628F80: [(usize, u32); 1] = [(0xC, 0x7F49E0)];
+const B_62E920: [u8; 17] = [0x56, 0x57, 0x33, 0xFF, 0xBE, 0x4C, 0x8E, 0xDF, 0x00, 0xE8, 0xB2, 0x60, 0x1C, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_62E920: [(usize, u32); 1] = [(0x9, 0x7F49E0)];
+const B_633250: [u8; 17] = [0x56, 0x57, 0x33, 0xFF, 0xBE, 0x7C, 0x93, 0xDF, 0x00, 0xE8, 0x82, 0x17, 0x1C, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_633250: [(usize, u32); 1] = [(0x9, 0x7F49E0)];
+const B_638D10: [u8; 20] = [0x56, 0x57, 0xBF, 0x2C, 0x9C, 0xDF, 0x00, 0xBE, 0x34, 0x9C, 0xDF, 0x00, 0xE8, 0xAF, 0xBD, 0x1B, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_638D10: [(usize, u32); 1] = [(0xC, 0x7F4AD0)];
+const B_63A820: [u8; 20] = [0x56, 0x57, 0xBF, 0xEC, 0x9D, 0xDF, 0x00, 0xBE, 0x2C, 0x9E, 0xDF, 0x00, 0xE8, 0xAF, 0xA1, 0x1B, 0x00, 0x5F, 0x5E, 0xC3];
+#[cfg(test)]
+const K_63A820: [(usize, u32); 1] = [(0xC, 0x7F49E0)];
+
+struct Port {
+    name: &'static str,
+    addr: usize,
+    body: &'static [u8],
+    thunk: extern "C" fn(),
+}
+
+static PORTS: [Port; COUNT] = [
+    Port { name: "vhashtable<>::scalar_deleting_dtor", addr: 0x004ABEC0, body: &B_4ABEC0, thunk: t_4abec0 },
+    Port { name: "std::locale::facet::scalar_deleting_dtor", addr: 0x004E3DF0, body: &B_4E3DF0, thunk: t_4e3df0 },
+    Port { name: "stdext::bad_alloc::scalar_deleting_dtor", addr: 0x004E7A90, body: &B_4E7A90, thunk: t_4e7a90 },
+    Port { name: "stdext::exception::scalar_deleting_dtor", addr: 0x004E80C0, body: &B_4E80C0, thunk: t_4e80c0 },
+    Port { name: "vhashtable_inplace<>::scalar_deleting_dtor", addr: 0x0070B930, body: &B_70B930, thunk: t_70b930 },
+    Port { name: "vhashtable<>::scalar_deleting_dtor_2", addr: 0x0070B970, body: &B_70B970, thunk: t_70b970 },
+    Port { name: "vhashtable_inplace<>::scalar_deleting_dtor_2", addr: 0x0070B9B0, body: &B_70B9B0, thunk: t_70b9b0 },
+    Port { name: "vhashtable<>::scalar_deleting_dtor_3", addr: 0x0070B9F0, body: &B_70B9F0, thunk: t_70b9f0 },
+    Port { name: "stub_multi_session_info::scalar_deleting_dtor", addr: 0x00812130, body: &B_812130, thunk: t_812130 },
+    Port { name: "rocket_multi_registration::scalar_deleting_dtor", addr: 0x0086EC10, body: &B_86EC10, thunk: t_86ec10 },
+    Port { name: "trigger_multi_registration::scalar_deleting_dtor", addr: 0x00871990, body: &B_871990, thunk: t_871990 },
+    Port { name: "vhashtable<>::scalar_deleting_dtor_4", addr: 0x009FE400, body: &B_9FE400, thunk: t_9fe400 },
+    Port { name: "vhashtable_inplace<>::scalar_deleting_dtor_3", addr: 0x009FE440, body: &B_9FE440, thunk: t_9fe440 },
+    Port { name: "vhashtable_inplace<>::scalar_deleting_dtor_4", addr: 0x009FE480, body: &B_9FE480, thunk: t_9fe480 },
+    Port { name: "vhashtable<>::scalar_deleting_dtor_7", addr: 0x00A776F0, body: &B_A776F0, thunk: t_a776f0 },
+    Port { name: "vhashtable<>::scalar_deleting_dtor_8", addr: 0x00AD3130, body: &B_AD3130, thunk: t_ad3130 },
+    Port { name: "vhashtable<>::scalar_deleting_dtor_9", addr: 0x00B89E60, body: &B_B89E60, thunk: t_b89e60 },
+    Port { name: "vint_callback::scalar_deleting_dtor_2", addr: 0x00B8CEB0, body: &B_B8CEB0, thunk: t_b8ceb0 },
+    Port { name: "vint_callback_lua::scalar_deleting_dtor", addr: 0x00B8D190, body: &B_B8D190, thunk: t_b8d190 },
+    Port { name: "vint_object_base::scalar_deleting_dtor_2", addr: 0x00B9C290, body: &B_B9C290, thunk: t_b9c290 },
+    Port { name: "vint_element_base::scalar_deleting_dtor_2", addr: 0x00B9C350, body: &B_B9C350, thunk: t_b9c350 },
+    Port { name: "vint_object_factory::scalar_deleting_dtor", addr: 0x00B9C410, body: &B_B9C410, thunk: t_b9c410 },
+    Port { name: "vint_object_factory_imp<>::scalar_deleting_dtor", addr: 0x00B9CA10, body: &B_B9CA10, thunk: t_b9ca10 },
+    Port { name: "vint_object_factory_imp<>::scalar_deleting_dtor_2", addr: 0x00B9D320, body: &B_B9D320, thunk: t_b9d320 },
+    Port { name: "string_pool::scalar_deleting_dtor", addr: 0x004A4B30, body: &B_4A4B30, thunk: t_4a4b30 },
+    Port { name: "split_mempool_template<>::scalar_deleting_dtor", addr: 0x005210F0, body: &B_5210F0, thunk: t_5210f0 },
+    Port { name: "script_group::scalar_deleting_dtor", addr: 0x00A57B80, body: &B_A57B80, thunk: t_a57b80 },
+    Port { name: "script_item::scalar_deleting_dtor", addr: 0x00A5A180, body: &B_A5A180, thunk: t_a5a180 },
+    Port { name: "script_mover::scalar_deleting_dtor", addr: 0x00A5D5A0, body: &B_A5D5A0, thunk: t_a5d5a0 },
+    Port { name: "script_npc::scalar_deleting_dtor", addr: 0x00A61770, body: &B_A61770, thunk: t_a61770 },
+    Port { name: "script_path::scalar_deleting_dtor", addr: 0x00A62CC0, body: &B_A62CC0, thunk: t_a62cc0 },
+    Port { name: "script_vehicle::scalar_deleting_dtor", addr: 0x00A6FC10, body: &B_A6FC10, thunk: t_a6fc10 },
+    Port { name: "script_cover_node::scalar_deleting_dtor", addr: 0x00A227D0, body: &B_A227D0, thunk: t_a227d0 },
+    Port { name: "script_spawn_region::scalar_deleting_dtor", addr: 0x00A66F50, body: &B_A66F50, thunk: t_a66f50 },
+    Port { name: "std::ios_base::failure::scalar_deleting_dtor", addr: 0x004E44B0, body: &B_4E44B0, thunk: t_4e44b0 },
+    Port { name: "std::runtime_error::scalar_deleting_dtor", addr: 0x004E7FA0, body: &B_4E7FA0, thunk: t_4e7fa0 },
+    Port { name: "std::length_error::scalar_deleting_dtor", addr: 0x004F1910, body: &B_4F1910, thunk: t_4f1910 },
+    Port { name: "std::logic_error::scalar_deleting_dtor", addr: 0x004F19A0, body: &B_4F19A0, thunk: t_4f19a0 },
+    Port { name: "std::out_of_range::scalar_deleting_dtor", addr: 0x004F1B30, body: &B_4F1B30, thunk: t_4f1b30 },
+    Port { name: "vhashtable<>::init", addr: 0x004ABF20, body: &B_4ABF20, thunk: t_4abf20 },
+    Port { name: "vhashtable<>::init_2", addr: 0x0070BA40, body: &B_70BA40, thunk: t_70ba40 },
+    Port { name: "vhashtable<>::init_3", addr: 0x0070BCA0, body: &B_70BCA0, thunk: t_70bca0 },
+    Port { name: "vhashtable<>::init_4", addr: 0x009FE5B0, body: &B_9FE5B0, thunk: t_9fe5b0 },
+    Port { name: "vhashtable<>::init_5", addr: 0x009FE960, body: &B_9FE960, thunk: t_9fe960 },
+    Port { name: "vhashtable<>::init_6", addr: 0x00A5FC60, body: &B_A5FC60, thunk: t_a5fc60 },
+    Port { name: "vhashtable<>::init_7", addr: 0x00A77750, body: &B_A77750, thunk: t_a77750 },
+    Port { name: "vhashtable<>::init_8", addr: 0x00AD31A0, body: &B_AD31A0, thunk: t_ad31a0 },
+    Port { name: "vhashtable<>::init_9", addr: 0x00B89ED0, body: &B_B89ED0, thunk: t_b89ed0 },
+    Port { name: "vhashtable<>::reset", addr: 0x004AC0E0, body: &B_4AC0E0, thunk: t_4ac0e0 },
+    Port { name: "vhashtable<>::reset_2", addr: 0x0070BC00, body: &B_70BC00, thunk: t_70bc00 },
+    Port { name: "vhashtable<>::reset_3", addr: 0x0070BE30, body: &B_70BE30, thunk: t_70be30 },
+    Port { name: "vhashtable<>::reset_4", addr: 0x009FE7B0, body: &B_9FE7B0, thunk: t_9fe7b0 },
+    Port { name: "vhashtable<>::reset_5", addr: 0x009FEB10, body: &B_9FEB10, thunk: t_9feb10 },
+    Port { name: "vhashtable<>::reset_6", addr: 0x00A5FDD0, body: &B_A5FDD0, thunk: t_a5fdd0 },
+    Port { name: "vhashtable<>::reset_7", addr: 0x00A77920, body: &B_A77920, thunk: t_a77920 },
+    Port { name: "vhashtable<>::reset_8", addr: 0x00AD33B0, body: &B_AD33B0, thunk: t_ad33b0 },
+    Port { name: "vhashtable<>::reset_9", addr: 0x00B8A050, body: &B_B8A050, thunk: t_b8a050 },
+    Port { name: "vhashtable<>::remove", addr: 0x004AC0A0, body: &B_4AC0A0, thunk: t_4ac0a0 },
+    Port { name: "vhashtable<>::remove_2", addr: 0x0070BBC0, body: &B_70BBC0, thunk: t_70bbc0 },
+    Port { name: "vhashtable<>::remove_3", addr: 0x0070BDF0, body: &B_70BDF0, thunk: t_70bdf0 },
+    Port { name: "vhashtable<>::remove_4", addr: 0x009FE770, body: &B_9FE770, thunk: t_9fe770 },
+    Port { name: "vhashtable<>::remove_5", addr: 0x009FEAD0, body: &B_9FEAD0, thunk: t_9fead0 },
+    Port { name: "vhashtable<>::remove_8", addr: 0x00AD3370, body: &B_AD3370, thunk: t_ad3370 },
+    Port { name: "vhashtable<>::remove_6", addr: 0x00A5FD90, body: &B_A5FD90, thunk: t_a5fd90 },
+    Port { name: "vhashtable<>::remove_9", addr: 0x00B8A010, body: &B_B8A010, thunk: t_b8a010 },
+    Port { name: "vhashtable<>::remove_7", addr: 0x00A778D0, body: &B_A778D0, thunk: t_a778d0 },
+    Port { name: "racing_diversion_type_info::get_title", addr: 0x006150A0, body: &B_6150A0, thunk: t_6150a0 },
+    Port { name: "safecracking_diversion_type_info::get_title", addr: 0x00615DF0, body: &B_615DF0, thunk: t_615df0 },
+    Port { name: "streaking_diversion_type::get_title", addr: 0x00616520, body: &B_616520, thunk: t_616520 },
+    Port { name: "stunt_back_seat_driver_diversion_type::get_title", addr: 0x00617010, body: &B_617010, thunk: t_617010 },
+    Port { name: "stunt_jumping_diversion_type::get_title", addr: 0x00618620, body: &B_618620, thunk: t_618620 },
+    Port { name: "stunt_drifting_diversion_type::get_title", addr: 0x00619BA0, body: &B_619BA0, thunk: t_619ba0 },
+    Port { name: "stunt_hydraulics_diversion_type::get_title", addr: 0x0061A460, body: &B_61A460, thunk: t_61a460 },
+    Port { name: "stunt_low_flying_diversion_type::get_title", addr: 0x0061BE70, body: &B_61BE70, thunk: t_61be70 },
+    Port { name: "stunt_near_miss_diversion_type::get_title", addr: 0x0061C780, body: &B_61C780, thunk: t_61c780 },
+    Port { name: "stunt_oncoming_traffic_diversion_type::get_title", addr: 0x0061D3B0, body: &B_61D3B0, thunk: t_61d3b0 },
+    Port { name: "stunt_peel_out_diversion_type::get_title", addr: 0x0061DB50, body: &B_61DB50, thunk: t_61db50 },
+    Port { name: "stunt_wheels_diversion_type::get_title", addr: 0x0061E2A0, body: &B_61E2A0, thunk: t_61e2a0 },
+    Port { name: "survival_diversion_type_info::get_title", addr: 0x0061F0F0, body: &B_61F0F0, thunk: t_61f0f0 },
+    Port { name: "tagging_diversion_type_info::get_title", addr: 0x006207D0, body: &B_6207D0, thunk: t_6207d0 },
+    Port { name: "taunting_diversion_type::get_title", addr: 0x00627340, body: &B_627340, thunk: t_627340 },
+    Port { name: "taxi_diversion_type_info::get_title", addr: 0x00628F80, body: &B_628F80, thunk: t_628f80 },
+    Port { name: "tow_truck_diversion_type_info::get_title", addr: 0x0062E920, body: &B_62E920, thunk: t_62e920 },
+    Port { name: "vehicle_surfing_style_two_diversion_type_info::get_title", addr: 0x00633250, body: &B_633250, thunk: t_633250 },
+    Port { name: "whoring_diversion_type_info::get_title", addr: 0x00638D10, body: &B_638D10, thunk: t_638d10 },
+    Port { name: "windshield_cannon_diversion_type_info::get_title", addr: 0x0063A820, body: &B_63A820, thunk: t_63a820 },
+];
+
 /// Install this module's replacements (called from hooks::install_all).
-pub fn install() {}
+pub fn install() {
+    let mut ok = 0;
+    for p in PORTS.iter() {
+        if replace_pinned(p.name, p.addr, p.body, p.thunk as usize) {
+            ok += 1;
+        }
+    }
+    log(&format!("port_small_c: replaced {ok}/{COUNT} with Rust"));
+}
 
 /// Per-function call counts for the periodic log.
 pub fn summary() -> String {
-    String::new()
+    let parts: Vec<String> = PORTS
+        .iter()
+        .zip(CNT.iter())
+        .filter_map(|(p, c)| {
+            let n = c.load(Ordering::Relaxed);
+            (n > 0).then(|| format!("{} {n}", p.name))
+        })
+        .collect();
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("port_small_c: {}", parts.join(", "))
 }
+
+
+// =================================================================================================
+// Offline differential test
+// =================================================================================================
+//
+// Each test runs the ORIGINAL bytes (copied to executable memory; their calls aimed at logging
+// stubs, their absolute data references at test statics) and the Rust port through its real thunk
+// on the same random arena, and compares EAX, ECX / EDX where the original defines them, the
+// preserved registers, every word of the arena, the caller's stack-argument slots, and the
+// ordered log of callee calls (the registers and stack arguments each callee reads).
+//
+// Run (one test per process):
+//   RUSTFLAGS="-C target-feature=+crt-static -C link-arg=/DYNAMICBASE:NO -C link-arg=/BASE:0x10000000" cargo test --release
+//   -p sr2-hook --target i686-pc-windows-msvc test_ -- --ignored --test-threads=1 --nocapture
+// (CASES=n changes the number of random cases per function, default 4000.)
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE, VirtualAlloc};
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    struct TB {
+        f: u32,
+        eax: u32,
+        ecx: u32,
+        edx: u32,
+        ebx: u32,
+        esi: u32,
+        edi: u32,
+        ebp: u32,
+        args: u32,
+        nargs: u32,
+        o_eax: u32,
+        o_ecx: u32,
+        o_edx: u32,
+        o_ebx: u32,
+        o_esi: u32,
+        o_edi: u32,
+        o_ebp: u32,
+        esp_save: u32,
+        argsp: u32,
+        cap: [u32; 4],
+    }
+
+    static mut SLOTS: [u32; 3] = [0; 3];
+
+    #[derive(Clone, Copy)]
+    struct In {
+        eax: u32,
+        ecx: u32,
+        edx: u32,
+        esi: u32,
+        edi: u32,
+    }
+
+    const EBX_IN: u32 = 0xB1B1_B1B1;
+    const EBP_IN: u32 = 0xE9E9_E9E9;
+
+    /// Call `f` with these registers and stack arguments; capture everything, including the
+    /// first four stack-argument words as they stand right after the call.
+    unsafe fn call_t(f: usize, r: In, args: &[u32]) -> TB {
+        let mut b = TB {
+            f: f as u32,
+            eax: r.eax,
+            ecx: r.ecx,
+            edx: r.edx,
+            ebx: EBX_IN,
+            esi: r.esi,
+            edi: r.edi,
+            ebp: EBP_IN,
+            args: args.as_ptr() as u32,
+            nargs: args.len() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            let slots = std::ptr::addr_of_mut!(SLOTS);
+            (*slots)[0] = &mut b as *mut TB as u32;
+            (*slots)[1] = f as u32;
+            std::arch::asm!(
+                "push ebp", "push ebx", "push esi", "push edi",
+                "mov [eax + 68], esp",
+                "mov [{s}], eax",
+                "mov ebx, eax",
+                "mov ecx, [ebx + 36]",
+                "mov esi, [ebx + 32]",
+                "2:",
+                "test ecx, ecx",
+                "jz 3f",
+                "push dword ptr [esi + ecx*4 - 4]",
+                "dec ecx",
+                "jmp 2b",
+                "3:",
+                "mov [ebx + 72], esp",
+                "mov ecx, [ebx + 8]", "mov edx, [ebx + 12]", "mov esi, [ebx + 20]", "mov edi, [ebx + 24]",
+                "mov ebp, [ebx + 28]", "mov eax, [ebx + 4]", "mov ebx, [ebx + 16]",
+                "call dword ptr [{s} + 4]",
+                "mov [{s} + 8], eax",
+                "mov eax, [{s}]",
+                "mov [eax + 44], ecx", "mov [eax + 48], edx", "mov [eax + 52], ebx", "mov [eax + 56], esi",
+                "mov [eax + 60], edi", "mov [eax + 64], ebp",
+                "mov ecx, [{s} + 8]",
+                "mov [eax + 40], ecx",
+                "mov ecx, [eax + 72]",
+                "mov edx, [ecx]", "mov [eax + 76], edx",
+                "mov edx, [ecx + 4]", "mov [eax + 80], edx",
+                "mov edx, [ecx + 8]", "mov [eax + 84], edx",
+                "mov edx, [ecx + 12]", "mov [eax + 88], edx",
+                "mov esp, [eax + 68]",
+                "pop edi", "pop esi", "pop ebx", "pop ebp",
+                s = sym SLOTS,
+                inout("eax") &mut b as *mut TB => _,
+                clobber_abi("C"),
+            );
+        }
+        b
+    }
+
+    fn exec_alloc(len: usize) -> usize {
+        let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) } as usize;
+        assert!(p != 0);
+        p
+    }
+
+    // --- logging stubs ----------------------------------------------------------------------------
+
+    #[derive(Clone, Copy)]
+    struct Beh {
+        mask: u32,     // registers logged: bit 0 EAX, 1 ECX, 2 EDX, 3 ESI, 4 EDI
+        nargs: u32,    // stack words logged
+        arg_from: u32, // ... starting at this one
+        find: bool,    // writes an arena address into *arg0 and returns AL 0 / non-zero
+    }
+
+    static LOG: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    static BEH: Mutex<Vec<Beh>> = Mutex::new(Vec::new());
+    static SEED: AtomicU32 = AtomicU32::new(1);
+    static NCALL: AtomicU32 = AtomicU32::new(0);
+    static ARENA_LO: AtomicU32 = AtomicU32::new(0);
+    static mut T_FLAG: u32 = 0;
+    static mut T_IMP: [u32; 2] = [0; 2];
+    static mut T_G: [u32; 2] = [0x1357_9BDF, 0x2468_ACE0];
+
+    fn mix(a: u32, b: u32, c: u32) -> u32 {
+        let mut x = (a as u64) << 32 | (b as u64) << 16 ^ c as u64;
+        x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (x >> 29);
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        (x >> 21) as u32
+    }
+
+    extern "C" fn stub_main(id: u32, blk: *const u32) -> u32 {
+        unsafe {
+            let beh = BEH.lock().unwrap()[id as usize];
+            let n = NCALL.fetch_add(1, Ordering::Relaxed);
+            let regs = [*blk.add(7), *blk.add(6), *blk.add(5), *blk.add(1), *blk];
+            let args = blk.add(9);
+            {
+                let mut lg = LOG.lock().unwrap();
+                lg.push(id);
+                for (k, v) in regs.iter().enumerate() {
+                    if beh.mask >> k & 1 != 0 {
+                        lg.push(*v);
+                    }
+                }
+                for k in 0..beh.nargs {
+                    lg.push(*args.add((beh.arg_from + k) as usize));
+                }
+            }
+            let h = mix(SEED.load(Ordering::Relaxed), id, n);
+            if beh.find {
+                let slot = *args as *mut u32;
+                let pick = ARENA_LO.load(Ordering::Relaxed) + 4 * (64 + (h >> 8) % 1500);
+                *slot = pick;
+                let al = if h & 1 == 0 { 0 } else { (h >> 4 & 0xFF) | 1 };
+                return (h & !0xFF) | al;
+            }
+            h
+        }
+    }
+
+    /// A stub for the game address `target` (registered in `T_REDIR`), `ret N`.
+    fn stub(target: usize, beh: Beh, ret_n: u16) -> usize {
+        {
+            let r = T_REDIR.lock().unwrap();
+            if let Some(e) = r.iter().find(|e| e.0 == target) {
+                return e.1;
+            }
+        }
+        let a = new_stub(beh, ret_n);
+        T_REDIR.lock().unwrap().push((target, a));
+        a
+    }
+
+    fn new_stub(beh: Beh, ret_n: u16) -> usize {
+        let id = {
+            let mut b = BEH.lock().unwrap();
+            b.push(beh);
+            b.len() as u32 - 1
+        };
+        let mut code: Vec<u8> = vec![0x60, 0x54, 0x68];
+        code.extend(id.to_le_bytes());
+        code.push(0xB8);
+        code.extend((stub_main as extern "C" fn(u32, *const u32) -> u32 as usize as u32).to_le_bytes());
+        code.extend([0xFF, 0xD0, 0x83, 0xC4, 0x08, 0x89, 0x44, 0x24, 0x1C, 0x61]);
+        if ret_n == 0 {
+            code.push(0xC3);
+        } else {
+            code.extend([0xC2, ret_n as u8, (ret_n >> 8) as u8]);
+        }
+        let p = exec_alloc(code.len() + 16);
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), p as *mut u8, code.len()) };
+        p
+    }
+
+    fn redirect_data(a: usize, to: usize) {
+        let mut r = T_REDIR.lock().unwrap();
+        if !r.iter().any(|e| e.0 == a) {
+            r.push((a, to));
+        }
+    }
+
+    const ALL5: Beh = Beh { mask: 31, nargs: 0, arg_from: 0, find: false };
+
+    /// The original's bytes in executable memory: `abs` = (game address, test address) operands
+    /// rewritten wherever they appear, `calls` = (offset of an E8, game address of the callee).
+    fn build(body: &[u8], calls: &[(usize, u32)], abs: &[(u32, u32)]) -> usize {
+        let mut b = body.to_vec();
+        for &(old, new) in abs {
+            let ob = old.to_le_bytes();
+            let mut found = 0;
+            for i in 0..b.len() - 3 {
+                if b[i..i + 4] == ob {
+                    b[i..i + 4].copy_from_slice(&new.to_le_bytes());
+                    found += 1;
+                }
+            }
+            assert!(found > 0, "operand {old:#x} not in the body");
+        }
+        let p = exec_alloc(b.len() + 16);
+        unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), p as *mut u8, b.len()) };
+        for &(off, target) in calls {
+            let dest = tgt(target as usize);
+            assert!(dest != target as usize, "callee {target:#x} has no stub");
+            let rel = (dest as i32).wrapping_sub((p + off + 5) as i32);
+            unsafe { std::ptr::write_unaligned((p + off + 1) as *mut i32, rel) };
+        }
+        p
+    }
+
+    // --- random numbers ---------------------------------------------------------------------------
+
+    struct Rng(u64);
+    impl Rng {
+        fn u32(&mut self) -> u32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 16) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.u32() % n
+        }
+    }
+
+    const ARENA_WORDS: usize = 2048;
+
+    fn cases() -> u32 {
+        std::env::var("CASES").ok().and_then(|v| v.parse().ok()).unwrap_or(4000)
+    }
+
+    fn ptr(arena: &Vec<u32>, word: usize) -> u32 {
+        arena.as_ptr() as u32 + (word as u32) * 4
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Fam {
+        Sdd { null_ok: bool },
+        HtInit,
+        HtRemove,
+        HtReset,
+        Gt,
+    }
+
+    /// What one random case sets up.
+    struct Case {
+        r: In,
+        args: Vec<u32>,
+        cmp_ecx: bool,
+        cmp_edx: bool,
+        cap: usize, // stack-argument words to compare after the call
+    }
+
+    fn setup_world() {
+        redirect_data(NO_FREE_FLAG, std::ptr::addr_of!(T_FLAG) as usize);
+        redirect_data(IMP_ENTER, std::ptr::addr_of!(T_IMP) as usize);
+        redirect_data(IMP_LEAVE, std::ptr::addr_of!(T_IMP) as usize + 4);
+        redirect_data(GLOBAL_A, std::ptr::addr_of!(T_G) as usize);
+        redirect_data(GLOBAL_B, std::ptr::addr_of!(T_G) as usize + 4);
+        unsafe {
+            let imp = std::ptr::addr_of_mut!(T_IMP);
+            if (*imp)[0] == 0 {
+                (*imp)[0] = new_stub(Beh { mask: 0, nargs: 1, arg_from: 0, find: false }, 4) as u32;
+                (*imp)[1] = new_stub(Beh { mask: 0, nargs: 1, arg_from: 0, find: false }, 4) as u32;
+            }
+        }
+        stub(FREE, Beh { mask: 1, nargs: 0, arg_from: 0, find: false }, 0);
+    }
+
+    fn run_family(name: &str, body: &[u8], k: &[(usize, u32)], thunk: usize, fam: Fam, seed: u64) {
+        T_REDIR.lock().unwrap().clear();
+        BEH.lock().unwrap().clear();
+        setup_world();
+        let mut calls = Vec::new();
+        for &(off, target) in k {
+            if target as usize != FREE {
+                stub(target as usize, ALL5, 0);
+            }
+            calls.push((off, target));
+        }
+        // the virtual methods live in the arena's vtable (words 0..16)
+        let find_stub = new_stub(Beh { mask: 31, nargs: 2, arg_from: 1, find: true }, 12);
+        let reset_stub = new_stub(ALL5, 0);
+        let abs = [
+            (NO_FREE_FLAG as u32, std::ptr::addr_of!(T_FLAG) as u32),
+            (IMP_ENTER as u32, std::ptr::addr_of!(T_IMP) as u32),
+            (IMP_LEAVE as u32, std::ptr::addr_of!(T_IMP) as u32 + 4),
+            (GLOBAL_A as u32, std::ptr::addr_of!(T_G) as u32),
+            (GLOBAL_B as u32, std::ptr::addr_of!(T_G) as u32 + 4),
+        ];
+        let used: Vec<(u32, u32)> = abs.iter().copied().filter(|a| body.windows(4).any(|w| w == a.0.to_le_bytes())).collect();
+        let orig = build(body, &calls, &used);
+        let mut rng = Rng(seed);
+        let mut arena = vec![0u32; ARENA_WORDS];
+        let (mut bad, n) = (0, cases());
+        for i in 0..n {
+            for w in arena.iter_mut() {
+                *w = rng.u32();
+            }
+            ARENA_LO.store(arena.as_ptr() as u32, Ordering::Relaxed);
+            arena[3] = find_stub as u32;
+            arena[6] = reset_stub as u32;
+            unsafe { (*std::ptr::addr_of_mut!(T_FLAG)) = [0, 1, 1, 2, 0xFF, 0x101][rng.below(6) as usize] };
+            let rr = In { eax: rng.u32(), ecx: rng.u32(), edx: rng.u32(), esi: rng.u32(), edi: rng.u32() };
+            let obj = 32 + rng.below(100) as usize;
+            let c = match fam {
+                Fam::Sdd { null_ok } => {
+                    let this = if null_ok && rng.below(6) == 0 { 0 } else { ptr(&arena, obj) };
+                    let flag = [rng.u32(), rng.u32() | 1, rng.u32() & !1, 1, 0][rng.below(5) as usize];
+                    Case { r: In { ecx: this, ..rr }, args: vec![flag], cmp_ecx: true, cmp_edx: true, cap: 0 }
+                }
+                Fam::HtInit | Fam::HtRemove | Fam::HtReset => {
+                    arena[obj] = ptr(&arena, 0);
+                    let this = ptr(&arena, obj);
+                    let a3 = if rng.below(3) == 0 { 0 } else { rng.u32() };
+                    let a4 = if rng.below(3) == 0 { 0 } else { rng.u32() };
+                    match fam {
+                        Fam::HtInit => Case { r: In { ecx: this, ..rr }, args: vec![rng.u32(), rng.u32(), a3, a4], cmp_ecx: true, cmp_edx: a3 != 0, cap: 0 },
+                        Fam::HtRemove => {
+                            // the found slot lives in the arena; its count word is random (wraps)
+                            Case { r: In { ecx: this, ..rr }, args: vec![rng.u32(), rng.u32()], cmp_ecx: false, cmp_edx: false, cap: 2 }
+                        }
+                        _ => Case { r: In { ecx: this, ..rr }, args: vec![], cmp_ecx: true, cmp_edx: false, cap: 0 },
+                    }
+                }
+                Fam::Gt => Case { r: rr, args: vec![], cmp_ecx: true, cmp_edx: true, cap: 0 },
+            };
+            let case_seed = rng.u32();
+            let snap = arena.clone();
+            let run = |f: usize, arena: &mut Vec<u32>| {
+                SEED.store(case_seed, Ordering::Relaxed);
+                NCALL.store(0, Ordering::Relaxed);
+                LOG.lock().unwrap().clear();
+                let t = unsafe { call_t(f, c.r, &c.args) };
+                let lg = LOG.lock().unwrap().clone();
+                let a = arena.clone();
+                (t, lg, a)
+            };
+            let (o, l1, a1) = run(orig, &mut arena);
+            arena.copy_from_slice(&snap);
+            let (t, l2, a2) = run(thunk, &mut arena);
+            arena.copy_from_slice(&snap);
+            let mut errs = String::new();
+            if o.o_eax != t.o_eax {
+                errs += &format!(" eax original {:#x} Rust {:#x};", o.o_eax, t.o_eax);
+            }
+            if c.cmp_ecx && o.o_ecx != t.o_ecx {
+                errs += &format!(" ecx original {:#x} Rust {:#x};", o.o_ecx, t.o_ecx);
+            }
+            if c.cmp_edx && o.o_edx != t.o_edx {
+                errs += &format!(" edx original {:#x} Rust {:#x};", o.o_edx, t.o_edx);
+            }
+            for (nm, v, w, x) in [("ebx", EBX_IN, o.o_ebx, t.o_ebx), ("esi", c.r.esi, o.o_esi, t.o_esi), ("edi", c.r.edi, o.o_edi, t.o_edi), ("ebp", EBP_IN, o.o_ebp, t.o_ebp)] {
+                if w != v || x != v {
+                    errs += &format!(" {nm} in {v:#x} original {w:#x} Rust {x:#x};");
+                }
+            }
+            if a1 != a2 {
+                let j = a1.iter().zip(&a2).position(|(x, y)| x != y).unwrap();
+                errs += &format!(" arena word {j}: original {:#x} Rust {:#x};", a1[j], a2[j]);
+            }
+            if l1 != l2 {
+                errs += &format!(" callee log original {l1:x?} Rust {l2:x?};");
+            }
+            if o.cap[..c.cap] != t.cap[..c.cap] {
+                errs += &format!(" arg slots original {:x?} Rust {:x?};", &o.cap[..c.cap], &t.cap[..c.cap]);
+            }
+            if !errs.is_empty() {
+                bad += 1;
+                if bad <= 5 {
+                    eprintln!("{name} case {i}:{errs}");
+                }
+            }
+        }
+        eprintln!("{name}: {n} cases, {bad} differ");
+        assert_eq!(bad, 0, "{bad} of {n} cases differ");
+    }
+
+    macro_rules! test_sdd_v {
+        ($n:ident, $nm:expr, $b:ident, $k:ident, $t:ident, $($p:expr),*) => {
+            #[test]
+            #[ignore = "offline differential test (see the comment above)"]
+            fn $n() {
+                run_family($nm, &$b, &$k, $t as *const () as usize, Fam::Sdd { null_ok: false }, 0x1234_5678_9ABC_DEF1);
+            }
+        };
+    }
+    macro_rules! test_sdd_d {
+        ($n:ident, $nm:expr, $b:ident, $k:ident, $t:ident, $($p:expr),*) => {
+            #[test]
+            #[ignore = "offline differential test (see the comment above)"]
+            fn $n() {
+                run_family($nm, &$b, &$k, $t as *const () as usize, Fam::Sdd { null_ok: true }, 0x0BAD_CAFE_1234_5678);
+            }
+        };
+    }
+    macro_rules! test_sdd_vd {
+        ($n:ident, $nm:expr, $b:ident, $k:ident, $t:ident, $($p:expr),*) => {
+            #[test]
+            #[ignore = "offline differential test (see the comment above)"]
+            fn $n() {
+                run_family($nm, &$b, &$k, $t as *const () as usize, Fam::Sdd { null_ok: false }, 0x5555_AAAA_1357_9BDF);
+            }
+        };
+    }
+    macro_rules! test_sdd_exc {
+        ($n:ident, $nm:expr, $b:ident, $k:ident, $t:ident, $($p:expr),*) => {
+            #[test]
+            #[ignore = "offline differential test (see the comment above)"]
+            fn $n() {
+                run_family($nm, &$b, &$k, $t as *const () as usize, Fam::Sdd { null_ok: false }, 0x2468_ACE0_1111_2222);
+            }
+        };
+    }
+    macro_rules! test_ht_init {
+        ($n:ident, $nm:expr, $b:ident, $k:ident, $t:ident) => {
+            #[test]
+            #[ignore = "offline differential test (see the comment above)"]
+            fn $n() {
+                run_family($nm, &$b, &$k, $t as *const () as usize, Fam::HtInit, 0x7777_1234_5678_9ABC);
+            }
+        };
+    }
+    macro_rules! test_ht_remove {
+        ($n:ident, $nm:expr, $b:ident, $k:ident, $t:ident, $($p:expr),*) => {
+            #[test]
+            #[ignore = "offline differential test (see the comment above)"]
+            fn $n() {
+                run_family($nm, &$b, &$k, $t as *const () as usize, Fam::HtRemove, 0x3333_4444_5555_6666);
+            }
+        };
+    }
+    macro_rules! test_ht_reset {
+        ($n:ident, $nm:expr, $b:ident, $k:ident, $t:ident) => {
+            #[test]
+            #[ignore = "offline differential test (see the comment above)"]
+            fn $n() {
+                run_family($nm, &$b, &$k, $t as *const () as usize, Fam::HtReset, 0x9999_8888_7777_6666);
+            }
+        };
+    }
+    macro_rules! test_gt {
+        ($n:ident, $nm:expr, $b:ident, $k:ident, $t:ident, $($p:expr),*) => {
+            #[test]
+            #[ignore = "offline differential test (see the comment above)"]
+            fn $n() {
+                run_family($nm, &$b, &$k, $t as *const () as usize, Fam::Gt, 0x0F0F_F0F0_1234_4321);
+            }
+        };
+    }
+
+    test_sdd_v!(test_4abec0, "vhashtable<>::scalar_deleting_dtor", B_4ABEC0, K_4ABEC0, t_4abec0, 0x00DDB0BC);
+    test_sdd_v!(test_4e3df0, "std::locale::facet::scalar_deleting_dtor", B_4E3DF0, K_4E3DF0, t_4e3df0, 0x00DBF220);
+    test_sdd_v!(test_4e7a90, "stdext::bad_alloc::scalar_deleting_dtor", B_4E7A90, K_4E7A90, t_4e7a90, 0x00DDE2C8);
+    test_sdd_v!(test_4e80c0, "stdext::exception::scalar_deleting_dtor", B_4E80C0, K_4E80C0, t_4e80c0, 0x00DDE2C8);
+    test_sdd_v!(test_70b930, "vhashtable_inplace<>::scalar_deleting_dtor", B_70B930, K_70B930, t_70b930, 0x00E18B94);
+    test_sdd_v!(test_70b970, "vhashtable<>::scalar_deleting_dtor_2", B_70B970, K_70B970, t_70b970, 0x00E18B94);
+    test_sdd_v!(test_70b9b0, "vhashtable_inplace<>::scalar_deleting_dtor_2", B_70B9B0, K_70B9B0, t_70b9b0, 0x00E18BD8);
+    test_sdd_v!(test_70b9f0, "vhashtable<>::scalar_deleting_dtor_3", B_70B9F0, K_70B9F0, t_70b9f0, 0x00E18BD8);
+    test_sdd_v!(test_812130, "stub_multi_session_info::scalar_deleting_dtor", B_812130, K_812130, t_812130, 0x00DFFD54);
+    test_sdd_v!(test_86ec10, "rocket_multi_registration::scalar_deleting_dtor", B_86EC10, K_86EC10, t_86ec10, 0x00E27E7C);
+    test_sdd_v!(test_871990, "trigger_multi_registration::scalar_deleting_dtor", B_871990, K_871990, t_871990, 0x00E27E7C);
+    test_sdd_v!(test_9fe400, "vhashtable<>::scalar_deleting_dtor_4", B_9FE400, K_9FE400, t_9fe400, 0x00E3E200);
+    test_sdd_v!(test_9fe440, "vhashtable_inplace<>::scalar_deleting_dtor_3", B_9FE440, K_9FE440, t_9fe440, 0x00E3E200);
+    test_sdd_v!(test_9fe480, "vhashtable_inplace<>::scalar_deleting_dtor_4", B_9FE480, K_9FE480, t_9fe480, 0x00E3E268);
+    test_sdd_v!(test_a776f0, "vhashtable<>::scalar_deleting_dtor_7", B_A776F0, K_A776F0, t_a776f0, 0x00E441B0);
+    test_sdd_v!(test_ad3130, "vhashtable<>::scalar_deleting_dtor_8", B_AD3130, K_AD3130, t_ad3130, 0x00E45E30);
+    test_sdd_v!(test_b89e60, "vhashtable<>::scalar_deleting_dtor_9", B_B89E60, K_B89E60, t_b89e60, 0x00E4C734);
+    test_sdd_v!(test_b8ceb0, "vint_callback::scalar_deleting_dtor_2", B_B8CEB0, K_B8CEB0, t_b8ceb0, 0x00E4CEBC);
+    test_sdd_v!(test_b8d190, "vint_callback_lua::scalar_deleting_dtor", B_B8D190, K_B8D190, t_b8d190, 0x00E4CEBC);
+    test_sdd_v!(test_b9c290, "vint_object_base::scalar_deleting_dtor_2", B_B9C290, K_B9C290, t_b9c290, 0x00E4D240);
+    test_sdd_v!(test_b9c350, "vint_element_base::scalar_deleting_dtor_2", B_B9C350, K_B9C350, t_b9c350, 0x00E4D240);
+    test_sdd_v!(test_b9c410, "vint_object_factory::scalar_deleting_dtor", B_B9C410, K_B9C410, t_b9c410, 0x00E4D3F0);
+    test_sdd_v!(test_b9ca10, "vint_object_factory_imp<>::scalar_deleting_dtor", B_B9CA10, K_B9CA10, t_b9ca10, 0x00E4D3F0);
+    test_sdd_v!(test_b9d320, "vint_object_factory_imp<>::scalar_deleting_dtor_2", B_B9D320, K_B9D320, t_b9d320, 0x00E4D3F0);
+    test_sdd_d!(test_4a4b30, "string_pool::scalar_deleting_dtor", B_4A4B30, K_4A4B30, t_4a4b30, 0x00BF4A00);
+    test_sdd_d!(test_5210f0, "split_mempool_template<>::scalar_deleting_dtor", B_5210F0, K_5210F0, t_5210f0, 0x00BF4A00);
+    test_sdd_d!(test_a57b80, "script_group::scalar_deleting_dtor", B_A57B80, K_A57B80, t_a57b80, 0x00A57BC0);
+    test_sdd_d!(test_a5a180, "script_item::scalar_deleting_dtor", B_A5A180, K_A5A180, t_a5a180, 0x00A5A1C0);
+    test_sdd_d!(test_a5d5a0, "script_mover::scalar_deleting_dtor", B_A5D5A0, K_A5D5A0, t_a5d5a0, 0x00A5D5E0);
+    test_sdd_d!(test_a61770, "script_npc::scalar_deleting_dtor", B_A61770, K_A61770, t_a61770, 0x00A617B0);
+    test_sdd_d!(test_a62cc0, "script_path::scalar_deleting_dtor", B_A62CC0, K_A62CC0, t_a62cc0, 0x00A62D00);
+    test_sdd_d!(test_a6fc10, "script_vehicle::scalar_deleting_dtor", B_A6FC10, K_A6FC10, t_a6fc10, 0x00A6FC50);
+    test_sdd_vd!(test_a227d0, "script_cover_node::scalar_deleting_dtor", B_A227D0, K_A227D0, t_a227d0, 0x00E3E3A8, 0x00A629F0);
+    test_sdd_vd!(test_a66f50, "script_spawn_region::scalar_deleting_dtor", B_A66F50, K_A66F50, t_a66f50, 0x00E4380C, 0x00A629F0);
+    test_sdd_exc!(test_4e44b0, "std::ios_base::failure::scalar_deleting_dtor", B_4E44B0, K_4E44B0, t_4e44b0, 0x00DDE2E8, 0x004E8060, 0x00DDE2C8);
+    test_sdd_exc!(test_4e7fa0, "std::runtime_error::scalar_deleting_dtor", B_4E7FA0, K_4E7FA0, t_4e7fa0, 0x00DDE2E8, 0x004E8060, 0x00DDE2C8);
+    test_sdd_exc!(test_4f1910, "std::length_error::scalar_deleting_dtor", B_4F1910, K_4F1910, t_4f1910, 0x00DDE68C, 0x004E8060, 0x00DDE2C8);
+    test_sdd_exc!(test_4f19a0, "std::logic_error::scalar_deleting_dtor", B_4F19A0, K_4F19A0, t_4f19a0, 0x00DDE68C, 0x004E8060, 0x00DDE2C8);
+    test_sdd_exc!(test_4f1b30, "std::out_of_range::scalar_deleting_dtor", B_4F1B30, K_4F1B30, t_4f1b30, 0x00DDE68C, 0x004E8060, 0x00DDE2C8);
+    test_ht_init!(test_4abf20, "vhashtable<>::init", B_4ABF20, K_4ABF20, t_4abf20);
+    test_ht_init!(test_70ba40, "vhashtable<>::init_2", B_70BA40, K_70BA40, t_70ba40);
+    test_ht_init!(test_70bca0, "vhashtable<>::init_3", B_70BCA0, K_70BCA0, t_70bca0);
+    test_ht_init!(test_9fe5b0, "vhashtable<>::init_4", B_9FE5B0, K_9FE5B0, t_9fe5b0);
+    test_ht_init!(test_9fe960, "vhashtable<>::init_5", B_9FE960, K_9FE960, t_9fe960);
+    test_ht_init!(test_a5fc60, "vhashtable<>::init_6", B_A5FC60, K_A5FC60, t_a5fc60);
+    test_ht_init!(test_a77750, "vhashtable<>::init_7", B_A77750, K_A77750, t_a77750);
+    test_ht_init!(test_ad31a0, "vhashtable<>::init_8", B_AD31A0, K_AD31A0, t_ad31a0);
+    test_ht_init!(test_b89ed0, "vhashtable<>::init_9", B_B89ED0, K_B89ED0, t_b89ed0);
+    test_ht_reset!(test_4ac0e0, "vhashtable<>::reset", B_4AC0E0, K_4AC0E0, t_4ac0e0);
+    test_ht_reset!(test_70bc00, "vhashtable<>::reset_2", B_70BC00, K_70BC00, t_70bc00);
+    test_ht_reset!(test_70be30, "vhashtable<>::reset_3", B_70BE30, K_70BE30, t_70be30);
+    test_ht_reset!(test_9fe7b0, "vhashtable<>::reset_4", B_9FE7B0, K_9FE7B0, t_9fe7b0);
+    test_ht_reset!(test_9feb10, "vhashtable<>::reset_5", B_9FEB10, K_9FEB10, t_9feb10);
+    test_ht_reset!(test_a5fdd0, "vhashtable<>::reset_6", B_A5FDD0, K_A5FDD0, t_a5fdd0);
+    test_ht_reset!(test_a77920, "vhashtable<>::reset_7", B_A77920, K_A77920, t_a77920);
+    test_ht_reset!(test_ad33b0, "vhashtable<>::reset_8", B_AD33B0, K_AD33B0, t_ad33b0);
+    test_ht_reset!(test_b8a050, "vhashtable<>::reset_9", B_B8A050, K_B8A050, t_b8a050);
+    test_ht_remove!(test_4ac0a0, "vhashtable<>::remove", B_4AC0A0, K_4AC0A0, t_4ac0a0, W16);
+    test_ht_remove!(test_70bbc0, "vhashtable<>::remove_2", B_70BBC0, K_70BBC0, t_70bbc0, W16);
+    test_ht_remove!(test_70bdf0, "vhashtable<>::remove_3", B_70BDF0, K_70BDF0, t_70bdf0, W16);
+    test_ht_remove!(test_9fe770, "vhashtable<>::remove_4", B_9FE770, K_9FE770, t_9fe770, W16);
+    test_ht_remove!(test_9fead0, "vhashtable<>::remove_5", B_9FEAD0, K_9FEAD0, t_9fead0, W16);
+    test_ht_remove!(test_ad3370, "vhashtable<>::remove_8", B_AD3370, K_AD3370, t_ad3370, W16);
+    test_ht_remove!(test_a5fd90, "vhashtable<>::remove_6", B_A5FD90, K_A5FD90, t_a5fd90, D0);
+    test_ht_remove!(test_b8a010, "vhashtable<>::remove_9", B_B8A010, K_B8A010, t_b8a010, DFFFF);
+    test_ht_remove!(test_a778d0, "vhashtable<>::remove_7", B_A778D0, K_A778D0, t_a778d0, PAIR);
+    test_gt!(test_6150a0, "racing_diversion_type_info::get_title", B_6150A0, K_6150A0, t_6150a0, 0x007F49E0, 0x00DFED94, 0x00DFED4C);
+    test_gt!(test_615df0, "safecracking_diversion_type_info::get_title", B_615DF0, K_615DF0, t_615df0, 0x007F49E0, 0x00000000, 0x00DF595C);
+    test_gt!(test_616520, "streaking_diversion_type::get_title", B_616520, K_616520, t_616520, 0x007F49E0, 0x00DF5AA0, 0x00DF5AB4);
+    test_gt!(test_617010, "stunt_back_seat_driver_diversion_type::get_title", B_617010, K_617010, t_617010, 0x007F4AD0, 0x00DF5E18, 0x00DF5E2C);
+    test_gt!(test_618620, "stunt_jumping_diversion_type::get_title", B_618620, K_618620, t_618620, 0x007F4AD0, 0x00DF5FEC, 0x00DF43A8);
+    test_gt!(test_619ba0, "stunt_drifting_diversion_type::get_title", B_619BA0, K_619BA0, t_619ba0, 0x007F4AD0, 0x00DF6284, 0x00DF6290);
+    test_gt!(test_61a460, "stunt_hydraulics_diversion_type::get_title", B_61A460, K_61A460, t_61a460, 0x007F4AD0, 0x00DF6474, 0x00DF6480);
+    test_gt!(test_61be70, "stunt_low_flying_diversion_type::get_title", B_61BE70, K_61BE70, t_61be70, 0x007F4AD0, 0x00DF6584, 0x00DF6594);
+    test_gt!(test_61c780, "stunt_near_miss_diversion_type::get_title", B_61C780, K_61C780, t_61c780, 0x007F4AD0, 0x00DF66D4, 0x00DF66E0);
+    test_gt!(test_61d3b0, "stunt_oncoming_traffic_diversion_type::get_title", B_61D3B0, K_61D3B0, t_61d3b0, 0x007F4AD0, 0x00DF67F4, 0x00DF6800);
+    test_gt!(test_61db50, "stunt_peel_out_diversion_type::get_title", B_61DB50, K_61DB50, t_61db50, 0x007F4AD0, 0x00DF6954, 0x00DF695C);
+    test_gt!(test_61e2a0, "stunt_wheels_diversion_type::get_title", B_61E2A0, K_61E2A0, t_61e2a0, 0x007F4AD0, 0x00DF6A34, 0x00DF6A3C);
+    test_gt!(test_61f0f0, "survival_diversion_type_info::get_title", B_61F0F0, K_61F0F0, t_61f0f0, 0x007F4AD0, 0x00DF6CA0, 0x00DF6CAC);
+    test_gt!(test_6207d0, "tagging_diversion_type_info::get_title", B_6207D0, K_6207D0, t_6207d0, 0x007F49E0, 0x00DF71D4, 0x00DF71F8);
+    test_gt!(test_627340, "taunting_diversion_type::get_title", B_627340, K_627340, t_627340, 0x007F49E0, 0x00DF78F8, 0x00DF790C);
+    test_gt!(test_628f80, "taxi_diversion_type_info::get_title", B_628F80, K_628F80, t_628f80, 0x007F49E0, 0x00DF7FDC, 0x00DF8004);
+    test_gt!(test_62e920, "tow_truck_diversion_type_info::get_title", B_62E920, K_62E920, t_62e920, 0x007F49E0, 0x00000000, 0x00DF8E4C);
+    test_gt!(test_633250, "vehicle_surfing_style_two_diversion_type_info::get_title", B_633250, K_633250, t_633250, 0x007F49E0, 0x00000000, 0x00DF937C);
+    test_gt!(test_638d10, "whoring_diversion_type_info::get_title", B_638D10, K_638D10, t_638d10, 0x007F4AD0, 0x00DF9C2C, 0x00DF9C34);
+    test_gt!(test_63a820, "windshield_cannon_diversion_type_info::get_title", B_63A820, K_63A820, t_63a820, 0x007F49E0, 0x00DF9DEC, 0x00DF9E2C);
+}
+
