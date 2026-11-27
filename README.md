@@ -33,6 +33,47 @@ cargo build -p sr2-hook --target i686-pc-windows-msvc --release
 
 Copy `target/i686-pc-windows-msvc/release/dinput8.dll` into your Saints Row 2 folder. Delete it to go back to the unmodified game.
 
+## In-game menu (F7)
+
+Press **F7** in game to open the test menu. The game ignores the controls while the menu is open.
+
+| Key | Action |
+|---|---|
+| Up / Down | move between items |
+| Left / Right | change a value (weather, time, mission, wanted level) |
+| Enter | choose or apply |
+| Backspace | back to the main page, or close |
+
+**Player options**
+- **God mode:** the player can't be hurt. It stays on through cutscenes and mission starts.
+- **Infinite ammo:** endless reserve ammo and grenades. Clips still empty and reload.
+- **Refill health.**
+- **Add $10,000.**
+- **Add 5,000 respect.**
+- **Clear wanted level.** This clears police and gang notoriety.
+- **Set wanted level:** pick 1 to 5 stars of police notoriety, then press Enter.
+- **Teleport to waypoint:** goes to the map waypoint.
+- **Time:** moves the clock an hour forward (Right or Enter) or back (Left).
+
+**World and cheats**
+- **Weather:** pick a weather type and apply it, or choose "normal" to hand weather back to the game.
+- **Game cheats:** the game's own cheat list. Toggle cheats on and off; one-shot cheats are marked "(once)".
+
+**Mission logging** records what the game does during a mission, for analysis.
+- **Logging:** turns the logger on or off.
+- **Mission:** picks which mission the log is labelled with.
+- **Mark point:** writes a labelled marker into the log. **F8** does the same from anywhere: it pauses the game and opens a box to type the label. Enter saves it; Esc cancels.
+
+The log is saved when the game exits or crashes.
+
+### Testing switches
+
+- **Turning off ports:** create `sr2-skip-modules.txt` in the game folder, with one name per line. Each line can be any of these:
+  - a module name, such as `port_small_a`;
+  - a single function name or address, such as `vehicle_is_helicopter` or `0xab5190`;
+  - `all_ports`, for a nearly vanilla game that keeps the menu.
+- **Crash reports:** after a crash, `python tools/crash_report.py` reads `sr2-hook.log`. It shows the last ported functions that ran and names every address on the stack.
+
 ## Repository layout
 
 | Path | What it is |
