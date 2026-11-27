@@ -294,6 +294,11 @@ fn trace_stub(id: u32, thunk: usize) -> usize {
     at
 }
 
+/// Every installed port: original address -> (name, pinned original body, thunk). twins.rs uses it
+/// to point identical copies of a ported function at the same thunk.
+pub(crate) static PINNED: std::sync::Mutex<std::collections::BTreeMap<usize, (String, Vec<u8>, usize)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
 /// Ports that broke the game in a play test and stay off until fixed (see docs/skipped_ports.md).
 const EXCLUDED: &[(usize, &str)] = &[
     (0xBF65F0, "aabb_point_dist_sq_x87: crashed loading a save (jumped to a float), 2026-11-26"),
@@ -320,6 +325,9 @@ pub(crate) fn replace_pinned(name: &str, addr: usize, body: &[u8], thunk: usize)
         Ok(()) => {
             if let Ok(mut v) = INSTALLED.lock() {
                 v.push(addr);
+            }
+            if let Ok(mut m) = PINNED.lock() {
+                m.insert(addr, (name.to_string(), body.to_vec(), thunk));
             }
             true
         }

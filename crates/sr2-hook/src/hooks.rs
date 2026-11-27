@@ -2199,6 +2199,10 @@ pub fn install_all() {
         if !module_skipped("port_small_vint") { crate::port_small_vint::install(); }
         if !module_skipped("port_small_data") { crate::port_small_data::install(); }
         if !module_skipped("port_small_game") { crate::port_small_game::install(); }
+        // Twins last: they reuse the thunks of the ports installed above.
+        if !module_skipped("twins") {
+            crate::twins::install();
+        }
         log(&crate::portlib::installed_list());
         if SURVEY {
             crate::survey::install(); // wraps whatever the slots hold, so after the ports
