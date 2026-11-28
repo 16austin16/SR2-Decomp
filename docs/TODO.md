@@ -37,5 +37,12 @@ The work agreed for later, in rough priority order. Done items move to the commi
   - handle device loss (the game's IDirect3DDevice9Lost wrappers);
   - feed input to ImGui;
   - port the Player, World, Cheats, Shops and Logging pages and the F8 label box.
+- **Remake of the in-game UI:** a modern, mouse-clickable version of the game's own menus and HUD, such as the
+  pause menu, map, phone, store menus, options and HUD widgets.
+  - Builds on the ImGui renderer above.
+  - The game draws these through its vint UI system (Lua scripts + vint_* bindings, docs/analysis/49_vint_system.md).
+    The likely route is to replace the screens one at a time, while the game logic underneath, such as buying an item
+    or changing a setting, keeps calling the game's own functions.
+  - Adds mouse support where the original is keyboard/controller only.
 - **Automatic bisect script:** launch with a skip list, auto-press Continue, wait for a crash or steady frames,
   then halve the list.
