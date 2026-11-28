@@ -11,7 +11,7 @@ import bisect, csv, os, re, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG = sys.argv[1] if len(sys.argv) > 1 else r"E:/SteamGames/steamapps/common/Saints Row 2/sr2-hook.log"
-MAP = os.path.join(ROOT, "target", "i686-pc-windows-msvc", "release", "deps", "dinput8.map")
+MAP = os.path.join(ROOT, os.environ.get("SR2_TARGET","target"), "i686-pc-windows-msvc", "release", "deps", "dinput8.map")
 
 
 def exe_names():

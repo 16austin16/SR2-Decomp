@@ -509,11 +509,14 @@ extern "C" fn turn_invulnerable(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let m = n - 1;
-        let first = if m <= 0 { index(l, name as i32) } else { index(l, -m) };
-        let flag = if first != 0 && rd(first as usize) == 0 {
+        // With one argument the original goes straight to flag = false (0xA4806D jle 0xA480DD) and reads
+        // no Lua stack slot. (An earlier version passed the name pointer as the stack index there; it read a
+        // wild address and crashed the game when a cutscene was skipped, 2026-11-28.)
+        let flag = if m <= 0 {
             false
         } else {
-            truth(index(l, if m <= 0 { m } else { -m }))
+            let first = index(l, -m);
+            if first != 0 && rd(first as usize) == 0 { false } else { truth(index(l, -m)) }
         };
         let f = flag as u32;
         let h = call_regs(SCRIPT_FIND_OBJECT_BY_NAME, 0, name, 0, 0, 0, &[]);

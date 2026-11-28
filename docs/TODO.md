@@ -17,6 +17,13 @@ The work agreed for later, in rough priority order. Done items move to the commi
      - (Done 2026-11-28: the indirect-stub pop count now comes from the epilogue balance.) 0xB8A010 now crashes
        the judge process.
      - 0xB92270 crashes the judge process at 60+ cases.
+   - Judge issues found in round 9:
+     - The indirect-call pop count still falls back to the push count when the function has no `ret` (it ends in
+       a tail jmp) or has a push right before the call (ba2a60, 5c7ec0, 879a40, 6d6b50).
+     - A panic at stubs.rs:108 (TABLE[id] out of range) on calls through import slots 0xDB80CC / 0xDB80D0
+       (savedevice_acquire 0x6909B0).
+     - The judge process segfaults on some ports with random function pointers (0x6111F0, 0xCF60F0, 0x68F6F0
+       on some seeds). Make faults inside stubs and the judge itself recoverable.
 2. **Porting round on small-function lists** with the Haiku trial: a few Haiku agents and the rest on Sonnet.
    - The judge is the only acceptance test.
    - Agents must not start sub-agents.

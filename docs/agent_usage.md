@@ -138,3 +138,56 @@ What the trial showed:
 - Haiku ports a third as much per agent (about 9 each, against about 47 for Sonnet). It stops early, and it avoids
   vtable and x87 functions.
 - Sonnet finds more of the judge's weak spots (the indirect-stub pop count, a rustc mask miscompile).
+
+### 2026-11-28: round 9, plan cost measured per model (Haiku alone, then Sonnet alone)
+
+No other Claude sessions were used during each phase. My own coordinating session also counts against the meter,
+but it stayed quiet during each phase.
+
+**Haiku phase** (h5-h8, on matched small-function lists):
+
+| | 5-hour | Weekly |
+|---|---:|---:|
+| Before | 36% | 23% |
+| After | 39% | 23% |
+
+| Agent | Tokens | Accepted | Removed |
+|---|---:|---:|---:|
+| h5 | 189k | 10 (7 PASS + 3 INC) | 0 |
+| h6 | 234k | 12 (8 PASS + 4 INC) | 0 (2 dropped: the judge process crashed on them) |
+| h7 | 203k | 10 (7 PASS + 3 INC) | 0 (1 dropped: judge crash) |
+| h8 | 231k | 13 (8 PASS + 5 INC) | 0 (1 dropped: judge crash) |
+| **Total** | **857k** | **45** | 0 |
+
+**Haiku: 3% of the 5-hour window and under 1% of the week for 45 ports, about 15 ports per 1% of the window.**
+
+**Sonnet phase** (s5-s7 on matched small-function lists, s8 on doc 62's hot candidates). Read 7 minutes before
+the 5-hour window reset, while s5 was still running:
+
+| | 5-hour | Weekly |
+|---|---:|---:|
+| Before | 39% | 23% |
+| At the reset (s5 still running) | 61% | 26% |
+
+| Agent | Tokens | Accepted | Removed |
+|---|---:|---:|---:|
+| s6 | 408k | 67 (49 PASS + 18 INC) | 5 (3 judge pop-count, 2 judge crashes) |
+| s7 | 374k | 53 (29 PASS + 24 INC) | 4 |
+| s8 (hot candidates) | 412k | 23 (16 PASS + 7 INC) | 0 |
+| s5 | (stopped at the reset; token count unknown) | 58 (41 PASS + 17 INC, judged by me after the stop) | 0 |
+
+**Sonnet, without s5: 22% of the 5-hour window and 3% of the week for 143 ports, about 6.5 ports per 1% of the
+window.** Taking only the small-list agents s6 and s7 (120 ports for about 2/3 of the cost), it is about 8 ports per
+1%.
+
+**Comparison (5-hour window):**
+- Haiku: about 15 ports per 1%, but only about 11 ports per agent.
+- Sonnet: about 6.5-8 ports per 1%, and about 60 ports per agent on small lists.
+
+So on the subscription, **Haiku costs about half as much per port** (not 7 times less, as the API-price estimate
+suggested). Sonnet gets about 5 times more done per agent and finds more judge weak spots.
+
+**Round 9 total:** Haiku 45 + Sonnet 201 (s5 58, s6 67, s7 53, s8 23) = **246 ports**, all judge-accepted. s5 was
+stopped at the 5-hour reset and its 58 ports were judged afterwards (all PASS or INCONCLUSIVE). Including s5,
+Sonnet's ports per 1% of the window come to about 9 (201 ports for at least 22%), so Haiku's cost advantage per port
+is somewhere between 1.7 and 2.3 times.

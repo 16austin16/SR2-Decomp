@@ -304,6 +304,7 @@ pub(crate) const EXCLUDED: &[(usize, &str)] = &[
     (0xBF65F0, "aabb_point_dist_sq_x87: crashed loading a save (jumped to a float), 2026-11-26"),
     (0xBB8A10, "hkvector4_equal_store: crashed in the Havok contact solver, 2026-11-26"),
     (0x72A100, "hkvector4_less_store: crashed in the Havok contact solver, 2026-11-26"),
+    (0x5B3E20, "sewage_info::load_from_table: crashed loading activities, 2026-11-28"),
 ];
 
 pub(crate) fn replace_pinned(name: &str, addr: usize, body: &[u8], thunk: usize) -> bool {
