@@ -83,6 +83,8 @@ mod port_small_vint;
 mod port_small_data;
 mod port_small_game;
 mod twins;
+mod shops_data;
+mod shops_menu;
 mod twins_table;
 mod port_sim_humans;
 mod port_states;

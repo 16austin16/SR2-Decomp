@@ -59,6 +59,10 @@ Press **F7** in game to open the test menu. The game ignores the controls while 
 - **Weather:** pick a weather type and apply it, or choose "normal" to hand weather back to the game.
 - **Game cheats:** the game's own cheat list. Toggle cheats on and off; one-shot cheats are marked "(once)".
 
+**Shops**
+- Lists every shop chain, such as Brown Baggers, Friendly Fire, Impressions and Rusty's Needle. The list comes from the game's own shop table, 98 shops in all.
+- Pick a chain to see its locations with their distance from you. Enter teleports you to the shop's purchase spot.
+
 **Mission logging** records what the game does during a mission, for analysis.
 - **Logging:** turns the logger on or off.
 - **Mission:** picks which mission the log is labelled with.

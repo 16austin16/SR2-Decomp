@@ -186,6 +186,10 @@ enum Page {
     World,
     Cheats,
     Logging,
+    /// Shop chains.
+    Shops,
+    /// The shops of the chain `State::shop_chain`.
+    ShopList,
 }
 
 #[derive(Clone, Copy)]
@@ -198,6 +202,8 @@ enum Action {
     Wanted(u32),
     God(bool),
     TeleportWaypoint,
+    /// Teleport to the door of shop i (index into the game's shop array).
+    TeleportShop(usize),
     /// Hours forward (1..23).
     Time(u32),
     /// Weather index, or -1 for the normal cycle.
@@ -214,6 +220,8 @@ struct State {
     ammo: bool,
     /// Stars for "Set wanted level".
     wanted: u32,
+    /// Chain index on the Shops page, for ShopList.
+    shop_chain: usize,
     weather: i32,
     pending: Vec<Action>,
     /// The last thing done, shown at the bottom.
@@ -227,6 +235,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     god: false,
     ammo: false,
     wanted: 3,
+    shop_chain: 0,
     weather: -1,
     pending: Vec::new(),
     status: String::new(),
@@ -250,7 +259,13 @@ fn pressed(scan: usize) -> bool {
 fn items(s: &State) -> Vec<String> {
     match s.page {
         Page::Main => {
-            vec!["Player options".into(), "World and cheats".into(), "Mission logging".into(), "Close".into()]
+            vec![
+                "Player options".into(),
+                "World and cheats".into(),
+                "Shops".into(),
+                "Mission logging".into(),
+                "Close".into(),
+            ]
         }
         Page::World => vec![
             format!("Weather: < {} >", if s.weather < 0 { "normal".into() } else { weather_name(s.weather as usize) }),
@@ -285,6 +300,31 @@ fn items(s: &State) -> Vec<String> {
             format!("Time: < {} >", clock()),
             "Back".into(),
         ],
+        Page::Shops => {
+            let g = crate::shops_menu::chains();
+            let mut v: Vec<String> = match g.as_ref() {
+                Some(c) => c.iter().map(|c| format!("{}  ({})", c.name, c.shops.len())).collect(),
+                None => vec!["(shops not loaded yet)".into()],
+            };
+            v.push("Back".into());
+            v
+        }
+        Page::ShopList => {
+            let g = crate::shops_menu::chains();
+            let mut v: Vec<String> = match g.as_ref().and_then(|c| c.get(s.shop_chain)) {
+                Some(c) => c
+                    .shops
+                    .iter()
+                    .map(|(i, n)| {
+                        let d = crate::shops_menu::distance_text(*i);
+                        if d.is_empty() { n.clone() } else { format!("{n}   ({d})") }
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            v.push("Back".into());
+            v
+        }
         Page::Logging => {
             let l = missionlog::status();
             vec![
@@ -331,11 +371,11 @@ fn keys() {
         s.cursor = (s.cursor + 1) % n;
     }
     if pressed(KEY_BACK) {
-        if s.page == Page::Main {
-            s.open = false;
-        } else {
-            s.page = Page::Main;
-            s.cursor = 0;
+        match s.page {
+            Page::Main => s.open = false,
+            Page::Cheats => (s.page, s.cursor) = (Page::World, 1),
+            Page::ShopList => (s.page, s.cursor) = (Page::Shops, s.shop_chain),
+            _ => (s.page, s.cursor) = (Page::Main, 0),
         }
     }
     let (left, right, enter) = (pressed(KEY_LEFT), pressed(KEY_RIGHT), pressed(KEY_ENTER));
@@ -343,7 +383,8 @@ fn keys() {
         Page::Main if enter => match s.cursor {
             0 => (s.page, s.cursor) = (Page::Player, 0),
             1 => (s.page, s.cursor) = (Page::World, 0),
-            2 => (s.page, s.cursor) = (Page::Logging, 0),
+            2 => (s.page, s.cursor) = (Page::Shops, 0),
+            3 => (s.page, s.cursor) = (Page::Logging, 0),
             _ => s.open = false,
         },
         Page::World => match s.cursor {
@@ -398,6 +439,25 @@ fn keys() {
             };
             if let Some(a) = a {
                 s.pending.push(a);
+            }
+        }
+        Page::Shops if enter => {
+            let n = crate::shops_menu::chains().as_ref().map_or(0, |c| c.len());
+            if s.cursor >= n {
+                (s.page, s.cursor) = (Page::Main, 2);
+            } else {
+                s.shop_chain = s.cursor;
+                (s.page, s.cursor) = (Page::ShopList, 0);
+            }
+        }
+        Page::ShopList if enter => {
+            let pick = crate::shops_menu::chains()
+                .as_ref()
+                .and_then(|c| c.get(s.shop_chain))
+                .and_then(|c| c.shops.get(s.cursor).map(|x| x.0));
+            match pick {
+                Some(i) => s.pending.push(Action::TeleportShop(i)),
+                None => (s.page, s.cursor) = (Page::Shops, s.shop_chain),
             }
         }
         Page::Logging => match s.cursor {
@@ -484,6 +544,16 @@ pub fn tick() {
                         let to = [t[0], t[1] + 2.0, t[2]];
                         let how = crate::teleport::teleport(p, &to);
                         format!("teleported to {:.0}, {:.0}, {:.0} ({how})", t[0], t[1], t[2])
+                    });
+                }
+                Action::TeleportShop(i) => {
+                    msg = Some(match crate::shops_menu::door(i) {
+                        Some(d) => {
+                            let to = [d[0], d[1] + 1.0, d[2]];
+                            let how = crate::teleport::teleport(p, &to);
+                            format!("teleported to the shop door ({how})")
+                        }
+                        None => "that shop's door is not loaded".into(),
                     });
                 }
                 Action::Time(hours) => {
@@ -674,6 +744,29 @@ fn rect(x: i32, y: i32, w: i32, h: i32) {
     unsafe { call_regs(FILL_RECT, 0, 0, 0, 0, 0, &[x as u32, y as u32, w as u32, h as u32, HUD_PAIR]) };
 }
 
+/// A filled rectangle with rounded corners of radius `rad`, built from one-unit slices at the top and
+/// bottom that follow a circle (the 2D layer only fills plain rectangles). `top_only` leaves the bottom
+/// corners square.
+fn rrect(x: f32, y: f32, w: f32, h: f32, rad: f32, top_only: bool) {
+    // Snap to whole units first so the corner slices and the body meet with no seam.
+    let (xi, yi) = (x.round() as i32, y.round() as i32);
+    let (wi, hi) = (w.round().max(1.0) as i32, h.round().max(1.0) as i32);
+    let n = (rad.round() as i32).min(wi / 2).min(hi / 2).max(0);
+    let r = n as f32;
+    for k in 0..n {
+        let dy = r - k as f32 - 0.5;
+        let inset = (r - (r * r - dy * dy).max(0.0).sqrt()).round() as i32;
+        rect(xi + inset, yi + k, wi - 2 * inset, 1);
+        if !top_only {
+            rect(xi + inset, yi + hi - 1 - k, wi - 2 * inset, 1);
+        }
+    }
+    let body = if top_only { hi - n } else { hi - 2 * n };
+    if body > 0 {
+        rect(xi, yi + n, wi, body);
+    }
+}
+
 fn text(x: f32, y: f32, scale: f32, s: &str) {
     let mut z: Vec<u8> = s.bytes().filter(|&c| c >= 0x20 && c < 0x7F).collect();
     z.push(0);
@@ -770,16 +863,23 @@ fn draw_menu() {
     if !OPEN.load(Ordering::Acquire) {
         return;
     }
-    let (title, list, cursor, status) = {
+    let (page, list, cursor, status, chain) = {
         let s = lock();
-        let title = match s.page {
-            Page::Main => "SR2 Decomp menu",
-            Page::Player => "Player options",
-            Page::World => "World",
-            Page::Cheats => "Game cheats (may affect achievements)",
-            Page::Logging => "Mission logging",
-        };
-        (title, items(&s), s.cursor, s.status.clone())
+        (s.page, items(&s), s.cursor, s.status.clone(), s.shop_chain)
+    };
+    let chain_name = if page == Page::ShopList {
+        crate::shops_menu::chains().as_ref().and_then(|c| c.get(chain).map(|c| c.name.clone())).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let (title, crumb): (String, String) = match page {
+        Page::Main => ("SR2 Decomp".into(), "test menu".into()),
+        Page::Player => ("Player options".into(), "Main > Player".into()),
+        Page::World => ("World".into(), "Main > World".into()),
+        Page::Cheats => ("Game cheats".into(), "Main > World > Cheats (may affect achievements)".into()),
+        Page::Logging => ("Mission logging".into(), "Main > Logging".into()),
+        Page::Shops => ("Shops".into(), "Main > Shops: pick a chain".into()),
+        Page::ShopList => (chain_name.clone(), format!("Main > Shops > {chain_name}: Enter teleports")),
     };
     let l = missionlog::status();
     let (sw, sh) = unsafe { (rd(SCREEN_W) as i32, rd(SCREEN_H) as i32) };
@@ -789,16 +889,21 @@ fn draw_menu() {
     let (vw, vh) = virtual_size(sw, sh);
     let u = vh / 480.0;
     let ts = TEXT_SCALE * u;
-    let lh = font_height() * ts + 2.0 * u;
-    let pad = 6.0 * u;
-    let w = 220.0 * u;
+    let small = ts * 0.78;
+    let lh = font_height() * ts + 3.0 * u;
+    let slh = font_height() * small + 2.0 * u;
+    let pad = 8.0 * u;
+    let w = 270.0 * u;
     // Long pages show a window of rows around the cursor.
     let start = cursor.saturating_sub(WINDOW / 2).min(list.len().saturating_sub(WINDOW));
     let shown = list.len().min(WINDOW);
-    let h = lh * (shown as f32 + 3.4) + pad * 2.0;
-    let x = vw - w - 12.0 * u;
-    let y = vh - h - 12.0 * u;
-    let r = |x: f32, y: f32, w: f32, h: f32| rect(x as i32, y as i32, w as i32, h as i32);
+    let head = lh * 1.7;
+    let rows_h = lh * shown as f32;
+    let h = head + slh * 1.4 + rows_h + pad * 1.5 + slh * 3.4;
+    let x = vw - w - 16.0 * u;
+    let y = (vh - h - 16.0 * u).max(8.0 * u);
+    let r = |x: f32, y: f32, w: f32, h: f32| rect(x as i32, y as i32, w.max(1.0) as i32, h.max(1.0) as i32);
+    let rad = 10.0 * u;
     let ctx = crate::gfx_cmd::thread_context() as usize;
     let saved: [i32; 10] = std::array::from_fn(|i| unsafe { rd(ctx + if i < 6 { 8 + i * 4 } else { 0x44 + (i - 6) * 4 }) } as i32);
     unsafe {
@@ -807,31 +912,64 @@ fn draw_menu() {
         // The list can leave a dark tint behind (fades): draw with none.
         let white = [1.0f32; 3];
         call_regs(SET_TINT, 0, 0, 0, white.as_ptr() as u32, 0, &[]);
-        color(0, 0, 0, 200);
-        r(x, y, w, h);
-        color(60, 140, 255, 255);
-        r(x, y, w, 2.0 * u);
-        let tx = x + pad;
-        let mut ty = y + pad;
+        // Shadow, body, header band.
+        color(0, 0, 0, 80);
+        rrect(x + 4.0 * u, y + 5.0 * u, w, h, rad, false);
+        color(14, 12, 22, 228);
+        rrect(x, y, w, h, rad, false);
+        color(112, 40, 176, 245);
+        rrect(x, y, w, head, rad, true);
+        color(170, 110, 235, 200);
+        r(x, y + head - 1.5 * u, w, 1.5 * u);
         color(255, 255, 255, 255);
-        text(tx, ty, ts, title);
-        ty += lh * 1.3;
+        text(x + pad, y + (head - lh) * 0.5 + u, ts * 1.12, &title);
+        // Breadcrumb.
+        let mut ty = y + head + slh * 0.3;
+        color(165, 160, 185, 255);
+        text(x + pad, ty, small, &crumb);
+        ty += slh * 1.1;
+        // Rows.
+        let rows_top = ty;
         for (i, item) in list.iter().enumerate().skip(start).take(shown) {
             if i == cursor {
-                color(60, 140, 255, 140);
-                r(x + pad * 0.5, ty - u, w - pad, lh);
+                color(112, 40, 176, 170);
+                rrect(x + pad * 0.5, ty - u, w - pad * 1.5, lh, 5.0 * u, false);
+                color(225, 195, 255, 255);
+                rrect(x + pad * 0.5 + 2.0 * u, ty + 2.0 * u, 3.0 * u, lh - 6.0 * u, 1.5 * u, false);
                 color(255, 255, 255, 255);
+            } else if item == "Back" || item == "Close" {
+                color(150, 145, 170, 255);
             } else {
-                color(190, 190, 190, 255);
+                color(205, 205, 215, 255);
             }
-            text(tx, ty, ts, item);
+            text(x + pad + 3.0 * u, ty, ts, item);
             ty += lh;
         }
-        ty += lh * 0.3;
-        color(150, 150, 150, 255);
-        text(tx, ty, ts * 0.8, &format!("log: {} | point {} | {}", l.mission_label, l.point, l.samples_text));
-        ty += lh * 0.8;
-        text(tx, ty, ts * 0.8, &format!("{status}   [mem {} / {} MB]", memory().0, memory().1));
+        // Scrollbar for long pages.
+        if list.len() > shown && shown > 0 {
+            let tx = x + w - pad * 0.6;
+            color(255, 255, 255, 28);
+            r(tx, rows_top - u, 3.0 * u, rows_h);
+            let th = (rows_h * shown as f32 / list.len() as f32).max(6.0 * u);
+            let off = (rows_h - th) * start as f32 / (list.len() - shown) as f32;
+            color(170, 110, 235, 230);
+            r(tx, rows_top - u + off, 3.0 * u, th);
+        }
+        // Footer: hints, status, log / memory.
+        ty += pad * 0.5;
+        color(255, 255, 255, 30);
+        r(x + pad, ty, w - pad * 2.0, u.max(1.0));
+        ty += pad * 0.6;
+        color(140, 135, 160, 255);
+        text(x + pad, ty, small, "Up/Down move  Left/Right change  Enter select  Bksp back");
+        ty += slh;
+        if !status.is_empty() {
+            color(200, 160, 255, 255);
+            text(x + pad, ty, small, &status);
+        }
+        ty += slh;
+        color(110, 105, 130, 255);
+        text(x + pad, ty, small, &format!("log: {} | point {} | {} | mem {} / {} MB", l.mission_label, l.point, l.samples_text, memory().0, memory().1));
         color(255, 255, 255, 255);
         let [x0, _x1, y0, _y1, vw, vh, l, rr, t, b] = saved;
         call_regs(SET_VIEWPORT, 0, 0, 0, 0, y0 as u32, &[x0 as u32, vw as u32, vh as u32, 1]);
