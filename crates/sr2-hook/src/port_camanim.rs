@@ -139,10 +139,28 @@ macro_rules! regs_thunk {
                 "pushad",
                 "mov eax, esp",
                 "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
@@ -151,24 +169,47 @@ macro_rules! regs_thunk {
     };
 }
 
-/// Like `regs_thunk`, but after `popad` EAX is a function to tail-jump to (0 = just return).
+/// A tail-jumping thunk. The Rust body returns the function to jump to (0 = just return) and leaves
+/// the registers the original has at that point in the block. The target travels in a slot reserved
+/// below the return address, so `ret` jumps with the stack exactly as the original's `jmp` has it.
 macro_rules! tail_thunk {
     ($name:ident, $f:ident) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
             std::arch::naked_asm!(
+                "sub esp, 4",
                 "pushad",
                 "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "lea ecx, [esp + 40]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov [esp + 32], eax",
                 "popad",
-                "test eax, eax",
-                "jz 2f",
-                "jmp eax",
+                "cmp dword ptr [esp], 0",
+                "je 2f",
+                "ret",
                 "2:",
+                "add esp, 4",
                 "ret",
                 f = sym $f,
             )
@@ -185,10 +226,28 @@ macro_rules! call_thunk {
                 "pushad",
                 "mov eax, esp",
                 "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 "test eax, eax",
                 "jz 2f",
@@ -414,6 +473,36 @@ struct Plan {
     edx: u32,
 }
 
+thread_local! {
+    /// The caller's EAX (camera_mode_pop leaves it when it removes the top entry).
+    static EAX_IN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// EAX / ECX / EDX the original has at the end of the last mode function (when it does not jump).
+    static FIN: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+fn set_fin(a: u32, c: u32, d: u32) {
+    FIN.with(|f| f.set([a, c, d]));
+}
+
+/// Leave the registers of the original in the block: the jump target in EAX with ECX / EDX from
+/// the plan, or the end state recorded by `set_fin`. Returns the target (0 = none).
+fn plan_regs(r: &mut Pushad, plan: &Plan) -> u32 {
+    if plan.call != 0 {
+        r.eax = plan.call;
+        r.ecx = plan.ecx;
+        r.edx = plan.edx;
+    } else {
+        let f = FIN.with(|f| f.get());
+        r.eax = f[0];
+        r.ecx = f[1];
+        r.edx = f[2];
+    }
+    plan.call
+}
+
 unsafe fn mode_enter_fn(mode: u32) -> u32 {
     unsafe { rd(MODE_TABLE + (mode as usize).wrapping_mul(0x14)) }
 }
@@ -455,11 +544,13 @@ unsafe fn mode_push(mode: u32) -> Plan {
         wd(MODE_STACK + (cnt as usize).wrapping_mul(4), mode);
         wd(MODE_COUNT, rd(MODE_COUNT).wrapping_add(1));
         if rd(MODE_CUR) == mode {
+            set_fin(e as u32, mode, cnt as u32);
             return Plan::default();
         }
         wd(CAM_FLAGS, rd(CAM_FLAGS) & !2);
         let f = mode_enter_fn(mode);
         wd(MODE_CUR, mode);
+        set_fin(0, mode, cnt as u32);
         if f == 0 { Plan::default() } else { Plan { call: f, ecx: mode, edx: cnt as u32 } }
     }
 }
@@ -474,7 +565,7 @@ unsafe fn derived_plan(r: &Regs, old_cur: u32) -> Plan {
     }
 }
 
-extern "C" fn mode_push_entry(r: &mut Pushad, _: *const u32) {
+extern "C" fn mode_push_entry(r: &mut Pushad, _: *const u32) -> u32 {
     let p = *r;
     let plan = match shadowing(MODE_PUSH) {
         None => unsafe { mode_push(p.ecx) },
@@ -493,11 +584,7 @@ extern "C" fn mode_push_entry(r: &mut Pushad, _: *const u32) {
             )
         },
     };
-    r.eax = plan.call;
-    if plan.call != 0 {
-        r.ecx = plan.ecx;
-        r.edx = plan.edx;
-    }
+    plan_regs(r, &plan)
 }
 tail_thunk!(mode_push_thunk, mode_push_entry);
 
@@ -513,11 +600,13 @@ unsafe fn mode_pop(mode: u32) -> Plan {
     unsafe {
         let n = rd(MODE_COUNT) as i32;
         if n <= 0 {
+            set_fin(EAX_IN.with(|c| c.get()), n as u32, mode);
             return Plan::default();
         }
         let old = rd(MODE_CUR);
         let mut cnt = n;
         let mut edx = mode;
+        let mut eax = EAX_IN.with(|c| c.get());
         let mut remove = false;
         if rd(MODE_STACK + (n as usize - 1) * 4) == mode {
             remove = true;
@@ -531,6 +620,7 @@ unsafe fn mode_pop(mode: u32) -> Plan {
                 }
                 e -= 1;
             }
+            eax = e as u32;
             if found {
                 edx = (n - 1) as u32;
                 if e < n - 1 {
@@ -539,6 +629,7 @@ unsafe fn mode_pop(mode: u32) -> Plan {
                         cnt = rd(MODE_COUNT) as i32;
                         e += 1;
                         edx = cnt.wrapping_sub(1) as u32;
+                        eax = e as u32;
                         if e >= cnt.wrapping_sub(1) {
                             break;
                         }
@@ -555,15 +646,18 @@ unsafe fn mode_pop(mode: u32) -> Plan {
         wd(CAM_FLAGS, rd(CAM_FLAGS) & !2);
         wd(MODE_CUR, new);
         if new == old {
+            set_fin(eax, new, edx);
             return Plan::default();
         }
         let f = mode_enter_fn(new);
+        set_fin(0, new, edx);
         if f == 0 { Plan::default() } else { Plan { call: f, ecx: new, edx } }
     }
 }
 
-extern "C" fn mode_pop_entry(r: &mut Pushad, _: *const u32) {
+extern "C" fn mode_pop_entry(r: &mut Pushad, _: *const u32) -> u32 {
     let p = *r;
+    EAX_IN.with(|c| c.set(p.eax));
     let plan = match shadowing(MODE_POP) {
         None => unsafe { mode_pop(p.edx) },
         Some((n, orig)) => unsafe {
@@ -581,11 +675,7 @@ extern "C" fn mode_pop_entry(r: &mut Pushad, _: *const u32) {
             )
         },
     };
-    r.eax = plan.call;
-    if plan.call != 0 {
-        r.ecx = plan.ecx;
-        r.edx = plan.edx;
-    }
+    plan_regs(r, &plan)
 }
 tail_thunk!(mode_pop_thunk, mode_pop_entry);
 

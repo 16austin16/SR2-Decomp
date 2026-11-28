@@ -157,7 +157,8 @@ impl W {
 
 /// A dword read of game memory.
 fn rd(a: usize) -> u32 {
-    unsafe { std::ptr::read_unaligned(a as *const u32) }
+    // volatile: a load the original does must fault even when its value ends up unused
+    unsafe { std::ptr::read_volatile(a as *const u32) }
 }
 
 /// A byte read of game memory.
@@ -184,19 +185,60 @@ fn q64(bits: u64) -> u64 {
     }
 }
 
-/// `fld dword [m]`.
+thread_local! {
+    /// The sticky exception flags (status word bits 0-5) the original would have raised so far.
+    static SF: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn sf_or(f: u32) {
+    SF.with(|c| c.set(c.get() | f));
+}
+
+/// `fld dword [m]`: a denormal raises DE, a signalling NaN raises IE.
 fn ldf(bits: u32) -> f64 {
-    f32::from_bits(bits) as f64
+    let e = bits & 0x7F80_0000;
+    let m = bits & 0x007F_FFFF;
+    if e == 0 && m != 0 {
+        sf_or(0x02);
+    } else if e == 0x7F80_0000 && m != 0 && bits & 0x0040_0000 == 0 {
+        sf_or(0x01);
+    }
+    f32::from_bits(q32(bits)) as f64
+}
+
+/// `fstp dword` / `fst dword`: the f32 bits of `x`, raising PE / OE / UE as the FPU does.
+fn stf(x: f64) -> u32 {
+    let r = x as f32;
+    if !x.is_nan() {
+        let back = r as f64;
+        if back != x {
+            sf_or(0x20);
+            if r.is_infinite() && x.is_finite() {
+                sf_or(0x08);
+            } else if r == 0.0 || r.is_subnormal() {
+                sf_or(0x10);
+            }
+        }
+    }
+    r.to_bits()
 }
 
 /// `fstp dword` followed by `fld dword`: the value rounded to f32.
 fn r32(x: f64) -> f64 {
-    (x as f32) as f64
+    f32::from_bits(stf(x)) as f64
 }
 
 /// The x87 condition codes (in the `ah` bit positions of the status word) after comparing `a`
-/// (ST0) with `b`.
+/// (ST0) with `b` (`fcom`: any NaN raises IE).
 fn cc(a: f64, b: f64) -> u32 {
+    if a.is_nan() || b.is_nan() {
+        sf_or(0x01);
+    }
+    ccu(a, b)
+}
+
+/// The same for `fucom` (no IE for a quiet NaN).
+fn ccu(a: f64, b: f64) -> u32 {
     if a.is_nan() || b.is_nan() {
         0x4500
     } else if a < b {
@@ -209,12 +251,12 @@ fn cc(a: f64, b: f64) -> u32 {
 }
 
 /// The low word `fnstsw ax` leaves after a compare: condition codes, the TOP field (the live
-/// one lowered by `pushed` values the original keeps on the x87 stack) and the live sticky flags.
+/// one lowered by `pushed` values the original keeps on the x87 stack) and the sticky flags.
 fn sw_ax(cc: u32, pushed: u32) -> u32 {
     let live: u32;
     unsafe { std::arch::asm!("fnstsw ax", "movzx eax, ax", out("eax") live, options(nomem, nostack)) };
     let top = ((live >> 11) & 7).wrapping_sub(pushed) & 7;
-    cc | (top << 11) | (live & 0xFF)
+    cc | (top << 11) | ((live | SF.with(|c| c.get())) & 0xFF)
 }
 
 // --- calling the original copy ---------------------------------------------------------------
@@ -440,10 +482,18 @@ macro_rules! thunk {
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
-                "sub esp, 8",
+                "sub esp, 136",
+                "movups [esp + 8], xmm0",
+                "movups [esp + 24], xmm1",
+                "movups [esp + 40], xmm2",
+                "movups [esp + 56], xmm3",
+                "movups [esp + 72], xmm4",
+                "movups [esp + 88], xmm5",
+                "movups [esp + 104], xmm6",
+                "movups [esp + 120], xmm7",
                 "mov eax, esp",
-                "lea ecx, [esp + 8]",
-                "lea edx, [esp + 44]",
+                "lea ecx, [esp + 136]",
+                "lea edx, [esp + 172]",
                 "push eax",
                 "push edx",
                 "push ecx",
@@ -451,7 +501,15 @@ macro_rules! thunk {
                 "call {f}",
                 "add esp, 16",
                 $fld,
-                "add esp, 8",
+                "movups xmm0, [esp + 8]",
+                "movups xmm1, [esp + 24]",
+                "movups xmm2, [esp + 40]",
+                "movups xmm3, [esp + 56]",
+                "movups xmm4, [esp + 72]",
+                "movups xmm5, [esp + 88]",
+                "movups xmm6, [esp + 104]",
+                "movups xmm7, [esp + 120]",
+                "add esp, 136",
                 "popad",
                 $ret,
                 id = const $id,
@@ -461,8 +519,31 @@ macro_rules! thunk {
     };
 }
 
+thread_local! {
+    /// XMM0-7 of the caller: the thunk saves them, a body that runs SSE code reads and writes
+    /// them here, the thunk restores them on return.
+    static XMM: std::cell::Cell<[[u32; 4]; 8]> = const { std::cell::Cell::new([[0; 4]; 8]) };
+}
+
+fn xmm_get() -> [[u32; 4]; 8] {
+    XMM.with(|c| c.get())
+}
+
+fn xmm_set(x: [[u32; 4]; 8]) {
+    XMM.with(|c| c.set(x));
+}
+
 /// Count a call; run the Rust body, shadowed against the original while the budget lasts.
 extern "C" fn entry(id: usize, r: &mut Pushad, args: *const u32, st: &mut f64) {
+    // The saved XMM0-7 follow the result slot; the body may change them through `xmm_set`.
+    let xa = unsafe { (st as *mut f64 as *mut u8).add(8) as *mut [[u32; 4]; 8] };
+    xmm_set(unsafe { std::ptr::read_unaligned(xa) });
+    SF.with(|c| c.set(0));
+    entry_inner(id, r, args, st);
+    unsafe { std::ptr::write_unaligned(xa, xmm_get()) };
+}
+
+fn entry_inner(id: usize, r: &mut Pushad, args: *const u32, st: &mut f64) {
     let p = &PORTS[id];
     let n = p.calls.fetch_add(1, Ordering::Relaxed);
     let orig = p.original.load(Ordering::Relaxed);
@@ -490,6 +571,7 @@ fn restore(regions: &[(usize, usize)], saved: &[Vec<u8>]) {
 /// the bytes written. On a mismatch keep the original's results.
 fn shadow(p: &Port, n: u32, orig: usize, r: &mut Pushad, args: *const u32, st: &mut f64) {
     let inp = Regs::of(r);
+    let xmm_in = xmm_get();
     // Dry run of the Rust body: which bytes does it write?
     let regions = {
         let mut probe = *r;
@@ -497,6 +579,8 @@ fn shadow(p: &Port, n: u32, orig: usize, r: &mut Pushad, args: *const u32, st: &
         let _ = (p.run)(&mut probe, args, &mut w);
         w.undo()
     };
+    xmm_set(xmm_in);
+    SF.with(|c| c.set(0));
     let pre = snapshot(&regions);
     let mut theirs = inp;
     let mut theirs_st = 0u64;
@@ -583,7 +667,7 @@ fn tabbar_get_height(p: &mut Pushad, _: *const u32, _: &mut W) -> f64 {
         x += ldf(rdd(0xe5bfd8));
     }
     let res = r32(x * ldf(at(p.ecx, 0x28)));
-    p.ecx = (res as f32).to_bits();
+    p.ecx = stf(res);
     res
 }
 
@@ -593,12 +677,13 @@ fn tabbar_get_height(p: &mut Pushad, _: *const u32, _: &mut W) -> f64 {
 fn pending_dim<const O: u32>(p: &mut Pushad, _: *const u32, _: &mut W) -> f64 {
     let a = ldf(at(p.ecx, 0x18));
     let b = ldf(at(p.ecx, 0x1c));
+    let _ = cc(b, a); // fcompp: a NaN raises IE
     let m = if b < a { a } else { b };
     let m = r32(m);
     let c = ldf(at(p.ecx, O));
     let res = r32(if c < m { m } else { c });
     p.eax = (p.eax & 0xFFFF_0000) | sw_ax(cc(c, m), 1);
-    p.ecx = (res as f32).to_bits();
+    p.ecx = stf(res);
     res
 }
 
@@ -620,7 +705,7 @@ fn rng_float01(p: &mut Pushad, _: *const u32, w: &mut W) -> f64 {
         x += ldf(rdd(0xe5bfd8));
     }
     let res = r32(x * f64::from_bits(rq(0xe5c030)));
-    p.ecx = (res as f32).to_bits();
+    p.ecx = stf(res);
     p.edx = v;
     res
 }
@@ -770,6 +855,7 @@ fn get_vec2<const A: u32, const B: u32>(p: &mut Pushad, a: *const u32, w: &mut W
         let vb = q32(at(p.ecx, B));
         w.d(ad(ptr, 4), q32(at(p.ecx, A)));
         w.d(ad(ptr, 8), vb);
+        w.d(a as usize, vb); // the original spills the second value through its first argument slot
     }
     p.eax = (ptr & !0xff) | 1;
     p.edx = tag;
@@ -859,13 +945,15 @@ fn text_set_wrap_width(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
         _ => (0.0, tag.wrapping_sub(3)),
     };
     let v = r32(x);
-    w.d(ad(p.ecx, 0xec), (v as f32).to_bits());
+    w.d(ad(p.ecx, 0xec), stf(v));
     let limit = f64::from_bits(rq(0xe5c120));
     let c = cc(v, limit);
     let f = rb(ad(p.ecx, 0xf0));
     let fin = if v < limit { ldf(rdd(0xdd071c)) } else { v };
     w.b(ad(p.ecx, 0xf0), f | 2);
-    w.d(ad(p.ecx, 0xec), (fin as f32).to_bits());
+    let fin_bits = stf(fin);
+    w.d(ad(p.ecx, 0xec), fin_bits);
+    w.d(a as usize, fin_bits); // the original's `fstp dword [esp + 4]` lands in its argument slot
     p.eax = (e & 0xFFFF_0000) | sw_ax(c, 1) & 0xFF00 | 1;
     p.edx = ptr;
     0.0
@@ -901,6 +989,7 @@ fn g_753410(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // 753436 pop ebp
     ebp = s[23];
     // 753437 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -932,6 +1021,7 @@ fn g_775820(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // 775846 pop ebp
     ebp = s[23];
     // 775847 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -963,6 +1053,7 @@ fn g_77aa70(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // 77aa96 pop ebp
     ebp = s[23];
     // 77aa97 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -994,6 +1085,7 @@ fn g_7ee590(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // 7ee5b6 pop ebp
     ebp = s[23];
     // 7ee5b7 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1025,6 +1117,7 @@ fn g_7ef9a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // 7ef9c6 pop ebp
     ebp = s[23];
     // 7ef9c7 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1056,6 +1149,7 @@ fn g_a3d990(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // a3d9b6 pop ebp
     ebp = s[23];
     // a3d9b7 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1087,6 +1181,7 @@ fn g_b90c60(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // b90c86 pop ebp
     ebp = s[23];
     // b90c87 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1118,6 +1213,7 @@ fn g_b90d70(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // b90d96 pop ebp
     ebp = s[23];
     // b90d97 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1153,6 +1249,7 @@ fn g_7d28e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // 7d290e pop ebp
     ebp = s[23];
     // 7d290f ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1186,6 +1283,7 @@ fn g_a41850(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // a4187b pop ebp
     ebp = s[23];
     // a4187c ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1202,7 +1300,7 @@ fn g_a2e510(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // a2e516 mov eax, dword ptr [ebp + 8]
     eax = s[25];
     // a2e519 fld dword ptr [0x2526da0]
-    let t1: f64 = f32::from_bits(rd(0x2526da0usize)) as f64;
+    let t1: f64 = ldf(rd(0x2526da0usize));
     // a2e51f mov ecx, dword ptr [eax + 8]
     ecx = rd((eax.wrapping_add(0x8)) as usize);
     // a2e522 fstp qword ptr [ecx + 8]
@@ -1217,6 +1315,7 @@ fn g_a2e510(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // a2e536 pop ebp
     ebp = s[23];
     // a2e537 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1248,6 +1347,7 @@ fn g_a398c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // a398e2 pop ebp
     ebp = s[23];
     // a398e3 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1279,6 +1379,7 @@ fn g_a47b50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // a47b72 pop ebp
     ebp = s[23];
     // a47b73 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1295,7 +1396,7 @@ fn g_d74500(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // d74506 mov eax, dword ptr [ebp + 8]
     eax = s[25];
     // d74509 fld dword ptr [0xe84380]
-    let t1: f64 = f32::from_bits(rd(0xe84380usize)) as f64;
+    let t1: f64 = ldf(rd(0xe84380usize));
     // d7450f mov ecx, dword ptr [eax + 8]
     ecx = rd((eax.wrapping_add(0x8)) as usize);
     // d74512 fstp qword ptr [ecx + 8]
@@ -1310,6 +1411,7 @@ fn g_d74500(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // d74526 pop ebp
     ebp = s[23];
     // d74527 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1326,7 +1428,7 @@ fn g_d74530(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // d74536 mov eax, dword ptr [ebp + 8]
     eax = s[25];
     // d74539 fld dword ptr [0xe84380]
-    let t1: f64 = f32::from_bits(rd(0xe84380usize)) as f64;
+    let t1: f64 = ldf(rd(0xe84380usize));
     // d7453f mov ecx, dword ptr [eax + 8]
     ecx = rd((eax.wrapping_add(0x8)) as usize);
     // d74542 fstp qword ptr [ecx + 8]
@@ -1341,6 +1443,7 @@ fn g_d74530(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // d74556 pop ebp
     ebp = s[23];
     // d74557 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1397,6 +1500,7 @@ fn g_d71d50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // d71d9b lea eax, [edx - 0xe]
     eax = ((edx.wrapping_add(0xfffffff2)) as usize) as u32;
     // d71d9e ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1454,6 +1558,7 @@ fn g_789480(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // 7894cf pop ebp
     ebp = s[23];
     // 7894d0 ret 
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1467,7 +1572,7 @@ fn g_a3cfe0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // a3cfe2 xor eax, eax
     eax = 0;
     // a3cfe4 fstp dword ptr [0x2529740]
-    w.d(0x2529740usize, (t1 as f32).to_bits());
+    w.d(0x2529740usize, stf(t1));
     // a3cfea ret 
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
@@ -1494,6 +1599,8 @@ fn g_cdfc60(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // cdfc77 add dword ptr [ecx + 0x1c], 1
     { let ad = (ecx.wrapping_add(0x1c)) as usize; w.d(ad, rd(ad).wrapping_add(0x1u32)); }
     // cdfc7b ret 8
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1514,7 +1621,7 @@ fn g_761860(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let _ = a;
     // 761860 fld dword ptr [ecx + 0x10]
-    let t1: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t1: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // 761863 ret 4
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t1
@@ -1525,7 +1632,7 @@ fn g_761870(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let _ = a;
     // 761870 fld dword ptr [ecx + 0x14]
-    let t1: f64 = f32::from_bits(rd((ecx.wrapping_add(0x14)) as usize)) as f64;
+    let t1: f64 = ldf(rd((ecx.wrapping_add(0x14)) as usize));
     // 761873 ret 4
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t1
@@ -1548,17 +1655,18 @@ fn g_77b2e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let t1: f64 = (s[23] as i32) as f64;
     // 77b2ed fmul qword ptr [0xe5c228]
     let t2: f64 = f64::from_bits(q64(rq(0xe5c228usize)));
-    let t3: f64 = t1 * t2;
+    let t3: f64 = xn3(t1, t2, t1 * t2);
     // 77b2f3 fadd qword ptr [0xe5bf68]
     let t4: f64 = f64::from_bits(q64(rq(0xe5bf68usize)));
-    let t5: f64 = t3 + t4;
+    let t5: f64 = xn3(t3, t4, t3 + t4);
     // 77b2f9 fstp dword ptr [esp]
-    s[23] = (t5 as f32).to_bits();
+    s[23] = stf(t5);
     // 77b2fc fld dword ptr [esp]
-    let t6: f64 = f32::from_bits(s[23]) as f64;
+    let t6: f64 = ldf(s[23]);
     // 77b2ff pop ecx
     ecx = s[23];
     // 77b300 ret 4
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t6
 }
@@ -1579,7 +1687,7 @@ fn g_781f40(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let _ = a;
     // 781f40 fld dword ptr [0xe5c220]
-    let t1: f64 = f32::from_bits(rd(0xe5c220usize)) as f64;
+    let t1: f64 = ldf(rd(0xe5c220usize));
     // 781f46 ret 4
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t1
@@ -1590,7 +1698,7 @@ fn g_781f50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let _ = a;
     // 781f50 fld dword ptr [ecx + 0x974]
-    let t1: f64 = f32::from_bits(rd((ecx.wrapping_add(0x974)) as usize)) as f64;
+    let t1: f64 = ldf(rd((ecx.wrapping_add(0x974)) as usize));
     // 781f56 ret 4
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t1
@@ -1601,7 +1709,7 @@ fn g_aefe60(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let _ = a;
     // aefe60 fld dword ptr [0xe8725c]
-    let t1: f64 = f32::from_bits(rd(0xe8725cusize)) as f64;
+    let t1: f64 = ldf(rd(0xe8725cusize));
     // aefe66 ret 8
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t1
@@ -1612,7 +1720,7 @@ fn g_b75c30(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let _ = a;
     // b75c30 fld dword ptr [0xe8725c]
-    let t1: f64 = f32::from_bits(rd(0xe8725cusize)) as f64;
+    let t1: f64 = ldf(rd(0xe8725cusize));
     // b75c36 ret 8
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t1
@@ -1623,7 +1731,7 @@ fn g_b75ca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let _ = a;
     // b75ca0 fld dword ptr [0xe5c0f0]
-    let t1: f64 = f32::from_bits(rd(0xe5c0f0usize)) as f64;
+    let t1: f64 = ldf(rd(0xe5c0f0usize));
     // b75ca6 ret 8
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t1
@@ -1634,7 +1742,7 @@ fn g_b7eeb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let _ = a;
     // b7eeb0 fld dword ptr [0xe8725c]
-    let t1: f64 = f32::from_bits(rd(0xe8725cusize)) as f64;
+    let t1: f64 = ldf(rd(0xe8725cusize));
     // b7eeb6 ret 8
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t1
@@ -1657,52 +1765,52 @@ fn g_404a20(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let mut s = [0u32; 40];
     // 404a20 sub esp, 8
     // 404a23 fld dword ptr [ecx]
-    let t1: f64 = f32::from_bits(rd((ecx) as usize)) as f64;
+    let t1: f64 = ldf(rd((ecx) as usize));
     // 404a25 fsub dword ptr [eax]
-    let t2: f64 = f32::from_bits(rd((eax) as usize)) as f64;
-    let t3: f64 = t1 - t2;
+    let t2: f64 = ldf(rd((eax) as usize));
+    let t3: f64 = xn3(t1, t2, t1 - t2);
     // 404a27 fstp dword ptr [esp]
-    s[22] = (t3 as f32).to_bits();
+    s[22] = stf(t3);
     // 404a2a fld dword ptr [esp]
-    let t4: f64 = f32::from_bits(s[22]) as f64;
+    let t4: f64 = ldf(s[22]);
     // 404a2d fmul st(0), st(0)
-    let t5: f64 = t4 * t4;
+    let t5: f64 = xn3(t4, t4, t4 * t4);
     // 404a2f fstp dword ptr [esp + 4]
-    s[23] = (t5 as f32).to_bits();
+    s[23] = stf(t5);
     // 404a33 fld dword ptr [ecx + 4]
-    let t6: f64 = f32::from_bits(rd((ecx.wrapping_add(0x4)) as usize)) as f64;
+    let t6: f64 = ldf(rd((ecx.wrapping_add(0x4)) as usize));
     // 404a36 fsub dword ptr [eax + 4]
-    let t7: f64 = f32::from_bits(rd((eax.wrapping_add(0x4)) as usize)) as f64;
-    let t8: f64 = t6 - t7;
+    let t7: f64 = ldf(rd((eax.wrapping_add(0x4)) as usize));
+    let t8: f64 = xn3(t6, t7, t6 - t7);
     // 404a39 fstp dword ptr [esp]
-    s[22] = (t8 as f32).to_bits();
+    s[22] = stf(t8);
     // 404a3c fld dword ptr [esp]
-    let t9: f64 = f32::from_bits(s[22]) as f64;
+    let t9: f64 = ldf(s[22]);
     // 404a3f fmul st(0), st(0)
-    let t10: f64 = t9 * t9;
+    let t10: f64 = xn3(t9, t9, t9 * t9);
     // 404a41 fadd dword ptr [esp + 4]
-    let t11: f64 = f32::from_bits(s[23]) as f64;
-    let t12: f64 = t10 + t11;
+    let t11: f64 = ldf(s[23]);
+    let t12: f64 = xn3(t10, t11, t10 + t11);
     // 404a45 fstp dword ptr [esp + 4]
-    s[23] = (t12 as f32).to_bits();
+    s[23] = stf(t12);
     // 404a49 fld dword ptr [ecx + 8]
-    let t13: f64 = f32::from_bits(rd((ecx.wrapping_add(0x8)) as usize)) as f64;
+    let t13: f64 = ldf(rd((ecx.wrapping_add(0x8)) as usize));
     // 404a4c fsub dword ptr [eax + 8]
-    let t14: f64 = f32::from_bits(rd((eax.wrapping_add(0x8)) as usize)) as f64;
-    let t15: f64 = t13 - t14;
+    let t14: f64 = ldf(rd((eax.wrapping_add(0x8)) as usize));
+    let t15: f64 = xn3(t13, t14, t13 - t14);
     // 404a4f fstp dword ptr [esp]
-    s[22] = (t15 as f32).to_bits();
+    s[22] = stf(t15);
     // 404a52 fld dword ptr [esp]
-    let t16: f64 = f32::from_bits(s[22]) as f64;
+    let t16: f64 = ldf(s[22]);
     // 404a55 fmul st(0), st(0)
-    let t17: f64 = t16 * t16;
+    let t17: f64 = xn3(t16, t16, t16 * t16);
     // 404a57 fadd dword ptr [esp + 4]
-    let t18: f64 = f32::from_bits(s[23]) as f64;
-    let t19: f64 = t17 + t18;
+    let t18: f64 = ldf(s[23]);
+    let t19: f64 = xn3(t17, t18, t17 + t18);
     // 404a5b fstp dword ptr [esp + 4]
-    s[23] = (t19 as f32).to_bits();
+    s[23] = stf(t19);
     // 404a5f fld dword ptr [esp + 4]
-    let t20: f64 = f32::from_bits(s[23]) as f64;
+    let t20: f64 = ldf(s[23]);
     // 404a63 add esp, 8
     // 404a66 ret 
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
@@ -1715,82 +1823,82 @@ fn g_bde570(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let mut s = [0u32; 40];
     // bde570 sub esp, 0xc
     // bde573 fld dword ptr [ecx]
-    let t1: f64 = f32::from_bits(rd((ecx) as usize)) as f64;
+    let t1: f64 = ldf(rd((ecx) as usize));
     // bde575 fstp dword ptr [esp + 4]
-    s[22] = (t1 as f32).to_bits();
+    s[22] = stf(t1);
     // bde579 fld dword ptr [ecx + 4]
-    let t2: f64 = f32::from_bits(rd((ecx.wrapping_add(0x4)) as usize)) as f64;
+    let t2: f64 = ldf(rd((ecx.wrapping_add(0x4)) as usize));
     // bde57c fstp dword ptr [esp]
-    s[21] = (t2 as f32).to_bits();
+    s[21] = stf(t2);
     // bde57f fld dword ptr [ecx + 8]
-    let t3: f64 = f32::from_bits(rd((ecx.wrapping_add(0x8)) as usize)) as f64;
+    let t3: f64 = ldf(rd((ecx.wrapping_add(0x8)) as usize));
     // bde582 fstp dword ptr [esp + 8]
-    s[23] = (t3 as f32).to_bits();
+    s[23] = stf(t3);
     // bde586 fld dword ptr [eax + 0xc]
-    let t4: f64 = f32::from_bits(rd((eax.wrapping_add(0xc)) as usize)) as f64;
+    let t4: f64 = ldf(rd((eax.wrapping_add(0xc)) as usize));
     // bde589 fld dword ptr [esp]
-    let t5: f64 = f32::from_bits(s[21]) as f64;
+    let t5: f64 = ldf(s[21]);
     // bde58c fld st(0)
     // bde58e fmulp st(2)
-    let t6: f64 = t4 * t5;
+    let t6: f64 = xn3(t4, t5, t4 * t5);
     // bde590 fld dword ptr [eax]
-    let t7: f64 = f32::from_bits(rd((eax) as usize)) as f64;
+    let t7: f64 = ldf(rd((eax) as usize));
     // bde592 fld dword ptr [esp + 4]
-    let t8: f64 = f32::from_bits(s[22]) as f64;
+    let t8: f64 = ldf(s[22]);
     // bde596 fld st(0)
     // bde598 fmulp st(2)
-    let t9: f64 = t7 * t8;
+    let t9: f64 = xn3(t7, t8, t7 * t8);
     // bde59a fxch st(3)
     // bde59c faddp st(1)
-    let t10: f64 = t9 + t6;
+    let t10: f64 = xn3(t9, t6, t9 + t6);
     // bde59e fld dword ptr [eax + 0x18]
-    let t11: f64 = f32::from_bits(rd((eax.wrapping_add(0x18)) as usize)) as f64;
+    let t11: f64 = ldf(rd((eax.wrapping_add(0x18)) as usize));
     // bde5a1 fld dword ptr [esp + 8]
-    let t12: f64 = f32::from_bits(s[23]) as f64;
+    let t12: f64 = ldf(s[23]);
     // bde5a5 fld st(0)
     // bde5a7 fmulp st(2)
-    let t13: f64 = t11 * t12;
+    let t13: f64 = xn3(t11, t12, t11 * t12);
     // bde5a9 fxch st(2)
     // bde5ab faddp st(1)
-    let t14: f64 = t13 + t10;
+    let t14: f64 = xn3(t13, t10, t13 + t10);
     // bde5ad fstp dword ptr [ecx]
-    w.d((ecx) as usize, (t14 as f32).to_bits());
+    w.d((ecx) as usize, stf(t14));
     // bde5af fld dword ptr [eax + 0x10]
-    let t15: f64 = f32::from_bits(rd((eax.wrapping_add(0x10)) as usize)) as f64;
+    let t15: f64 = ldf(rd((eax.wrapping_add(0x10)) as usize));
     // bde5b2 fmul st(2)
-    let t16: f64 = t15 * t5;
+    let t16: f64 = xn3(t15, t5, t15 * t5);
     // bde5b4 fld dword ptr [eax + 4]
-    let t17: f64 = f32::from_bits(rd((eax.wrapping_add(0x4)) as usize)) as f64;
+    let t17: f64 = ldf(rd((eax.wrapping_add(0x4)) as usize));
     // bde5b7 fmul st(4)
-    let t18: f64 = t17 * t8;
+    let t18: f64 = xn3(t17, t8, t17 * t8);
     // bde5b9 faddp st(1)
-    let t19: f64 = t16 + t18;
+    let t19: f64 = xn3(t16, t18, t16 + t18);
     // bde5bb fld dword ptr [eax + 0x1c]
-    let t20: f64 = f32::from_bits(rd((eax.wrapping_add(0x1c)) as usize)) as f64;
+    let t20: f64 = ldf(rd((eax.wrapping_add(0x1c)) as usize));
     // bde5be fmul st(2)
-    let t21: f64 = t20 * t12;
+    let t21: f64 = xn3(t20, t12, t20 * t12);
     // bde5c0 faddp st(1)
-    let t22: f64 = t19 + t21;
+    let t22: f64 = xn3(t19, t21, t19 + t21);
     // bde5c2 fstp dword ptr [ecx + 4]
-    w.d((ecx.wrapping_add(0x4)) as usize, (t22 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x4)) as usize, stf(t22));
     // bde5c5 fld dword ptr [eax + 0x14]
-    let t23: f64 = f32::from_bits(rd((eax.wrapping_add(0x14)) as usize)) as f64;
+    let t23: f64 = ldf(rd((eax.wrapping_add(0x14)) as usize));
     // bde5c8 fmulp st(2)
-    let t24: f64 = t5 * t23;
+    let t24: f64 = xn3(t5, t23, t5 * t23);
     // bde5ca fld dword ptr [eax + 8]
-    let t25: f64 = f32::from_bits(rd((eax.wrapping_add(0x8)) as usize)) as f64;
+    let t25: f64 = ldf(rd((eax.wrapping_add(0x8)) as usize));
     // bde5cd fmulp st(3)
-    let t26: f64 = t8 * t25;
+    let t26: f64 = xn3(t8, t25, t8 * t25);
     // bde5cf fxch st(1)
     // bde5d1 faddp st(2)
-    let t27: f64 = t26 + t24;
+    let t27: f64 = xn3(t26, t24, t26 + t24);
     // bde5d3 fmul dword ptr [eax + 0x20]
-    let t28: f64 = f32::from_bits(rd((eax.wrapping_add(0x20)) as usize)) as f64;
-    let t29: f64 = t12 * t28;
+    let t28: f64 = ldf(rd((eax.wrapping_add(0x20)) as usize));
+    let t29: f64 = xn3(t12, t28, t12 * t28);
     // bde5d6 faddp st(1)
-    let t30: f64 = t27 + t29;
+    let t30: f64 = xn3(t27, t29, t27 + t29);
     // bde5d8 fstp dword ptr [ecx + 8]
-    w.d((ecx.wrapping_add(0x8)) as usize, (t30 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x8)) as usize, stf(t30));
     // bde5db add esp, 0xc
     // bde5de ret 
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
@@ -1806,85 +1914,86 @@ fn g_bdde20(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // bdde23 mov edx, dword ptr [esp + 0xc]
     edx = s[25];
     // bdde27 fld dword ptr [edx + 4]
-    let t1: f64 = f32::from_bits(rd((edx.wrapping_add(0x4)) as usize)) as f64;
+    let t1: f64 = ldf(rd((edx.wrapping_add(0x4)) as usize));
     // bdde2a fstp dword ptr [esp + 0xc]
-    s[25] = (t1 as f32).to_bits();
+    s[25] = stf(t1);
     // bdde2e fld dword ptr [edx]
-    let t2: f64 = f32::from_bits(rd((edx) as usize)) as f64;
+    let t2: f64 = ldf(rd((edx) as usize));
     // bdde30 fstp dword ptr [esp]
-    s[22] = (t2 as f32).to_bits();
+    s[22] = stf(t2);
     // bdde33 fld dword ptr [edx + 8]
-    let t3: f64 = f32::from_bits(rd((edx.wrapping_add(0x8)) as usize)) as f64;
+    let t3: f64 = ldf(rd((edx.wrapping_add(0x8)) as usize));
     // bdde36 fstp dword ptr [esp + 4]
-    s[23] = (t3 as f32).to_bits();
+    s[23] = stf(t3);
     // bdde3a fld dword ptr [ecx + 0xc]
-    let t4: f64 = f32::from_bits(rd((ecx.wrapping_add(0xc)) as usize)) as f64;
+    let t4: f64 = ldf(rd((ecx.wrapping_add(0xc)) as usize));
     // bdde3d fld dword ptr [esp + 0xc]
-    let t5: f64 = f32::from_bits(s[25]) as f64;
+    let t5: f64 = ldf(s[25]);
     // bdde41 fld st(0)
     // bdde43 fmulp st(2)
-    let t6: f64 = t4 * t5;
+    let t6: f64 = xn3(t4, t5, t4 * t5);
     // bdde45 fld dword ptr [ecx]
-    let t7: f64 = f32::from_bits(rd((ecx) as usize)) as f64;
+    let t7: f64 = ldf(rd((ecx) as usize));
     // bdde47 fld dword ptr [esp]
-    let t8: f64 = f32::from_bits(s[22]) as f64;
+    let t8: f64 = ldf(s[22]);
     // bdde4a fld st(0)
     // bdde4c fmulp st(2)
-    let t9: f64 = t7 * t8;
+    let t9: f64 = xn3(t7, t8, t7 * t8);
     // bdde4e fxch st(3)
     // bdde50 faddp st(1)
-    let t10: f64 = t9 + t6;
+    let t10: f64 = xn3(t9, t6, t9 + t6);
     // bdde52 fld dword ptr [ecx + 0x18]
-    let t11: f64 = f32::from_bits(rd((ecx.wrapping_add(0x18)) as usize)) as f64;
+    let t11: f64 = ldf(rd((ecx.wrapping_add(0x18)) as usize));
     // bdde55 fld dword ptr [esp + 4]
-    let t12: f64 = f32::from_bits(s[23]) as f64;
+    let t12: f64 = ldf(s[23]);
     // bdde59 fld st(0)
     // bdde5b fmulp st(2)
-    let t13: f64 = t11 * t12;
+    let t13: f64 = xn3(t11, t12, t11 * t12);
     // bdde5d fxch st(2)
     // bdde5f faddp st(1)
-    let t14: f64 = t13 + t10;
+    let t14: f64 = xn3(t13, t10, t13 + t10);
     // bdde61 fstp dword ptr [eax]
-    w.d((eax) as usize, (t14 as f32).to_bits());
+    w.d((eax) as usize, stf(t14));
     // bdde63 fld dword ptr [ecx + 4]
-    let t15: f64 = f32::from_bits(rd((ecx.wrapping_add(0x4)) as usize)) as f64;
+    let t15: f64 = ldf(rd((ecx.wrapping_add(0x4)) as usize));
     // bdde66 fmul st(3)
-    let t16: f64 = t15 * t8;
+    let t16: f64 = xn3(t15, t8, t15 * t8);
     // bdde68 fld dword ptr [ecx + 0x10]
-    let t17: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t17: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // bdde6b fmul st(3)
-    let t18: f64 = t17 * t5;
+    let t18: f64 = xn3(t17, t5, t17 * t5);
     // bdde6d faddp st(1)
-    let t19: f64 = t16 + t18;
+    let t19: f64 = xn3(t16, t18, t16 + t18);
     // bdde6f fld dword ptr [ecx + 0x1c]
-    let t20: f64 = f32::from_bits(rd((ecx.wrapping_add(0x1c)) as usize)) as f64;
+    let t20: f64 = ldf(rd((ecx.wrapping_add(0x1c)) as usize));
     // bdde72 fmul st(2)
-    let t21: f64 = t20 * t12;
+    let t21: f64 = xn3(t20, t12, t20 * t12);
     // bdde74 faddp st(1)
-    let t22: f64 = t19 + t21;
+    let t22: f64 = xn3(t19, t21, t19 + t21);
     // bdde76 fstp dword ptr [eax + 4]
-    w.d((eax.wrapping_add(0x4)) as usize, (t22 as f32).to_bits());
+    w.d((eax.wrapping_add(0x4)) as usize, stf(t22));
     // bdde79 fld dword ptr [ecx + 8]
-    let t23: f64 = f32::from_bits(rd((ecx.wrapping_add(0x8)) as usize)) as f64;
+    let t23: f64 = ldf(rd((ecx.wrapping_add(0x8)) as usize));
     // bdde7c fmulp st(3)
-    let t24: f64 = t8 * t23;
+    let t24: f64 = xn3(t8, t23, t8 * t23);
     // bdde7e fld dword ptr [ecx + 0x14]
-    let t25: f64 = f32::from_bits(rd((ecx.wrapping_add(0x14)) as usize)) as f64;
+    let t25: f64 = ldf(rd((ecx.wrapping_add(0x14)) as usize));
     // bdde81 fmulp st(2)
-    let t26: f64 = t5 * t25;
+    let t26: f64 = xn3(t5, t25, t5 * t25);
     // bdde83 fxch st(2)
     // bdde85 faddp st(1)
-    let t27: f64 = t26 + t24;
+    let t27: f64 = xn3(t26, t24, t26 + t24);
     // bdde87 fld dword ptr [ecx + 0x20]
-    let t28: f64 = f32::from_bits(rd((ecx.wrapping_add(0x20)) as usize)) as f64;
+    let t28: f64 = ldf(rd((ecx.wrapping_add(0x20)) as usize));
     // bdde8a fmulp st(2)
-    let t29: f64 = t12 * t28;
+    let t29: f64 = xn3(t12, t28, t12 * t28);
     // bdde8c faddp st(1)
-    let t30: f64 = t29 + t27;
+    let t30: f64 = xn3(t29, t27, t29 + t27);
     // bdde8e fstp dword ptr [eax + 8]
-    w.d((eax.wrapping_add(0x8)) as usize, (t30 as f32).to_bits());
+    w.d((eax.wrapping_add(0x8)) as usize, stf(t30));
     // bdde91 add esp, 8
     // bdde94 ret 4
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -1899,77 +2008,77 @@ fn g_a0fe30(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // a0fe36 mov ecx, dword ptr [edx]
     ecx = rd((edx) as usize);
     // a0fe38 fld dword ptr [eax]
-    let t1: f64 = f32::from_bits(rd((eax) as usize)) as f64;
+    let t1: f64 = ldf(rd((eax) as usize));
     // a0fe3a fadd dword ptr [ecx]
-    let t2: f64 = f32::from_bits(rd((ecx) as usize)) as f64;
-    let t3: f64 = t1 + t2;
+    let t2: f64 = ldf(rd((ecx) as usize));
+    let t3: f64 = xn3(t1, t2, t1 + t2);
     // a0fe3c fstp dword ptr [esp]
-    s[18] = (t3 as f32).to_bits();
+    s[18] = stf(t3);
     // a0fe3f fld dword ptr [eax + 4]
-    let t4: f64 = f32::from_bits(rd((eax.wrapping_add(0x4)) as usize)) as f64;
+    let t4: f64 = ldf(rd((eax.wrapping_add(0x4)) as usize));
     // a0fe42 fadd dword ptr [ecx + 4]
-    let t5: f64 = f32::from_bits(rd((ecx.wrapping_add(0x4)) as usize)) as f64;
-    let t6: f64 = t4 + t5;
+    let t5: f64 = ldf(rd((ecx.wrapping_add(0x4)) as usize));
+    let t6: f64 = xn3(t4, t5, t4 + t5);
     // a0fe45 fstp dword ptr [esp + 4]
-    s[19] = (t6 as f32).to_bits();
+    s[19] = stf(t6);
     // a0fe49 fld dword ptr [eax + 8]
-    let t7: f64 = f32::from_bits(rd((eax.wrapping_add(0x8)) as usize)) as f64;
+    let t7: f64 = ldf(rd((eax.wrapping_add(0x8)) as usize));
     // a0fe4c mov eax, dword ptr [edx + 8]
     eax = rd((edx.wrapping_add(0x8)) as usize);
     // a0fe4f fadd dword ptr [ecx + 8]
-    let t8: f64 = f32::from_bits(rd((ecx.wrapping_add(0x8)) as usize)) as f64;
-    let t9: f64 = t7 + t8;
+    let t8: f64 = ldf(rd((ecx.wrapping_add(0x8)) as usize));
+    let t9: f64 = xn3(t7, t8, t7 + t8);
     // a0fe52 fstp dword ptr [esp + 8]
-    s[20] = (t9 as f32).to_bits();
+    s[20] = stf(t9);
     // a0fe56 fld dword ptr [eax]
-    let t10: f64 = f32::from_bits(rd((eax) as usize)) as f64;
+    let t10: f64 = ldf(rd((eax) as usize));
     // a0fe58 fadd dword ptr [esp]
-    let t11: f64 = f32::from_bits(s[18]) as f64;
-    let t12: f64 = t10 + t11;
+    let t11: f64 = ldf(s[18]);
+    let t12: f64 = xn3(t10, t11, t10 + t11);
     // a0fe5b fstp dword ptr [esp + 0xc]
-    s[21] = (t12 as f32).to_bits();
+    s[21] = stf(t12);
     // a0fe5f fld dword ptr [eax + 4]
-    let t13: f64 = f32::from_bits(rd((eax.wrapping_add(0x4)) as usize)) as f64;
+    let t13: f64 = ldf(rd((eax.wrapping_add(0x4)) as usize));
     // a0fe62 fadd dword ptr [esp + 4]
-    let t14: f64 = f32::from_bits(s[19]) as f64;
-    let t15: f64 = t13 + t14;
+    let t14: f64 = ldf(s[19]);
+    let t15: f64 = xn3(t13, t14, t13 + t14);
     // a0fe66 fstp dword ptr [esp + 0x10]
-    s[22] = (t15 as f32).to_bits();
+    s[22] = stf(t15);
     // a0fe6a fld dword ptr [eax + 8]
-    let t16: f64 = f32::from_bits(rd((eax.wrapping_add(0x8)) as usize)) as f64;
+    let t16: f64 = ldf(rd((eax.wrapping_add(0x8)) as usize));
     // a0fe6d fadd dword ptr [esp + 8]
-    let t17: f64 = f32::from_bits(s[20]) as f64;
-    let t18: f64 = t16 + t17;
+    let t17: f64 = ldf(s[20]);
+    let t18: f64 = xn3(t16, t17, t16 + t17);
     // a0fe71 fstp dword ptr [esp + 0x14]
-    s[23] = (t18 as f32).to_bits();
+    s[23] = stf(t18);
     // a0fe75 fld dword ptr [esp + 0xc]
-    let t19: f64 = f32::from_bits(s[21]) as f64;
+    let t19: f64 = ldf(s[21]);
     // a0fe79 fld qword ptr [0xe5c4c0]
     let t20: f64 = f64::from_bits(q64(rq(0xe5c4c0usize)));
     // a0fe7f fmul st(1), st(0)
-    let t21: f64 = t19 * t20;
+    let t21: f64 = xn3(t19, t20, t19 * t20);
     // a0fe81 fxch st(1)
     // a0fe83 fstp dword ptr [esp]
-    s[18] = (t21 as f32).to_bits();
+    s[18] = stf(t21);
     // a0fe86 mov eax, dword ptr [esp]
     eax = s[18];
     // a0fe89 fld dword ptr [esp + 0x10]
-    let t22: f64 = f32::from_bits(s[22]) as f64;
+    let t22: f64 = ldf(s[22]);
     // a0fe8d mov dword ptr [esi], eax
     w.d((esi) as usize, eax);
     // a0fe8f fmul st(1)
-    let t23: f64 = t22 * t20;
+    let t23: f64 = xn3(t22, t20, t22 * t20);
     // a0fe91 fstp dword ptr [esp + 4]
-    s[19] = (t23 as f32).to_bits();
+    s[19] = stf(t23);
     // a0fe95 mov ecx, dword ptr [esp + 4]
     ecx = s[19];
     // a0fe99 mov dword ptr [esi + 4], ecx
     w.d((esi.wrapping_add(0x4)) as usize, ecx);
     // a0fe9c fmul dword ptr [esp + 0x14]
-    let t24: f64 = f32::from_bits(s[23]) as f64;
-    let t25: f64 = t20 * t24;
+    let t24: f64 = ldf(s[23]);
+    let t25: f64 = xn3(t20, t24, t20 * t24);
     // a0fea0 fstp dword ptr [esp + 8]
-    s[20] = (t25 as f32).to_bits();
+    s[20] = stf(t25);
     // a0fea4 mov edx, dword ptr [esp + 8]
     edx = s[20];
     // a0fea8 mov dword ptr [esi + 8], edx
@@ -1988,96 +2097,97 @@ fn g_729f30(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // 729f30 mov ecx, dword ptr [esp + 4]
     ecx = s[25];
     // 729f34 fld dword ptr [edx]
-    let t1: f64 = f32::from_bits(rd((edx) as usize)) as f64;
+    let t1: f64 = ldf(rd((edx) as usize));
     // 729f36 fmul dword ptr [ecx]
-    let t2: f64 = f32::from_bits(rd((ecx) as usize)) as f64;
-    let t3: f64 = t1 * t2;
+    let t2: f64 = ldf(rd((ecx) as usize));
+    let t3: f64 = xn3(t1, t2, t1 * t2);
     // 729f38 fld dword ptr [edx + 0xc]
-    let t4: f64 = f32::from_bits(rd((edx.wrapping_add(0xc)) as usize)) as f64;
+    let t4: f64 = ldf(rd((edx.wrapping_add(0xc)) as usize));
     // 729f3b fmul dword ptr [ecx + 4]
-    let t5: f64 = f32::from_bits(rd((ecx.wrapping_add(0x4)) as usize)) as f64;
-    let t6: f64 = t4 * t5;
+    let t5: f64 = ldf(rd((ecx.wrapping_add(0x4)) as usize));
+    let t6: f64 = xn3(t4, t5, t4 * t5);
     // 729f3e faddp st(1)
-    let t7: f64 = t3 + t6;
+    let t7: f64 = xn3(t3, t6, t3 + t6);
     // 729f40 fstp dword ptr [eax]
-    w.d((eax) as usize, (t7 as f32).to_bits());
+    w.d((eax) as usize, stf(t7));
     // 729f42 fld dword ptr [edx + 0x10]
-    let t8: f64 = f32::from_bits(rd((edx.wrapping_add(0x10)) as usize)) as f64;
+    let t8: f64 = ldf(rd((edx.wrapping_add(0x10)) as usize));
     // 729f45 fmul dword ptr [ecx + 4]
-    let t9: f64 = f32::from_bits(rd((ecx.wrapping_add(0x4)) as usize)) as f64;
-    let t10: f64 = t8 * t9;
+    let t9: f64 = ldf(rd((ecx.wrapping_add(0x4)) as usize));
+    let t10: f64 = xn3(t8, t9, t8 * t9);
     // 729f48 fld dword ptr [edx + 4]
-    let t11: f64 = f32::from_bits(rd((edx.wrapping_add(0x4)) as usize)) as f64;
+    let t11: f64 = ldf(rd((edx.wrapping_add(0x4)) as usize));
     // 729f4b fmul dword ptr [ecx]
-    let t12: f64 = f32::from_bits(rd((ecx) as usize)) as f64;
-    let t13: f64 = t11 * t12;
+    let t12: f64 = ldf(rd((ecx) as usize));
+    let t13: f64 = xn3(t11, t12, t11 * t12);
     // 729f4d faddp st(1)
-    let t14: f64 = t10 + t13;
+    let t14: f64 = xn3(t10, t13, t10 + t13);
     // 729f4f fstp dword ptr [eax + 4]
-    w.d((eax.wrapping_add(0x4)) as usize, (t14 as f32).to_bits());
+    w.d((eax.wrapping_add(0x4)) as usize, stf(t14));
     // 729f52 fld dword ptr [edx + 0x14]
-    let t15: f64 = f32::from_bits(rd((edx.wrapping_add(0x14)) as usize)) as f64;
+    let t15: f64 = ldf(rd((edx.wrapping_add(0x14)) as usize));
     // 729f55 fmul dword ptr [ecx + 4]
-    let t16: f64 = f32::from_bits(rd((ecx.wrapping_add(0x4)) as usize)) as f64;
-    let t17: f64 = t15 * t16;
+    let t16: f64 = ldf(rd((ecx.wrapping_add(0x4)) as usize));
+    let t17: f64 = xn3(t15, t16, t15 * t16);
     // 729f58 fld dword ptr [edx + 8]
-    let t18: f64 = f32::from_bits(rd((edx.wrapping_add(0x8)) as usize)) as f64;
+    let t18: f64 = ldf(rd((edx.wrapping_add(0x8)) as usize));
     // 729f5b fmul dword ptr [ecx]
-    let t19: f64 = f32::from_bits(rd((ecx) as usize)) as f64;
-    let t20: f64 = t18 * t19;
+    let t19: f64 = ldf(rd((ecx) as usize));
+    let t20: f64 = xn3(t18, t19, t18 * t19);
     // 729f5d faddp st(1)
-    let t21: f64 = t17 + t20;
+    let t21: f64 = xn3(t17, t20, t17 + t20);
     // 729f5f fadd dword ptr [ecx + 8]
-    let t22: f64 = f32::from_bits(rd((ecx.wrapping_add(0x8)) as usize)) as f64;
-    let t23: f64 = t21 + t22;
+    let t22: f64 = ldf(rd((ecx.wrapping_add(0x8)) as usize));
+    let t23: f64 = xn3(t21, t22, t21 + t22);
     // 729f62 fstp dword ptr [eax + 8]
-    w.d((eax.wrapping_add(0x8)) as usize, (t23 as f32).to_bits());
+    w.d((eax.wrapping_add(0x8)) as usize, stf(t23));
     // 729f65 fld dword ptr [ecx + 0x10]
-    let t24: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t24: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // 729f68 fmul dword ptr [edx + 0xc]
-    let t25: f64 = f32::from_bits(rd((edx.wrapping_add(0xc)) as usize)) as f64;
-    let t26: f64 = t24 * t25;
+    let t25: f64 = ldf(rd((edx.wrapping_add(0xc)) as usize));
+    let t26: f64 = xn3(t24, t25, t24 * t25);
     // 729f6b fld dword ptr [edx]
-    let t27: f64 = f32::from_bits(rd((edx) as usize)) as f64;
+    let t27: f64 = ldf(rd((edx) as usize));
     // 729f6d fmul dword ptr [ecx + 0xc]
-    let t28: f64 = f32::from_bits(rd((ecx.wrapping_add(0xc)) as usize)) as f64;
-    let t29: f64 = t27 * t28;
+    let t28: f64 = ldf(rd((ecx.wrapping_add(0xc)) as usize));
+    let t29: f64 = xn3(t27, t28, t27 * t28);
     // 729f70 faddp st(1)
-    let t30: f64 = t26 + t29;
+    let t30: f64 = xn3(t26, t29, t26 + t29);
     // 729f72 fstp dword ptr [eax + 0xc]
-    w.d((eax.wrapping_add(0xc)) as usize, (t30 as f32).to_bits());
+    w.d((eax.wrapping_add(0xc)) as usize, stf(t30));
     // 729f75 fld dword ptr [edx + 4]
-    let t31: f64 = f32::from_bits(rd((edx.wrapping_add(0x4)) as usize)) as f64;
+    let t31: f64 = ldf(rd((edx.wrapping_add(0x4)) as usize));
     // 729f78 fmul dword ptr [ecx + 0xc]
-    let t32: f64 = f32::from_bits(rd((ecx.wrapping_add(0xc)) as usize)) as f64;
-    let t33: f64 = t31 * t32;
+    let t32: f64 = ldf(rd((ecx.wrapping_add(0xc)) as usize));
+    let t33: f64 = xn3(t31, t32, t31 * t32);
     // 729f7b fld dword ptr [ecx + 0x10]
-    let t34: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t34: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // 729f7e fmul dword ptr [edx + 0x10]
-    let t35: f64 = f32::from_bits(rd((edx.wrapping_add(0x10)) as usize)) as f64;
-    let t36: f64 = t34 * t35;
+    let t35: f64 = ldf(rd((edx.wrapping_add(0x10)) as usize));
+    let t36: f64 = xn3(t34, t35, t34 * t35);
     // 729f81 faddp st(1)
-    let t37: f64 = t33 + t36;
+    let t37: f64 = xn3(t33, t36, t33 + t36);
     // 729f83 fstp dword ptr [eax + 0x10]
-    w.d((eax.wrapping_add(0x10)) as usize, (t37 as f32).to_bits());
+    w.d((eax.wrapping_add(0x10)) as usize, stf(t37));
     // 729f86 fld dword ptr [edx + 8]
-    let t38: f64 = f32::from_bits(rd((edx.wrapping_add(0x8)) as usize)) as f64;
+    let t38: f64 = ldf(rd((edx.wrapping_add(0x8)) as usize));
     // 729f89 fmul dword ptr [ecx + 0xc]
-    let t39: f64 = f32::from_bits(rd((ecx.wrapping_add(0xc)) as usize)) as f64;
-    let t40: f64 = t38 * t39;
+    let t39: f64 = ldf(rd((ecx.wrapping_add(0xc)) as usize));
+    let t40: f64 = xn3(t38, t39, t38 * t39);
     // 729f8c fld dword ptr [ecx + 0x10]
-    let t41: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t41: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // 729f8f fmul dword ptr [edx + 0x14]
-    let t42: f64 = f32::from_bits(rd((edx.wrapping_add(0x14)) as usize)) as f64;
-    let t43: f64 = t41 * t42;
+    let t42: f64 = ldf(rd((edx.wrapping_add(0x14)) as usize));
+    let t43: f64 = xn3(t41, t42, t41 * t42);
     // 729f92 faddp st(1)
-    let t44: f64 = t40 + t43;
+    let t44: f64 = xn3(t40, t43, t40 + t43);
     // 729f94 fadd dword ptr [ecx + 0x14]
-    let t45: f64 = f32::from_bits(rd((ecx.wrapping_add(0x14)) as usize)) as f64;
-    let t46: f64 = t44 + t45;
+    let t45: f64 = ldf(rd((ecx.wrapping_add(0x14)) as usize));
+    let t46: f64 = xn3(t44, t45, t44 + t45);
     // 729f97 fstp dword ptr [eax + 0x14]
-    w.d((eax.wrapping_add(0x14)) as usize, (t46 as f32).to_bits());
+    w.d((eax.wrapping_add(0x14)) as usize, stf(t46));
     // 729f9a ret 4
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -2098,18 +2208,18 @@ fn g_bdb4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // bdb4fa fld qword ptr [0xe5c038]
     let t2: f64 = f64::from_bits(q64(rq(0xe5c038usize)));
     // bdb500 fdiv st(1), st(0)
-    let t3: f64 = t1 / t2;
+    let t3: f64 = xn3(t1, t2, t1 / t2);
     // bdb502 fld qword ptr [0xe5bfe8]
     let t4: f64 = f64::from_bits(q64(rq(0xe5bfe8usize)));
     // bdb508 fmul st(2), st(0)
-    let t5: f64 = t3 * t4;
+    let t5: f64 = xn3(t3, t4, t3 * t4);
     // bdb50a fld1 
     let t6: f64 = 1.0;
     // bdb50c fsub st(3), st(0)
-    let t7: f64 = t5 - t6;
+    let t7: f64 = xn3(t5, t6, t5 - t6);
     // bdb50e fxch st(3)
     // bdb510 fstp dword ptr [ecx]
-    w.d((ecx) as usize, (t7 as f32).to_bits());
+    w.d((ecx) as usize, stf(t7));
     // bdb512 movzx edx, byte ptr [eax + 1]
     edx = rb((eax.wrapping_add(0x1)) as usize) as u32;
     // bdb516 mov dword ptr [esp], edx
@@ -2117,13 +2227,13 @@ fn g_bdb4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // bdb519 fild dword ptr [esp]
     let t8: f64 = (s[23] as i32) as f64;
     // bdb51c fdiv st(2)
-    let t9: f64 = t8 / t2;
+    let t9: f64 = xn3(t8, t2, t8 / t2);
     // bdb51e fmul st(1)
-    let t10: f64 = t9 * t4;
+    let t10: f64 = xn3(t9, t4, t9 * t4);
     // bdb520 fsub st(3)
-    let t11: f64 = t10 - t6;
+    let t11: f64 = xn3(t10, t6, t10 - t6);
     // bdb522 fstp dword ptr [ecx + 4]
-    w.d((ecx.wrapping_add(0x4)) as usize, (t11 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x4)) as usize, stf(t11));
     // bdb525 movzx edx, byte ptr [eax + 2]
     edx = rb((eax.wrapping_add(0x2)) as usize) as u32;
     // bdb529 mov dword ptr [esp], edx
@@ -2131,13 +2241,13 @@ fn g_bdb4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // bdb52c fild dword ptr [esp]
     let t12: f64 = (s[23] as i32) as f64;
     // bdb52f fdiv st(2)
-    let t13: f64 = t12 / t2;
+    let t13: f64 = xn3(t12, t2, t12 / t2);
     // bdb531 fmul st(1)
-    let t14: f64 = t13 * t4;
+    let t14: f64 = xn3(t13, t4, t13 * t4);
     // bdb533 fsub st(3)
-    let t15: f64 = t14 - t6;
+    let t15: f64 = xn3(t14, t6, t14 - t6);
     // bdb535 fstp dword ptr [ecx + 8]
-    w.d((ecx.wrapping_add(0x8)) as usize, (t15 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x8)) as usize, stf(t15));
     // bdb538 movzx eax, byte ptr [eax + 3]
     eax = rb((eax.wrapping_add(0x3)) as usize) as u32;
     // bdb53c mov dword ptr [esp], eax
@@ -2147,16 +2257,17 @@ fn g_bdb4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // bdb543 fild dword ptr [esp]
     let t16: f64 = (s[23] as i32) as f64;
     // bdb546 fdivrp st(2)
-    let t17: f64 = t16 / t2;
+    let t17: f64 = xn3(t16, t2, t16 / t2);
     // bdb548 fmulp st(1)
-    let t18: f64 = t17 * t4;
+    let t18: f64 = xn3(t17, t4, t17 * t4);
     // bdb54a fsubrp st(1)
-    let t19: f64 = t18 - t6;
+    let t19: f64 = xn3(t18, t6, t18 - t6);
     // bdb54c fstp dword ptr [ecx]
-    w.d((ecx) as usize, (t19 as f32).to_bits());
+    w.d((ecx) as usize, stf(t19));
     // bdb54e pop ecx
     ecx = s[23];
     // bdb54f ret 4
+    w.d((a as usize) + 0, s[25]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -2172,37 +2283,39 @@ fn g_50b440(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     // 50b441 mov eax, dword ptr [ecx + 0xd0]
     eax = rd((ecx.wrapping_add(0xd0)) as usize);
     // 50b447 fld dword ptr [eax + 0x1c]
-    let t1: f64 = f32::from_bits(rd((eax.wrapping_add(0x1c)) as usize)) as f64;
+    let t1: f64 = ldf(rd((eax.wrapping_add(0x1c)) as usize));
     // 50b44a mov eax, dword ptr [esp + 8]
     eax = s[25];
     // 50b44e fstp dword ptr [esp]
-    s[23] = (t1 as f32).to_bits();
+    s[23] = stf(t1);
     // 50b451 fld dword ptr [esp]
-    let t2: f64 = f32::from_bits(s[23]) as f64;
+    let t2: f64 = ldf(s[23]);
     // 50b454 fld st(0)
     // 50b456 fchs 
     let t3: f64 = -t2;
     // 50b458 fstp dword ptr [esp]
-    s[23] = (t3 as f32).to_bits();
+    s[23] = stf(t3);
     // 50b45b fld dword ptr [esp]
-    let t4: f64 = f32::from_bits(s[23]) as f64;
+    let t4: f64 = ldf(s[23]);
     // 50b45e fst dword ptr [eax]
-    w.d((eax) as usize, (t4 as f32).to_bits());
+    w.d((eax) as usize, stf(t4));
     // 50b460 fst dword ptr [eax + 4]
-    w.d((eax.wrapping_add(0x4)) as usize, (t4 as f32).to_bits());
+    w.d((eax.wrapping_add(0x4)) as usize, stf(t4));
     // 50b463 fstp dword ptr [eax + 8]
-    w.d((eax.wrapping_add(0x8)) as usize, (t4 as f32).to_bits());
+    w.d((eax.wrapping_add(0x8)) as usize, stf(t4));
     // 50b466 mov eax, dword ptr [esp + 0xc]
     eax = s[26];
     // 50b46a fst dword ptr [eax]
-    w.d((eax) as usize, (t2 as f32).to_bits());
+    w.d((eax) as usize, stf(t2));
     // 50b46c fst dword ptr [eax + 4]
-    w.d((eax.wrapping_add(0x4)) as usize, (t2 as f32).to_bits());
+    w.d((eax.wrapping_add(0x4)) as usize, stf(t2));
     // 50b46f fstp dword ptr [eax + 8]
-    w.d((eax.wrapping_add(0x8)) as usize, (t2 as f32).to_bits());
+    w.d((eax.wrapping_add(0x8)) as usize, stf(t2));
     // 50b472 pop ecx
     ecx = s[23];
     // 50b473 ret 8
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -2214,52 +2327,54 @@ fn g_7685c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[25] = unsafe { *a.add(0) };
     s[26] = unsafe { *a.add(1) };
     // 7685c0 fld dword ptr [ecx + 0xc]
-    let t1: f64 = f32::from_bits(rd((ecx.wrapping_add(0xc)) as usize)) as f64;
+    let t1: f64 = ldf(rd((ecx.wrapping_add(0xc)) as usize));
     // 7685c3 fsub dword ptr [ecx + 4]
-    let t2: f64 = f32::from_bits(rd((ecx.wrapping_add(0x4)) as usize)) as f64;
-    let t3: f64 = t1 - t2;
+    let t2: f64 = ldf(rd((ecx.wrapping_add(0x4)) as usize));
+    let t3: f64 = xn3(t1, t2, t1 - t2);
     // 7685c6 fstp dword ptr [ecx + 0xc]
-    w.d((ecx.wrapping_add(0xc)) as usize, (t3 as f32).to_bits());
+    w.d((ecx.wrapping_add(0xc)) as usize, stf(t3));
     // 7685c9 fld dword ptr [ecx + 0x10]
-    let t4: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t4: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // 7685cc fsub dword ptr [ecx + 8]
-    let t5: f64 = f32::from_bits(rd((ecx.wrapping_add(0x8)) as usize)) as f64;
-    let t6: f64 = t4 - t5;
+    let t5: f64 = ldf(rd((ecx.wrapping_add(0x8)) as usize));
+    let t6: f64 = xn3(t4, t5, t4 - t5);
     // 7685cf fstp dword ptr [ecx + 0x10]
-    w.d((ecx.wrapping_add(0x10)) as usize, (t6 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x10)) as usize, stf(t6));
     // 7685d2 fild dword ptr [esp + 4]
     let t7: f64 = (s[25] as i32) as f64;
     // 7685d6 fstp dword ptr [esp + 4]
-    s[25] = (t7 as f32).to_bits();
+    s[25] = stf(t7);
     // 7685da fld dword ptr [ecx + 0xc]
-    let t8: f64 = f32::from_bits(rd((ecx.wrapping_add(0xc)) as usize)) as f64;
+    let t8: f64 = ldf(rd((ecx.wrapping_add(0xc)) as usize));
     // 7685dd fld dword ptr [esp + 4]
-    let t9: f64 = f32::from_bits(s[25]) as f64;
+    let t9: f64 = ldf(s[25]);
     // 7685e1 fld st(0)
     // 7685e3 faddp st(2)
-    let t10: f64 = t8 + t9;
+    let t10: f64 = xn3(t8, t9, t8 + t9);
     // 7685e5 fxch st(1)
     // 7685e7 fstp dword ptr [ecx + 0xc]
-    w.d((ecx.wrapping_add(0xc)) as usize, (t10 as f32).to_bits());
+    w.d((ecx.wrapping_add(0xc)) as usize, stf(t10));
     // 7685ea fstp dword ptr [ecx + 4]
-    w.d((ecx.wrapping_add(0x4)) as usize, (t9 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x4)) as usize, stf(t9));
     // 7685ed fild dword ptr [esp + 8]
     let t11: f64 = (s[26] as i32) as f64;
     // 7685f1 fstp dword ptr [esp + 4]
-    s[25] = (t11 as f32).to_bits();
+    s[25] = stf(t11);
     // 7685f5 fld dword ptr [ecx + 0x10]
-    let t12: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t12: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // 7685f8 fld dword ptr [esp + 4]
-    let t13: f64 = f32::from_bits(s[25]) as f64;
+    let t13: f64 = ldf(s[25]);
     // 7685fc fld st(0)
     // 7685fe faddp st(2)
-    let t14: f64 = t12 + t13;
+    let t14: f64 = xn3(t12, t13, t12 + t13);
     // 768600 fxch st(1)
     // 768602 fstp dword ptr [ecx + 0x10]
-    w.d((ecx.wrapping_add(0x10)) as usize, (t14 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x10)) as usize, stf(t14));
     // 768605 fstp dword ptr [ecx + 8]
-    w.d((ecx.wrapping_add(0x8)) as usize, (t13 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x8)) as usize, stf(t13));
     // 768608 ret 8
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -2271,52 +2386,54 @@ fn g_768a70(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[25] = unsafe { *a.add(0) };
     s[26] = unsafe { *a.add(1) };
     // 768a70 fld dword ptr [ecx + 0xc]
-    let t1: f64 = f32::from_bits(rd((ecx.wrapping_add(0xc)) as usize)) as f64;
+    let t1: f64 = ldf(rd((ecx.wrapping_add(0xc)) as usize));
     // 768a73 fsub dword ptr [ecx + 4]
-    let t2: f64 = f32::from_bits(rd((ecx.wrapping_add(0x4)) as usize)) as f64;
-    let t3: f64 = t1 - t2;
+    let t2: f64 = ldf(rd((ecx.wrapping_add(0x4)) as usize));
+    let t3: f64 = xn3(t1, t2, t1 - t2);
     // 768a76 fstp dword ptr [ecx + 0xc]
-    w.d((ecx.wrapping_add(0xc)) as usize, (t3 as f32).to_bits());
+    w.d((ecx.wrapping_add(0xc)) as usize, stf(t3));
     // 768a79 fld dword ptr [ecx + 0x10]
-    let t4: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t4: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // 768a7c fsub dword ptr [ecx + 8]
-    let t5: f64 = f32::from_bits(rd((ecx.wrapping_add(0x8)) as usize)) as f64;
-    let t6: f64 = t4 - t5;
+    let t5: f64 = ldf(rd((ecx.wrapping_add(0x8)) as usize));
+    let t6: f64 = xn3(t4, t5, t4 - t5);
     // 768a7f fstp dword ptr [ecx + 0x10]
-    w.d((ecx.wrapping_add(0x10)) as usize, (t6 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x10)) as usize, stf(t6));
     // 768a82 fild dword ptr [esp + 4]
     let t7: f64 = (s[25] as i32) as f64;
     // 768a86 fstp dword ptr [esp + 4]
-    s[25] = (t7 as f32).to_bits();
+    s[25] = stf(t7);
     // 768a8a fld dword ptr [ecx + 0xc]
-    let t8: f64 = f32::from_bits(rd((ecx.wrapping_add(0xc)) as usize)) as f64;
+    let t8: f64 = ldf(rd((ecx.wrapping_add(0xc)) as usize));
     // 768a8d fld dword ptr [esp + 4]
-    let t9: f64 = f32::from_bits(s[25]) as f64;
+    let t9: f64 = ldf(s[25]);
     // 768a91 fld st(0)
     // 768a93 faddp st(2)
-    let t10: f64 = t8 + t9;
+    let t10: f64 = xn3(t8, t9, t8 + t9);
     // 768a95 fxch st(1)
     // 768a97 fstp dword ptr [ecx + 0xc]
-    w.d((ecx.wrapping_add(0xc)) as usize, (t10 as f32).to_bits());
+    w.d((ecx.wrapping_add(0xc)) as usize, stf(t10));
     // 768a9a fstp dword ptr [ecx + 4]
-    w.d((ecx.wrapping_add(0x4)) as usize, (t9 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x4)) as usize, stf(t9));
     // 768a9d fild dword ptr [esp + 8]
     let t11: f64 = (s[26] as i32) as f64;
     // 768aa1 fstp dword ptr [esp + 4]
-    s[25] = (t11 as f32).to_bits();
+    s[25] = stf(t11);
     // 768aa5 fld dword ptr [ecx + 0x10]
-    let t12: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t12: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // 768aa8 fld dword ptr [esp + 4]
-    let t13: f64 = f32::from_bits(s[25]) as f64;
+    let t13: f64 = ldf(s[25]);
     // 768aac fld st(0)
     // 768aae faddp st(2)
-    let t14: f64 = t12 + t13;
+    let t14: f64 = xn3(t12, t13, t12 + t13);
     // 768ab0 fxch st(1)
     // 768ab2 fstp dword ptr [ecx + 0x10]
-    w.d((ecx.wrapping_add(0x10)) as usize, (t14 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x10)) as usize, stf(t14));
     // 768ab5 fstp dword ptr [ecx + 8]
-    w.d((ecx.wrapping_add(0x8)) as usize, (t13 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x8)) as usize, stf(t13));
     // 768ab8 ret 8
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -2328,52 +2445,54 @@ fn g_768ea0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[25] = unsafe { *a.add(0) };
     s[26] = unsafe { *a.add(1) };
     // 768ea0 fld dword ptr [ecx + 0xc]
-    let t1: f64 = f32::from_bits(rd((ecx.wrapping_add(0xc)) as usize)) as f64;
+    let t1: f64 = ldf(rd((ecx.wrapping_add(0xc)) as usize));
     // 768ea3 fsub dword ptr [ecx + 4]
-    let t2: f64 = f32::from_bits(rd((ecx.wrapping_add(0x4)) as usize)) as f64;
-    let t3: f64 = t1 - t2;
+    let t2: f64 = ldf(rd((ecx.wrapping_add(0x4)) as usize));
+    let t3: f64 = xn3(t1, t2, t1 - t2);
     // 768ea6 fstp dword ptr [ecx + 0xc]
-    w.d((ecx.wrapping_add(0xc)) as usize, (t3 as f32).to_bits());
+    w.d((ecx.wrapping_add(0xc)) as usize, stf(t3));
     // 768ea9 fld dword ptr [ecx + 0x10]
-    let t4: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t4: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // 768eac fsub dword ptr [ecx + 8]
-    let t5: f64 = f32::from_bits(rd((ecx.wrapping_add(0x8)) as usize)) as f64;
-    let t6: f64 = t4 - t5;
+    let t5: f64 = ldf(rd((ecx.wrapping_add(0x8)) as usize));
+    let t6: f64 = xn3(t4, t5, t4 - t5);
     // 768eaf fstp dword ptr [ecx + 0x10]
-    w.d((ecx.wrapping_add(0x10)) as usize, (t6 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x10)) as usize, stf(t6));
     // 768eb2 fild dword ptr [esp + 4]
     let t7: f64 = (s[25] as i32) as f64;
     // 768eb6 fstp dword ptr [esp + 4]
-    s[25] = (t7 as f32).to_bits();
+    s[25] = stf(t7);
     // 768eba fld dword ptr [ecx + 0xc]
-    let t8: f64 = f32::from_bits(rd((ecx.wrapping_add(0xc)) as usize)) as f64;
+    let t8: f64 = ldf(rd((ecx.wrapping_add(0xc)) as usize));
     // 768ebd fld dword ptr [esp + 4]
-    let t9: f64 = f32::from_bits(s[25]) as f64;
+    let t9: f64 = ldf(s[25]);
     // 768ec1 fld st(0)
     // 768ec3 faddp st(2)
-    let t10: f64 = t8 + t9;
+    let t10: f64 = xn3(t8, t9, t8 + t9);
     // 768ec5 fxch st(1)
     // 768ec7 fstp dword ptr [ecx + 0xc]
-    w.d((ecx.wrapping_add(0xc)) as usize, (t10 as f32).to_bits());
+    w.d((ecx.wrapping_add(0xc)) as usize, stf(t10));
     // 768eca fstp dword ptr [ecx + 4]
-    w.d((ecx.wrapping_add(0x4)) as usize, (t9 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x4)) as usize, stf(t9));
     // 768ecd fild dword ptr [esp + 8]
     let t11: f64 = (s[26] as i32) as f64;
     // 768ed1 fstp dword ptr [esp + 4]
-    s[25] = (t11 as f32).to_bits();
+    s[25] = stf(t11);
     // 768ed5 fld dword ptr [ecx + 0x10]
-    let t12: f64 = f32::from_bits(rd((ecx.wrapping_add(0x10)) as usize)) as f64;
+    let t12: f64 = ldf(rd((ecx.wrapping_add(0x10)) as usize));
     // 768ed8 fld dword ptr [esp + 4]
-    let t13: f64 = f32::from_bits(s[25]) as f64;
+    let t13: f64 = ldf(s[25]);
     // 768edc fld st(0)
     // 768ede faddp st(2)
-    let t14: f64 = t12 + t13;
+    let t14: f64 = xn3(t12, t13, t12 + t13);
     // 768ee0 fxch st(1)
     // 768ee2 fstp dword ptr [ecx + 0x10]
-    w.d((ecx.wrapping_add(0x10)) as usize, (t14 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x10)) as usize, stf(t14));
     // 768ee5 fstp dword ptr [ecx + 8]
-    w.d((ecx.wrapping_add(0x8)) as usize, (t13 as f32).to_bits());
+    w.d((ecx.wrapping_add(0x8)) as usize, stf(t13));
     // 768ee8 ret 8
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     0.0
 }
@@ -2386,18 +2505,21 @@ fn g_b9dd80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[26] = unsafe { *a.add(1) };
     s[27] = unsafe { *a.add(2) };
     // b9dd80 fld dword ptr [esp + 4]
-    let t1: f64 = f32::from_bits(s[25]) as f64;
+    let t1: f64 = ldf(s[25]);
     // b9dd84 fmul dword ptr [esp + 0xc]
-    let t2: f64 = f32::from_bits(s[27]) as f64;
-    let t3: f64 = t1 * t2;
+    let t2: f64 = ldf(s[27]);
+    let t3: f64 = xn3(t1, t2, t1 * t2);
     // b9dd88 fadd dword ptr [esp + 8]
-    let t4: f64 = f32::from_bits(s[26]) as f64;
-    let t5: f64 = t3 + t4;
+    let t4: f64 = ldf(s[26]);
+    let t5: f64 = xn3(t3, t4, t3 + t4);
     // b9dd8c fstp dword ptr [esp + 4]
-    s[25] = (t5 as f32).to_bits();
+    s[25] = stf(t5);
     // b9dd90 fld dword ptr [esp + 4]
-    let t6: f64 = f32::from_bits(s[25]) as f64;
+    let t6: f64 = ldf(s[25]);
     // b9dd94 ret 
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
+    w.d((a as usize) + 8, s[27]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t6
 }
@@ -2410,21 +2532,24 @@ fn g_b9df70(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[26] = unsafe { *a.add(1) };
     s[27] = unsafe { *a.add(2) };
     // b9df70 fld dword ptr [esp + 4]
-    let t1: f64 = f32::from_bits(s[25]) as f64;
+    let t1: f64 = ldf(s[25]);
     // b9df74 fld st(0)
     // b9df76 fmul dword ptr [esp + 0xc]
-    let t2: f64 = f32::from_bits(s[27]) as f64;
-    let t3: f64 = t1 * t2;
+    let t2: f64 = ldf(s[27]);
+    let t3: f64 = xn3(t1, t2, t1 * t2);
     // b9df7a fmulp st(1)
-    let t4: f64 = t1 * t3;
+    let t4: f64 = xn3(t1, t3, t1 * t3);
     // b9df7c fadd dword ptr [esp + 8]
-    let t5: f64 = f32::from_bits(s[26]) as f64;
-    let t6: f64 = t4 + t5;
+    let t5: f64 = ldf(s[26]);
+    let t6: f64 = xn3(t4, t5, t4 + t5);
     // b9df80 fstp dword ptr [esp + 4]
-    s[25] = (t6 as f32).to_bits();
+    s[25] = stf(t6);
     // b9df84 fld dword ptr [esp + 4]
-    let t7: f64 = f32::from_bits(s[25]) as f64;
+    let t7: f64 = ldf(s[25]);
     // b9df88 ret 
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
+    w.d((a as usize) + 8, s[27]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t7
 }
@@ -2437,26 +2562,29 @@ fn g_b9df90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[26] = unsafe { *a.add(1) };
     s[27] = unsafe { *a.add(2) };
     // b9df90 fld dword ptr [esp + 8]
-    let t1: f64 = f32::from_bits(s[26]) as f64;
+    let t1: f64 = ldf(s[26]);
     // b9df94 fld dword ptr [esp + 4]
-    let t2: f64 = f32::from_bits(s[25]) as f64;
+    let t2: f64 = ldf(s[25]);
     // b9df98 fld st(0)
     // b9df9a fmul dword ptr [esp + 0xc]
-    let t3: f64 = f32::from_bits(s[27]) as f64;
-    let t4: f64 = t2 * t3;
+    let t3: f64 = ldf(s[27]);
+    let t4: f64 = xn3(t2, t3, t2 * t3);
     // b9df9e fxch st(1)
     // b9dfa0 fsub qword ptr [0xe5bfe8]
     let t5: f64 = f64::from_bits(q64(rq(0xe5bfe8usize)));
-    let t6: f64 = t2 - t5;
+    let t6: f64 = xn3(t2, t5, t2 - t5);
     // b9dfa6 fmulp st(1)
-    let t7: f64 = t4 * t6;
+    let t7: f64 = xn3(t4, t6, t4 * t6);
     // b9dfa8 fsubp st(1)
-    let t8: f64 = t1 - t7;
+    let t8: f64 = xn3(t1, t7, t1 - t7);
     // b9dfaa fstp dword ptr [esp + 8]
-    s[26] = (t8 as f32).to_bits();
+    s[26] = stf(t8);
     // b9dfae fld dword ptr [esp + 8]
-    let t9: f64 = f32::from_bits(s[26]) as f64;
+    let t9: f64 = ldf(s[26]);
     // b9dfb2 ret 
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
+    w.d((a as usize) + 8, s[27]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t9
 }
@@ -2469,23 +2597,26 @@ fn g_b9e030(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[26] = unsafe { *a.add(1) };
     s[27] = unsafe { *a.add(2) };
     // b9e030 fld dword ptr [esp + 4]
-    let t1: f64 = f32::from_bits(s[25]) as f64;
+    let t1: f64 = ldf(s[25]);
     // b9e034 fld st(0)
     // b9e036 fmul dword ptr [esp + 0xc]
-    let t2: f64 = f32::from_bits(s[27]) as f64;
-    let t3: f64 = t1 * t2;
+    let t2: f64 = ldf(s[27]);
+    let t3: f64 = xn3(t1, t2, t1 * t2);
     // b9e03a fmul st(1)
-    let t4: f64 = t3 * t1;
+    let t4: f64 = xn3(t3, t1, t3 * t1);
     // b9e03c fmulp st(1)
-    let t5: f64 = t1 * t4;
+    let t5: f64 = xn3(t1, t4, t1 * t4);
     // b9e03e fadd dword ptr [esp + 8]
-    let t6: f64 = f32::from_bits(s[26]) as f64;
-    let t7: f64 = t5 + t6;
+    let t6: f64 = ldf(s[26]);
+    let t7: f64 = xn3(t5, t6, t5 + t6);
     // b9e042 fstp dword ptr [esp + 4]
-    s[25] = (t7 as f32).to_bits();
+    s[25] = stf(t7);
     // b9e046 fld dword ptr [esp + 4]
-    let t8: f64 = f32::from_bits(s[25]) as f64;
+    let t8: f64 = ldf(s[25]);
     // b9e04a ret 
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
+    w.d((a as usize) + 8, s[27]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t8
 }
@@ -2498,30 +2629,33 @@ fn g_b9e050(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[26] = unsafe { *a.add(1) };
     s[27] = unsafe { *a.add(2) };
     // b9e050 fld dword ptr [esp + 4]
-    let t1: f64 = f32::from_bits(s[25]) as f64;
+    let t1: f64 = ldf(s[25]);
     // b9e054 fsub qword ptr [0xe5bf40]
     let t2: f64 = f64::from_bits(q64(rq(0xe5bf40usize)));
-    let t3: f64 = t1 - t2;
+    let t3: f64 = xn3(t1, t2, t1 - t2);
     // b9e05a fstp dword ptr [esp + 4]
-    s[25] = (t3 as f32).to_bits();
+    s[25] = stf(t3);
     // b9e05e fld dword ptr [esp + 4]
-    let t4: f64 = f32::from_bits(s[25]) as f64;
+    let t4: f64 = ldf(s[25]);
     // b9e062 fld st(0)
     // b9e064 fmul dword ptr [esp + 0xc]
-    let t5: f64 = f32::from_bits(s[27]) as f64;
-    let t6: f64 = t4 * t5;
+    let t5: f64 = ldf(s[27]);
+    let t6: f64 = xn3(t4, t5, t4 * t5);
     // b9e068 fmul st(1)
-    let t7: f64 = t6 * t4;
+    let t7: f64 = xn3(t6, t4, t6 * t4);
     // b9e06a fmulp st(1)
-    let t8: f64 = t4 * t7;
+    let t8: f64 = xn3(t4, t7, t4 * t7);
     // b9e06c fadd dword ptr [esp + 8]
-    let t9: f64 = f32::from_bits(s[26]) as f64;
-    let t10: f64 = t8 + t9;
+    let t9: f64 = ldf(s[26]);
+    let t10: f64 = xn3(t8, t9, t8 + t9);
     // b9e070 fstp dword ptr [esp + 4]
-    s[25] = (t10 as f32).to_bits();
+    s[25] = stf(t10);
     // b9e074 fld dword ptr [esp + 4]
-    let t11: f64 = f32::from_bits(s[25]) as f64;
+    let t11: f64 = ldf(s[25]);
     // b9e078 ret 
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
+    w.d((a as usize) + 8, s[27]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t11
 }
@@ -2534,25 +2668,28 @@ fn g_b9e100(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[26] = unsafe { *a.add(1) };
     s[27] = unsafe { *a.add(2) };
     // b9e100 fld dword ptr [esp + 4]
-    let t1: f64 = f32::from_bits(s[25]) as f64;
+    let t1: f64 = ldf(s[25]);
     // b9e104 fld st(0)
     // b9e106 fmul dword ptr [esp + 0xc]
-    let t2: f64 = f32::from_bits(s[27]) as f64;
-    let t3: f64 = t1 * t2;
+    let t2: f64 = ldf(s[27]);
+    let t3: f64 = xn3(t1, t2, t1 * t2);
     // b9e10a fmul st(1)
-    let t4: f64 = t3 * t1;
+    let t4: f64 = xn3(t3, t1, t3 * t1);
     // b9e10c fmul st(1)
-    let t5: f64 = t4 * t1;
+    let t5: f64 = xn3(t4, t1, t4 * t1);
     // b9e10e fmulp st(1)
-    let t6: f64 = t1 * t5;
+    let t6: f64 = xn3(t1, t5, t1 * t5);
     // b9e110 fadd dword ptr [esp + 8]
-    let t7: f64 = f32::from_bits(s[26]) as f64;
-    let t8: f64 = t6 + t7;
+    let t7: f64 = ldf(s[26]);
+    let t8: f64 = xn3(t6, t7, t6 + t7);
     // b9e114 fstp dword ptr [esp + 4]
-    s[25] = (t8 as f32).to_bits();
+    s[25] = stf(t8);
     // b9e118 fld dword ptr [esp + 4]
-    let t9: f64 = f32::from_bits(s[25]) as f64;
+    let t9: f64 = ldf(s[25]);
     // b9e11c ret 
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
+    w.d((a as usize) + 8, s[27]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t9
 }
@@ -2565,39 +2702,42 @@ fn g_b9e120(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[26] = unsafe { *a.add(1) };
     s[27] = unsafe { *a.add(2) };
     // b9e120 fld dword ptr [esp + 4]
-    let t1: f64 = f32::from_bits(s[25]) as f64;
+    let t1: f64 = ldf(s[25]);
     // b9e124 fld1 
     let t2: f64 = 1.0;
     // b9e126 fsub st(1), st(0)
-    let t3: f64 = t1 - t2;
+    let t3: f64 = xn3(t1, t2, t1 - t2);
     // b9e128 fxch st(1)
     // b9e12a fstp dword ptr [esp + 4]
-    s[25] = (t3 as f32).to_bits();
+    s[25] = stf(t3);
     // b9e12e fld dword ptr [esp + 4]
-    let t4: f64 = f32::from_bits(s[25]) as f64;
+    let t4: f64 = ldf(s[25]);
     // b9e132 fld st(0)
     // b9e134 fld st(0)
     // b9e136 fmulp st(1)
-    let t5: f64 = t4 * t4;
+    let t5: f64 = xn3(t4, t4, t4 * t4);
     // b9e138 fld st(1)
     // b9e13a fmulp st(1)
-    let t6: f64 = t5 * t4;
+    let t6: f64 = xn3(t5, t4, t5 * t4);
     // b9e13c fmulp st(1)
-    let t7: f64 = t4 * t6;
+    let t7: f64 = xn3(t4, t6, t4 * t6);
     // b9e13e fsubrp st(1)
-    let t8: f64 = t7 - t2;
+    let t8: f64 = xn3(t7, t2, t7 - t2);
     // b9e140 fld dword ptr [esp + 0xc]
-    let t9: f64 = f32::from_bits(s[27]) as f64;
+    let t9: f64 = ldf(s[27]);
     // b9e144 fmulp st(1)
-    let t10: f64 = t8 * t9;
+    let t10: f64 = xn3(t8, t9, t8 * t9);
     // b9e146 fsubr dword ptr [esp + 8]
-    let t11: f64 = f32::from_bits(s[26]) as f64;
-    let t12: f64 = t11 - t10;
+    let t11: f64 = ldf(s[26]);
+    let t12: f64 = xn3(t11, t10, t11 - t10);
     // b9e14a fstp dword ptr [esp + 4]
-    s[25] = (t12 as f32).to_bits();
+    s[25] = stf(t12);
     // b9e14e fld dword ptr [esp + 4]
-    let t13: f64 = f32::from_bits(s[25]) as f64;
+    let t13: f64 = ldf(s[25]);
     // b9e152 ret 
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
+    w.d((a as usize) + 8, s[27]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t13
 }
@@ -2610,27 +2750,30 @@ fn g_b9e1e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[26] = unsafe { *a.add(1) };
     s[27] = unsafe { *a.add(2) };
     // b9e1e0 fld dword ptr [esp + 4]
-    let t1: f64 = f32::from_bits(s[25]) as f64;
+    let t1: f64 = ldf(s[25]);
     // b9e1e4 fld st(0)
     // b9e1e6 fmul dword ptr [esp + 0xc]
-    let t2: f64 = f32::from_bits(s[27]) as f64;
-    let t3: f64 = t1 * t2;
+    let t2: f64 = ldf(s[27]);
+    let t3: f64 = xn3(t1, t2, t1 * t2);
     // b9e1ea fmul st(1)
-    let t4: f64 = t3 * t1;
+    let t4: f64 = xn3(t3, t1, t3 * t1);
     // b9e1ec fmul st(1)
-    let t5: f64 = t4 * t1;
+    let t5: f64 = xn3(t4, t1, t4 * t1);
     // b9e1ee fmul st(1)
-    let t6: f64 = t5 * t1;
+    let t6: f64 = xn3(t5, t1, t5 * t1);
     // b9e1f0 fmulp st(1)
-    let t7: f64 = t1 * t6;
+    let t7: f64 = xn3(t1, t6, t1 * t6);
     // b9e1f2 fadd dword ptr [esp + 8]
-    let t8: f64 = f32::from_bits(s[26]) as f64;
-    let t9: f64 = t7 + t8;
+    let t8: f64 = ldf(s[26]);
+    let t9: f64 = xn3(t7, t8, t7 + t8);
     // b9e1f6 fstp dword ptr [esp + 4]
-    s[25] = (t9 as f32).to_bits();
+    s[25] = stf(t9);
     // b9e1fa fld dword ptr [esp + 4]
-    let t10: f64 = f32::from_bits(s[25]) as f64;
+    let t10: f64 = ldf(s[25]);
     // b9e1fe ret 
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
+    w.d((a as usize) + 8, s[27]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t10
 }
@@ -2643,38 +2786,41 @@ fn g_b9e200(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[26] = unsafe { *a.add(1) };
     s[27] = unsafe { *a.add(2) };
     // b9e200 fld dword ptr [esp + 4]
-    let t1: f64 = f32::from_bits(s[25]) as f64;
+    let t1: f64 = ldf(s[25]);
     // b9e204 fld1 
     let t2: f64 = 1.0;
     // b9e206 fsub st(1), st(0)
-    let t3: f64 = t1 - t2;
+    let t3: f64 = xn3(t1, t2, t1 - t2);
     // b9e208 fxch st(1)
     // b9e20a fstp dword ptr [esp + 4]
-    s[25] = (t3 as f32).to_bits();
+    s[25] = stf(t3);
     // b9e20e fld dword ptr [esp + 4]
-    let t4: f64 = f32::from_bits(s[25]) as f64;
+    let t4: f64 = ldf(s[25]);
     // b9e212 fld st(0)
     // b9e214 fmul st(0), st(0)
-    let t5: f64 = t4 * t4;
+    let t5: f64 = xn3(t4, t4, t4 * t4);
     // b9e216 fmul st(1)
-    let t6: f64 = t5 * t4;
+    let t6: f64 = xn3(t5, t4, t5 * t4);
     // b9e218 fmul st(1)
-    let t7: f64 = t6 * t4;
+    let t7: f64 = xn3(t6, t4, t6 * t4);
     // b9e21a fmulp st(1)
-    let t8: f64 = t4 * t7;
+    let t8: f64 = xn3(t4, t7, t4 * t7);
     // b9e21c faddp st(1)
-    let t9: f64 = t2 + t8;
+    let t9: f64 = xn3(t2, t8, t2 + t8);
     // b9e21e fmul dword ptr [esp + 0xc]
-    let t10: f64 = f32::from_bits(s[27]) as f64;
-    let t11: f64 = t9 * t10;
+    let t10: f64 = ldf(s[27]);
+    let t11: f64 = xn3(t9, t10, t9 * t10);
     // b9e222 fadd dword ptr [esp + 8]
-    let t12: f64 = f32::from_bits(s[26]) as f64;
-    let t13: f64 = t11 + t12;
+    let t12: f64 = ldf(s[26]);
+    let t13: f64 = xn3(t11, t12, t11 + t12);
     // b9e226 fstp dword ptr [esp + 4]
-    s[25] = (t13 as f32).to_bits();
+    s[25] = stf(t13);
     // b9e22a fld dword ptr [esp + 4]
-    let t14: f64 = f32::from_bits(s[25]) as f64;
+    let t14: f64 = ldf(s[25]);
     // b9e22e ret 
+    w.d((a as usize) + 0, s[25]);
+    w.d((a as usize) + 4, s[26]);
+    w.d((a as usize) + 8, s[27]);
     (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp) = (eax, ecx, edx, ebx, esi, edi, ebp);
     t14
 }
@@ -2775,12 +2921,89 @@ fn set_part(reg: u32, shift: u32, mask: u32, v: u32) -> u32 {
 /// `fld dword`: a signalling NaN becomes quiet, as on the FPU (a plain `as f64` can be folded
 /// away together with the `as f32` of the matching `fstp dword`).
 fn ldq(bits: u32) -> f64 {
-    f32::from_bits(q32(bits)) as f64
+    ldf(bits)
+}
+
+thread_local! {
+    /// A denormal memory operand was widened for the arithmetic instruction being evaluated.
+    static PDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A memory operand of an x87 arithmetic instruction: DE is raised only when the other operand
+/// is not a NaN, so it is held back for `arith_flags`.
+fn ldn(bits: u32) -> f64 {
+    if bits & 0x7F80_0000 == 0 && bits & 0x007F_FFFF != 0 {
+        PDE.with(|c| c.set(true));
+        return f32::from_bits(bits) as f64;
+    }
+    ldf(bits)
+}
+
+/// As `ldn`, keeping a signalling NaN signalling.
+fn ldnr(bits: u32) -> f64 {
+    if bits & 0x7F80_0000 == 0 && bits & 0x007F_FFFF != 0 {
+        PDE.with(|c| c.set(true));
+        return f32::from_bits(bits) as f64;
+    }
+    ldr32(bits)
+}
+
+/// The status flags an x87 add / sub / mul / div of `a` and `b` (result `r`, 53-bit precision)
+/// raises: IE for a signalling NaN or an invalid operation, ZE for a divide by zero, OE / PE for
+/// an overflow, PE for an inexact result. The operation is recovered from `r`.
+fn arith_flags(a: f64, b: f64, r: f64) {
+    if PDE.with(|c| c.replace(false)) && !a.is_nan() && !b.is_nan() {
+        sf_or(0x02);
+    }
+    const QUIET: u64 = 0x0008_0000_0000_0000;
+    if a.is_nan() || b.is_nan() {
+        if (a.is_nan() && a.to_bits() & QUIET == 0) || (b.is_nan() && b.to_bits() & QUIET == 0) {
+            sf_or(0x01);
+        }
+        return;
+    }
+    if r.is_nan() {
+        sf_or(0x01);
+        return;
+    }
+    if r.is_infinite() {
+        if a.is_finite() && b.is_finite() {
+            if b == 0.0 && a / b == r {
+                sf_or(0x04);
+            } else {
+                sf_or(0x08 | 0x20);
+            }
+        }
+        return;
+    }
+    let two_sum = |x: f64, y: f64| {
+        let bb = r - x;
+        (x - (r - bb)) + (y - bb) != 0.0
+    };
+    let inexact = if a + b == r {
+        two_sum(a, b)
+    } else if a - b == r {
+        two_sum(a, -b)
+    } else if b - a == r {
+        two_sum(b, -a)
+    } else if a * b == r {
+        a.mul_add(b, -r) != 0.0
+    } else if b != 0.0 && a / b == r {
+        (-r).mul_add(b, a) != 0.0
+    } else if a != 0.0 && b / a == r {
+        (-r).mul_add(a, b) != 0.0
+    } else {
+        false
+    };
+    if inexact {
+        sf_or(0x20);
+    }
 }
 
 /// The result `r` of an x87 add / sub / mul / div of `a` and `b`: with two NaN operands the FPU
 /// returns the one with the larger significand (SSE returns the first operand).
 fn xn(a: f64, b: f64, r: f64) -> f64 {
+    arith_flags(a, b, r);
     if a.is_nan() && b.is_nan() {
         const SIG: u64 = 0x000F_FFFF_FFFF_FFFF;
         if (b.to_bits() & SIG) > (a.to_bits() & SIG) { b } else { a }
@@ -2796,7 +3019,7 @@ fn rw(a: usize) -> u16 {
 }
 
 /// The registers, the stack argument and the x87 values of a call into the CRT, and what comes
-/// back. Offsets used by the asm: f 0, eax 4, ecx 8, edx 12, arg 16, out 20, st1 28, st0 36.
+/// back. Offsets used by the asm: f 0, eax 4, ecx 8, edx 12, arg 16, out 20, st1 28, st0 36, ebx 44, esi 48, edi 52, ebp 56.
 #[repr(C)]
 struct CrtBlock {
     f: u32,
@@ -2807,27 +3030,57 @@ struct CrtBlock {
     out: [u32; 2],
     in1: [u32; 2],
     in0: [u32; 2],
+    ebx: u32,
+    esi: u32,
+    edi: u32,
+    ebp: u32,
+}
+
+/// Leave the values the original keeps below the call's operands on the x87 stack.
+fn x87_push_below(below: &[f64]) {
+    for v in below {
+        unsafe { std::arch::asm!("fld qword ptr [{p}]", p = in(reg) v, options(nostack)) };
+    }
+}
+
+fn x87_pop_below(n: usize) {
+    for _ in 0..n {
+        unsafe { std::arch::asm!("fstp st(0)", options(nostack)) };
+    }
 }
 
 /// Call the CRT function `f` (cdecl, one dword on the stack, result in ST0) with these EAX /
 /// ECX / EDX; returns the three registers and ST0 as the original code would see them.
-fn crt_call1(f: usize, arg: u32, eax: u32, ecx: u32, edx: u32) -> (u32, u32, u32, f64) {
-    let mut b = CrtBlock { f: f as u32, eax, ecx, edx, arg, out: [0; 2], in1: [0; 2], in0: [0; 2] };
+fn crt_call1(f: usize, arg: u32, eax: u32, ecx: u32, edx: u32, r4: [u32; 4]) -> (u32, u32, u32, f64) {
+    let mut b = CrtBlock { f: f as u32, eax, ecx, edx, arg, out: [0; 2], in1: [0; 2], in0: [0; 2], ebx: r4[0], esi: r4[1], edi: r4[2], ebp: r4[3] };
     unsafe {
         std::arch::asm!(
+            "push ebp",
             "push ebx",
-            "mov ebx, eax",
-            "push dword ptr [ebx + 16]",
-            "mov ecx, [ebx + 8]",
-            "mov edx, [ebx + 12]",
-            "mov eax, [ebx + 4]",
-            "call dword ptr [ebx]",
-            "add esp, 4",
-            "mov [ebx + 4], eax",
-            "mov [ebx + 8], ecx",
-            "mov [ebx + 12], edx",
-            "fstp qword ptr [ebx + 20]",
+            "push esi",
+            "push edi",
+            "push eax",
+            "push dword ptr [eax]",
+            "push dword ptr [eax + 16]",
+            "mov edx, eax",
+            "mov ebx, [edx + 44]",
+            "mov esi, [edx + 48]",
+            "mov edi, [edx + 52]",
+            "mov ebp, [edx + 56]",
+            "mov ecx, [edx + 8]",
+            "mov eax, [edx + 4]",
+            "mov edx, [edx + 12]",
+            "call dword ptr [esp + 4]",
+            "add esp, 8",
+            "pop esi",
+            "mov [esi + 4], eax",
+            "mov [esi + 8], ecx",
+            "mov [esi + 12], edx",
+            "fstp qword ptr [esi + 20]",
+            "pop edi",
+            "pop esi",
             "pop ebx",
+            "pop ebp",
             inout("eax") &mut b as *mut CrtBlock => _,
             lateout("ecx") _,
             lateout("edx") _,
@@ -2839,7 +3092,7 @@ fn crt_call1(f: usize, arg: u32, eax: u32, ecx: u32, edx: u32) -> (u32, u32, u32
 
 /// Call `crt_pow_x87` (0xCA05D0): `st1 ^ st0` on the x87 stack, result in ST0, both inputs
 /// consumed. Returns the three registers and the result.
-fn crt_pow(eax: u32, ecx: u32, edx: u32, st1: f64, st0: f64) -> (u32, u32, u32, f64) {
+fn crt_pow(eax: u32, ecx: u32, edx: u32, st1: f64, st0: f64, r4: [u32; 4]) -> (u32, u32, u32, f64) {
     let mut b = CrtBlock {
         f: 0xca05d0,
         eax,
@@ -2849,22 +3102,40 @@ fn crt_pow(eax: u32, ecx: u32, edx: u32, st1: f64, st0: f64) -> (u32, u32, u32, 
         out: [0; 2],
         in1: [st1.to_bits() as u32, (st1.to_bits() >> 32) as u32],
         in0: [st0.to_bits() as u32, (st0.to_bits() >> 32) as u32],
+        ebx: r4[0],
+        esi: r4[1],
+        edi: r4[2],
+        ebp: r4[3],
     };
     unsafe {
         std::arch::asm!(
+            "push ebp",
             "push ebx",
-            "mov ebx, eax",
-            "fld qword ptr [ebx + 28]",
-            "fld qword ptr [ebx + 36]",
-            "mov ecx, [ebx + 8]",
-            "mov edx, [ebx + 12]",
-            "mov eax, [ebx + 4]",
-            "call dword ptr [ebx]",
-            "mov [ebx + 4], eax",
-            "mov [ebx + 8], ecx",
-            "mov [ebx + 12], edx",
-            "fstp qword ptr [ebx + 20]",
+            "push esi",
+            "push edi",
+            "push eax",
+            "push dword ptr [eax]",
+            "fld qword ptr [eax + 28]",
+            "fld qword ptr [eax + 36]",
+            "mov edx, eax",
+            "mov ebx, [edx + 44]",
+            "mov esi, [edx + 48]",
+            "mov edi, [edx + 52]",
+            "mov ebp, [edx + 56]",
+            "mov ecx, [edx + 8]",
+            "mov eax, [edx + 4]",
+            "mov edx, [edx + 12]",
+            "call dword ptr [esp]",
+            "add esp, 4",
+            "pop esi",
+            "mov [esi + 4], eax",
+            "mov [esi + 8], ecx",
+            "mov [esi + 12], edx",
+            "fstp qword ptr [esi + 20]",
+            "pop edi",
+            "pop esi",
             "pop ebx",
+            "pop ebp",
             inout("eax") &mut b as *mut CrtBlock => _,
             lateout("ecx") _,
             lateout("edx") _,
@@ -2913,6 +3184,8 @@ fn g2_b96520(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b96535 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b96537 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -2927,6 +3200,8 @@ fn g2_b96520(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b96543 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b96545 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -2972,6 +3247,8 @@ fn g2_b965b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b965c5 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b965c7 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -2986,6 +3263,8 @@ fn g2_b965b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b965d3 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b965d5 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3016,7 +3295,7 @@ fn g2_b96860(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9686b mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // b9686d fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b96870 test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -3035,10 +3314,12 @@ fn g2_b96860(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9687c mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9687e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // b96881 pop ecx
                 ecx = s[23];
                 // b96882 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3048,7 +3329,7 @@ fn g2_b96860(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b96888 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // b9688e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xb96891;
             }
             0xb96891 => {
@@ -3057,6 +3338,8 @@ fn g2_b96860(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b96893 pop ecx
                 ecx = s[23];
                 // b96894 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3108,12 +3391,14 @@ fn g2_b968c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b968d7 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b968d9 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b968dd fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b968e1 fstp dword ptr [ecx + 0x88]
-                w.d((ecx.wrapping_add(0x88)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x88)) as usize, stf(f[0]));
                 // b968e7 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3123,12 +3408,14 @@ fn g2_b968c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b968ed mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b968ef fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b968f3 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b968f7 fstp dword ptr [ecx + 0x88]
-                w.d((ecx.wrapping_add(0x88)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x88)) as usize, stf(f[0]));
                 // b968fd ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3145,16 +3432,18 @@ fn g2_b968c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9690a => {
                 // b9690a fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // b96910 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b96912 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b96916 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9691a fstp dword ptr [ecx + 0x88]
-                w.d((ecx.wrapping_add(0x88)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x88)) as usize, stf(f[0]));
                 // b96920 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3165,14 +3454,16 @@ fn g2_b968c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb96926 => {
                 // b96926 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9692a mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9692c fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b96930 fstp dword ptr [ecx + 0x88]
-                w.d((ecx.wrapping_add(0x88)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x88)) as usize, stf(f[0]));
                 // b96936 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3203,7 +3494,7 @@ fn g2_b96dc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b96dc8 mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // b96dca fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b96dcd test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -3222,10 +3513,12 @@ fn g2_b96dc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b96dd9 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b96ddb fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // b96dde pop ecx
                 ecx = s[23];
                 // b96ddf ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3235,7 +3528,7 @@ fn g2_b96dc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b96de5 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // b96deb fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xb96dee;
             }
             0xb96dee => {
@@ -3244,6 +3537,8 @@ fn g2_b96dc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b96df0 pop ecx
                 ecx = s[23];
                 // b96df1 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3295,12 +3590,14 @@ fn g2_b96e20(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b96e37 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b96e39 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b96e3d fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b96e41 fstp dword ptr [ecx + 0x78]
-                w.d((ecx.wrapping_add(0x78)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x78)) as usize, stf(f[0]));
                 // b96e44 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3310,12 +3607,14 @@ fn g2_b96e20(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b96e4a mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b96e4c fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b96e50 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b96e54 fstp dword ptr [ecx + 0x78]
-                w.d((ecx.wrapping_add(0x78)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x78)) as usize, stf(f[0]));
                 // b96e57 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3332,16 +3631,18 @@ fn g2_b96e20(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb96e64 => {
                 // b96e64 fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // b96e6a mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b96e6c fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b96e70 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b96e74 fstp dword ptr [ecx + 0x78]
-                w.d((ecx.wrapping_add(0x78)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x78)) as usize, stf(f[0]));
                 // b96e77 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3352,14 +3653,16 @@ fn g2_b96e20(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb96e7d => {
                 // b96e7d fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b96e81 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b96e83 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b96e87 fstp dword ptr [ecx + 0x78]
-                w.d((ecx.wrapping_add(0x78)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x78)) as usize, stf(f[0]));
                 // b96e8a ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3411,14 +3714,16 @@ fn g2_b9cf10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9cf27 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9cf29 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9cf2d fld dword ptr [ecx + 0x5c]
                 f[0] = ldq(rd((ecx.wrapping_add(0x5c)) as usize));
                 // b9cf30 fadd dword ptr [esp + 4]
-                f[0] = xn(f[0], ldq(s[25]), f[0] + ldq(s[25]));
+                f[0] = xn(f[0], ldn(s[25]), f[0] + ldn(s[25]));
                 // b9cf34 fstp dword ptr [ecx + 0x54]
-                w.d((ecx.wrapping_add(0x54)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x54)) as usize, stf(f[0]));
                 // b9cf37 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3428,14 +3733,16 @@ fn g2_b9cf10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9cf3d mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9cf3f fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9cf43 fld dword ptr [ecx + 0x5c]
                 f[0] = ldq(rd((ecx.wrapping_add(0x5c)) as usize));
                 // b9cf46 fadd dword ptr [esp + 4]
-                f[0] = xn(f[0], ldq(s[25]), f[0] + ldq(s[25]));
+                f[0] = xn(f[0], ldn(s[25]), f[0] + ldn(s[25]));
                 // b9cf4a fstp dword ptr [ecx + 0x54]
-                w.d((ecx.wrapping_add(0x54)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x54)) as usize, stf(f[0]));
                 // b9cf4d ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3452,18 +3759,20 @@ fn g2_b9cf10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9cf5a => {
                 // b9cf5a fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // b9cf60 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9cf62 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9cf66 fld dword ptr [ecx + 0x5c]
                 f[0] = ldq(rd((ecx.wrapping_add(0x5c)) as usize));
                 // b9cf69 fadd dword ptr [esp + 4]
-                f[0] = xn(f[0], ldq(s[25]), f[0] + ldq(s[25]));
+                f[0] = xn(f[0], ldn(s[25]), f[0] + ldn(s[25]));
                 // b9cf6d fstp dword ptr [ecx + 0x54]
-                w.d((ecx.wrapping_add(0x54)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x54)) as usize, stf(f[0]));
                 // b9cf70 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3474,16 +3783,18 @@ fn g2_b9cf10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9cf76 => {
                 // b9cf76 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9cf7a mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9cf7c fld dword ptr [ecx + 0x5c]
                 f[0] = ldq(rd((ecx.wrapping_add(0x5c)) as usize));
                 // b9cf7f fadd dword ptr [esp + 4]
-                f[0] = xn(f[0], ldq(s[25]), f[0] + ldq(s[25]));
+                f[0] = xn(f[0], ldn(s[25]), f[0] + ldn(s[25]));
                 // b9cf83 fstp dword ptr [ecx + 0x54]
-                w.d((ecx.wrapping_add(0x54)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x54)) as usize, stf(f[0]));
                 // b9cf86 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3510,7 +3821,7 @@ fn g2_b9cfb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9cfb1 fld dword ptr [ecx + 0x5c]
                 f[0] = ldq(rd((ecx.wrapping_add(0x5c)) as usize));
                 // b9cfb4 fadd dword ptr [ecx + 0x54]
-                f[0] = xn(f[0], ldq(rd((ecx.wrapping_add(0x54)) as usize)), f[0] + ldq(rd((ecx.wrapping_add(0x54)) as usize)));
+                f[0] = xn(f[0], ldn(rd((ecx.wrapping_add(0x54)) as usize)), f[0] + ldn(rd((ecx.wrapping_add(0x54)) as usize)));
                 // b9cfb7 mov ecx, dword ptr [esp + 8]
                 ecx = s[25];
                 // b9cfbb mov eax, dword ptr [ecx]
@@ -3519,7 +3830,7 @@ fn g2_b9cfb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
                 // b9cfbf fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b9cfc2 je 0xb9cfd5
                 pc = if fl.zf { 0xb9cfd5 } else { 0xb9cfc4 };
             }
@@ -3535,10 +3846,12 @@ fn g2_b9cfb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9cfcc mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9cfce fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // b9cfd1 pop ecx
                 ecx = s[23];
                 // b9cfd2 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3548,7 +3861,7 @@ fn g2_b9cfb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9cfd8 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // b9cfde fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xb9cfe1;
             }
             0xb9cfe1 => {
@@ -3557,6 +3870,8 @@ fn g2_b9cfb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9cfe3 pop ecx
                 ecx = s[23];
                 // b9cfe4 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3602,6 +3917,8 @@ fn g2_b9d160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9d175 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9d177 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3616,6 +3933,8 @@ fn g2_b9d160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9d183 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9d185 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3646,7 +3965,7 @@ fn g2_b9f670(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f678 mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // b9f67a fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b9f67d test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -3665,10 +3984,12 @@ fn g2_b9f670(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f689 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9f68b fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // b9f68e pop ecx
                 ecx = s[23];
                 // b9f68f ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3678,7 +3999,7 @@ fn g2_b9f670(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f695 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // b9f69b fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xb9f69e;
             }
             0xb9f69e => {
@@ -3687,6 +4008,8 @@ fn g2_b9f670(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f6a0 pop ecx
                 ecx = s[23];
                 // b9f6a1 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3717,7 +4040,7 @@ fn g2_b9f760(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f768 mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // b9f76a fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b9f76d test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -3736,10 +4059,12 @@ fn g2_b9f760(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f779 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9f77b fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // b9f77e pop ecx
                 ecx = s[23];
                 // b9f77f ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3749,7 +4074,7 @@ fn g2_b9f760(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f785 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // b9f78b fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xb9f78e;
             }
             0xb9f78e => {
@@ -3758,6 +4083,8 @@ fn g2_b9f760(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f790 pop ecx
                 ecx = s[23];
                 // b9f791 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3788,7 +4115,7 @@ fn g2_b9fb00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9fb0b mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // b9fb0d fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b9fb10 test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -3807,10 +4134,12 @@ fn g2_b9fb00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9fb1c mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9fb1e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // b9fb21 pop ecx
                 ecx = s[23];
                 // b9fb22 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3820,7 +4149,7 @@ fn g2_b9fb00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9fb28 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // b9fb2e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xb9fb31;
             }
             0xb9fb31 => {
@@ -3829,6 +4158,8 @@ fn g2_b9fb00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9fb33 pop ecx
                 ecx = s[23];
                 // b9fb34 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3880,12 +4211,14 @@ fn g2_b9fb60(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9fb77 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9fb79 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9fb7d fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9fb81 fstp dword ptr [ecx + 0xa0]
-                w.d((ecx.wrapping_add(0xa0)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xa0)) as usize, stf(f[0]));
                 // b9fb87 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3895,12 +4228,14 @@ fn g2_b9fb60(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9fb8d mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9fb8f fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9fb93 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9fb97 fstp dword ptr [ecx + 0xa0]
-                w.d((ecx.wrapping_add(0xa0)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xa0)) as usize, stf(f[0]));
                 // b9fb9d ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3917,16 +4252,18 @@ fn g2_b9fb60(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9fbaa => {
                 // b9fbaa fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // b9fbb0 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9fbb2 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9fbb6 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9fbba fstp dword ptr [ecx + 0xa0]
-                w.d((ecx.wrapping_add(0xa0)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xa0)) as usize, stf(f[0]));
                 // b9fbc0 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3937,14 +4274,16 @@ fn g2_b9fb60(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9fbc6 => {
                 // b9fbc6 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9fbca mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // b9fbcc fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9fbd0 fstp dword ptr [ecx + 0xa0]
-                w.d((ecx.wrapping_add(0xa0)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xa0)) as usize, stf(f[0]));
                 // b9fbd6 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -3990,6 +4329,8 @@ fn g2_ba1400(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba1418 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba141a ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4004,6 +4345,8 @@ fn g2_ba1400(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba1426 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba1428 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4034,7 +4377,7 @@ fn g2_ba1f70(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba1f7b mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // ba1f7d fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // ba1f80 test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -4053,10 +4396,12 @@ fn g2_ba1f70(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba1f8c mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba1f8e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // ba1f91 pop ecx
                 ecx = s[23];
                 // ba1f92 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4066,7 +4411,7 @@ fn g2_ba1f70(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba1f98 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // ba1f9e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xba1fa1;
             }
             0xba1fa1 => {
@@ -4075,6 +4420,8 @@ fn g2_ba1f70(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba1fa3 pop ecx
                 ecx = s[23];
                 // ba1fa4 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4126,12 +4473,14 @@ fn g2_ba1fd0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba1fe7 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba1fe9 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba1fed fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba1ff1 fstp dword ptr [ecx + 0xf4]
-                w.d((ecx.wrapping_add(0xf4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xf4)) as usize, stf(f[0]));
                 // ba1ff7 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4141,12 +4490,14 @@ fn g2_ba1fd0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba1ffd mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba1fff fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba2003 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba2007 fstp dword ptr [ecx + 0xf4]
-                w.d((ecx.wrapping_add(0xf4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xf4)) as usize, stf(f[0]));
                 // ba200d ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4163,16 +4514,18 @@ fn g2_ba1fd0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba201a => {
                 // ba201a fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // ba2020 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba2022 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba2026 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba202a fstp dword ptr [ecx + 0xf4]
-                w.d((ecx.wrapping_add(0xf4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xf4)) as usize, stf(f[0]));
                 // ba2030 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4183,14 +4536,16 @@ fn g2_ba1fd0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba2036 => {
                 // ba2036 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba203a mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba203c fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba2040 fstp dword ptr [ecx + 0xf4]
-                w.d((ecx.wrapping_add(0xf4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xf4)) as usize, stf(f[0]));
                 // ba2046 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4221,7 +4576,7 @@ fn g2_ba2070(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba207b mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // ba207d fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // ba2080 test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -4240,10 +4595,12 @@ fn g2_ba2070(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba208c mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba208e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // ba2091 pop ecx
                 ecx = s[23];
                 // ba2092 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4253,7 +4610,7 @@ fn g2_ba2070(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba2098 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // ba209e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xba20a1;
             }
             0xba20a1 => {
@@ -4262,6 +4619,8 @@ fn g2_ba2070(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba20a3 pop ecx
                 ecx = s[23];
                 // ba20a4 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4313,12 +4672,14 @@ fn g2_ba20d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba20e7 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba20e9 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba20ed fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba20f1 fstp dword ptr [ecx + 0xf8]
-                w.d((ecx.wrapping_add(0xf8)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xf8)) as usize, stf(f[0]));
                 // ba20f7 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4328,12 +4689,14 @@ fn g2_ba20d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba20fd mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba20ff fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba2103 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba2107 fstp dword ptr [ecx + 0xf8]
-                w.d((ecx.wrapping_add(0xf8)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xf8)) as usize, stf(f[0]));
                 // ba210d ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4350,16 +4713,18 @@ fn g2_ba20d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba211a => {
                 // ba211a fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // ba2120 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba2122 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba2126 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba212a fstp dword ptr [ecx + 0xf8]
-                w.d((ecx.wrapping_add(0xf8)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xf8)) as usize, stf(f[0]));
                 // ba2130 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4370,14 +4735,16 @@ fn g2_ba20d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba2136 => {
                 // ba2136 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba213a mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba213c fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba2140 fstp dword ptr [ecx + 0xf8]
-                w.d((ecx.wrapping_add(0xf8)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xf8)) as usize, stf(f[0]));
                 // ba2146 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4408,7 +4775,7 @@ fn g2_ba2170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba217b mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // ba217d fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // ba2180 test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -4427,10 +4794,12 @@ fn g2_ba2170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba218c mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba218e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // ba2191 pop ecx
                 ecx = s[23];
                 // ba2192 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4440,7 +4809,7 @@ fn g2_ba2170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba2198 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // ba219e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xba21a1;
             }
             0xba21a1 => {
@@ -4449,6 +4818,8 @@ fn g2_ba2170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba21a3 pop ecx
                 ecx = s[23];
                 // ba21a4 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4500,12 +4871,14 @@ fn g2_ba21d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba21e7 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba21e9 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba21ed fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba21f1 fstp dword ptr [ecx + 0xfc]
-                w.d((ecx.wrapping_add(0xfc)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xfc)) as usize, stf(f[0]));
                 // ba21f7 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4515,12 +4888,14 @@ fn g2_ba21d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba21fd mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba21ff fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba2203 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba2207 fstp dword ptr [ecx + 0xfc]
-                w.d((ecx.wrapping_add(0xfc)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xfc)) as usize, stf(f[0]));
                 // ba220d ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4537,16 +4912,18 @@ fn g2_ba21d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba221a => {
                 // ba221a fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // ba2220 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba2222 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba2226 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba222a fstp dword ptr [ecx + 0xfc]
-                w.d((ecx.wrapping_add(0xfc)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xfc)) as usize, stf(f[0]));
                 // ba2230 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4557,14 +4934,16 @@ fn g2_ba21d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba2236 => {
                 // ba2236 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba223a mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba223c fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba2240 fstp dword ptr [ecx + 0xfc]
-                w.d((ecx.wrapping_add(0xfc)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xfc)) as usize, stf(f[0]));
                 // ba2246 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4595,7 +4974,7 @@ fn g2_ba2270(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba227b mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // ba227d fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // ba2280 test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -4614,10 +4993,12 @@ fn g2_ba2270(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba228c mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba228e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // ba2291 pop ecx
                 ecx = s[23];
                 // ba2292 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4627,7 +5008,7 @@ fn g2_ba2270(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba2298 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // ba229e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xba22a1;
             }
             0xba22a1 => {
@@ -4636,6 +5017,8 @@ fn g2_ba2270(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba22a3 pop ecx
                 ecx = s[23];
                 // ba22a4 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4687,12 +5070,14 @@ fn g2_ba22d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba22e7 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba22e9 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba22ed fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba22f1 fstp dword ptr [ecx + 0x100]
-                w.d((ecx.wrapping_add(0x100)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x100)) as usize, stf(f[0]));
                 // ba22f7 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4702,12 +5087,14 @@ fn g2_ba22d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba22fd mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba22ff fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba2303 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba2307 fstp dword ptr [ecx + 0x100]
-                w.d((ecx.wrapping_add(0x100)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x100)) as usize, stf(f[0]));
                 // ba230d ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4724,16 +5111,18 @@ fn g2_ba22d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba231a => {
                 // ba231a fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // ba2320 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba2322 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba2326 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba232a fstp dword ptr [ecx + 0x100]
-                w.d((ecx.wrapping_add(0x100)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x100)) as usize, stf(f[0]));
                 // ba2330 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4744,14 +5133,16 @@ fn g2_ba22d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba2336 => {
                 // ba2336 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba233a mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba233c fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba2340 fstp dword ptr [ecx + 0x100]
-                w.d((ecx.wrapping_add(0x100)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x100)) as usize, stf(f[0]));
                 // ba2346 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4801,6 +5192,8 @@ fn g2_ba35a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba35ba mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba35bc ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4815,6 +5208,8 @@ fn g2_ba35a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba35c8 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba35ca ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4845,7 +5240,7 @@ fn g2_ba3640(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba364b mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // ba364d fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // ba3650 test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -4864,10 +5259,12 @@ fn g2_ba3640(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba365c mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba365e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // ba3661 pop ecx
                 ecx = s[23];
                 // ba3662 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4877,7 +5274,7 @@ fn g2_ba3640(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba3668 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // ba366e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xba3671;
             }
             0xba3671 => {
@@ -4886,6 +5283,8 @@ fn g2_ba3640(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba3673 pop ecx
                 ecx = s[23];
                 // ba3674 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4931,6 +5330,8 @@ fn g2_ba3cf0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba3d08 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba3d0a ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4945,6 +5346,8 @@ fn g2_ba3cf0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba3d16 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba3d18 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -4990,6 +5393,8 @@ fn g2_ba5030(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5048 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba504a ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5004,6 +5409,8 @@ fn g2_ba5030(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5056 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba5058 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5034,7 +5441,7 @@ fn g2_ba5b50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5b5b mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // ba5b5d fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // ba5b60 test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -5053,10 +5460,12 @@ fn g2_ba5b50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5b6c mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba5b6e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // ba5b71 pop ecx
                 ecx = s[23];
                 // ba5b72 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5066,7 +5475,7 @@ fn g2_ba5b50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5b78 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // ba5b7e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xba5b81;
             }
             0xba5b81 => {
@@ -5075,6 +5484,8 @@ fn g2_ba5b50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5b83 pop ecx
                 ecx = s[23];
                 // ba5b84 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5126,12 +5537,14 @@ fn g2_ba5bb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5bc7 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba5bc9 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba5bcd fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba5bd1 fstp dword ptr [ecx + 0xc0]
-                w.d((ecx.wrapping_add(0xc0)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xc0)) as usize, stf(f[0]));
                 // ba5bd7 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5141,12 +5554,14 @@ fn g2_ba5bb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5bdd mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba5bdf fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba5be3 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba5be7 fstp dword ptr [ecx + 0xc0]
-                w.d((ecx.wrapping_add(0xc0)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xc0)) as usize, stf(f[0]));
                 // ba5bed ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5163,16 +5578,18 @@ fn g2_ba5bb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba5bfa => {
                 // ba5bfa fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // ba5c00 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba5c02 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba5c06 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba5c0a fstp dword ptr [ecx + 0xc0]
-                w.d((ecx.wrapping_add(0xc0)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xc0)) as usize, stf(f[0]));
                 // ba5c10 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5183,14 +5600,16 @@ fn g2_ba5bb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba5c16 => {
                 // ba5c16 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba5c1a mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba5c1c fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba5c20 fstp dword ptr [ecx + 0xc0]
-                w.d((ecx.wrapping_add(0xc0)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xc0)) as usize, stf(f[0]));
                 // ba5c26 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5221,7 +5640,7 @@ fn g2_ba5c50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5c5b mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // ba5c5d fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // ba5c60 test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -5240,10 +5659,12 @@ fn g2_ba5c50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5c6c mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba5c6e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // ba5c71 pop ecx
                 ecx = s[23];
                 // ba5c72 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5253,7 +5674,7 @@ fn g2_ba5c50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5c78 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // ba5c7e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xba5c81;
             }
             0xba5c81 => {
@@ -5262,6 +5683,8 @@ fn g2_ba5c50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5c83 pop ecx
                 ecx = s[23];
                 // ba5c84 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5315,12 +5738,14 @@ fn g2_ba5cb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fl = fl_logic(r_, 8);
                 eax = set_part(eax, 0, 0xff, r_);
                 // ba5cc9 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba5ccd fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba5cd1 fstp dword ptr [ecx + 0xc4]
-                w.d((ecx.wrapping_add(0xc4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xc4)) as usize, stf(f[0]));
                 // ba5cd7 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5332,12 +5757,14 @@ fn g2_ba5cb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fl = fl_logic(r_, 8);
                 eax = set_part(eax, 0, 0xff, r_);
                 // ba5cdf fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba5ce3 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba5ce7 fstp dword ptr [ecx + 0xc4]
-                w.d((ecx.wrapping_add(0xc4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xc4)) as usize, stf(f[0]));
                 // ba5ced ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5354,18 +5781,20 @@ fn g2_ba5cb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba5cfa => {
                 // ba5cfa fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // ba5d00 xor al, al
                 let r_ = ((eax & 0xff)) ^ ((eax & 0xff));
                 fl = fl_logic(r_, 8);
                 eax = set_part(eax, 0, 0xff, r_);
                 // ba5d02 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba5d06 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba5d0a fstp dword ptr [ecx + 0xc4]
-                w.d((ecx.wrapping_add(0xc4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xc4)) as usize, stf(f[0]));
                 // ba5d10 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5376,7 +5805,7 @@ fn g2_ba5cb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba5d16 => {
                 // ba5d16 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba5d1a xor al, al
                 let r_ = ((eax & 0xff)) ^ ((eax & 0xff));
                 fl = fl_logic(r_, 8);
@@ -5384,8 +5813,10 @@ fn g2_ba5cb0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5d1c fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // ba5d20 fstp dword ptr [ecx + 0xc4]
-                w.d((ecx.wrapping_add(0xc4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0xc4)) as usize, stf(f[0]));
                 // ba5d26 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5416,7 +5847,7 @@ fn g2_ba6400(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba640b mov eax, dword ptr [ecx]
                 eax = rd((ecx) as usize);
                 // ba640d fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // ba6410 test eax, eax
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
@@ -5435,10 +5866,12 @@ fn g2_ba6400(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba641c mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba641e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // ba6421 pop ecx
                 ecx = s[23];
                 // ba6422 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5448,7 +5881,7 @@ fn g2_ba6400(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba6428 mov dword ptr [ecx], 3
                 w.d((ecx) as usize, 0x3u32);
                 // ba642e fstp dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[0]));
                 pc = 0xba6431;
             }
             0xba6431 => {
@@ -5457,6 +5890,8 @@ fn g2_ba6400(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba6433 pop ecx
                 ecx = s[23];
                 // ba6434 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5521,7 +5956,7 @@ fn g2_ba6460(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba6484 => {
                 // ba6484 fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // ba648a jmp 0xba648f
                 pc = 0xba648f;
             }
@@ -5532,7 +5967,7 @@ fn g2_ba6460(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba648f => {
                 // ba648f fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // ba6493 fldz 
                 f[0] = 0.0;
                 // ba6495 fld dword ptr [esp + 4]
@@ -5559,15 +5994,19 @@ fn g2_ba6460(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fl = fl_logic(r_, 8);
                 eax = set_part(eax, 0, 0xff, r_);
                 // ba64a8 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
             0xba64ab => {
                 // ba64ab fstp dword ptr [ecx + 0x98]
-                w.d((ecx.wrapping_add(0x98)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x98)) as usize, stf(f[0]));
                 // ba64b1 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // ba64b3 ret 8
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5604,6 +6043,7 @@ fn g2_7903d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x7903db => {
                 // 7903db ret 4
+                w.d((a as usize) + 0, s[25]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5616,8 +6056,9 @@ fn g2_7903d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 7903e4 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // 7903e8 fstp dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 7903eb ret 4
+                w.d((a as usize) + 0, s[25]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -5692,7 +6133,7 @@ fn g2_5e4970(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x5e4995 => {
                 // 5e4995 fadd dword ptr [0xe5bfd8]
-                f[0] = xn(f[0], ldq(rd((0xe5bfd8u32) as usize)), f[0] + ldq(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn(f[0], ldn(rd((0xe5bfd8u32) as usize)), f[0] + ldn(rd((0xe5bfd8u32) as usize)));
                 // 5e499b pop ecx
                 ecx = s[23];
                 // 5e499c ret 
@@ -5849,15 +6290,15 @@ fn g2_b8a150(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b8a164 fld dword ptr [edx + 4]
                 f[0] = ldq(rd((edx.wrapping_add(0x4)) as usize));
                 // b8a167 fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b8a16a fld dword ptr [edx]
                 f[0] = ldq(rd((edx) as usize));
                 // b8a16c fstp dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // b8a16f fld dword ptr [esp]
                 f[0] = ldq(s[23]);
                 // b8a172 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // b8a175 pop ecx
                 ecx = s[23];
                 // b8a176 ret 
@@ -5908,15 +6349,15 @@ fn g2_b956b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b956cd fldz 
                 f[0] = 0.0;
                 // b956cf fst dword ptr [esp]
-                s[21] = (f[0] as f32).to_bits();
+                s[21] = stf(f[0]);
                 // b956d2 mov edx, dword ptr [esp]
                 edx = s[21];
                 // b956d5 fst dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b956d9 mov ecx, dword ptr [esp + 4]
                 ecx = s[22];
                 // b956dd fstp dword ptr [esp + 8]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b956e1 mov dword ptr [eax], edx
                 w.d((eax) as usize, edx);
                 // b956e3 mov edx, dword ptr [esp + 8]
@@ -5959,7 +6400,7 @@ fn g2_b9dda0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9dda9 fld dword ptr [ebp + 8]
                 f[0] = ldq(s[25]);
                 // b9ddac fst dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9ddb0 mov eax, dword ptr [esp + 4]
                 eax = s[22];
                 // b9ddb4 shr eax, 0x1f
@@ -5973,7 +6414,7 @@ fn g2_b9dda0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9ddbb => {
                 // b9ddbb fst dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9ddbf cmp dword ptr [esp + 4], 0
                 fl = fl_sub(s[22], 0x0u32, 32).1;
                 // b9ddc4 je 0xb9ddff
@@ -5985,23 +6426,23 @@ fn g2_b9dda0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9ddcc fmul qword ptr [0xe5c1b8]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c1b8u32) as usize))), f[0] * f64::from_bits(q64(rq((0xe5c1b8u32) as usize))));
                 // b9ddd2 fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9ddd6 fld qword ptr [0xe5bfe8]
                 f[0] = f64::from_bits(q64(rq((0xe5bfe8u32) as usize)));
                 // b9dddc fld dword ptr [esp + 4]
                 f[1] = ldq(s[22]);
                 // b9dde0 call 0xca05d0
-                { let (ra, rc, rd_, r) = crt_pow(eax, ecx, edx, f[0], f[1]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_pow(eax, ecx, edx, f[0], f[1], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9dde5 fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9dde9 fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9dded fmul dword ptr [ebp + 0x10]
-                f[0] = xn(f[0], ldq(s[27]), f[0] * ldq(s[27]));
+                f[0] = xn(f[0], ldn(s[27]), f[0] * ldn(s[27]));
                 // b9ddf0 fadd dword ptr [ebp + 0xc]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9ddf3 fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9ddf7 fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9ddfb mov esp, ebp
@@ -6009,6 +6450,9 @@ fn g2_b9dda0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9ddfd pop ebp
                 ebp = s[23];
                 // b9ddfe ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6017,7 +6461,7 @@ fn g2_b9dda0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9de01 fld dword ptr [ebp + 0xc]
                 f[0] = ldq(s[26]);
                 // b9de04 fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9de08 fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9de0c mov esp, ebp
@@ -6025,6 +6469,9 @@ fn g2_b9dda0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9de0e pop ebp
                 ebp = s[23];
                 // b9de0f ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6067,7 +6514,7 @@ fn g2_b9de10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9de24 fxch st(1)
                 f.swap(2, 1);
                 // b9de26 fstp dword ptr [esp + 4]
-                s[22] = (f[2] as f32).to_bits();
+                s[22] = stf(f[2]);
                 // b9de2a mov eax, dword ptr [esp + 4]
                 eax = s[22];
                 // b9de2e shr eax, 0x1f
@@ -6083,7 +6530,7 @@ fn g2_b9de10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9de35 fsubr st(1)
                 f[1] = xn(f[1], f[0], f[0] - f[1]);
                 // b9de37 fstp dword ptr [esp + 4]
-                s[22] = (f[1] as f32).to_bits();
+                s[22] = stf(f[1]);
                 // b9de3b cmp dword ptr [esp + 4], 0
                 fl = fl_sub(s[22], 0x0u32, 32).1;
                 // b9de40 je 0xb9de7b
@@ -6093,15 +6540,15 @@ fn g2_b9de10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9de42 fmul qword ptr [0xe5c9c0]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c9c0u32) as usize))), f[0] * f64::from_bits(q64(rq((0xe5c9c0u32) as usize))));
                 // b9de48 fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9de4c fld qword ptr [0xe5bfe8]
                 f[0] = f64::from_bits(q64(rq((0xe5bfe8u32) as usize)));
                 // b9de52 fld dword ptr [esp + 4]
                 f[1] = ldq(s[22]);
                 // b9de56 call 0xca05d0
-                { let (ra, rc, rd_, r) = crt_pow(eax, ecx, edx, f[0], f[1]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_pow(eax, ecx, edx, f[0], f[1], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9de5b fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9de5f fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9de63 fld1 
@@ -6109,11 +6556,11 @@ fn g2_b9de10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9de65 fsubrp st(1)
                 f[0] = xn(f[0], f[1], f[1] - f[0]);
                 // b9de67 fmul dword ptr [ebp + 0x10]
-                f[0] = xn(f[0], ldq(s[27]), f[0] * ldq(s[27]));
+                f[0] = xn(f[0], ldn(s[27]), f[0] * ldn(s[27]));
                 // b9de6a fadd dword ptr [ebp + 0xc]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9de6d fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9de71 fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9de75 mov esp, ebp
@@ -6121,6 +6568,9 @@ fn g2_b9de10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9de77 pop ebp
                 ebp = s[23];
                 // b9de78 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6134,9 +6584,9 @@ fn g2_b9de10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9de7d fld dword ptr [ebp + 0xc]
                 f[0] = ldq(s[26]);
                 // b9de80 fadd dword ptr [ebp + 0x10]
-                f[0] = xn(f[0], ldq(s[27]), f[0] + ldq(s[27]));
+                f[0] = xn(f[0], ldn(s[27]), f[0] + ldn(s[27]));
                 // b9de83 fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9de87 fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9de8b mov esp, ebp
@@ -6144,6 +6594,9 @@ fn g2_b9de10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9de8d pop ebp
                 ebp = s[23];
                 // b9de8e ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6176,7 +6629,7 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9de99 fld dword ptr [ebp + 8]
                 f[0] = ldq(s[25]);
                 // b9de9c fst dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9dea0 cmp dword ptr [esp + 4], 0
                 fl = fl_sub(s[22], 0x0u32, 32).1;
                 // b9dea5 jne 0xb9deb0
@@ -6191,6 +6644,9 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9deae pop ebp
                 ebp = s[23];
                 // b9deaf ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6204,7 +6660,7 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9deb6 fxch st(1)
                 f.swap(2, 1);
                 // b9deb8 fstp dword ptr [esp + 4]
-                s[22] = (f[2] as f32).to_bits();
+                s[22] = stf(f[2]);
                 // b9debc cmp dword ptr [esp + 4], 0
                 fl = fl_sub(s[22], 0x0u32, 32).1;
                 // b9dec1 jne 0xb9ded9
@@ -6217,9 +6673,9 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9dec7 fld dword ptr [ebp + 0xc]
                 f[0] = ldq(s[26]);
                 // b9deca fadd dword ptr [ebp + 0x10]
-                f[0] = xn(f[0], ldq(s[27]), f[0] + ldq(s[27]));
+                f[0] = xn(f[0], ldn(s[27]), f[0] + ldn(s[27]));
                 // b9decd fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9ded1 fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9ded5 mov esp, ebp
@@ -6227,6 +6683,9 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9ded7 pop ebp
                 ebp = s[23];
                 // b9ded8 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6240,11 +6699,11 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9dee3 fsubrp st(1)
                 f[1] = xn(f[1], f[2], f[2] - f[1]);
                 // b9dee5 fstp dword ptr [ebp + 8]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9dee8 fld dword ptr [ebp + 8]
                 f[1] = ldq(s[25]);
                 // b9deeb fst dword ptr [esp + 4]
-                s[22] = (f[1] as f32).to_bits();
+                s[22] = stf(f[1]);
                 // b9deef mov eax, dword ptr [esp + 4]
                 eax = s[22];
                 // b9def3 shr eax, 0x1f
@@ -6260,13 +6719,13 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9defa fmul qword ptr [0xe5c1b8]
                 f[1] = xn(f[1], f64::from_bits(q64(rq((0xe5c1b8u32) as usize))), f[1] * f64::from_bits(q64(rq((0xe5c1b8u32) as usize))));
                 // b9df00 fstp dword ptr [esp + 4]
-                s[22] = (f[1] as f32).to_bits();
+                s[22] = stf(f[1]);
                 // b9df04 fld dword ptr [esp + 4]
                 f[1] = ldq(s[22]);
                 // b9df08 call 0xca05d0
-                { let (ra, rc, rd_, r) = crt_pow(eax, ecx, edx, f[0], f[1]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_pow(eax, ecx, edx, f[0], f[1], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9df0d fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9df11 fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9df15 fld dword ptr [ebp + 0x10]
@@ -6276,9 +6735,9 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9df1e fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9df20 fadd dword ptr [ebp + 0xc]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9df23 fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9df27 fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9df2b mov esp, ebp
@@ -6286,6 +6745,9 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9df2d pop ebp
                 ebp = s[23];
                 // b9df2e ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6293,13 +6755,13 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9df2f fmul qword ptr [0xe5c9c0]
                 f[1] = xn(f[1], f64::from_bits(q64(rq((0xe5c9c0u32) as usize))), f[1] * f64::from_bits(q64(rq((0xe5c9c0u32) as usize))));
                 // b9df35 fstp dword ptr [esp + 4]
-                s[22] = (f[1] as f32).to_bits();
+                s[22] = stf(f[1]);
                 // b9df39 fld dword ptr [esp + 4]
                 f[1] = ldq(s[22]);
                 // b9df3d call 0xca05d0
-                { let (ra, rc, rd_, r) = crt_pow(eax, ecx, edx, f[0], f[1]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_pow(eax, ecx, edx, f[0], f[1], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9df42 fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9df46 fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9df4a fsubr qword ptr [0xe5bfe8]
@@ -6311,9 +6773,9 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9df59 fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9df5b fadd dword ptr [ebp + 0xc]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9df5e fstp dword ptr [esp + 4]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b9df62 fld dword ptr [esp + 4]
                 f[0] = ldq(s[22]);
                 // b9df66 mov esp, ebp
@@ -6321,6 +6783,9 @@ fn g2_b9de90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9df68 pop ebp
                 ebp = s[23];
                 // b9df69 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6348,7 +6813,7 @@ fn g2_b9dfc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9dfc4 fadd st(0), st(0)
                 f[0] = xn(f[0], f[0], f[0] + f[0]);
                 // b9dfc6 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9dfca fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9dfce fld st(0)
@@ -6360,7 +6825,7 @@ fn g2_b9dfc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9dfd4 fxch st(1)
                 f.swap(2, 1);
                 // b9dfd6 fst dword ptr [esp + 4]
-                s[25] = (f[2] as f32).to_bits();
+                s[25] = stf(f[2]);
                 // b9dfda mov eax, dword ptr [esp + 4]
                 eax = s[25];
                 // b9dfde shr eax, 0x1f
@@ -6384,12 +6849,15 @@ fn g2_b9dfc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9dff5 fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9dff7 fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9dffb fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9dfff fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e003 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6413,10 +6881,13 @@ fn g2_b9dfc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e020 fsubp st(1)
                 f[0] = xn(f[0], f[1], f[0] - f[1]);
                 // b9e022 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e026 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e02a ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6448,7 +6919,7 @@ fn g2_b9e080(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e08c fxch st(1)
                 f.swap(1, 0);
                 // b9e08e fstp dword ptr [esp + 4]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e092 fld dword ptr [esp + 4]
                 f[1] = ldq(s[25]);
                 // b9e096 fld qword ptr [0xe5bf40]
@@ -6456,7 +6927,7 @@ fn g2_b9e080(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e09c fsubr st(1)
                 f[2] = xn(f[2], f[1], f[1] - f[2]);
                 // b9e09e fstp dword ptr [esp + 4]
-                s[25] = (f[2] as f32).to_bits();
+                s[25] = stf(f[2]);
                 // b9e0a2 mov eax, dword ptr [esp + 4]
                 eax = s[25];
                 // b9e0a6 shr eax, 0x1f
@@ -6482,12 +6953,15 @@ fn g2_b9e080(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e0bd fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9e0bf fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e0c3 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e0c7 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e0cb ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6495,7 +6969,7 @@ fn g2_b9e080(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e0cc fsub st(1)
                 f[1] = xn(f[1], f[0], f[1] - f[0]);
                 // b9e0ce fstp dword ptr [esp + 4]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e0d2 fld dword ptr [esp + 4]
                 f[1] = ldq(s[25]);
                 // b9e0d6 fld st(0)
@@ -6513,12 +6987,15 @@ fn g2_b9e080(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e0e8 fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9e0ea fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e0ee fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e0f2 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e0f6 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6550,7 +7027,7 @@ fn g2_b9e160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e16c fxch st(1)
                 f.swap(1, 0);
                 // b9e16e fstp dword ptr [esp + 4]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e172 fld dword ptr [esp + 4]
                 f[1] = ldq(s[25]);
                 // b9e176 fld qword ptr [0xe5bf40]
@@ -6558,7 +7035,7 @@ fn g2_b9e160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e17c fsubr st(1)
                 f[2] = xn(f[2], f[1], f[1] - f[2]);
                 // b9e17e fstp dword ptr [esp + 4]
-                s[25] = (f[2] as f32).to_bits();
+                s[25] = stf(f[2]);
                 // b9e182 mov eax, dword ptr [esp + 4]
                 eax = s[25];
                 // b9e186 shr eax, 0x1f
@@ -6586,12 +7063,15 @@ fn g2_b9e160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e19f fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9e1a1 fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e1a5 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e1a9 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e1ad ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6599,7 +7079,7 @@ fn g2_b9e160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e1ae fsub st(1)
                 f[1] = xn(f[1], f[0], f[1] - f[0]);
                 // b9e1b0 fstp dword ptr [esp + 4]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e1b4 fld dword ptr [esp + 4]
                 f[1] = ldq(s[25]);
                 // b9e1b8 fld st(0)
@@ -6623,12 +7103,15 @@ fn g2_b9e160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e1d0 fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9e1d2 fsubr dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), ldq(s[26]) - f[0]);
+                f[0] = xn(f[0], ldn(s[26]), ldn(s[26]) - f[0]);
                 // b9e1d6 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e1da fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e1de ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6660,7 +7143,7 @@ fn g2_b9e230(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e23c fxch st(1)
                 f.swap(1, 0);
                 // b9e23e fstp dword ptr [esp + 4]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e242 fld dword ptr [esp + 4]
                 f[1] = ldq(s[25]);
                 // b9e246 fld qword ptr [0xe5bf40]
@@ -6668,7 +7151,7 @@ fn g2_b9e230(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e24c fsubr st(1)
                 f[2] = xn(f[2], f[1], f[1] - f[2]);
                 // b9e24e fstp dword ptr [esp + 4]
-                s[25] = (f[2] as f32).to_bits();
+                s[25] = stf(f[2]);
                 // b9e252 mov eax, dword ptr [esp + 4]
                 eax = s[25];
                 // b9e256 shr eax, 0x1f
@@ -6698,12 +7181,15 @@ fn g2_b9e230(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e271 fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9e273 fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e277 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e27b fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e27f ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6711,7 +7197,7 @@ fn g2_b9e230(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e280 fsub st(1)
                 f[1] = xn(f[1], f[0], f[1] - f[0]);
                 // b9e282 fstp dword ptr [esp + 4]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e286 fld dword ptr [esp + 4]
                 f[1] = ldq(s[25]);
                 // b9e28a fld st(0)
@@ -6733,12 +7219,15 @@ fn g2_b9e230(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e2a0 fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9e2a2 fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e2a6 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e2aa fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e2ae ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6773,13 +7262,13 @@ fn g2_b9e2b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e2c0 fmul qword ptr [0xe5c448]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c448u32) as usize))), f[0] * f64::from_bits(q64(rq((0xe5c448u32) as usize))));
                 // b9e2c6 fstp dword ptr [esp + 0x18]
-                s[27] = (f[0] as f32).to_bits();
+                s[27] = stf(f[0]);
                 // b9e2ca fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[27]);
                 // b9e2ce fstp dword ptr [esp]
-                s[21] = (f[0] as f32).to_bits();
+                s[21] = stf(f[0]);
                 // b9e2d1 call 0x40b820
-                { let (ra, rc, rd_, r) = crt_call1(0x40b820, s[21], eax, ecx, edx); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_call1(0x40b820, s[21], eax, ecx, edx, [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9e2d6 fld qword ptr [esp + 4]
                 f[1] = f64::from_bits(q64((s[22] as u64) | ((s[23] as u64) << 32)));
                 // b9e2da fmul st(1), st(0)
@@ -6787,13 +7276,16 @@ fn g2_b9e2b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e2dc fsubrp st(1)
                 f[0] = xn(f[0], f[1], f[1] - f[0]);
                 // b9e2de fadd dword ptr [esp + 0x14]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e2e2 fstp dword ptr [esp + 0x18]
-                s[27] = (f[0] as f32).to_bits();
+                s[27] = stf(f[0]);
                 // b9e2e6 fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[27]);
                 // b9e2ea add esp, 0xc
                 // b9e2ed ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6823,23 +7315,26 @@ fn g2_b9e2f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e2f5 fmul qword ptr [0xe5c448]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c448u32) as usize))), f[0] * f64::from_bits(q64(rq((0xe5c448u32) as usize))));
                 // b9e2fb fstp dword ptr [esp + 8]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e2ff fld dword ptr [esp + 8]
                 f[0] = ldq(s[25]);
                 // b9e303 fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b9e306 call 0x428cd0
-                { let (ra, rc, rd_, r) = crt_call1(0x428cd0, s[23], eax, ecx, edx); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_call1(0x428cd0, s[23], eax, ecx, edx, [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9e30b fmul dword ptr [esp + 0x10]
-                f[0] = xn(f[0], ldq(s[27]), f[0] * ldq(s[27]));
+                f[0] = xn(f[0], ldn(s[27]), f[0] * ldn(s[27]));
                 // b9e30f add esp, 4
                 // b9e312 fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e316 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e31a fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e31e ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6869,13 +7364,13 @@ fn g2_b9e320(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e325 fmul qword ptr [0xe5c160]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c160u32) as usize))), f[0] * f64::from_bits(q64(rq((0xe5c160u32) as usize))));
                 // b9e32b fstp dword ptr [esp + 8]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e32f fld dword ptr [esp + 8]
                 f[0] = ldq(s[25]);
                 // b9e333 fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b9e336 call 0x40b820
-                { let (ra, rc, rd_, r) = crt_call1(0x40b820, s[23], eax, ecx, edx); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_call1(0x40b820, s[23], eax, ecx, edx, [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9e33b fsub qword ptr [0xe5bf40]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5bf40u32) as usize))), f[0] - f64::from_bits(q64(rq((0xe5bf40u32) as usize))));
                 // b9e341 add esp, 4
@@ -6886,12 +7381,15 @@ fn g2_b9e320(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e34e fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9e350 fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e354 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e358 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e35c ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6930,25 +7428,28 @@ fn g2_b9e360(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e374 fsubrp st(1)
                 f[0] = xn(f[0], f[1], f[1] - f[0]);
                 // b9e376 fstp dword ptr [esp + 0x10]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e37a fld dword ptr [esp + 0x10]
                 f[0] = ldq(s[25]);
                 // b9e37e fstp dword ptr [esp]
-                s[21] = (f[0] as f32).to_bits();
+                s[21] = stf(f[0]);
                 // b9e381 call 0x40ea20
-                { let (ra, rc, rd_, r) = crt_call1(0x40ea20, s[21], eax, ecx, edx); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_call1(0x40ea20, s[21], eax, ecx, edx, [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9e386 fsub qword ptr [0xe5bf40]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5bf40u32) as usize))), f[0] - f64::from_bits(q64(rq((0xe5bf40u32) as usize))));
                 // b9e38c fmul dword ptr [esp + 0x18]
-                f[0] = xn(f[0], ldq(s[27]), f[0] * ldq(s[27]));
+                f[0] = xn(f[0], ldn(s[27]), f[0] * ldn(s[27]));
                 // b9e390 fsubr qword ptr [esp + 4]
                 f[0] = xn(f[0], f64::from_bits(q64((s[22] as u64) | ((s[23] as u64) << 32))), f64::from_bits(q64((s[22] as u64) | ((s[23] as u64) << 32))) - f[0]);
                 // b9e394 fstp dword ptr [esp + 0x10]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e398 fld dword ptr [esp + 0x10]
                 f[0] = ldq(s[25]);
                 // b9e39c add esp, 0xc
                 // b9e39f ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -6982,7 +7483,7 @@ fn g2_b9e3a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e3a9 fxch st(1)
                 f.swap(1, 0);
                 // b9e3ab fstp dword ptr [esp + 8]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e3af fld dword ptr [esp + 8]
                 f[1] = ldq(s[25]);
                 // b9e3b3 fmul st(0), st(0)
@@ -6990,23 +7491,26 @@ fn g2_b9e3a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e3b5 fsubp st(1)
                 f[0] = xn(f[0], f[1], f[0] - f[1]);
                 // b9e3b7 fstp dword ptr [esp + 8]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e3bb fld dword ptr [esp + 8]
                 f[0] = ldq(s[25]);
                 // b9e3bf fstp dword ptr [esp]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b9e3c2 call 0x40ea20
-                { let (ra, rc, rd_, r) = crt_call1(0x40ea20, s[23], eax, ecx, edx); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_call1(0x40ea20, s[23], eax, ecx, edx, [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9e3c7 fmul dword ptr [esp + 0x10]
-                f[0] = xn(f[0], ldq(s[27]), f[0] * ldq(s[27]));
+                f[0] = xn(f[0], ldn(s[27]), f[0] * ldn(s[27]));
                 // b9e3cb add esp, 4
                 // b9e3ce fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e3d2 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e3d6 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e3da ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -7041,7 +7545,7 @@ fn g2_b9e3e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e3f0 fxch st(1)
                 f.swap(1, 0);
                 // b9e3f2 fstp dword ptr [esp + 0x10]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e3f6 fld dword ptr [esp + 0x10]
                 f[1] = ldq(s[25]);
                 // b9e3fa fld st(0)
@@ -7053,7 +7557,7 @@ fn g2_b9e3e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e400 fxch st(1)
                 f.swap(3, 2);
                 // b9e402 fstp dword ptr [esp + 0x10]
-                s[25] = (f[3] as f32).to_bits();
+                s[25] = stf(f[3]);
                 // b9e406 mov eax, dword ptr [esp + 0x10]
                 eax = s[25];
                 // b9e40a shr eax, 0x1f
@@ -7077,13 +7581,13 @@ fn g2_b9e3e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e41d fsubp st(1)
                 f[0] = xn(f[0], f[1], f[0] - f[1]);
                 // b9e41f fstp dword ptr [esp + 0x10]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e423 fld dword ptr [esp + 0x10]
                 f[0] = ldq(s[25]);
                 // b9e427 fstp dword ptr [esp]
-                s[21] = (f[0] as f32).to_bits();
+                s[21] = stf(f[0]);
                 // b9e42a call 0x40ea20
-                { let (ra, rc, rd_, r) = crt_call1(0x40ea20, s[21], eax, ecx, edx); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_call1(0x40ea20, s[21], eax, ecx, edx, [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9e42f fsub qword ptr [0xe5bf40]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5bf40u32) as usize))), f[0] - f64::from_bits(q64(rq((0xe5bf40u32) as usize))));
                 // b9e435 add esp, 4
@@ -7096,11 +7600,14 @@ fn g2_b9e3e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e444 fsubr qword ptr [esp]
                 f[0] = xn(f[0], f64::from_bits(q64((s[22] as u64) | ((s[23] as u64) << 32))), f64::from_bits(q64((s[22] as u64) | ((s[23] as u64) << 32))) - f[0]);
                 // b9e447 fstp dword ptr [esp + 0xc]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e44b fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[25]);
                 // b9e44f add esp, 8
                 // b9e452 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -7112,7 +7619,7 @@ fn g2_b9e3e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e457 fxch st(1)
                 f.swap(1, 0);
                 // b9e459 fstp dword ptr [esp + 0x10]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e45d fld dword ptr [esp + 0x10]
                 f[1] = ldq(s[25]);
                 // b9e461 fmul st(0), st(0)
@@ -7120,13 +7627,13 @@ fn g2_b9e3e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e463 fsubp st(1)
                 f[0] = xn(f[0], f[1], f[0] - f[1]);
                 // b9e465 fstp dword ptr [esp + 0x10]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e469 fld dword ptr [esp + 0x10]
                 f[0] = ldq(s[25]);
                 // b9e46d fstp dword ptr [esp]
-                s[21] = (f[0] as f32).to_bits();
+                s[21] = stf(f[0]);
                 // b9e470 call 0x40ea20
-                { let (ra, rc, rd_, r) = crt_call1(0x40ea20, s[21], eax, ecx, edx); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
+                { let (ra, rc, rd_, r) = crt_call1(0x40ea20, s[21], eax, ecx, edx, [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; f[0] = r; }
                 // b9e475 fadd qword ptr [0xe5bf40]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5bf40u32) as usize))), f[0] + f64::from_bits(q64(rq((0xe5bf40u32) as usize))));
                 // b9e47b add esp, 4
@@ -7137,13 +7644,16 @@ fn g2_b9e3e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e488 fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9e48a fadd dword ptr [esp + 0x10]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e48e fstp dword ptr [esp + 0xc]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e492 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[25]);
                 // b9e496 add esp, 8
                 // b9e499 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -7173,11 +7683,11 @@ fn g2_b9e4a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e4aa fst qword ptr [esp + 0xc]
                 { let b_ = f[0].to_bits(); s[22] = b_ as u32; s[23] = (b_ >> 32) as u32; }
                 // b9e4ae fstp dword ptr [esp + 8]
-                s[21] = (f[0] as f32).to_bits();
+                s[21] = stf(f[0]);
                 // b9e4b2 fldz 
                 f[0] = 0.0;
                 // b9e4b4 fstp dword ptr [esp + 4]
-                s[20] = (f[0] as f32).to_bits();
+                s[20] = stf(f[0]);
                 // b9e4b8 fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[25]);
                 // b9e4bc fld1 
@@ -7185,23 +7695,26 @@ fn g2_b9e4a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e4be fsubrp st(1)
                 f[0] = xn(f[0], f[1], f[1] - f[0]);
                 // b9e4c0 fstp dword ptr [esp + 0x20]
-                s[27] = (f[0] as f32).to_bits();
+                s[27] = stf(f[0]);
                 // b9e4c4 fld dword ptr [esp + 0x20]
                 f[0] = ldq(s[27]);
                 // b9e4c8 fstp dword ptr [esp]
-                s[19] = (f[0] as f32).to_bits();
+                s[19] = stf(f[0]);
                 // b9e4cb call 0xb9e4f0
-                { let mut q = Pushad { edi, esi, ebp, esp: 0, ebx, edx, ecx, eax }; let r = g2_b9e4f0(&mut q, s[19..].as_ptr(), w); eax = q.eax; ecx = q.ecx; edx = q.edx; f[0] = r; }
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xb9e4f0, &mut r_, s[19..].as_ptr(), 3, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // b9e4d0 fsubr qword ptr [esp + 0xc]
                 f[0] = xn(f[0], f64::from_bits(q64((s[22] as u64) | ((s[23] as u64) << 32))), f64::from_bits(q64((s[22] as u64) | ((s[23] as u64) << 32))) - f[0]);
                 // b9e4d4 fadd dword ptr [esp + 0x1c]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e4d8 fstp dword ptr [esp + 0x20]
-                s[27] = (f[0] as f32).to_bits();
+                s[27] = stf(f[0]);
                 // b9e4dc fld dword ptr [esp + 0x20]
                 f[0] = ldq(s[27]);
                 // b9e4e0 add esp, 0x14
                 // b9e4e3 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -7231,7 +7744,7 @@ fn g2_b9e4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e4fa fsubr st(1)
                 f[1] = xn(f[1], f[0], f[0] - f[1]);
                 // b9e4fc fstp dword ptr [esp + 4]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e500 mov eax, dword ptr [esp + 4]
                 eax = s[25];
                 // b9e504 shr eax, 0x1f
@@ -7251,14 +7764,17 @@ fn g2_b9e4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e513 fmulp st(1)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9e515 fmul dword ptr [esp + 0xc]
-                f[0] = xn(f[0], ldq(s[27]), f[0] * ldq(s[27]));
+                f[0] = xn(f[0], ldn(s[27]), f[0] * ldn(s[27]));
                 // b9e519 fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e51d fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e521 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e525 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -7268,7 +7784,7 @@ fn g2_b9e4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e52c fsubr st(1)
                 f[1] = xn(f[1], f[0], f[0] - f[1]);
                 // b9e52e fstp dword ptr [esp + 4]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e532 mov ecx, dword ptr [esp + 4]
                 ecx = s[25];
                 // b9e536 shr ecx, 0x1f
@@ -7284,7 +7800,7 @@ fn g2_b9e4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e53e fsub qword ptr [0xe5c9a0]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c9a0u32) as usize))), f[0] - f64::from_bits(q64(rq((0xe5c9a0u32) as usize))));
                 // b9e544 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e548 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[27]);
                 // b9e54c fmul qword ptr [0xe5c9b0]
@@ -7300,12 +7816,15 @@ fn g2_b9e4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e55c fadd qword ptr [0xe5c370]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c370u32) as usize))), f[0] + f64::from_bits(q64(rq((0xe5c370u32) as usize))));
                 // b9e562 fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e566 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e56a fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e56e ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -7315,7 +7834,7 @@ fn g2_b9e4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e575 fsubr st(1)
                 f[1] = xn(f[1], f[0], f[0] - f[1]);
                 // b9e577 fstp dword ptr [esp + 4]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e57b mov edx, dword ptr [esp + 4]
                 edx = s[25];
                 // b9e57f shr edx, 0x1f
@@ -7331,7 +7850,7 @@ fn g2_b9e4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e587 fsub qword ptr [0xe5c990]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c990u32) as usize))), f[0] - f64::from_bits(q64(rq((0xe5c990u32) as usize))));
                 // b9e58d fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e591 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[27]);
                 // b9e595 fmul qword ptr [0xe5c9b0]
@@ -7347,12 +7866,15 @@ fn g2_b9e4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e5a5 fadd qword ptr [0xe5c988]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c988u32) as usize))), f[0] + f64::from_bits(q64(rq((0xe5c988u32) as usize))));
                 // b9e5ab fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e5af fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e5b3 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e5b7 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -7360,7 +7882,7 @@ fn g2_b9e4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e5b8 fsub qword ptr [0xe5c980]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c980u32) as usize))), f[0] - f64::from_bits(q64(rq((0xe5c980u32) as usize))));
                 // b9e5be fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e5c2 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[27]);
                 // b9e5c6 fmul qword ptr [0xe5c9b0]
@@ -7376,12 +7898,15 @@ fn g2_b9e4f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e5d6 fadd qword ptr [0xe5c978]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5c978u32) as usize))), f[0] + f64::from_bits(q64(rq((0xe5c978u32) as usize))));
                 // b9e5dc fadd dword ptr [esp + 8]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e5e0 fstp dword ptr [esp + 4]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e5e4 fld dword ptr [esp + 4]
                 f[0] = ldq(s[25]);
                 // b9e5e8 ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -7413,7 +7938,7 @@ fn g2_b9e5f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e600 fsubr st(1)
                 f[1] = xn(f[1], f[0], f[0] - f[1]);
                 // b9e602 fstp dword ptr [esp + 0x18]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9e606 mov eax, dword ptr [esp + 0x18]
                 eax = s[25];
                 // b9e60a fld dword ptr [esp + 0x20]
@@ -7431,15 +7956,15 @@ fn g2_b9e5f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e615 fst qword ptr [esp + 0xc]
                 { let b_ = f[1].to_bits(); s[22] = b_ as u32; s[23] = (b_ >> 32) as u32; }
                 // b9e619 fstp dword ptr [esp + 8]
-                s[21] = (f[1] as f32).to_bits();
+                s[21] = stf(f[1]);
                 // b9e61d fldz 
                 f[1] = 0.0;
                 // b9e61f fstp dword ptr [esp + 4]
-                s[20] = (f[1] as f32).to_bits();
+                s[20] = stf(f[1]);
                 // b9e623 fadd st(0), st(0)
                 f[0] = xn(f[0], f[0], f[0] + f[0]);
                 // b9e625 fstp dword ptr [esp + 0x18]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e629 fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[25]);
                 // b9e62d fld1 
@@ -7447,71 +7972,77 @@ fn g2_b9e5f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9e62f fsubrp st(1)
                 f[0] = xn(f[0], f[1], f[1] - f[0]);
                 // b9e631 fstp dword ptr [esp + 0x18]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e635 fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[25]);
                 // b9e639 fstp dword ptr [esp]
-                s[19] = (f[0] as f32).to_bits();
+                s[19] = stf(f[0]);
                 // b9e63c call 0xb9e4f0
-                { let mut q = Pushad { edi, esi, ebp, esp: 0, ebx, edx, ecx, eax }; let r = g2_b9e4f0(&mut q, s[19..].as_ptr(), w); eax = q.eax; ecx = q.ecx; edx = q.edx; f[0] = r; }
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xb9e4f0, &mut r_, s[19..].as_ptr(), 3, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // b9e641 fsubr qword ptr [esp + 0xc]
                 f[0] = xn(f[0], f64::from_bits(q64((s[22] as u64) | ((s[23] as u64) << 32))), f64::from_bits(q64((s[22] as u64) | ((s[23] as u64) << 32))) - f[0]);
                 // b9e645 add esp, 0xc
                 // b9e648 fadd qword ptr [0xe5bfa0]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5bfa0u32) as usize))), f[0] + f64::from_bits(q64(rq((0xe5bfa0u32) as usize))));
                 // b9e64e fstp dword ptr [esp + 0xc]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e652 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[25]);
                 // b9e656 fmul qword ptr [0xe5bf70]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5bf70u32) as usize))), f[0] * f64::from_bits(q64(rq((0xe5bf70u32) as usize))));
                 // b9e65c fadd dword ptr [esp + 0x10]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e660 fstp dword ptr [esp + 0xc]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e664 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[25]);
                 // b9e668 add esp, 8
                 // b9e66b ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
             0xb9e66c => {
                 // b9e66c fstp dword ptr [esp + 8]
-                s[21] = (f[1] as f32).to_bits();
+                s[21] = stf(f[1]);
                 // b9e670 fldz 
                 f[1] = 0.0;
                 // b9e672 fstp dword ptr [esp + 4]
-                s[20] = (f[1] as f32).to_bits();
+                s[20] = stf(f[1]);
                 // b9e676 fadd st(0), st(0)
                 f[0] = xn(f[0], f[0], f[0] + f[0]);
                 // b9e678 fsub qword ptr [0xe5bf40]
                 f[0] = xn(f[0], f64::from_bits(q64(rq((0xe5bf40u32) as usize))), f[0] - f64::from_bits(q64(rq((0xe5bf40u32) as usize))));
                 // b9e67e fstp dword ptr [esp + 0x18]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e682 fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[25]);
                 // b9e686 fstp dword ptr [esp]
-                s[19] = (f[0] as f32).to_bits();
+                s[19] = stf(f[0]);
                 // b9e689 call 0xb9e4f0
-                { let mut q = Pushad { edi, esi, ebp, esp: 0, ebx, edx, ecx, eax }; let r = g2_b9e4f0(&mut q, s[19..].as_ptr(), w); eax = q.eax; ecx = q.ecx; edx = q.edx; f[0] = r; }
+                { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xb9e4f0, &mut r_, s[19..].as_ptr(), 3, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // b9e68e fld qword ptr [0xe5bf70]
                 f[1] = f64::from_bits(q64(rq((0xe5bf70u32) as usize)));
                 // b9e694 add esp, 0xc
                 // b9e697 fmul st(1), st(0)
                 f[0] = xn(f[0], f[1], f[0] * f[1]);
                 // b9e699 fmul dword ptr [esp + 0x14]
-                f[1] = xn(f[1], ldq(s[27]), f[1] * ldq(s[27]));
+                f[1] = xn(f[1], ldn(s[27]), f[1] * ldn(s[27]));
                 // b9e69d faddp st(1)
                 f[0] = xn(f[0], f[1], f[0] + f[1]);
                 // b9e69f fadd dword ptr [esp + 0x10]
-                f[0] = xn(f[0], ldq(s[26]), f[0] + ldq(s[26]));
+                f[0] = xn(f[0], ldn(s[26]), f[0] + ldn(s[26]));
                 // b9e6a3 fstp dword ptr [esp + 0xc]
-                s[25] = (f[0] as f32).to_bits();
+                s[25] = stf(f[0]);
                 // b9e6a7 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[25]);
                 // b9e6ab add esp, 8
                 // b9e6ae ret 
+                w.d((a as usize) + 0, s[25]);
+                w.d((a as usize) + 4, s[26]);
+                w.d((a as usize) + 8, s[27]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -7564,6 +8095,21 @@ fn rx(a: usize) -> [u32; 4] {
     unsafe { std::ptr::read_unaligned(a as *const [u32; 4]) }
 }
 
+/// A 16-byte aligned access (`movaps` and SSE memory operands): a misaligned address raises
+/// the same fault as the original (a general protection fault).
+fn chk_align16(a: usize) -> usize {
+    if a & 15 != 0 {
+        unsafe { std::arch::asm!("movaps xmm0, xmmword ptr [{p}]", p = in(reg) a, out("xmm0") _, options(nostack)) };
+    }
+    a
+}
+
+/// `rx` for an instruction that needs the address 16-byte aligned.
+#[allow(dead_code)]
+fn rxa(a: usize) -> [u32; 4] {
+    rx(chk_align16(a))
+}
+
 /// `fld qword; fistp dword` with the live x87 control word (rounding mode, overflow -> 0x80000000).
 #[allow(dead_code)]
 fn fist32(v: f64) -> u32 {
@@ -7611,7 +8157,7 @@ fn fldcw16(cw: u16) {
 /// Call `_ftol2_sse` (0xDA0140) with `v` in ST0; returns EAX / ECX / EDX as it leaves them (the
 /// function consumes ST0).
 #[allow(dead_code)]
-fn crt_ftol2(eax: u32, ecx: u32, edx: u32, v: f64) -> (u32, u32, u32) {
+fn crt_ftol2(eax: u32, ecx: u32, edx: u32, v: f64, below: &[f64], r4: [u32; 4]) -> (u32, u32, u32) {
     let mut b = CrtBlock {
         f: 0xda0140,
         eax,
@@ -7621,26 +8167,46 @@ fn crt_ftol2(eax: u32, ecx: u32, edx: u32, v: f64) -> (u32, u32, u32) {
         out: [0; 2],
         in1: [0; 2],
         in0: [v.to_bits() as u32, (v.to_bits() >> 32) as u32],
+        ebx: r4[0],
+        esi: r4[1],
+        edi: r4[2],
+        ebp: r4[3],
     };
+    x87_push_below(below);
     unsafe {
         std::arch::asm!(
+            "push ebp",
             "push ebx",
-            "mov ebx, eax",
-            "fld qword ptr [ebx + 36]",
-            "mov ecx, [ebx + 8]",
-            "mov edx, [ebx + 12]",
-            "mov eax, [ebx + 4]",
-            "call dword ptr [ebx]",
-            "mov [ebx + 4], eax",
-            "mov [ebx + 8], ecx",
-            "mov [ebx + 12], edx",
+            "push esi",
+            "push edi",
+            "push eax",
+            "push dword ptr [eax]",
+            "fld qword ptr [eax + 36]",
+            "mov edx, eax",
+            "mov ebx, [edx + 44]",
+            "mov esi, [edx + 48]",
+            "mov edi, [edx + 52]",
+            "mov ebp, [edx + 56]",
+            "mov ecx, [edx + 8]",
+            "mov eax, [edx + 4]",
+            "mov edx, [edx + 12]",
+            "call dword ptr [esp]",
+            "add esp, 4",
+            "pop esi",
+            "mov [esi + 4], eax",
+            "mov [esi + 8], ecx",
+            "mov [esi + 12], edx",
+            "pop edi",
+            "pop esi",
             "pop ebx",
+            "pop ebp",
             inout("eax") &mut b as *mut CrtBlock => _,
             lateout("ecx") _,
             lateout("edx") _,
             clobber_abi("C"),
         );
     }
+    x87_pop_below(below.len());
     (b.eax, b.ecx, b.edx)
 }
 
@@ -7750,15 +8316,19 @@ fn fs_rd32(off: u32) -> u32 {
 /// `fmul dword [m]` and friends: widen an f32 operand without quieting a signalling NaN.
 fn ldr32(b: u32) -> f64 {
     if b & 0x7F80_0000 == 0x7F80_0000 && b & 0x007F_FFFF != 0 {
+        if b & 0x0040_0000 == 0 {
+            sf_or(0x01);
+        }
         f64::from_bits(((b >> 31) as u64) << 63 | 0x7FFu64 << 52 | ((b & 0x007F_FFFF) as u64) << 29)
     } else {
-        f32::from_bits(b) as f64
+        ldf(b)
     }
 }
 
 /// As `xn`, with the FPU's NaN rules for an x87 arithmetic instruction: a QNaN beats an SNaN, then the
 /// larger significand wins, then the clear sign; a lone NaN comes out quieted.
 fn xn3(a: f64, b: f64, r: f64) -> f64 {
+    arith_flags(a, b, r);
     const SIG: u64 = 0x000F_FFFF_FFFF_FFFF;
     const QUIET: u64 = 0x0008_0000_0000_0000;
     if a.is_nan() || b.is_nan() {
@@ -7807,7 +8377,7 @@ fn g3_40b6a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 40b6a2 fld dword ptr [ecx]
                 f[1] = ldq(rd((ecx) as usize));
                 // 40b6a4 fucompp 
-                cc87 = cc(f[1], f[0]);
+                cc87 = ccu(f[1], f[0]);
                 // 40b6a6 fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
                 // 40b6a8 test ah, 0x44
@@ -7822,7 +8392,7 @@ fn g3_40b6a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 40b6b0 fld dword ptr [ecx + 4]
                 f[1] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
                 // 40b6b3 fucompp 
-                cc87 = cc(f[1], f[0]);
+                cc87 = ccu(f[1], f[0]);
                 // 40b6b5 fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
                 // 40b6b7 test ah, 0x44
@@ -7837,7 +8407,7 @@ fn g3_40b6a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 40b6bf fld dword ptr [ecx + 8]
                 f[1] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
                 // 40b6c2 fucompp 
-                cc87 = cc(f[1], f[0]);
+                cc87 = ccu(f[1], f[0]);
                 // 40b6c4 fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
                 // 40b6c6 test ah, 0x44
@@ -7899,13 +8469,13 @@ fn g3_417120(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 417131 fld dword ptr [ecx]
                 f[1] = ldq(rd((ecx) as usize));
                 // 417133 fstp dword ptr [esp + 4]
-                s[9] = (f[1] as f32).to_bits();
+                s[9] = stf(f[1]);
                 // 417137 jmp 0x41713d
                 pc = 0x41713d;
             }
             0x417139 => {
                 // 417139 fst dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 pc = 0x41713d;
             }
             0x41713d => {
@@ -7944,12 +8514,14 @@ fn g3_417120(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 41715f fld dword ptr [ecx]
                 f[0] = ldq(rd((ecx) as usize));
                 // 417161 fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // 417165 fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // 417169 fstp dword ptr [ecx]
-                w.d((ecx) as usize, (f[0] as f32).to_bits());
+                w.d((ecx) as usize, stf(f[0]));
                 // 41716b ret 
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -7960,12 +8532,14 @@ fn g3_417120(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x41716e => {
                 // 41716e fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // 417172 fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // 417176 fstp dword ptr [ecx]
-                w.d((ecx) as usize, (f[0] as f32).to_bits());
+                w.d((ecx) as usize, stf(f[0]));
                 // 417178 ret 
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -8008,11 +8582,11 @@ fn g3_46fe30(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 46fe40 fld dword ptr [0xe99c44]
                 f[1] = ldq(rd((0xe99c44u32) as usize));
                 // 46fe46 fmul dword ptr [esp + 8]
-                f[1] = xn3(f[1], ldr32(s[10]), f[1] * ldr32(s[10]));
+                f[1] = xn3(f[1], ldnr(s[10]), f[1] * ldnr(s[10]));
                 // 46fe4a fsubp st(1)
                 f[0] = xn3(f[0], f[1], f[0] - f[1]);
                 // 46fe4c fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 46fe4f fld dword ptr [ecx]
                 f[0] = ldq(rd((ecx) as usize));
                 // 46fe51 fld dword ptr [esp]
@@ -8037,14 +8611,15 @@ fn g3_46fe30(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x46fe63 => {
                 // 46fe63 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 46fe66 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // 46fe69 fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // 46fe6b pop ecx
                 ecx = s[8];
                 // 46fe6c ret 
+                w.d((a as usize) + 0, s[10]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -8052,11 +8627,11 @@ fn g3_46fe30(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 46fe6d fld dword ptr [0xe99c44]
                 f[0] = ldq(rd((0xe99c44u32) as usize));
                 // 46fe73 fmul dword ptr [esp + 8]
-                f[0] = xn3(f[0], ldr32(s[10]), f[0] * ldr32(s[10]));
+                f[0] = xn3(f[0], ldnr(s[10]), f[0] * ldnr(s[10]));
                 // 46fe77 fadd dword ptr [edx]
-                f[0] = xn3(f[0], ldr32(rd((edx) as usize)), f[0] + ldr32(rd((edx) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edx) as usize)), f[0] + ldnr(rd((edx) as usize)));
                 // 46fe79 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 46fe7c fld dword ptr [ecx]
                 f[0] = ldq(rd((ecx) as usize));
                 // 46fe7e fld dword ptr [esp]
@@ -8081,14 +8656,15 @@ fn g3_46fe30(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x46fe90 => {
                 // 46fe90 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 46fe93 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // 46fe96 fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // 46fe98 pop ecx
                 ecx = s[8];
                 // 46fe99 ret 
+                w.d((a as usize) + 0, s[10]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -8142,7 +8718,7 @@ fn g3_479a80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 479aa8 fmul qword ptr [0xe5c400]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5c400u32) as usize)), f[0] * f64::from_bits(rq((0xe5c400u32) as usize)));
                 // 479aae fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 479ab1 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // 479ab4 pop ecx
@@ -8199,21 +8775,21 @@ fn g3_47bc90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 47bcb2 fxch st(1)
                 f.swap(1, 0);
                 // 47bcb4 fst dword ptr [ecx]
-                w.d((ecx) as usize, (f[1] as f32).to_bits());
+                w.d((ecx) as usize, stf(f[1]));
                 // 47bcb6 fxch st(1)
                 f.swap(1, 0);
                 // 47bcb8 fst dword ptr [ecx + 4]
-                w.d((ecx.wrapping_add(0x4)) as usize, (f[1] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x4)) as usize, stf(f[1]));
                 // 47bcbb fst dword ptr [ecx + 0x28]
-                w.d((ecx.wrapping_add(0x28)) as usize, (f[1] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x28)) as usize, stf(f[1]));
                 // 47bcbe fldz 
                 f[2] = 0.0;
                 // 47bcc0 fst dword ptr [ecx + 0x10]
-                w.d((ecx.wrapping_add(0x10)) as usize, (f[2] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x10)) as usize, stf(f[2]));
                 // 47bcc3 fld1 
                 f[3] = 1.0;
                 // 47bcc5 fst dword ptr [ecx + 0x14]
-                w.d((ecx.wrapping_add(0x14)) as usize, (f[3] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x14)) as usize, stf(f[3]));
                 // 47bcc8 fxch st(3)
                 f.swap(3, 0);
                 // 47bcca fdivrp st(2)
@@ -8283,16 +8859,19 @@ fn g3_47bc90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 47bd03 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // 47bd05 fstp dword ptr [ecx + 0x18]
-                w.d((ecx.wrapping_add(0x18)) as usize, (f[2] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x18)) as usize, stf(f[2]));
                 // 47bd08 fxch st(1)
                 f.swap(1, 0);
                 // 47bd0a fst dword ptr [ecx + 0x1c]
-                w.d((ecx.wrapping_add(0x1c)) as usize, (f[1] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x1c)) as usize, stf(f[1]));
                 // 47bd0d fstp dword ptr [ecx + 0x20]
-                w.d((ecx.wrapping_add(0x20)) as usize, (f[1] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x20)) as usize, stf(f[1]));
                 // 47bd10 fstp dword ptr [ecx + 0x24]
-                w.d((ecx.wrapping_add(0x24)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x24)) as usize, stf(f[0]));
                 // 47bd13 ret 
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
+                w.d((a as usize) + 8, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -8303,6 +8882,9 @@ fn g3_47bc90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fl = fl_logic(0, 32);
                 // 47bd18 fstp st(0)
                 // 47bd1a ret 
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
+                w.d((a as usize) + 8, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -8373,7 +8955,7 @@ fn g3_47ffc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 47fff8 mov dword ptr [esp], edx
                 s[8] = edx;
                 // 47fffb fsub dword ptr [esp]
-                f[0] = xn3(f[0], ldr32(s[8]), f[0] - ldr32(s[8]));
+                f[0] = xn3(f[0], ldnr(s[8]), f[0] - ldnr(s[8]));
                 // 47fffe mov edx, dword ptr [eax + 0xeeb958]
                 edx = rd((eax.wrapping_add(0xeeb958)) as usize);
                 // 480004 mov dword ptr [esp + 4], edx
@@ -8381,45 +8963,45 @@ fn g3_47ffc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 480008 mov edx, dword ptr [eax + 0xeeb95c]
                 edx = rd((eax.wrapping_add(0xeeb95c)) as usize);
                 // 48000e fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // 480012 fld dword ptr [ecx + 4]
                 f[0] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
                 // 480015 mov dword ptr [esp + 8], edx
                 s[10] = edx;
                 // 480019 fsub dword ptr [esp + 4]
-                f[0] = xn3(f[0], ldr32(s[9]), f[0] - ldr32(s[9]));
+                f[0] = xn3(f[0], ldnr(s[9]), f[0] - ldnr(s[9]));
                 // 48001d fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // 480021 fld dword ptr [ecx + 8]
                 f[0] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
                 // 480024 fsub dword ptr [esp + 8]
-                f[0] = xn3(f[0], ldr32(s[10]), f[0] - ldr32(s[10]));
+                f[0] = xn3(f[0], ldnr(s[10]), f[0] - ldnr(s[10]));
                 // 480028 fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // 48002c fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[11]);
                 // 480030 fstp dword ptr [eax + 0xeeb960]
-                w.d((eax.wrapping_add(0xeeb960)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0xeeb960)) as usize, stf(f[0]));
                 // 480036 fld dword ptr [esp + 0x10]
                 f[0] = ldq(s[12]);
                 // 48003a fstp dword ptr [eax + 0xeeb964]
-                w.d((eax.wrapping_add(0xeeb964)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0xeeb964)) as usize, stf(f[0]));
                 // 480040 fld dword ptr [esp + 0x14]
                 f[0] = ldq(s[13]);
                 // 480044 fstp dword ptr [eax + 0xeeb968]
-                w.d((eax.wrapping_add(0xeeb968)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0xeeb968)) as usize, stf(f[0]));
                 // 48004a fld dword ptr [ecx]
                 f[0] = ldq(rd((ecx) as usize));
                 // 48004c fstp dword ptr [eax + 0xeeb954]
-                w.d((eax.wrapping_add(0xeeb954)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0xeeb954)) as usize, stf(f[0]));
                 // 480052 fld dword ptr [ecx + 4]
                 f[0] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
                 // 480055 fstp dword ptr [eax + 0xeeb958]
-                w.d((eax.wrapping_add(0xeeb958)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0xeeb958)) as usize, stf(f[0]));
                 // 48005b fld dword ptr [ecx + 8]
                 f[0] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
                 // 48005e fstp dword ptr [eax + 0xeeb95c]
-                w.d((eax.wrapping_add(0xeeb95c)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0xeeb95c)) as usize, stf(f[0]));
                 // 480064 mov al, 1
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // 480066 add esp, 0x18
@@ -8480,7 +9062,7 @@ fn g3_499af0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 499b17 fld dword ptr [ecx + 0xc]
                 f[1] = ldq(rd((ecx.wrapping_add(0xc)) as usize));
                 // 499b1a fucompp 
-                cc87 = cc(f[1], f[0]);
+                cc87 = ccu(f[1], f[0]);
                 // 499b1c fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
                 // 499b1e test ah, 0x44
@@ -8495,7 +9077,7 @@ fn g3_499af0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 499b29 fld dword ptr [ecx + 0x10]
                 f[1] = ldq(rd((ecx.wrapping_add(0x10)) as usize));
                 // 499b2c fucompp 
-                cc87 = cc(f[1], f[0]);
+                cc87 = ccu(f[1], f[0]);
                 // 499b2e fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
                 // 499b30 test ah, 0x44
@@ -8590,8 +9172,9 @@ fn g3_49e210(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 49e252 fld dword ptr [0xdd1c88]
                 f[0] = ldq(rd((0xdd1c88u32) as usize));
                 // 49e258 fstp dword ptr [0x25f5d38]
-                w.d((0x25f5d38u32) as usize, (f[0] as f32).to_bits());
+                w.d((0x25f5d38u32) as usize, stf(f[0]));
                 // 49e25e ret 
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -8603,13 +9186,14 @@ fn g3_49e210(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x49e263 => {
                 // 49e263 fstp dword ptr [0x25f5d38]
-                w.d((0x25f5d38u32) as usize, (f[0] as f32).to_bits());
+                w.d((0x25f5d38u32) as usize, stf(f[0]));
                 // 49e269 mov byte ptr [0x2526ba3], cl
                 w.b((0x2526ba3u32) as usize, ((ecx & 0xff)) as u8);
                 pc = 0x49e26f;
             }
             0x49e26f => {
                 // 49e26f ret 
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -8651,12 +9235,12 @@ fn g3_49fca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 49fcb4 mov eax, dword ptr [0x25f5d98]
                 eax = rd((0x25f5d98u32) as usize);
                 // 49fcb9 fdiv dword ptr [0x25f5d9c]
-                f[0] = xn3(f[0], ldr32(rd((0x25f5d9cu32) as usize)), f[0] / ldr32(rd((0x25f5d9cu32) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((0x25f5d9cu32) as usize)), f[0] / ldnr(rd((0x25f5d9cu32) as usize)));
                 // 49fcbf add eax, -1
                 let (r_, f_) = fl_add(eax, 0xffffffffu32, 32); fl = f_;
                 eax = r_;
                 // 49fcc2 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 49fcc5 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // 49fcc8 mov dword ptr [esp], eax
@@ -8807,7 +9391,7 @@ fn g3_503fe0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 503fed push esi
                 s[9] = esi;
                 // 503fee fstp dword ptr [esp + 0xc]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // 503ff2 push edi
                 s[8] = edi;
                 // 503ff3 je 0x504001
@@ -8817,7 +9401,7 @@ fn g3_503fe0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 503ff5 fld dword ptr [0xe87998]
                 f[0] = ldq(rd((0xe87998u32) as usize));
                 // 503ffb fstp dword ptr [ebx + 0x200]
-                w.d((ebx.wrapping_add(0x200)) as usize, (f[0] as f32).to_bits());
+                w.d((ebx.wrapping_add(0x200)) as usize, stf(f[0]));
                 pc = 0x504001;
             }
             0x504001 => {
@@ -8877,7 +9461,7 @@ fn g3_503fe0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 504045 movzx edx, word ptr [esi + eax*8 + 4]
                 edx = (rw((esi.wrapping_add(eax.wrapping_mul(8)).wrapping_add(0x4)) as usize) as u32);
                 // 50404a fstp dword ptr [esp + 0x14]
-                s[13] = (f[1] as f32).to_bits();
+                s[13] = stf(f[1]);
                 // 50404e fld dword ptr [esp + 0x14]
                 f[1] = ldq(s[13]);
                 // 504052 fld dword ptr [ebx + 0x200]
@@ -8909,7 +9493,7 @@ fn g3_503fe0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 50406d pop edi
                 edi = s[8];
                 // 50406e fstp dword ptr [ebx + 0x200]
-                w.d((ebx.wrapping_add(0x200)) as usize, (f[0] as f32).to_bits());
+                w.d((ebx.wrapping_add(0x200)) as usize, stf(f[0]));
                 // 504074 pop esi
                 esi = s[9];
                 // 504075 mov ax, dx
@@ -8917,6 +9501,8 @@ fn g3_503fe0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 504078 pop ebx
                 ebx = s[10];
                 // 504079 ret 
+                w.d((a as usize) + 0, s[12]);
+                w.d((a as usize) + 4, s[13]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -8949,6 +9535,8 @@ fn g3_503fe0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 50408f pop ebx
                 ebx = s[10];
                 // 504090 ret 
+                w.d((a as usize) + 0, s[12]);
+                w.d((a as usize) + 4, s[13]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -8989,6 +9577,8 @@ fn g3_514f80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 514f8f pop ecx
                 ecx = s[10];
                 // 514f90 ret 
+                w.d((a as usize) + 0, s[12]);
+                w.d((a as usize) + 4, s[13]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -9020,7 +9610,7 @@ fn g3_514f80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 514fa2 fld st(1)
                 f[2] = f[0];
                 // 514fa4 fucompp 
-                cc87 = cc(f[2], f[1]);
+                cc87 = ccu(f[2], f[1]);
                 // 514fa6 fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
                 // 514fa8 test ah, 0x44
@@ -9063,6 +9653,8 @@ fn g3_514f80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 514fc9 pop ecx
                 ecx = s[10];
                 // 514fca ret 
+                w.d((a as usize) + 0, s[12]);
+                w.d((a as usize) + 4, s[13]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -9105,6 +9697,8 @@ fn g3_514f80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 514fe6 pop ecx
                 ecx = s[10];
                 // 514fe7 ret 
+                w.d((a as usize) + 0, s[12]);
+                w.d((a as usize) + 4, s[13]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -9117,36 +9711,38 @@ fn g3_514f80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x514fec => {
                 // 514fec fsub dword ptr [edi]
-                f[0] = xn3(f[0], ldr32(rd((edi) as usize)), f[0] - ldr32(rd((edi) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi) as usize)), f[0] - ldnr(rd((edi) as usize)));
                 // 514fee fld dword ptr [ebx + ecx*8]
                 f[1] = ldq(rd((ebx.wrapping_add(ecx.wrapping_mul(8))) as usize));
                 // 514ff1 fsub dword ptr [edi]
-                f[1] = xn3(f[1], ldr32(rd((edi) as usize)), f[1] - ldr32(rd((edi) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((edi) as usize)), f[1] - ldnr(rd((edi) as usize)));
                 // 514ff3 fdivp st(1)
                 f[0] = xn3(f[0], f[1], f[0] / f[1]);
                 // 514ff5 fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 514ff9 fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // 514ffd fld dword ptr [ebx + ecx*8 + 4]
                 f[1] = ldq(rd((ebx.wrapping_add(ecx.wrapping_mul(8)).wrapping_add(0x4)) as usize));
                 // 515001 fsub dword ptr [edi + 4]
-                f[1] = xn3(f[1], ldr32(rd((edi.wrapping_add(0x4)) as usize)), f[1] - ldr32(rd((edi.wrapping_add(0x4)) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((edi.wrapping_add(0x4)) as usize)), f[1] - ldnr(rd((edi.wrapping_add(0x4)) as usize)));
                 // 515004 fmulp st(1)
                 f[0] = xn3(f[0], f[1], f[0] * f[1]);
                 // 515006 fadd dword ptr [edi + 4]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x4)) as usize)), f[0] + ldr32(rd((edi.wrapping_add(0x4)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x4)) as usize)), f[0] + ldnr(rd((edi.wrapping_add(0x4)) as usize)));
                 // 515009 pop edi
                 edi = s[8];
                 // 51500a pop ebx
                 ebx = s[9];
                 // 51500b fstp dword ptr [esp]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 51500e fld dword ptr [esp]
                 f[0] = ldq(s[10]);
                 // 515011 pop ecx
                 ecx = s[10];
                 // 515012 ret 
+                w.d((a as usize) + 0, s[12]);
+                w.d((a as usize) + 4, s[13]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -9189,21 +9785,24 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5151f5 mov eax, edx
                 eax = edx;
                 // 5151f7 fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // 5151f9 fld dword ptr [ebp + 8]
                 f[0] = ldq(rd((ebp.wrapping_add(0x8)) as usize));
                 // 5151fc fstp dword ptr [edx + 4]
-                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 5151ff fld dword ptr [ebp + 0xc]
                 f[0] = ldq(rd((ebp.wrapping_add(0xc)) as usize));
                 // 515202 pop ebp
                 ebp = s[10];
                 // 515203 fstp dword ptr [edx + 8]
-                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x8)) as usize, stf(f[0]));
                 // 515206 pop ebx
                 ebx = s[11];
                 // 515207 add esp, 0x18
                 // 51520a ret 
+                w.d((a as usize) + 0, s[19]);
+                w.d((a as usize) + 4, s[20]);
+                w.d((a as usize) + 8, s[21]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -9237,7 +9836,7 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 51521d fld st(1)
                 f[2] = f[0];
                 // 51521f fucompp 
-                cc87 = cc(f[2], f[1]);
+                cc87 = ccu(f[2], f[1]);
                 // 515221 fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 1);
                 // 515223 test ah, 0x44
@@ -9279,7 +9878,7 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 515245 lea eax, [ecx + ebp + 4]
                 eax = ecx.wrapping_add(ebp).wrapping_add(0x4);
                 // 515249 fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // 51524b pop edi
                 edi = s[8];
                 // 51524c fld dword ptr [eax + 4]
@@ -9287,7 +9886,7 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 51524f pop esi
                 esi = s[9];
                 // 515250 fstp dword ptr [edx + 4]
-                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 515253 pop ebp
                 ebp = s[10];
                 // 515254 fld dword ptr [eax + 8]
@@ -9295,11 +9894,14 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 515257 mov eax, edx
                 eax = edx;
                 // 515259 fstp dword ptr [edx + 8]
-                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x8)) as usize, stf(f[0]));
                 // 51525c pop ebx
                 ebx = s[11];
                 // 51525d add esp, 0x18
                 // 515260 ret 
+                w.d((a as usize) + 0, s[19]);
+                w.d((a as usize) + 4, s[20]);
+                w.d((a as usize) + 8, s[21]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -9338,7 +9940,7 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 51527e pop edi
                 edi = s[8];
                 // 51527f fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // 515281 pop esi
                 esi = s[9];
                 // 515282 fld dword ptr [0x252a6d4]
@@ -9346,7 +9948,7 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 515288 pop ebp
                 ebp = s[10];
                 // 515289 fstp dword ptr [edx + 4]
-                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 51528c mov eax, edx
                 eax = edx;
                 // 51528e fld dword ptr [0x252a6d8]
@@ -9354,9 +9956,12 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 515294 pop ebx
                 ebx = s[11];
                 // 515295 fstp dword ptr [edx + 8]
-                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x8)) as usize, stf(f[0]));
                 // 515298 add esp, 0x18
                 // 51529b ret 
+                w.d((a as usize) + 0, s[19]);
+                w.d((a as usize) + 4, s[20]);
+                w.d((a as usize) + 8, s[21]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -9374,37 +9979,37 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x5152a6 => {
                 // 5152a6 fsub dword ptr [esi]
-                f[0] = xn3(f[0], ldr32(rd((esi) as usize)), f[0] - ldr32(rd((esi) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi) as usize)), f[0] - ldnr(rd((esi) as usize)));
                 // 5152a8 pop edi
                 edi = s[8];
                 // 5152a9 fld dword ptr [eax]
                 f[1] = ldq(rd((eax) as usize));
                 // 5152ab fsub dword ptr [esi]
-                f[1] = xn3(f[1], ldr32(rd((esi) as usize)), f[1] - ldr32(rd((esi) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((esi) as usize)), f[1] - ldnr(rd((esi) as usize)));
                 // 5152ad fdivp st(1)
                 f[0] = xn3(f[0], f[1], f[0] / f[1]);
                 // 5152af fstp dword ptr [esp + 0x2c]
-                s[20] = (f[0] as f32).to_bits();
+                s[20] = stf(f[0]);
                 // 5152b3 fld dword ptr [eax + 4]
                 f[0] = ldq(rd((eax.wrapping_add(0x4)) as usize));
                 // 5152b6 fsub dword ptr [esi + 4]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x4)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x4)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x4)) as usize)), f[0] - ldnr(rd((esi.wrapping_add(0x4)) as usize)));
                 // 5152b9 fstp dword ptr [esp + 0xc]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // 5152bd fld dword ptr [eax + 8]
                 f[0] = ldq(rd((eax.wrapping_add(0x8)) as usize));
                 // 5152c0 fsub dword ptr [esi + 8]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x8)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x8)) as usize)), f[0] - ldnr(rd((esi.wrapping_add(0x8)) as usize)));
                 // 5152c3 fstp dword ptr [esp + 0x10]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // 5152c7 fld dword ptr [eax + 0xc]
                 f[0] = ldq(rd((eax.wrapping_add(0xc)) as usize));
                 // 5152ca mov eax, edx
                 eax = edx;
                 // 5152cc fsub dword ptr [esi + 0xc]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0xc)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0xc)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0xc)) as usize)), f[0] - ldnr(rd((esi.wrapping_add(0xc)) as usize)));
                 // 5152cf fstp dword ptr [esp + 0x14]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // 5152d3 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[12]);
                 // 5152d7 fld dword ptr [esp + 0x2c]
@@ -9416,43 +10021,46 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5152df fxch st(1)
                 f.swap(1, 0);
                 // 5152e1 fstp dword ptr [esp + 0x18]
-                s[15] = (f[1] as f32).to_bits();
+                s[15] = stf(f[1]);
                 // 5152e5 fld dword ptr [esp + 0x10]
                 f[1] = ldq(s[13]);
                 // 5152e9 fmul st(1)
                 f[1] = xn3(f[1], f[0], f[1] * f[0]);
                 // 5152eb fstp dword ptr [esp + 0x1c]
-                s[16] = (f[1] as f32).to_bits();
+                s[16] = stf(f[1]);
                 // 5152ef fmul dword ptr [esp + 0x14]
-                f[0] = xn3(f[0], ldr32(s[14]), f[0] * ldr32(s[14]));
+                f[0] = xn3(f[0], ldnr(s[14]), f[0] * ldnr(s[14]));
                 // 5152f3 fstp dword ptr [esp + 0x20]
-                s[17] = (f[0] as f32).to_bits();
+                s[17] = stf(f[0]);
                 // 5152f7 fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[15]);
                 // 5152fb fadd dword ptr [esi + 4]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x4)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x4)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x4)) as usize)), f[0] + ldnr(rd((esi.wrapping_add(0x4)) as usize)));
                 // 5152fe fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // 515300 fld dword ptr [esi + 8]
                 f[0] = ldq(rd((esi.wrapping_add(0x8)) as usize));
                 // 515303 fadd dword ptr [esp + 0x1c]
-                f[0] = xn3(f[0], ldr32(s[16]), f[0] + ldr32(s[16]));
+                f[0] = xn3(f[0], ldnr(s[16]), f[0] + ldnr(s[16]));
                 // 515307 fstp dword ptr [edx + 4]
-                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 51530a fld dword ptr [esi + 0xc]
                 f[0] = ldq(rd((esi.wrapping_add(0xc)) as usize));
                 // 51530d pop esi
                 esi = s[9];
                 // 51530e fadd dword ptr [esp + 0x1c]
-                f[0] = xn3(f[0], ldr32(s[17]), f[0] + ldr32(s[17]));
+                f[0] = xn3(f[0], ldnr(s[17]), f[0] + ldnr(s[17]));
                 // 515312 pop ebp
                 ebp = s[10];
                 // 515313 pop ebx
                 ebx = s[11];
                 // 515314 fstp dword ptr [edx + 8]
-                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x8)) as usize, stf(f[0]));
                 // 515317 add esp, 0x18
                 // 51531a ret 
+                w.d((a as usize) + 0, s[19]);
+                w.d((a as usize) + 4, s[20]);
+                w.d((a as usize) + 8, s[21]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -9465,7 +10073,7 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 515321 pop esi
                 esi = s[9];
                 // 515322 fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // 515324 pop ebp
                 ebp = s[10];
                 // 515325 fld dword ptr [eax + 8]
@@ -9473,15 +10081,18 @@ fn g3_5151e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 515328 pop ebx
                 ebx = s[11];
                 // 515329 fstp dword ptr [edx + 4]
-                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 51532c fld dword ptr [eax + 0xc]
                 f[0] = ldq(rd((eax.wrapping_add(0xc)) as usize));
                 // 51532f mov eax, edx
                 eax = edx;
                 // 515331 fstp dword ptr [edx + 8]
-                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x8)) as usize, stf(f[0]));
                 // 515334 add esp, 0x18
                 // 515337 ret 
+                w.d((a as usize) + 0, s[19]);
+                w.d((a as usize) + 4, s[20]);
+                w.d((a as usize) + 8, s[21]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -9561,7 +10172,7 @@ fn g3_569ec0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 569efb fstp st(1)
                 f[0] = f[1];
                 // 569efd fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 569f00 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // 569f03 pop ecx
@@ -9578,7 +10189,7 @@ fn g3_569ec0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             0x569f07 => {
                 // 569f07 fstp st(0)
                 // 569f09 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 569f0c fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // 569f0f pop ecx
@@ -9847,32 +10458,34 @@ fn g3_6d7840(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 6d7856 mov eax, dword ptr [0x2527d10]
                 eax = rd((0x2527d10u32) as usize);
                 // 6d785b fsub dword ptr [0x27e6710]
-                f[1] = xn3(f[1], ldr32(rd((0x27e6710u32) as usize)), f[1] - ldr32(rd((0x27e6710u32) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((0x27e6710u32) as usize)), f[1] - ldnr(rd((0x27e6710u32) as usize)));
                 // 6d7861 fstp dword ptr [esp + 4]
-                s[9] = (f[1] as f32).to_bits();
+                s[9] = stf(f[1]);
                 // 6d7865 fld dword ptr [esp + 4]
                 f[1] = ldq(s[9]);
                 // 6d7869 fsub dword ptr [ecx + 8]
-                f[1] = xn3(f[1], ldr32(rd((ecx.wrapping_add(0x8)) as usize)), f[1] - ldr32(rd((ecx.wrapping_add(0x8)) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((ecx.wrapping_add(0x8)) as usize)), f[1] - ldnr(rd((ecx.wrapping_add(0x8)) as usize)));
                 // 6d786c mov ecx, dword ptr [eax + 0x1540]
                 ecx = rd((eax.wrapping_add(0x1540)) as usize);
                 // 6d7872 fstp dword ptr [esp + 4]
-                s[9] = (f[1] as f32).to_bits();
+                s[9] = stf(f[1]);
                 // 6d7876 fld dword ptr [esp + 4]
                 f[1] = ldq(s[9]);
                 // 6d787a fstp dword ptr [ecx + 0x164]
-                w.d((ecx.wrapping_add(0x164)) as usize, (f[1] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x164)) as usize, stf(f[1]));
                 // 6d7880 mov edx, dword ptr [eax + 0x1540]
                 edx = rd((eax.wrapping_add(0x1540)) as usize);
                 // 6d7886 fstp dword ptr [edx + 0x168]
-                w.d((edx.wrapping_add(0x168)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x168)) as usize, stf(f[0]));
                 // 6d788c ret 
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
             0x6d788d => {
                 // 6d788d fstp st(0)
                 // 6d788f ret 
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -9936,11 +10549,11 @@ fn g3_6d8170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 6d8199 fld dword ptr [ecx]
                 f[0] = ldq(rd((ecx) as usize));
                 // 6d819b fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 6d819e fld dword ptr [ecx + 4]
                 f[0] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
                 // 6d81a1 fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // 6d81a5 mov edx, dword ptr [esp + 4]
                 edx = s[9];
                 // 6d81a9 fld dword ptr [ecx + 8]
@@ -9948,7 +10561,7 @@ fn g3_6d8170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 6d81ac mov ecx, dword ptr [esp]
                 ecx = s[8];
                 // 6d81af fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 6d81b3 mov eax, dword ptr [esp + 8]
                 eax = s[10];
                 // 6d81b7 mov byte ptr [0x2658ca4], 1
@@ -9961,6 +10574,7 @@ fn g3_6d8170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 w.d((0x2658cb0u32) as usize, eax);
                 // 6d81cf add esp, 0xc
                 // 6d81d2 ret 
+                w.d((a as usize) + 0, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -9973,6 +10587,7 @@ fn g3_6d8170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 w.b((0x2658ca4u32) as usize, (0x0u32) as u8);
                 // 6d81dc add esp, 0xc
                 // 6d81df ret 
+                w.d((a as usize) + 0, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -9998,7 +10613,7 @@ fn g3_6d8240(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 6d8244 fld dword ptr [eax + 8]
                 f[0] = ldq(rd((eax.wrapping_add(0x8)) as usize));
                 // 6d8247 fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // 6d824b fldz 
                 f[0] = 0.0;
                 // 6d824d fld dword ptr [esp + 4]
@@ -10019,8 +10634,9 @@ fn g3_6d8240(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 6d825c mov byte ptr [0x2526d78], 1
                 w.b((0x2526d78u32) as usize, (0x1u32) as u8);
                 // 6d8263 fstp dword ptr [0x2526d7c]
-                w.d((0x2526d7cu32) as usize, (f[0] as f32).to_bits());
+                w.d((0x2526d7cu32) as usize, stf(f[0]));
                 // 6d8269 ret 
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10029,8 +10645,9 @@ fn g3_6d8240(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 6d826c mov byte ptr [0x2526d78], 0
                 w.b((0x2526d78u32) as usize, (0x0u32) as u8);
                 // 6d8273 fstp dword ptr [0x2526d7c]
-                w.d((0x2526d7cu32) as usize, (f[0] as f32).to_bits());
+                w.d((0x2526d7cu32) as usize, stf(f[0]));
                 // 6d8279 ret 
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10138,8 +10755,9 @@ fn g3_7277f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 f[0] = f[2];
                 // 727850 fstp st(0)
                 // 727852 fstp dword ptr [0x2527e3c]
-                w.d((0x2527e3cu32) as usize, (f[0] as f32).to_bits());
+                w.d((0x2527e3cu32) as usize, stf(f[0]));
                 // 727858 ret 
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10148,8 +10766,9 @@ fn g3_7277f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 72785b fsubp st(1)
                 f[0] = xn3(f[0], f[1], f[0] - f[1]);
                 // 72785d fstp dword ptr [0x2527e3c]
-                w.d((0x2527e3cu32) as usize, (f[0] as f32).to_bits());
+                w.d((0x2527e3cu32) as usize, stf(f[0]));
                 // 727863 ret 
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10179,8 +10798,9 @@ fn g3_7277f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 72787d fchs 
                 f[0] = -f[0];
                 // 72787f fstp dword ptr [0x2527e3c]
-                w.d((0x2527e3cu32) as usize, (f[0] as f32).to_bits());
+                w.d((0x2527e3cu32) as usize, stf(f[0]));
                 // 727885 ret 
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10188,8 +10808,9 @@ fn g3_7277f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 727886 fstp st(1)
                 f[0] = f[1];
                 // 727888 fstp dword ptr [0x2527e3c]
-                w.d((0x2527e3cu32) as usize, (f[0] as f32).to_bits());
+                w.d((0x2527e3cu32) as usize, stf(f[0]));
                 // 72788e ret 
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10222,20 +10843,22 @@ fn g3_92a8e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 92a8eb mov eax, dword ptr [esp + 4]
                 eax = s[11];
                 // 92a8ef fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // 92a8f1 fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 92a8f4 fst dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // 92a8f7 mov eax, dword ptr [esp + 8]
                 eax = s[12];
                 // 92a8fb fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // 92a8fd fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 92a900 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // 92a903 ret 8
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10286,44 +10909,46 @@ fn g3_92a8e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 92a945 fld dword ptr [ecx + 0x1ec]
                 f[0] = ldq(rd((ecx.wrapping_add(0x1ec)) as usize));
                 // 92a94b fmul dword ptr [eax]
-                f[0] = xn3(f[0], ldr32(rd((eax) as usize)), f[0] * ldr32(rd((eax) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((eax) as usize)), f[0] * ldnr(rd((eax) as usize)));
                 // 92a94d pop edi
                 edi = s[8];
                 // 92a94e pop esi
                 esi = s[9];
                 // 92a94f fstp dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // 92a951 fld dword ptr [ecx + 0x1f0]
                 f[0] = ldq(rd((ecx.wrapping_add(0x1f0)) as usize));
                 // 92a957 fmul dword ptr [eax + 4]
-                f[0] = xn3(f[0], ldr32(rd((eax.wrapping_add(0x4)) as usize)), f[0] * ldr32(rd((eax.wrapping_add(0x4)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((eax.wrapping_add(0x4)) as usize)), f[0] * ldnr(rd((eax.wrapping_add(0x4)) as usize)));
                 // 92a95a fstp dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 92a95d fld dword ptr [ecx + 0x1f4]
                 f[0] = ldq(rd((ecx.wrapping_add(0x1f4)) as usize));
                 // 92a963 fmul dword ptr [eax + 8]
-                f[0] = xn3(f[0], ldr32(rd((eax.wrapping_add(0x8)) as usize)), f[0] * ldr32(rd((eax.wrapping_add(0x8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((eax.wrapping_add(0x8)) as usize)), f[0] * ldnr(rd((eax.wrapping_add(0x8)) as usize)));
                 // 92a966 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // 92a969 fld dword ptr [edx]
                 f[0] = ldq(rd((edx) as usize));
                 // 92a96b fmul dword ptr [ecx + 0x1ec]
-                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0x1ec)) as usize)), f[0] * ldr32(rd((ecx.wrapping_add(0x1ec)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((ecx.wrapping_add(0x1ec)) as usize)), f[0] * ldnr(rd((ecx.wrapping_add(0x1ec)) as usize)));
                 // 92a971 fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // 92a973 fld dword ptr [ecx + 0x1f0]
                 f[0] = ldq(rd((ecx.wrapping_add(0x1f0)) as usize));
                 // 92a979 fmul dword ptr [edx + 4]
-                f[0] = xn3(f[0], ldr32(rd((edx.wrapping_add(0x4)) as usize)), f[0] * ldr32(rd((edx.wrapping_add(0x4)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edx.wrapping_add(0x4)) as usize)), f[0] * ldnr(rd((edx.wrapping_add(0x4)) as usize)));
                 // 92a97c fstp dword ptr [edx + 4]
-                w.d((edx.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 92a97f fld dword ptr [ecx + 0x1f4]
                 f[0] = ldq(rd((ecx.wrapping_add(0x1f4)) as usize));
                 // 92a985 fmul dword ptr [edx + 8]
-                f[0] = xn3(f[0], ldr32(rd((edx.wrapping_add(0x8)) as usize)), f[0] * ldr32(rd((edx.wrapping_add(0x8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edx.wrapping_add(0x8)) as usize)), f[0] * ldnr(rd((edx.wrapping_add(0x8)) as usize)));
                 // 92a988 fstp dword ptr [edx + 8]
-                w.d((edx.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((edx.wrapping_add(0x8)) as usize, stf(f[0]));
                 // 92a98b ret 8
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10361,19 +10986,19 @@ fn g3_9b5c80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 9b5c8e fldz 
                 f[0] = 0.0;
                 // 9b5c90 fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // 9b5c92 and ecx, 1
                 let r_ = (ecx) & (0x1u32);
                 fl = fl_logic(r_, 32);
                 ecx = r_;
                 // 9b5c95 fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // 9b5c98 xor dword ptr [eax + 0x30], ecx
                 let r_ = (rd((eax.wrapping_add(0x30)) as usize)) ^ (ecx);
                 fl = fl_logic(r_, 32);
                 w.d((eax.wrapping_add(0x30)) as usize, r_);
                 // 9b5c9b fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // 9b5c9e mov ecx, dword ptr [esp + 8]
                 ecx = s[10];
                 // 9b5ca2 mov dword ptr [eax + 0xc], ecx
@@ -10385,7 +11010,7 @@ fn g3_9b5c80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fl = fl_logic(r_, 8);
                 w.b((eax.wrapping_add(0x2c)) as usize, (r_) as u8);
                 // 9b5caf fstp dword ptr [eax + 0x1c]
-                w.d((eax.wrapping_add(0x1c)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x1c)) as usize, stf(f[0]));
                 // 9b5cb2 test edx, edx
                 let r_ = (edx) & (edx);
                 fl = fl_logic(r_, 32);
@@ -10412,6 +11037,8 @@ fn g3_9b5c80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 9b5ccf mov dword ptr [eax + 0x18], ecx
                 w.d((eax.wrapping_add(0x18)) as usize, ecx);
                 // 9b5cd2 ret 
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10422,6 +11049,8 @@ fn g3_9b5c80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x9b5cda => {
                 // 9b5cda ret 
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10488,20 +11117,22 @@ fn g3_a00230(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a00262 mov eax, dword ptr [esp + 4]
                 eax = s[9];
                 // a00266 fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a00268 fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a0026b fst dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a0026e mov eax, dword ptr [esp + 8]
                 eax = s[10];
                 // a00272 fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a00274 fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a00277 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a0027a ret 8
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10535,6 +11166,8 @@ fn g3_a00230(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a002a3 mov dword ptr [ecx + 8], eax
                 w.d((ecx.wrapping_add(0x8)) as usize, eax);
                 // a002a6 ret 8
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10601,20 +11234,22 @@ fn g3_a002b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a002e2 mov eax, dword ptr [esp + 4]
                 eax = s[10];
                 // a002e6 fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a002e8 fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a002eb fst dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a002ee mov eax, dword ptr [esp + 8]
                 eax = s[11];
                 // a002f2 fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a002f4 fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a002f7 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a002fa ret 8
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10698,6 +11333,8 @@ fn g3_a002b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a0034d pop esi
                 esi = s[8];
                 // a0034e ret 8
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10748,21 +11385,23 @@ fn g3_a6be10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a6be30 fldz 
                 f[0] = 0.0;
                 // a6be32 fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a6be34 fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a6be37 fst dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a6be3a mov eax, dword ptr [esp + 0x10]
                 eax = s[12];
                 // a6be3e fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a6be40 fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a6be43 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a6be46 add esp, 8
                 // a6be49 ret 8
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10772,45 +11411,47 @@ fn g3_a6be10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a6be52 fchs 
                 f[0] = -f[0];
                 // a6be54 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // a6be57 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // a6be5a fst dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // a6be5d fstp dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a6be5f fldz 
                 f[0] = 0.0;
                 // a6be61 fstp dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a6be64 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // a6be67 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a6be6a fld dword ptr [ecx + 0x124]
                 f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
                 // a6be70 mov eax, dword ptr [esp + 0x10]
                 eax = s[12];
                 // a6be74 fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // a6be78 fld dword ptr [ecx + 0x128]
                 f[0] = ldq(rd((ecx.wrapping_add(0x128)) as usize));
                 // a6be7e fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // a6be81 fld dword ptr [ecx + 0x128]
                 f[0] = ldq(rd((ecx.wrapping_add(0x128)) as usize));
                 // a6be87 fstp dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a6be89 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[11]);
                 // a6be8d fstp dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a6be90 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // a6be93 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a6be96 add esp, 8
                 // a6be99 ret 8
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10822,31 +11463,31 @@ fn g3_a6be10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a6bea6 fchs 
                 f[0] = -f[0];
                 // a6bea8 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // a6beab fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // a6beae fst dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // a6beb1 fst dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // a6beb5 fstp dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a6beb7 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // a6beba fstp dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a6bebd fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // a6bec1 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a6bec4 fld dword ptr [ecx + 0x124]
                 f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
                 // a6beca fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // a6bece fld dword ptr [ecx + 0x124]
                 f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
                 // a6bed4 fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // a6bed8 fld dword ptr [ecx + 0x124]
                 f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
                 // a6bede jmp 0xa6bf26
@@ -10858,31 +11499,31 @@ fn g3_a6be10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a6bee6 mov eax, dword ptr [esp + 0xc]
                 eax = s[11];
                 // a6beea fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // a6beee fld dword ptr [ecx + 0x12c]
                 f[0] = ldq(rd((ecx.wrapping_add(0x12c)) as usize));
                 // a6bef4 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // a6bef7 fld dword ptr [ecx + 0x124]
                 f[0] = ldq(rd((ecx.wrapping_add(0x124)) as usize));
                 // a6befd fstp dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a6beff fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // a6bf03 fstp dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a6bf06 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // a6bf09 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a6bf0c fld dword ptr [ecx + 0x134]
                 f[0] = ldq(rd((ecx.wrapping_add(0x134)) as usize));
                 // a6bf12 fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // a6bf16 fld dword ptr [ecx + 0x138]
                 f[0] = ldq(rd((ecx.wrapping_add(0x138)) as usize));
                 // a6bf1c fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // a6bf20 fld dword ptr [ecx + 0x130]
                 f[0] = ldq(rd((ecx.wrapping_add(0x130)) as usize));
                 pc = 0xa6bf26;
@@ -10891,17 +11532,19 @@ fn g3_a6be10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a6bf26 mov eax, dword ptr [esp + 0x10]
                 eax = s[12];
                 // a6bf2a fstp dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // a6bf2c fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[11]);
                 // a6bf30 fstp dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // a6bf33 fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // a6bf37 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // a6bf3a add esp, 8
                 // a6bf3d ret 8
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -10933,7 +11576,7 @@ fn g3_a97a90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a97a9a fld dword ptr [eax + 0x7c]
                 f[0] = ldq(rd((eax.wrapping_add(0x7c)) as usize));
                 // a97a9d fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // a97aa0 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // a97aa3 pop ecx
@@ -10946,7 +11589,7 @@ fn g3_a97a90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // a97aa5 fldz 
                 f[0] = 0.0;
                 // a97aa7 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // a97aaa fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // a97aad pop ecx
@@ -10989,20 +11632,22 @@ fn g3_aa4400(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // aa4411 mov eax, dword ptr [esp + 4]
                 eax = s[9];
                 // aa4415 fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // aa4417 fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // aa441a fst dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // aa441d mov eax, dword ptr [esp + 8]
                 eax = s[10];
                 // aa4421 fst dword ptr [eax]
-                w.d((eax) as usize, (f[0] as f32).to_bits());
+                w.d((eax) as usize, stf(f[0]));
                 // aa4423 fst dword ptr [eax + 4]
-                w.d((eax.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4)) as usize, stf(f[0]));
                 // aa4426 fstp dword ptr [eax + 8]
-                w.d((eax.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x8)) as usize, stf(f[0]));
                 // aa4429 ret 8
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -11036,6 +11681,8 @@ fn g3_aa4400(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // aa4453 mov dword ptr [ecx + 8], eax
                 w.d((ecx.wrapping_add(0x8)) as usize, eax);
                 // aa4456 ret 8
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -11062,7 +11709,7 @@ fn g3_ac0290(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ac0294 fsub qword ptr [0xe5bfa0]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5bfa0u32) as usize)), f[0] - f64::from_bits(rq((0xe5bfa0u32) as usize)));
                 // ac029a fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // ac029d fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // ac02a0 fld qword ptr [0xe5c188]
@@ -11179,19 +11826,19 @@ fn g3_af9950(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // af9954 mov eax, dword ptr [esp + 0x10]
                 eax = s[12];
                 // af9958 fsub dword ptr [ecx + 8]
-                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0x8)) as usize)), f[0] - ldr32(rd((ecx.wrapping_add(0x8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((ecx.wrapping_add(0x8)) as usize)), f[0] - ldnr(rd((ecx.wrapping_add(0x8)) as usize)));
                 // af995b fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // af995e fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // af9961 fmul dword ptr [eax]
-                f[0] = xn3(f[0], ldr32(rd((eax) as usize)), f[0] * ldr32(rd((eax) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((eax) as usize)), f[0] * ldnr(rd((eax) as usize)));
                 // af9963 fadd dword ptr [ecx + 8]
-                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0x8)) as usize)), f[0] + ldr32(rd((ecx.wrapping_add(0x8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((ecx.wrapping_add(0x8)) as usize)), f[0] + ldnr(rd((ecx.wrapping_add(0x8)) as usize)));
                 // af9966 mov ecx, dword ptr [esp + 0x14]
                 ecx = s[13];
                 // af996a fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // af996e fld dword ptr [ecx]
                 f[0] = ldq(rd((ecx) as usize));
                 // af9970 fld dword ptr [esp + 0x10]
@@ -11215,6 +11862,10 @@ fn g3_af9950(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // af9983 pop ecx
                 ecx = s[8];
                 // af9984 ret 0x10
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
+                w.d((a as usize) + 8, s[12]);
+                w.d((a as usize) + 12, s[13]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -11222,9 +11873,9 @@ fn g3_af9950(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // af9987 mov ecx, dword ptr [esp + 0xc]
                 ecx = s[11];
                 // af998b fsub dword ptr [ecx + 0xb8]
-                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0xb8)) as usize)), f[0] - ldr32(rd((ecx.wrapping_add(0xb8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((ecx.wrapping_add(0xb8)) as usize)), f[0] - ldnr(rd((ecx.wrapping_add(0xb8)) as usize)));
                 // af9991 fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // af9995 fldz 
                 f[0] = 0.0;
                 // af9997 fld dword ptr [esp + 8]
@@ -11258,7 +11909,7 @@ fn g3_af9950(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xaf99b0 => {
                 // af99b0 fstp dword ptr [esp + 0x10]
-                s[12] = (f[1] as f32).to_bits();
+                s[12] = stf(f[1]);
                 // af99b4 fld dword ptr [esp + 0x10]
                 f[1] = ldq(s[12]);
                 // af99b8 fld dword ptr [esp + 0x14]
@@ -11270,7 +11921,7 @@ fn g3_af9950(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // af99c0 fxch st(1)
                 f.swap(2, 1);
                 // af99c2 fstp dword ptr [esp + 0x10]
-                s[12] = (f[2] as f32).to_bits();
+                s[12] = stf(f[2]);
                 // af99c6 fld dword ptr [0xe5c154]
                 f[2] = ldq(rd((0xe5c154u32) as usize));
                 // af99cc fld dword ptr [esp + 0x10]
@@ -11312,15 +11963,15 @@ fn g3_af9950(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xaf99f0 => {
                 // af99f0 fstp dword ptr [esp + 0x10]
-                s[12] = (f[2] as f32).to_bits();
+                s[12] = stf(f[2]);
                 // af99f4 fabs 
                 f[1] = f[1].abs();
                 // af99f6 fstp dword ptr [esp + 0x14]
-                s[13] = (f[1] as f32).to_bits();
+                s[13] = stf(f[1]);
                 // af99fa fld dword ptr [esp + 0x14]
                 f[1] = ldq(s[13]);
                 // af99fe fstp dword ptr [esp + 0x14]
-                s[13] = (f[1] as f32).to_bits();
+                s[13] = stf(f[1]);
                 // af9a02 fld dword ptr [0xe5c150]
                 f[1] = ldq(rd((0xe5c150u32) as usize));
                 // af9a08 fld dword ptr [esp + 0x14]
@@ -11351,22 +12002,26 @@ fn g3_af9950(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xaf9a23 => {
                 // af9a23 fstp dword ptr [esp + 0x14]
-                s[13] = (f[1] as f32).to_bits();
+                s[13] = stf(f[1]);
                 // af9a27 fld dword ptr [esp + 0x14]
                 f[1] = ldq(s[13]);
                 // af9a2b fmul dword ptr [esp + 0x10]
-                f[1] = xn3(f[1], ldr32(s[12]), f[1] * ldr32(s[12]));
+                f[1] = xn3(f[1], ldnr(s[12]), f[1] * ldnr(s[12]));
                 // af9a2f fmulp st(1)
                 f[0] = xn3(f[0], f[1], f[0] * f[1]);
                 // af9a31 fadd dword ptr [ecx + 0xb8]
-                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0xb8)) as usize)), f[0] + ldr32(rd((ecx.wrapping_add(0xb8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((ecx.wrapping_add(0xb8)) as usize)), f[0] + ldnr(rd((ecx.wrapping_add(0xb8)) as usize)));
                 // af9a37 fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // af9a3b fld dword ptr [esp + 0x10]
                 f[0] = ldq(s[12]);
                 // af9a3f pop ecx
                 ecx = s[8];
                 // af9a40 ret 0x10
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
+                w.d((a as usize) + 8, s[12]);
+                w.d((a as usize) + 12, s[13]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -11398,7 +12053,7 @@ fn g3_afe2c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // afe2ca fld dword ptr [eax + 0x120]
                 f[0] = ldq(rd((eax.wrapping_add(0x120)) as usize));
                 // afe2d0 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // afe2d3 fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // afe2d6 pop ecx
@@ -11411,7 +12066,7 @@ fn g3_afe2c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // afe2d8 fldz 
                 f[0] = 0.0;
                 // afe2da fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // afe2dd fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // afe2e0 pop ecx
@@ -11479,7 +12134,7 @@ fn g3_b92cc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b92cc2 fld dword ptr [ecx]
                 f[1] = ldq(rd((ecx) as usize));
                 // b92cc4 fucompp 
-                cc87 = cc(f[1], f[0]);
+                cc87 = ccu(f[1], f[0]);
                 // b92cc6 fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
                 // b92cc8 test ah, 0x44
@@ -11494,7 +12149,7 @@ fn g3_b92cc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b92cd0 fld dword ptr [ecx + 4]
                 f[1] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
                 // b92cd3 fucompp 
-                cc87 = cc(f[1], f[0]);
+                cc87 = ccu(f[1], f[0]);
                 // b92cd5 fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
                 // b92cd7 test ah, 0x44
@@ -11539,7 +12194,7 @@ fn g3_b92cf0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b92cf2 fld dword ptr [ecx]
                 f[1] = ldq(rd((ecx) as usize));
                 // b92cf4 fucompp 
-                cc87 = cc(f[1], f[0]);
+                cc87 = ccu(f[1], f[0]);
                 // b92cf6 fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
                 // b92cf8 test ah, 0x44
@@ -11554,7 +12209,7 @@ fn g3_b92cf0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b92d00 fld dword ptr [ecx + 4]
                 f[1] = ldq(rd((ecx.wrapping_add(0x4)) as usize));
                 // b92d03 fucompp 
-                cc87 = cc(f[1], f[0]);
+                cc87 = ccu(f[1], f[0]);
                 // b92d05 fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
                 // b92d07 test ah, 0x44
@@ -11569,7 +12224,7 @@ fn g3_b92cf0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b92d0f fld dword ptr [ecx + 8]
                 f[1] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
                 // b92d12 fucompp 
-                cc87 = cc(f[1], f[0]);
+                cc87 = ccu(f[1], f[0]);
                 // b92d14 fnstsw ax
                 eax = (eax & 0xffff0000) | sw_ax(cc87, 0);
                 // b92d16 test ah, 0x44
@@ -11629,7 +12284,7 @@ fn g3_b99980(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb99995 => {
                 // b99995 fstp dword ptr [esp + 0xc]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // b99999 push ebx
                 s[8] = ebx;
                 // b9999a mov bl, byte ptr [ecx + 0x3c]
@@ -11649,7 +12304,7 @@ fn g3_b99980(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b999aa fxch st(2)
                 f.swap(2, 0);
                 // b999ac fst dword ptr [ecx + 0x34]
-                w.d((ecx.wrapping_add(0x34)) as usize, (f[2] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x34)) as usize, stf(f[2]));
                 // b999af jmp 0xb999d1
                 pc = 0xb999d1;
             }
@@ -11667,7 +12322,7 @@ fn g3_b99980(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b999bf fadd st(1)
                 f[3] = xn3(f[3], f[2], f[3] + f[2]);
                 // b999c1 fmul dword ptr [ecx + 0x40]
-                f[3] = xn3(f[3], ldr32(rd((ecx.wrapping_add(0x40)) as usize)), f[3] * ldr32(rd((ecx.wrapping_add(0x40)) as usize)));
+                f[3] = xn3(f[3], ldnr(rd((ecx.wrapping_add(0x40)) as usize)), f[3] * ldnr(rd((ecx.wrapping_add(0x40)) as usize)));
                 // b999c4 jmp 0xb999c9
                 pc = 0xb999c9;
             }
@@ -11678,9 +12333,9 @@ fn g3_b99980(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb999c9 => {
                 // b999c9 fmul dword ptr [ecx + 0x34]
-                f[3] = xn3(f[3], ldr32(rd((ecx.wrapping_add(0x34)) as usize)), f[3] * ldr32(rd((ecx.wrapping_add(0x34)) as usize)));
+                f[3] = xn3(f[3], ldnr(rd((ecx.wrapping_add(0x34)) as usize)), f[3] * ldnr(rd((ecx.wrapping_add(0x34)) as usize)));
                 // b999cc fstp dword ptr [ecx + 0x34]
-                w.d((ecx.wrapping_add(0x34)) as usize, (f[3] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x34)) as usize, stf(f[3]));
                 // b999cf fxch st(2)
                 f.swap(2, 0);
                 pc = 0xb999d1;
@@ -11713,7 +12368,7 @@ fn g3_b99980(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb999e8 => {
                 // b999e8 fstp dword ptr [esp + 0x10]
-                s[12] = (f[3] as f32).to_bits();
+                s[12] = stf(f[3]);
                 // b999ec xor edx, edx
                 edx = 0;
                 fl = fl_logic(0, 32);
@@ -11722,7 +12377,7 @@ fn g3_b99980(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b999f2 fld dword ptr [esp + 0x10]
                 f[3] = ldq(s[12]);
                 // b999f6 fst dword ptr [ecx + 0x34]
-                w.d((ecx.wrapping_add(0x34)) as usize, (f[3] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x34)) as usize, stf(f[3]));
                 // b999f9 jne 0xb99a20
                 pc = if !fl.zf { 0xb99a20 } else { 0xb999fb };
             }
@@ -11744,17 +12399,18 @@ fn g3_b99980(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b99a06 fld dword ptr [ecx + 0x48]
                 f[1] = ldq(rd((ecx.wrapping_add(0x48)) as usize));
                 // b99a09 fmul dword ptr [0xe84380]
-                f[1] = xn3(f[1], ldr32(rd((0xe84380u32) as usize)), f[1] * ldr32(rd((0xe84380u32) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((0xe84380u32) as usize)), f[1] * ldnr(rd((0xe84380u32) as usize)));
                 // b99a0f fmulp st(1)
                 f[0] = xn3(f[0], f[1], f[0] * f[1]);
                 // b99a11 fstp dword ptr [ecx + 0x38]
-                w.d((ecx.wrapping_add(0x38)) as usize, (f[0] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x38)) as usize, stf(f[0]));
                 // b99a14 mov dword ptr [esi + 4], edx
                 w.d((esi.wrapping_add(0x4)) as usize, edx);
                 // b99a17 mov byte ptr [ecx + 0x3c], dl
                 w.b((ecx.wrapping_add(0x3c)) as usize, ((edx & 0xff)) as u8);
                 // b99a1a add esp, 8
                 // b99a1d ret 4
+                w.d((a as usize) + 0, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -11764,7 +12420,7 @@ fn g3_b99980(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b99a22 pop ebx
                 ebx = s[8];
                 // b99a23 fstp dword ptr [ecx + 0x38]
-                w.d((ecx.wrapping_add(0x38)) as usize, (f[3] as f32).to_bits());
+                w.d((ecx.wrapping_add(0x38)) as usize, stf(f[3]));
                 // b99a26 fnstcw word ptr [esp + 0xc]
                 s[12] = set_part(s[12], 0, 0xffff, fnstcw16() as u32);
                 // b99a2a fdivp st(2)
@@ -11795,6 +12451,7 @@ fn g3_b99980(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fldcw16((((s[12] >> 0) & 0xffff)) as u16);
                 // b99a54 add esp, 8
                 // b99a57 ret 4
+                w.d((a as usize) + 0, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -11813,7 +12470,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[13] = unsafe { *a.add(3) };
     s[14] = unsafe { *a.add(4) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xcee7e0u32;
@@ -11835,7 +12492,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee7f6 fld dword ptr [ecx + 8]
                 f[0] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
                 // cee7f9 fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // cee7fd movss dword ptr [esp + 0x18], xmm0
                 s[14] = x[0][0];
                 // cee803 fld dword ptr [esp + 0x18]
@@ -11859,13 +12516,13 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee820 fmul st(1)
                 f[3] = xn3(f[3], f[2], f[3] * f[2]);
                 // cee822 fstp dword ptr [esp + 0x18]
-                s[14] = (f[3] as f32).to_bits();
+                s[14] = stf(f[3]);
                 // cee826 fld st(1)
                 f[3] = f[1];
                 // cee828 fmul qword ptr [0xe5bf70]
                 f[3] = xn3(f[3], f64::from_bits(rq((0xe5bf70u32) as usize)), f[3] * f64::from_bits(rq((0xe5bf70u32) as usize)));
                 // cee82e fstp dword ptr [esp + 0x14]
-                s[13] = (f[3] as f32).to_bits();
+                s[13] = stf(f[3]);
                 // cee832 fld dword ptr [esp + 0x14]
                 f[3] = ldq(s[13]);
                 // cee836 fcomi st(3)
@@ -11878,9 +12535,9 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee83c fstp st(2)
                 f[0] = f[2];
                 // cee83e fadd dword ptr [esp + 0x18]
-                f[1] = xn3(f[1], ldr32(s[14]), f[1] + ldr32(s[14]));
+                f[1] = xn3(f[1], ldnr(s[14]), f[1] + ldnr(s[14]));
                 // cee842 fstp dword ptr [edx + 4]
-                w.d((edx.wrapping_add(0x4)) as usize, (f[1] as f32).to_bits());
+                w.d((edx.wrapping_add(0x4)) as usize, stf(f[1]));
                 // cee845 jmp 0xcee875
                 pc = 0xcee875;
             }
@@ -11890,7 +12547,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee849 fld dword ptr [ecx + 8]
                 f[3] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
                 // cee84c fstp dword ptr [esp + 0x14]
-                s[13] = (f[3] as f32).to_bits();
+                s[13] = stf(f[3]);
                 // cee850 fld st(1)
                 f[3] = f[1];
                 // cee852 fsubp st(3)
@@ -11916,7 +12573,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee86a fxch st(1)
                 f.swap(1, 0);
                 // cee86c fstp dword ptr [edx + 4]
-                w.d((edx.wrapping_add(0x4)) as usize, (f[1] as f32).to_bits());
+                w.d((edx.wrapping_add(0x4)) as usize, stf(f[1]));
                 // cee86f jmp 0xcee875
                 pc = 0xcee875;
             }
@@ -11930,11 +12587,11 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee875 fld dword ptr [edx + 4]
                 f[1] = ldq(rd((edx.wrapping_add(0x4)) as usize));
                 // cee878 fstp dword ptr [esp + 0x18]
-                s[14] = (f[1] as f32).to_bits();
+                s[14] = stf(f[1]);
                 // cee87c fld dword ptr [ecx + 0xc]
                 f[1] = ldq(rd((ecx.wrapping_add(0xc)) as usize));
                 // cee87f fstp dword ptr [esp + 0x14]
-                s[13] = (f[1] as f32).to_bits();
+                s[13] = stf(f[1]);
                 // cee883 fld dword ptr [esp + 0x18]
                 f[1] = ldq(s[14]);
                 // cee887 fld st(0)
@@ -11948,7 +12605,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee891 fxch st(1)
                 f.swap(3, 2);
                 // cee893 fstp dword ptr [esp + 0x18]
-                s[14] = (f[3] as f32).to_bits();
+                s[14] = stf(f[3]);
                 // cee897 fld dword ptr [esp + 0x18]
                 f[3] = ldq(s[14]);
                 // cee89b fldz 
@@ -11964,7 +12621,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee8a7 fld dword ptr [ecx + 8]
                 f[3] = ldq(rd((ecx.wrapping_add(0x8)) as usize));
                 // cee8aa fstp dword ptr [esp + 0x18]
-                s[14] = (f[3] as f32).to_bits();
+                s[14] = stf(f[3]);
                 // cee8ae fld dword ptr [esp + 0x18]
                 f[3] = ldq(s[14]);
                 // cee8b2 fld st(0)
@@ -11980,15 +12637,15 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee8bc fxch st(2)
                 f.swap(4, 2);
                 // cee8be fstp dword ptr [esp + 0x14]
-                s[13] = (f[4] as f32).to_bits();
+                s[13] = stf(f[4]);
                 // cee8c2 fld dword ptr [ecx + 0x24]
                 f[4] = ldq(rd((ecx.wrapping_add(0x24)) as usize));
                 // cee8c5 fstp dword ptr [esp + 0x18]
-                s[14] = (f[4] as f32).to_bits();
+                s[14] = stf(f[4]);
                 // cee8c9 fld dword ptr [ecx + 0x14]
                 f[4] = ldq(rd((ecx.wrapping_add(0x14)) as usize));
                 // cee8cc fstp dword ptr [esp + 0x10]
-                s[12] = (f[4] as f32).to_bits();
+                s[12] = stf(f[4]);
                 // cee8d0 fld dword ptr [ecx + 0x20]
                 f[4] = ldq(rd((ecx.wrapping_add(0x20)) as usize));
                 // cee8d3 fld dword ptr [esp + 0x18]
@@ -12006,7 +12663,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee8e3 fxch st(2)
                 f.swap(6, 4);
                 // cee8e5 fstp dword ptr [esp + 0x18]
-                s[14] = (f[6] as f32).to_bits();
+                s[14] = stf(f[6]);
                 // cee8e9 fld dword ptr [esp + 0x18]
                 f[6] = ldq(s[14]);
                 // cee8ed fmul st(5)
@@ -12022,7 +12679,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee8f9 fxch st(1)
                 f.swap(6, 5);
                 // cee8fb fstp dword ptr [esp + 0x18]
-                s[14] = (f[6] as f32).to_bits();
+                s[14] = stf(f[6]);
                 // cee8ff fld dword ptr [ecx + 0x18]
                 f[6] = ldq(rd((ecx.wrapping_add(0x18)) as usize));
                 // cee902 fsub st(4)
@@ -12034,7 +12691,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee908 fxch st(1)
                 f.swap(5, 4);
                 // cee90a fstp dword ptr [esp + 0x14]
-                s[13] = (f[5] as f32).to_bits();
+                s[13] = stf(f[5]);
                 // cee90e fld dword ptr [esp + 0x14]
                 f[5] = ldq(s[13]);
                 // cee912 fld st(4)
@@ -12054,11 +12711,11 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee920 fxch st(1)
                 f.swap(2, 1);
                 // cee922 fstp dword ptr [esp + 0x14]
-                s[13] = (f[2] as f32).to_bits();
+                s[13] = stf(f[2]);
                 // cee926 fld dword ptr [esi]
                 f[2] = ldq(rd((esi) as usize));
                 // cee928 fstp dword ptr [esp + 0x10]
-                s[12] = (f[2] as f32).to_bits();
+                s[12] = stf(f[2]);
                 // cee92c fld dword ptr [esp + 0x10]
                 f[2] = ldq(s[12]);
                 // cee930 fxch st(1)
@@ -12070,20 +12727,26 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xcee93a => {
                 // cee93a fdiv dword ptr [ecx + 8]
-                f[1] = xn3(f[1], ldr32(rd((ecx.wrapping_add(0x8)) as usize)), f[1] / ldr32(rd((ecx.wrapping_add(0x8)) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((ecx.wrapping_add(0x8)) as usize)), f[1] / ldnr(rd((ecx.wrapping_add(0x8)) as usize)));
                 // cee93d pop esi
                 esi = s[8];
                 // cee93e fmul dword ptr [esp + 0x14]
-                f[1] = xn3(f[1], ldr32(s[14]), f[1] * ldr32(s[14]));
+                f[1] = xn3(f[1], ldnr(s[14]), f[1] * ldnr(s[14]));
                 // cee942 fstp dword ptr [esp + 0x14]
-                s[14] = (f[1] as f32).to_bits();
+                s[14] = stf(f[1]);
                 // cee946 fmul dword ptr [esp + 0x10]
-                f[0] = xn3(f[0], ldr32(s[13]), f[0] * ldr32(s[13]));
+                f[0] = xn3(f[0], ldnr(s[13]), f[0] * ldnr(s[13]));
                 // cee94a fsub dword ptr [esp + 0x14]
-                f[0] = xn3(f[0], ldr32(s[14]), f[0] - ldr32(s[14]));
+                f[0] = xn3(f[0], ldnr(s[14]), f[0] - ldnr(s[14]));
                 // cee94e fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // cee950 ret 0x14
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
+                w.d((a as usize) + 8, s[12]);
+                w.d((a as usize) + 12, s[13]);
+                w.d((a as usize) + 16, s[14]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -12091,7 +12754,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee953 fld dword ptr [ecx + 0x10]
                 f[4] = ldq(rd((ecx.wrapping_add(0x10)) as usize));
                 // cee956 fstp dword ptr [esp + 0x18]
-                s[14] = (f[4] as f32).to_bits();
+                s[14] = stf(f[4]);
                 // cee95a fld dword ptr [esp + 0x18]
                 f[4] = ldq(s[14]);
                 // cee95e fcomi st(3)
@@ -12117,15 +12780,15 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee96f fxch st(1)
                 f.swap(3, 2);
                 // cee971 fstp dword ptr [esp + 0x10]
-                s[13] = (f[3] as f32).to_bits();
+                s[13] = stf(f[3]);
                 // cee975 fld dword ptr [ecx + 0x24]
                 f[3] = ldq(rd((ecx.wrapping_add(0x24)) as usize));
                 // cee978 fstp dword ptr [esp + 0x14]
-                s[14] = (f[3] as f32).to_bits();
+                s[14] = stf(f[3]);
                 // cee97c fld dword ptr [ecx + 0x14]
                 f[3] = ldq(rd((ecx.wrapping_add(0x14)) as usize));
                 // cee97f fstp dword ptr [esp + 0xc]
-                s[12] = (f[3] as f32).to_bits();
+                s[12] = stf(f[3]);
                 // cee983 fld dword ptr [ecx + 0x28]
                 f[3] = ldq(rd((ecx.wrapping_add(0x28)) as usize));
                 // cee986 fld dword ptr [esp + 0x14]
@@ -12143,7 +12806,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee996 fxch st(2)
                 f.swap(5, 3);
                 // cee998 fstp dword ptr [esp + 0x14]
-                s[14] = (f[5] as f32).to_bits();
+                s[14] = stf(f[5]);
                 // cee99c fld dword ptr [esp + 0x14]
                 f[5] = ldq(s[14]);
                 // cee9a0 fmul st(4)
@@ -12159,7 +12822,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee9ac fxch st(1)
                 f.swap(5, 4);
                 // cee9ae fstp dword ptr [esp + 0x14]
-                s[14] = (f[5] as f32).to_bits();
+                s[14] = stf(f[5]);
                 // cee9b2 fld dword ptr [ecx + 0x1c]
                 f[5] = ldq(rd((ecx.wrapping_add(0x1c)) as usize));
                 // cee9b5 fsub st(3)
@@ -12171,7 +12834,7 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee9bb fxch st(1)
                 f.swap(4, 3);
                 // cee9bd fstp dword ptr [esp + 0x10]
-                s[13] = (f[4] as f32).to_bits();
+                s[13] = stf(f[4]);
                 // cee9c1 fld dword ptr [esp + 0x10]
                 f[4] = ldq(s[13]);
                 // cee9c5 fld st(3)
@@ -12187,14 +12850,20 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee9cf fmulp st(1)
                 f[1] = xn3(f[1], f[2], f[1] * f[2]);
                 // cee9d1 fstp dword ptr [esp + 0x10]
-                s[13] = (f[1] as f32).to_bits();
+                s[13] = stf(f[1]);
                 // cee9d5 fmul dword ptr [esp + 0x10]
-                f[0] = xn3(f[0], ldr32(s[13]), f[0] * ldr32(s[13]));
+                f[0] = xn3(f[0], ldnr(s[13]), f[0] * ldnr(s[13]));
                 // cee9d9 fsub dword ptr [esp + 0x14]
-                f[0] = xn3(f[0], ldr32(s[14]), f[0] - ldr32(s[14]));
+                f[0] = xn3(f[0], ldnr(s[14]), f[0] - ldnr(s[14]));
                 // cee9dd fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // cee9df ret 0x14
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
+                w.d((a as usize) + 8, s[12]);
+                w.d((a as usize) + 12, s[13]);
+                w.d((a as usize) + 16, s[14]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -12213,18 +12882,24 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee9f9 movss dword ptr [esp + 0x14], xmm0
                 s[13] = x[0][0];
                 // cee9ff fmul dword ptr [ecx + 0x14]
-                f[1] = xn3(f[1], ldr32(rd((ecx.wrapping_add(0x14)) as usize)), f[1] * ldr32(rd((ecx.wrapping_add(0x14)) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((ecx.wrapping_add(0x14)) as usize)), f[1] * ldnr(rd((ecx.wrapping_add(0x14)) as usize)));
                 // ceea02 pop esi
                 esi = s[8];
                 // ceea03 fstp dword ptr [esp + 0x14]
-                s[14] = (f[1] as f32).to_bits();
+                s[14] = stf(f[1]);
                 // ceea07 fmul dword ptr [esp + 0x10]
-                f[0] = xn3(f[0], ldr32(s[13]), f[0] * ldr32(s[13]));
+                f[0] = xn3(f[0], ldnr(s[13]), f[0] * ldnr(s[13]));
                 // ceea0b fsub dword ptr [esp + 0x14]
-                f[0] = xn3(f[0], ldr32(s[14]), f[0] - ldr32(s[14]));
+                f[0] = xn3(f[0], ldnr(s[14]), f[0] - ldnr(s[14]));
                 // ceea0f fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // ceea11 ret 0x14
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
+                w.d((a as usize) + 8, s[12]);
+                w.d((a as usize) + 12, s[13]);
+                w.d((a as usize) + 16, s[14]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -12233,12 +12908,18 @@ fn g3_cee7e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceea16 pop esi
                 esi = s[8];
                 // ceea17 fmul dword ptr [esp + 0x10]
-                f[0] = xn3(f[0], ldr32(s[13]), f[0] * ldr32(s[13]));
+                f[0] = xn3(f[0], ldnr(s[13]), f[0] * ldnr(s[13]));
                 // ceea1b fsub dword ptr [esp + 0x14]
-                f[0] = xn3(f[0], ldr32(s[14]), f[0] - ldr32(s[14]));
+                f[0] = xn3(f[0], ldnr(s[14]), f[0] - ldnr(s[14]));
                 // ceea1f fstp dword ptr [edx]
-                w.d((edx) as usize, (f[0] as f32).to_bits());
+                w.d((edx) as usize, stf(f[0]));
                 // ceea21 ret 0x14
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
+                w.d((a as usize) + 8, s[12]);
+                w.d((a as usize) + 12, s[13]);
+                w.d((a as usize) + 16, s[14]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -12256,7 +12937,7 @@ fn g3_ceeb40(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[11] = unsafe { *a.add(2) };
     s[12] = unsafe { *a.add(3) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xceeb40u32;
@@ -12300,7 +12981,7 @@ fn g3_ceeb40(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceeb70 xorps xmm1, xmm1
                 { let b_ = x[1]; let a_ = x[1]; x[1] = bitop4(0, a_, b_); }
                 // ceeb73 comiss xmm1, xmm0
-                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[0]; fl = fl_fcomi(ldf(x[1][0]), ldf(b_[0])); }
                 // ceeb76 movss dword ptr [esp + 0xc], xmm0
                 s[11] = x[0][0];
                 // ceeb7c jbe 0xceeb83
@@ -12310,6 +12991,11 @@ fn g3_ceeb40(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceeb7e fldz 
                 f[0] = 0.0;
                 // ceeb80 ret 0x10
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
+                w.d((a as usize) + 8, s[11]);
+                w.d((a as usize) + 12, s[12]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -12317,6 +13003,11 @@ fn g3_ceeb40(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceeb83 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[11]);
                 // ceeb87 ret 0x10
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
+                w.d((a as usize) + 8, s[11]);
+                w.d((a as usize) + 12, s[12]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -12334,7 +13025,7 @@ fn g3_ceeb90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[11] = unsafe { *a.add(2) };
     s[12] = unsafe { *a.add(3) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xceeb90u32;
@@ -12393,12 +13084,17 @@ fn g3_ceeb90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceebd0 fld1 
                 f[0] = 1.0;
                 // ceebd2 ret 0x10
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
+                w.d((a as usize) + 8, s[11]);
+                w.d((a as usize) + 12, s[12]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
             0xceebd5 => {
                 // ceebd5 comiss xmm0, dword ptr [0xdd32c0]
-                { let b_ = [rd((0xdd32c0u32) as usize), 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = [rd((0xdd32c0u32) as usize), 0, 0, 0]; fl = fl_fcomi(ldf(x[0][0]), ldf(b_[0])); }
                 // ceebdc jbe 0xceebe3
                 pc = if (fl.cf || fl.zf) { 0xceebe3 } else { 0xceebde };
             }
@@ -12406,6 +13102,11 @@ fn g3_ceeb90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceebde fldz 
                 f[0] = 0.0;
                 // ceebe0 ret 0x10
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
+                w.d((a as usize) + 8, s[11]);
+                w.d((a as usize) + 12, s[12]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -12415,10 +13116,15 @@ fn g3_ceeb90(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceebe7 fmul qword ptr [0xe5c180]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5c180u32) as usize)), f[0] * f64::from_bits(rq((0xe5c180u32) as usize)));
                 // ceebed fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // ceebf1 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[11]);
                 // ceebf5 ret 0x10
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
+                w.d((a as usize) + 8, s[11]);
+                w.d((a as usize) + 12, s[12]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -12434,7 +13140,7 @@ fn g3_cf20a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[9] = unsafe { *a.add(0) };
     s[10] = unsafe { *a.add(1) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xcf20a0u32;
@@ -12458,12 +13164,15 @@ fn g3_cf20a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cf20ba movss dword ptr [esp + 8], xmm0
                 s[10] = x[0][0];
                 // cf20c0 fmul dword ptr [esp + 8]
-                f[0] = xn3(f[0], ldr32(s[10]), f[0] * ldr32(s[10]));
+                f[0] = xn3(f[0], ldnr(s[10]), f[0] * ldnr(s[10]));
                 // cf20c4 fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // cf20c8 fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // cf20cc ret 8
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -12479,12 +13188,15 @@ fn g3_cf20a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cf20de movss dword ptr [esp + 8], xmm0
                 s[10] = x[0][0];
                 // cf20e4 fmul dword ptr [esp + 8]
-                f[0] = xn3(f[0], ldr32(s[10]), f[0] * ldr32(s[10]));
+                f[0] = xn3(f[0], ldnr(s[10]), f[0] * ldnr(s[10]));
                 // cf20e8 fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // cf20ec fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // cf20f0 ret 8
+                w.d((a as usize) + 0, s[9]);
+                w.d((a as usize) + 4, s[10]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -12574,11 +13286,11 @@ fn g3_cfdd80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfddcf mov dword ptr [eax + 0x18], edi
                 w.d((eax.wrapping_add(0x18)) as usize, edi);
                 // cfddd2 fst dword ptr [eax + 0x34]
-                w.d((eax.wrapping_add(0x34)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x34)) as usize, stf(f[0]));
                 // cfddd5 fst dword ptr [eax + 0x38]
-                w.d((eax.wrapping_add(0x38)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x38)) as usize, stf(f[0]));
                 // cfddd8 fstp dword ptr [eax + 0x3c]
-                w.d((eax.wrapping_add(0x3c)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x3c)) as usize, stf(f[0]));
                 // cfdddb mov edi, dword ptr [esi]
                 edi = rd((esi) as usize);
                 // cfdddd fld dword ptr [esp + 0x14]
@@ -12604,7 +13316,7 @@ fn g3_cfdd80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfddfb mov edx, dword ptr [edx + 8]
                 edx = rd((edx.wrapping_add(0x8)) as usize);
                 // cfddfe fstp dword ptr [eax + 0x44]
-                w.d((eax.wrapping_add(0x44)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x44)) as usize, stf(f[0]));
                 // cfde01 fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[14]);
                 // cfde05 mov dword ptr [eax + 0x30], edx
@@ -12612,13 +13324,13 @@ fn g3_cfdd80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfde08 mov edx, dword ptr [esp + 0x28]
                 edx = s[18];
                 // cfde0c fstp dword ptr [eax + 0x48]
-                w.d((eax.wrapping_add(0x48)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x48)) as usize, stf(f[0]));
                 // cfde0f fld dword ptr [esp + 0x1c]
                 f[0] = ldq(s[15]);
                 // cfde13 mov dword ptr [eax + 0xc], edx
                 w.d((eax.wrapping_add(0xc)) as usize, edx);
                 // cfde16 fstp dword ptr [eax + 0x4c]
-                w.d((eax.wrapping_add(0x4c)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x4c)) as usize, stf(f[0]));
                 // cfde19 mov edx, ecx
                 edx = ecx;
                 // cfde1b fld dword ptr [esp + 0x20]
@@ -12630,7 +13342,7 @@ fn g3_cfdd80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfde25 pop edi
                 edi = s[8];
                 // cfde26 fstp dword ptr [eax + 0x50]
-                w.d((eax.wrapping_add(0x50)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x50)) as usize, stf(f[0]));
                 // cfde29 add ecx, 1
                 let (r_, f_) = fl_add(ecx, 0x1u32, 32); fl = f_;
                 ecx = r_;
@@ -12645,6 +13357,14 @@ fn g3_cfdd80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfde38 pop ebx
                 ebx = s[10];
                 // cfde39 ret 
+                w.d((a as usize) + 0, s[12]);
+                w.d((a as usize) + 4, s[13]);
+                w.d((a as usize) + 8, s[14]);
+                w.d((a as usize) + 12, s[15]);
+                w.d((a as usize) + 16, s[16]);
+                w.d((a as usize) + 20, s[17]);
+                w.d((a as usize) + 24, s[18]);
+                w.d((a as usize) + 28, s[19]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -12660,6 +13380,14 @@ fn g3_cfdd80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfde3f pop ebx
                 ebx = s[10];
                 // cfde40 ret 
+                w.d((a as usize) + 0, s[12]);
+                w.d((a as usize) + 4, s[13]);
+                w.d((a as usize) + 8, s[14]);
+                w.d((a as usize) + 12, s[15]);
+                w.d((a as usize) + 16, s[16]);
+                w.d((a as usize) + 20, s[17]);
+                w.d((a as usize) + 24, s[18]);
+                w.d((a as usize) + 28, s[19]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -12742,13 +13470,13 @@ fn g3_cfde50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfde9a mov dword ptr [eax + 0x18], esi
                 w.d((eax.wrapping_add(0x18)) as usize, esi);
                 // cfde9d fst dword ptr [eax + 0x1c]
-                w.d((eax.wrapping_add(0x1c)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x1c)) as usize, stf(f[0]));
                 // cfdea0 fst dword ptr [eax + 0x20]
-                w.d((eax.wrapping_add(0x20)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x20)) as usize, stf(f[0]));
                 // cfdea3 pop edi
                 edi = s[8];
                 // cfdea4 fst dword ptr [eax + 0x24]
-                w.d((eax.wrapping_add(0x24)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x24)) as usize, stf(f[0]));
                 // cfdea7 mov esi, dword ptr [edx]
                 esi = rd((edx) as usize);
                 // cfdea9 mov dword ptr [eax + 0x28], esi
@@ -12762,13 +13490,13 @@ fn g3_cfde50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfdeb5 mov dword ptr [eax + 0x30], edx
                 w.d((eax.wrapping_add(0x30)) as usize, edx);
                 // cfdeb8 fst dword ptr [eax + 0x34]
-                w.d((eax.wrapping_add(0x34)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x34)) as usize, stf(f[0]));
                 // cfdebb mov edx, dword ptr [esp + 0x14]
                 edx = s[14];
                 // cfdebf fst dword ptr [eax + 0x38]
-                w.d((eax.wrapping_add(0x38)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x38)) as usize, stf(f[0]));
                 // cfdec2 fstp dword ptr [eax + 0x3c]
-                w.d((eax.wrapping_add(0x3c)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x3c)) as usize, stf(f[0]));
                 // cfdec5 mov dword ptr [eax + 0xc], edx
                 w.d((eax.wrapping_add(0xc)) as usize, edx);
                 // cfdec8 fld dword ptr [esp + 0xc]
@@ -12776,7 +13504,7 @@ fn g3_cfde50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfdecc mov edx, ecx
                 edx = ecx;
                 // cfdece fstp dword ptr [eax + 0x44]
-                w.d((eax.wrapping_add(0x44)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x44)) as usize, stf(f[0]));
                 // cfded1 or edx, 0xc0000000
                 let r_ = (edx) | (0xc0000000u32);
                 fl = fl_logic(r_, 32);
@@ -12787,7 +13515,7 @@ fn g3_cfde50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 let (r_, f_) = fl_add(ecx, 0x1u32, 32); fl = f_;
                 ecx = r_;
                 // cfdede fstp dword ptr [eax + 0x48]
-                w.d((eax.wrapping_add(0x48)) as usize, (f[0] as f32).to_bits());
+                w.d((eax.wrapping_add(0x48)) as usize, stf(f[0]));
                 // cfdee1 mov dword ptr [eax + 4], edx
                 w.d((eax.wrapping_add(0x4)) as usize, edx);
                 // cfdee4 mov dword ptr [0x252a364], ecx
@@ -12797,6 +13525,11 @@ fn g3_cfde50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfdeec pop esi
                 esi = s[9];
                 // cfdeed ret 
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
+                w.d((a as usize) + 8, s[13]);
+                w.d((a as usize) + 12, s[14]);
+                w.d((a as usize) + 16, s[15]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -12810,6 +13543,11 @@ fn g3_cfde50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cfdef2 pop esi
                 esi = s[9];
                 // cfdef3 ret 
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
+                w.d((a as usize) + 8, s[13]);
+                w.d((a as usize) + 12, s[14]);
+                w.d((a as usize) + 16, s[15]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -12953,7 +13691,7 @@ fn g3_d2bad0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[11] = unsafe { *a.add(1) };
     s[12] = unsafe { *a.add(2) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd2bad0u32;
@@ -12991,6 +13729,10 @@ fn g3_d2bad0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d2baf2 pop ebp
                 ebp = s[8];
                 // d2baf3 ret 0xc
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
+                w.d((a as usize) + 8, s[12]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13002,12 +13744,16 @@ fn g3_d2bad0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d2bb03 xorps xmm0, xmm0
                 { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
                 // d2bb06 movaps xmmword ptr [ecx + 0x20], xmm0
-                { let v_: [u32; 4] = x[0]; let a_ = (ecx.wrapping_add(0x20)) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                { let v_: [u32; 4] = x[0]; let a_ = chk_align16((ecx.wrapping_add(0x20)) as usize); w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
                 // d2bb0a mov esp, ebp
                 // mov esp, ebp
                 // d2bb0c pop ebp
                 ebp = s[8];
                 // d2bb0d ret 0xc
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
+                w.d((a as usize) + 8, s[12]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13024,7 +13770,7 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[23] = unsafe { *a.add(1) };
     s[24] = unsafe { *a.add(2) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd38770u32;
@@ -13041,9 +13787,9 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d38779 mov eax, dword ptr [ebp + 0xc]
                 eax = s[23];
                 // d3877c movaps xmm1, xmmword ptr [ecx + 0x10]
-                x[1] = rx((ecx.wrapping_add(0x10)) as usize);
+                x[1] = rxa((ecx.wrapping_add(0x10)) as usize);
                 // d38780 movaps xmm3, xmmword ptr [eax]
-                x[3] = rx((eax) as usize);
+                x[3] = rxa((eax) as usize);
                 // d38783 movaps xmm0, xmm3
                 x[0] = x[3];
                 // d38786 mulps xmm0, xmm1
@@ -13065,13 +13811,13 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d387a3 addps xmm2, xmm1
                 { let b_ = x[1]; x[2] = sse_arith(8, x[2], b_); }
                 // d387a6 movaps xmm1, xmmword ptr [ecx + 0x10]
-                x[1] = rx((ecx.wrapping_add(0x10)) as usize);
+                x[1] = rxa((ecx.wrapping_add(0x10)) as usize);
                 // d387aa movaps xmm0, xmm1
                 x[0] = x[1];
                 // d387ad movss dword ptr [esp + 0x10], xmm2
                 s[12] = x[2][0];
                 // d387b3 movaps xmm2, xmmword ptr [eax + 0x10]
-                x[2] = rx((eax.wrapping_add(0x10)) as usize);
+                x[2] = rxa((eax.wrapping_add(0x10)) as usize);
                 // d387b7 mulps xmm0, xmm2
                 { let b_ = x[2]; x[0] = sse_arith(10, x[0], b_); }
                 // d387ba shufps xmm1, xmm1, 0xff
@@ -13095,7 +13841,7 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d387da movss xmm1, dword ptr [esp + 0x10]
                 x[1] = [s[12], 0, 0, 0];
                 // d387e0 comiss xmm1, xmm0
-                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[0]; fl = fl_fcomi(ldf(x[1][0]), ldf(b_[0])); }
                 // d387e3 movss dword ptr [esp + 0x20], xmm4
                 s[16] = x[4][0];
                 // d387e9 jb 0xd38870
@@ -13103,7 +13849,7 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xd387ef => {
                 // d387ef comiss xmm0, dword ptr [esp + 0x20]
-                { let b_ = [s[16], 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = [s[16], 0, 0, 0]; fl = fl_fcomi(ldf(x[0][0]), ldf(b_[0])); }
                 // d387f4 jbe 0xd38870
                 pc = if (fl.cf || fl.zf) { 0xd38870 } else { 0xd387f6 };
             }
@@ -13111,7 +13857,7 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d387f6 fld dword ptr [esp + 0x10]
                 f[0] = ldq(s[12]);
                 // d387fa movaps xmm4, xmmword ptr [0xe18ab0]
-                x[4] = rx((0xe18ab0u32) as usize);
+                x[4] = rxa((0xe18ab0u32) as usize);
                 // d38801 fld dword ptr [esp + 0x20]
                 f[1] = ldq(s[16]);
                 // d38805 fsubr st(1)
@@ -13119,7 +13865,7 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d38807 fdivp st(1)
                 f[0] = xn3(f[0], f[1], f[0] / f[1]);
                 // d38809 fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // d3880d movss xmm1, dword ptr [esp + 0xc]
                 x[1] = [s[11], 0, 0, 0];
                 // d38813 movss xmm0, xmm1
@@ -13133,17 +13879,17 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d38821 mulps xmm2, xmm0
                 { let b_ = x[0]; x[2] = sse_arith(10, x[2], b_); }
                 // d38824 movaps xmm0, xmmword ptr [ecx + 0x20]
-                x[0] = rx((ecx.wrapping_add(0x20)) as usize);
+                x[0] = rxa((ecx.wrapping_add(0x20)) as usize);
                 // d38828 addps xmm4, xmm2
                 { let b_ = x[2]; x[4] = sse_arith(8, x[4], b_); }
                 // d3882b subps xmm4, xmm0
                 { let b_ = x[0]; x[4] = sse_arith(9, x[4], b_); }
                 // d3882e movaps xmm0, xmmword ptr [0xe18c90]
-                x[0] = rx((0xe18c90u32) as usize);
+                x[0] = rxa((0xe18c90u32) as usize);
                 // d38835 andps xmm4, xmm0
                 { let b_ = x[0]; let a_ = x[4]; x[4] = bitop4(1, a_, b_); }
                 // d38838 movaps xmm0, xmmword ptr [ecx + 0x30]
-                x[0] = rx((ecx.wrapping_add(0x30)) as usize);
+                x[0] = rxa((ecx.wrapping_add(0x30)) as usize);
                 // d3883c cmpleps xmm4, xmm0
                 { let b_ = x[0]; x[4] = sse_cmp(2, x[4], b_, false); }
                 // d38840 movmskps eax, xmm4
@@ -13163,11 +13909,11 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3884d movss dword ptr [eax + 0x10], xmm1
                 w.d((eax.wrapping_add(0x10)) as usize, x[1][0]);
                 // d38852 movaps xmm0, xmmword ptr [ecx + 0x10]
-                x[0] = rx((ecx.wrapping_add(0x10)) as usize);
+                x[0] = rxa((ecx.wrapping_add(0x10)) as usize);
                 // d38856 mov ecx, dword ptr [eax + 0x40]
                 ecx = rd((eax.wrapping_add(0x40)) as usize);
                 // d38859 movaps xmmword ptr [eax], xmm0
-                { let v_: [u32; 4] = x[0]; let a_ = (eax) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                { let v_: [u32; 4] = x[0]; let a_ = chk_align16((eax) as usize); w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
                 // d3885c mov dword ptr [eax + ecx*4 + 0x20], 0xffffffff
                 w.d((eax.wrapping_add(ecx.wrapping_mul(4)).wrapping_add(0x20)) as usize, 0xffffffffu32);
                 // d38864 mov eax, dword ptr [ebp + 8]
@@ -13179,6 +13925,10 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3886c pop ebp
                 ebp = s[20];
                 // d3886d ret 0xc
+                w.d((a as usize) + 0, s[22]);
+                w.d((a as usize) + 4, s[23]);
+                w.d((a as usize) + 8, s[24]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13192,6 +13942,10 @@ fn g3_d38770(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d38878 pop ebp
                 ebp = s[20];
                 // d38879 ret 0xc
+                w.d((a as usize) + 0, s[22]);
+                w.d((a as usize) + 4, s[23]);
+                w.d((a as usize) + 8, s[24]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13208,7 +13962,7 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[31] = unsafe { *a.add(1) };
     s[32] = unsafe { *a.add(2) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd3e470u32;
@@ -13254,11 +14008,11 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3e4ae fld dword ptr [esp + 0x14]
                 f[0] = ldq(s[13]);
                 // d3e4b2 movaps xmm4, xmmword ptr [eax]
-                x[4] = rx((eax) as usize);
+                x[4] = rxa((eax) as usize);
                 // d3e4b5 fld dword ptr [esp + 0x18]
                 f[1] = ldq(s[14]);
                 // d3e4b9 movaps xmm5, xmmword ptr [eax + 0x10]
-                x[5] = rx((eax.wrapping_add(0x10)) as usize);
+                x[5] = rxa((eax.wrapping_add(0x10)) as usize);
                 // d3e4bd xorps xmm3, xmm3
                 { let b_ = x[3]; let a_ = x[3]; x[3] = bitop4(0, a_, b_); }
                 // d3e4c0 mov esi, edx
@@ -13279,7 +14033,7 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xd3e4cc => {
                 // d3e4cc movaps xmm1, xmmword ptr [esi]
-                x[1] = rx((esi) as usize);
+                x[1] = rxa((esi) as usize);
                 // d3e4cf movaps xmm0, xmm1
                 x[0] = x[1];
                 // d3e4d2 mulps xmm0, xmm4
@@ -13327,7 +14081,7 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3e520 movss dword ptr [esp + 0x20], xmm6
                 s[16] = x[6][0];
                 // d3e526 comiss xmm0, xmm3
-                { let b_ = x[3]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[3]; fl = fl_fcomi(ldf(x[0][0]), ldf(b_[0])); }
                 // d3e529 movss xmm0, dword ptr [esp + 0x20]
                 x[0] = [s[16], 0, 0, 0];
                 // d3e52f jb 0xd3e56b
@@ -13335,7 +14089,7 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xd3e531 => {
                 // d3e531 comiss xmm0, xmm3
-                { let b_ = x[3]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[3]; fl = fl_fcomi(ldf(x[0][0]), ldf(b_[0])); }
                 // d3e534 jae 0xd3e5f7
                 pc = if !fl.cf { 0xd3e5f7 } else { 0xd3e53a };
             }
@@ -13349,7 +14103,7 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3e544 fdivp st(1)
                 f[2] = xn3(f[2], f[3], f[2] / f[3]);
                 // d3e546 fstp dword ptr [esp + 0x1c]
-                s[15] = (f[2] as f32).to_bits();
+                s[15] = stf(f[2]);
                 // d3e54a fld dword ptr [esp + 0x1c]
                 f[2] = ldq(s[15]);
                 // d3e54e fcompi st(2)
@@ -13373,7 +14127,7 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xd3e56b => {
                 // d3e56b comiss xmm0, xmm3
-                { let b_ = x[3]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[3]; fl = fl_fcomi(ldf(x[0][0]), ldf(b_[0])); }
                 // d3e56e jb 0xd3e5b2
                 pc = if fl.cf { 0xd3e5b2 } else { 0xd3e570 };
             }
@@ -13387,7 +14141,7 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3e57a fdivp st(1)
                 f[2] = xn3(f[2], f[3], f[2] / f[3]);
                 // d3e57c fstp dword ptr [esp + 0x1c]
-                s[15] = (f[2] as f32).to_bits();
+                s[15] = stf(f[2]);
                 // d3e580 fld dword ptr [esp + 0x1c]
                 f[2] = ldq(s[15]);
                 // d3e584 fcompi st(1)
@@ -13433,6 +14187,10 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3e5ae pop ebp
                 ebp = s[28];
                 // d3e5af ret 0xc
+                w.d((a as usize) + 0, s[30]);
+                w.d((a as usize) + 4, s[31]);
+                w.d((a as usize) + 8, s[32]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13460,7 +14218,7 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3e5c8 fstp st(1)
                 f[0] = f[1];
                 // d3e5ca comiss xmm3, xmm0
-                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[3][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[0]; fl = fl_fcomi(ldf(x[3][0]), ldf(b_[0])); }
                 // d3e5cd fstp st(0)
                 // d3e5cf ja 0xd3e5fb
                 pc = if (!fl.cf && !fl.zf) { 0xd3e5fb } else { 0xd3e5d1 };
@@ -13471,7 +14229,7 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3e5d4 movaps xmm1, xmmword ptr [esp + 0x40]
                 x[1] = [s[24], s[25], s[26], s[27]];
                 // d3e5d9 movaps xmmword ptr [edi], xmm1
-                { let v_: [u32; 4] = x[1]; let a_ = (edi) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                { let v_: [u32; 4] = x[1]; let a_ = chk_align16((edi) as usize); w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
                 // d3e5dc movss dword ptr [edi + 0x10], xmm0
                 w.d((edi.wrapping_add(0x10)) as usize, x[0][0]);
                 // d3e5e1 mov dword ptr [edi + eax*4 + 0x20], 0xffffffff
@@ -13489,6 +14247,10 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3e5f3 pop ebp
                 ebp = s[28];
                 // d3e5f4 ret 0xc
+                w.d((a as usize) + 0, s[30]);
+                w.d((a as usize) + 4, s[31]);
+                w.d((a as usize) + 8, s[32]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13511,6 +14273,10 @@ fn g3_d3e470(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3e605 pop ebp
                 ebp = s[28];
                 // d3e606 ret 0xc
+                w.d((a as usize) + 0, s[30]);
+                w.d((a as usize) + 4, s[31]);
+                w.d((a as usize) + 8, s[32]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13526,7 +14292,7 @@ fn g3_d3f650(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[14] = unsafe { *a.add(0) };
     s[15] = unsafe { *a.add(1) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd3f650u32;
@@ -13541,13 +14307,13 @@ fn g3_d3f650(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // and esp, -N (alignment is not modelled)
                 // d3f656 sub esp, 0x10
                 // d3f659 movaps xmm1, xmmword ptr [ecx + 0x30]
-                x[1] = rx((ecx.wrapping_add(0x30)) as usize);
+                x[1] = rxa((ecx.wrapping_add(0x30)) as usize);
                 // d3f65d movaps xmm2, xmmword ptr [ecx + 0x20]
-                x[2] = rx((ecx.wrapping_add(0x20)) as usize);
+                x[2] = rxa((ecx.wrapping_add(0x20)) as usize);
                 // d3f661 mov eax, dword ptr [ebp + 8]
                 eax = s[14];
                 // d3f664 movaps xmm3, xmmword ptr [eax]
-                x[3] = rx((eax) as usize);
+                x[3] = rxa((eax) as usize);
                 // d3f667 mov ecx, dword ptr [ebp + 0xc]
                 ecx = s[15];
                 // d3f66a movaps xmm0, xmm1
@@ -13573,7 +14339,7 @@ fn g3_d3f650(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3f68c movss dword ptr [esp], xmm4
                 s[8] = x[4][0];
                 // d3f691 comiss xmm0, dword ptr [esp]
-                { let b_ = [s[8], 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = [s[8], 0, 0, 0]; fl = fl_fcomi(ldf(x[0][0]), ldf(b_[0])); }
                 // d3f695 jbe 0xd3f6aa
                 pc = if (fl.cf || fl.zf) { 0xd3f6aa } else { 0xd3f697 };
             }
@@ -13586,7 +14352,7 @@ fn g3_d3f650(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fl = fl_logic(r_, 32);
                 eax = r_;
                 // d3f69e movaps xmmword ptr [ecx], xmm2
-                { let v_: [u32; 4] = x[2]; let a_ = (ecx) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                { let v_: [u32; 4] = x[2]; let a_ = chk_align16((ecx) as usize); w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
                 // d3f6a1 mov dword ptr [ecx + 0xc], eax
                 w.d((ecx.wrapping_add(0xc)) as usize, eax);
                 // d3f6a4 mov esp, ebp
@@ -13594,6 +14360,9 @@ fn g3_d3f650(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3f6a6 pop ebp
                 ebp = s[12];
                 // d3f6a7 ret 8
+                w.d((a as usize) + 0, s[14]);
+                w.d((a as usize) + 4, s[15]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13605,7 +14374,7 @@ fn g3_d3f650(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fl = fl_logic(r_, 32);
                 eax = r_;
                 // d3f6b4 movaps xmmword ptr [ecx], xmm1
-                { let v_: [u32; 4] = x[1]; let a_ = (ecx) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                { let v_: [u32; 4] = x[1]; let a_ = chk_align16((ecx) as usize); w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
                 // d3f6b7 mov dword ptr [ecx + 0xc], eax
                 w.d((ecx.wrapping_add(0xc)) as usize, eax);
                 // d3f6ba mov esp, ebp
@@ -13613,6 +14382,9 @@ fn g3_d3f650(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3f6bc pop ebp
                 ebp = s[12];
                 // d3f6bd ret 8
+                w.d((a as usize) + 0, s[14]);
+                w.d((a as usize) + 4, s[15]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13627,7 +14399,7 @@ fn g3_d47dc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let mut s = [0u32; 21];
     s[9] = unsafe { *a.add(0) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd47dc0u32;
@@ -13639,7 +14411,7 @@ fn g3_d47dc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d47dc5 xorps xmm0, xmm0
                 { let b_ = x[0]; let a_ = x[0]; x[0] = bitop4(0, a_, b_); }
                 // d47dc8 comiss xmm1, xmm0
-                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[0]; fl = fl_fcomi(ldf(x[1][0]), ldf(b_[0])); }
                 // d47dcb jbe 0xd47de2
                 pc = if (fl.cf || fl.zf) { 0xd47de2 } else { 0xd47dcd };
             }
@@ -13647,7 +14419,7 @@ fn g3_d47dc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d47dcd movss xmm1, dword ptr [ecx + 0x74]
                 x[1] = [rd((ecx.wrapping_add(0x74)) as usize), 0, 0, 0];
                 // d47dd2 comiss xmm1, xmm0
-                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[0]; fl = fl_fcomi(ldf(x[1][0]), ldf(b_[0])); }
                 // d47dd5 jbe 0xd47de2
                 pc = if (fl.cf || fl.zf) { 0xd47de2 } else { 0xd47dd7 };
             }
@@ -13659,6 +14431,8 @@ fn g3_d47dc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d47ddd mov byte ptr [eax], cl
                 w.b((eax) as usize, ((ecx & 0xff)) as u8);
                 // d47ddf ret 4
+                w.d((a as usize) + 0, s[9]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13671,6 +14445,8 @@ fn g3_d47dc0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d47de8 mov byte ptr [eax], cl
                 w.b((eax) as usize, ((ecx & 0xff)) as u8);
                 // d47dea ret 4
+                w.d((a as usize) + 0, s[9]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13685,7 +14461,7 @@ fn g3_d489c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let mut s = [0u32; 21];
     s[9] = unsafe { *a.add(0) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd489c0u32;
@@ -13695,7 +14471,7 @@ fn g3_d489c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d489c0 movss xmm0, dword ptr [ecx + 0x44]
                 x[0] = [rd((ecx.wrapping_add(0x44)) as usize), 0, 0, 0];
                 // d489c5 comiss xmm0, dword ptr [0xdd32c0]
-                { let b_ = [rd((0xdd32c0u32) as usize), 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = [rd((0xdd32c0u32) as usize), 0, 0, 0]; fl = fl_fcomi(ldf(x[0][0]), ldf(b_[0])); }
                 // d489cc mov eax, dword ptr [esp + 4]
                 eax = s[9];
                 // d489d0 jbe 0xd489d9
@@ -13707,6 +14483,8 @@ fn g3_d489c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d489d4 mov byte ptr [eax], cl
                 w.b((eax) as usize, ((ecx & 0xff)) as u8);
                 // d489d6 ret 4
+                w.d((a as usize) + 0, s[9]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13717,6 +14495,8 @@ fn g3_d489c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d489db mov byte ptr [eax], cl
                 w.b((eax) as usize, ((ecx & 0xff)) as u8);
                 // d489dd ret 4
+                w.d((a as usize) + 0, s[9]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -13745,7 +14525,7 @@ fn g3_493b80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 493b8b mov dword ptr [0x25f5b20], ecx
                 w.d((0x25f5b20u32) as usize, ecx);
                 // 493b91 fstp dword ptr [esp + 4]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // 493b95 mov edx, dword ptr [eax + 4]
                 edx = rd((eax.wrapping_add(0x4)) as usize);
                 // 493b98 fld dword ptr [0x25f5b18]
@@ -13753,7 +14533,7 @@ fn g3_493b80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 493b9e mov dword ptr [0x25f5b24], edx
                 w.d((0x25f5b24u32) as usize, edx);
                 // 493ba4 fstp dword ptr [esp + 8]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // 493ba8 mov ecx, dword ptr [eax + 8]
                 ecx = rd((eax.wrapping_add(0x8)) as usize);
                 // 493bab fld dword ptr [0x25f5b1c]
@@ -13761,7 +14541,7 @@ fn g3_493b80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 493bb1 mov dword ptr [0x25f5b28], ecx
                 w.d((0x25f5b28u32) as usize, ecx);
                 // 493bb7 fstp dword ptr [esp + 0xc]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // 493bbb mov edx, dword ptr [eax]
                 edx = rd((eax) as usize);
                 // 493bbd mov dword ptr [0x25f5b14], edx
@@ -13783,7 +14563,7 @@ fn g3_493b80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 493bdf call 0xbde980
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xbde980, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // 493be4 fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 493be8 fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // 493bec add esp, 8
@@ -13801,7 +14581,7 @@ fn g3_493b80(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x493bfe => {
                 // 493bfe fstp dword ptr [0x2526be8]
-                w.d((0x2526be8u32) as usize, (f[0] as f32).to_bits());
+                w.d((0x2526be8u32) as usize, stf(f[0]));
                 // 493c04 add esp, 0x10
                 // 493c07 ret 
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
@@ -13842,31 +14622,31 @@ fn g3_495590(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 49559b mov edi, dword ptr [0x21703d4]
                 edi = rd((0x21703d4u32) as usize);
                 // 4955a1 fsub dword ptr [edi + 0x14]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x14)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x14)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x14)) as usize)), f[0] - ldnr(rd((edi.wrapping_add(0x14)) as usize)));
                 // 4955a4 mov esi, 0x25f62e8
                 esi = 0x25f62e8u32;
                 // 4955a9 fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // 4955ad mov eax, dword ptr [esp + 0xc]
                 eax = s[11];
                 // 4955b1 fld dword ptr [0x25f5b30]
                 f[0] = ldq(rd((0x25f5b30u32) as usize));
                 // 4955b7 fsub dword ptr [edi + 0x18]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x18)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x18)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x18)) as usize)), f[0] - ldnr(rd((edi.wrapping_add(0x18)) as usize)));
                 // 4955ba fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // 4955be mov ecx, dword ptr [esp + 0x10]
                 ecx = s[12];
                 // 4955c2 fld dword ptr [0x25f5b34]
                 f[0] = ldq(rd((0x25f5b34u32) as usize));
                 // 4955c8 fsub dword ptr [edi + 0x1c]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x1c)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x1c)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x1c)) as usize)), f[0] - ldnr(rd((edi.wrapping_add(0x1c)) as usize)));
                 // 4955cb mov dword ptr [0x25f62ec], ecx
                 w.d((0x25f62ecu32) as usize, ecx);
                 // 4955d1 mov dword ptr [0x25f62e8], eax
                 w.d((0x25f62e8u32) as usize, eax);
                 // 4955d6 fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // 4955da mov edx, dword ptr [esp + 0x14]
                 edx = s[13];
                 // 4955de fldz 
@@ -13874,29 +14654,29 @@ fn g3_495590(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4955e0 mov dword ptr [0x25f62f0], edx
                 w.d((0x25f62f0u32) as usize, edx);
                 // 4955e6 fstp dword ptr [0x25f62ec]
-                w.d((0x25f62ecu32) as usize, (f[0] as f32).to_bits());
+                w.d((0x25f62ecu32) as usize, stf(f[0]));
                 // 4955ec call 0xbde150
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0xbde150, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
                 // 4955f1 fld dword ptr [0x25f5b2c]
                 f[0] = ldq(rd((0x25f5b2cu32) as usize));
                 // 4955f7 fsub dword ptr [edi + 0x14]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x14)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x14)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x14)) as usize)), f[0] - ldnr(rd((edi.wrapping_add(0x14)) as usize)));
                 // 4955fa fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // 4955fe mov eax, dword ptr [esp + 0xc]
                 eax = s[11];
                 // 495602 fld dword ptr [0x25f5b30]
                 f[0] = ldq(rd((0x25f5b30u32) as usize));
                 // 495608 fsub dword ptr [edi + 0x18]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x18)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x18)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x18)) as usize)), f[0] - ldnr(rd((edi.wrapping_add(0x18)) as usize)));
                 // 49560b fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // 49560f mov ecx, dword ptr [esp + 0x10]
                 ecx = s[12];
                 // 495613 fld dword ptr [0x25f5b34]
                 f[0] = ldq(rd((0x25f5b34u32) as usize));
                 // 495619 fsub dword ptr [edi + 0x1c]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x1c)) as usize)), f[0] - ldr32(rd((edi.wrapping_add(0x1c)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x1c)) as usize)), f[0] - ldnr(rd((edi.wrapping_add(0x1c)) as usize)));
                 // 49561c mov dword ptr [0x25f62f4], eax
                 w.d((0x25f62f4u32) as usize, eax);
                 // 495621 mov al, byte ptr [0x2528b48]
@@ -13904,7 +14684,7 @@ fn g3_495590(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 495626 cmp al, 1
                 fl = fl_sub((eax & 0xff), 0x1u32, 8).1;
                 // 495628 fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // 49562c mov edx, dword ptr [esp + 0x14]
                 edx = s[13];
                 // 495630 fldz 
@@ -13912,7 +14692,7 @@ fn g3_495590(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 495632 pop edi
                 edi = s[8];
                 // 495633 fstp dword ptr [0xf53930]
-                w.d((0xf53930u32) as usize, (f[0] as f32).to_bits());
+                w.d((0xf53930u32) as usize, stf(f[0]));
                 // 495639 mov dword ptr [0x25f62f8], ecx
                 w.d((0x25f62f8u32) as usize, ecx);
                 // 49563f mov dword ptr [0x25f62fc], edx
@@ -13948,7 +14728,7 @@ fn g3_495590(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             0x495660 => {
                 H188[4].fetch_add(1, Ordering::Relaxed);
                 // 495660 fstp dword ptr [esp]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 495663 push ecx
                 s[9] = ecx;
                 // 495664 fld dword ptr [esp + 4]
@@ -13956,15 +14736,15 @@ fn g3_495590(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 495668 fdiv qword ptr [0xe5c3d8]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5c3d8u32) as usize)), f[0] / f64::from_bits(rq((0xe5c3d8u32) as usize)));
                 // 49566e fstp dword ptr [esp + 4]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 495672 fld dword ptr [esp + 4]
                 f[0] = ldq(s[10]);
                 // 495676 fstp dword ptr [esp]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // 495679 call 0x40ea20
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[9..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // 49567e fstp dword ptr [0xf5392c]
-                w.d((0xf5392cu32) as usize, (f[0] as f32).to_bits());
+                w.d((0xf5392cu32) as usize, stf(f[0]));
                 // 495684 mov edx, dword ptr [0xe9a664]
                 edx = rd((0xe9a664u32) as usize);
                 // 49568a mov eax, dword ptr [0xe9a668]
@@ -14044,7 +14824,7 @@ fn g3_4a0ca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4a0cc4 lea eax, [esi + edi]
                 eax = esi.wrapping_add(edi);
                 // 4a0cc7 fstp dword ptr [0xf53aa8]
-                w.d((0xf53aa8u32) as usize, (f[0] as f32).to_bits());
+                w.d((0xf53aa8u32) as usize, stf(f[0]));
                 // 4a0ccd mov dword ptr [0xe9a6c0], eax
                 w.d((0xe9a6c0u32) as usize, eax);
                 // 4a0cd2 jl 0x4a0dc4
@@ -14071,6 +14851,7 @@ fn g3_4a0ca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4a0cf4 pop ecx
                 ecx = s[9];
                 // 4a0cf5 ret 
+                w.d((a as usize) + 0, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14105,7 +14886,7 @@ fn g3_4a0ca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4a0d1e fsubrp st(1)
                 f[0] = xn3(f[0], f[1], f[1] - f[0]);
                 // 4a0d20 fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // 4a0d24 fld dword ptr [0xe44850]
                 f[0] = ldq(rd((0xe44850u32) as usize));
                 // 4a0d2a fld dword ptr [esp + 4]
@@ -14166,13 +14947,13 @@ fn g3_4a0ca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4a0d6d mov eax, ecx
                 eax = ecx;
                 // 4a0d6f fstp dword ptr [0xf53aa8]
-                w.d((0xf53aa8u32) as usize, (f[0] as f32).to_bits());
+                w.d((0xf53aa8u32) as usize, stf(f[0]));
                 // 4a0d75 fld dword ptr [0xf53aa8]
                 f[0] = ldq(rd((0xf53aa8u32) as usize));
                 // 4a0d7b cdq 
                 edx = if (eax as i32) < 0 { 0xffffffff } else { 0 };
                 // 4a0d7c fadd dword ptr [esp + 0xc]
-                f[0] = xn3(f[0], ldr32(s[11]), f[0] + ldr32(s[11]));
+                f[0] = xn3(f[0], ldnr(s[11]), f[0] + ldnr(s[11]));
                 // 4a0d80 sub eax, edx
                 let (r_, f_) = fl_sub(eax, edx, 32); fl = f_;
                 eax = r_;
@@ -14183,7 +14964,7 @@ fn g3_4a0ca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 let (r_, f_) = fl_add(eax, edi, 32); fl = f_;
                 eax = r_;
                 // 4a0d86 fstp dword ptr [0xf53aa8]
-                w.d((0xf53aa8u32) as usize, (f[0] as f32).to_bits());
+                w.d((0xf53aa8u32) as usize, stf(f[0]));
                 // 4a0d8c mov dword ptr [0xf53ab0], eax
                 w.d((0xf53ab0u32) as usize, eax);
                 // 4a0d91 js 0x4a0dae
@@ -14213,6 +14994,7 @@ fn g3_4a0ca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4a0dac pop ecx
                 ecx = s[9];
                 // 4a0dad ret 
+                w.d((a as usize) + 0, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14238,6 +15020,7 @@ fn g3_4a0ca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4a0dc2 pop ecx
                 ecx = s[9];
                 // 4a0dc3 ret 
+                w.d((a as usize) + 0, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14271,6 +15054,7 @@ fn g3_4a0ca0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4a0dd9 pop ecx
                 ecx = s[9];
                 // 4a0dda ret 
+                w.d((a as usize) + 0, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14296,7 +15080,7 @@ fn g3_4b2680(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4b2684 fmul qword ptr [0xe5c190]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5c190u32) as usize)), f[0] * f64::from_bits(rq((0xe5c190u32) as usize)));
                 // 4b268a fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // 4b268e fldz 
                 f[0] = 0.0;
                 // 4b2690 fld dword ptr [esp + 4]
@@ -14326,7 +15110,7 @@ fn g3_4b2680(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x4b26ad => {
                 // 4b26ad call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0], &f[..0], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // 4b26b2 cmp eax, 0x77359400
                 fl = fl_sub(eax, 0x77359400u32, 32).1;
                 // 4b26b7 jle 0x4b26c4
@@ -14338,6 +15122,7 @@ fn g3_4b2680(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4b26bf mov eax, esi
                 eax = esi;
                 // 4b26c1 ret 4
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14353,6 +15138,7 @@ fn g3_4b2680(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4b26d1 mov eax, esi
                 eax = esi;
                 // 4b26d3 ret 4
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14362,6 +15148,7 @@ fn g3_4b2680(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 4b26d8 mov eax, esi
                 eax = esi;
                 // 4b26da ret 4
+                w.d((a as usize) + 0, s[9]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14406,6 +15193,8 @@ fn g3_523b10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 eax = set_part(eax, 0, 0xff, (fl.zf) as u32);
                 // 523b28 add esp, 8
                 // 523b2b ret 
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14425,6 +15214,8 @@ fn g3_523b10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 eax = set_part(eax, 0, 0xff, 0x1u32);
                 // 523b38 add esp, 8
                 // 523b3b ret 
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14464,6 +15255,8 @@ fn g3_523b10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 eax = 0x1u32;
                 // 523b6e add esp, 8
                 // 523b71 ret 
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14473,6 +15266,8 @@ fn g3_523b10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fl = fl_logic(0, 32);
                 // 523b74 add esp, 8
                 // 523b77 ret 
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14534,7 +15329,7 @@ fn g3_523fa0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 523fd5 fmul qword ptr [0xe5bfe0]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5bfe0u32) as usize)), f[0] * f64::from_bits(rq((0xe5bfe0u32) as usize)));
                 // 523fdb fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 523fde fld dword ptr [esp]
                 f[0] = ldq(s[8]);
                 // 523fe1 pop ecx
@@ -14576,7 +15371,7 @@ fn g3_5ce2b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5ce2c2 fld dword ptr [edi + 0x14]
                 f[0] = ldq(rd((edi.wrapping_add(0x14)) as usize));
                 // 5ce2c5 fsub dword ptr [esi + 0x108]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x108)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x108)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x108)) as usize)), f[0] - ldnr(rd((esi.wrapping_add(0x108)) as usize)));
                 // 5ce2cb add esi, 0x108
                 let (r_, f_) = fl_add(esi, 0x108u32, 32); fl = f_;
                 esi = r_;
@@ -14584,41 +15379,41 @@ fn g3_5ce2b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 let r_ = (eax) & (eax);
                 fl = fl_logic(r_, 32);
                 // 5ce2d3 fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 5ce2d7 fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // 5ce2db fmul st(0), st(0)
                 f[0] = xn3(f[0], f[0], f[0] * f[0]);
                 // 5ce2dd fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // 5ce2e1 fld dword ptr [edi + 0x18]
                 f[0] = ldq(rd((edi.wrapping_add(0x18)) as usize));
                 // 5ce2e4 fsub dword ptr [esi + 4]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x4)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x4)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x4)) as usize)), f[0] - ldnr(rd((esi.wrapping_add(0x4)) as usize)));
                 // 5ce2e7 fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 5ce2eb fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // 5ce2ef fmul st(0), st(0)
                 f[0] = xn3(f[0], f[0], f[0] * f[0]);
                 // 5ce2f1 fadd dword ptr [esp + 0x10]
-                f[0] = xn3(f[0], ldr32(s[12]), f[0] + ldr32(s[12]));
+                f[0] = xn3(f[0], ldnr(s[12]), f[0] + ldnr(s[12]));
                 // 5ce2f5 fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // 5ce2f9 fld dword ptr [edi + 0x1c]
                 f[0] = ldq(rd((edi.wrapping_add(0x1c)) as usize));
                 // 5ce2fc fsub dword ptr [esi + 8]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x8)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x8)) as usize)), f[0] - ldnr(rd((esi.wrapping_add(0x8)) as usize)));
                 // 5ce2ff fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 5ce303 fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // 5ce307 fmul st(0), st(0)
                 f[0] = xn3(f[0], f[0], f[0] * f[0]);
                 // 5ce309 fadd dword ptr [esp + 0x10]
-                f[0] = xn3(f[0], ldr32(s[12]), f[0] + ldr32(s[12]));
+                f[0] = xn3(f[0], ldnr(s[12]), f[0] + ldnr(s[12]));
                 // 5ce30d fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // 5ce311 je 0x5ce33f
                 pc = if fl.zf { 0x5ce33f } else { 0x5ce313 };
             }
@@ -14655,7 +15450,7 @@ fn g3_5ce2b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5ce336 call 0x404a20
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x404a20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // 5ce33b fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 pc = 0x5ce33f;
             }
             0x5ce33f => {
@@ -14675,7 +15470,7 @@ fn g3_5ce2b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5ce34d fxch st(1)
                 f.swap(1, 0);
                 // 5ce34f fstp dword ptr [esp + 0x10]
-                s[14] = (f[1] as f32).to_bits();
+                s[14] = stf(f[1]);
                 // 5ce353 fld dword ptr [esp + 0x10]
                 f[1] = ldq(s[14]);
                 // 5ce357 fcompp 
@@ -14694,6 +15489,7 @@ fn g3_5ce2b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 eax = 0x1u32;
                 // 5ce365 add esp, 0xc
                 // 5ce368 ret 4
+                w.d((a as usize) + 0, s[14]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14704,6 +15500,7 @@ fn g3_5ce2b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fl = fl_logic(0, 32);
                 // 5ce36d add esp, 0xc
                 // 5ce370 ret 4
+                w.d((a as usize) + 0, s[14]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -14757,11 +15554,11 @@ fn g3_5d03d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5d03f5 fild dword ptr [esp + 4]
                 f[0] = (((s[9]) as i32) as f64);
                 // 5d03f9 fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // 5d03fd fild dword ptr [esi + 0x104]
                 f[0] = (((rd((esi.wrapping_add(0x104)) as usize)) as i32) as f64);
                 // 5d0403 fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 5d0407 fldz 
                 f[0] = 0.0;
                 // 5d0409 fld dword ptr [esp + 4]
@@ -14779,7 +15576,7 @@ fn g3_5d03d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             0x5d0416 => {
                 H194[3].fetch_add(1, Ordering::Relaxed);
                 // 5d0416 fst dword ptr [esp + 4]
-                s[9] = (f[1] as f32).to_bits();
+                s[9] = stf(f[1]);
                 // 5d041a jmp 0x5d0424
                 pc = 0x5d0424;
             }
@@ -14788,7 +15585,7 @@ fn g3_5d03d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5d041c fxch st(1)
                 f.swap(1, 0);
                 // 5d041e fst dword ptr [esp + 4]
-                s[9] = (f[1] as f32).to_bits();
+                s[9] = stf(f[1]);
                 // 5d0422 fxch st(1)
                 f.swap(1, 0);
                 pc = 0x5d0424;
@@ -14833,7 +15630,7 @@ fn g3_5d03d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5d0445 fxch st(1)
                 f.swap(1, 0);
                 // 5d0447 fstp dword ptr [esp]
-                s[9] = (f[1] as f32).to_bits();
+                s[9] = stf(f[1]);
                 // 5d044a fld dword ptr [esp]
                 f[1] = ldq(s[9]);
                 // 5d044d fxch st(1)
@@ -14841,7 +15638,7 @@ fn g3_5d03d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5d044f fdivp st(1)
                 f[0] = xn3(f[0], f[1], f[0] / f[1]);
                 // 5d0451 fstp dword ptr [esp + 4]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 5d0455 fld dword ptr [esp + 4]
                 f[0] = ldq(s[10]);
                 // 5d0459 add esp, 8
@@ -14858,7 +15655,7 @@ fn g3_5d03d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5d0460 fstp st(1)
                 f[0] = f[1];
                 // 5d0462 fst dword ptr [esp]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // 5d0465 fld dword ptr [esp]
                 f[1] = ldq(s[9]);
                 // 5d0468 fxch st(1)
@@ -14866,7 +15663,7 @@ fn g3_5d03d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5d046a fdivp st(1)
                 f[0] = xn3(f[0], f[1], f[0] / f[1]);
                 // 5d046c fstp dword ptr [esp + 4]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 5d0470 fld dword ptr [esp + 4]
                 f[0] = ldq(s[10]);
                 // 5d0474 add esp, 8
@@ -14883,7 +15680,7 @@ fn g3_5d03d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 5d047b fdivp st(1)
                 f[0] = xn3(f[0], f[1], f[0] / f[1]);
                 // 5d047d fstp dword ptr [esp + 4]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // 5d0481 fld dword ptr [esp + 4]
                 f[0] = ldq(s[10]);
                 // 5d0485 add esp, 8
@@ -14916,7 +15713,7 @@ fn g3_7a9730(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 7a9736 mov ebx, dword ptr [esp + 0x20]
                 ebx = s[20];
                 // 7a973a fstp dword ptr [esp + 8]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // 7a973e push ebp
                 s[11] = ebp;
                 // 7a973f push esi
@@ -14940,23 +15737,23 @@ fn g3_7a9730(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 7a9758 fld dword ptr [ebx + 0x14]
                 f[0] = ldq(rd((ebx.wrapping_add(0x14)) as usize));
                 // 7a975b fsub dword ptr [esi + 0x14]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x14)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x14)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x14)) as usize)), f[0] - ldnr(rd((esi.wrapping_add(0x14)) as usize)));
                 // 7a975e push ecx
                 s[8] = ecx;
                 // 7a975f fstp dword ptr [esp + 0x20]
-                s[16] = (f[0] as f32).to_bits();
+                s[16] = stf(f[0]);
                 // 7a9763 fld dword ptr [ebx + 0x18]
                 f[0] = ldq(rd((ebx.wrapping_add(0x18)) as usize));
                 // 7a9766 fsub dword ptr [esi + 0x18]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x18)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x18)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x18)) as usize)), f[0] - ldnr(rd((esi.wrapping_add(0x18)) as usize)));
                 // 7a9769 fstp dword ptr [esp + 0x24]
-                s[17] = (f[0] as f32).to_bits();
+                s[17] = stf(f[0]);
                 // 7a976d fld dword ptr [ebx + 0x1c]
                 f[0] = ldq(rd((ebx.wrapping_add(0x1c)) as usize));
                 // 7a9770 fsub dword ptr [esi + 0x1c]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x1c)) as usize)), f[0] - ldr32(rd((esi.wrapping_add(0x1c)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x1c)) as usize)), f[0] - ldnr(rd((esi.wrapping_add(0x1c)) as usize)));
                 // 7a9773 fstp dword ptr [esp + 0x28]
-                s[18] = (f[0] as f32).to_bits();
+                s[18] = stf(f[0]);
                 // 7a9777 fld dword ptr [esp + 0x20]
                 f[0] = ldq(s[16]);
                 // 7a977b fld dword ptr [esp + 0x24]
@@ -14980,15 +15777,15 @@ fn g3_7a9730(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // 7a9791 faddp st(1)
                 f[0] = xn3(f[0], f[1], f[0] + f[1]);
                 // 7a9793 fstp dword ptr [esp + 0x1c]
-                s[15] = (f[0] as f32).to_bits();
+                s[15] = stf(f[0]);
                 // 7a9797 fld dword ptr [esp + 0x1c]
                 f[0] = ldq(s[15]);
                 // 7a979b fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // 7a979e call 0x40ea20
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // 7a97a3 fstp dword ptr [esp + 0x1c]
-                s[15] = (f[0] as f32).to_bits();
+                s[15] = stf(f[0]);
                 // 7a97a7 add esp, 4
                 // 7a97aa fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[15]);
@@ -15013,7 +15810,7 @@ fn g3_7a9730(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0x7a97bf => {
                 // 7a97bf fstp dword ptr [esp + 0x14]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // 7a97c3 mov ebp, esi
                 ebp = esi;
                 // 7a97c5 jmp 0x7a97c9
@@ -15045,6 +15842,7 @@ fn g3_7a9730(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 ebx = s[12];
                 // 7a97de add esp, 0x18
                 // 7a97e1 ret 
+                w.d((a as usize) + 0, s[20]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -15082,17 +15880,17 @@ fn g3_b00ce0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b00cee cmp byte ptr [esi + 0xf], bl
                 fl = fl_sub((rb((esi.wrapping_add(0xf)) as usize) as u32), (ebx & 0xff), 8).1;
                 // b00cf1 fsub dword ptr [esp + 0xc]
-                f[0] = xn3(f[0], ldr32(s[13]), f[0] - ldr32(s[13]));
+                f[0] = xn3(f[0], ldnr(s[13]), f[0] - ldnr(s[13]));
                 // b00cf5 push edi
                 s[9] = edi;
                 // b00cf6 mov edi, ecx
                 edi = ecx;
                 // b00cf8 fstp dword ptr [esp + 0x18]
-                s[15] = (f[0] as f32).to_bits();
+                s[15] = stf(f[0]);
                 // b00cfc fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[15]);
                 // b00d00 fst dword ptr [esi + 0x10]
-                w.d((esi.wrapping_add(0x10)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x10)) as usize, stf(f[0]));
                 // b00d03 jne 0xb00d15
                 pc = if !fl.zf { 0xb00d15 } else { 0xb00d05 };
             }
@@ -15204,7 +16002,7 @@ fn g3_b00ce0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b00d6a fld dword ptr [edi + 0x14]
                 f[0] = ldq(rd((edi.wrapping_add(0x14)) as usize));
                 // b00d6d fstp dword ptr [esi + 0x10]
-                w.d((esi.wrapping_add(0x10)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x10)) as usize, stf(f[0]));
                 // b00d70 mov byte ptr [esi + 0xf], bl
                 w.b((esi.wrapping_add(0xf)) as usize, ((ebx & 0xff)) as u8);
                 pc = 0xb00d73;
@@ -15288,7 +16086,7 @@ fn g3_b00ce0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b00dbd fld dword ptr [edi + 0x14]
                 f[0] = ldq(rd((edi.wrapping_add(0x14)) as usize));
                 // b00dc0 fstp dword ptr [esi + 0x10]
-                w.d((esi.wrapping_add(0x10)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x10)) as usize, stf(f[0]));
                 // b00dc3 mov byte ptr [esi + 0xf], bl
                 w.b((esi.wrapping_add(0xf)) as usize, ((ebx & 0xff)) as u8);
                 pc = 0xb00dc6;
@@ -15308,6 +16106,9 @@ fn g3_b00ce0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b00dc9 pop ebx
                 ebx = s[11];
                 // b00dca ret 0xc
+                w.d((a as usize) + 0, s[13]);
+                w.d((a as usize) + 4, s[14]);
+                w.d((a as usize) + 8, s[15]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -15379,56 +16180,56 @@ fn g3_b957b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b957dd fld dword ptr [ebx + 0x7c]
                 f[0] = ldq(rd((ebx.wrapping_add(0x7c)) as usize));
                 // b957e0 fmul dword ptr [edi + 4]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x4)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x4)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x4)) as usize)), f[0] * ldnr(rd((edi.wrapping_add(0x4)) as usize)));
                 // b957e3 push ecx
                 s[8] = ecx;
                 // b957e4 fstp dword ptr [edi + 4]
-                w.d((edi.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((edi.wrapping_add(0x4)) as usize, stf(f[0]));
                 // b957e7 fld dword ptr [ebx + 0x80]
                 f[0] = ldq(rd((ebx.wrapping_add(0x80)) as usize));
                 // b957ed fmul dword ptr [edi + 8]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x8)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x8)) as usize)), f[0] * ldnr(rd((edi.wrapping_add(0x8)) as usize)));
                 // b957f0 fstp dword ptr [edi + 8]
-                w.d((edi.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((edi.wrapping_add(0x8)) as usize, stf(f[0]));
                 // b957f3 fld dword ptr [ebx + 0x84]
                 f[0] = ldq(rd((ebx.wrapping_add(0x84)) as usize));
                 // b957f9 fmul dword ptr [edi + 0xc]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0xc)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0xc)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0xc)) as usize)), f[0] * ldnr(rd((edi.wrapping_add(0xc)) as usize)));
                 // b957fc fstp dword ptr [edi + 0xc]
-                w.d((edi.wrapping_add(0xc)) as usize, (f[0] as f32).to_bits());
+                w.d((edi.wrapping_add(0xc)) as usize, stf(f[0]));
                 // b957ff fld dword ptr [ebx + 0x88]
                 f[0] = ldq(rd((ebx.wrapping_add(0x88)) as usize));
                 // b95805 fmul dword ptr [edi + 0x10]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x10)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x10)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x10)) as usize)), f[0] * ldnr(rd((edi.wrapping_add(0x10)) as usize)));
                 // b95808 fstp dword ptr [edi + 0x10]
-                w.d((edi.wrapping_add(0x10)) as usize, (f[0] as f32).to_bits());
+                w.d((edi.wrapping_add(0x10)) as usize, stf(f[0]));
                 // b9580b fld dword ptr [ebx + 0x78]
                 f[0] = ldq(rd((ebx.wrapping_add(0x78)) as usize));
                 // b9580e fstp dword ptr [esp + 0x68]
-                s[34] = (f[0] as f32).to_bits();
+                s[34] = stf(f[0]);
                 // b95812 fld dword ptr [esp + 0x68]
                 f[0] = ldq(s[34]);
                 // b95816 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // b95819 call 0x428cd0
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x428cd0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // b9581e fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // b95822 fld dword ptr [esp + 0x68]
                 f[0] = ldq(s[34]);
                 // b95826 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // b95829 call 0x40b820
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40b820, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // b9582e fstp dword ptr [esp + 0x68]
-                s[34] = (f[0] as f32).to_bits();
+                s[34] = stf(f[0]);
                 // b95832 lea esi, [edi + 0x34]
                 esi = edi.wrapping_add(0x34);
                 // b95835 fld dword ptr [esp + 0x68]
                 f[0] = ldq(s[34]);
                 // b95839 add esp, 4
                 // b9583c fst dword ptr [esp + 0x18]
-                s[15] = (f[0] as f32).to_bits();
+                s[15] = stf(f[0]);
                 // b95840 push esi
                 s[8] = esi;
                 // b95841 fld dword ptr [esp + 0xc]
@@ -15442,77 +16243,77 @@ fn g3_b957b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9584f fchs 
                 f[2] = -f[2];
                 // b95851 fstp dword ptr [esp + 0x20]
-                s[16] = (f[2] as f32).to_bits();
+                s[16] = stf(f[2]);
                 // b95855 fldz 
                 f[2] = 0.0;
                 // b95857 fst dword ptr [esp + 0x24]
-                s[17] = (f[2] as f32).to_bits();
+                s[17] = stf(f[2]);
                 // b9585b fst dword ptr [esp + 0x30]
-                s[20] = (f[2] as f32).to_bits();
+                s[20] = stf(f[2]);
                 // b9585f fxch st(1)
                 f.swap(2, 1);
                 // b95861 fstp dword ptr [esp + 0x28]
-                s[18] = (f[2] as f32).to_bits();
+                s[18] = stf(f[2]);
                 // b95865 fxch st(1)
                 f.swap(1, 0);
                 // b95867 fstp dword ptr [esp + 0x2c]
-                s[19] = (f[1] as f32).to_bits();
+                s[19] = stf(f[1]);
                 // b9586b fld dword ptr [ebx + 0x90]
                 f[1] = ldq(rd((ebx.wrapping_add(0x90)) as usize));
                 // b95871 fstp dword ptr [esp + 0x34]
-                s[21] = (f[1] as f32).to_bits();
+                s[21] = stf(f[1]);
                 // b95875 fst dword ptr [esp + 0x38]
-                s[22] = (f[0] as f32).to_bits();
+                s[22] = stf(f[0]);
                 // b95879 fst dword ptr [esp + 0x3c]
-                s[23] = (f[0] as f32).to_bits();
+                s[23] = stf(f[0]);
                 // b9587d fst dword ptr [esp + 0x40]
-                s[24] = (f[0] as f32).to_bits();
+                s[24] = stf(f[0]);
                 // b95881 fld dword ptr [ebx + 0x94]
                 f[1] = ldq(rd((ebx.wrapping_add(0x94)) as usize));
                 // b95887 fstp dword ptr [esp + 0x44]
-                s[25] = (f[1] as f32).to_bits();
+                s[25] = stf(f[1]);
                 // b9588b fstp dword ptr [esp + 0x48]
-                s[26] = (f[0] as f32).to_bits();
+                s[26] = stf(f[0]);
                 // b9588f fld dword ptr [esi + 4]
                 f[0] = ldq(rd((esi.wrapping_add(0x4)) as usize));
                 // b95892 fmul dword ptr [ebx + 0x60]
-                f[0] = xn3(f[0], ldr32(rd((ebx.wrapping_add(0x60)) as usize)), f[0] * ldr32(rd((ebx.wrapping_add(0x60)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((ebx.wrapping_add(0x60)) as usize)), f[0] * ldnr(rd((ebx.wrapping_add(0x60)) as usize)));
                 // b95895 fld dword ptr [esi]
                 f[1] = ldq(rd((esi) as usize));
                 // b95897 fmul dword ptr [ebx + 0x5c]
-                f[1] = xn3(f[1], ldr32(rd((ebx.wrapping_add(0x5c)) as usize)), f[1] * ldr32(rd((ebx.wrapping_add(0x5c)) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((ebx.wrapping_add(0x5c)) as usize)), f[1] * ldnr(rd((ebx.wrapping_add(0x5c)) as usize)));
                 // b9589a faddp st(1)
                 f[0] = xn3(f[0], f[1], f[0] + f[1]);
                 // b9589c fadd dword ptr [esi + 8]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x8)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x8)) as usize)), f[0] + ldnr(rd((esi.wrapping_add(0x8)) as usize)));
                 // b9589f fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // b958a3 fld dword ptr [esi + 0x10]
                 f[0] = ldq(rd((esi.wrapping_add(0x10)) as usize));
                 // b958a6 fmul dword ptr [ebx + 0x60]
-                f[0] = xn3(f[0], ldr32(rd((ebx.wrapping_add(0x60)) as usize)), f[0] * ldr32(rd((ebx.wrapping_add(0x60)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((ebx.wrapping_add(0x60)) as usize)), f[0] * ldnr(rd((ebx.wrapping_add(0x60)) as usize)));
                 // b958a9 fld dword ptr [esi + 0xc]
                 f[1] = ldq(rd((esi.wrapping_add(0xc)) as usize));
                 // b958ac fmul dword ptr [ebx + 0x5c]
-                f[1] = xn3(f[1], ldr32(rd((ebx.wrapping_add(0x5c)) as usize)), f[1] * ldr32(rd((ebx.wrapping_add(0x5c)) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((ebx.wrapping_add(0x5c)) as usize)), f[1] * ldnr(rd((ebx.wrapping_add(0x5c)) as usize)));
                 // b958af faddp st(1)
                 f[0] = xn3(f[0], f[1], f[0] + f[1]);
                 // b958b1 fadd dword ptr [esi + 0x14]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x14)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x14)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x14)) as usize)), f[0] + ldnr(rd((esi.wrapping_add(0x14)) as usize)));
                 // b958b4 fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // b958b8 fld dword ptr [edi + 0x2c]
                 f[0] = ldq(rd((edi.wrapping_add(0x2c)) as usize));
                 // b958bb fadd dword ptr [esp + 0xc]
-                f[0] = xn3(f[0], ldr32(s[11]), f[0] + ldr32(s[11]));
+                f[0] = xn3(f[0], ldnr(s[11]), f[0] + ldnr(s[11]));
                 // b958bf fstp dword ptr [edi + 0x2c]
-                w.d((edi.wrapping_add(0x2c)) as usize, (f[0] as f32).to_bits());
+                w.d((edi.wrapping_add(0x2c)) as usize, stf(f[0]));
                 // b958c2 fld dword ptr [edi + 0x30]
                 f[0] = ldq(rd((edi.wrapping_add(0x30)) as usize));
                 // b958c5 fadd dword ptr [esp + 0x10]
-                f[0] = xn3(f[0], ldr32(s[12]), f[0] + ldr32(s[12]));
+                f[0] = xn3(f[0], ldnr(s[12]), f[0] + ldnr(s[12]));
                 // b958c9 fstp dword ptr [edi + 0x30]
-                w.d((edi.wrapping_add(0x30)) as usize, (f[0] as f32).to_bits());
+                w.d((edi.wrapping_add(0x30)) as usize, stf(f[0]));
                 // b958cc call 0x729f30
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(4, false, 0x729f30, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
                 // b958d1 mov ecx, dword ptr [eax]
@@ -15574,39 +16375,39 @@ fn g3_b957b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b95923 fld dword ptr [esi + 4]
                 f[0] = ldq(rd((esi.wrapping_add(0x4)) as usize));
                 // b95926 fmul dword ptr [ebx + 0x68]
-                f[0] = xn3(f[0], ldr32(rd((ebx.wrapping_add(0x68)) as usize)), f[0] * ldr32(rd((ebx.wrapping_add(0x68)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((ebx.wrapping_add(0x68)) as usize)), f[0] * ldnr(rd((ebx.wrapping_add(0x68)) as usize)));
                 // b95929 fld dword ptr [ebx + 0x64]
                 f[1] = ldq(rd((ebx.wrapping_add(0x64)) as usize));
                 // b9592c fmul dword ptr [esi]
-                f[1] = xn3(f[1], ldr32(rd((esi) as usize)), f[1] * ldr32(rd((esi) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((esi) as usize)), f[1] * ldnr(rd((esi) as usize)));
                 // b9592e faddp st(1)
                 f[0] = xn3(f[0], f[1], f[0] + f[1]);
                 // b95930 fadd dword ptr [esi + 8]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x8)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x8)) as usize)), f[0] + ldnr(rd((esi.wrapping_add(0x8)) as usize)));
                 // b95933 fstp dword ptr [esp + 8]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // b95937 fld dword ptr [esi + 0x10]
                 f[0] = ldq(rd((esi.wrapping_add(0x10)) as usize));
                 // b9593a fmul dword ptr [ebx + 0x68]
-                f[0] = xn3(f[0], ldr32(rd((ebx.wrapping_add(0x68)) as usize)), f[0] * ldr32(rd((ebx.wrapping_add(0x68)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((ebx.wrapping_add(0x68)) as usize)), f[0] * ldnr(rd((ebx.wrapping_add(0x68)) as usize)));
                 // b9593d fld dword ptr [esi + 0xc]
                 f[1] = ldq(rd((esi.wrapping_add(0xc)) as usize));
                 // b95940 fmul dword ptr [ebx + 0x64]
-                f[1] = xn3(f[1], ldr32(rd((ebx.wrapping_add(0x64)) as usize)), f[1] * ldr32(rd((ebx.wrapping_add(0x64)) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((ebx.wrapping_add(0x64)) as usize)), f[1] * ldnr(rd((ebx.wrapping_add(0x64)) as usize)));
                 // b95943 faddp st(1)
                 f[0] = xn3(f[0], f[1], f[0] + f[1]);
                 // b95945 fadd dword ptr [esi + 0x14]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x14)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x14)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x14)) as usize)), f[0] + ldnr(rd((esi.wrapping_add(0x14)) as usize)));
                 // b95948 pop esi
                 esi = s[9];
                 // b95949 fstp dword ptr [esp + 8]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // b9594d fld dword ptr [edi + 0x2c]
                 f[0] = ldq(rd((edi.wrapping_add(0x2c)) as usize));
                 // b95950 fadd dword ptr [esp + 4]
-                f[0] = xn3(f[0], ldr32(s[11]), f[0] + ldr32(s[11]));
+                f[0] = xn3(f[0], ldnr(s[11]), f[0] + ldnr(s[11]));
                 // b95954 fstp dword ptr [esp + 0xc]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // b95958 mov eax, dword ptr [esp + 0xc]
                 eax = s[13];
                 // b9595c fld dword ptr [edi + 0x30]
@@ -15614,9 +16415,9 @@ fn g3_b957b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9595f mov dword ptr [edi + 0x4c], eax
                 w.d((edi.wrapping_add(0x4c)) as usize, eax);
                 // b95962 fadd dword ptr [esp + 8]
-                f[0] = xn3(f[0], ldr32(s[12]), f[0] + ldr32(s[12]));
+                f[0] = xn3(f[0], ldnr(s[12]), f[0] + ldnr(s[12]));
                 // b95966 fstp dword ptr [esp + 0x10]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // b9596a mov ecx, dword ptr [esp + 0x10]
                 ecx = s[14];
                 // b9596e mov dword ptr [edi + 0x50], ecx
@@ -15624,23 +16425,24 @@ fn g3_b957b0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b95971 fld dword ptr [ebx + 0x94]
                 f[0] = ldq(rd((ebx.wrapping_add(0x94)) as usize));
                 // b95977 fmul dword ptr [edi + 0x28]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x28)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x28)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x28)) as usize)), f[0] * ldnr(rd((edi.wrapping_add(0x28)) as usize)));
                 // b9597a fstp dword ptr [esp + 0x60]
-                s[34] = (f[0] as f32).to_bits();
+                s[34] = stf(f[0]);
                 // b9597e fld dword ptr [ebx + 0x90]
                 f[0] = ldq(rd((ebx.wrapping_add(0x90)) as usize));
                 // b95984 pop ebx
                 ebx = s[10];
                 // b95985 fmul dword ptr [edi + 0x24]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x24)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x24)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x24)) as usize)), f[0] * ldnr(rd((edi.wrapping_add(0x24)) as usize)));
                 // b95988 fstp dword ptr [edi + 0x24]
-                w.d((edi.wrapping_add(0x24)) as usize, (f[0] as f32).to_bits());
+                w.d((edi.wrapping_add(0x24)) as usize, stf(f[0]));
                 // b9598b fld dword ptr [esp + 0x5c]
                 f[0] = ldq(s[34]);
                 // b9598f fstp dword ptr [edi + 0x28]
-                w.d((edi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                w.d((edi.wrapping_add(0x28)) as usize, stf(f[0]));
                 // b95992 add esp, 0x58
                 // b95995 ret 4
+                w.d((a as usize) + 0, s[34]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -15694,7 +16496,7 @@ fn g3_b9f6d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9f6ea => {
                 // b9f6ea fst dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // b9f6ee jmp 0xb9f70e
                 pc = 0xb9f70e;
             }
@@ -15717,7 +16519,7 @@ fn g3_b9f6d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9f6ff => {
                 // b9f6ff fadd dword ptr [0xe5bfd8]
-                f[1] = xn3(f[1], ldr32(rd((0xe5bfd8u32) as usize)), f[1] + ldr32(rd((0xe5bfd8u32) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((0xe5bfd8u32) as usize)), f[1] + ldnr(rd((0xe5bfd8u32) as usize)));
                 // b9f705 jmp 0xb9f70a
                 pc = 0xb9f70a;
             }
@@ -15728,14 +16530,14 @@ fn g3_b9f6d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9f70a => {
                 // b9f70a fstp dword ptr [esp + 8]
-                s[10] = (f[1] as f32).to_bits();
+                s[10] = stf(f[1]);
                 pc = 0xb9f70e;
             }
             0xb9f70e => {
                 // b9f70e fld dword ptr [esp + 8]
                 f[1] = ldq(s[10]);
                 // b9f712 fst dword ptr [esi + 0x7c]
-                w.d((esi.wrapping_add(0x7c)) as usize, (f[1] as f32).to_bits());
+                w.d((esi.wrapping_add(0x7c)) as usize, stf(f[1]));
                 // b9f715 fcomp st(1)
                 cc87 = cc(f[1], f[0]);
                 // b9f717 fnstsw ax
@@ -15748,7 +16550,7 @@ fn g3_b9f6d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9f71e => {
                 // b9f71e fstp dword ptr [esi + 0x7c]
-                w.d((esi.wrapping_add(0x7c)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x7c)) as usize, stf(f[0]));
                 // b9f721 jmp 0xb9f725
                 pc = 0xb9f725;
             }
@@ -15760,11 +16562,11 @@ fn g3_b9f6d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f725 fld dword ptr [esi + 0x74]
                 f[0] = ldq(rd((esi.wrapping_add(0x74)) as usize));
                 // b9f728 fadd dword ptr [esi + 0x7c]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x7c)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x7c)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x7c)) as usize)), f[0] + ldnr(rd((esi.wrapping_add(0x7c)) as usize)));
                 // b9f72b fmul qword ptr [0xe5c0c8]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5c0c8u32) as usize)), f[0] * f64::from_bits(rq((0xe5c0c8u32) as usize)));
                 // b9f731 call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0], &f[..0], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // b9f736 mov dword ptr [esi + 0x78], eax
                 w.d((esi.wrapping_add(0x78)) as usize, eax);
                 // b9f739 mov al, 1
@@ -15772,6 +16574,8 @@ fn g3_b9f6d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f73b pop esi
                 esi = s[8];
                 // b9f73c ret 8
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -15846,7 +16650,7 @@ fn g3_b9f7c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9f7eb => {
                 // b9f7eb fadd dword ptr [0xe5bfd8]
-                f[0] = xn3(f[0], ldr32(rd((0xe5bfd8u32) as usize)), f[0] + ldr32(rd((0xe5bfd8u32) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((0xe5bfd8u32) as usize)), f[0] + ldnr(rd((0xe5bfd8u32) as usize)));
                 // b9f7f1 jmp 0xb9f7f6
                 pc = 0xb9f7f6;
             }
@@ -15857,17 +16661,17 @@ fn g3_b9f7c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xb9f7f6 => {
                 // b9f7f6 fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // b9f7fa fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // b9f7fe fst dword ptr [esi + 0x74]
-                w.d((esi.wrapping_add(0x74)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x74)) as usize, stf(f[0]));
                 // b9f801 fadd dword ptr [esi + 0x7c]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0x7c)) as usize)), f[0] + ldr32(rd((esi.wrapping_add(0x7c)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0x7c)) as usize)), f[0] + ldnr(rd((esi.wrapping_add(0x7c)) as usize)));
                 // b9f804 fmul qword ptr [0xe5c0c8]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5c0c8u32) as usize)), f[0] * f64::from_bits(rq((0xe5c0c8u32) as usize)));
                 // b9f80a call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0], &f[..0], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // b9f80f mov dword ptr [esi + 0x78], eax
                 w.d((esi.wrapping_add(0x78)) as usize, eax);
                 // b9f812 mov al, 1
@@ -15875,6 +16679,8 @@ fn g3_b9f7c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // b9f814 pop esi
                 esi = s[8];
                 // b9f815 ret 8
+                w.d((a as usize) + 0, s[10]);
+                w.d((a as usize) + 4, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -15904,11 +16710,11 @@ fn g3_ba1160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba1169 cmp dword ptr [eax], 7
                 fl = fl_sub(rd((eax) as usize), 0x7u32, 32).1;
                 // ba116c fst dword ptr [esp]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // ba116f push esi
                 s[9] = esi;
                 // ba1170 fst dword ptr [esp + 8]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // ba1174 push edi
                 s[8] = edi;
                 // ba1175 mov esi, ecx
@@ -15920,11 +16726,11 @@ fn g3_ba1160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba1179 fld dword ptr [eax + 4]
                 f[1] = ldq(rd((eax.wrapping_add(0x4)) as usize));
                 // ba117c fstp dword ptr [esp + 8]
-                s[10] = (f[1] as f32).to_bits();
+                s[10] = stf(f[1]);
                 // ba1180 fld dword ptr [eax + 8]
                 f[1] = ldq(rd((eax.wrapping_add(0x8)) as usize));
                 // ba1183 fstp dword ptr [esp + 0xc]
-                s[11] = (f[1] as f32).to_bits();
+                s[11] = stf(f[1]);
                 // ba1187 fld dword ptr [esp + 8]
                 f[1] = ldq(s[10]);
                 // ba118b fcom st(1)
@@ -15948,7 +16754,7 @@ fn g3_ba1160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba119c fxch st(1)
                 f.swap(2, 1);
                 // ba119e call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2], &f[..2], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // ba11a3 fld dword ptr [esp + 0xc]
                 f[2] = ldq(s[11]);
                 // ba11a7 fcom st(2)
@@ -15993,7 +16799,7 @@ fn g3_ba1160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba11ce => {
                 // ba11ce call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0], &f[..0], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // ba11d3 mov dword ptr [esi + 0xac], eax
                 w.d((esi.wrapping_add(0xac)) as usize, eax);
                 // ba11d9 cmp dword ptr [esi + 0x98], 9
@@ -16070,6 +16876,8 @@ fn g3_ba1160(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 esi = s[9];
                 // ba1232 add esp, 8
                 // ba1235 ret 8
+                w.d((a as usize) + 0, s[13]);
+                w.d((a as usize) + 4, s[14]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -16099,11 +16907,11 @@ fn g3_ba12c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba12c9 cmp dword ptr [eax], 7
                 fl = fl_sub(rd((eax) as usize), 0x7u32, 32).1;
                 // ba12cc fst dword ptr [esp]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // ba12cf push esi
                 s[9] = esi;
                 // ba12d0 fst dword ptr [esp + 8]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // ba12d4 push edi
                 s[8] = edi;
                 // ba12d5 mov esi, ecx
@@ -16115,11 +16923,11 @@ fn g3_ba12c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba12d9 fld dword ptr [eax + 4]
                 f[1] = ldq(rd((eax.wrapping_add(0x4)) as usize));
                 // ba12dc fstp dword ptr [esp + 8]
-                s[10] = (f[1] as f32).to_bits();
+                s[10] = stf(f[1]);
                 // ba12e0 fld dword ptr [eax + 8]
                 f[1] = ldq(rd((eax.wrapping_add(0x8)) as usize));
                 // ba12e3 fstp dword ptr [esp + 0xc]
-                s[11] = (f[1] as f32).to_bits();
+                s[11] = stf(f[1]);
                 // ba12e7 fld dword ptr [esp + 8]
                 f[1] = ldq(s[10]);
                 // ba12eb fcom st(1)
@@ -16143,7 +16951,7 @@ fn g3_ba12c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba12fc fxch st(1)
                 f.swap(2, 1);
                 // ba12fe call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2], &f[..2], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // ba1303 fld dword ptr [esp + 0xc]
                 f[2] = ldq(s[11]);
                 // ba1307 fcom st(2)
@@ -16188,7 +16996,7 @@ fn g3_ba12c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba132e => {
                 // ba132e call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0], &f[..0], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // ba1333 mov dword ptr [esi + 0xb4], eax
                 w.d((esi.wrapping_add(0xb4)) as usize, eax);
                 // ba1339 cmp dword ptr [esi + 0x98], 9
@@ -16266,6 +17074,8 @@ fn g3_ba12c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 esi = s[9];
                 // ba1392 add esp, 8
                 // ba1395 ret 8
+                w.d((a as usize) + 0, s[13]);
+                w.d((a as usize) + 4, s[14]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -16295,11 +17105,11 @@ fn g3_ba58f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba58f9 cmp dword ptr [eax], 7
                 fl = fl_sub(rd((eax) as usize), 0x7u32, 32).1;
                 // ba58fc fst dword ptr [esp]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // ba58ff push esi
                 s[9] = esi;
                 // ba5900 fst dword ptr [esp + 8]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // ba5904 push edi
                 s[8] = edi;
                 // ba5905 mov esi, ecx
@@ -16311,11 +17121,11 @@ fn g3_ba58f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5909 fld dword ptr [eax + 4]
                 f[1] = ldq(rd((eax.wrapping_add(0x4)) as usize));
                 // ba590c fstp dword ptr [esp + 8]
-                s[10] = (f[1] as f32).to_bits();
+                s[10] = stf(f[1]);
                 // ba5910 fld dword ptr [eax + 8]
                 f[1] = ldq(rd((eax.wrapping_add(0x8)) as usize));
                 // ba5913 fstp dword ptr [esp + 0xc]
-                s[11] = (f[1] as f32).to_bits();
+                s[11] = stf(f[1]);
                 // ba5917 fld dword ptr [esp + 8]
                 f[1] = ldq(s[10]);
                 // ba591b fcom st(1)
@@ -16339,7 +17149,7 @@ fn g3_ba58f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba592c fxch st(1)
                 f.swap(2, 1);
                 // ba592e call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2], &f[..2], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // ba5933 fld dword ptr [esp + 0xc]
                 f[2] = ldq(s[11]);
                 // ba5937 fcom st(2)
@@ -16384,7 +17194,7 @@ fn g3_ba58f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba595e => {
                 // ba595e call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0], &f[..0], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // ba5963 mov dword ptr [esi + 0xac], eax
                 w.d((esi.wrapping_add(0xac)) as usize, eax);
                 // ba5969 cmp dword ptr [esi + 0x98], 9
@@ -16461,6 +17271,8 @@ fn g3_ba58f0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 esi = s[9];
                 // ba59c2 add esp, 8
                 // ba59c5 ret 8
+                w.d((a as usize) + 0, s[13]);
+                w.d((a as usize) + 4, s[14]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -16490,11 +17302,11 @@ fn g3_ba5a50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5a59 cmp dword ptr [eax], 7
                 fl = fl_sub(rd((eax) as usize), 0x7u32, 32).1;
                 // ba5a5c fst dword ptr [esp]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // ba5a5f push esi
                 s[9] = esi;
                 // ba5a60 fst dword ptr [esp + 8]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // ba5a64 push edi
                 s[8] = edi;
                 // ba5a65 mov esi, ecx
@@ -16506,11 +17318,11 @@ fn g3_ba5a50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5a69 fld dword ptr [eax + 4]
                 f[1] = ldq(rd((eax.wrapping_add(0x4)) as usize));
                 // ba5a6c fstp dword ptr [esp + 8]
-                s[10] = (f[1] as f32).to_bits();
+                s[10] = stf(f[1]);
                 // ba5a70 fld dword ptr [eax + 8]
                 f[1] = ldq(rd((eax.wrapping_add(0x8)) as usize));
                 // ba5a73 fstp dword ptr [esp + 0xc]
-                s[11] = (f[1] as f32).to_bits();
+                s[11] = stf(f[1]);
                 // ba5a77 fld dword ptr [esp + 8]
                 f[1] = ldq(s[10]);
                 // ba5a7b fcom st(1)
@@ -16534,7 +17346,7 @@ fn g3_ba5a50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ba5a8c fxch st(1)
                 f.swap(2, 1);
                 // ba5a8e call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[2], &f[..2], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // ba5a93 fld dword ptr [esp + 0xc]
                 f[2] = ldq(s[11]);
                 // ba5a97 fcom st(2)
@@ -16579,7 +17391,7 @@ fn g3_ba5a50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
             }
             0xba5abe => {
                 // ba5abe call 0xda0140
-                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0]); eax = ra; ecx = rc; edx = rd_; }
+                { let (ra, rc, rd_) = crt_ftol2(eax, ecx, edx, f[0], &f[..0], [ebx, esi, edi, ebp]); eax = ra; ecx = rc; edx = rd_; }
                 // ba5ac3 mov dword ptr [esi + 0xb4], eax
                 w.d((esi.wrapping_add(0xb4)) as usize, eax);
                 // ba5ac9 cmp dword ptr [esi + 0x98], 9
@@ -16657,6 +17469,8 @@ fn g3_ba5a50(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 esi = s[9];
                 // ba5b22 add esp, 8
                 // ba5b25 ret 8
+                w.d((a as usize) + 0, s[13]);
+                w.d((a as usize) + 4, s[14]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -16688,7 +17502,7 @@ fn g3_bde750(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // bde75f fsub qword ptr [0xe5bf40]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf40u32) as usize)), f[0] - f64::from_bits(rq((0xe5bf40u32) as usize)));
                 // bde765 fstp dword ptr [esi + 8]
-                w.d((esi.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x8)) as usize, stf(f[0]));
                 // bde768 call 0xbdce30
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xbdce30, &mut r_, s[9..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // bde76d fmul qword ptr [0xe5bf78]
@@ -16696,7 +17510,7 @@ fn g3_bde750(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // bde773 push ecx
                 s[8] = ecx;
                 // bde774 fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // bde778 fld dword ptr [esi + 8]
                 f[0] = ldq(rd((esi.wrapping_add(0x8)) as usize));
                 // bde77b fmul st(0), st(0)
@@ -16706,35 +17520,35 @@ fn g3_bde750(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // bde77f fsubrp st(1)
                 f[0] = xn3(f[0], f[1], f[1] - f[0]);
                 // bde781 fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // bde785 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[11]);
                 // bde789 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // bde78c call 0x40ea20
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // bde791 fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // bde795 fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // bde799 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // bde79c call 0x40b820
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40b820, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // bde7a1 fmul dword ptr [esp + 0xc]
-                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                f[0] = xn3(f[0], ldnr(s[11]), f[0] * ldnr(s[11]));
                 // bde7a5 fstp dword ptr [esi]
-                w.d((esi) as usize, (f[0] as f32).to_bits());
+                w.d((esi) as usize, stf(f[0]));
                 // bde7a7 fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // bde7ab fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // bde7ae call 0x428cd0
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x428cd0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // bde7b3 fmul dword ptr [esp + 0xc]
-                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                f[0] = xn3(f[0], ldnr(s[11]), f[0] * ldnr(s[11]));
                 // bde7b7 fstp dword ptr [esi + 4]
-                w.d((esi.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x4)) as usize, stf(f[0]));
                 // bde7ba add esp, 0x10
                 // bde7bd ret 
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
@@ -16781,7 +17595,7 @@ fn g3_bde7c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // bde7db faddp st(1)
                 f[0] = xn3(f[0], f[1], f[0] + f[1]);
                 // bde7dd fstp dword ptr [esi + 8]
-                w.d((esi.wrapping_add(0x8)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x8)) as usize, stf(f[0]));
                 // bde7e0 call 0xbdce30
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0xbdce30, &mut r_, s[9..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // bde7e5 fmul qword ptr [0xe5bf78]
@@ -16789,7 +17603,7 @@ fn g3_bde7c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // bde7eb push ecx
                 s[8] = ecx;
                 // bde7ec fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // bde7f0 fld dword ptr [esi + 8]
                 f[0] = ldq(rd((esi.wrapping_add(0x8)) as usize));
                 // bde7f3 fmul st(0), st(0)
@@ -16799,39 +17613,41 @@ fn g3_bde7c0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // bde7f7 fsubrp st(1)
                 f[0] = xn3(f[0], f[1], f[1] - f[0]);
                 // bde7f9 fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // bde7fd fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[11]);
                 // bde801 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // bde804 call 0x40ea20
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // bde809 fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // bde80d fld dword ptr [esp + 0x10]
                 f[0] = ldq(s[12]);
                 // bde811 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // bde814 call 0x40b820
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40b820, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // bde819 fmul dword ptr [esp + 0xc]
-                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                f[0] = xn3(f[0], ldnr(s[11]), f[0] * ldnr(s[11]));
                 // bde81d fstp dword ptr [esi]
-                w.d((esi) as usize, (f[0] as f32).to_bits());
+                w.d((esi) as usize, stf(f[0]));
                 // bde81f fld dword ptr [esp + 0x10]
                 f[0] = ldq(s[12]);
                 // bde823 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // bde826 call 0x428cd0
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x428cd0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // bde82b fmul dword ptr [esp + 0xc]
-                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                f[0] = xn3(f[0], ldnr(s[11]), f[0] * ldnr(s[11]));
                 // bde82f add esp, 4
                 // bde832 fstp dword ptr [esi + 4]
-                w.d((esi.wrapping_add(0x4)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x4)) as usize, stf(f[0]));
                 // bde835 pop ecx
                 ecx = s[9];
                 // bde836 ret 8
+                w.d((a as usize) + 0, s[11]);
+                w.d((a as usize) + 4, s[12]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -16860,15 +17676,15 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2e18 fmul qword ptr [0xe5bf70]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf70u32) as usize)), f[0] * f64::from_bits(rq((0xe5bf70u32) as usize)));
                 // be2e1e fstp dword ptr [esp + 0x28]
-                s[18] = (f[0] as f32).to_bits();
+                s[18] = stf(f[0]);
                 // be2e22 fld dword ptr [esp + 0x28]
                 f[0] = ldq(s[18]);
                 // be2e26 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // be2e29 call 0x428cd0
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x428cd0, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // be2e2e fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // be2e32 fld dword ptr [edi]
                 f[0] = ldq(rd((edi) as usize));
                 // be2e34 fld dword ptr [esp + 4]
@@ -16880,25 +17696,25 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2e3c fxch st(1)
                 f.swap(1, 0);
                 // be2e3e fstp dword ptr [esp + 4]
-                s[9] = (f[1] as f32).to_bits();
+                s[9] = stf(f[1]);
                 // be2e42 fld dword ptr [edi + 4]
                 f[1] = ldq(rd((edi.wrapping_add(0x4)) as usize));
                 // be2e45 fmul st(1)
                 f[1] = xn3(f[1], f[0], f[1] * f[0]);
                 // be2e47 fstp dword ptr [esp + 8]
-                s[10] = (f[1] as f32).to_bits();
+                s[10] = stf(f[1]);
                 // be2e4b fmul dword ptr [edi + 8]
-                f[0] = xn3(f[0], ldr32(rd((edi.wrapping_add(0x8)) as usize)), f[0] * ldr32(rd((edi.wrapping_add(0x8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((edi.wrapping_add(0x8)) as usize)), f[0] * ldnr(rd((edi.wrapping_add(0x8)) as usize)));
                 // be2e4e fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // be2e52 fld dword ptr [esp + 0x28]
                 f[0] = ldq(s[18]);
                 // be2e56 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // be2e59 call 0x40b820
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40b820, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // be2e5e fstp dword ptr [esp + 0x28]
-                s[18] = (f[0] as f32).to_bits();
+                s[18] = stf(f[0]);
                 // be2e62 fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // be2e66 fld st(0)
@@ -16906,7 +17722,7 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2e68 fmul st(0), st(0)
                 f[1] = xn3(f[1], f[1], f[1] * f[1]);
                 // be2e6a fstp dword ptr [esp + 0x18]
-                s[14] = (f[1] as f32).to_bits();
+                s[14] = stf(f[1]);
                 // be2e6e fld dword ptr [esp + 8]
                 f[1] = ldq(s[10]);
                 // be2e72 fld st(0)
@@ -16914,7 +17730,7 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2e74 fmul st(0), st(0)
                 f[2] = xn3(f[2], f[2], f[2] * f[2]);
                 // be2e76 fstp dword ptr [esp + 8]
-                s[10] = (f[2] as f32).to_bits();
+                s[10] = stf(f[2]);
                 // be2e7a fld dword ptr [esp + 0xc]
                 f[2] = ldq(s[11]);
                 // be2e7e fld st(0)
@@ -16922,25 +17738,25 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2e80 fmul st(0), st(0)
                 f[3] = xn3(f[3], f[3], f[3] * f[3]);
                 // be2e82 fstp dword ptr [esp + 0xc]
-                s[11] = (f[3] as f32).to_bits();
+                s[11] = stf(f[3]);
                 // be2e86 fld st(1)
                 f[3] = f[1];
                 // be2e88 fmul st(3)
                 f[3] = xn3(f[3], f[0], f[3] * f[0]);
                 // be2e8a fstp dword ptr [esp + 4]
-                s[9] = (f[3] as f32).to_bits();
+                s[9] = stf(f[3]);
                 // be2e8e fld st(0)
                 f[3] = f[2];
                 // be2e90 fmul st(3)
                 f[3] = xn3(f[3], f[0], f[3] * f[0]);
                 // be2e92 fstp dword ptr [esp + 0x10]
-                s[12] = (f[3] as f32).to_bits();
+                s[12] = stf(f[3]);
                 // be2e96 fld st(0)
                 f[3] = f[2];
                 // be2e98 fmul st(2)
                 f[3] = xn3(f[3], f[1], f[3] * f[1]);
                 // be2e9a fstp dword ptr [esp + 0x20]
-                s[16] = (f[3] as f32).to_bits();
+                s[16] = stf(f[3]);
                 // be2e9e fld dword ptr [esp + 0x28]
                 f[3] = ldq(s[18]);
                 // be2ea2 fld st(0)
@@ -16950,7 +17766,7 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2ea6 fxch st(3)
                 f.swap(3, 0);
                 // be2ea8 fstp dword ptr [esp + 0x1c]
-                s[15] = (f[3] as f32).to_bits();
+                s[15] = stf(f[3]);
                 // be2eac fld st(2)
                 f[3] = f[0];
                 // be2eae fmulp st(2)
@@ -16958,11 +17774,11 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2eb0 fxch st(1)
                 f.swap(2, 1);
                 // be2eb2 fstp dword ptr [esp + 0x14]
-                s[13] = (f[2] as f32).to_bits();
+                s[13] = stf(f[2]);
                 // be2eb6 fmulp st(1)
                 f[0] = xn3(f[0], f[1], f[0] * f[1]);
                 // be2eb8 fstp dword ptr [esp + 0x28]
-                s[18] = (f[0] as f32).to_bits();
+                s[18] = stf(f[0]);
                 // be2ebc fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // be2ec0 fld qword ptr [0xe5bfe8]
@@ -16980,7 +17796,7 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2ed2 fsub st(1)
                 f[3] = xn3(f[3], f[2], f[3] - f[2]);
                 // be2ed4 fstp dword ptr [esi]
-                w.d((esi) as usize, (f[3] as f32).to_bits());
+                w.d((esi) as usize, stf(f[3]));
                 // be2ed6 fld dword ptr [esp + 0x28]
                 f[3] = ldq(s[18]);
                 // be2eda fmul st(2)
@@ -16994,7 +17810,7 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2ee4 fadd st(2)
                 f[5] = xn3(f[5], f[3], f[5] + f[3]);
                 // be2ee6 fstp dword ptr [esi + 4]
-                w.d((esi.wrapping_add(0x4)) as usize, (f[5] as f32).to_bits());
+                w.d((esi.wrapping_add(0x4)) as usize, stf(f[5]));
                 // be2ee9 fld dword ptr [esp + 0x10]
                 f[5] = ldq(s[12]);
                 // be2eed fmul st(4)
@@ -17008,7 +17824,7 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2ef7 fsub st(1)
                 f[7] = xn3(f[7], f[6], f[7] - f[6]);
                 // be2ef9 fstp dword ptr [esi + 8]
-                w.d((esi.wrapping_add(0x8)) as usize, (f[7] as f32).to_bits());
+                w.d((esi.wrapping_add(0x8)) as usize, stf(f[7]));
                 // be2efc fxch st(2)
                 f.swap(6, 4);
                 // be2efe fsubrp st(3)
@@ -17016,7 +17832,7 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2f00 fxch st(2)
                 f.swap(5, 3);
                 // be2f02 fstp dword ptr [esi + 0xc]
-                w.d((esi.wrapping_add(0xc)) as usize, (f[5] as f32).to_bits());
+                w.d((esi.wrapping_add(0xc)) as usize, stf(f[5]));
                 // be2f05 fld dword ptr [esp + 0x18]
                 f[5] = ldq(s[14]);
                 // be2f09 fmul st(4)
@@ -17032,7 +17848,7 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2f13 fxch st(3)
                 f.swap(5, 2);
                 // be2f15 fstp dword ptr [esi + 0x10]
-                w.d((esi.wrapping_add(0x10)) as usize, (f[5] as f32).to_bits());
+                w.d((esi.wrapping_add(0x10)) as usize, stf(f[5]));
                 // be2f18 fld dword ptr [esp + 0x1c]
                 f[5] = ldq(s[15]);
                 // be2f1c fmul st(4)
@@ -17046,7 +17862,7 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2f26 fadd st(1)
                 f[6] = xn3(f[6], f[5], f[6] + f[5]);
                 // be2f28 fstp dword ptr [esi + 0x14]
-                w.d((esi.wrapping_add(0x14)) as usize, (f[6] as f32).to_bits());
+                w.d((esi.wrapping_add(0x14)) as usize, stf(f[6]));
                 // be2f2b fxch st(1)
                 f.swap(5, 4);
                 // be2f2d faddp st(2)
@@ -17054,19 +17870,20 @@ fn g3_be2e10(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be2f2f fxch st(1)
                 f.swap(4, 3);
                 // be2f31 fstp dword ptr [esi + 0x18]
-                w.d((esi.wrapping_add(0x18)) as usize, (f[4] as f32).to_bits());
+                w.d((esi.wrapping_add(0x18)) as usize, stf(f[4]));
                 // be2f34 fsubp st(2)
                 f[1] = xn3(f[1], f[3], f[1] - f[3]);
                 // be2f36 fxch st(1)
                 f.swap(2, 1);
                 // be2f38 fstp dword ptr [esi + 0x1c]
-                w.d((esi.wrapping_add(0x1c)) as usize, (f[2] as f32).to_bits());
+                w.d((esi.wrapping_add(0x1c)) as usize, stf(f[2]));
                 // be2f3b fsubrp st(1)
                 f[0] = xn3(f[0], f[1], f[1] - f[0]);
                 // be2f3d fstp dword ptr [esi + 0x20]
-                w.d((esi.wrapping_add(0x20)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x20)) as usize, stf(f[0]));
                 // be2f40 add esp, 0x24
                 // be2f43 ret 4
+                w.d((a as usize) + 0, s[18]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -17082,7 +17899,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let mut s = [0u32; 31];
     s[19] = unsafe { *a.add(0) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xbe4170u32;
@@ -17130,7 +17947,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be419e faddp st(1)
                 f[0] = xn3(f[0], f[1], f[0] + f[1]);
                 // be41a0 fstp dword ptr [esp + 0x2c]
-                s[19] = (f[0] as f32).to_bits();
+                s[19] = stf(f[0]);
                 // be41a4 fld dword ptr [esp + 0x2c]
                 f[0] = ldq(s[19]);
                 // be41a8 fldz 
@@ -17147,7 +17964,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be41b4 fld dword ptr [ebx + 4]
                 f[1] = ldq(rd((ebx.wrapping_add(0x4)) as usize));
                 // be41b7 fstp dword ptr [esp + 0x10]
-                s[12] = (f[1] as f32).to_bits();
+                s[12] = stf(f[1]);
                 // be41bb fld dword ptr [esp + 0x10]
                 f[1] = ldq(s[12]);
                 // be41bf fld st(0)
@@ -17155,7 +17972,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be41c1 fld dword ptr [ebx]
                 f[3] = ldq(rd((ebx) as usize));
                 // be41c3 fstp dword ptr [esp + 0x2c]
-                s[19] = (f[3] as f32).to_bits();
+                s[19] = stf(f[3]);
                 // be41c7 fld dword ptr [esp + 0x2c]
                 f[3] = ldq(s[19]);
                 // be41cb fld st(0)
@@ -17163,7 +17980,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be41cd fld dword ptr [ebx + 8]
                 f[5] = ldq(rd((ebx.wrapping_add(0x8)) as usize));
                 // be41d0 fstp dword ptr [esp + 0x2c]
-                s[19] = (f[5] as f32).to_bits();
+                s[19] = stf(f[5]);
                 // be41d4 fld dword ptr [esp + 0x2c]
                 f[5] = ldq(s[19]);
                 // be41d8 fld st(0)
@@ -17189,7 +18006,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be41ec faddp st(1)
                 f[4] = xn3(f[4], f[5], f[4] + f[5]);
                 // be41ee fstp dword ptr [esp + 0x2c]
-                s[19] = (f[4] as f32).to_bits();
+                s[19] = stf(f[4]);
                 // be41f2 fld dword ptr [esp + 0x2c]
                 f[4] = ldq(s[19]);
                 // be41f6 fxch st(4)
@@ -17212,7 +18029,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be4207 fstp st(1)
                 f[0] = f[1];
                 // be4209 ucomiss xmm1, xmm0
-                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[0]; fl = fl_fcomi(ldf(x[1][0]), ldf(b_[0])); }
                 // be420c fstp st(0)
                 // be420e lahf 
                 eax = set_part(eax, 8, 0xff, ((fl.sf as u32) << 7) | ((fl.zf as u32) << 6) | ((fl.pf as u32) << 2) | 2 | (fl.cf as u32));
@@ -17227,7 +18044,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be4214 movss xmm1, dword ptr [ebx + 0x20]
                 x[1] = [rd((ebx.wrapping_add(0x20)) as usize), 0, 0, 0];
                 // be4219 ucomiss xmm1, xmm0
-                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[0]; fl = fl_fcomi(ldf(x[1][0]), ldf(b_[0])); }
                 // be421c lahf 
                 eax = set_part(eax, 8, 0xff, ((fl.sf as u32) << 7) | ((fl.zf as u32) << 6) | ((fl.pf as u32) << 2) | 2 | (fl.cf as u32));
                 // be421d test ah, 0x44
@@ -17241,7 +18058,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be4222 movss xmm1, dword ptr [ebx + 0x1c]
                 x[1] = [rd((ebx.wrapping_add(0x1c)) as usize), 0, 0, 0];
                 // be4227 ucomiss xmm1, xmm0
-                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[0]; fl = fl_fcomi(ldf(x[1][0]), ldf(b_[0])); }
                 // be422a lahf 
                 eax = set_part(eax, 8, 0xff, ((fl.sf as u32) << 7) | ((fl.zf as u32) << 6) | ((fl.pf as u32) << 2) | 2 | (fl.cf as u32));
                 // be422b test ah, 0x44
@@ -17281,11 +18098,11 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be4263 fld dword ptr [edi + 4]
                 f[3] = ldq(rd((edi.wrapping_add(0x4)) as usize));
                 // be4266 fstp dword ptr [esp + 0x2c]
-                s[19] = (f[3] as f32).to_bits();
+                s[19] = stf(f[3]);
                 // be426a fld dword ptr [edi + 8]
                 f[3] = ldq(rd((edi.wrapping_add(0x8)) as usize));
                 // be426d fstp dword ptr [esp + 0x10]
-                s[12] = (f[3] as f32).to_bits();
+                s[12] = stf(f[3]);
                 // be4271 fld dword ptr [esp + 0x2c]
                 f[3] = ldq(s[19]);
                 // be4275 fld st(0)
@@ -17303,7 +18120,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be4283 fxch st(1)
                 f.swap(5, 4);
                 // be4285 fstp dword ptr [esp + 0x1c]
-                s[15] = (f[5] as f32).to_bits();
+                s[15] = stf(f[5]);
                 // be4289 mov eax, dword ptr [esp + 0x1c]
                 eax = s[15];
                 // be428d fld dword ptr [edi]
@@ -17311,7 +18128,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be428f mov dword ptr [esi], eax
                 w.d((esi) as usize, eax);
                 // be4291 fstp dword ptr [esp + 0x2c]
-                s[19] = (f[5] as f32).to_bits();
+                s[19] = stf(f[5]);
                 // be4295 fmul st(4)
                 f[4] = xn3(f[4], f[0], f[4] * f[0]);
                 // be4297 fld dword ptr [esp + 0x2c]
@@ -17327,7 +18144,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be42a3 fxch st(2)
                 f.swap(4, 2);
                 // be42a5 fstp dword ptr [esp + 0x20]
-                s[16] = (f[4] as f32).to_bits();
+                s[16] = stf(f[4]);
                 // be42a9 mov ecx, dword ptr [esp + 0x20]
                 ecx = s[16];
                 // be42ad fxch st(1)
@@ -17341,7 +18158,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be42b6 fsubrp st(1)
                 f[0] = xn3(f[0], f[1], f[1] - f[0]);
                 // be42b8 fstp dword ptr [esp + 0x24]
-                s[17] = (f[0] as f32).to_bits();
+                s[17] = stf(f[0]);
                 // be42bc mov edx, dword ptr [esp + 0x24]
                 edx = s[17];
                 // be42c0 mov dword ptr [esi + 8], edx
@@ -17361,19 +18178,19 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be42cc fld dword ptr [edi + 8]
                 f[0] = ldq(rd((edi.wrapping_add(0x8)) as usize));
                 // be42cf fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // be42d3 fld dword ptr [esi + 4]
                 f[0] = ldq(rd((esi.wrapping_add(0x4)) as usize));
                 // be42d6 fstp dword ptr [esp + 0x2c]
-                s[19] = (f[0] as f32).to_bits();
+                s[19] = stf(f[0]);
                 // be42da fld dword ptr [edi + 4]
                 f[0] = ldq(rd((edi.wrapping_add(0x4)) as usize));
                 // be42dd fstp dword ptr [esp + 0x18]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // be42e1 fld dword ptr [esi + 8]
                 f[0] = ldq(rd((esi.wrapping_add(0x8)) as usize));
                 // be42e4 fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // be42e8 fld dword ptr [esp + 0x2c]
                 f[0] = ldq(s[19]);
                 // be42ec fld st(0)
@@ -17399,19 +18216,19 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be4306 fsubrp st(1)
                 f[4] = xn3(f[4], f[5], f[5] - f[4]);
                 // be4308 fstp dword ptr [esp + 0x1c]
-                s[15] = (f[4] as f32).to_bits();
+                s[15] = stf(f[4]);
                 // be430c mov eax, dword ptr [esp + 0x1c]
                 eax = s[15];
                 // be4310 fld dword ptr [edi]
                 f[4] = ldq(rd((edi) as usize));
                 // be4312 fstp dword ptr [esp + 0x2c]
-                s[19] = (f[4] as f32).to_bits();
+                s[19] = stf(f[4]);
                 // be4316 fld dword ptr [esi]
                 f[4] = ldq(rd((esi) as usize));
                 // be4318 mov dword ptr [ebx], eax
                 w.d((ebx) as usize, eax);
                 // be431a fstp dword ptr [esp + 0x18]
-                s[14] = (f[4] as f32).to_bits();
+                s[14] = stf(f[4]);
                 // be431e fld dword ptr [esp + 0x2c]
                 f[4] = ldq(s[19]);
                 // be4322 fld st(0)
@@ -17431,7 +18248,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be4332 fxch st(2)
                 f.swap(4, 2);
                 // be4334 fstp dword ptr [esp + 0x20]
-                s[16] = (f[4] as f32).to_bits();
+                s[16] = stf(f[4]);
                 // be4338 mov ecx, dword ptr [esp + 0x20]
                 ecx = s[16];
                 // be433c mov dword ptr [ebx + 4], ecx
@@ -17443,7 +18260,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be4343 fsubrp st(1)
                 f[0] = xn3(f[0], f[1], f[1] - f[0]);
                 // be4345 fstp dword ptr [esp + 0x24]
-                s[17] = (f[0] as f32).to_bits();
+                s[17] = stf(f[0]);
                 // be4349 mov edx, dword ptr [esp + 0x24]
                 edx = s[17];
                 // be434d mov dword ptr [ebx + 8], edx
@@ -17451,19 +18268,19 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be4350 fld dword ptr [edi + 4]
                 f[0] = ldq(rd((edi.wrapping_add(0x4)) as usize));
                 // be4353 fstp dword ptr [esp + 0x18]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // be4357 fld dword ptr [ebx + 8]
                 f[0] = ldq(rd((ebx.wrapping_add(0x8)) as usize));
                 // be435a fstp dword ptr [esp + 0x2c]
-                s[19] = (f[0] as f32).to_bits();
+                s[19] = stf(f[0]);
                 // be435e fld dword ptr [edi + 8]
                 f[0] = ldq(rd((edi.wrapping_add(0x8)) as usize));
                 // be4361 fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // be4365 fld dword ptr [ebx + 4]
                 f[0] = ldq(rd((ebx.wrapping_add(0x4)) as usize));
                 // be4368 fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // be436c fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[14]);
                 // be4370 fld st(0)
@@ -17489,15 +18306,15 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be438a fsubrp st(1)
                 f[4] = xn3(f[4], f[5], f[5] - f[4]);
                 // be438c fstp dword ptr [esp + 0x1c]
-                s[15] = (f[4] as f32).to_bits();
+                s[15] = stf(f[4]);
                 // be4390 fld dword ptr [ebx]
                 f[4] = ldq(rd((ebx) as usize));
                 // be4392 fstp dword ptr [esp + 0x2c]
-                s[19] = (f[4] as f32).to_bits();
+                s[19] = stf(f[4]);
                 // be4396 fld dword ptr [edi]
                 f[4] = ldq(rd((edi) as usize));
                 // be4398 fstp dword ptr [esp + 0x18]
-                s[14] = (f[4] as f32).to_bits();
+                s[14] = stf(f[4]);
                 // be439c fld dword ptr [esp + 0x2c]
                 f[4] = ldq(s[19]);
                 // be43a0 fld st(0)
@@ -17517,7 +18334,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be43b0 fxch st(2)
                 f.swap(4, 2);
                 // be43b2 fstp dword ptr [esp + 0x20]
-                s[16] = (f[4] as f32).to_bits();
+                s[16] = stf(f[4]);
                 // be43b6 fmulp st(2)
                 f[1] = xn3(f[1], f[3], f[1] * f[3]);
                 // be43b8 mov eax, dword ptr [esp + 0x1c]
@@ -17535,7 +18352,7 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // be43c9 pop edi
                 edi = s[8];
                 // be43ca fstp dword ptr [esp + 0x20]
-                s[17] = (f[0] as f32).to_bits();
+                s[17] = stf(f[0]);
                 // be43ce mov edx, dword ptr [esp + 0x20]
                 edx = s[17];
                 // be43d2 mov dword ptr [esi + 8], edx
@@ -17546,6 +18363,8 @@ fn g3_be4170(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 ebx = s[10];
                 // be43d7 add esp, 0x1c
                 // be43da ret 4
+                w.d((a as usize) + 0, s[19]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -17573,7 +18392,7 @@ fn g3_cee660(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // cee665 push ecx
                 s[8] = ecx;
                 // cee666 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // cee669 mov esi, ecx
                 esi = ecx;
                 // cee66b call 0x49ee60
@@ -17584,20 +18403,21 @@ fn g3_cee660(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 f[1] = xn3(f[1], f64::from_bits(rq((0xe5c478u32) as usize)), f[1] * f64::from_bits(rq((0xe5c478u32) as usize)));
                 // cee679 add esp, 4
                 // cee67c fmul dword ptr [esi + 0x10]
-                f[1] = xn3(f[1], ldr32(rd((esi.wrapping_add(0x10)) as usize)), f[1] * ldr32(rd((esi.wrapping_add(0x10)) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((esi.wrapping_add(0x10)) as usize)), f[1] * ldnr(rd((esi.wrapping_add(0x10)) as usize)));
                 // cee67f fmul dword ptr [esi + 0xc]
-                f[1] = xn3(f[1], ldr32(rd((esi.wrapping_add(0xc)) as usize)), f[1] * ldr32(rd((esi.wrapping_add(0xc)) as usize)));
+                f[1] = xn3(f[1], ldnr(rd((esi.wrapping_add(0xc)) as usize)), f[1] * ldnr(rd((esi.wrapping_add(0xc)) as usize)));
                 // cee682 pop esi
                 esi = s[9];
                 // cee683 fmulp st(1)
                 f[0] = xn3(f[0], f[1], f[0] * f[1]);
                 // cee685 fmul dword ptr [esp + 4]
-                f[0] = xn3(f[0], ldr32(s[11]), f[0] * ldr32(s[11]));
+                f[0] = xn3(f[0], ldnr(s[11]), f[0] * ldnr(s[11]));
                 // cee689 fstp dword ptr [esp + 4]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // cee68d fld dword ptr [esp + 4]
                 f[0] = ldq(s[11]);
                 // cee691 ret 4
+                w.d((a as usize) + 0, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -17615,7 +18435,7 @@ fn g3_ceec00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[15] = unsafe { *a.add(2) };
     s[16] = unsafe { *a.add(3) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xceec00u32;
@@ -17630,7 +18450,7 @@ fn g3_ceec00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceec0a push esi
                 s[9] = esi;
                 // ceec0b fstp dword ptr [esp + 0x18]
-                s[15] = (f[0] as f32).to_bits();
+                s[15] = stf(f[0]);
                 // ceec0f push ecx
                 s[8] = ecx;
                 // ceec10 fld dword ptr [esp + 0x1c]
@@ -17638,16 +18458,16 @@ fn g3_ceec00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceec14 mov esi, ecx
                 esi = ecx;
                 // ceec16 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // ceec19 call 0x49ee60
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x49ee60, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // ceec1e fstp dword ptr [esp + 8]
-                s[10] = (f[0] as f32).to_bits();
+                s[10] = stf(f[0]);
                 // ceec22 add esp, 4
                 // ceec25 fld dword ptr [esi + 0x10]
                 f[0] = ldq(rd((esi.wrapping_add(0x10)) as usize));
                 // ceec28 fstp dword ptr [esp + 8]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // ceec2c fld dword ptr [esp + 4]
                 f[0] = ldq(s[10]);
                 // ceec30 fld dword ptr [esp + 8]
@@ -17666,6 +18486,11 @@ fn g3_ceec00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 f[0] = 0.0;
                 // ceec3f add esp, 8
                 // ceec42 ret 0x10
+                w.d((a as usize) + 0, s[13]);
+                w.d((a as usize) + 4, s[14]);
+                w.d((a as usize) + 8, s[15]);
+                w.d((a as usize) + 12, s[16]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -17673,7 +18498,7 @@ fn g3_ceec00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceec45 movss xmm0, dword ptr [esp + 0x18]
                 x[0] = [s[15], 0, 0, 0];
                 // ceec4b comiss xmm0, dword ptr [0xdd32c0]
-                { let b_ = [rd((0xdd32c0u32) as usize), 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = [rd((0xdd32c0u32) as usize), 0, 0, 0]; fl = fl_fcomi(ldf(x[0][0]), ldf(b_[0])); }
                 // ceec52 jbe 0xceec5e
                 pc = if (fl.cf || fl.zf) { 0xceec5e } else { 0xceec54 };
             }
@@ -17702,21 +18527,26 @@ fn g3_ceec00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceec73 fsubp st(1)
                 f[0] = xn3(f[0], f[1], f[0] - f[1]);
                 // ceec75 fmul dword ptr [esi + 0xc]
-                f[0] = xn3(f[0], ldr32(rd((esi.wrapping_add(0xc)) as usize)), f[0] * ldr32(rd((esi.wrapping_add(0xc)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((esi.wrapping_add(0xc)) as usize)), f[0] * ldnr(rd((esi.wrapping_add(0xc)) as usize)));
                 // ceec78 pop esi
                 esi = s[9];
                 // ceec79 fstp dword ptr [esp + 4]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // ceec7d fld dword ptr [esp + 4]
                 f[0] = ldq(s[11]);
                 // ceec81 fmul dword ptr [esp + 0x14]
-                f[0] = xn3(f[0], ldr32(s[15]), f[0] * ldr32(s[15]));
+                f[0] = xn3(f[0], ldnr(s[15]), f[0] * ldnr(s[15]));
                 // ceec85 fstp dword ptr [esp + 0x14]
-                s[15] = (f[0] as f32).to_bits();
+                s[15] = stf(f[0]);
                 // ceec89 fld dword ptr [esp + 0x14]
                 f[0] = ldq(s[15]);
                 // ceec8d add esp, 8
                 // ceec90 ret 0x10
+                w.d((a as usize) + 0, s[13]);
+                w.d((a as usize) + 4, s[14]);
+                w.d((a as usize) + 8, s[15]);
+                w.d((a as usize) + 12, s[16]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -17725,11 +18555,11 @@ fn g3_ceec00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceec95 fld dword ptr [esi + 8]
                 f[1] = ldq(rd((esi.wrapping_add(0x8)) as usize));
                 // ceec98 fstp dword ptr [esp + 8]
-                s[11] = (f[1] as f32).to_bits();
+                s[11] = stf(f[1]);
                 // ceec9c fld dword ptr [esi + 0x10]
                 f[1] = ldq(rd((esi.wrapping_add(0x10)) as usize));
                 // ceec9f fstp dword ptr [esp + 4]
-                s[10] = (f[1] as f32).to_bits();
+                s[10] = stf(f[1]);
                 // ceeca3 fld dword ptr [esp + 8]
                 f[1] = ldq(s[11]);
                 // ceeca7 fld st(0)
@@ -17747,7 +18577,7 @@ fn g3_ceec00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceecb5 fmul st(2)
                 f[4] = xn3(f[4], f[2], f[4] * f[2]);
                 // ceecb7 fstp dword ptr [esp + 4]
-                s[11] = (f[4] as f32).to_bits();
+                s[11] = stf(f[4]);
                 // ceecbb fld dword ptr [esp + 4]
                 f[4] = ldq(s[11]);
                 // ceecbf fld st(0)
@@ -17771,27 +18601,32 @@ fn g3_ceec00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // ceecd1 fxch st(1)
                 f.swap(3, 2);
                 // ceecd3 fstp dword ptr [esp + 4]
-                s[11] = (f[3] as f32).to_bits();
+                s[11] = stf(f[3]);
                 // ceecd7 fxch st(2)
                 f.swap(2, 0);
                 // ceecd9 fsubrp st(1)
                 f[1] = xn3(f[1], f[2], f[2] - f[1]);
                 // ceecdb fmul dword ptr [esp + 4]
-                f[1] = xn3(f[1], ldr32(s[11]), f[1] * ldr32(s[11]));
+                f[1] = xn3(f[1], ldnr(s[11]), f[1] * ldnr(s[11]));
                 // ceecdf faddp st(1)
                 f[0] = xn3(f[0], f[1], f[0] + f[1]);
                 // ceece1 fstp dword ptr [esp + 4]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // ceece5 fld dword ptr [esp + 4]
                 f[0] = ldq(s[11]);
                 // ceece9 fmul dword ptr [esp + 0x14]
-                f[0] = xn3(f[0], ldr32(s[15]), f[0] * ldr32(s[15]));
+                f[0] = xn3(f[0], ldnr(s[15]), f[0] * ldnr(s[15]));
                 // ceeced fstp dword ptr [esp + 0x14]
-                s[15] = (f[0] as f32).to_bits();
+                s[15] = stf(f[0]);
                 // ceecf1 fld dword ptr [esp + 0x14]
                 f[0] = ldq(s[15]);
                 // ceecf5 add esp, 8
                 // ceecf8 ret 0x10
+                w.d((a as usize) + 0, s[13]);
+                w.d((a as usize) + 4, s[14]);
+                w.d((a as usize) + 8, s[15]);
+                w.d((a as usize) + 12, s[16]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return f[0];
             }
@@ -17808,7 +18643,7 @@ fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[20] = unsafe { *a.add(1) };
     s[21] = unsafe { *a.add(2) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd3c880u32;
@@ -17880,7 +18715,7 @@ fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 fl = fl_logic(r_, 32);
                 eax = r_;
                 // d3c8ce fstp dword ptr [esp + 0x10]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // d3c8d2 push ecx
                 s[8] = ecx;
                 // d3c8d3 fld dword ptr [esp + 0x14]
@@ -17889,7 +18724,7 @@ fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 let (r_, f_) = fl_shift("shr", edi, 7, 32); fl = f_;
                 edi = r_;
                 // d3c8da fmul dword ptr [0xe86870]
-                f[0] = xn3(f[0], ldr32(rd((0xe86870u32) as usize)), f[0] * ldr32(rd((0xe86870u32) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((0xe86870u32) as usize)), f[0] * ldnr(rd((0xe86870u32) as usize)));
                 // d3c8e0 and edi, 1
                 let r_ = (edi) & (0x1u32);
                 fl = fl_logic(r_, 32);
@@ -17897,7 +18732,7 @@ fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3c8e3 mov dword ptr [esp + 0x20], eax
                 s[16] = eax;
                 // d3c8e7 fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // d3c8eb fld dword ptr [esp + 0x10]
                 f[0] = ldq(s[12]);
                 // d3c8ef fmul st(0), st(0)
@@ -17907,17 +18742,17 @@ fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3c8f3 fsubrp st(1)
                 f[0] = xn3(f[0], f[1], f[1] - f[0]);
                 // d3c8f5 fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // d3c8f9 fld dword ptr [esp + 0x14]
                 f[0] = ldq(s[13]);
                 // d3c8fd fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // d3c900 call 0x40ea20
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // d3c905 mov ecx, dword ptr [ebp + 8]
                 ecx = s[19];
                 // d3c908 fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // d3c90c movzx eax, word ptr [ecx]
                 eax = (rw((ecx) as usize) as u32);
                 // d3c90f add esp, 4
@@ -17995,7 +18830,7 @@ fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3c97d shufps xmm3, xmm2, 0
                 { let b_ = x[2]; let a_ = x[3]; x[3] = shufps(a_, b_, 0); }
                 // d3c981 movaps xmm2, xmmword ptr [ebx + 0x50]
-                x[2] = rx((ebx.wrapping_add(0x50)) as usize);
+                x[2] = rxa((ebx.wrapping_add(0x50)) as usize);
                 // d3c985 mulps xmm3, xmm2
                 { let b_ = x[2]; x[3] = sse_arith(10, x[3], b_); }
                 // d3c988 movaps xmm2, xmm1
@@ -18003,7 +18838,7 @@ fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3c98b shufps xmm2, xmm1, 0
                 { let b_ = x[1]; let a_ = x[2]; x[2] = shufps(a_, b_, 0); }
                 // d3c98f movaps xmm1, xmmword ptr [ebx + 0x40]
-                x[1] = rx((ebx.wrapping_add(0x40)) as usize);
+                x[1] = rxa((ebx.wrapping_add(0x40)) as usize);
                 // d3c993 mov edx, 3
                 edx = 0x3u32;
                 // d3c998 sub edx, edi
@@ -18021,7 +18856,7 @@ fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3c9a7 mulps xmm3, xmm0
                 { let b_ = x[0]; x[3] = sse_arith(10, x[3], b_); }
                 // d3c9aa movaps xmm0, xmmword ptr [edx + ebx]
-                x[0] = rx((edx.wrapping_add(ebx)) as usize);
+                x[0] = rxa((edx.wrapping_add(ebx)) as usize);
                 // d3c9ae or esi, 0x3f000000
                 let r_ = (esi) | (0x3f000000u32);
                 fl = fl_logic(r_, 32);
@@ -18029,7 +18864,7 @@ fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3c9b4 addps xmm3, xmm0
                 { let b_ = x[0]; x[3] = sse_arith(8, x[3], b_); }
                 // d3c9b7 movaps xmmword ptr [eax], xmm3
-                { let v_: [u32; 4] = x[3]; let a_ = (eax) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                { let v_: [u32; 4] = x[3]; let a_ = chk_align16((eax) as usize); w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
                 // d3c9ba sub ecx, 1
                 let (r_, f_) = fl_sub(ecx, 0x1u32, 32); fl = f_;
                 ecx = r_;
@@ -18060,6 +18895,10 @@ fn g3_d3c880(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3c9d7 pop ebp
                 ebp = s[17];
                 // d3c9d8 ret 0xc
+                w.d((a as usize) + 0, s[19]);
+                w.d((a as usize) + 4, s[20]);
+                w.d((a as usize) + 8, s[21]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -18075,7 +18914,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     s[35] = unsafe { *a.add(0) };
     s[36] = unsafe { *a.add(1) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd3c9e0u32;
@@ -18098,17 +18937,17 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3c9ec mov dword ptr [esp + 0x1c], ecx
                 s[16] = ecx;
                 // d3c9f0 movaps xmm1, xmmword ptr [ecx + 0x20]
-                x[1] = rx((ecx.wrapping_add(0x20)) as usize);
+                x[1] = rxa((ecx.wrapping_add(0x20)) as usize);
                 // d3c9f4 movaps xmm0, xmmword ptr [ecx + 0x30]
-                x[0] = rx((ecx.wrapping_add(0x30)) as usize);
+                x[0] = rxa((ecx.wrapping_add(0x30)) as usize);
                 // d3c9f8 mov eax, dword ptr [ebp + 8]
                 eax = s[35];
                 // d3c9fb movaps xmm2, xmmword ptr [ecx + 0x40]
-                x[2] = rx((ecx.wrapping_add(0x40)) as usize);
+                x[2] = rxa((ecx.wrapping_add(0x40)) as usize);
                 // d3c9ff subps xmm0, xmm1
                 { let b_ = x[1]; x[0] = sse_arith(9, x[0], b_); }
                 // d3ca02 movaps xmm1, xmmword ptr [eax]
-                x[1] = rx((eax) as usize);
+                x[1] = rxa((eax) as usize);
                 // d3ca05 movaps xmmword ptr [esp + 0x50], xmm0
                 { let v_: [u32; 4] = x[0]; s[29] = v_[0]; s[30] = v_[1]; s[31] = v_[2]; s[32] = v_[3]; }
                 // d3ca0a movaps xmm0, xmm1
@@ -18130,7 +18969,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3ca27 movaps xmm0, xmm1
                 x[0] = x[1];
                 // d3ca2a movaps xmm1, xmmword ptr [ecx + 0x50]
-                x[1] = rx((ecx.wrapping_add(0x50)) as usize);
+                x[1] = rxa((ecx.wrapping_add(0x50)) as usize);
                 // d3ca2e mulps xmm0, xmm1
                 { let b_ = x[1]; x[0] = sse_arith(10, x[0], b_); }
                 // d3ca31 addss xmm3, xmm2
@@ -18164,7 +19003,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3ca65 faddp st(1)
                 f[0] = xn3(f[0], f[1], f[0] + f[1]);
                 // d3ca67 fstp dword ptr [esp + 0x14]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // d3ca6b fld dword ptr [0xe5cd18]
                 f[0] = ldq(rd((0xe5cd18u32) as usize));
                 // d3ca71 fld dword ptr [esp + 0x14]
@@ -18180,7 +19019,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3ca7b push ecx
                 s[8] = ecx;
                 // d3ca7c fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // d3ca7f call 0x40ea20
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // d3ca84 fld1 
@@ -18191,7 +19030,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 f[0] = xn3(f[0], f[1], f[1] / f[0]);
                 // d3ca8b add esp, 4
                 // d3ca8e fstp dword ptr [esp + 0x14]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // d3ca92 fld dword ptr [esp + 0x20]
                 f[0] = ldq(s[17]);
                 // d3ca96 fld dword ptr [esp + 0x14]
@@ -18203,15 +19042,15 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3ca9e fxch st(1)
                 f.swap(1, 0);
                 // d3caa0 fstp dword ptr [esp + 0xc]
-                s[12] = (f[1] as f32).to_bits();
+                s[12] = stf(f[1]);
                 // d3caa4 movss xmm1, dword ptr [esp + 0xc]
                 x[1] = [s[12], 0, 0, 0];
                 // d3caaa comiss xmm1, xmm0
-                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[0]; fl = fl_fcomi(ldf(x[1][0]), ldf(b_[0])); }
                 // d3caad fmul dword ptr [esp + 0x30]
-                f[0] = xn3(f[0], ldr32(s[21]), f[0] * ldr32(s[21]));
+                f[0] = xn3(f[0], ldnr(s[21]), f[0] * ldnr(s[21]));
                 // d3cab1 fstp dword ptr [esp + 0x10]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // d3cab5 jb 0xd3cade
                 pc = if fl.cf { 0xd3cade } else { 0xd3cab7 };
             }
@@ -18246,7 +19085,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3cae0 movss xmm1, dword ptr [esp + 0x10]
                 x[1] = [s[13], 0, 0, 0];
                 // d3cae6 comiss xmm1, xmm0
-                { let b_ = x[0]; fl = fl_fcomi(f32::from_bits(x[1][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = x[0]; fl = fl_fcomi(ldf(x[1][0]), ldf(b_[0])); }
                 // d3cae9 jb 0xd3caf2
                 pc = if fl.cf { 0xd3caf2 } else { 0xd3caeb };
             }
@@ -18268,19 +19107,19 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3caf8 push ecx
                 s[8] = ecx;
                 // d3caf9 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // d3cafc call 0x49ee60
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x49ee60, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // d3cb01 fstp dword ptr [esp + 0x10]
-                s[12] = (f[0] as f32).to_bits();
+                s[12] = stf(f[0]);
                 // d3cb05 fld dword ptr [esp + 0x14]
                 f[0] = ldq(s[13]);
                 // d3cb09 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // d3cb0c call 0x49ee60
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x49ee60, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // d3cb11 fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // d3cb15 add esp, 4
                 // d3cb18 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[12]);
@@ -18332,7 +19171,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3cb64 movss dword ptr [esp + 0x50], xmm2
                 s[29] = x[2][0];
                 // d3cb6a comiss xmm0, dword ptr [esp + 0x50]
-                { let b_ = [s[29], 0, 0, 0]; fl = fl_fcomi(f32::from_bits(x[0][0]) as f64, f32::from_bits(b_[0]) as f64); }
+                { let b_ = [s[29], 0, 0, 0]; fl = fl_fcomi(ldf(x[0][0]), ldf(b_[0])); }
                 // d3cb6f jb 0xd3cb78
                 pc = if fl.cf { 0xd3cb78 } else { 0xd3cb71 };
             }
@@ -18352,13 +19191,13 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3cb7a fld dword ptr [0xe866bc]
                 f[0] = ldq(rd((0xe866bcu32) as usize));
                 // d3cb80 fmul dword ptr [esp + 0x10]
-                f[0] = xn3(f[0], ldr32(s[13]), f[0] * ldr32(s[13]));
+                f[0] = xn3(f[0], ldnr(s[13]), f[0] * ldnr(s[13]));
                 // d3cb84 fsub dword ptr [0xe86874]
-                f[0] = xn3(f[0], ldr32(rd((0xe86874u32) as usize)), f[0] - ldr32(rd((0xe86874u32) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((0xe86874u32) as usize)), f[0] - ldnr(rd((0xe86874u32) as usize)));
                 // d3cb8a fadd qword ptr [0xe5c368]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5c368u32) as usize)), f[0] + f64::from_bits(rq((0xe5c368u32) as usize)));
                 // d3cb90 fstp dword ptr [esp + 0x14]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // d3cb94 fld dword ptr [esp + 0x14]
                 f[0] = ldq(s[14]);
                 // d3cb98 fistp dword ptr [esp + 0xc]
@@ -18419,13 +19258,13 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3cbd8 fadd qword ptr [0xe5bf70]
                 f[0] = xn3(f[0], f64::from_bits(rq((0xe5bf70u32) as usize)), f[0] + f64::from_bits(rq((0xe5bf70u32) as usize)));
                 // d3cbde fstp dword ptr [esp + 0x18]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // d3cbe2 fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[14]);
                 // d3cbe6 fmul dword ptr [0xe86870]
-                f[0] = xn3(f[0], ldr32(rd((0xe86870u32) as usize)), f[0] * ldr32(rd((0xe86870u32) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((0xe86870u32) as usize)), f[0] * ldnr(rd((0xe86870u32) as usize)));
                 // d3cbec fstp dword ptr [esp + 0x14]
-                s[13] = (f[0] as f32).to_bits();
+                s[13] = stf(f[0]);
                 // d3cbf0 fld dword ptr [esp + 0x14]
                 f[0] = ldq(s[13]);
                 // d3cbf4 fmul st(0), st(0)
@@ -18435,16 +19274,16 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3cbf8 fsubrp st(1)
                 f[0] = xn3(f[0], f[1], f[1] - f[0]);
                 // d3cbfa fstp dword ptr [esp + 0x18]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // d3cbfe fld dword ptr [esp + 0x18]
                 f[0] = ldq(s[14]);
                 // d3cc02 fstp dword ptr [esp]
-                s[8] = (f[0] as f32).to_bits();
+                s[8] = stf(f[0]);
                 // d3cc05 call 0x40ea20
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, true, 0x40ea20, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; f[0] = f64::from_bits(st_); }
                 // d3cc0a add esp, 4
                 // d3cc0d fstp dword ptr [esp + 0x14]
-                s[14] = (f[0] as f32).to_bits();
+                s[14] = stf(f[0]);
                 // d3cc11 test bl, 0x10
                 let r_ = ((ebx & 0xff)) & (0x10u32);
                 fl = fl_logic(r_, 8);
@@ -18515,7 +19354,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3cc6e shufps xmm3, xmm2, 0
                 { let b_ = x[2]; let a_ = x[3]; x[3] = shufps(a_, b_, 0); }
                 // d3cc72 movaps xmm2, xmmword ptr [eax + 0x50]
-                x[2] = rx((eax.wrapping_add(0x50)) as usize);
+                x[2] = rxa((eax.wrapping_add(0x50)) as usize);
                 // d3cc76 mulps xmm3, xmm2
                 { let b_ = x[2]; x[3] = sse_arith(10, x[3], b_); }
                 // d3cc79 movaps xmm2, xmm1
@@ -18523,7 +19362,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3cc7c shufps xmm2, xmm1, 0
                 { let b_ = x[1]; let a_ = x[2]; x[2] = shufps(a_, b_, 0); }
                 // d3cc80 movaps xmm1, xmmword ptr [eax + 0x40]
-                x[1] = rx((eax.wrapping_add(0x40)) as usize);
+                x[1] = rxa((eax.wrapping_add(0x40)) as usize);
                 // d3cc84 mov ecx, 3
                 ecx = 0x3u32;
                 // d3cc89 sub ecx, esi
@@ -18541,7 +19380,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3cc98 mulps xmm3, xmm0
                 { let b_ = x[0]; x[3] = sse_arith(10, x[3], b_); }
                 // d3cc9b movaps xmm0, xmmword ptr [ecx + eax]
-                x[0] = rx((ecx.wrapping_add(eax)) as usize);
+                x[0] = rxa((ecx.wrapping_add(eax)) as usize);
                 // d3cc9f mov eax, dword ptr [ebp + 0xc]
                 eax = s[36];
                 // d3cca2 pop edi
@@ -18553,7 +19392,7 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3cca9 addps xmm3, xmm0
                 { let b_ = x[0]; x[3] = sse_arith(8, x[3], b_); }
                 // d3ccac movaps xmmword ptr [eax], xmm3
-                { let v_: [u32; 4] = x[3]; let a_ = (eax) as usize; w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
+                { let v_: [u32; 4] = x[3]; let a_ = chk_align16((eax) as usize); w.d(a_, v_[0]); w.d(a_ + 4, v_[1]); w.d(a_ + 8, v_[2]); w.d(a_ + 12, v_[3]); }
                 // d3ccaf pop esi
                 esi = s[10];
                 // d3ccb0 mov dword ptr [eax + 0xc], ebx
@@ -18565,6 +19404,9 @@ fn g3_d3c9e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d3ccb6 pop ebp
                 ebp = s[33];
                 // d3ccb7 ret 8
+                w.d((a as usize) + 0, s[35]);
+                w.d((a as usize) + 4, s[36]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -18579,7 +19421,7 @@ fn g3_d4c420(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let mut s = [0u32; 25];
     s[13] = unsafe { *a.add(0) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd4c420u32;
@@ -18623,6 +19465,8 @@ fn g3_d4c420(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 esi = s[8];
                 // d4c479 add esp, 0xc
                 // d4c47c ret 4
+                w.d((a as usize) + 0, s[13]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -18659,37 +19503,38 @@ fn g3_d4c480(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d4c494 fxch st(1)
                 f.swap(1, 0);
                 // d4c496 fstp dword ptr [esp + 4]
-                s[9] = (f[1] as f32).to_bits();
+                s[9] = stf(f[1]);
                 // d4c49a fld dword ptr [ecx + 0xc4]
                 f[1] = ldq(rd((ecx.wrapping_add(0xc4)) as usize));
                 // d4c4a0 fdivr st(1)
                 f[1] = xn3(f[1], f[0], f[0] / f[1]);
                 // d4c4a2 fstp dword ptr [esp + 8]
-                s[10] = (f[1] as f32).to_bits();
+                s[10] = stf(f[1]);
                 // d4c4a6 fdiv dword ptr [ecx + 0xc8]
-                f[0] = xn3(f[0], ldr32(rd((ecx.wrapping_add(0xc8)) as usize)), f[0] / ldr32(rd((ecx.wrapping_add(0xc8)) as usize)));
+                f[0] = xn3(f[0], ldnr(rd((ecx.wrapping_add(0xc8)) as usize)), f[0] / ldnr(rd((ecx.wrapping_add(0xc8)) as usize)));
                 // d4c4ac mov ecx, esi
                 ecx = esi;
                 // d4c4ae fstp dword ptr [esp + 0xc]
-                s[11] = (f[0] as f32).to_bits();
+                s[11] = stf(f[0]);
                 // d4c4b2 call 0x703480
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
                 // d4c4b7 fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // d4c4bb fstp dword ptr [esi]
-                w.d((esi) as usize, (f[0] as f32).to_bits());
+                w.d((esi) as usize, stf(f[0]));
                 // d4c4bd fld dword ptr [esp + 8]
                 f[0] = ldq(s[10]);
                 // d4c4c1 fstp dword ptr [esi + 0x14]
-                w.d((esi.wrapping_add(0x14)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x14)) as usize, stf(f[0]));
                 // d4c4c4 fld dword ptr [esp + 0xc]
                 f[0] = ldq(s[11]);
                 // d4c4c8 fstp dword ptr [esi + 0x28]
-                w.d((esi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x28)) as usize, stf(f[0]));
                 // d4c4cb pop esi
                 esi = s[8];
                 // d4c4cc add esp, 0xc
                 // d4c4cf ret 4
+                w.d((a as usize) + 0, s[13]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -18703,7 +19548,7 @@ fn g3_d4e570(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let mut s = [0u32; 22];
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd4e570u32;
@@ -18824,6 +19669,7 @@ fn g3_d4e570(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d4e6b5 pop ebx
                 ebx = s[9];
                 // d4e6b6 ret 
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -18837,7 +19683,7 @@ fn g3_d4eb00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let mut s = [0u32; 21];
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd4eb00u32;
@@ -18909,6 +19755,7 @@ fn g3_d4eb00(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d4ebad pop edi
                 edi = s[8];
                 // d4ebae ret 
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -18922,7 +19769,7 @@ fn g3_d51f60(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let mut s = [0u32; 21];
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd51f60u32;
@@ -18997,6 +19844,7 @@ fn g3_d51f60(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d51fe3 pop edi
                 edi = s[8];
                 // d51fe4 ret 
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -19010,7 +19858,7 @@ fn g3_d550e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (p.eax, p.ecx, p.edx, p.ebx, p.esi, p.edi, p.ebp);
     let mut s = [0u32; 21];
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd550e0u32;
@@ -19074,6 +19922,7 @@ fn g3_d550e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d55165 pop edi
                 edi = s[8];
                 // d55166 ret 
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -19088,7 +19937,7 @@ fn g3_d835a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let mut s = [0u32; 23];
     s[11] = unsafe { *a.add(0) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd835a0u32;
@@ -19122,6 +19971,8 @@ fn g3_d835a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d835d0 pop ecx
                 ecx = s[9];
                 // d835d1 ret 4
+                w.d((a as usize) + 0, s[11]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -19136,7 +19987,7 @@ fn g3_d835e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let mut s = [0u32; 23];
     s[11] = unsafe { *a.add(0) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd835e0u32;
@@ -19170,6 +20021,8 @@ fn g3_d835e0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d83610 pop ecx
                 ecx = s[9];
                 // d83611 ret 4
+                w.d((a as usize) + 0, s[11]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -19205,22 +20058,23 @@ fn g3_d83620(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d83630 mov ecx, esi
                 ecx = esi;
                 // d83632 fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // d83636 call 0x703480
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
                 // d8363b fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // d8363f fst dword ptr [esi]
-                w.d((esi) as usize, (f[0] as f32).to_bits());
+                w.d((esi) as usize, stf(f[0]));
                 // d83641 fst dword ptr [esi + 0x14]
-                w.d((esi.wrapping_add(0x14)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x14)) as usize, stf(f[0]));
                 // d83644 fstp dword ptr [esi + 0x28]
-                w.d((esi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x28)) as usize, stf(f[0]));
                 // d83647 pop esi
                 esi = s[8];
                 // d83648 pop ecx
                 ecx = s[9];
                 // d83649 ret 4
+                w.d((a as usize) + 0, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -19256,22 +20110,23 @@ fn g3_d83650(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d83660 mov ecx, esi
                 ecx = esi;
                 // d83662 fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // d83666 call 0x703480
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
                 // d8366b fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // d8366f fst dword ptr [esi]
-                w.d((esi) as usize, (f[0] as f32).to_bits());
+                w.d((esi) as usize, stf(f[0]));
                 // d83671 fst dword ptr [esi + 0x14]
-                w.d((esi.wrapping_add(0x14)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x14)) as usize, stf(f[0]));
                 // d83674 fstp dword ptr [esi + 0x28]
-                w.d((esi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x28)) as usize, stf(f[0]));
                 // d83677 pop esi
                 esi = s[8];
                 // d83678 pop ecx
                 ecx = s[9];
                 // d83679 ret 4
+                w.d((a as usize) + 0, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -19286,7 +20141,7 @@ fn g3_d83920(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let mut s = [0u32; 23];
     s[11] = unsafe { *a.add(0) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd83920u32;
@@ -19320,6 +20175,8 @@ fn g3_d83920(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d83950 pop ecx
                 ecx = s[9];
                 // d83951 ret 4
+                w.d((a as usize) + 0, s[11]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -19334,7 +20191,7 @@ fn g3_d83960(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
     let mut s = [0u32; 23];
     s[11] = unsafe { *a.add(0) };
     let mut f = [0f64; 8];
-    let mut x = [[0u32; 4]; 8];
+    let mut x = xmm_get();
     let mut fl = Fl::default();
     let mut cc87 = 0u32;
     let mut pc = 0xd83960u32;
@@ -19368,6 +20225,8 @@ fn g3_d83960(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d83990 pop ecx
                 ecx = s[9];
                 // d83991 ret 4
+                w.d((a as usize) + 0, s[11]);
+                xmm_set(x);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -19403,22 +20262,23 @@ fn g3_d839a0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d839b0 mov ecx, esi
                 ecx = esi;
                 // d839b2 fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // d839b6 call 0x703480
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
                 // d839bb fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // d839bf fst dword ptr [esi]
-                w.d((esi) as usize, (f[0] as f32).to_bits());
+                w.d((esi) as usize, stf(f[0]));
                 // d839c1 fst dword ptr [esi + 0x14]
-                w.d((esi.wrapping_add(0x14)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x14)) as usize, stf(f[0]));
                 // d839c4 fstp dword ptr [esi + 0x28]
-                w.d((esi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x28)) as usize, stf(f[0]));
                 // d839c7 pop esi
                 esi = s[8];
                 // d839c8 pop ecx
                 ecx = s[9];
                 // d839c9 ret 4
+                w.d((a as usize) + 0, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -19454,22 +20314,23 @@ fn g3_d839d0(p: &mut Pushad, a: *const u32, w: &mut W) -> f64 {
                 // d839e0 mov ecx, esi
                 ecx = esi;
                 // d839e2 fstp dword ptr [esp + 4]
-                s[9] = (f[0] as f32).to_bits();
+                s[9] = stf(f[0]);
                 // d839e6 call 0x703480
                 { let mut r_ = Regs { eax, ecx, edx, ebx, esi, edi, ebp }; let mut st_ = 0u64; unsafe { call_orig(0, false, 0x703480, &mut r_, s[8..].as_ptr(), 8, &mut st_) }; eax = r_.eax; ecx = r_.ecx; edx = r_.edx; ebx = r_.ebx; esi = r_.esi; edi = r_.edi; ebp = r_.ebp; }
                 // d839eb fld dword ptr [esp + 4]
                 f[0] = ldq(s[9]);
                 // d839ef fst dword ptr [esi]
-                w.d((esi) as usize, (f[0] as f32).to_bits());
+                w.d((esi) as usize, stf(f[0]));
                 // d839f1 fst dword ptr [esi + 0x14]
-                w.d((esi.wrapping_add(0x14)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x14)) as usize, stf(f[0]));
                 // d839f4 fstp dword ptr [esi + 0x28]
-                w.d((esi.wrapping_add(0x28)) as usize, (f[0] as f32).to_bits());
+                w.d((esi.wrapping_add(0x28)) as usize, stf(f[0]));
                 // d839f7 pop esi
                 esi = s[8];
                 // d839f8 pop ecx
                 ecx = s[9];
                 // d839f9 ret 4
+                w.d((a as usize) + 0, s[11]);
                 p.eax = eax; p.ecx = ecx; p.edx = edx; p.ebx = ebx; p.esi = esi; p.edi = edi; p.ebp = ebp;
                 return 0.0;
             }
@@ -19988,12 +20849,12 @@ fn nsl_run(p: &mut Pushad) -> u32 {
     let xy = xn3(yy, xx, yy + xx);
     let zz = xn3(z, z, z * z);
     let d2 = xn3(xy, zz, xy + zz);
-    let arg = (d2 as f32).to_bits();
-    let (eax, ecx, edx, root) = crt_call1(NSL_SQRT.load(Ordering::Relaxed), arg, p.eax, p.ecx, p.edx);
+    let arg = stf(d2);
+    let (eax, ecx, edx, root) = crt_call1(NSL_SQRT.load(Ordering::Relaxed), arg, p.eax, p.ecx, p.edx, [p.ebx, p.esi, p.edi, p.ebp]);
     p.eax = eax;
     p.ecx = ecx;
     p.edx = edx;
-    let len = (root as f32).to_bits();
+    let len = stf(root);
     let len_d = ldq(len);
     // fld 0.0; fsubr: len - 0.0, spilled as f32 and reloaded.
     let lenp = ldq(((len_d - 0.0) as f32).to_bits());
@@ -20148,9 +21009,26 @@ extern "C" fn nsl_entry(p: &mut Pushad) -> u32 {
 extern "C" fn nsl_thunk() {
     std::arch::naked_asm!(
         "pushad",
-        "push esp",
+        "sub esp, 128",
+        "movups [esp], xmm1",
+        "movups [esp + 16], xmm2",
+        "movups [esp + 32], xmm3",
+        "movups [esp + 48], xmm4",
+        "movups [esp + 64], xmm5",
+        "movups [esp + 80], xmm6",
+        "movups [esp + 96], xmm7",
+        "lea eax, [esp + 128]",
+        "push eax",
         "call {f}",
         "add esp, 4",
+        "movups xmm1, [esp]",
+        "movups xmm2, [esp + 16]",
+        "movups xmm3, [esp + 32]",
+        "movups xmm4, [esp + 48]",
+        "movups xmm5, [esp + 64]",
+        "movups xmm6, [esp + 80]",
+        "movups xmm7, [esp + 96]",
+        "add esp, 128",
         "movd xmm0, eax",
         "popad",
         "ret",

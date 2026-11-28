@@ -9,6 +9,119 @@
 //! (EAX = state - 1, ESI kept) and read no register; `gameplay_exit` takes one cdecl argument
 //! (the next state). All are entered through thunks that keep ECX / EDX.
 
+
+/// Thunks like portlib's keep_ecx_edx*, but also keeping XMM0-7 (the original leaves them alone).
+#[allow(unused_macros)]
+macro_rules! kx0 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "call {f}",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+#[allow(unused_macros)]
+macro_rules! kx1 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "push dword ptr [esp + 140]",
+            "call {f}",
+            "add esp, 4",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+#[allow(unused_macros)]
+macro_rules! kx2 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "push dword ptr [esp + 144]",
+            "push dword ptr [esp + 144]",
+            "call {f}",
+            "add esp, 8",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+
 use crate::portlib::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -706,13 +819,13 @@ extern "C" fn frontend_render() {
 
 // --- install ----------------------------------------------------------------------------------
 
-keep_ecx_edx!(gameplay_enter_thunk, gameplay_enter);
-keep_ecx_edx_arg1!(gameplay_exit_thunk, gameplay_exit);
-keep_ecx_edx!(loading_enter_thunk, loading_enter);
-keep_ecx_edx!(loading_exit_thunk, loading_exit);
-keep_ecx_edx!(frontend_enter_thunk, frontend_enter);
-keep_ecx_edx!(frontend_exit_thunk, frontend_exit);
-keep_ecx_edx!(frontend_render_thunk, frontend_render);
+kx0!(gameplay_enter_thunk, gameplay_enter);
+kx1!(gameplay_exit_thunk, gameplay_exit);
+kx0!(loading_enter_thunk, loading_enter);
+kx0!(loading_exit_thunk, loading_exit);
+kx0!(frontend_enter_thunk, frontend_enter);
+kx0!(frontend_exit_thunk, frontend_exit);
+kx0!(frontend_render_thunk, frontend_render);
 
 /// Install this module's replacements (called from hooks::install_all).
 pub fn install() {

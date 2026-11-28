@@ -217,12 +217,30 @@ macro_rules! regs_thunk {
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
-                "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 128]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
@@ -453,13 +471,14 @@ unsafe fn shop_net_exit(s: u32) -> bool {
 
 /// Two circular lists: `[0x145A4FC]` (next +0, key +8, value +0xC), then `[0x2527D4C]` (key +0xC,
 /// result +0x10). -1 when absent or when the value equals `[0x33D630C]`.
-unsafe fn find_index(edx: u32) -> u32 {
+/// Returns (EAX, ECX, EDX) as the original leaves them: the list cursors / heads stay in ECX / EDX.
+unsafe fn find_index(edx0: u32) -> (u32, u32, u32) {
     unsafe {
         let head = rd(0x0145_A4FC);
         if head == 0 {
-            return u32::MAX;
+            return (u32::MAX, 0, edx0);
         }
-        let h = rd(edx as usize);
+        let h = rd(edx0 as usize);
         let mut n = head;
         loop {
             if rd(n as usize + 8) == h {
@@ -467,25 +486,28 @@ unsafe fn find_index(edx: u32) -> u32 {
             }
             n = rd(n as usize);
             if n == head || n == 0 {
-                return u32::MAX;
+                return (u32::MAX, head, h);
             }
         }
         let v = rd(n as usize + 0xC);
         if v == rd(0x033D_630C) {
-            return u32::MAX;
+            return (u32::MAX, head, h);
         }
         let head2 = rd(0x0252_7D4C);
         if head2 == 0 {
-            return u32::MAX;
+            return (u32::MAX, 0, 0);
         }
         let mut m = head2;
         loop {
             if rd(m as usize + 0xC) == v {
-                return rd(m as usize + 0x10);
+                return (rd(m as usize + 0x10), m, head2);
             }
             m = rd(m as usize);
-            if m == head2 || m == 0 {
-                return u32::MAX;
+            if m == head2 {
+                return (u32::MAX, m, head2);
+            }
+            if m == 0 {
+                return (u32::MAX, 0, head2);
             }
         }
     }
@@ -493,7 +515,9 @@ unsafe fn find_index(edx: u32) -> u32 {
 
 extern "C" fn find_index_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    let ours = unsafe { find_index(p.edx) };
+    let (ours, fecx, fedx) = unsafe { find_index(p.edx) };
+    r.ecx = fecx;
+    r.edx = fedx;
     let Some((n, orig)) = shadowing(FIND_INDEX) else {
         r.eax = ours;
         return;
@@ -792,7 +816,8 @@ extern "C" fn release_thunk() {
 const NET_RELEASE: usize = 0x00A7_9240; // EDX, stack (5, 1, 0)
 const NET_ADD_REF: usize = 0x00A7_9120; // ECX = 1, EDI, stack (5, 0)
 
-unsafe fn leave(human: u32, shop: u32, edi: u32) {
+/// Returns the callee's EAX when the player path ran (ECX is then whatever the callee leaves).
+unsafe fn leave(human: u32, shop: u32, edi: u32) -> Option<u32> {
     unsafe {
         let player = rd(PLAYER);
         let is_player = human != 0 && human == player;
@@ -807,16 +832,24 @@ unsafe fn leave(human: u32, shop: u32, edi: u32) {
             let ecx = rd(rd(sh + 4) as usize + 0x10);
             let eax = rd(rd(ecx as usize + 0x6C) as usize + 8);
             let edx = rd(eax as usize + 0x68);
-            call_regs(NET_RELEASE, eax, ecx, edx, shop, edi, &[5, 1, 0]);
+            let r = call_regs(NET_RELEASE, eax, ecx, edx, shop, edi, &[5, 1, 0]);
+            wb(sh + 0x25, 0);
+            wb(sh + 0x9C, 0);
+            return Some(r);
         }
         wb(sh + 0x25, 0);
         wb(sh + 0x9C, 0);
+        None
     }
 }
 
 extern "C" fn leave_entry(r: &mut Pushad, _: *const u32) {
     count(LEAVE);
-    unsafe { leave(r.eax, r.esi, r.edi) };
+    // the original leaves ECX = the local player (`mov ecx, [0x21703D4]`) unless the callee clobbers it
+    match unsafe { leave(r.eax, r.esi, r.edi) } {
+        Some(e) => r.eax = e,
+        None => r.ecx = unsafe { rd(PLAYER) },
+    }
 }
 regs_thunk!(leave_thunk, leave_entry);
 
@@ -1416,22 +1449,21 @@ const AUDIO_VOICE_STOP: usize = 0x0047_FEB0; // ECX = voice handle*
 const AUDIO_SLOT_RELEASE: usize = 0x009F_4AB0; // stdcall (sound id, 0)
 const SOUND_TABLE: usize = 0x00EE_B8F8; // stride 0x19C: +0 voice, +0xB4 = 0xEEB9AC id
 
-unsafe fn audio_start(rec: u32) {
+unsafe fn audio_start(rec: u32) -> u32 {
     unsafe {
         let r = rec as usize;
         if (rd(r + 4) as i32) < 0 {
             if rd(r + 0x68) != 0 {
                 wd(r + 0x68, 0);
             }
-            return;
+            return 0;
         }
         if (rb(FLAG_D14) != 0 && rb(FLAG_CF7) != 0) || rb(FLAG_D15) != 0 {
             hit(H_AUDIO_STOP_PATH);
-            call_regs(AUDIO_STOP, 0, 0, 0, 0, 0, &[rec]);
-            return;
+            return call_regs(AUDIO_STOP, 0, 0, 0, 0, 0, &[rec]);
         }
         if rd(r + 0x68) == 0 {
-            return;
+            return 0;
         }
         let mut i = 0u32;
         loop {
@@ -1462,16 +1494,17 @@ unsafe fn audio_start(rec: u32) {
                 break;
             }
         }
+        i
     }
 }
 
-extern "C" fn audio_start_entry(_: &mut Pushad, args: *const u32) {
+extern "C" fn audio_start_entry(r: &mut Pushad, args: *const u32) {
     count(AUDIO_START);
-    unsafe { audio_start(*args) };
+    r.eax = unsafe { audio_start(*args) };
 }
 regs_thunk!(audio_start_thunk, audio_start_entry, "ret 4");
 
-unsafe fn audio_stop(rec: u32) {
+unsafe fn audio_stop(rec: u32, eax0: u32, edx0: u32) -> u32 {
     unsafe {
         let r = rec as usize;
         let n = rd(r + 0x68);
@@ -1481,7 +1514,7 @@ unsafe fn audio_stop(rec: u32) {
             loop {
                 hit(H_AUDIO_STOPPED);
                 let p = (r + 0x38 + i as usize * 12) as u32;
-                call_regs(AUDIO_VOICE_STOP, 0, p, 0, i, p, &[]);
+                call_regs(AUDIO_VOICE_STOP, eax0, p, edx0, i, p, &[]);
                 i = i.wrapping_add(1);
                 if !(i < rd(r + 0x68)) {
                     break;
@@ -1490,13 +1523,13 @@ unsafe fn audio_stop(rec: u32) {
         }
         let sound = rd(r);
         wd(r + 0x68, 0);
-        call_regs(AUDIO_SLOT_RELEASE, 0, 0, 0, i, 0, &[sound, 0]);
+        call_regs(AUDIO_SLOT_RELEASE, 0, 0, 0, i, 0, &[sound, 0])
     }
 }
 
-extern "C" fn audio_stop_entry(_: &mut Pushad, args: *const u32) {
+extern "C" fn audio_stop_entry(r: &mut Pushad, args: *const u32) {
     count(AUDIO_STOP_P);
-    unsafe { audio_stop(*args) };
+    r.eax = unsafe { audio_stop(*args, r.eax, r.edx) };
 }
 regs_thunk!(audio_stop_thunk, audio_stop_entry, "ret 4");
 

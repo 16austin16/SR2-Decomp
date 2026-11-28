@@ -143,6 +143,89 @@ unsafe fn call_orig(f: usize, r: &mut Regs, args: [u32; 3], want_st0: bool) -> f
     f64::from_bits(b.st0[0] as u64 | (b.st0[1] as u64) << 32)
 }
 
+#[repr(C)]
+struct Block4 {
+    f: u32,
+    r: Regs,
+    args: [u32; 4],
+    esp: u32,
+}
+
+/// `call_orig` for a callee with up to four stack arguments (cdecl or stdcall); all seven registers in and out.
+unsafe fn call_orig4(f: usize, r: &mut Regs, args: [u32; 4]) {
+    let mut b = Block4 { f: f as u32, r: *r, args, esp: 0 };
+    unsafe {
+        std::arch::asm!(
+            "push ebp", "push ebx", "push esi", "push edi",
+            "mov [eax + 48], esp",
+            "push eax", "push eax", "push eax", "push eax", "push eax",
+            "push dword ptr [eax]",
+            "push dword ptr [eax + 44]",
+            "push dword ptr [eax + 40]",
+            "push dword ptr [eax + 36]",
+            "push dword ptr [eax + 32]",
+            "mov ecx, [eax + 8]", "mov edx, [eax + 12]", "mov ebx, [eax + 16]",
+            "mov esi, [eax + 20]", "mov edi, [eax + 24]", "mov ebp, [eax + 28]",
+            "mov eax, [eax + 4]",
+            "call dword ptr [esp + 16]",
+            "push ebx",
+            "mov ebx, [esp + 24]",
+            "mov [ebx + 4], eax", "mov [ebx + 8], ecx", "mov [ebx + 12], edx",
+            "mov [ebx + 20], esi", "mov [ebx + 24], edi", "mov [ebx + 28], ebp",
+            "pop dword ptr [ebx + 16]",
+            "mov esp, [ebx + 48]",
+            "pop edi", "pop esi", "pop ebx", "pop ebp",
+            inout("eax") &mut b as *mut Block4 => _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    *r = b.r;
+}
+
+/// `regs_thunk!` with a frame: `$frame` bytes below the caller's ESP are reserved first, so a port can build the
+/// buffer an LTCG original keeps in its own frame at the very same address (the judge compares pointers to it).
+macro_rules! regs_thunk_frame {
+    ($name:ident, $f:ident, $ret:literal, $frame:literal) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {frame}",
+                "pushad",
+                "mov eax, esp",
+                "lea ecx, [esp + 36 + {frame}]",
+                "sub esp, 128",
+                "movups [esp], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3", "movups [esp + 64], xmm4", "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
+                "push ecx",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, [esp]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]", "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "popad",
+                "add esp, {frame}",
+                $ret,
+                f = sym $f,
+                frame = const $frame,
+            )
+        }
+    };
+}
+
+macro_rules! port_thunk_frame {
+    ($thunk:ident, $entry:ident, $id:expr, $h:ident, $ret:literal, $frame:literal) => {
+        extern "C" fn $entry(r: &mut Pushad, a: *const u32) {
+            unsafe { $h($id, r, a) }
+        }
+        regs_thunk_frame!($thunk, $entry, $ret, $frame);
+    };
+}
+
 /// A naked thunk: `pushad`, then `f(&mut block, &stack args)`, then `popad`. The Rust body puts
 /// its result in the block's EAX; an `f32` return stays on ST0. `$ret` is the `ret` form.
 macro_rules! regs_thunk {
@@ -153,10 +236,18 @@ macro_rules! regs_thunk {
                 "pushad",
                 "mov eax, esp",
                 "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3", "movups [esp + 64], xmm4", "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]", "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
@@ -563,6 +654,7 @@ unsafe fn read_at(start: u32, count: u32, s: u32) -> u32 {
 }
 
 /// Read `n` bits at the cursor; the cursor advances even when the read was rejected.
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn read_n(s: u32, n: u32) -> u32 {
     unsafe {
         let c = rd(s as usize + 0x10);
@@ -655,151 +747,280 @@ unsafe fn shadow_reader(id: usize, p: &Pushad, stream: u32, args: [u32; 3], out:
     }
 }
 
+// --- the bit writers / readers: what the originals leave in the registers ------------------------------------------------
+// The LTCG originals leave real values in EAX / ECX / EDX (a cursor, a mask, a shifted-out value, a callee's
+// leftovers); callers can read them, so each handler below reproduces them from the entry state.
+
+const WRITE_U32_FN: usize = 0x007F_D560;
+const WRITE_U8_FN: usize = 0x007F_D100;
+const READ_AT_FN: usize = 0x007F_D8F0;
+
+/// Store a call's EAX / ECX / EDX (what the callee left) as the registers this port returns.
+fn put_regs(r: &mut Pushad, g: &Regs) {
+    r.eax = g.eax;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
+}
+
 // --- 0x7FD030 net_bits_write_at (EAX = start, ECX = count, ESI = stream, [esp+4] = value, `ret 4`) ----
+// Out of range / count 0 / count > 0x20: EDX = value. Else the loop leaves EAX = start + count, ECX = the address of the
+// last byte touched and EDX = value >> count.
 
 unsafe fn h_write_at(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
         let value = *a;
+        let (start, count) = (p.eax, p.ecx);
+        r.edx = value;
+        let size = std::ptr::read_volatile((p.esi as usize + 0xC) as *const u32); // faults first, as `cmp edi, [esi+0xC]`
+        if !(start.wrapping_add(count) > size || count > 0x20 || count == 0) {
+            let last = start.wrapping_add(count).wrapping_sub(1);
+            r.eax = start.wrapping_add(count);
+            r.ecx = rd(p.esi as usize).wrapping_add(last >> 3);
+            r.edx = if count >= 32 { 0 } else { value >> count };
+        }
         shadow_writer(id, &p, p.esi, [value, 0, 0], |s| write_at(s, p.eax, p.ecx, value));
     }
 }
 port_thunk!(write_at_thunk, write_at_entry, WRITE_AT, h_write_at, "ret 4");
 
 // --- 0x7FD0B0 net_bits_write_bit (ECX = stream, DL = bit; only bit 0 counts) --------------------------
+// Skipped: EAX = the cursor, EDX = DL. Else EAX = the mask (bit set) or its complement byte, EDX = the byte's address.
 
 unsafe fn h_write_bit(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        let s = p.ecx as usize;
+        let c = rd(s + 0x10);
+        r.edx = p.edx & 0xFF;
+        r.eax = c;
+        if c.wrapping_add(1) <= rd(s + 0xC) {
+            let mask = 1u32 << (c & 7);
+            r.edx = rd(s).wrapping_add(c >> 3);
+            r.eax = if p.edx & 1 != 0 { mask } else { !mask & 0xFF };
+        }
         shadow_writer(id, &p, p.ecx, [0; 3], |s| write_n(s, p.edx, 1));
     }
 }
 port_thunk!(write_bit_thunk, write_bit_entry, WRITE_BIT, h_write_bit);
 
 // --- the 8-bit writers 0x7FD100 / 0x7FD260 (movsx) / 0x7FD700 (EAX = stream, DL = value) ----------------
+// Skipped: ECX = cursor + 8, EDX = the extended value. Else ECX = the last bit's mask (or its complement byte), EDX =
+// that byte's address.
+
+unsafe fn write8_regs(r: &mut Pushad, signed: bool) {
+    unsafe {
+        let s = r.eax as usize;
+        let c = rd(s + 0x10);
+        let v = if signed { r.edx as u8 as i8 as i32 as u32 } else { r.edx & 0xFF };
+        if c.wrapping_add(8) > rd(s + 0xC) {
+            r.ecx = c.wrapping_add(8);
+            r.edx = v;
+            return;
+        }
+        let bit = c.wrapping_add(7);
+        let mask = 1u32 << (bit & 7);
+        r.edx = rd(s).wrapping_add(bit >> 3);
+        r.ecx = if v & 0x80 != 0 { mask } else { !mask & 0xFF };
+    }
+}
 
 unsafe fn h_write_u8(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        write8_regs(r, false);
+        shadow_writer(id, &p, p.eax, [0; 3], |s| write_n(s, p.edx & 0xFF, 8));
+    }
+}
+unsafe fn h_write_s8(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        write8_regs(r, true);
         shadow_writer(id, &p, p.eax, [0; 3], |s| write_n(s, p.edx & 0xFF, 8));
     }
 }
 port_thunk!(write_u8_thunk, write_u8_entry, WRITE_U8, h_write_u8);
-port_thunk!(write_s8_thunk, write_s8_entry, WRITE_S8, h_write_u8);
+port_thunk!(write_s8_thunk, write_s8_entry, WRITE_S8, h_write_s8);
 port_thunk!(write_u8_dup_thunk, write_u8_dup_entry, WRITE_U8_DUP, h_write_u8);
 
 // --- the 16-bit writers 0x7FD3C0 / 0x7FD490 (movsx) (ECX = stream, DX = value) --------------------------
+// Skipped: EAX = the cursor, EDX = the extended value. Else EAX = cursor + 0x11, EDX = the extended value >> 16.
+
+unsafe fn write16_regs(r: &mut Pushad, signed: bool) {
+    unsafe {
+        let s = r.ecx as usize;
+        let c = rd(s + 0x10);
+        let v = if signed { r.edx as u16 as i16 as i32 as u32 } else { r.edx & 0xFFFF };
+        if c.wrapping_add(0x10) > rd(s + 0xC) {
+            r.eax = c;
+            r.edx = v;
+        } else {
+            r.eax = c.wrapping_add(0x11);
+            r.edx = v >> 16;
+        }
+    }
+}
 
 unsafe fn h_write_u16(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        write16_regs(r, false);
+        shadow_writer(id, &p, p.ecx, [0; 3], |s| write_n(s, p.edx & 0xFFFF, 16));
+    }
+}
+unsafe fn h_write_s16(id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        let p = *r;
+        write16_regs(r, true);
         shadow_writer(id, &p, p.ecx, [0; 3], |s| write_n(s, p.edx & 0xFFFF, 16));
     }
 }
 port_thunk!(write_u16_thunk, write_u16_entry, WRITE_U16, h_write_u16);
-port_thunk!(write_s16_thunk, write_s16_entry, WRITE_S16, h_write_u16);
+port_thunk!(write_s16_thunk, write_s16_entry, WRITE_S16, h_write_s16);
 
 // --- the 32-bit writers 0x7FD560 / 0x7FD630 (ECX = stream, EDX = value), 0x7FD860 (stack, `ret 4`) ----
+// 0x7FD560 / 0x7FD630 leave EAX = the cursor (skipped) or cursor + 0x21 with EDX = 0.
 
 unsafe fn h_write_u32(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        let c = rd(p.ecx as usize + 0x10);
+        if c.wrapping_add(0x20) > rd(p.ecx as usize + 0xC) {
+            r.eax = c;
+        } else {
+            r.eax = c.wrapping_add(0x21);
+            r.edx = 0;
+        }
         shadow_writer(id, &p, p.ecx, [0; 3], |s| write_n(s, p.edx, 32));
     }
 }
 port_thunk!(write_u32_thunk, write_u32_entry, WRITE_U32, h_write_u32);
 port_thunk!(write_u32_dup_thunk, write_u32_dup_entry, WRITE_U32_DUP, h_write_u32);
 
-unsafe fn h_write_u32_stack(id: usize, r: &mut Pushad, a: *const u32) {
+/// 0x7FD860: `mov edx, [esp+4]; call 0x7FD560`.
+unsafe fn h_write_u32_stack(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
-        let p = *r;
-        let v = *a;
-        shadow_writer(id, &p, p.ecx, [v, 0, 0], |s| write_n(s, v, 32));
+        let mut g = Regs::of(r);
+        g.edx = *a;
+        call_orig(WRITE_U32_FN, &mut g, [0; 3], false);
+        put_regs(r, &g);
     }
 }
 port_thunk!(write_u32_stack_thunk, write_u32_stack_entry, WRITE_U32_STACK, h_write_u32_stack, "ret 4");
 
 // --- 0x7FD870 / 0x7FD8A0 net_bits_write_vec3 / vec2 (ECX = stream, ESI = float*) --------------------------
 // Each float goes through `fld dword` / `fstp dword` (a signalling NaN is quieted), then the
-// 32-bit writer.
+// 32-bit writer 0x7FD560 (ECX = the previous call's ECX).
 
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn write_floats(s: u32, src: u32, n: usize) {
     for i in 0..n {
         unsafe { write_n(s, q32(rd(src as usize + i * 4)), 32) };
     }
 }
 
-unsafe fn h_write_vec3(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn write_floats_orig(r: &mut Pushad, n: usize) {
     unsafe {
-        let p = *r;
-        shadow_writer(id, &p, p.ecx, [0; 3], |s| write_floats(s, p.esi, 3));
+        let mut g = Regs::of(r);
+        for i in 0..n {
+            g.edx = q32(rd(r.esi as usize + i * 4));
+            call_orig(WRITE_U32_FN, &mut g, [0; 3], false);
+        }
+        put_regs(r, &g);
     }
+}
+
+unsafe fn h_write_vec3(_id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe { write_floats_orig(r, 3) }
 }
 port_thunk!(write_vec3_thunk, write_vec3_entry, WRITE_VEC3, h_write_vec3);
 
-unsafe fn h_write_vec2(id: usize, r: &mut Pushad, _a: *const u32) {
-    unsafe {
-        let p = *r;
-        shadow_writer(id, &p, p.ecx, [0; 3], |s| write_floats(s, p.esi, 2));
-    }
+unsafe fn h_write_vec2(_id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe { write_floats_orig(r, 2) }
 }
 port_thunk!(write_vec2_thunk, write_vec2_entry, WRITE_VEC2, h_write_vec2);
 
 // --- 0x7FD8C0 net_bits_write_bytes (EAX = stream, EDI = count, [esp+4] = source, `ret 4`) -----------------
+// One 0x7FD100 call per byte (DL = the byte, ESI = the index, EBX = the source).
 
-unsafe fn h_write_bytes(id: usize, r: &mut Pushad, a: *const u32) {
+unsafe fn h_write_bytes(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
-        let p = *r;
         let src = *a;
-        shadow_writer(id, &p, p.eax, [src, 0, 0], |s| {
-            for i in 0..p.edi {
-                write_n(s, rb((src as usize).wrapping_add(i as usize)) as u32, 8);
-            }
-        });
+        let mut g = Regs::of(r);
+        g.ebx = src;
+        for i in 0..r.edi {
+            g.esi = i;
+            g.edx = (g.edx & !0xFF) | rb((src as usize).wrapping_add(i as usize)) as u32;
+            call_orig(WRITE_U8_FN, &mut g, [0; 3], false);
+        }
+        put_regs(r, &g);
     }
 }
 port_thunk!(write_bytes_thunk, write_bytes_entry, WRITE_BYTES, h_write_bytes, "ret 4");
 
 // --- 0x7FD8F0 net_bits_read_at (EAX = start, ESI = count, EDX = stream -> EAX) -----------------------------
+// Rejected (range / more than 0x20 bits): ECX = start + count. Count 0: ECX = 0. Else ECX = count, EDX = the last bit's index & 7.
 
 unsafe fn h_read_at(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        let size = std::ptr::read_volatile((p.edx as usize + 0xC) as *const u32); // faults first, as `cmp ecx, [edx+0xC]`
         let ours = read_at(p.eax, p.esi, p.edx);
+        if p.eax.wrapping_add(p.esi) > size || p.esi > 0x20 {
+            r.ecx = p.eax.wrapping_add(p.esi);
+        } else if p.esi == 0 {
+            r.ecx = 0;
+        } else {
+            r.ecx = p.esi;
+            r.edx = p.eax.wrapping_add(p.esi).wrapping_sub(1) & 7;
+        }
         r.eax = checked_eax(id, &p, [0; 3], ours);
     }
 }
 port_thunk!(read_at_thunk, read_at_entry, READ_AT, h_read_at);
 
+/// The read wrappers: `ebx = cursor; eax = cursor; edx = stream; esi = n; call 0x7FD8F0; cursor += n`.
+/// `g` carries the registers in and the callee's out.
+unsafe fn read_via_at(g: &mut Regs, stream: u32, n: u32) {
+    unsafe {
+        let cur = rd(stream as usize + 0x10);
+        g.eax = cur;
+        g.ebx = cur;
+        g.edx = stream;
+        g.esi = n;
+        call_orig(READ_AT_FN, g, [0; 3], false);
+        wd(stream as usize + 0x10, cur.wrapping_add(n));
+    }
+}
+
 // --- 0x7FD940 net_bits_read_n (EAX = count, EDI = stream -> EAX) ----------------------------------------
 
-unsafe fn h_read_n(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn h_read_n(_id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
-        let p = *r;
-        r.eax = shadow_reader(id, &p, p.edi, [0; 3], (0, 0), || read_n(p.edi, p.eax));
+        let mut g = Regs::of(r);
+        read_via_at(&mut g, r.edi, r.eax);
+        put_regs(r, &g);
     }
 }
 port_thunk!(read_n_thunk, read_n_entry, READ_N, h_read_n);
 
 // --- the typed readers (EDI = stream -> EAX raw bits): 8 / 16 / 32 bits ------------------------------------
 
-unsafe fn h_read8(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn read_fixed(r: &mut Pushad, n: u32) {
     unsafe {
-        let p = *r;
-        r.eax = shadow_reader(id, &p, p.edi, [0; 3], (0, 0), || read_n(p.edi, 8));
+        let mut g = Regs::of(r);
+        read_via_at(&mut g, r.edi, n);
+        put_regs(r, &g);
     }
 }
-unsafe fn h_read16(id: usize, r: &mut Pushad, _a: *const u32) {
-    unsafe {
-        let p = *r;
-        r.eax = shadow_reader(id, &p, p.edi, [0; 3], (0, 0), || read_n(p.edi, 16));
-    }
+unsafe fn h_read8(_id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe { read_fixed(r, 8) }
 }
-unsafe fn h_read32(id: usize, r: &mut Pushad, _a: *const u32) {
-    unsafe {
-        let p = *r;
-        r.eax = shadow_reader(id, &p, p.edi, [0; 3], (0, 0), || read_n(p.edi, 32));
-    }
+unsafe fn h_read16(_id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe { read_fixed(r, 16) }
+}
+unsafe fn h_read32(_id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe { read_fixed(r, 32) }
 }
 port_thunk!(read_u8_thunk, read_u8_entry, READ_U8, h_read8);
 port_thunk!(read_s8_thunk, read_s8_entry, READ_S8, h_read8);
@@ -810,11 +1031,16 @@ port_thunk!(read_u32_thunk, read_u32_entry, READ_U32, h_read32);
 port_thunk!(read_s32_thunk, read_s32_entry, READ_S32, h_read32);
 
 // --- 0x7FD960 net_bits_read_bit (ECX = stream -> AL) ----------------------------------------------------------
-// EAX = (new cursor & ~0xFF) | bit: the cursor is in EAX when `setne al` runs.
+// EAX = (new cursor & ~0xFF) | bit: the cursor is in EAX when `setne al` runs. EDX = the bit (0 / 1).
 
 unsafe fn h_read_bit(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        r.edx = {
+            let s = p.ecx as usize;
+            let c = rd(s + 0x10);
+            (c.wrapping_add(1) <= rd(s + 0xC) && get_bit(rd(s), c)) as u32
+        };
         r.eax = shadow_reader(id, &p, p.ecx, [0; 3], (0, 0), || {
             let s = p.ecx as usize;
             let c = rd(s + 0x10);
@@ -826,42 +1052,24 @@ unsafe fn h_read_bit(id: usize, r: &mut Pushad, _a: *const u32) {
 }
 port_thunk!(read_bit_thunk, read_bit_entry, READ_BIT, h_read_bit);
 
-// --- 0x7FDA90 net_bits_read_f32 (EDI = stream -> ST0; EAX = the raw bits) ------------------------------------
+// --- 0x7FDA90 net_bits_read_f32 (EDI = stream -> ST0; EAX = the raw bits, ECX = the raw bits too) ----------------
 
-unsafe fn h_read_f32(id: usize, r: &mut Pushad, _a: *const u32) -> f32 {
+unsafe fn h_read_f32(_id: usize, r: &mut Pushad, _a: *const u32) -> f32 {
     unsafe {
-        let p = *r;
-        let Some((n, orig)) = shadowing(id) else {
-            let bits = read_n(p.edi, 32);
-            r.eax = bits;
-            return f32::from_bits(q32(bits));
-        };
-        let cp = p.edi as usize + 0x10;
-        let cur = rd(cp);
-        let inp = Regs::of(&p);
-        let mut o = inp;
-        let st0 = call_orig(orig, &mut o, [0; 3], true) as f32;
-        check_preserved(id, &inp, &o);
-        let cur_o = rd(cp);
-        wd(cp, cur);
-        let bits = read_n(p.edi, 32);
-        let ours = f32::from_bits(q32(bits));
-        if bits != o.eax || rd(cp) != cur_o || ours.to_bits() != st0.to_bits() {
-            mismatch(id, n, format!("cursor {cur:#x}: original eax {:#x} st0 {:#x} cursor {cur_o:#x}, Rust eax {bits:#x} cursor {:#x}", o.eax, st0.to_bits(), rd(cp)));
-            wd(cp, cur_o);
-            r.eax = o.eax;
-            return st0;
-        }
-        r.eax = bits;
-        ours
+        let mut g = Regs::of(r);
+        read_via_at(&mut g, r.edi, 32);
+        put_regs(r, &g);
+        r.ecx = g.eax; // the original stores the bits over the saved ECX slot and pops it back
+        f32::from_bits(q32(g.eax))
     }
 }
 port_thunk_f32!(read_f32_thunk, read_f32_entry, READ_F32, h_read_f32);
 
-// --- 0x7FDAC0 / 0x7FDB20 net_bits_read_vec3 / vec2 (EDI = stream, [esp+4] = out float*, `ret 4`) ----------
-// The first float is stored as the raw dword, the others through `fld dword` / `fstp dword`.
-// EAX is the last raw read.
+// --- 0x7FDAC0 / 0x7FDB20 net_bits_read_vec3 / vec2 (EDI = stream, [esp+4] = out float*, `ret 4`) ----
+// The first float is stored as the raw dword, the others through `fld dword` / `fstp dword`. The
+// original also overwrites its stack argument with the raw bits of the later reads. EAX is the last raw read.
 
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn read_floats(stream: u32, out: u32, n: usize) -> u32 {
     unsafe {
         let mut v = 0;
@@ -873,41 +1081,46 @@ unsafe fn read_floats(stream: u32, out: u32, n: usize) -> u32 {
     }
 }
 
-unsafe fn h_read_vec3(id: usize, r: &mut Pushad, a: *const u32) {
+unsafe fn read_floats_orig(r: &mut Pushad, a: *const u32, n: usize) {
     unsafe {
-        let p = *r;
         let out = *a;
-        r.eax = shadow_reader(id, &p, p.edi, [out, 0, 0], (out as usize, 12), || read_floats(p.edi, out, 3));
+        let mut g = Regs::of(r);
+        for i in 0..n {
+            read_via_at(&mut g, r.edi, 32);
+            wd(out as usize + i * 4, if i == 0 { g.eax } else { q32(g.eax) });
+            if i >= 1 {
+                *(a as *mut u32) = g.eax;
+            }
+        }
+        put_regs(r, &g);
     }
+}
+
+unsafe fn h_read_vec3(_id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe { read_floats_orig(r, a, 3) }
 }
 port_thunk!(read_vec3_thunk, read_vec3_entry, READ_VEC3, h_read_vec3, "ret 4");
 
-unsafe fn h_read_vec2(id: usize, r: &mut Pushad, a: *const u32) {
-    unsafe {
-        let p = *r;
-        let out = *a;
-        r.eax = shadow_reader(id, &p, p.edi, [out, 0, 0], (out as usize, 8), || read_floats(p.edi, out, 2));
-    }
+unsafe fn h_read_vec2(_id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe { read_floats_orig(r, a, 2) }
 }
 port_thunk!(read_vec2_thunk, read_vec2_entry, READ_VEC2, h_read_vec2, "ret 4");
 
 // --- 0x7FDB70 net_bits_read_bytes ([esp+4] = stream, [esp+8] = out, [esp+0xC] = count, `ret 0xC`) --------
-// EAX is the last 8-bit read (unchanged for a count of 0).
+// One 8-bit read per byte; EAX is the last, ECX the output pointer once a byte was read.
 
-unsafe fn h_read_bytes(id: usize, r: &mut Pushad, a: *const u32) {
+unsafe fn h_read_bytes(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
-        let p = *r;
         let [stream, out, count] = sargs(a, 3);
-        // The output buffer is only snapshotted when it is a sane size.
-        let len = if count <= 0x1_0000 { count as usize } else { 0 };
-        r.eax = shadow_reader(id, &p, stream, [stream, out, count], (out as usize, len), || {
-            let mut v = p.eax;
-            for i in 0..count {
-                v = read_n(stream, 8);
-                wb((out as usize).wrapping_add(i as usize), v as u8);
-            }
-            v
-        });
+        let mut g = Regs::of(r);
+        for i in 0..count {
+            g.ebp = stream;
+            g.edi = i;
+            read_via_at(&mut g, stream, 8);
+            g.ecx = out;
+            wb((out as usize).wrapping_add(i as usize), g.eax as u8);
+        }
+        put_regs(r, &g);
     }
 }
 port_thunk!(read_bytes_thunk, read_bytes_entry, READ_BYTES, h_read_bytes, "ret 12");
@@ -1011,24 +1224,65 @@ unsafe fn map_find(map: u32, key: u32, create: u8) -> u32 {
     }
 }
 
-unsafe fn h_map_find(id: usize, r: &mut Pushad, a: *const u32) {
+/// The bucket of `key` and the hash value the original leaves in ECX (the value before the final fold).
+unsafe fn map_bucket_d(map: u32, key: u32) -> (u32, u32) {
+    let k = key as i32;
+    let a = (!k.wrapping_shl(15)).wrapping_add(k);
+    let b = (a >> 10) ^ a;
+    let b = b.wrapping_mul(9);
+    let c = b ^ (b >> 6);
+    let d = c.wrapping_add(!c.wrapping_shl(11));
+    let h = (d >> 16) ^ d;
+    (idiv_rem(h, unsafe { rd(map as usize + 0x60) } as i32) as u32, d as u32)
+}
+
+unsafe fn h_map_find(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
         let [key, create, _] = sargs(a, 2);
-        let creates = create as u8 != 0 && (rd(p.esi as usize + 0x1C) as i32) > 0 && map_lookup(p.esi, key) == 0;
-        if creates {
-            // The pool allocator takes a lock and changes the pool: not shadowed.
-            let _ = shadowing(id);
-            r.eax = map_find(p.esi, key, create as u8);
-        } else {
-            r.eax = checked_eax(id, &p, [key, create, 0], map_find(p.esi, key, create as u8));
+        let (bucket, d) = map_bucket_d(p.esi, key);
+        let table = rd(p.esi as usize + 0x5C);
+        r.ecx = d;
+        r.edx = bucket;
+        let mut node = rd((table as usize).wrapping_add(bucket as usize * 4));
+        while node != 0 {
+            if key == rd(node as usize + 0xC) {
+                r.eax = node;
+                return;
+            }
+            node = rd(node as usize + 4);
         }
+        r.eax = 0;
+        if create as u8 == 0 || (rd(p.esi as usize + 0x1C) as i32) <= 0 {
+            return;
+        }
+        let n = call_regs(POOL_ALLOC, 0, d, bucket, p.esi, p.esi + 0x20, &[]);
+        wd(n as usize + 0xC, key);
+        wd(n as usize + 0x10, bucket);
+        let table = rd(p.esi as usize + 0x5C);
+        let slotp = (table as usize).wrapping_add(bucket as usize * 4);
+        let head = rd(slotp);
+        wd(n as usize + 4, head);
+        wd(n as usize + 8, 0);
+        let table = rd(p.esi as usize + 0x5C);
+        let slotp = (table as usize).wrapping_add(bucket as usize * 4);
+        let head = rd(slotp);
+        r.ecx = table;
+        if head != 0 {
+            wd(head as usize + 8, n);
+            r.ecx = head;
+        }
+        let table = rd(p.esi as usize + 0x5C);
+        r.edx = table;
+        wd((table as usize).wrapping_add(bucket as usize * 4), n);
+        r.eax = n;
     }
 }
 port_thunk!(map_find_thunk, map_find_entry, MAP_FIND, h_map_find, "ret 8");
 
 // --- 0x804FB0 net_id_to_handle (AX = net id -> EAX = handle or 0) -----------------------------------------------
 
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn id_to_handle(eax: u32) -> u32 {
     unsafe {
         if eax & 0xFFFF == 0xFFFF {
@@ -1043,10 +1297,28 @@ unsafe fn id_to_handle(eax: u32) -> u32 {
     }
 }
 
-unsafe fn h_id_to_handle(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn h_id_to_handle(_id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
-        r.eax = checked_eax(id, &p, [0; 3], id_to_handle(p.eax));
+        if p.eax as u16 == 0xFFFF {
+            r.eax = 0;
+            return;
+        }
+        let key = p.eax & 0xFFFF;
+        let mut g = Regs::of(&p);
+        g.eax = key;
+        g.esi = rd(NET_ID_MAP);
+        call_orig(0x0080_8E30, &mut g, [key, 0, 0], false);
+        r.ecx = g.ecx;
+        r.edx = g.edx;
+        let node = g.eax;
+        r.eax = 0;
+        if node != 0 {
+            let rec = rd(node as usize);
+            if rec != 0 {
+                r.eax = rd(rec as usize + 4);
+            }
+        }
     }
 }
 port_thunk!(id_to_handle_thunk, id_to_handle_entry, ID_TO_HANDLE, h_id_to_handle);
@@ -1116,6 +1388,12 @@ unsafe fn record_owned(eax: u32, rec: u32) -> u32 {
 unsafe fn h_record_owned(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        if p.ecx != 0 {
+            let sess = rd(SESSION);
+            if sess != 0 && rd(sess as usize + 0x408) != 0 {
+                r.edx = lo(p.edx, rb(p.ecx as usize) as u32);
+            }
+        }
         r.eax = checked_eax(id, &p, [0; 3], record_owned(p.eax, p.ecx));
     }
 }
@@ -1145,6 +1423,7 @@ unsafe fn find_conn(session: u32, id: u32) -> u32 {
 unsafe fn h_find_conn(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        r.ecx = rd(p.eax as usize + 0x400);
         r.eax = checked_eax(id, &p, [0; 3], find_conn(p.eax, p.edx));
     }
 }
@@ -1172,6 +1451,15 @@ unsafe fn guid_equal(eax: u32, a: u32, b: u32) -> u32 {
 unsafe fn h_guid_equal(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        if p.edx != 0 {
+            // ECX = 1 when equal (`sete cl`); EDX = advanced to the first differing byte (16 when equal).
+            let mut d = 0u32;
+            while d < 16 && rb(p.edx as usize + d as usize) == rb(p.ecx as usize + d as usize) {
+                d += 1;
+            }
+            r.ecx = (d == 16) as u32;
+            r.edx = p.edx.wrapping_add(d);
+        }
         r.eax = checked_eax(id, &p, [0; 3], guid_equal(p.eax, p.ecx, p.edx));
     }
 }
@@ -1197,6 +1485,11 @@ unsafe fn state_allows(rec: u32, conn: u32) -> u32 {
 unsafe fn h_state_allows(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        if rw(p.eax as usize + 0x10) != 0xFFFF && p.ecx != 0 {
+            let st = rd(p.ecx as usize + 0x3C);
+            r.ecx = st;
+            r.edx = 1u32.wrapping_shl(st);
+        }
         r.eax = checked_eax(id, &p, [0; 3], state_allows(p.eax, p.ecx));
     }
 }
@@ -1228,9 +1521,18 @@ unsafe fn route_allows(rec: u32, conn: u32, send: bool) -> u32 {
     }
 }
 
+unsafe fn route_edx(r: &mut Pushad) {
+    unsafe {
+        if rd(r.eax as usize + 0xC) == 0 && r.ecx != 0 {
+            r.edx = rd(r.ecx as usize + 0x1AC);
+        }
+    }
+}
+
 unsafe fn h_route_send(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        route_edx(r);
         r.eax = checked_eax(id, &p, [0; 3], route_allows(p.eax, p.ecx, true));
     }
 }
@@ -1239,6 +1541,7 @@ port_thunk!(route_send_thunk, route_send_entry, ROUTE_SEND, h_route_send);
 unsafe fn h_route_recv(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        route_edx(r);
         r.eax = checked_eax(id, &p, [0; 3], route_allows(p.eax, p.ecx, false));
     }
 }
@@ -1280,10 +1583,38 @@ unsafe fn loss_ratio(conn: u32) -> f32 {
     }
 }
 
+/// EAX / EDX the original leaves: the walked pointer and the count of old entries (ECX is restored).
+unsafe fn loss_regs(p: &Pushad) -> (u32, u32) {
+    unsafe {
+        let conn = p.eax;
+        if conn == 0 {
+            return (0, p.edx);
+        }
+        let n = rd(conn as usize + 0x15C0);
+        if n == 0 {
+            return (conn, 0);
+        }
+        let now = rd(NOW);
+        let mut e = conn as usize + 0x1C4;
+        let mut total = 0u32;
+        for _ in 0..n {
+            if rb(e + 5) == 0 && rd(e).wrapping_add(0x3E8) < now {
+                total = total.wrapping_add(1);
+            }
+            e = e.wrapping_add(0x10);
+        }
+        (e as u32, total)
+    }
+}
+
 unsafe fn h_loss_ratio(id: usize, r: &mut Pushad, _a: *const u32) -> f32 {
     unsafe {
         let p = *r;
+        (r.eax, r.edx) = loss_regs(&p);
         let ours = loss_ratio(p.eax);
+        if p.eax != 0 && r.edx >= 0x14 {
+            r.ecx = ours.to_bits(); // the result float is stored over the saved ECX slot and popped back
+        }
         let Some((n, orig)) = shadowing(id) else { return ours };
         let inp = Regs::of(&p);
         let mut o = inp;
@@ -1388,12 +1719,14 @@ unsafe fn h_recent_ids(id: usize, r: &mut Pushad, _a: *const u32) {
         let n = rb(c + 0x1DBA) as usize;
         let found = (0..n).any(|i| (rd(c + 0x1CBA + i * 2) & 0xFFFF) as u16 == p.esi as u16);
         r.eax = checked_eax(id, &p, [0; 3], lo(p.eax, found as u32));
+        r.ecx = lo(p.ecx, n as u32);
     }
 }
 port_thunk!(recent_ids_thunk, recent_ids_entry, RECENT_IDS, h_recent_ids);
 
 /// The connection owning a net record: id byte [rec] looked up in the session (a null record
 /// gives 0; a missing session faults, as in the original).
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn owner_conn_of_record(rec: u32) -> u32 {
     unsafe {
         if rec == 0 {
@@ -1404,26 +1737,53 @@ unsafe fn owner_conn_of_record(rec: u32) -> u32 {
 }
 
 /// 0x807230 net_object_owner_conn (EAX = object -> EAX = connection or 0).
-unsafe fn h_obj_owner_conn(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn h_obj_owner_conn(_id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
-        let ours = if p.eax == 0 { 0 } else { owner_conn_of_record(rd(p.eax as usize + 0xB0)) };
-        r.eax = checked_eax(id, &p, [0; 3], ours);
+        if p.eax == 0 {
+            r.eax = 0;
+            return;
+        }
+        let rec = std::ptr::read_volatile((p.eax as usize + 0xB0) as *const u32);
+        if rec == 0 {
+            r.eax = 0;
+            return;
+        }
+        let rid = std::ptr::read_volatile(rec as usize as *const u8);
+        owner_conn_tail(r, &p, rid);
+    }
+}
+
+/// `mov dl, [rec]; mov eax, [session]; jmp 0x80FE80`: the lookup's EAX / ECX / EDX are the port's.
+unsafe fn owner_conn_tail(r: &mut Pushad, p: &Pushad, rid: u8) {
+    unsafe {
+        let mut g = Regs::of(p);
+        g.eax = rd(SESSION);
+        g.edx = lo(p.edx, rid as u32);
+        call_orig(0x0080_FE80, &mut g, [0; 3], false);
+        put_regs(r, &g);
     }
 }
 port_thunk!(obj_owner_conn_thunk, obj_owner_conn_entry, OBJ_OWNER_CONN, h_obj_owner_conn);
 
 /// 0x807250 net_handle_owner_conn (ECX = handle -> EAX = connection or 0).
-unsafe fn h_handle_owner_conn(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn h_handle_owner_conn(_id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
-        let ours = if p.ecx == 0 {
-            0
-        } else {
-            let (o, ok) = slot(p.ecx);
-            if ok { owner_conn_of_record(rd(o as usize + 0xB0)) } else { 0 }
-        };
-        r.eax = checked_eax(id, &p, [0; 3], ours);
+        r.eax = 0;
+        if p.ecx == 0 {
+            return;
+        }
+        let (o, ok) = slot(p.ecx);
+        if !ok {
+            return;
+        }
+        let rec = std::ptr::read_volatile((o as usize + 0xB0) as *const u32);
+        if rec == 0 {
+            return;
+        }
+        let rid = std::ptr::read_volatile(rec as usize as *const u8);
+        owner_conn_tail(r, &p, rid);
     }
 }
 port_thunk!(handle_owner_conn_thunk, handle_owner_conn_entry, HANDLE_OWNER_CONN, h_handle_owner_conn);
@@ -1431,12 +1791,23 @@ port_thunk!(handle_owner_conn_thunk, handle_owner_conn_entry, HANDLE_OWNER_CONN,
 /// 0x807680 net_registration_find_field (ESI = registration, EDI = key -> EAX = entry or 0): the
 /// entries are 0x44 bytes from reg + 0x60, the key is the first dword, the entry returned
 /// starts 0x40 before the key.
-unsafe fn h_reg_find_field(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn h_reg_find_field(_id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
         let n = rd(p.esi as usize + 0x18);
-        let ours = (0..n).find(|&i| rd(p.esi as usize + 0x60 + i as usize * 0x44) == p.edi).map_or(0, |i| p.esi + 0x20 + i * 0x44);
-        r.eax = checked_eax(id, &p, [0; 3], ours);
+        r.ecx = n;
+        r.eax = 0;
+        let mut e = p.esi.wrapping_add(0x60);
+        for k in 0..n {
+            if rd(e as usize) == p.edi {
+                r.ecx = k.wrapping_mul(17);
+                r.edx = e;
+                r.eax = p.esi.wrapping_add(0x20).wrapping_add(k.wrapping_mul(0x44));
+                return;
+            }
+            e = e.wrapping_add(0x44);
+            r.edx = e;
+        }
     }
 }
 port_thunk!(reg_find_field_thunk, reg_find_field_entry, REG_FIND_FIELD, h_reg_find_field);
@@ -1541,6 +1912,7 @@ unsafe fn send_conn(esi: u32, buf: &mut [u8], size: u32, a: u32, b: u32) -> u32 
 }
 
 /// 0x814740: EDI = session; (buffer, size) on the stack, `ret` (cdecl).
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn send_remotes_raw(edi: u32, buf: u32, size: u32) -> u32 {
     unsafe {
         let args = [buf, size];
@@ -1552,12 +1924,14 @@ unsafe fn send_remotes_raw(edi: u32, buf: u32, size: u32) -> u32 {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn send_remotes(edi: u32, buf: &mut [u8], size: u32) -> u32 {
     unsafe { send_remotes_raw(edi, buf.as_mut_ptr() as u32, size) }
 }
 
 /// 0x814790: ECX = buffer; stack: an address-like value (the caller's ECX), size; cdecl. The
 /// record keeps [buffer, size, that value].
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn send_raw(buf: &mut [u8], ecx_in: u32, size: u32) -> u32 {
     unsafe {
         let bp = buf.as_mut_ptr() as u32;
@@ -1834,165 +2208,246 @@ fn set_len(buf: &mut [u8], size: usize) {
     buf[1..3].copy_from_slice(&(size.wrapping_sub(3) as u16).to_le_bytes());
 }
 
-/// 0x7F8DF0 net_send_mp_info (ECX = connection): packet 0x5B {u8 [conn+0x44], u8 [conn+0x45]}
-/// to the connection's session's remotes (EDI = [conn+0x1AC]). EAX = the send's.
-unsafe fn h_send_mp_info(id: usize, r: &mut Pushad, _a: *const u32) {
+// The LTCG senders keep a 0x514-byte packet buffer in their frame: the buffer is at (their entry ESP) - 0x520, the
+// stack-protector cookie at (their ESP after `sub esp, N`) + N - 4, and they end with __security_check_cookie (ECX = the
+// cookie) whose EAX is their EAX. The ports build the buffer at the same address (the thunk reserves the frame).
+
+const COOKIE: usize = 0x00E8_0B50;
+const CHECK_COOKIE: usize = 0x00C9_604F;
+
+/// The buffer address of the senders above: entry ESP - 0x520 (`a` points at the first stack argument, entry ESP + 4).
+fn frame_buf(a: *const u32) -> *mut u8 {
+    (a as usize).wrapping_sub(0x524) as *mut u8
+}
+
+/// `call __security_check_cookie`, then the registers it leaves become the port's.
+unsafe fn finish_cookie(r: &mut Pushad, g: &mut Regs) {
     unsafe {
-        let p = *r;
-        r.eax = shadow_send(id, &p, [0; 3], rb(0x00E8_BA94) != 0, || {
-            let mut buf = [0u8; 0x51C];
-            buf[0] = 0x5B;
-            let h = hdr_size(0x00E8_BA94);
-            buf[h] = rb(p.ecx as usize + 0x44);
-            buf[h + 1] = rb(p.ecx as usize + 0x45);
-            let size = h + 2;
-            set_len(&mut buf, size);
-            (send_remotes(rd(p.ecx as usize + 0x1AC), &mut buf, size as u32), true)
-        });
+        // The originals restore the callee-saved registers before the check.
+        g.ebx = r.ebx;
+        g.esi = r.esi;
+        g.edi = r.edi;
+        g.ebp = r.ebp;
+        g.ecx = rd(COOKIE);
+        call_orig(CHECK_COOKIE, g, [0; 3], false);
+        put_regs(r, g);
     }
 }
-port_thunk!(send_mp_info_thunk, send_mp_info_entry, SEND_MP_INFO, h_send_mp_info);
+
+/// Header size of a packet from its channel byte: 3 or 4.
+unsafe fn hdr(flag: usize) -> u32 {
+    unsafe { if rb(flag) == 0 { 3 } else { 4 } }
+}
+
+/// 0x7F8DF0 net_send_mp_info (ECX = connection): packet 0x5B {u8 [conn+0x44], u8 [conn+0x45]}
+/// to the connection's session's remotes (EDI = [conn+0x1AC]).
+unsafe fn h_send_mp_info(_id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        let p = *r;
+        let buf = frame_buf(a);
+        let c = p.ecx as usize;
+        let h = hdr(0x00E8_BA94);
+        let esp0 = (a as u32).wrapping_sub(0x528);
+        *buf = 0x5B;
+        let (b0, b1) = (rb(c + 0x44), rb(c + 0x45));
+        *buf.add(h as usize) = b0;
+        *buf.add(h as usize + 1) = b1;
+        let size = h + 2;
+        (buf.add(1) as *mut u16).write_unaligned((size - 3) as u16);
+        let mut g = Regs::of(&p);
+        g.eax = size;
+        g.edx = buf as u32;
+        g.edi = rd(c + 0x1AC);
+        g.ebx = b1 as u32;
+        g.esi = p.esi;
+        let _ = esp0;
+        call_orig(SEND_REMOTES, &mut g, [buf as u32, size, 0], false);
+        finish_cookie(r, &mut g);
+    }
+}
+port_thunk_frame!(send_mp_info_thunk, send_mp_info_entry, SEND_MP_INFO, h_send_mp_info, "ret", 0x540);
 
 /// 0x7F8D70 net_send_upd_state_sub3 (ECX = connection): only for a connection whose byte [+0] is 0:
-/// packet 0x20 {u8 3} to that connection. When it is not sent the original's EAX is the cookie
-/// xor ESP (no meaning); the input EAX is returned then.
-unsafe fn h_send_upd_state_sub3(id: usize, r: &mut Pushad, _a: *const u32) {
+/// packet 0x20 {u8 3} to that connection (0x814670 with ESI = the connection, ECX = the buffer).
+unsafe fn h_send_upd_state_sub3(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
-        r.eax = shadow_send(id, &p, [0; 3], rb(0x00E8_C21C) != 0, || {
-            if rb(p.ecx as usize) != 0 {
-                return (p.eax, false);
-            }
-            let mut buf = [0u8; 0x51C];
-            buf[0] = 0x20;
-            let h = hdr_size(0x00E8_C21C);
-            buf[h] = 3;
+        let buf = frame_buf(a);
+        let esp0 = (a as u32).wrapping_sub(0x524);
+        let mut g = Regs::of(&p);
+        g.eax = rd(COOKIE) ^ esp0;
+        g.esi = p.ecx;
+        if rb(p.ecx as usize) == 0 {
+            let h = hdr(0x00E8_C21C);
+            *buf = 0x20;
+            *buf.add(h as usize) = 3;
             let size = h + 1;
-            set_len(&mut buf, size);
-            (send_conn(p.ecx, &mut buf, size as u32, 0, 0), true)
-        });
+            (buf.add(1) as *mut u16).write_unaligned((size - 3) as u16);
+            g.eax = size;
+            g.ecx = buf as u32;
+            g.edx = size - 3;
+            call_orig4(SEND_CONN, &mut g, [buf as u32, size, 0, 0]);
+        }
+        finish_cookie(r, &mut g);
+        r.esi = p.esi;
     }
 }
-port_thunk!(send_upd_state_sub3_thunk, send_upd_state_sub3_entry, SEND_UPD_STATE_SUB3, h_send_upd_state_sub3);
+port_thunk_frame!(send_upd_state_sub3_thunk, send_upd_state_sub3_entry, SEND_UPD_STATE_SUB3, h_send_upd_state_sub3, "ret", 0x540);
 
 /// 0x7F8C50 net_conn_set_phase_broadcast (ECX = connection, EDX = phase): stores the phase at
 /// [conn+0x40] when it changed; for a connection whose byte [+0] is non-zero sends packet 0x20
-/// {u8 1, u32 phase} to the session's remotes (EDI = [conn+0x1AC]). Early exits leave the
-/// cookie xor ESP in EAX (no meaning): the input EAX is returned then.
-unsafe fn h_set_phase_broadcast(id: usize, r: &mut Pushad, _a: *const u32) {
+/// {u8 1, u32 phase} to the session's remotes (EDI = [conn+0x1AC]).
+unsafe fn h_set_phase_broadcast(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
+        let buf = frame_buf(a);
         let c = p.ecx as usize;
-        r.eax = shadow_send_ex(id, &p, [0; 3], rb(0x00E8_C21C) != 0, false, &[(c + 0x40, 4)], || {
-            if p.edx == rd(c + 0x40) {
-                return (p.eax, false);
-            }
+        let esp0 = (a as u32).wrapping_sub(0x528);
+        let mut g = Regs::of(&p);
+        g.eax = rd(COOKIE) ^ esp0;
+        if p.edx != rd(c + 0x40) {
             wd(c + 0x40, p.edx);
-            if rb(c) == 0 {
-                return (p.eax, false);
+            if rb(c) != 0 {
+                let h = hdr(0x00E8_C21C);
+                *buf = 0x20;
+                *buf.add(h as usize) = 1;
+                (buf.add(h as usize + 1) as *mut u32).write_unaligned(p.edx);
+                let size = h + 5;
+                (buf.add(1) as *mut u16).write_unaligned((size - 3) as u16);
+                g.eax = size;
+                g.edx = buf as u32;
+                g.edi = rd(c + 0x1AC);
+                g.esi = h + 1;
+                call_orig(SEND_REMOTES, &mut g, [buf as u32, size, 0], false);
             }
-            let mut buf = [0u8; 0x51C];
-            buf[0] = 0x20;
-            let h = hdr_size(0x00E8_C21C);
-            buf[h] = 1;
-            buf[h + 1..h + 5].copy_from_slice(&p.edx.to_le_bytes());
-            let size = h + 5;
-            set_len(&mut buf, size);
-            (send_remotes(rd(c + 0x1AC), &mut buf, size as u32), true)
-        });
+        }
+        finish_cookie(r, &mut g);
+        r.esi = p.esi;
+        r.edi = p.edi;
     }
 }
-port_thunk!(set_phase_broadcast_thunk, set_phase_broadcast_entry, SET_PHASE_BROADCAST, h_set_phase_broadcast);
+port_thunk_frame!(set_phase_broadcast_thunk, set_phase_broadcast_entry, SET_PHASE_BROADCAST, h_set_phase_broadcast, "ret", 0x540);
 
 /// 0x816F60 net_send_join_deny (ECX passed through, [esp+4] = reason byte): packet 4 {u32 0xC9,
-/// u8 reason} through 0x814790 (ECX = buffer, stack: the incoming ECX, size; cdecl). EAX = its.
-unsafe fn h_send_join_deny(id: usize, r: &mut Pushad, a: *const u32) {
+/// u8 reason} through 0x814790 (ECX = buffer, stack: the incoming ECX, size; cdecl).
+unsafe fn h_send_join_deny(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
-        let arg = *a;
-        r.eax = shadow_send(id, &p, [arg, 0, 0], rb(0x00E8_BF7C) != 0, || {
-            let mut buf = [0u8; 0x51C];
-            buf[0] = 4;
-            let h = hdr_size(0x00E8_BF7C);
-            buf[h..h + 4].copy_from_slice(&0xC9u32.to_le_bytes());
-            buf[h + 4] = arg as u8;
-            let size = h + 5;
-            set_len(&mut buf, size);
-            (send_raw(&mut buf, p.ecx, size as u32), true)
-        });
+        let reason = *a as u8;
+        let buf = frame_buf(a);
+        let h = hdr(0x00E8_BF7C);
+        *buf = 4;
+        (buf.add(h as usize) as *mut u32).write_unaligned(0xC9);
+        *buf.add(h as usize + 4) = reason;
+        let size = h + 5;
+        (buf.add(1) as *mut u16).write_unaligned((size - 3) as u16);
+        let mut g = Regs::of(&p);
+        g.eax = size;
+        g.ecx = buf as u32;
+        g.edx = size - 3;
+        g.ebx = lo(p.ebx, reason as u32);
+        call_orig(SEND_RAW, &mut g, [p.ecx, size, 0], false);
+        finish_cookie(r, &mut g);
     }
 }
-port_thunk!(send_join_deny_thunk, send_join_deny_entry, SEND_JOIN_DENY, h_send_join_deny);
+port_thunk_frame!(send_join_deny_thunk, send_join_deny_entry, SEND_JOIN_DENY, h_send_join_deny, "ret", 0x540);
 
 /// 0x816B50 net_send_upd_conn (EDI = connection, no stack arguments): packet 0x0B {u8 [conn+0x1B0],
 /// then the connection description from 0x8157C0 (EAX = conn, ECX = buffer, stack: &size)} to
 /// every other, ready (byte [+0x1B8] == 1), non-local connection of the session's circular list
 /// (head [session+0x400], link +0x22CC). EAX at the end: the session pointer after a pass over
 /// the list, else 0x8157C0's.
-unsafe fn h_send_upd_conn(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn h_send_upd_conn(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
-        r.eax = shadow_send(id, &p, [0; 3], rb(0x00E8_C024) != 0, || {
-            let edi = p.edi as usize;
-            let mut buf = [0u8; 0x51C];
-            buf[0] = 0x0B;
-            let h = hdr_size(0x00E8_C024);
-            buf[h] = rb(edi + 0x1B0);
-            let mut size: u32 = h as u32 + 1;
-            let w = call_regs(0x0081_57C0, p.edi, buf.as_mut_ptr() as u32, 0, 0, p.edi, &[&mut size as *mut u32 as u32]);
-            let mut esi = rd(rd(edi + 0x1AC) as usize + 0x400);
-            set_len(&mut buf, size as usize);
-            if esi == 0 {
-                return (w, false);
-            }
+        let edi = p.edi as usize;
+        let buf = frame_buf(a);
+        let size_p = (a as usize).wrapping_sub(0x528) as *mut u32;
+        let h = hdr(0x00E8_C024);
+        *buf = 0x0B;
+        let id_byte = rb(edi + 0x1B0);
+        *buf.add(h as usize) = id_byte;
+        std::ptr::write_volatile(size_p, h + 1);
+        let mut g = Regs::of(&p);
+        g.eax = p.edi;
+        g.ecx = buf as u32;
+        g.edx = lo(p.edx, id_byte as u32);
+        call_orig(0x0081_57C0, &mut g, [size_p as u32, 0, 0], false);
+        let sess = rd(edi + 0x1AC);
+        let size = std::ptr::read_volatile(size_p);
+        g.edx = sess;
+        g.ebp = size;
+        g.ecx = size.wrapping_sub(3);
+        (buf.add(1) as *mut u16).write_unaligned(g.ecx as u16);
+        let mut esi = rd(sess as usize + 0x400);
+        if esi != 0 {
             loop {
-                if rb(esi as usize + 0x1B8) == 1 && esi != p.edi && esi != rd(rd(esi as usize + 0x1AC) as usize + 0x408) {
-                    send_conn(esi, &mut buf, size & 0xFFFF, 0, 0);
+                if rb(esi as usize + 0x1B8) == 1 && esi as usize != edi {
+                    g.eax = rd(esi as usize + 0x1AC);
+                    if esi != rd(g.eax as usize + 0x408) {
+                        g.esi = esi;
+                        g.ecx = size & 0xFFFF;
+                        g.edx = buf as u32;
+                        call_orig4(SEND_CONN, &mut g, [buf as u32, size & 0xFFFF, 0, 0]);
+                    }
                 }
                 esi = rd(esi as usize + 0x22CC);
-                if esi == rd(rd(edi + 0x1AC) as usize + 0x400) || esi == 0 {
+                g.eax = rd(edi + 0x1AC);
+                if esi == rd(g.eax as usize + 0x400) || esi == 0 {
                     break;
                 }
             }
-            (rd(edi + 0x1AC), false)
-        });
+        }
+        finish_cookie(r, &mut g);
     }
 }
-port_thunk!(send_upd_conn_thunk, send_upd_conn_entry, SEND_UPD_CONN, h_send_upd_conn);
+port_thunk_frame!(send_upd_conn_thunk, send_upd_conn_entry, SEND_UPD_CONN, h_send_upd_conn, "ret", 0x540);
 
 /// 0x8148C0 net_send_packet_to_list_or_remotes (stack: buffer, size; `ret`): with no explicit
 /// recipient list ([0xEB1FE4] == 0) it is 0x814740 on the session [0x2528C14]; otherwise 0x814670
 /// to every entry of the list [0xEB1FDC] (count [0xEB1FE4]) except the session's local connection
 /// [session+0x408]. The caller's buffer is used as it is (the send helper writes its 4th byte).
 /// EAX: no list -> the send's; empty / negative list -> the count; else the list pointer.
-unsafe fn h_send_to_list_or_remotes(id: usize, r: &mut Pushad, a: *const u32) {
+unsafe fn h_send_to_list_or_remotes(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
         let (buf, size) = (*a, *a.add(1));
-        r.eax = shadow_send_ex(id, &p, [buf, size, 0], false, true, &[], || {
-            let count = rd(0x00EB_1FE4);
-            let session = rd(0x0252_8C14);
-            let local = rd(session as usize + 0x408);
-            if count == 0 {
-                return (send_remotes_raw(session, buf, size), true);
+        let count = rd(0x00EB_1FE4);
+        let session = rd(0x0252_8C14);
+        let local = rd(session as usize + 0x408);
+        let mut g = Regs::of(&p);
+        g.eax = count;
+        g.ecx = local;
+        g.ebx = size;
+        g.ebp = buf;
+        g.edi = session;
+        if count == 0 {
+            call_orig(SEND_REMOTES, &mut g, [buf, size, 0], false);
+            put_regs(r, &g);
+            return;
+        }
+        if (count as i32) <= 0 {
+            put_regs(r, &g);
+            return;
+        }
+        g.edi = 0;
+        g.eax = rd(0x00EB_1FDC);
+        let mut i = 0u32;
+        loop {
+            g.edx = local;
+            let e = rd(g.eax as usize + i as usize * 4);
+            if e != local {
+                g.esi = e;
+                call_orig4(SEND_CONN, &mut g, [buf, size, 0, 0]);
+                g.eax = rd(0x00EB_1FDC);
             }
-            if (count as i32) <= 0 {
-                return (count, false);
+            i += 1;
+            g.edi = i;
+            if (i as i32) >= count as i32 {
+                break;
             }
-            let mut i = 0usize;
-            loop {
-                let list = rd(0x00EB_1FDC) as usize;
-                let e = rd(list + i * 4);
-                if e != local {
-                    send_conn_raw(e, buf, size, 0, 0);
-                }
-                i += 1;
-                if (i as i32) >= count as i32 {
-                    break;
-                }
-            }
-            (rd(0x00EB_1FDC), false)
-        });
+        }
+        put_regs(r, &g);
     }
 }
 port_thunk!(send_to_list_or_remotes_thunk, send_to_list_or_remotes_entry, SEND_TO_LIST_OR_REMOTES, h_send_to_list_or_remotes);
@@ -2098,9 +2553,27 @@ unsafe fn recent_ids_push(conn: usize, id: u16) {
     }
 }
 
+/// ECX / EDX the original leaves: the second list's count, and the loop's last DL / EDX.
+unsafe fn recent_ids_regs(p: &Pushad) -> (u32, u32) {
+    unsafe {
+        let conn = p.eax as usize;
+        let cnt0 = rb(conn + 0x1DBA);
+        let cl2 = rb(conn + 0x1CB8) as u32;
+        if cl2 != 0x20 {
+            return (cl2, cl2);
+        }
+        let si = p.esi as u16;
+        let found = (0..cnt0 as usize).any(|i| rw(conn + 0x1CBA + i * 2) == si);
+        let after = if found { cnt0.wrapping_sub(1) } else { cnt0 };
+        let edx = if cnt0 != 0 && after == 0x80 { 0x7E } else { (p.edx & !0xFF) | cnt0 as u32 };
+        (cl2, edx)
+    }
+}
+
 unsafe fn h_recent_ids_push(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        (r.ecx, r.edx) = recent_ids_regs(&p);
         let c = p.eax as usize;
         r.eax = shadow_mem(id, &p, [0; 3], &[(c + 0x1C38, 0x184)], || {
             recent_ids_push(c, p.esi as u16);
@@ -2157,6 +2630,7 @@ unsafe fn h_ack_window_push(id: usize, r: &mut Pushad, _a: *const u32) {
         let p = *r;
         let c = p.ecx as usize;
         let ent = c + (rd(c + 0x15C0).wrapping_add(1).wrapping_add(0x1C) << 4) as usize;
+        r.edx = 0;
         r.eax = shadow_mem(id, &p, [0; 3], &[(c + 0x15C0, 8), (ent, 0x10)], || h_ack_window_push_inner(&p));
     }
 }
@@ -2204,10 +2678,43 @@ unsafe fn ack_record(p: &Pushad) {
     }
 }
 
+/// ECX / EDX the original leaves (the search index, the entry address, the sample, the old ring index).
+unsafe fn ack_record_regs(p: &Pushad) -> (u32, u32) {
+    unsafe {
+        let c = p.eax as usize;
+        if c == 0 || rb(c + 0x1B0) >= 0xC {
+            return (p.ecx, p.edx);
+        }
+        let n = rd(c + 0x15C0);
+        if n == 0 {
+            return (0, p.edx);
+        }
+        let mut k = 0u32;
+        let mut e = c + 0x1C0;
+        loop {
+            if rw(e) == p.esi as u16 {
+                break;
+            }
+            k = k.wrapping_add(1);
+            e = e.wrapping_add(0x10);
+            if k >= n {
+                return (k, e as u32);
+            }
+        }
+        let ecx = k << 4;
+        let edx = (c as u32).wrapping_add(ecx);
+        if rb((c as u32).wrapping_add(ecx).wrapping_add(0x1C8) as usize) != 0 {
+            return (ecx, edx);
+        }
+        (rd(0x0252_A3CC).wrapping_sub(rd(edx as usize + 0x1C4)) >> 1, rb(c + 0x2234) as u32)
+    }
+}
+
 unsafe fn h_ack_record(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
         let c = p.eax as usize;
+        (r.ecx, r.edx) = ack_record_regs(&p);
         let mut regions = vec![];
         if c != 0 && rb(c + 0x1B0) < 0xC {
             let n = (rd(c + 0x15C0) as usize).min(0x140);
@@ -2252,9 +2759,32 @@ unsafe fn check_timeout(p: &Pushad) -> u32 {
     }
 }
 
+/// ECX / EDX the original leaves on the paths that read the clock (the silence, the wrapped difference).
+unsafe fn check_timeout_regs(p: &Pushad) -> (u32, u32) {
+    unsafe {
+        let c = p.edi as usize;
+        if rb(0x0252_8B56) != 0 || rb(c + 0x1B8) == 0 {
+            return (p.ecx, p.edx);
+        }
+        let limit = if rd(rd(c + 0x1AC) as usize + 0x1C) == 0xA { 0x3A98u32 } else { 0xEA60 };
+        let now = rd(0x0252_A3CC);
+        let stamp = rd(c + 0x2240);
+        let mut d = now.wrapping_sub(stamp);
+        if stamp > now {
+            d = d.wrapping_sub(1);
+        }
+        if d > limit {
+            return (now, d);
+        }
+        let sil = if stamp > now { now.wrapping_sub(stamp).wrapping_sub(1) } else { now.wrapping_sub(stamp) };
+        (sil, d)
+    }
+}
+
 unsafe fn h_check_timeout(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        (r.ecx, r.edx) = check_timeout_regs(&p);
         r.eax = shadow_mem(id, &p, [0; 3], &[(p.edi as usize + 0x1B8, 1)], || check_timeout(&p));
     }
 }
@@ -2285,6 +2815,13 @@ unsafe fn h_timeout_expired(id: usize, r: &mut Pushad, _a: *const u32) {
             }
         };
         r.eax = checked_eax(id, &p, [0; 3], ours);
+        if rb(0x0252_8B89) != 0 {
+            let dl = rd(0x00EB_1614);
+            if (dl as i32) >= 0 {
+                let now = rd(0x00E8_43AC);
+                r.ecx = if (dl as i32) > (now as i32) { now } else { now.wrapping_sub(dl) };
+            }
+        }
     }
 }
 port_thunk!(timeout_expired_thunk, timeout_expired_entry, TIMEOUT_EXPIRED, h_timeout_expired);
@@ -2317,6 +2854,8 @@ unsafe fn h_rate_meter_init(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
         let (m, w) = (*a, *a.add(1));
+        r.ecx = 0;
+        r.edx = w & 0xFFFF;
         r.eax = shadow_mem(id, &p, [m, w, 0], &[(m as usize, 0x80)], || {
             let dl = p.edx as u8;
             let win = if dl < 0x1E { dl as u32 } else { 0x1E };
@@ -2352,6 +2891,7 @@ unsafe fn h_rate_meter_remaining(id: usize, r: &mut Pushad, _a: *const u32) {
         }
         let cap = rd(m);
         let ours = if sum > cap { 0 } else { cap - sum };
+        r.ecx = sum;
         r.eax = checked_eax(id, &p, [0; 3], ours);
     }
 }
@@ -2365,6 +2905,12 @@ unsafe fn h_conn_note_received(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
         let c = p.eax as usize;
+        if c != 0 {
+            r.edx = rd(0x0252_A3CC);
+            if rb(c + 0x1B8) != 0 && p.edx as u16 != 0xFFFF {
+                r.ecx = rw(c + 0x168E) as u32;
+            }
+        }
         let regions = if c != 0 { vec![(c + 0x168E, 2), (c + 0x15C6, 0xC8), (c + 0x2240, 4)] } else { vec![] };
         r.eax = shadow_mem(id, &p, [0; 3], &regions, || {
             if c != 0 {
@@ -2391,6 +2937,9 @@ unsafe fn h_ack_window_mark_all(id: usize, r: &mut Pushad, _a: *const u32) {
         let p = *r;
         let c = p.edx as usize;
         let n = if c != 0 { rd(c + 0x15C0) } else { 0 };
+        if n != 0 {
+            r.ecx = (c as u32).wrapping_add(0x1C9).wrapping_add(n.wrapping_mul(0x10));
+        }
         let regions = if c != 0 { vec![(c + 0x1C0, (n as usize).min(0x140) * 0x10)] } else { vec![] };
         r.eax = shadow_mem(id, &p, [0; 3], &regions, || {
             if c == 0 {
@@ -2416,6 +2965,10 @@ unsafe fn h_reset_ack_window(id: usize, r: &mut Pushad, _a: *const u32) {
         let p = *r;
         let c = p.eax as usize;
         let regions = if c != 0 { vec![(c + 0x15C0, 8), (c + 0x168E, 4), (c + 0x1C0, 0x10)] } else { vec![] };
+        r.ecx = 0;
+        if c != 0 {
+            r.edx = 1;
+        }
         r.eax = shadow_mem(id, &p, [0; 3], &regions, || {
             if c != 0 {
                 wd(c + 0x15C0, 0);
@@ -2446,8 +2999,10 @@ unsafe fn h_clock_predicted_ms(id: usize, r: &mut Pushad, _a: *const u32) {
         let p = *r;
         let s = rd(0x0252_8C14) as usize;
         let local_path = if rb(0x0252_8B56) != 0 && rb(0x0252_8B2B) == 0 { true } else { rb(s + 0x3F8) == 0 };
+        r.ecx = s as u32;
         let ours = if !local_path {
             let t = fist_trunc_lo(rf(0x0213_002C) as f64 * f64::from_bits(((rd(0x00E5_C204) as u64) << 32) | rd(0x00E5_C200) as u64));
+            r.edx = t;
             rd(s + 8).wrapping_sub(t).wrapping_add(0x64)
         } else {
             let n = rd(rd(s + 0x408) as usize + 0x1DE8);
@@ -2518,14 +3073,20 @@ unsafe fn h_out_of_phase_mask(id: usize, r: &mut Pushad, _a: *const u32) {
         let s = p.ecx as usize;
         let head = rd(s + 0x400);
         let mut mask = 0u32;
+        r.edx = head;
         if head != 0 {
             let peer = rd(s + 0x404);
             let mut n = head;
             loop {
-                if n != peer && rd(peer as usize + 0x40) != rd(n as usize + 0x40) {
-                    mask |= 1u32.wrapping_shl(rb(n as usize + 0x1B0) as u32);
+                if n != peer {
+                    r.ecx = rd(peer as usize + 0x40);
+                    if r.ecx != rd(n as usize + 0x40) {
+                        r.ecx = lo(r.ecx, rb(n as usize + 0x1B0) as u32);
+                        mask |= 1u32.wrapping_shl(rb(n as usize + 0x1B0) as u32);
+                    }
                 }
                 n = rd(n as usize + 0x22CC);
+                r.edx = n;
                 if n == head || n == 0 {
                     break;
                 }
@@ -2539,39 +3100,45 @@ port_thunk!(out_of_phase_mask_thunk, out_of_phase_mask_entry, OUT_OF_PHASE_MASK,
 /// 0x80FF00 session_peers_phase_equal (EDX = session -> AL): true when this is not the hosting
 /// path ([0x2528B56] set, [0x2528B2B] clear) or the session byte +0x3F8 is clear; false when
 /// 0x8CD8D0 (EAX = session) says so; else whether every connection but the peer shares the peer's phase.
-/// The upper EAX bytes are the original's: the node it stopped on, or 0x8CD8D0's.
-unsafe fn peers_phase_equal(p: &Pushad) -> u32 {
+/// The upper EAX bytes are the original's: the node it stopped on, or 0x8CD8D0's. ECX / EDX: the list head and the
+/// peer on the walking paths, 0x8CD8D0's leftovers otherwise.
+unsafe fn h_peers_phase_equal(_id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
+        let p = *r;
         let s = p.edx as usize;
         if (rb(0x0252_8B56) != 0 && rb(0x0252_8B2B) == 0) || rb(s + 0x3F8) == 0 {
-            return lo(p.eax, 1);
+            r.eax = lo(p.eax, 1);
+            return;
         }
-        let r = call_regs(0x008C_D8D0, p.edx, 0, 0, 0, 0, &[]);
-        if r as u8 != 0 {
-            return lo(r, 0);
+        let mut g = Regs::of(&p);
+        g.eax = p.edx;
+        call_orig(0x008C_D8D0, &mut g, [0; 3], false);
+        r.ecx = g.ecx;
+        r.edx = g.edx;
+        if g.eax as u8 != 0 {
+            r.eax = lo(g.eax, 0);
+            return;
         }
         let head = rd(s + 0x400);
+        r.ecx = head;
         let mut n = head;
         if n == 0 {
-            return lo(n, 1);
+            r.eax = lo(n, 1);
+            return;
         }
         let peer = rd(s + 0x404);
+        r.edx = peer;
         loop {
             if n != peer && rd(peer as usize + 0x40) != rd(n as usize + 0x40) {
-                return lo(n, 0);
+                r.eax = lo(n, 0);
+                return;
             }
             n = rd(n as usize + 0x22CC);
             if n == head || n == 0 {
-                return lo(n, 1);
+                r.eax = lo(n, 1);
+                return;
             }
         }
-    }
-}
-
-unsafe fn h_peers_phase_equal(id: usize, r: &mut Pushad, _a: *const u32) {
-    unsafe {
-        let p = *r;
-        r.eax = checked_eax(id, &p, [0; 3], peers_phase_equal(&p));
     }
 }
 port_thunk!(peers_phase_equal_thunk, peers_phase_equal_entry, PEERS_PHASE_EQUAL, h_peers_phase_equal);
@@ -2579,57 +3146,64 @@ port_thunk!(peers_phase_equal_thunk, peers_phase_equal_entry, PEERS_PHASE_EQUAL,
 /// 0x810040 session_all_conns_state_eq / 0x8100F0 session_all_conns_state_ge (ESI = session,
 /// EDI = state -> AL): needs 0x80FF00 (EDX = session) to say yes, then every connection's state
 /// [+0x3C] must equal / be >= (signed) EDI. The upper EAX bytes: 0x80FF00's, or the node that failed / ended the walk.
-unsafe fn all_conns_state(p: &Pushad, ge: bool) -> u32 {
+/// ECX = the list head once the walk starts, else 0x80FF00's leftovers; EDX = 0x80FF00's leftovers.
+unsafe fn all_conns_state(r: &mut Pushad, ge: bool) {
     unsafe {
+        let p = *r;
         let s = p.esi as usize;
-        let r = call_regs(0x0080_FF00, p.eax, p.ecx, p.esi, p.esi, p.edi, &[]);
-        if r as u8 == 0 {
-            return lo(r, 0);
+        let mut g = Regs::of(&p);
+        g.edx = p.esi;
+        call_orig(0x0080_FF00, &mut g, [0; 3], false);
+        r.ecx = g.ecx;
+        r.edx = g.edx;
+        if g.eax as u8 == 0 {
+            r.eax = lo(g.eax, 0);
+            return;
         }
         let head = rd(s + 0x400);
+        r.ecx = head;
         let mut n = head;
         if n == 0 {
-            return lo(0, 1);
+            r.eax = lo(0, 1);
+            return;
         }
         loop {
             let st = rd(n as usize + 0x3C);
             let bad = if ge { (st as i32) < (p.edi as i32) } else { st != p.edi };
             if bad {
-                return lo(n, 0);
+                r.eax = lo(n, 0);
+                return;
             }
             n = rd(n as usize + 0x22CC);
             if n == head || n == 0 {
-                return lo(n, 1);
+                r.eax = lo(n, 1);
+                return;
             }
         }
     }
 }
 
-unsafe fn h_all_conns_state_eq(id: usize, r: &mut Pushad, _a: *const u32) {
-    unsafe {
-        let p = *r;
-        r.eax = checked_eax(id, &p, [0; 3], all_conns_state(&p, false));
-    }
+unsafe fn h_all_conns_state_eq(_id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe { all_conns_state(r, false) }
 }
 port_thunk!(all_conns_state_eq_thunk, all_conns_state_eq_entry, ALL_CONNS_STATE_EQ, h_all_conns_state_eq);
 
-unsafe fn h_all_conns_state_ge(id: usize, r: &mut Pushad, _a: *const u32) {
-    unsafe {
-        let p = *r;
-        r.eax = checked_eax(id, &p, [0; 3], all_conns_state(&p, true));
-    }
+unsafe fn h_all_conns_state_ge(_id: usize, r: &mut Pushad, _a: *const u32) {
+    unsafe { all_conns_state(r, true) }
 }
 port_thunk!(all_conns_state_ge_thunk, all_conns_state_ge_entry, ALL_CONNS_STATE_GE, h_all_conns_state_ge);
 
 /// 0x810080 lobby_any_conn_state_4 (-> AL): some connection of the list of the session at [0x2528CE8] is in state 4.
-unsafe fn h_lobby_any_conn_state_4(id: usize, r: &mut Pushad, _a: *const u32) {
+/// ECX = the list head, EDX = 4 once there is a list.
+unsafe fn h_lobby_any_conn_state_4(_id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
-        let p = *r;
         let head = rd(rd(0x0252_8CE8) as usize + 0x400);
+        r.ecx = head;
         let mut n = head;
-        let ours = if n == 0 {
+        r.eax = if n == 0 {
             lo(n, 0)
         } else {
+            r.edx = 4;
             loop {
                 if rd(n as usize + 0x3C) == 4 {
                     break lo(n, 1);
@@ -2640,7 +3214,6 @@ unsafe fn h_lobby_any_conn_state_4(id: usize, r: &mut Pushad, _a: *const u32) {
                 }
             }
         };
-        r.eax = checked_eax(id, &p, [0; 3], ours);
     }
 }
 port_thunk!(lobby_any_conn_state_4_thunk, lobby_any_conn_state_4_entry, LOBBY_ANY_CONN_STATE_4, h_lobby_any_conn_state_4);
@@ -2652,6 +3225,9 @@ unsafe fn h_state_in_set_b(id: usize, r: &mut Pushad, _a: *const u32) {
         let p = *r;
         let e = rd(p.eax as usize + 0x1C).wrapping_sub(2);
         let yes = e <= 0xA && [0u8, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0][e as usize] == 0;
+        if e <= 0xA {
+            r.ecx = [0u32, 1, 0, 1, 1, 0, 1, 0, 0, 0, 0][e as usize]; // the jump-table index byte
+        }
         r.eax = checked_eax(id, &p, [0; 3], lo(e, yes as u32));
     }
 }
@@ -2662,6 +3238,7 @@ unsafe fn h_state_is_8(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
         let ours = (rd(rd(0x0252_8CB4) as usize + 0x1C) == 8) as u32;
+        r.ecx = rd(0x0252_8CB4);
         r.eax = checked_eax(id, &p, [0; 3], ours);
     }
 }
@@ -2669,17 +3246,16 @@ port_thunk!(state_is_8_thunk, state_is_8_entry, STATE_IS_8, h_state_is_8);
 
 /// 0x7F7A00 net_local_conn_id (-> AL): the id byte [+0x1B0] of the session's local connection ([session+0x408]), 0 without a session.
 /// EAX keeps the connection pointer above AL.
-unsafe fn h_local_conn_id(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn h_local_conn_id(_id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
-        let p = *r;
-        let s = rd(0x0252_8C14);
-        let ours = if s == 0 {
-            0
-        } else {
-            let c = rd(s as usize + 0x408);
-            lo(c, rb(c as usize + 0x1B0) as u32)
-        };
-        r.eax = checked_eax(id, &p, [0; 3], ours);
+        let sess = std::ptr::read_volatile(0x0252_8C14usize as *const u32);
+        if sess == 0 {
+            r.eax = 0;
+            return;
+        }
+        let c = std::ptr::read_volatile((sess as usize + 0x408) as *const u32);
+        let b = std::ptr::read_volatile((c as usize + 0x1B0) as *const u8);
+        r.eax = (std::hint::black_box(c) & 0xFFFF_FF00) | b as u32;
     }
 }
 port_thunk!(local_conn_id_thunk, local_conn_id_entry, LOCAL_CONN_ID, h_local_conn_id);
@@ -2687,36 +3263,32 @@ port_thunk!(local_conn_id_thunk, local_conn_id_entry, LOCAL_CONN_ID, h_local_con
 /// 0x7F8020 net_id_to_human (AX = net id -> EAX): the object a net id maps to (map 0x212E258, find
 /// 0x808E30 (ESI = map; id, 0)), through the handle slot table, when its flag byte +0x3CC is exactly 1
 /// (the original builds an all-ones / zero mask with `neg` / `sbb` / `not`); else 0.
-unsafe fn id_to_human(p: &Pushad) -> u32 {
-    unsafe {
-        let key = p.eax & 0xFFFF;
-        if p.eax as u16 == 0xFFFF {
-            return 0;
-        }
-        let node = call_regs(0x0080_8E30, key, p.ecx, p.edx, rd(NET_ID_MAP), p.edi, &[key, 0]);
-        if node == 0 {
-            return 0;
-        }
-        let rec = rd(node as usize);
-        if rec == 0 {
-            return 0;
-        }
-        let handle = rd(rec as usize + 4);
-        if handle == 0 {
-            return 0;
-        }
-        let o = rd(HANDLES + ((handle & 0xFFF) as usize) * 16);
-        if o == 0 || rd(o as usize + 0x44) != handle || rd(o as usize + 0x4C) != 1 {
-            return 0;
-        }
-        if rb(o as usize + 0x3CC).wrapping_sub(1) != 0 { 0 } else { o }
-    }
-}
-
-unsafe fn h_id_to_human(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn h_id_to_human(_id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
-        r.eax = checked_eax(id, &p, [0; 3], id_to_human(&p));
+        // EAX is the object (or 0); ECX / EDX are what the original leaves: the handle, the slot
+        // offset and the all-ones / zero mask on the paths that got that far.
+        let (mut eax, mut ecx, mut edx) = (0u32, p.ecx, p.edx);
+        if p.eax as u16 != 0xFFFF {
+            let key = p.eax & 0xFFFF;
+            let node = call_regs(0x0080_8E30, key, p.ecx, p.edx, rd(NET_ID_MAP), p.edi, &[key, 0]);
+            let rec = if node != 0 { rd(node as usize) } else { 0 };
+            if rec != 0 {
+                let handle = rd(rec as usize + 4);
+                ecx = handle;
+                if handle != 0 {
+                    edx = (handle & 0xFFF) << 4;
+                    let o = rd(HANDLES + edx as usize);
+                    if o != 0 && rd(o as usize + 0x44) == handle && rd(o as usize + 0x4C) == 1 {
+                        ecx = if rb(o as usize + 0x3CC).wrapping_sub(1) != 0 { 0 } else { 0xFFFF_FFFF };
+                        eax = o & ecx;
+                    }
+                }
+            }
+        }
+        r.eax = eax;
+        r.ecx = ecx;
+        r.edx = edx;
     }
 }
 port_thunk!(id_to_human_thunk, id_to_human_entry, ID_TO_HUMAN, h_id_to_human);
@@ -2758,38 +3330,53 @@ port_thunk!(map_set_thunk, map_set_entry, MAP_SET, h_map_set, "ret 4");
 /// scan of the session's reservations (count +0x3F4, 0x50-byte entries from +0x5C, GUID at +0 compared with
 /// 0x8176E0 (ECX = wanted, EDX = entry), id dword at +0x24 compared with the wanted one's). Found: store
 /// the index through the out pointer (when non-null), AL = 1; else AL = 0. The upper EAX bytes are 0x8176E0's.
-unsafe fn find_reservation(p: &Pushad, guid: u32, out: u32) -> u32 {
+/// 0x80F2E0 session_find_reservation (EAX = session; stack: GUID record, out index*; `ret 8`): walks the 0x50-byte
+/// entries from the last (0x5C + index * 0x50) down, 0x8176E0 (ECX = GUID, EDX = entry, EDI = entry) on each; AL = 1 with
+/// the index stored when the GUIDs and the dwords at +0x24 match. EDX = the entry's +0x24 after a GUID match.
+unsafe fn h_find_reservation(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
+        let p = *r;
+        let (guid, out) = (*a, *a.add(1));
         let s = p.eax as usize;
         let mut i = (rd(s + 0x3F4) as i32).wrapping_sub(1);
         if i < 0 {
-            return lo(p.eax, 0);
+            r.eax = lo(p.eax, 0);
+            return;
         }
         let mut e = (s + 0x5C + (i as usize).wrapping_mul(0x50)) as u32;
-        let mut r;
+        let mut g = Regs::of(&p);
+        g.ebx = guid;
+        g.ebp = out;
+        let mut eax = p.eax;
         loop {
-            r = call_regs(0x0081_76E0, p.eax, guid, e, 0, 0, &[]);
-            if r as u8 != 0 && rd(e as usize + 0x24) == rd(guid as usize + 0x24) {
-                if out != 0 {
-                    wd(out as usize, i as u32);
+            g.eax = eax;
+            g.ecx = guid;
+            g.edx = e;
+            g.esi = i as u32;
+            g.edi = e;
+            call_orig(0x0081_76E0, &mut g, [0; 3], false);
+            eax = g.eax;
+            if eax as u8 != 0 {
+                g.edx = rd(e as usize + 0x24);
+                if g.edx == rd(guid as usize + 0x24) {
+                    if out != 0 {
+                        wd(out as usize, i as u32);
+                    }
+                    r.eax = lo(eax, 1);
+                    r.ecx = g.ecx;
+                    r.edx = g.edx;
+                    return;
                 }
-                return lo(r, 1);
             }
             i -= 1;
             e = e.wrapping_sub(0x50);
             if i < 0 {
-                return lo(r, 0);
+                r.eax = lo(eax, 0);
+                r.ecx = g.ecx;
+                r.edx = g.edx;
+                return;
             }
         }
-    }
-}
-
-unsafe fn h_find_reservation(id: usize, r: &mut Pushad, a: *const u32) {
-    unsafe {
-        let p = *r;
-        let (guid, out) = (*a, *a.add(1));
-        let regions = if out != 0 { vec![(out as usize, 4usize)] } else { vec![] };
-        r.eax = shadow_mem(id, &p, [guid, out, 0], &regions, || find_reservation(&p, guid, out));
     }
 }
 port_thunk!(find_reservation_thunk, find_reservation_entry, FIND_RESERVATION, h_find_reservation, "ret 8");
@@ -2820,6 +3407,13 @@ unsafe fn h_remove_reservation(id: usize, r: &mut Pushad, _a: *const u32) {
         let p = *r;
         let s = p.eax as usize;
         let d = (p.edx as usize).wrapping_mul(0x50).wrapping_add(s);
+        let last = rd(s + 0x3F4).wrapping_sub(1);
+        if last == p.edx {
+            r.ecx = last;
+        } else {
+            r.ecx = 0;
+            r.edx = rd((last as usize).wrapping_mul(0x50).wrapping_add(s).wrapping_add(0x5C + 0x24));
+        }
         r.eax = shadow_mem(id, &p, [0; 3], &[(s + 0x3F4, 4), (d.wrapping_add(0x34), 0x50)], || remove_reservation(&p));
     }
 }
@@ -2828,19 +3422,35 @@ port_thunk!(remove_reservation_thunk, remove_reservation_entry, REMOVE_RESERVATI
 /// 0x80C350 session_guid_in_array (EAX = array of 0x28-byte GUID entries; stack: count, base; cdecl): AL = 1 when some
 /// entry matches the GUID at base + 0x14C (0x8176E0: ECX = entry, EDX = GUID) with an equal id dword (+0x24).
 /// EAX: the id dword with AL = 1 when found; else the last value EAX held with AL = 0.
-unsafe fn guid_in_array(p: &Pushad, count: u32, base: u32) -> u32 {
+/// 0x80C350 session_guid_in_array (EAX = array of 0x28-byte entries; stack: count, the record whose GUID (+0x14C) is
+/// looked for; `ret`): 0x8176E0 (ECX = entry, EDX = GUID, EDI = index) per entry. AL = 1 on the first entry whose GUID
+/// and the dword at +0x24 match.
+unsafe fn h_guid_in_array(_id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
-        let g = base.wrapping_add(0x14C);
-        let mut eax = p.eax;
+        let p = *r;
+        let (count, base) = (*a, *a.add(1));
+        let g_ptr = base.wrapping_add(0x14C);
+        let mut g = Regs::of(&p);
+        g.ebx = count;
+        g.ebp = g_ptr;
         let mut e = p.eax;
         let mut i = 0i32;
+        let mut eax = p.eax;
+        let mut found = false;
         if (count as i32) > 0 {
             loop {
-                eax = call_regs(0x0081_76E0, eax, e, g, 0, 0, &[]);
+                g.eax = eax;
+                g.ecx = e;
+                g.edx = g_ptr;
+                g.esi = e;
+                g.edi = i as u32;
+                call_orig(0x0081_76E0, &mut g, [0; 3], false);
+                eax = g.eax;
                 if eax as u8 != 0 {
-                    eax = rd(g as usize + 0x24);
+                    eax = rd(g_ptr as usize + 0x24);
                     if eax == rd(e as usize + 0x24) {
-                        return lo(eax, 1);
+                        found = true;
+                        break;
                     }
                 }
                 i += 1;
@@ -2850,15 +3460,9 @@ unsafe fn guid_in_array(p: &Pushad, count: u32, base: u32) -> u32 {
                 }
             }
         }
-        lo(eax, 0)
-    }
-}
-
-unsafe fn h_guid_in_array(id: usize, r: &mut Pushad, a: *const u32) {
-    unsafe {
-        let p = *r;
-        let (count, base) = (*a, *a.add(1));
-        r.eax = checked_eax(id, &p, [count, base, 0], guid_in_array(&p, count, base));
+        r.eax = lo(eax, found as u32);
+        r.ecx = g.ecx;
+        r.edx = g.edx;
     }
 }
 port_thunk!(guid_in_array_thunk, guid_in_array_entry, GUID_IN_ARRAY, h_guid_in_array);
@@ -2872,17 +3476,20 @@ unsafe fn h_find_best_conn(id: usize, r: &mut Pushad, a: *const u32) {
         let skip = *a;
         let (mut best, mut score) = (0u32, 0u32);
         let head = p.edi;
+        r.ecx = head;
         if head != 0 {
             let mut c = head;
             loop {
                 if c != skip && rb(c as usize + 0x1DCC) == 0 && rb(c as usize + 0x1B8) != 0 {
                     let v = rd(c as usize + 0x1DBC);
+                    r.edx = v;
                     if v > score || best == 0 {
                         best = c;
                         score = v;
                     }
                 }
                 c = rd(c as usize + 0x22CC);
+                r.ecx = c;
                 if c == head || c == 0 {
                     break;
                 }
@@ -2898,6 +3505,7 @@ unsafe fn h_session_info_base_init(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
         let o = p.eax as usize;
+        r.ecx = 0;
         r.eax = shadow_mem(id, &p, [0; 3], &[(o, 0x4A)], || {
             wd(o, 0x00DF_FD54);
             wd(o + 0x30, 0);
@@ -2963,6 +3571,7 @@ unsafe fn h_byte_nc_init(id: usize, r: &mut Pushad, _a: *const u32) {
 unsafe fn h_byte_nc_init_bits(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        r.ecx = p.ecx >> 3;
         let o = p.eax as usize;
         r.eax = shadow_mem(id, &p, [0; 3], &[(o, 8)], || {
             wd(o, 0x00E2_64C4);
@@ -2978,6 +3587,7 @@ port_thunk!(byte_nc_init_bits_thunk, byte_nc_init_bits_entry, BYTE_NC_INIT_BITS,
 unsafe fn h_bit_nc_init(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        r.ecx = 0;
         let o = p.eax as usize;
         r.eax = shadow_mem(id, &p, [0; 3], &[(o, 0x10)], || {
             wd(o, 0x00E2_64D8);
@@ -2991,6 +3601,8 @@ unsafe fn h_bit_nc_init(id: usize, r: &mut Pushad, _a: *const u32) {
 unsafe fn h_bit_nc_init_bits(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        r.edx = p.ecx >> 3;
+        r.ecx = p.ecx & 7;
         let o = p.eax as usize;
         r.eax = shadow_mem(id, &p, [0; 3], &[(o, 0x10)], || {
             wd(o + 4, p.ecx);
@@ -3008,6 +3620,7 @@ port_thunk!(bit_nc_init_bits_thunk, bit_nc_init_bits_entry, BIT_NC_INIT_BITS, h_
 unsafe fn h_float_comp_init(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
+        r.edx = lo(p.edx, *a.add(5) & 0xFF);
         let o = p.eax as usize;
         let v = args_of(a, 6);
         r.eax = shadow_mem_regs(id, &p, &v, &[(o, 0x1C)], || {
@@ -3028,6 +3641,7 @@ port_thunk!(float_comp_init_thunk, float_comp_init_entry, FLOAT_COMP_INIT, h_flo
 unsafe fn h_float_comp_init_copy(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
+        r.ecx = 0;
         let o = p.eax as usize;
         let v = args_of(a, 7);
         r.eax = shadow_mem_regs(id, &p, &v, &[(o, 0x20)], || {
@@ -3045,6 +3659,7 @@ port_thunk!(float_comp_init_copy_thunk, float_comp_init_copy_entry, FLOAT_COMP_I
 unsafe fn h_float_comp_copy(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        r.ecx = 0;
         let o = p.eax as usize;
         r.eax = shadow_mem(id, &p, [0; 3], &[(o + 4, 0x1C)], || {
             let tmp = snap_bytes(p.ecx as usize + 4, 0x1C);
@@ -3060,6 +3675,7 @@ port_thunk!(float_comp_copy_thunk, float_comp_copy_entry, FLOAT_COMP_COPY, h_flo
 unsafe fn h_vector3_comp_ctor(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
+        r.ecx = 0;
         let o = p.eax as usize;
         let v = args_of(a, 22);
         r.eax = shadow_mem_regs(id, &p, &v, &[(o, 0x68)], || {
@@ -3087,6 +3703,7 @@ port_thunk!(vector3_comp_ctor_thunk, vector3_comp_ctor_entry, VECTOR3_COMP_CTOR,
 unsafe fn h_vector2_comp_ctor(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
+        r.ecx = 0;
         let o = p.eax as usize;
         let v = args_of(a, 15);
         r.eax = shadow_mem_regs(id, &p, &v, &[(o, 0x48)], || {
@@ -3127,6 +3744,7 @@ port_thunk!(vector3_uncomp_ctor_thunk, vector3_uncomp_ctor_entry, VECTOR3_UNCOMP
 unsafe fn h_heading_comp_ctor(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
+        r.ecx = 0;
         let o = p.eax as usize;
         let v = args_of(a, 7);
         r.eax = shadow_mem_regs(id, &p, &v, &[(o, 0x28)], || {
@@ -3156,6 +3774,22 @@ unsafe fn handle_obj(h: u32) -> u32 {
         }
         let o = rd(HANDLES + ((h & 0xFFF) as usize) * 16);
         if o != 0 && rd(o as usize + 0x44) == h { o } else { 0 }
+    }
+}
+
+/// The replication record of a handle and the ECX the originals leave when it is 0: the slot entry or record
+/// last loaded (the input ECX for handle 0).
+unsafe fn slot_rec(h: u32, ecx: u32) -> (u32, u32) {
+    unsafe {
+        if h == 0 {
+            return (0, ecx);
+        }
+        let o = rd(HANDLES + ((h & 0xFFF) as usize) * 16);
+        if o == 0 || rd(o as usize + 0x44) != h {
+            return (0, o);
+        }
+        let rec = rd(o as usize + 0xB0);
+        (rec, rec)
     }
 }
 
@@ -3192,6 +3826,8 @@ unsafe fn h_ownership_pending(id: usize, r: &mut Pushad, _a: *const u32) {
                 }
             };
         }
+        r.ecx = rd(0x0252_8BAC);
+        r.edx = nid as u32;
         r.eax = checked_eax(id, &p, [0; 3], ours);
     }
 }
@@ -3203,6 +3839,7 @@ unsafe fn h_conn_object_list_add(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
         let c = p.eax as usize;
+        r.ecx = rd(c + 0x21F0);
         r.eax = shadow_mem(id, &p, [0; 3], &[(c + 0x1DF0, 0x404)], || {
             let n = rd(c + 0x21F0) as usize;
             wd(c + n.wrapping_mul(4).wrapping_add(0x1DF0), p.edx);
@@ -3219,6 +3856,27 @@ unsafe fn h_conn_object_list_remove(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
         let c = p.eax as usize;
+        {
+            // ECX = the index reached, EDX = the entry address (not found) or the moved last handle (found).
+            let n = rd(c + 0x21F0);
+            let mut i = 0u32;
+            r.ecx = 0;
+            let mut found = false;
+            if n != 0 {
+                loop {
+                    if rd(c + 0x1DF0 + i as usize * 4) == p.edi {
+                        found = true;
+                        break;
+                    }
+                    i += 1;
+                    if i >= n {
+                        break;
+                    }
+                }
+                r.ecx = i;
+                r.edx = if found { rd(c + (n as usize).wrapping_mul(4).wrapping_add(0x1DEC)) } else { (c as u32).wrapping_add(0x1DF0).wrapping_add(n.wrapping_mul(4)) };
+            }
+        }
         r.eax = shadow_mem(id, &p, [0; 3], &[(c + 0x1DF0, 0x404)], || {
             let n = rd(c + 0x21F0);
             let mut i = 0u32;
@@ -3261,6 +3919,7 @@ unsafe fn h_guid_entry_read(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
         let (e, cur, buf) = (p.eax as usize, p.edx as usize, p.esi);
+        let mut last = 0u32;
         r.eax = shadow_mem(id, &p, [0; 3], &[(e, 0x28), (cur, 4)], || {
             for i in 0..9 {
                 wd(e + i * 4, 0);
@@ -3276,34 +3935,37 @@ unsafe fn h_guid_entry_read(id: usize, r: &mut Pushad, _a: *const u32) {
             wd(e + 0xC, rd(at(c, 4)));
             wd(cur, rd(cur).wrapping_add(8));
             let c = rd(cur);
-            wd(e + 0x24, rd(at(c, 0)));
+            last = rd(at(c, 0));
+            wd(e + 0x24, last);
             wd(cur, rd(cur).wrapping_add(4));
             p.eax
         });
+        r.ecx = last;
     }
 }
 port_thunk!(guid_entry_read_thunk, guid_entry_read_entry, GUID_ENTRY_READ, h_guid_entry_read);
 
 /// 0x7FFDF0 net_id_to_object_ac (AX = net id -> EAX): like net_id_to_human without the flag test: the field
 /// +0xAC of the object the net id's handle names, 0 when anything is missing.
-unsafe fn h_id_to_object_ac(id: usize, r: &mut Pushad, _a: *const u32) {
+unsafe fn h_id_to_object_ac(_id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
-        let ours = if p.eax as u16 == 0xFFFF {
-            0
-        } else {
+        let (mut eax, mut ecx) = (0u32, p.ecx);
+        if p.eax as u16 != 0xFFFF {
             let key = p.eax & 0xFFFF;
             let node = call_regs(0x0080_8E30, key, p.ecx, p.edx, rd(NET_ID_MAP), p.edi, &[key, 0]);
             let rec = if node != 0 { rd(node as usize) } else { 0 };
             let handle = if rec != 0 { rd(rec as usize + 4) } else { 0 };
-            if handle == 0 {
-                0
-            } else {
-                let o = handle_obj(handle);
-                if o == 0 { 0 } else { rd(o as usize + 0xAC) }
+            if handle != 0 {
+                let o = rd(HANDLES + ((handle & 0xFFF) as usize) * 16);
+                ecx = o;
+                if o != 0 && rd(o as usize + 0x44) == handle {
+                    eax = rd(o as usize + 0xAC);
+                }
             }
-        };
-        r.eax = checked_eax(id, &p, [0; 3], ours);
+        }
+        r.eax = eax;
+        r.ecx = ecx;
     }
 }
 port_thunk!(id_to_object_ac_thunk, id_to_object_ac_entry, ID_TO_OBJECT_AC, h_id_to_object_ac);
@@ -3353,14 +4015,10 @@ unsafe fn h_read_state_delta(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
         PORTS[id].calls.fetch_add(1, Ordering::Relaxed);
-        let rec = if p.eax != 0 {
-            let o = handle_obj(p.eax);
-            if o == 0 { 0 } else { rd(o as usize + 0xB0) }
-        } else {
-            0
-        };
+        let (rec, left) = slot_rec(p.eax, p.ecx);
         if rec == 0 {
             r.eax = 2;
+            r.ecx = left;
             return;
         }
         let m = rd(MANAGERS + rd(rec as usize + 8) as usize * 4);
@@ -3415,13 +4073,9 @@ unsafe fn h_on_state_sent(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         let p = *r;
         PORTS[id].calls.fetch_add(1, Ordering::Relaxed);
-        let rec = if p.eax != 0 {
-            let o = handle_obj(p.eax);
-            if o == 0 { 0 } else { rd(o as usize + 0xB0) }
-        } else {
-            0
-        };
+        let (rec, left) = slot_rec(p.eax, p.ecx);
         if rec == 0 {
+            r.ecx = left;
             return;
         }
         let m = rd(MANAGERS + rd(rec as usize + 8) as usize * 4);
@@ -3463,6 +4117,14 @@ unsafe fn can_migrate(p: &Pushad) -> u32 {
 unsafe fn h_can_migrate(id: usize, r: &mut Pushad, _a: *const u32) {
     unsafe {
         let p = *r;
+        let o = p.eax as usize;
+        if p.eax != 0 && rb(o + 0x80) & 0xB == 0 {
+            let rec = rd(o + 0xB0);
+            r.ecx = rec;
+            if rec != 0 && rw(rec as usize + 0x67E) != 0xFFFF {
+                r.ecx = lo(rec, 0);
+            }
+        }
         r.eax = checked_eax(id, &p, [0; 3], can_migrate(&p));
     }
 }
@@ -3533,12 +4195,16 @@ unsafe fn h_request_ownership(id: usize, r: &mut Pushad, a: *const u32) {
             if rec != 0 && rd(SESSION) != 0 && (rb(rec as usize + 0x67C) & 2 != 0 || call_regs(0x0080_6760, h, rec, p.edx, rd(SESSION), rec, &[]) as u8 != 0) {
                 PORTS[id].calls.fetch_add(1, Ordering::Relaxed);
                 r.eax = request_ownership(&p, obj, arg2, cb).0;
+                let mut g = Regs::of(r);
+                finish_cookie(r, &mut g);
                 return;
             }
         }
         let n = rd(0x0252_8BAC) as usize;
         let regions = [(0x0252_8BACusize, 4usize), (0x0212_BB38 + n.min(0x20) * 8, 8)];
         r.eax = shadow_send_ex(id, &p, [obj, arg2, cb], rb(0x00E8_C2DC) != 0, false, &regions, || request_ownership(&p, obj, arg2, cb));
+        let mut g = Regs::of(r);
+        finish_cookie(r, &mut g);
     }
 }
 port_thunk!(request_ownership_thunk, request_ownership_entry, REQUEST_OWNERSHIP, h_request_ownership);
@@ -3771,12 +4437,15 @@ unsafe fn h_add_field(id: usize, r: &mut Pushad, a: *const u32) {
             }
         }
         let mask = (1u32 << (rd(reg + 0x1C) & 31)).wrapping_sub(1);
+        r.ecx = rd(reg + 0x1C);
         if rd(e) == mask {
             br(id, 2);
             r.eax = 0;
             return;
         }
         br(id, 3);
+        r.ecx = *a.add(1);
+        r.edx = *a.add(2);
         wd(f, *a);
         wd(f + 4, *a.add(1));
         wd(f + 0x40, *a.add(2));
@@ -4108,12 +4777,22 @@ port_thunk!(send_new_owner_thunk, send_new_owner_entry, SEND_NEW_OWNER, h_send_n
 // unregistered (0x804140, ESI = record). Branches: 1 = no object / record / session, or the record is not the local connection's;
 // 2 = the connection list is empty; 3 = sent to a connection (0x814670, ESI = connection); 4 = a connection skipped (state or byte
 // test); 5 = skipped because 0x804960 found the handle. EAX = the final 0x804140's, or what the original leaves on the early exits.
-unsafe fn h_deactivate_send(id: usize, r: &mut Pushad, _a: *const u32) {
+/// The original ends in __security_check_cookie (ECX = the cookie): its EAX is the port's.
+unsafe fn h_deactivate_send(id: usize, r: &mut Pushad, a: *const u32) {
+    unsafe {
+        deactivate_send_inner(id, r, a);
+        let mut g = Regs::of(r);
+        finish_cookie(r, &mut g);
+    }
+}
+
+unsafe fn deactivate_send_inner(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         enter(id);
         let h = r.ecx;
         if h == 0 {
             br(id, 1);
+            r.eax = rd(COOKIE) ^ (a as u32).wrapping_sub(0x520);
             return;
         }
         let obj = slot_of(h);
@@ -4227,30 +4906,44 @@ unsafe fn h_register_local(id: usize, r: &mut Pushad, a: *const u32) {
                 ebp = o;
             }
         }
+        // From here the registers follow the original: ECX = the local connection, EDX = the slot offset of the handle, then
+        // whatever each callee leaves.
+        let mut g = Regs::of(r);
+        g.ecx = local;
+        if edi != 0 {
+            g.edx = (edi & 0xFFF) << 4;
+        }
+        g.ebp = ebp;
         let o = rd(0x027B_3C60);
-        eax = o;
+        g.eax = o;
         if o != 0 && rd(o as usize + 0x3C) == 1 {
             br(id, 8);
             let c = rd(o as usize + 0x90);
             let vt = rd(c as usize);
             let f = rd(vt as usize + 4);
-            eax = call_regs(f as usize, vt, c, f, r.esi, edi, &[]);
+            g.eax = vt;
+            g.ecx = c;
+            g.edx = f;
+            call_orig(f as usize, &mut g, [0; 3], false);
         }
         if ebp == 0 || rb(ebp as usize + 0x80) & 1 != 0 {
             br(id, 4);
-            r.eax = eax;
+            put_regs(r, &g);
             return;
         }
-        let rec = call_regs(cal(0x0080_4050), eax, r.ecx, r.edx, r.esi, edi, &[]);
+        call_orig(cal(0x0080_4050), &mut g, [0; 3], false);
+        let rec = g.eax;
         if rec == 0 {
             br(id, 5);
-            r.eax = 0;
+            put_regs(r, &g);
             return;
         }
         br(id, 6);
         let rp = rec as usize;
         ww(rp + 2, edi as u16);
-        call_regs(cal(0x0080_7A20), edi & 0xFFFF, r.ecx, r.edx, rec, edi, &[rec]);
+        g.eax = edi & 0xFFFF;
+        g.esi = rec;
+        call_orig(cal(0x0080_7A20), &mut g, [rec, 0, 0], false);
         wd(rp + 4, edi);
         wd(rp + 8, ty);
         wb(rp, rb(local as usize + 0x1B0));
@@ -4260,8 +4953,12 @@ unsafe fn h_register_local(id: usize, r: &mut Pushad, a: *const u32) {
         let mgr = rd(MANAGERS + ty as usize * 4);
         let vt = rd(mgr as usize);
         let f = rd(vt as usize + 4);
-        call_regs(f as usize, f, mgr, vt, rec, edi, &[edi]);
+        g.eax = f;
+        g.ecx = mgr;
+        g.edx = vt;
+        call_orig(f as usize, &mut g, [edi, 0, 0], false);
         ww(rp + 0x67E, 0xFFFF);
+        g.edx = sess;
         let head = rd(sess as usize + 0x400);
         if head != 0 {
             let mut c = head;
@@ -4282,16 +4979,16 @@ unsafe fn h_register_local(id: usize, r: &mut Pushad, a: *const u32) {
             }
         }
         if rb(SNAP_FLAG) != 0 {
-            call_regs(cal(0x007F_FAC0), 0, 0, 0, rec, edi, &[rw(rp + 2) as u32]);
+            g.edx = rw(rp + 2) as u32;
+            call_orig(cal(0x007F_FAC0), &mut g, [rw(rp + 2) as u32, 0, 0], false);
         }
-        let obj = call_regs(cal(0x0092_5030), 0, edi, 0, rec, edi, &[]);
-        if obj == 0 {
-            br(id, 7);
-            r.eax = 0;
-            return;
+        g.ecx = edi;
+        call_orig(cal(0x0092_5030), &mut g, [0; 3], false);
+        let obj = g.eax;
+        if obj != 0 {
+            wd(obj as usize + 0xB0, rec);
         }
-        wd(obj as usize + 0xB0, rec);
-        r.eax = obj;
+        put_regs(r, &g);
     }
 }
 port_thunk!(register_local_thunk, register_local_entry, REGISTER_LOCAL, h_register_local);
@@ -4603,17 +5300,22 @@ port_thunk!(give_ownership_thunk, give_ownership_entry, GIVE_OWNERSHIP, h_give_o
 unsafe fn h_give_if_allowed(id: usize, r: &mut Pushad, a: *const u32) {
     unsafe {
         enter(id);
-        let esi = r.esi;
+        let p = *r;
+        let esi = p.esi;
         if esi == 0 {
             br(id, 1);
             return;
         }
         let ecx = rd(esi as usize + 0xB0);
+        r.ecx = ecx;
+        let mut edx = p.edx;
         if ecx != 0 {
             let sess = rd(SESSION);
             if sess != 0 {
                 let local = rd(sess as usize + 0x408);
                 if local != 0 {
+                    edx = lo(p.edx, rb(ecx as usize) as u32);
+                    r.edx = edx;
                     if rb(ecx as usize) != rb(local as usize + 0x1B0) || rb(ecx as usize + 0x67C) & 1 != 0 {
                         br(id, 2);
                         r.eax = local;
@@ -4622,14 +5324,18 @@ unsafe fn h_give_if_allowed(id: usize, r: &mut Pushad, a: *const u32) {
                 }
             }
         }
-        let can = call_regs(cal(0x0080_6D50), esi, ecx, r.edx, esi, r.edi, &[]);
-        if can as u8 == 0 {
+        // 0x806D50 (EAX = object), then 0x806910 (object, connection, 0) with the registers 0x806D50 left.
+        let mut g = Regs { eax: esi, ecx, edx, ebx: p.ebx, esi, edi: p.edi, ebp: p.ebp };
+        call_orig(0x0080_6D50, &mut g, [0; 3], false);
+        if g.eax as u8 == 0 {
             br(id, 3);
-            r.eax = can;
+            put_regs(r, &g);
             return;
         }
         br(id, 4);
-        r.eax = call_regs(cal(0x0080_6910), esi, ecx, r.edx, esi, r.edi, &[esi, *a, 0]);
+        g.eax = *a;
+        call_orig(0x0080_6910, &mut g, [esi, *a, 0], false);
+        put_regs(r, &g);
     }
 }
 port_thunk!(give_if_allowed_thunk, give_if_allowed_entry, GIVE_IF_ALLOWED, h_give_if_allowed);

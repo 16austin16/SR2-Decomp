@@ -141,16 +141,111 @@ macro_rules! regs_thunk {
                 "pushad",
                 "mov eax, esp",
                 "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
             )
         }
     };
+}
+
+/// The seven general registers in and out of `call_all`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CRegs {
+    pub eax: u32,
+    pub ecx: u32,
+    pub edx: u32,
+    pub ebx: u32,
+    pub esi: u32,
+    pub edi: u32,
+    pub ebp: u32,
+}
+
+#[repr(C)]
+struct AllBlk {
+    f: u32,
+    r: CRegs,
+    args: u32,
+    nargs: u32,
+    esp: u32,
+    st0: [u32; 2],
+    want_st0: u32,
+}
+
+/// Call `f` with all seven general registers from `r` and cdecl / stdcall stack arguments, then
+/// capture all seven registers back into `r` (and ST0 when `want_st0`; else the x87 stack is left
+/// as the callee leaves it). Works for callees that pop their arguments. The block pointer is
+/// parked in the TEB's ArbitraryUserPointer (fs:[0x14]) across the call, restored afterwards.
+unsafe fn call_all(f: usize, r: &mut CRegs, args: &[u32], want_st0: bool) -> f64 {
+    let mut b = AllBlk { f: f as u32, r: *r, args: args.as_ptr() as u32, nargs: args.len() as u32, esp: 0, st0: [0; 2], want_st0: want_st0 as u32 };
+    unsafe {
+        std::arch::asm!(
+            "push ebp", "push ebx", "push esi", "push edi",
+            "push dword ptr fs:[0x14]",
+            "mov fs:[0x14], eax",
+            "mov [eax + 40], esp",
+            "mov ecx, [eax + 36]",
+            "mov esi, [eax + 32]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "call 4f",
+            // the callee returns here
+            "push eax",
+            "mov eax, fs:[0x14]",
+            "pop dword ptr [eax + 4]",
+            "mov [eax + 8], ecx", "mov [eax + 12], edx", "mov [eax + 16], ebx",
+            "mov [eax + 20], esi", "mov [eax + 24], edi", "mov [eax + 28], ebp",
+            "cmp dword ptr [eax + 52], 0",
+            "je 5f",
+            "fstp qword ptr [eax + 44]",
+            "5:",
+            "mov esp, [eax + 40]",
+            "pop dword ptr fs:[0x14]",
+            "pop edi", "pop esi", "pop ebx", "pop ebp",
+            "jmp 6f",
+            "4:",
+            "push dword ptr [eax]",
+            "mov ecx, [eax + 8]", "mov edx, [eax + 12]", "mov ebx, [eax + 16]",
+            "mov esi, [eax + 20]", "mov edi, [eax + 24]", "mov ebp, [eax + 28]",
+            "mov eax, [eax + 4]",
+            "ret",
+            "6:",
+            inout("eax") &mut b as *mut AllBlk => _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    *r = b.r;
+    f64::from_bits(b.st0[0] as u64 | (b.st0[1] as u64) << 32)
 }
 
 // --- the port table -------------------------------------------------------------------------------
@@ -334,6 +429,10 @@ unsafe fn dead_or_invalid(eax: u32, edx: u32) -> u32 {
 extern "C" fn dead_or_invalid_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(DEAD_OR_INVALID, &p, 0, unsafe { dead_or_invalid(p.eax, p.edx) });
+    // ECX = the object the handle resolves to (0 when stale / unset), once the human is not null
+    if p.edx != 0 {
+        r.ecx = unsafe { resolve(rd(p.edx as usize + 0x44)) };
+    }
 }
 regs_thunk!(dead_or_invalid_thunk, dead_or_invalid_entry);
 
@@ -384,6 +483,9 @@ extern "C" fn active_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let arg = unsafe { *args };
     r.eax = checked_eax(ACTIVE, &p, arg, unsafe { active(p.eax, arg) });
+    if p.eax != 0 {
+        r.ecx = (p.eax & 0xFFF) << 4; // the slot offset the lookup left in ECX
+    }
 }
 regs_thunk!(active_thunk, active_entry);
 
@@ -432,9 +534,31 @@ unsafe fn interaction_state_is(h: u32, state: u32) -> u32 {
     }
 }
 
+/// The live path: rider_find (0xB07A30, ESI = the handle at +0x44, EAX = the human) called by
+/// address; ECX = the `sete cl` of the state compare, EDX = the callee's.
+unsafe fn interaction_live(r: &mut Pushad, h: u32, state: u32) {
+    unsafe {
+        let mut g = CRegs { eax: h, ecx: r.ecx, edx: r.edx, ebx: r.ebx, esi: rd(h as usize + 0x44), edi: r.edi, ebp: r.ebp };
+        call_all(0x00B0_7A30, &mut g, &[], false);
+        r.edx = g.edx;
+        if g.eax == 0 {
+            r.ecx = 0;
+            r.eax = 0;
+        } else {
+            let v = rd(g.eax as usize + 4);
+            r.ecx = (v == state) as u32;
+            r.eax = (v & !0xFF) | r.ecx;
+        }
+    }
+}
+
 extern "C" fn entering_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let h = unsafe { *args };
+    if shadowing(ENTERING).is_none() {
+        unsafe { interaction_live(r, h, 1) };
+        return;
+    }
     r.eax = checked_eax(ENTERING, &p, h, unsafe { interaction_state_is(h, 1) });
 }
 regs_thunk!(entering_thunk, entering_entry);
@@ -442,6 +566,10 @@ regs_thunk!(entering_thunk, entering_entry);
 extern "C" fn exiting_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let h = unsafe { *args };
+    if shadowing(EXITING).is_none() {
+        unsafe { interaction_live(r, h, 2) };
+        return;
+    }
     r.eax = checked_eax(EXITING, &p, h, unsafe { interaction_state_is(h, 2) });
 }
 regs_thunk!(exiting_thunk, exiting_entry);
@@ -473,7 +601,42 @@ unsafe fn seat_occupant(v: u32, seat: u32) -> u32 {
     }
 }
 
+/// The live path: the checks, then the tail `jmp 0x960D60` (EAX = the occupant handle) by address.
+unsafe fn seat_occupant_live(r: &mut Pushad) {
+    unsafe {
+        let (v, seat) = (r.ecx, r.edx);
+        if v == 0 {
+            r.eax = 0;
+            return;
+        }
+        let n = if rb(v as usize + 0x84D8) == 1 {
+            let n = rd(v as usize + 0x6CE8);
+            if n == 0 {
+                r.eax = 0;
+                return;
+            }
+            n
+        } else {
+            8
+        };
+        if seat as i32 >= n as i32 {
+            r.eax = 0;
+            return;
+        }
+        let handle = rd(v.wrapping_add(seat.wrapping_mul(0x24)).wrapping_add(0x8ABC) as usize);
+        let mut g = CRegs { eax: handle, ecx: r.ecx, edx: r.edx, ebx: r.ebx, esi: r.esi, edi: r.edi, ebp: r.ebp };
+        call_all(0x0096_0D60, &mut g, &[], false);
+        r.eax = g.eax;
+        r.ecx = g.ecx;
+        r.edx = g.edx;
+    }
+}
+
 extern "C" fn seat_occupant_entry(r: &mut Pushad, _: *const u32) {
+    if shadowing(SEAT_OCCUPANT).is_none() {
+        unsafe { seat_occupant_live(r) };
+        return;
+    }
     let p = *r;
     r.eax = checked_eax(SEAT_OCCUPANT, &p, 0, unsafe { seat_occupant(p.ecx, p.edx) });
 }
@@ -551,6 +714,8 @@ unsafe fn static_contact(obj: u32) -> u32 {
 extern "C" fn static_contact_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(STATIC_CONTACT, &p, 0, unsafe { static_contact(p.eax) });
+    // ECX = the list head, loaded before the walk
+    r.ecx = unsafe { rd(0x0175_CD84 + (rd(p.eax as usize + 0x44) & 0xFFF) as usize * 8) };
 }
 regs_thunk!(static_contact_thunk, static_contact_entry);
 
@@ -708,6 +873,18 @@ unsafe fn elapsed(p: u32) -> u32 {
 extern "C" fn elapsed_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(ELAPSED, &p, 0, unsafe { elapsed(p.eax) });
+    unsafe {
+        let t = rd(p.eax as usize) as i32;
+        if t >= 0 {
+            let n = rd(GAME_NOW) as i32;
+            r.edx = n as u32;
+            if t <= n {
+                // ECX = the gap; negated again on the short path
+                let d = n.wrapping_sub(t);
+                r.ecx = if d <= HALF { d.wrapping_neg() as u32 } else { d as u32 };
+            }
+        }
+    }
 }
 regs_thunk!(elapsed_thunk, elapsed_entry);
 
@@ -749,6 +926,14 @@ unsafe fn set_random(max: u32, ts: u32, min: u32) -> u32 {
 extern "C" fn set_random_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let min = unsafe { *args };
+    // ECX = the table index + 1 (the clock when the offset is negative); EDX = the offset
+    unsafe {
+        let k = rd(RAND_INDEX);
+        let v = rd(RAND_TABLE.wrapping_add(k.wrapping_mul(4)) as usize);
+        let off = udiv_rem(v, p.eax.wrapping_sub(min).wrapping_add(1)).wrapping_add(min);
+        r.edx = off;
+        r.ecx = if (off as i32) < 0 { rd(GAME_NOW) } else { k.wrapping_add(1) };
+    }
     let Some((n, orig)) = shadowing(SET_RANDOM) else {
         r.eax = unsafe { set_random(p.eax, p.edi, min) };
         return;

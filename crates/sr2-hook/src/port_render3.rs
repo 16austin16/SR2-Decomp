@@ -485,54 +485,58 @@ extern "C" fn cull_thunk() {
 // 0x4B54A0 city_view_instance_filter_test  (ESI = instance, EDX = view record, stack u16 key)
 // =================================================================================================
 
-/// Returns EAX as the original leaves it (callers test AL).
-unsafe fn filter_impl(esi: u32, view: usize, key: u32) -> u32 {
+/// Returns (EAX, ECX, EDX) as the original leaves them (callers test AL): the loop counter and the
+/// advanced list pointer stay in ECX / EDX.
+unsafe fn filter_impl(esi: u32, view: usize, key: u32, ecx0: u32) -> (u32, u32, u32) {
     unsafe {
         let count = rd(view + 0x58);
         if count == 0 {
-            return 0;
+            return (0, ecx0, view as u32);
         }
-        if rh(view + 0x60) as u16 != key as u16 {
-            return (count & !0xFF) | ((count as i32) < 0) as u32;
+        let cx = rh(view + 0x60) as u32;
+        if cx as u16 != key as u16 {
+            let neg = ((count as i32) < 0) as u32;
+            return ((count & !0xFF) | neg, (ecx0 & 0xFFFF_0000) | cx, neg);
         }
         let list = rd(view + 0x5C) as usize;
         if (count as i32) > 0 {
-            // include-style: found -> 1
             let n = count as i32;
             let mut k = 0i32;
             while k < n {
                 if rh(list + k as usize * 2) == esi {
-                    return (count & !0xFF) | 1;
+                    return ((count & !0xFF) | 1, k as u32, (list + k as usize * 2) as u32);
                 }
                 k += 1;
             }
-            count & !0xFF
+            (count & !0xFF, k as u32, (list + k as usize * 2) as u32)
         } else {
             let n = count.wrapping_neg();
             if (n as i32) <= 0 {
-                return (n & !0xFF) | 1;
+                return ((n & !0xFF) | 1, 0, view as u32);
             }
             let mut k = 0i32;
             while k < n as i32 {
                 if rh(list + k as usize * 2) == esi {
-                    return n & !0xFF;
+                    return (n & !0xFF, k as u32, (list + k as usize * 2) as u32);
                 }
                 k += 1;
             }
-            (n & !0xFF) | 1
+            ((n & !0xFF) | 1, k as u32, (list + k as usize * 2) as u32)
         }
     }
 }
 
-extern "C" fn filter_rs(esi: u32, view: u32, key: u32) -> u32 {
+extern "C" fn filter_rs(esi: u32, view: u32, key: u32, out: *mut [u32; 2]) -> u32 {
     unsafe {
+        let (eax, ecx, edx) = filter_impl(esi, view as usize, key, (*out)[0]);
+        (*out)[0] = ecx;
+        (*out)[1] = edx;
         if !S_FILTER.active() {
-            return filter_impl(esi, view as usize, key);
+            return eax;
         }
         S_FILTER.calls.fetch_add(1, Ordering::Relaxed);
         let orig = call_regs(S_FILTER.orig.load(Ordering::Relaxed), 0, 0, view, esi, 0, &[key]);
-        let mine = filter_impl(esi, view as usize, key);
-        if mine & 0xFF != orig & 0xFF {
+        if eax & 0xFF != orig & 0xFF {
             S_FILTER.bad.fetch_add(1, Ordering::Relaxed);
         }
         orig
@@ -542,17 +546,21 @@ extern "C" fn filter_rs(esi: u32, view: u32, key: u32) -> u32 {
 #[unsafe(naked)]
 extern "C" fn filter_thunk() {
     std::arch::naked_asm!(
-        "push ecx",
-        "push edx",
+        "sub esp, 8",
+        "mov [esp], ecx",
+        "mov [esp + 4], edx",
         xmm_save!(),
-        "push dword ptr [esp + 140]",
+        "lea eax, [esp + 128]",
+        "push eax",
+        "push dword ptr [esp + 144]",
         "push edx",
         "push esi",
         "call {f}",
-        "add esp, 12",
+        "add esp, 16",
         xmm_load!(),
-        "pop edx",
-        "pop ecx",
+        "mov ecx, [esp]",
+        "mov edx, [esp + 4]",
+        "add esp, 8",
         "ret",
         f = sym filter_rs,
     )
@@ -649,7 +657,7 @@ extern "C" fn view_cull_thunk() {
 // 0xC094E0 texture_entry_animated_resolve  (EAX = index -> EAX = entry or 0)
 // =================================================================================================
 
-unsafe fn texres_impl(idx: i32) -> u32 {
+unsafe fn texres_impl(idx: i32, out: &mut [u32; 2]) -> u32 {
     unsafe {
         if idx < 0 || idx >= rd(TEX_COUNT) as i32 {
             return 0;
@@ -662,7 +670,10 @@ unsafe fn texres_impl(idx: i32) -> u32 {
         if frames > 1 && rh(entry + 8) == 0 {
             let rate = rb(info + 0x1A) as f64;
             let sign = rd(TEX_TICK) as i32;
-            let step = (rate * RATE_SCALE) as f32 as f64;
+            let step32 = (rate * RATE_SCALE) as f32;
+            // `fstp dword [esp + 0xC]` overwrites the pushed ECX; the final `pop ecx` leaves these bits
+            out[0] = step32.to_bits();
+            let step = step32 as f64;
             let mut tick = rd(TEX_TICK) as i32 as f64;
             if sign < 0 {
                 tick += TWO_32;
@@ -670,18 +681,21 @@ unsafe fn texres_impl(idx: i32) -> u32 {
             let v = ftol2(step * tick);
             i = i.wrapping_add(v.wrapping_rem(frames as i32));
         }
+        out[1] = (i as u32).wrapping_mul(3);
         base.wrapping_add((i as u32).wrapping_mul(12))
     }
 }
 
-extern "C" fn texres_rs(idx: u32) -> u32 {
+extern "C" fn texres_rs(idx: u32, out: *mut [u32; 2]) -> u32 {
     unsafe {
+        let mut o = *out;
+        let mine = texres_impl(idx as i32, &mut o);
+        *out = o;
         if !S_TEX.active() {
-            return texres_impl(idx as i32);
+            return mine;
         }
         S_TEX.calls.fetch_add(1, Ordering::Relaxed);
         let orig = call_regs(S_TEX.orig.load(Ordering::Relaxed), idx, 0, 0, 0, 0, &[]);
-        let mine = texres_impl(idx as i32);
         if mine != orig {
             S_TEX.bad.fetch_add(1, Ordering::Relaxed);
         }
@@ -692,15 +706,19 @@ extern "C" fn texres_rs(idx: u32) -> u32 {
 #[unsafe(naked)]
 extern "C" fn texres_thunk() {
     std::arch::naked_asm!(
-        "push ecx",
-        "push edx",
+        "sub esp, 8",
+        "mov [esp], ecx",
+        "mov [esp + 4], edx",
         xmm_save!(),
+        "lea ecx, [esp + 128]",
+        "push ecx",
         "push eax",
         "call {f}",
-        "add esp, 4",
+        "add esp, 8",
         xmm_load!(),
-        "pop edx",
-        "pop ecx",
+        "mov ecx, [esp]",
+        "mov edx, [esp + 4]",
+        "add esp, 8",
         "ret",
         f = sym texres_rs,
     )
@@ -735,8 +753,12 @@ unsafe fn less_impl(a: usize, b: usize) -> u32 {
     }
 }
 
-extern "C" fn less_rs(a: u32, b: u32) -> u32 {
+extern "C" fn less_rs(a: u32, b: u32, out: *mut [u32; 2]) -> u32 {
     unsafe {
+        // the original leaves ECX = b's sort key and EDX = b's (flags & 0x180)
+        let fb = rd(b as usize + 4);
+        (*out)[0] = ((fb & 0x180) | ((fb >> 4) & 0x200)) >> 7;
+        (*out)[1] = fb & 0x180;
         if !S_LESS.active() {
             return less_impl(a as usize, b as usize);
         }
@@ -753,16 +775,18 @@ extern "C" fn less_rs(a: u32, b: u32) -> u32 {
 #[unsafe(naked)]
 extern "C" fn less_thunk() {
     std::arch::naked_asm!(
-        "push ecx",
-        "push edx",
+        "sub esp, 8",
         xmm_save!(),
+        "lea eax, [esp + 128]",
+        "push eax",
         "push esi",
         "push edi",
         "call {f}",
-        "add esp, 8",
+        "add esp, 12",
         xmm_load!(),
-        "pop edx",
-        "pop ecx",
+        "mov ecx, [esp]",
+        "mov edx, [esp + 4]",
+        "add esp, 8",
         "ret",
         f = sym less_rs,
     )
@@ -897,7 +921,7 @@ extern "C" fn dist_thunk() {
 // =================================================================================================
 
 #[inline(always)]
-unsafe fn mat44_impl(a: usize, b: usize, out: usize) {
+unsafe fn mat44_impl(a: usize, b: usize, out: usize, xs: *mut f32) {
     unsafe {
         let b0 = _mm_loadu_ps(b as *const f32);
         let b1 = _mm_loadu_ps((b + 0x10) as *const f32);
@@ -911,15 +935,29 @@ unsafe fn mat44_impl(a: usize, b: usize, out: usize) {
             acc = _mm_add_ps(acc, _mm_mul_ps(_mm_shuffle_ps::<0xAA>(r, r), b2));
             acc = _mm_add_ps(acc, _mm_mul_ps(_mm_shuffle_ps::<0xFF>(r, r), b3));
             _mm_storeu_ps((out + row * 16) as *mut f32, acc);
+            if row == 2 {
+                // XMM6 keeps the last term of row 2
+                _mm_storeu_ps(xs.add(24), _mm_mul_ps(_mm_shuffle_ps::<0xFF>(r, r), b3));
+            }
+            if row == 3 {
+                // the original leaves XMM0 = row 3 of A, XMM1 = w * B3, XMM2 = x * B0, XMM3/4 = B2/B3,
+                // XMM5 = the result row (XMM7 untouched)
+                _mm_storeu_ps(xs, r);
+                _mm_storeu_ps(xs.add(4), _mm_mul_ps(_mm_shuffle_ps::<0xFF>(r, r), b3));
+                _mm_storeu_ps(xs.add(8), _mm_mul_ps(_mm_shuffle_ps::<0x00>(r, r), b0));
+                _mm_storeu_ps(xs.add(12), b2);
+                _mm_storeu_ps(xs.add(16), b3);
+                _mm_storeu_ps(xs.add(20), acc);
+            }
             row += 1;
         }
     }
 }
 
-extern "C" fn mat44_rs(a: u32, b: u32, out: u32) {
+extern "C" fn mat44_rs(a: u32, b: u32, out: u32, xs: *mut f32) {
     unsafe {
         if !S_MAT.active() {
-            return mat44_impl(a as usize, b as usize, out as usize);
+            return mat44_impl(a as usize, b as usize, out as usize, xs);
         }
         S_MAT.calls.fetch_add(1, Ordering::Relaxed);
         let mut before = [0u8; 64];
@@ -929,7 +967,9 @@ extern "C" fn mat44_rs(a: u32, b: u32, out: u32) {
         call_regs(S_MAT.orig.load(Ordering::Relaxed), 0, a, b, 0, 0, &[out]);
         std::ptr::copy_nonoverlapping(out as *const u8, theirs.as_mut_ptr(), 64);
         std::ptr::copy_nonoverlapping(before.as_ptr(), out as *mut u8, 64);
-        mat44_impl(a as usize, b as usize, out as usize);
+        let mut scratch = [0f32; 28];
+        mat44_impl(a as usize, b as usize, out as usize, scratch.as_mut_ptr());
+        mat44_impl(a as usize, b as usize, out as usize, xs);
         std::ptr::copy_nonoverlapping(out as *const u8, mine.as_mut_ptr(), 64);
         let same = (0..16).all(|k| {
             let x = f32::from_le_bytes(theirs[k * 4..k * 4 + 4].try_into().unwrap());
@@ -949,11 +989,17 @@ extern "C" fn mat44_thunk() {
         "push ecx",
         "push edx",
         xmm_save!(),
-        "push dword ptr [esp + 140]",
+        "push ebp",
+        "mov ebp, esp",
+        "and esp, 0xfffffff0",
+        "lea eax, [ebp + 4]",
+        "push eax",
+        "push dword ptr [ebp + 144]",
         "push edx",
         "push ecx",
         "call {f}",
-        "add esp, 12",
+        "mov esp, ebp",
+        "pop ebp",
         xmm_load!(),
         "pop edx",
         "pop ecx",
@@ -1021,19 +1067,22 @@ extern "C" fn plane_rs(plane: u32, y: u32, x: u32, z: u32) -> f32 {
 
 #[unsafe(naked)]
 extern "C" fn plane_thunk() {
+    // The original leaves EAX alone, ECX / EDX = the two stack pointers, and overwrites its first
+    // stack argument slot with the result (`fstp dword [esp + 4]`).
     std::arch::naked_asm!(
-        "push ecx",
-        "push edx",
+        "push eax",
         xmm_save!(),
-        "push dword ptr [esp + 144]",
-        "push dword ptr [esp + 144]",
+        "push dword ptr [esp + 140]",
+        "push dword ptr [esp + 140]",
         "push ecx",
         "push eax",
         "call {f}",
         "add esp, 16",
         xmm_load!(),
-        "pop edx",
-        "pop ecx",
+        "mov edx, [esp + 8]",
+        "mov ecx, [esp + 12]",
+        "fst dword ptr [esp + 8]",
+        "pop eax",
         "ret 8",
         f = sym plane_rs,
     )

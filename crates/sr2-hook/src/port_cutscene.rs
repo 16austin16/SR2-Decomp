@@ -14,6 +14,119 @@
 //! - counters: ports that call the game's functions (whose side effects cannot be run twice) keep
 //!   a per-port call counter and per-branch counters, no shadow.
 
+
+/// Thunks like portlib's keep_ecx_edx*, but also keeping XMM0-7 (the original leaves them alone).
+#[allow(unused_macros)]
+macro_rules! kx0 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "call {f}",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+#[allow(unused_macros)]
+macro_rules! kx1 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "push dword ptr [esp + 140]",
+            "call {f}",
+            "add esp, 4",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+#[allow(unused_macros)]
+macro_rules! kx2 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "push dword ptr [esp + 144]",
+            "push dword ptr [esp + 144]",
+            "call {f}",
+            "add esp, 8",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use crate::portlib::*;
@@ -103,7 +216,7 @@ macro_rules! sp {
         extern "C" fn $w(rec: u32) {
             unsafe { shadow($idx, rec, $rust, $reg) }
         }
-        keep_ecx_edx_arg1!($t, $w);
+        kx1!($t, $w);
     };
 }
 
@@ -513,11 +626,12 @@ macro_rules! cp {
             ST[$idx].calls.fetch_add(1, Ordering::Relaxed);
             unsafe { $rust(rec) }
         }
-        keep_ecx_edx_arg1!($t, $w);
+        kx1!($t, $w);
     };
 }
 
 /// `call_regs` for a callee that returns on the x87 stack: the result is popped as a qword.
+#[allow(dead_code)]
 unsafe fn call_regs_st0(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> f64 {
     let mut out = 0f64;
     let block: [u32; 9] =
@@ -567,6 +681,7 @@ unsafe fn ftol(x: f64) -> i32 {
 }
 
 /// `push s; call _atof (0xC984F5); add esp, 4` with the result popped from ST0.
+#[allow(dead_code)]
 unsafe fn atof(s: u32) -> f64 {
     let mut out = 0f64;
     unsafe {
@@ -586,6 +701,7 @@ unsafe fn atof(s: u32) -> f64 {
 
 /// `script_find_object_by_name` (0xA52BB0, ECX = name, EAX = &found) and, when it did not find
 /// it, `script_object_to_human` (0xA52C70, ESI = name). Returns EAX as the callers test it.
+#[allow(dead_code)]
 unsafe fn find_obj(name: u32) -> u32 {
     unsafe {
         let mut found = 0u32;
@@ -600,6 +716,7 @@ unsafe fn find_obj(name: u32) -> u32 {
 
 /// `string_crc32` (0xBDCA30, stdcall, EAX = &out, EDX = 0) then `navpoint_find` (0xA5EB50,
 /// EAX = &hash, still the pointer the crc call received).
+#[allow(dead_code)]
 unsafe fn navpoint(name: u32) -> u32 {
     unsafe {
         let mut h = 0u32;
@@ -610,6 +727,7 @@ unsafe fn navpoint(name: u32) -> u32 {
 }
 
 /// A virtual call `this->vtable[slot](...)`: ECX = this, EDX = vtable, EAX = the function.
+#[allow(dead_code)]
 unsafe fn vcall(this: u32, slot: usize) -> u32 {
     unsafe {
         let vt = rd(this as usize);
@@ -618,46 +736,909 @@ unsafe fn vcall(this: u32, slot: usize) -> u32 {
     }
 }
 
-// --- shot functions with callees ------------------------------------------------------------------
+// --- ambient-register calls ------------------------------------------------------------------------
+//
+// The shot / action functions below are LTCG code: the callees read whatever the caller left in
+// EAX / ECX / EDX / EBX / ESI / EDI / EBP. `Amb` models the machine registers; every `cx*` call
+// loads all seven from it, calls by address, and stores every register back.
 
-// 0x6D7510 spawning_peds_disabled: b8 == 1 -> clear the ped flags, run b7da30, set the dirty byte.
-unsafe fn spawning_peds(rec: u32) {
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Amb {
+    eax: u32,
+    ecx: u32,
+    edx: u32,
+    ebx: u32,
+    esi: u32,
+    edi: u32,
+    ebp: u32,
+}
+
+/// The `pushad` block, lowest address first.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Pr {
+    edi: u32,
+    esi: u32,
+    ebp: u32,
+    esp: u32,
+    ebx: u32,
+    edx: u32,
+    ecx: u32,
+    eax: u32,
+}
+
+impl Amb {
+    fn of(p: &Pr) -> Amb {
+        Amb { eax: p.eax, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp }
+    }
+}
+
+#[repr(C)]
+struct Blk {
+    r: Amb,
+    f: u32,
+    args: u32,
+    n: u32,
+    esp: u32,
+    flags: u32,
+    st0: f64,
+}
+
+static mut CUR_BLK: *mut Blk = std::ptr::null_mut();
+static mut CUR_F: u32 = 0;
+
+/// Call `f` with all seven registers from `a` and the cdecl / stdcall stack `args`; every register
+/// goes back into `a`. `flags` bit 0: pop ST0 into `*st0` afterwards; bit 1: push `*st0` first.
+unsafe fn cxf(f: usize, a: &mut Amb, args: &[u32], flags: u32, st0: &mut f64) {
+    let mut b = Blk { r: *a, f: f as u32, args: args.as_ptr() as u32, n: args.len() as u32, esp: 0, flags, st0: *st0 };
     unsafe {
+        let prev = CUR_BLK;
+        CUR_BLK = &mut b;
+        std::arch::asm!(
+            "push ebp", "push ebx", "push esi", "push edi",
+            "mov eax, [{cur}]",
+            "mov [eax + 40], esp",
+            "mov edx, [eax + 28]",
+            "mov [{curf}], edx",
+            "mov ecx, [eax + 36]",
+            "mov esi, [eax + 32]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "test dword ptr [eax + 44], 2",
+            "jz 4f",
+            "fld qword ptr [eax + 48]",
+            "4:",
+            "mov ecx, [eax + 4]", "mov edx, [eax + 8]", "mov ebx, [eax + 12]",
+            "mov esi, [eax + 16]", "mov edi, [eax + 20]", "mov ebp, [eax + 24]",
+            "mov eax, [eax]",
+            "call dword ptr [{curf}]",
+            "push eax",
+            "mov eax, [{cur}]",
+            "mov [eax + 4], ecx", "mov [eax + 8], edx", "mov [eax + 12], ebx",
+            "mov [eax + 16], esi", "mov [eax + 20], edi", "mov [eax + 24], ebp",
+            "pop dword ptr [eax]",
+            "test dword ptr [eax + 44], 1",
+            "jz 5f",
+            "fstp qword ptr [eax + 48]",
+            "5:",
+            "mov esp, [eax + 40]",
+            "pop edi", "pop esi", "pop ebx", "pop ebp",
+            cur = sym CUR_BLK,
+            curf = sym CUR_F,
+            clobber_abi("C"),
+        );
+        CUR_BLK = prev;
+    }
+    *a = b.r;
+    *st0 = b.st0;
+}
+
+/// A plain call; the result is EAX (also left in `a.eax`).
+unsafe fn cx(f: usize, a: &mut Amb, args: &[u32]) -> u32 {
+    let mut z = 0f64;
+    unsafe { cxf(f, a, args, 0, &mut z) };
+    a.eax
+}
+
+/// A call that returns on ST0 (popped and returned).
+unsafe fn cx_st0(f: usize, a: &mut Amb, args: &[u32]) -> f64 {
+    let mut z = 0f64;
+    unsafe { cxf(f, a, args, 1, &mut z) };
+    z
+}
+
+/// A call with `v` on ST0 at entry (the callee consumes it): `_ftol2`.
+unsafe fn cx_in(f: usize, a: &mut Amb, args: &[u32], v: f64) -> u32 {
+    let mut z = v;
+    unsafe { cxf(f, a, args, 2, &mut z) };
+    a.eax
+}
+
+/// Thunk: `pushad`, `f(&mut pushad, &mut stack arg 0)`, `popad`, with XMM0-7 kept.
+macro_rules! rt {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "pushad",
+                "mov eax, esp",
+                "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2", "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4", "movups [esp + 80], xmm5", "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
+                "push ecx",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, [esp + 0]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]", "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]", "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "popad",
+                "ret",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+/// A register-exact port: `$rust(&mut Amb, slot)`; `slot` is the address of stack argument 0.
+/// EAX / ECX / EDX leave as the body left them; the callee-saved registers come back as they went in.
+macro_rules! rp {
+    ($w:ident, $t:ident, $idx:expr, $rust:ident) => {
+        extern "C" fn $w(p: &mut Pr, slot: *mut u32) {
+            ST[$idx].calls.fetch_add(1, Ordering::Relaxed);
+            let mut a = Amb::of(p);
+            unsafe { $rust(&mut a, slot) };
+            p.eax = a.eax;
+            p.ecx = a.ecx;
+            p.edx = a.edx;
+        }
+        rt!($t, $w);
+    };
+}
+
+/// `lea eax, slot; mov ecx, esi; mov byte [slot], 0; call 0xA52BB0; cmp byte [slot], 0; jne ok;
+/// call 0xA52C70`: find an object by the name in ESI. Returns EAX.
+unsafe fn look(a: &mut Amb, slot: usize) -> u32 {
+    unsafe {
+        a.eax = slot as u32;
+        a.ecx = a.esi;
+        wb(slot, 0);
+        cx(0x00A5_2BB0, a, &[]);
+        if rb(slot) == 0 {
+            cx(0x00A5_2C70, a, &[]);
+        }
+        a.eax
+    }
+}
+
+/// `push name; xor edx, edx; lea eax, slot; call 0xBDCA30; call 0xA5EB50`: the navpoint. Returns EAX.
+unsafe fn nav(a: &mut Amb, slot: usize, name: u32) -> u32 {
+    unsafe {
+        a.edx = 0;
+        a.eax = slot as u32;
+        cx(0x00BD_CA30, a, &[name]);
+        cx(0x00A5_EB50, a, &[])
+    }
+}
+
+/// `mov edx, [this]; mov eax, [edx + slot*4]; mov ecx, this; call eax`.
+unsafe fn vc(a: &mut Amb, this: u32, slot: usize) -> u32 {
+    unsafe {
+        a.edx = rd(this as usize);
+        a.eax = rd(a.edx as usize + slot * 4);
+        a.ecx = this;
+        let f = a.eax as usize;
+        cx(f, a, &[])
+    }
+}
+
+/// `fnstsw ax` after `fldz; fcom dword [p]; fstp st(0)`: (status word).
+unsafe fn zero_cmp_sw(p: usize) -> u32 {
+    let sw: u32;
+    unsafe {
+        std::arch::asm!(
+            "fldz",
+            "fcom dword ptr [{p}]",
+            "fnstsw ax",
+            "fstp st(0)",
+            p = in(reg) p,
+            out("eax") sw,
+        );
+    }
+    sw & 0xFFFF
+}
+
+// --- register-exact ports (the original's EAX / ECX / EDX / EBX / ESI / EDI / EBP flow modelled by `Amb`) --
+
+// 0x6D7510 spawning_peds_disabled (EBX low byte = 1; the else path tail-jumps to 0xB7DA30 with EBX restored).
+unsafe fn spawning_peds(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        let ebx0 = a.ebx;
+        a.ebx = (a.ebx & !0xFF) | 1;
         if b8(rec) == 1 {
             hit(27, 0);
+            a.eax &= !0xFF;
             wb(0x0215_DA25, 0);
             wb(0x0215_DA05, 0);
-            call(0x00B7_DA30);
+            cx(0x00B7_DA30, a, &[]);
             wb(0x0252_9620, 1);
         } else {
             hit(27, 1);
             wb(0x0215_DA25, 1);
             wb(0x0215_DA05, 1);
-            call(0x00B7_DA30);
+            a.ebx = ebx0;
+            cx(0x00B7_DA30, a, &[]);
         }
     }
 }
-cp!(spawning_peds_w, spawning_peds_t, 27, spawning_peds);
+rp!(spawning_peds_w, spawning_peds_t, 27, spawning_peds);
 
 // 0x6D7550 spawning_cars_disabled
-unsafe fn spawning_cars(rec: u32) {
+unsafe fn spawning_cars(a: &mut Amb, s: *mut u32) {
     unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        a.ebx = (a.ebx & !0xFF) | 1;
         if b8(rec) == 1 {
             hit(28, 0);
             wb(0x0215_DA1D, 0);
-            call(0x0093_C660);
+            cx(0x0093_C660, a, &[]);
             wb(0x0215_D9FD, 0);
-            call(0x00B8_1130);
+            cx(0x00B8_1130, a, &[]);
             wb(0x0252_9620, 1);
         } else {
             hit(28, 1);
             wb(0x0215_D9FD, 1);
-            call(0x00B8_1130);
+            cx(0x00B8_1130, a, &[]);
             wb(0x0252_9620, 1);
         }
     }
 }
-cp!(spawning_cars_w, spawning_cars_t, 28, spawning_cars);
+rp!(spawning_cars_w, spawning_cars_t, 28, spawning_cars);
+
+// 0x6D7A60 hide_player_compnt: EDI = name -> 0x9E7530 (index or -1); then 0x9EA4E0 / a tail jump to 0x9EA660.
+unsafe fn hide_player_compnt(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        let edi0 = a.edi;
+        a.edi = rd(rec as usize + 8);
+        cx(0x009E_7530, a, &[]);
+        a.edi = edi0;
+        if a.eax != 0xFFFF_FFFF {
+            hit(30, 0);
+            a.ecx = rd(0x0217_03D4);
+            a.edx = rd(a.ecx as usize + 0x13B0);
+            let (idx, v) = (a.eax, a.edx);
+            cx(0x009E_A4E0, a, &[v, idx]);
+        } else {
+            hit(30, 1);
+            a.eax = rd(0x0217_03D4);
+            a.ecx = rd(a.eax as usize + 0x13B0);
+            wd(s as usize, a.ecx);
+            let v = a.ecx;
+            cx(0x009E_A660, a, &[v]);
+        }
+    }
+}
+rp!(hide_player_compnt_w, hide_player_compnt_t, 30, hide_player_compnt);
+
+// 0x6D8140 time_of_day_set: `fld dword [rec + 8]; call _ftol2; mov ecx, eax; jmp 0x68A5C0`.
+unsafe fn time_of_day_set(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        let v = f8(rec) as f64;
+        cx_in(0x00DA_0140, a, &[], v);
+        a.ecx = a.eax;
+        cx(0x0068_A5C0, a, &[]);
+    }
+}
+rp!(time_of_day_set_w, time_of_day_set_t, 31, time_of_day_set);
+
+// 0x6D7AF0 mesh_mover_hide: door by name (0xA5B6E0, EAX = name) -> ESI = door -> 0xA5B800.
+unsafe fn mesh_mover_hide(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rd(rec as usize + 8);
+        if a.eax != 0 {
+            cx(0x00A5_B6E0, a, &[]);
+            if a.eax != 0 {
+                hit(33, 0);
+                a.esi = a.eax;
+                cx(0x00A5_B800, a, &[]);
+            }
+        }
+    }
+}
+rp!(mesh_mover_hide_w, mesh_mover_hide_t, 33, mesh_mover_hide);
+
+// 0x6D7B10 mesh_mover_show
+unsafe fn mesh_mover_show(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rd(rec as usize + 8);
+        if a.eax != 0 {
+            cx(0x00A5_B6E0, a, &[]);
+            if a.eax != 0 {
+                hit(34, 0);
+                a.esi = a.eax;
+                cx(0x00A5_B970, a, &[]);
+            }
+        }
+    }
+}
+rp!(mesh_mover_show_w, mesh_mover_show_t, 34, mesh_mover_show);
+
+// 0x6D8280 chunk_hide: EDI = name -> 0x4A9770 (chunk); then 0x6D8A10 (ECX = list, stdcall 1 arg = rec + 8).
+unsafe fn chunk_hide(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.esi = rec + 8;
+        a.edi = rd(rec as usize + 8);
+        cx(0x004A_9770, a, &[]);
+        if a.eax != 0 {
+            hit(35, 0);
+            let c = a.eax as usize;
+            a.ecx = rd(PLAYER_PTR);
+            wb(c + 0x1D, rb(c + 0x1D) | 1);
+            a.ecx = a.ecx.wrapping_add(0x1EE4);
+            let arg = a.esi;
+            cx(0x006D_8A10, a, &[arg]);
+        }
+    }
+}
+rp!(chunk_hide_w, chunk_hide_t, 35, chunk_hide);
+
+// 0x6D82B0 chunk_show
+unsafe fn chunk_show(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        a.edi = rd(rec as usize + 8);
+        cx(0x004A_9770, a, &[]);
+        if a.eax != 0 {
+            hit(36, 0);
+            let c = a.eax as usize;
+            wb(c + 0x1D, rb(c + 0x1D) & 0xFE);
+        }
+    }
+}
+rp!(chunk_show_w, chunk_show_t, 36, chunk_show);
+
+// 0x6D7DB0 weather_stage: index = 0x4DEE30(name); player+0x43D4 = 1; tail jump 0x4DEC00 (EAX = index, CL = 1).
+unsafe fn weather_stage(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rd(rec as usize + 8);
+        if a.eax != 0 {
+            let name = a.eax;
+            cx(0x004D_EE30, a, &[name]);
+            if a.eax != 0xFFFF_FFFF {
+                hit(37, 0);
+                a.edx = rd(PLAYER_PTR);
+                a.ecx = (a.ecx & !0xFF) | 1;
+                wb(a.edx as usize + 0x43D4, 1);
+                cx(0x004D_EC00, a, &[]);
+            }
+        }
+    }
+}
+rp!(weather_stage_w, weather_stage_t, 37, weather_stage);
+
+// 0x6D7750 shot_fade_in: when 0.0 < v: 0x4D1270(int(v * 1000.0), 0.0f) with DL = 0, then
+// player+0xB03 = 1 unless player+0xB02 is set. EAX leaves as the status word of the compare.
+unsafe fn shot_fade_in(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.ecx = rec;
+        let sw = zero_cmp_sw(rec as usize + 8);
+        a.eax = (a.eax & 0xFFFF_0000) | sw;
+        // `test ah, 5; jp skip`: the jump is taken when the result has even parity (0 or 5).
+        if matches!((sw >> 8) & 5, 1 | 4) {
+            hit(38, 0);
+            let v = f8(rec);
+            let ms = cx_in(0x00DA_0140, a, &[], v as f64 * *(0x00E5_C0D8 as *const f64));
+            a.edx &= !0xFF;
+            cx(0x004D_1270, a, &[ms, 0]);
+            a.eax = rd(PLAYER_PTR);
+            let p = a.eax as usize;
+            if rb(p + 0xB02) == 0 {
+                hit(38, 1);
+                wb(p + 0xB03, 1);
+            }
+        }
+    }
+}
+rp!(shot_fade_in_w, shot_fade_in_t, 38, shot_fade_in);
+
+// 0x6CB680 cam_stop_track
+unsafe fn act_cam_stop_track(a: &mut Amb, _s: *mut u32) {
+    unsafe {
+        a.edi = 0;
+        a.eax = CAM_POS;
+        a.ecx = 0;
+        a.esi = 0;
+        cx(CAM_SET, a, &[]);
+    }
+}
+rp!(act_cam_stop_track_w, act_cam_stop_track_t, 39, act_cam_stop_track);
+
+// 0x6CB2E0 cam_track_char
+unsafe fn act_cam_track_char(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        a.esi = rd(rec as usize + 0xC);
+        if a.esi != 0 {
+            let o = look(a, s as usize);
+            if o != 0 {
+                hit(40, 0);
+                a.esi = o;
+                a.edi = 0;
+                a.eax = CAM_POS;
+                a.ecx = 0x00DD_80C8;
+                cx(CAM_SET, a, &[]);
+            }
+        }
+    }
+}
+rp!(act_cam_track_char_w, act_cam_track_char_t, 40, act_cam_track_char);
+
+// 0x6CB330 cam_look_at_char: the frame is `push ebp; mov ebp, esp; and esp, -8; sub esp, 8; push esi; push edi`
+// and the "found" byte lives at [esp + 0xF].
+unsafe fn act_cam_look_at_char(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        let e = (s as u32).wrapping_sub(4); // ESP at entry
+        let ebp = e.wrapping_sub(4);
+        a.ebp = ebp;
+        let esp = (ebp & !7).wrapping_sub(8).wrapping_sub(8);
+        let local = esp.wrapping_add(0xF) as usize;
+        a.eax = rec;
+        a.esi = rd(rec as usize + 0xC);
+        if a.esi != 0 {
+            let o = look(a, local);
+            if o != 0 {
+                hit(41, 0);
+                a.esi = o;
+                a.edi = 0;
+                a.eax = CAM_POS;
+                a.ecx = 0x00DD_80C8;
+                cx(CAM_SET, a, &[]);
+                a.eax = CAM_POS;
+                a.ecx = 0;
+                a.esi = 0;
+                cx(CAM_SET, a, &[]);
+            }
+        }
+    }
+}
+rp!(act_cam_look_at_char_w, act_cam_look_at_char_t, 41, act_cam_look_at_char);
+
+// 0x6CB6E0 hide_character: 0x926860 (ECX = human, args [1, 1, 0]).
+unsafe fn act_hide_character(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        a.esi = rd(rec as usize + 8);
+        if a.esi != 0 {
+            let o = look(a, s as usize);
+            if o != 0 {
+                hit(42, 0);
+                a.ecx = o;
+                cx(0x0092_6860, a, &[1, 1, 0]);
+            }
+        }
+    }
+}
+rp!(act_hide_character_w, act_hide_character_t, 42, act_hide_character);
+
+// 0x6CB730 show_character: args [0, 1, 0].
+unsafe fn act_show_character(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        a.esi = rd(rec as usize + 8);
+        if a.esi != 0 {
+            let o = look(a, s as usize);
+            if o != 0 {
+                hit(43, 0);
+                a.ecx = o;
+                cx(0x0092_6860, a, &[0, 1, 0]);
+            }
+        }
+    }
+}
+rp!(act_show_character_w, act_show_character_t, 43, act_show_character);
+
+// 0x6CB780 disable_physics
+unsafe fn act_disable_physics(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        a.esi = rd(rec as usize + 8);
+        if a.esi != 0 {
+            let o = look(a, s as usize);
+            if o != 0 {
+                hit(44, 0);
+                a.esi = o;
+                cx(0x006F_C610, a, &[0x14, 0]);
+                a.eax = rd(o as usize + 0x570);
+                if a.eax != 0 {
+                    let e = a.eax as usize;
+                    wb(e + 0x130, rb(e + 0x130) | 2);
+                }
+                wd(o as usize + 0xCC, rd(o as usize + 0xCC) | 0x40_0000);
+            }
+        }
+    }
+}
+rp!(act_disable_physics_w, act_disable_physics_t, 44, act_disable_physics);
+
+// 0x6CB7E0 enable_physics
+unsafe fn act_enable_physics(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        a.esi = rd(rec as usize + 8);
+        if a.esi != 0 {
+            let o = look(a, s as usize);
+            if o != 0 {
+                hit(45, 0);
+                a.esi = o;
+                cx(0x006F_C610, a, &[0xF, 0]);
+                a.eax = rd(o as usize + 0x570);
+                if a.eax != 0 {
+                    let e = a.eax as usize;
+                    wb(e + 0x130, rb(e + 0x130) & 0xFD);
+                }
+                a.ecx = o + 0x14;
+                a.eax = o;
+                cx(0x0095_F090, a, &[o + 0x14, 0, 0xFFFF_FFFF, 0]);
+                wd(o as usize + 0xCC, rd(o as usize + 0xCC) & 0xFFBF_FFFF);
+            }
+        }
+    }
+}
+rp!(act_enable_physics_w, act_enable_physics_t, 45, act_enable_physics);
+
+// 0x6CB850 hide_vehicle: 0xA70030 (EAX = name) -> object; vslot 0x2C (is-vehicle-like, AL) then
+// vslot 0x34 -> the vehicle; 0xAACC60(handle, 1, 0).
+unsafe fn act_hide_vehicle(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rd(rec as usize + 8);
+        cx(0x00A7_0030, a, &[]);
+        a.esi = a.eax;
+        if a.esi != 0 {
+            let this = a.esi;
+            vc(a, this, 0x2C / 4);
+            if a.eax & 0xFF != 0 {
+                hit(46, 0);
+                vc(a, this, 0x34 / 4);
+                a.ecx = rd(a.eax as usize + 0x44);
+                let h = a.ecx;
+                cx(0x00AA_CC60, a, &[h, 1, 0]);
+            }
+        }
+    }
+}
+rp!(act_hide_vehicle_w, act_hide_vehicle_t, 46, act_hide_vehicle);
+
+// 0x6CB890 show_vehicle: as hide, 0xAACC60(handle, 0, 0), then a tail call of vslot 0x20 of the vehicle.
+unsafe fn act_show_vehicle(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        let esi0 = a.esi;
+        a.eax = rd(rec as usize + 8);
+        cx(0x00A7_0030, a, &[]);
+        a.esi = a.eax;
+        if a.esi != 0 {
+            let this = a.esi;
+            vc(a, this, 0x2C / 4);
+            if a.eax & 0xFF != 0 {
+                hit(47, 0);
+                vc(a, this, 0x34 / 4);
+                a.esi = a.eax;
+                a.ecx = rd(a.esi as usize + 0x44);
+                let h = a.ecx;
+                cx(0x00AA_CC60, a, &[h, 0, 0]);
+                let v = a.esi;
+                a.esi = esi0;
+                vc(a, v, 0x20 / 4);
+            }
+        }
+    }
+}
+rp!(act_show_vehicle_w, act_show_vehicle_t, 47, act_show_vehicle);
+
+// 0x6CB8E0 hide_group: 0xA57730 (EAX = name) -> group; 0xA58070 (EDI = group, 1 arg).
+unsafe fn act_hide_group(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rd(rec as usize + 8);
+        if a.eax != 0 {
+            cx(0x00A5_7730, a, &[]);
+            if a.eax != 0 {
+                hit(48, 0);
+                a.edi = a.eax;
+                cx(0x00A5_8070, a, &[1]);
+            }
+        }
+    }
+}
+rp!(act_hide_group_w, act_hide_group_t, 48, act_hide_group);
+
+// 0x6CB900 show_group
+unsafe fn act_show_group(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rd(rec as usize + 8);
+        if a.eax != 0 {
+            cx(0x00A5_7730, a, &[]);
+            if a.eax != 0 {
+                hit(49, 0);
+                a.edi = a.eax;
+                cx(0x00A5_8070, a, &[0]);
+            }
+        }
+    }
+}
+rp!(act_show_group_w, act_show_group_t, 49, act_show_group);
+
+// 0x6CB250 look_at_nothing
+unsafe fn act_look_at_nothing(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        a.esi = rd(rec as usize + 8);
+        if a.esi != 0 {
+            let o = look(a, s as usize);
+            if o != 0 {
+                hit(50, 0);
+                wd(o as usize + 0x758, rd(o as usize + 0x758) | 1);
+                if rb(o as usize + 0x3CC) == 2 {
+                    hit(50, 1);
+                    wb(o as usize + 0x140, rb(o as usize + 0x140) & 0xFB);
+                }
+            }
+        }
+    }
+}
+rp!(act_look_at_nothing_w, act_look_at_nothing_t, 50, act_look_at_nothing);
+
+// 0x6CB6A0 cam_follow_target: v = f32(_atof(rec[+0x10])) is stored over stack argument 0; the compare
+// leaves its status word in AX.
+unsafe fn act_cam_follow_target(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        a.ecx = rd(rec as usize + 0x10);
+        let arg = a.ecx;
+        let v = cx_st0(0x00C9_84F5, a, &[arg]) as f32;
+        wf(s as usize, v);
+        wb(0x025F_5D90, 1);
+        let sw: u32;
+        std::arch::asm!(
+            "fldz",
+            "fld dword ptr [{s}]",
+            "fcom st(1)",
+            "fnstsw ax",
+            "fstp st(1)",
+            "fstp dword ptr [{d}]",
+            s = in(reg) s as usize,
+            d = in(reg) 0x025F_5D94usize,
+            out("eax") sw,
+        );
+        a.eax = (a.eax & 0xFFFF_0000) | (sw & 0xFFFF);
+        if (sw >> 8) & 0x41 != 0 {
+            hit(51, 0);
+            wb(0x025F_5D90, 0);
+        }
+    }
+}
+rp!(act_cam_follow_target_w, act_cam_follow_target_t, 51, act_cam_follow_target);
+
+// 0x6CB2A0 cam_cut_to: navpoint (rec[+0xC]) -> camera set (EAX = nav+0x1C, EDI = nav+0x28, ECX =
+// ESI = 0), then cam_stop_slide (0x6CB5E0) with the record as its argument.
+unsafe fn act_cam_cut_to(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.ebx = rec;
+        let name = rd(rec as usize + 0xC);
+        let n = nav(a, s as usize, name);
+        if n != 0 {
+            hit(52, 0);
+            a.edi = n + 0x28;
+            a.eax = n + 0x1C;
+            a.ecx = 0;
+            a.esi = 0;
+            cx(CAM_SET, a, &[]);
+            cx(0x006C_B5E0, a, &[rec]);
+        }
+    }
+}
+rp!(act_cam_cut_to_w, act_cam_cut_to_t, 52, act_cam_cut_to);
+
+// 0x6CB110 look_at: both objects by name; fields of the first's look record at +0x730.
+unsafe fn act_look_at(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.ebp = rec;
+        a.esi = rd(rec as usize + 8);
+        if a.esi == 0 {
+            return;
+        }
+        let o1 = look(a, s as usize);
+        if o1 == 0 {
+            return;
+        }
+        a.edi = o1;
+        a.esi = rd(rec as usize + 0xC);
+        if a.esi == 0 {
+            return;
+        }
+        let o2 = look(a, s as usize);
+        if o2 == 0 {
+            return;
+        }
+        hit(53, 0);
+        let (da, b) = (o1 as usize, o2 as usize);
+        a.edx = 0xFFFF_FFFE;
+        wd(da + 0x758, rd(da + 0x758) & 0xFFFF_FFFE);
+        a.ecx = rd(b + 0x44);
+        let p = da + 0x730;
+        a.eax = p as u32;
+        wd(p + 0x30, rd(p + 0x30) & 0xFFFF_FFFE);
+        wf(p, 0.0);
+        wd(p + 0xC, a.ecx);
+        wf(p + 4, 0.0);
+        wf(p + 8, 0.0);
+        wb(p + 0x2C, rb(p + 0x2C) | 1);
+        wf(p + 0x1C, q(rf(0x00DD_0C54)));
+        wd(p + 0x18, 0xFFFF_FFFF);
+        if rb(da + 0x3CC) == 2 {
+            hit(53, 1);
+            wb(da + 0x140, rb(da + 0x140) | 4);
+        }
+    }
+}
+rp!(act_look_at_w, act_look_at_t, 53, act_look_at);
+
+// 0x6CB1D0 look_at_nav: object + navpoint; 0x9B5C00(obj, -1.0f) with EAX = nav & ~0xFF,
+// EDX = nav + 0x1C, ESI = 0.
+unsafe fn act_look_at_nav(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.edi = rec;
+        a.esi = rd(rec as usize + 8);
+        if a.esi == 0 {
+            return;
+        }
+        let o = look(a, s as usize);
+        if o == 0 {
+            return;
+        }
+        a.esi = o;
+        a.eax = rd(rec as usize + 0xC);
+        if a.eax == 0 {
+            return;
+        }
+        let name = a.eax;
+        let n = nav(a, s as usize, name);
+        if n == 0 {
+            return;
+        }
+        hit(54, 0);
+        let m1 = q(rf(0x00E8_7998));
+        wd(o as usize + 0x758, rd(o as usize + 0x758) & 0xFFFF_FFFE);
+        a.edx = n + 0x1C;
+        a.eax = n & !0xFF;
+        a.esi = 0;
+        cx(0x009B_5C00, a, &[o, m1.to_bits()]);
+    }
+}
+rp!(act_look_at_nav_w, act_look_at_nav_t, 54, act_look_at_nav);
+
+// 0x6CAA80 teleports_to
+unsafe fn act_teleports_to(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.ebx = rec;
+        a.esi = rd(rec as usize + 8);
+        if a.esi == 0 {
+            return;
+        }
+        let o = look(a, s as usize);
+        if o == 0 {
+            return;
+        }
+        a.edi = o;
+        let name = rd(rec as usize + 0xC);
+        let n = nav(a, s as usize, name);
+        a.esi = n;
+        if n == 0 {
+            return;
+        }
+        hit(55, 0);
+        if rb(o as usize + 0x3CC) == 2 {
+            hit(55, 1);
+            cx(0x0044_7CD0, a, &[o, 0, 0]);
+        }
+        a.ecx = n + 0x28;
+        a.edx = n + 0x1C;
+        cx(0x009A_0B00, a, &[o, 0, 1, 0, 0]);
+    }
+}
+rp!(act_teleports_to_w, act_teleports_to_t, 55, act_teleports_to);
+
+// 0x6CAB00 walk_to / 0x6CAB70 run_to: object, navpoint; [0x2527D28] = 3 / 7; 0x6CA560(nav, 1 / 2)
+// with ESI = object, EDI = the record.
+unsafe fn walk_run(a: &mut Amb, s: *mut u32, idx: usize, state: u32, mode: u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.edi = rec;
+        a.esi = rd(rec as usize + 8);
+        if a.esi == 0 {
+            return;
+        }
+        let o = look(a, s as usize);
+        if o == 0 {
+            return;
+        }
+        a.esi = o;
+        let name = rd(rec as usize + 0xC);
+        let n = nav(a, s as usize, name);
+        if n == 0 {
+            return;
+        }
+        hit(idx, 0);
+        wd(0x0252_7D28, state);
+        cx(0x006C_A560, a, &[n, mode]);
+    }
+}
+unsafe fn act_walk_to(a: &mut Amb, s: *mut u32) {
+    unsafe { walk_run(a, s, 56, 3, 1) }
+}
+rp!(act_walk_to_w, act_walk_to_t, 56, act_walk_to);
+unsafe fn act_run_to(a: &mut Amb, s: *mut u32) {
+    unsafe { walk_run(a, s, 57, 7, 2) }
+}
+rp!(act_run_to_w, act_run_to_t, 57, act_run_to);
+
+// 0x6CACD0 suicides: 0x9847A0(obj, -1.0f, 0, 0) with EDX = ECX = 0; its ST0 result is popped.
+unsafe fn act_suicides(a: &mut Amb, s: *mut u32) {
+    unsafe {
+        let rec = rd(s as usize);
+        a.eax = rec;
+        a.esi = rd(rec as usize + 8);
+        if a.esi == 0 {
+            return;
+        }
+        let o = look(a, s as usize);
+        if o == 0 {
+            return;
+        }
+        hit(58, 0);
+        let m1 = q(rf(0x00E8_7998));
+        a.edx = 0;
+        a.ecx = 0;
+        cx_st0(0x0098_47A0, a, &[o, m1.to_bits(), 0, 0]);
+    }
+}
+rp!(act_suicides_w, act_suicides_t, 58, act_suicides);
+
+// --- shot functions with callees ------------------------------------------------------------------
 
 // 0x6D76D0 spawning_remove_all
 unsafe fn spawning_remove_all(rec: u32) {
@@ -676,35 +1657,6 @@ unsafe fn spawning_remove_all(rec: u32) {
     }
 }
 cp!(spawning_remove_all_w, spawning_remove_all_t, 29, spawning_remove_all);
-
-// 0x6D7A60 hide_player_compnt: EDI = name -> 0x9E7530 (index or -1); then 0x9EA4E0 / 0x9EA660.
-unsafe fn hide_player_compnt(rec: u32) {
-    unsafe {
-        let name = rd(rec as usize + 8);
-        let idx = call_regs(0x009E_7530, 0, 0, 0, 0, name, &[]);
-        if idx != 0xFFFF_FFFF {
-            hit(30, 0);
-            let p = rd(0x0217_03D4);
-            let v = rd(p as usize + 0x13B0);
-            call_regs(0x009E_A4E0, idx, p, v, 0, 0, &[v, idx]);
-        } else {
-            hit(30, 1);
-            let p = rd(0x0217_03D4);
-            let v = rd(p as usize + 0x13B0);
-            call_regs(0x009E_A660, p, v, 0, 0, 0, &[v]);
-        }
-    }
-}
-cp!(hide_player_compnt_w, hide_player_compnt_t, 30, hide_player_compnt);
-
-// 0x6D8140 time_of_day_set: ECX = int(v) for 0x68A5C0.
-unsafe fn time_of_day_set(rec: u32) {
-    unsafe {
-        let n = ftol(f8(rec) as f64) as u32;
-        call_regs(0x0068_A5C0, n, n, 0, 0, 0, &[]);
-    }
-}
-cp!(time_of_day_set_w, time_of_day_set_t, 31, time_of_day_set);
 
 // 0x6D7AA0 bink_play: n = int(v); n >= 1 -> set volume (import 0xDB8400) and pause(0)
 // (0xDB83D0); n < 0 -> pause(1); n == 0 -> nothing. Handle at 0x140E670.
@@ -728,463 +1680,10 @@ unsafe fn bink_play(rec: u32) {
 }
 cp!(bink_play_w, bink_play_t, 32, bink_play);
 
-// 0x6D7AF0 / 0x6D7B10 mesh_mover_hide / show: door by name (0xA5B6E0, EAX = name) -> ESI = door.
-unsafe fn mesh_mover_hide(rec: u32) {
-    unsafe {
-        let name = rd(rec as usize + 8);
-        if name != 0 {
-            let d = call_regs(0x00A5_B6E0, name, 0, 0, 0, 0, &[]);
-            if d != 0 {
-                hit(33, 0);
-                call_regs(0x00A5_B800, d, 0, 0, d, 0, &[]);
-            }
-        }
-    }
-}
-cp!(mesh_mover_hide_w, mesh_mover_hide_t, 33, mesh_mover_hide);
-
-unsafe fn mesh_mover_show(rec: u32) {
-    unsafe {
-        let name = rd(rec as usize + 8);
-        if name != 0 {
-            let d = call_regs(0x00A5_B6E0, name, 0, 0, 0, 0, &[]);
-            if d != 0 {
-                hit(34, 0);
-                call_regs(0x00A5_B970, d, 0, 0, d, 0, &[]);
-            }
-        }
-    }
-}
-cp!(mesh_mover_show_w, mesh_mover_show_t, 34, mesh_mover_show);
-
-// 0x6D8280 chunk_hide: EDI = name -> 0x4A9770 (chunk); bit 0 of chunk+0x1D set; the name pointer
-// (rec + 8) is added to the player's list at +0x1EE4 (0x6D8A10, ECX = list, stdcall 1 arg).
-unsafe fn chunk_hide(rec: u32) {
-    unsafe {
-        let name = rd(rec as usize + 8);
-        let c = call_regs(0x004A_9770, 0, 0, 0, 0, name, &[]);
-        if c != 0 {
-            hit(35, 0);
-            let list = rd(PLAYER_PTR) + 0x1EE4;
-            wb(c as usize + 0x1D, rb(c as usize + 0x1D) | 1);
-            call_regs(0x006D_8A10, c, list, 0, 0, 0, &[rec + 8]);
-        }
-    }
-}
-cp!(chunk_hide_w, chunk_hide_t, 35, chunk_hide);
-
-// 0x6D82B0 chunk_show
-unsafe fn chunk_show(rec: u32) {
-    unsafe {
-        let name = rd(rec as usize + 8);
-        let c = call_regs(0x004A_9770, 0, 0, 0, 0, name, &[]);
-        if c != 0 {
-            hit(36, 0);
-            wb(c as usize + 0x1D, rb(c as usize + 0x1D) & 0xFE);
-        }
-    }
-}
-cp!(chunk_show_w, chunk_show_t, 36, chunk_show);
-
-// 0x6D7DB0 weather_stage: index = 0x4DEE30(name) (-1 when unknown); player+0x43D4 = 1; the forced
-// weather is applied through 0x4DEC00 (EAX = index, CL = 1).
-unsafe fn weather_stage(rec: u32) {
-    unsafe {
-        let name = rd(rec as usize + 8);
-        if name != 0 {
-            let idx = call_regs(0x004D_EE30, 0, 0, 0, 0, 0, &[name]);
-            if idx != 0xFFFF_FFFF {
-                hit(37, 0);
-                wb(rd(PLAYER_PTR) as usize + 0x43D4, 1);
-                call_regs(0x004D_EC00, idx, 1, 0, 0, 0, &[]);
-            }
-        }
-    }
-}
-cp!(weather_stage_w, weather_stage_t, 37, weather_stage);
-
-// 0x6D7750 shot_fade_in: when 0.0 < v: 0x4D1270(int(v * 1000.0), 0.0f) with DL = 0, then
-// player+0xB03 = 1 unless player+0xB02 is set.
-unsafe fn shot_fade_in(rec: u32) {
-    unsafe {
-        let v = f8(rec);
-        if 0.0f64 < v as f64 {
-            hit(38, 0);
-            let ms = ftol(v as f64 * *(0x00E5_C0D8 as *const f64));
-            call_regs(0x004D_1270, 0, 0, 0, 0, 0, &[ms as u32, 0]);
-            let p = pl();
-            if rb(p + 0xB02) == 0 {
-                hit(38, 1);
-                wb(p + 0xB03, 1);
-            }
-        }
-    }
-}
-cp!(shot_fade_in_w, shot_fade_in_t, 38, shot_fade_in);
-
 // --- actions --------------------------------------------------------------------------------------
 
 const CAM_SET: usize = 0x004A_29E0; // EAX = pos ptr, ECX = flag/ptr, ESI = target object, EDI = orient ptr
 const CAM_POS: u32 = 0x025F_5B20;
-
-// 0x6CB680 cam_stop_track
-unsafe fn act_cam_stop_track(_rec: u32) {
-    unsafe {
-        call_regs(CAM_SET, CAM_POS, 0, 0, 0, 0, &[]);
-    }
-}
-cp!(act_cam_stop_track_w, act_cam_stop_track_t, 39, act_cam_stop_track);
-
-// 0x6CB2E0 cam_track_char
-unsafe fn act_cam_track_char(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 0xC);
-        if n != 0 {
-            let o = find_obj(n);
-            if o != 0 {
-                hit(40, 0);
-                call_regs(CAM_SET, CAM_POS, 0x00DD_80C8, 0, o, 0, &[]);
-            }
-        }
-    }
-}
-cp!(act_cam_track_char_w, act_cam_track_char_t, 40, act_cam_track_char);
-
-// 0x6CB330 cam_look_at_char
-unsafe fn act_cam_look_at_char(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 0xC);
-        if n != 0 {
-            let o = find_obj(n);
-            if o != 0 {
-                hit(41, 0);
-                call_regs(CAM_SET, CAM_POS, 0x00DD_80C8, 0, o, 0, &[]);
-                call_regs(CAM_SET, CAM_POS, 0, 0, 0, 0, &[]);
-            }
-        }
-    }
-}
-cp!(act_cam_look_at_char_w, act_cam_look_at_char_t, 41, act_cam_look_at_char);
-
-// 0x6CB6E0 / 0x6CB730 hide_character / show_character: 0x926860 (ECX = human, args (a, 1, b)).
-unsafe fn act_hide_character(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        if n != 0 {
-            let o = find_obj(n);
-            if o != 0 {
-                hit(42, 0);
-                call_regs(0x0092_6860, 0, o, 0, n, 0, &[1, 1, 0]);
-            }
-        }
-    }
-}
-cp!(act_hide_character_w, act_hide_character_t, 42, act_hide_character);
-
-unsafe fn act_show_character(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        if n != 0 {
-            let o = find_obj(n);
-            if o != 0 {
-                hit(43, 0);
-                call_regs(0x0092_6860, 0, o, 0, n, 0, &[0, 1, 0]);
-            }
-        }
-    }
-}
-cp!(act_show_character_w, act_show_character_t, 43, act_show_character);
-
-// 0x6CB780 disable_physics
-unsafe fn act_disable_physics(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        if n != 0 {
-            let o = find_obj(n);
-            if o != 0 {
-                hit(44, 0);
-                call_regs(0x006F_C610, 0, 0, 0, o, 0, &[0x14, 0]);
-                let e = rd(o as usize + 0x570);
-                if e != 0 {
-                    wb(e as usize + 0x130, rb(e as usize + 0x130) | 2);
-                }
-                wd(o as usize + 0xCC, rd(o as usize + 0xCC) | 0x40_0000);
-            }
-        }
-    }
-}
-cp!(act_disable_physics_w, act_disable_physics_t, 44, act_disable_physics);
-
-// 0x6CB7E0 enable_physics
-unsafe fn act_enable_physics(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        if n != 0 {
-            let o = find_obj(n);
-            if o != 0 {
-                hit(45, 0);
-                call_regs(0x006F_C610, 0, 0, 0, o, 0, &[0xF, 0]);
-                let e = rd(o as usize + 0x570);
-                if e != 0 {
-                    wb(e as usize + 0x130, rb(e as usize + 0x130) & 0xFD);
-                }
-                call_regs(0x0095_F090, o, 0, 0, 0, 0, &[o + 0x14, 0, 0xFFFF_FFFF, 0]);
-                wd(o as usize + 0xCC, rd(o as usize + 0xCC) & 0xFFBF_FFFF);
-            }
-        }
-    }
-}
-cp!(act_enable_physics_w, act_enable_physics_t, 45, act_enable_physics);
-
-// 0x6CB850 hide_vehicle: 0xA70030 (EAX = name) -> object; vslot 0x2C (is-vehicle-like, AL) then
-// vslot 0x34 -> the vehicle; 0xAACC60(handle, 1, 0).
-unsafe fn act_hide_vehicle(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        let o = call_regs(0x00A7_0030, n, 0, 0, 0, 0, &[]);
-        if o != 0 && (vcall(o, 0x2C / 4) & 0xFF) != 0 {
-            hit(46, 0);
-            let v = vcall(o, 0x34 / 4);
-            let h = rd(v as usize + 0x44);
-            call_regs(0x00AA_CC60, 0, 0, 0, 0, 0, &[h, 1, 0]);
-        }
-    }
-}
-cp!(act_hide_vehicle_w, act_hide_vehicle_t, 46, act_hide_vehicle);
-
-// 0x6CB890 show_vehicle: as hide, 0xAACC60(handle, 0, 0), then a tail call of vslot 0x20 of the vehicle.
-unsafe fn act_show_vehicle(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        let o = call_regs(0x00A7_0030, n, 0, 0, 0, 0, &[]);
-        if o != 0 && (vcall(o, 0x2C / 4) & 0xFF) != 0 {
-            hit(47, 0);
-            let v = vcall(o, 0x34 / 4);
-            let h = rd(v as usize + 0x44);
-            call_regs(0x00AA_CC60, 0, 0, 0, 0, 0, &[h, 0, 0]);
-            vcall(v, 0x20 / 4);
-        }
-    }
-}
-cp!(act_show_vehicle_w, act_show_vehicle_t, 47, act_show_vehicle);
-
-// 0x6CB8E0 / 0x6CB900 hide_group / show_group: 0xA57730 (EAX = name) -> group; 0xA58070 (EDI = group, 1 arg).
-unsafe fn act_hide_group(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        if n != 0 {
-            let g = call_regs(0x00A5_7730, n, 0, 0, 0, 0, &[]);
-            if g != 0 {
-                hit(48, 0);
-                call_regs(0x00A5_8070, 0, 0, 0, 0, g, &[1]);
-            }
-        }
-    }
-}
-cp!(act_hide_group_w, act_hide_group_t, 48, act_hide_group);
-
-unsafe fn act_show_group(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        if n != 0 {
-            let g = call_regs(0x00A5_7730, n, 0, 0, 0, 0, &[]);
-            if g != 0 {
-                hit(49, 0);
-                call_regs(0x00A5_8070, 0, 0, 0, 0, g, &[0]);
-            }
-        }
-    }
-}
-cp!(act_show_group_w, act_show_group_t, 49, act_show_group);
-
-// 0x6CB250 look_at_nothing
-unsafe fn act_look_at_nothing(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        if n != 0 {
-            let o = find_obj(n);
-            if o != 0 {
-                hit(50, 0);
-                wd(o as usize + 0x758, rd(o as usize + 0x758) | 1);
-                if rb(o as usize + 0x3CC) == 2 {
-                    hit(50, 1);
-                    wb(o as usize + 0x140, rb(o as usize + 0x140) & 0xFB);
-                }
-            }
-        }
-    }
-}
-cp!(act_look_at_nothing_w, act_look_at_nothing_t, 50, act_look_at_nothing);
-
-// 0x6CB6A0 cam_follow_target: v = f32(_atof(rec[+0x10])); [25F5D90] = (v > 0.0); [25F5D94] = v.
-unsafe fn act_cam_follow_target(rec: u32) {
-    unsafe {
-        let v = atof(rd(rec as usize + 0x10)) as f32;
-        wb(0x025F_5D90, 1);
-        wf(0x025F_5D94, v);
-        if !(v as f64 > 0.0) {
-            hit(51, 0);
-            wb(0x025F_5D90, 0);
-        }
-    }
-}
-cp!(act_cam_follow_target_w, act_cam_follow_target_t, 51, act_cam_follow_target);
-
-// 0x6CB2A0 cam_cut_to: navpoint (rec[+0xC]) -> camera set (EAX = nav+0x1C, EDI = nav+0x28, ECX =
-// ESI = 0), then cam_stop_slide (0x6CB5E0) with the record as its (ignored) argument.
-unsafe fn act_cam_cut_to(rec: u32) {
-    unsafe {
-        let nav = navpoint(rd(rec as usize + 0xC));
-        if nav != 0 {
-            hit(52, 0);
-            call_regs(CAM_SET, nav + 0x1C, 0, 0, 0, nav + 0x28, &[]);
-            call_regs(0x006C_B5E0, 0, 0, 0, 0, 0, &[rec]);
-        }
-    }
-}
-cp!(act_cam_cut_to_w, act_cam_cut_to_t, 52, act_cam_cut_to);
-
-// 0x6CB110 look_at: both objects by name; fields of the first's look record at +0x730.
-unsafe fn act_look_at(rec: u32) {
-    unsafe {
-        let n1 = rd(rec as usize + 8);
-        if n1 == 0 {
-            return;
-        }
-        let a = find_obj(n1);
-        if a == 0 {
-            return;
-        }
-        let n2 = rd(rec as usize + 0xC);
-        if n2 == 0 {
-            return;
-        }
-        let b = find_obj(n2);
-        if b == 0 {
-            return;
-        }
-        hit(53, 0);
-        let (a, b) = (a as usize, b as usize);
-        wd(a + 0x758, rd(a + 0x758) & 0xFFFF_FFFE);
-        let h = rd(b + 0x44);
-        let p = a + 0x730;
-        wd(p + 0x30, rd(p + 0x30) & 0xFFFF_FFFE);
-        wf(p, 0.0);
-        wd(p + 0xC, h);
-        wf(p + 4, 0.0);
-        wf(p + 8, 0.0);
-        wb(p + 0x2C, rb(p + 0x2C) | 1);
-        wf(p + 0x1C, q(rf(0x00DD_0C54)));
-        wd(p + 0x18, 0xFFFF_FFFF);
-        if rb(a + 0x3CC) == 2 {
-            hit(53, 1);
-            wb(a + 0x140, rb(a + 0x140) | 4);
-        }
-    }
-}
-cp!(act_look_at_w, act_look_at_t, 53, act_look_at);
-
-// 0x6CB1D0 look_at_nav: object + navpoint; 0x9B5C00(obj, -1.0f) with EAX = nav & ~0xFF,
-// EDX = nav + 0x1C, ESI = 0.
-unsafe fn act_look_at_nav(rec: u32) {
-    unsafe {
-        let n1 = rd(rec as usize + 8);
-        if n1 == 0 {
-            return;
-        }
-        let a = find_obj(n1);
-        if a == 0 {
-            return;
-        }
-        let n2 = rd(rec as usize + 0xC);
-        if n2 == 0 {
-            return;
-        }
-        let nav = navpoint(n2);
-        if nav == 0 {
-            return;
-        }
-        hit(54, 0);
-        let m1 = q(rf(0x00E8_7998));
-        wd(a as usize + 0x758, rd(a as usize + 0x758) & 0xFFFF_FFFE);
-        call_regs(0x009B_5C00, nav & !0xFF, 0, nav + 0x1C, 0, 0, &[a, m1.to_bits()]);
-    }
-}
-cp!(act_look_at_nav_w, act_look_at_nav_t, 54, act_look_at_nav);
-
-// 0x6CAA80 teleports_to
-unsafe fn act_teleports_to(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        if n == 0 {
-            return;
-        }
-        let o = find_obj(n);
-        if o == 0 {
-            return;
-        }
-        let nav = navpoint(rd(rec as usize + 0xC));
-        if nav == 0 {
-            return;
-        }
-        hit(55, 0);
-        let mut eax = nav;
-        if rb(o as usize + 0x3CC) == 2 {
-            hit(55, 1);
-            eax = call_regs(0x0044_7CD0, 0, 0, 0, 0, 0, &[o, 0, 0]);
-        }
-        call_regs(0x009A_0B00, eax, nav + 0x28, nav + 0x1C, nav, o, &[o, 0, 1, 0, 0]);
-    }
-}
-cp!(act_teleports_to_w, act_teleports_to_t, 55, act_teleports_to);
-
-// 0x6CAB00 walk_to / 0x6CAB70 run_to: object, navpoint; [0x2527D28] = 3 / 7; 0x6CA560(nav, 1 / 2)
-// with ESI = object, EDI = the record.
-unsafe fn walk_run(rec: u32, idx: usize, state: u32, mode: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        if n == 0 {
-            return;
-        }
-        let o = find_obj(n);
-        if o == 0 {
-            return;
-        }
-        let nav = navpoint(rd(rec as usize + 0xC));
-        if nav == 0 {
-            return;
-        }
-        hit(idx, 0);
-        wd(0x0252_7D28, state);
-        call_regs(0x006C_A560, nav, 0, 0, o, rec, &[nav, mode]);
-    }
-}
-unsafe fn act_walk_to(rec: u32) {
-    unsafe { walk_run(rec, 56, 3, 1) }
-}
-cp!(act_walk_to_w, act_walk_to_t, 56, act_walk_to);
-unsafe fn act_run_to(rec: u32) {
-    unsafe { walk_run(rec, 57, 7, 2) }
-}
-cp!(act_run_to_w, act_run_to_t, 57, act_run_to);
-
-// 0x6CACD0 suicides: 0x9847A0(obj, -1.0f, 0, 0) with EDX = ECX = 0; its ST0 result is popped.
-unsafe fn act_suicides(rec: u32) {
-    unsafe {
-        let n = rd(rec as usize + 8);
-        if n == 0 {
-            return;
-        }
-        let o = find_obj(n);
-        if o == 0 {
-            return;
-        }
-        hit(58, 0);
-        let m1 = q(rf(0x00E8_7998));
-        call_regs_st0(0x0098_47A0, o, 0, 0, n, 0, &[o, m1.to_bits(), 0, 0]);
-    }
-}
-cp!(act_suicides_w, act_suicides_t, 58, act_suicides);
 
 // 0x6CB5E0 cam_stop_slide: resets the camera-slide record (player+0x1540 + 0x1C) and the two
 // 9-dword blocks at player+0x158C / +0x15B4. Shadowed.
@@ -1259,7 +1758,7 @@ extern "C" fn act_cam_slide_update_w(rec: u32) -> u32 {
         r
     }
 }
-keep_ecx_edx_arg1!(act_cam_slide_update_t, act_cam_slide_update_w);
+kx1!(act_cam_slide_update_t, act_cam_slide_update_w);
 
 // level_lights 0x6d7590..0x6d75a2 size 0x12
 const B_LEVEL_LIGHTS: [u8; 18] = [
@@ -1881,7 +2380,7 @@ pub(crate) mod big {
     #![allow(clippy::missing_safety_doc)]
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use crate::portlib::{keep_ecx_edx_arg1, replace_pinned};
+    use crate::portlib::{replace_pinned};
 
     // --- memory access: in the offline test the game's globals sit DELTA higher -------------------
     /// The offline test keeps the game's globals (0xD00000..0x3000000) at a fixed offset.
@@ -2413,7 +2912,7 @@ pub(crate) mod big {
     extern "C" fn place_characters_w(rec: u32) {
         unsafe { place_characters(rec) }
     }
-    keep_ecx_edx_arg1!(place_characters_t, place_characters_w);
+    kx1!(place_characters_t, place_characters_w);
 
     pub(crate) const PC_BODY: [u8; 2563] = [
     0x81, 0xEC, 0x70, 0x02, 0x00, 0x00, 0x53, 0x55, 0x56, 0x8B, 0xB4, 0x24, 0x80, 0x02, 0x00, 0x00,

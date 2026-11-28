@@ -761,16 +761,23 @@ extern "C" fn glare_thunk() {
 // inner floats are copied (through the x87, so signalling NaNs come out quiet) from `src` to
 // `block[+0xC] + index * 4`.
 
-unsafe fn pwrite_impl(block: usize, e: usize, src: usize) {
+/// Returns EAX as the original leaves it. With a non-empty outer count the original also overwrites its
+/// first stack argument slot with the block's table pointer, and leaves ECX = EDX = 0 (the high halves
+/// of its 64-bit loop counters).
+unsafe fn pwrite_impl(block: usize, e: usize, src: usize, slot: *mut u32, out: *mut [u32; 2]) -> u32 {
     unsafe {
         if rh(e + 8) == 0 {
-            return;
+            return block as u32;
         }
+        *slot = rd(block + 0xC);
+        (*out)[0] = 0;
+        (*out)[1] = 0;
         let base = rd(block + 0xC) as usize;
         let mut inner = rh(e + 0xA);
         let mut o: u32 = 0;
         loop {
-            let idx = rd(rd(e + 0xC) as usize + o as usize * 4) as usize;
+            // volatile: the original always reads the index, even when the inner count is 0
+            let idx = std::ptr::read_volatile((rd(e + 0xC) as usize + o as usize * 4) as *const u32) as usize;
             let mut dest = base.wrapping_add(idx.wrapping_mul(4));
             let mut s = src;
             if inner != 0 {
@@ -791,31 +798,39 @@ unsafe fn pwrite_impl(block: usize, e: usize, src: usize) {
                 break;
             }
         }
+        rh(e + 8)
     }
 }
 
-extern "C" fn pwrite_rs(block: u32, e: u32, src: u32) {
+extern "C" fn pwrite_rs(block: u32, e: u32, src: u32, slot: *mut u32, out: *mut [u32; 2]) -> u32 {
     let counted = br_open(F_PWRITE);
-    unsafe { pwrite_impl(block as usize, e as usize, src as usize) };
+    let r = unsafe { pwrite_impl(block as usize, e as usize, src as usize, slot, out) };
     if counted {
         BR[F_PWRITE][0].fetch_add(1, Ordering::Relaxed);
     }
+    r
 }
 
 #[unsafe(naked)]
 extern "C" fn pwrite_thunk() {
     std::arch::naked_asm!(
-        "push ecx",
-        "push edx",
+        "sub esp, 8",
+        "mov [esp], ecx",
+        "mov [esp + 4], edx",
         xmm_save!(),
-        "push dword ptr [esp + 144]",
-        "push dword ptr [esp + 144]",
+        "lea ecx, [esp + 128]",
+        "push ecx",
+        "lea ecx, [esp + 144]",
+        "push ecx",
+        "push dword ptr [esp + 152]",
+        "push dword ptr [esp + 152]",
         "push eax",
         "call {f}",
-        "add esp, 12",
+        "add esp, 20",
         xmm_load!(),
-        "pop edx",
-        "pop ecx",
+        "mov ecx, [esp]",
+        "mov edx, [esp + 4]",
+        "add esp, 8",
         "ret",
         f = sym pwrite_rs,
     )
@@ -825,17 +840,21 @@ extern "C" fn pwrite_thunk() {
 // 0xD1ACA0 shader_param_set_by_id  (ESI = list {count, entries (16 bytes) at +4}, stack (param, id, src))
 // =================================================================================================
 
-unsafe fn pbyid_impl(list: usize, param: u32, id: u32, src: u32) {
+/// Returns EAX as the original leaves it: the entry EAX for an empty list, else the last entry pointer
+/// or (after a match) the callee's result.
+unsafe fn pbyid_impl(list: usize, param: u32, id: u32, src: u32, eax0: u32) -> u32 {
     unsafe {
         if rd(list) == 0 {
-            return;
+            return eax0;
         }
+        let mut eax;
         let mut i: u32 = 0;
         let mut off: u32 = 0;
         loop {
             let ent = rd(list + 4).wrapping_add(off);
+            eax = ent;
             if rd(ent as usize) == id {
-                call_regs(PARAM_WRITE_FLOATS, param, 0, 0, 0, 0, &[ent, src]);
+                eax = call_regs(PARAM_WRITE_FLOATS, param, 0, 0, 0, 0, &[ent, src]);
             }
             i += 1;
             off = off.wrapping_add(0x10);
@@ -843,15 +862,17 @@ unsafe fn pbyid_impl(list: usize, param: u32, id: u32, src: u32) {
                 break;
             }
         }
+        eax
     }
 }
 
-extern "C" fn pbyid_rs(list: u32, param: u32, id: u32, src: u32) {
+extern "C" fn pbyid_rs(list: u32, param: u32, id: u32, src: u32, eax0: u32) -> u32 {
     let counted = br_open(F_PBYID);
-    unsafe { pbyid_impl(list as usize, param, id, src) };
+    let r = unsafe { pbyid_impl(list as usize, param, id, src, eax0) };
     if counted {
         BR[F_PBYID][0].fetch_add(1, Ordering::Relaxed);
     }
+    r
 }
 
 #[unsafe(naked)]
@@ -860,12 +881,13 @@ extern "C" fn pbyid_thunk() {
         "push ecx",
         "push edx",
         xmm_save!(),
-        "push dword ptr [esp + 148]",
-        "push dword ptr [esp + 148]",
-        "push dword ptr [esp + 148]",
+        "push eax",
+        "push dword ptr [esp + 152]",
+        "push dword ptr [esp + 152]",
+        "push dword ptr [esp + 152]",
         "push esi",
         "call {f}",
-        "add esp, 16",
+        "add esp, 20",
         xmm_load!(),
         "pop edx",
         "pop ecx",
@@ -883,31 +905,33 @@ extern "C" fn pbyid_thunk() {
 // `{lo = b, hi = flag}` (`lower_bound_key64_rec16`, ECX = first, EAX = last); on an exact match
 // `shader_param_write_floats(EAX = a, entry, c)`.
 
-unsafe fn pset_impl(block: u32, flag: u32, a: u32, b: u32, c: u32) {
+/// Returns EAX as the original leaves it (the last callee's result).
+unsafe fn pset_impl(block: u32, flag: u32, a: u32, b: u32, c: u32) -> u32 {
     unsafe {
         if flag == 0 {
-            call_regs(PARAM_SET_BY_ID, 0, 0, 0, block, 0, &[a, b, c]);
-            return;
+            return call_regs(PARAM_SET_BY_ID, c, a, 0, block, 0, &[a, b, c]);
         }
         let first = rd(block as usize + 4);
         let last = first.wrapping_add(rd(block as usize) << 4);
         let key: [u32; 2] = [b, flag];
         let r = call_regs(LOWER_BOUND_KEY64, last, first, 0, 0, 0, &[key.as_ptr() as u32]);
         if r != last && rd(r as usize + 4) == flag && rd(r as usize) == b {
-            call_regs(PARAM_WRITE_FLOATS, a, 0, 0, 0, 0, &[r, c]);
+            return call_regs(PARAM_WRITE_FLOATS, a, c, 0, 0, 0, &[r, c]);
         }
+        r
     }
 }
 
-extern "C" fn pset_rs(block: u32, flag: u32, a: u32, b: u32, c: u32) {
+extern "C" fn pset_rs(block: u32, flag: u32, a: u32, b: u32, c: u32) -> u32 {
     let counted = br_open(F_PSET);
-    unsafe { pset_impl(block, flag, a, b, c) };
+    let eax = unsafe { pset_impl(block, flag, a, b, c) };
     if counted {
         BR[F_PSET][0].fetch_add(1, Ordering::Relaxed);
         if flag == 0 {
             BR[F_PSET][1].fetch_add(1, Ordering::Relaxed);
         }
     }
+    eax
 }
 
 #[unsafe(naked)]

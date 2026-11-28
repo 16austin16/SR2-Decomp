@@ -45,49 +45,71 @@ struct Pushad {
 static NULL_OBJ: AtomicU32 = AtomicU32::new(0);
 static METHOD_CALLS: AtomicU32 = AtomicU32::new(0);
 
-/// Layout read and written by `call_method`'s asm.
-#[repr(C)]
-struct CallBlk {
-    f: u32,
+/// The seven general registers as the original's straight-line asm holds them. `call` runs the
+/// method with exactly these registers and leaves in the struct what the method left. The method
+/// may pop any number of its own arguments (or be garbage that returns anyway): the frame is
+/// found again by a marker word above the arguments. The callee sees `args` (at most 12 words)
+/// and zeros above them; the caller passes the original's own stack words after (a, b), so a
+/// method that reads past its arguments sees what it would see in the original.
+#[derive(Clone, Copy)]
+struct St {
+    eax: u32,
     ecx: u32,
     edx: u32,
     ebx: u32,
     esi: u32,
     edi: u32,
     ebp: u32,
-    a: u32,
-    b: u32,
-    esp: u32,
-    res: u32,
 }
 
-/// `eax = f; ecx = obj; edx = a; ebx / esi / edi / ebp as given; push b; push a; call f`
-/// (f pops both with `ret 8`). Returns the method's EAX.
 #[inline(never)]
-unsafe fn call_method(f: u32, obj: u32, a: u32, b: u32, ebx: u32, esi: u32, edi: u32, ebp: u32) -> u32 {
-    let mut blk = CallBlk { f, ecx: obj, edx: a, ebx, esi, edi, ebp, a, b, esp: 0, res: 0 };
+unsafe fn call_regs_st(f: u32, st: &mut St, args: &[u32]) {
+    let mut a8 = [0u32; 12];
+    a8[..args.len()].copy_from_slice(args);
+    let block: [u32; 3] = [f, a8.as_ptr() as u32, st as *mut St as u32];
     unsafe {
         std::arch::asm!(
-            "push ebp", "push ebx", "push esi", "push edi",
-            "mov [eax + 36], esp",
-            "push eax",
-            "push dword ptr [eax + 32]",
-            "push dword ptr [eax + 28]",
-            "mov ecx, [eax + 4]", "mov edx, [eax + 8]", "mov ebx, [eax + 12]",
-            "mov esi, [eax + 16]", "mov edi, [eax + 20]", "mov ebp, [eax + 24]",
-            "mov eax, [eax]",
-            "call eax",
-            "mov ecx, [esp]",
-            "mov [ecx + 40], eax",
-            "mov esp, [ecx + 36]",
-            "pop edi", "pop esi", "pop ebx", "pop ebp",
-            inout("eax") &mut blk as *mut CallBlk => _,
-            lateout("ecx") _,
-            lateout("edx") _,
+            "push ebx", "push esi", "push edi", "push ebp",
+            "push dword ptr [eax + 8]",
+            "mov ebx, eax",
+            "push dword ptr [ebx]",
+            "push 0x5352324D",
+            "mov esi, [ebx + 4]",
+            "mov ecx, 12",
+            "2:",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jnz 2b",
+            "mov ebx, [ebx + 8]",
+            "mov eax, [ebx]", "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]",
+            "mov esi, [ebx + 16]", "mov edi, [ebx + 20]", "mov ebp, [ebx + 24]", "mov ebx, [ebx + 12]",
+            "call dword ptr [esp + 52]",
+            // keep the method's registers, then find the marker the method's `ret N` left above
+            "push eax", "push ecx", "push edx", "push ebx", "push esi", "push edi", "push ebp",
+            "lea eax, [esp + 28]",
+            "mov ecx, 16",
+            "3:",
+            "cmp dword ptr [eax], 0x5352324D",
+            "je 4f",
+            "add eax, 4",
+            "dec ecx",
+            "jnz 3b",
+            "xor eax, eax", "mov eax, [eax]",
+            "4:",
+            "mov edi, [eax + 8]",
+            "mov ecx, [esp + 24]", "mov [edi], ecx",
+            "mov ecx, [esp + 20]", "mov [edi + 4], ecx",
+            "mov ecx, [esp + 16]", "mov [edi + 8], ecx",
+            "mov ecx, [esp + 12]", "mov [edi + 12], ecx",
+            "mov ecx, [esp + 8]", "mov [edi + 16], ecx",
+            "mov ecx, [esp + 4]", "mov [edi + 20], ecx",
+            "mov ecx, [esp]", "mov [edi + 24], ecx",
+            "lea esp, [eax + 12]",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("eax") block.as_ptr() => _, lateout("ecx") _, lateout("edx") _,
             clobber_abi("C"),
         );
     }
-    blk.res
 }
 
 extern "C" fn wrap_entry(p: &mut Pushad, args: *const u32, slot: u32) {
@@ -95,14 +117,27 @@ extern "C" fn wrap_entry(p: &mut Pushad, args: *const u32, slot: u32) {
         let obj = *args;
         if obj == 0 {
             NULL_OBJ.fetch_add(1, Ordering::Relaxed);
+            // the original leaves ECX = 0 (it loaded the object into ECX to test it) and clears AL
             p.eax &= !0xFF;
+            p.ecx = 0;
             return;
         }
         METHOD_CALLS.fetch_add(1, Ordering::Relaxed);
         let a = *args.add(1);
         let b = *args.add(2);
         let f = rd(rd(obj as usize) as usize + slot as usize);
-        p.eax = call_method(f, obj, a, b, p.ebx, p.esi, p.edi, p.ebp);
+        // eax = the method, ecx = obj, edx = a, stack (a, b); EBX / ESI / EDI / EBP as the caller's
+        let mut s = St { eax: f, ecx: obj, edx: a, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp };
+        // the words above (a, b): the original's own return address, object, a, b and what follows
+        let w = |i: isize| *args.offset(i);
+        call_regs_st(f, &mut s, &[a, b, w(-1), w(0), w(1), w(2), w(3), w(4), w(5), w(6), w(7), w(8)]);
+        p.eax = s.eax;
+        p.ecx = s.ecx;
+        p.edx = s.edx;
+        p.ebx = s.ebx;
+        p.esi = s.esi;
+        p.edi = s.edi;
+        p.ebp = s.ebp;
     }
 }
 

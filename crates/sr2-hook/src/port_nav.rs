@@ -113,14 +113,20 @@ macro_rules! regs_thunk {
         #[unsafe(naked)]
         extern "C" fn $name() {
             std::arch::naked_asm!(
+                "sub esp, 128",
+                "movups [esp], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2", "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4", "movups [esp + 80], xmm5", "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
                 "pushad",
                 "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
                 "popad",
+                "movups xmm0, [esp]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]", "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]", "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "ret",
                 f = sym $f,
             )
@@ -233,6 +239,7 @@ const NAV_GOAL_COMMIT_ADDR: usize = 0x00B2_C220;
 /// Ports without a shadow copy (their callees rewrite rings / pools that cannot be snapshotted).
 const NO_SHADOW: [usize; 8] = [ROUTE_CLEAR, HULL_RELEASE, HULL_BY_HANDLE, ROAD_PROBE, FREE_PATH_LISTS, ROUTE_REFILL, PATH_MARK_ENDS, GOAL_INSTALL];
 
+const NAV_CELL_HAS_LINK_FLAG2: usize = 0x00A0_5460;
 const NAV_CELL_LOCATE: usize = 0x00A0_2C10;
 const NAV_ROUTE_LIST_FREE: usize = 0x00A1_8500;
 const AI_SET_FORCE_FLAG: usize = 0x00B2_B8A0;
@@ -378,33 +385,38 @@ fn checked_eax(id: usize, p: &Pushad, ours: u32) -> u32 {
 /// ref = chunk << 20 | kind << 19 | index. -1, chunk >= 0x866 (unsigned), a null record, record
 /// flags (+0x1C) & 3 and a signed count (+0x6C kind 0 / +0x7C kind 1) <= 0 give 0; otherwise
 /// `[rec + 0x240 / 0x248] -> [+0x14] + index * 0x30`. The index is not bounds-checked.
-unsafe fn node_ref_to_cell(r: u32) -> u32 {
+///
+/// Returns (EAX, ECX, EDX): EDX = kind and ECX = the chunk, then the record, then the object, as far as it got.
+unsafe fn node_ref_to_cell(r: u32, ecx_in: u32, edx_in: u32) -> (u32, u32, u32) {
     unsafe {
         if r == 0xFFFF_FFFF {
-            return 0;
+            return (0, ecx_in, edx_in);
         }
         let kind = (r >> 0x13) & 1;
         let chunk = r >> 0x14;
         let idx = r & 0x7FFFF;
         if chunk == 0xFFFF || chunk >= 0x866 {
-            return 0;
+            return (0, chunk, kind);
         }
         let rec = rd(CHUNKS + chunk as usize * 4) as usize;
         if rec == 0 || rb(rec + 0x1C) & 3 != 0 {
-            return 0;
+            return (0, rec as u32, kind);
         }
         let count = rd(rec + if kind != 0 { 0x7C } else { 0x6C }) as i32;
         if count <= 0 {
-            return 0;
+            return (0, rec as u32, kind);
         }
         let obj = rd(rec + if kind != 0 { 0x248 } else { 0x240 }) as usize;
-        rd(obj + 0x14).wrapping_add(idx.wrapping_mul(3) << 4)
+        (rd(obj + 0x14).wrapping_add(idx.wrapping_mul(3) << 4), obj as u32, kind)
     }
 }
 
 extern "C" fn node_ref_to_cell_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked_eax(NODE_REF_TO_CELL, &p, unsafe { node_ref_to_cell(p.eax) });
+    let (eax, ecx, edx) = unsafe { node_ref_to_cell(p.eax, p.ecx, p.edx) };
+    r.eax = checked_eax(NODE_REF_TO_CELL, &p, eax);
+    r.ecx = ecx;
+    r.edx = edx;
 }
 regs_thunk!(node_ref_to_cell_thunk, node_ref_to_cell_entry);
 
@@ -448,6 +460,8 @@ unsafe fn link_flags_to_mask(p: u32) -> u32 {
 extern "C" fn link_flags_to_mask_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(LINK_FLAGS_TO_MASK, &p, unsafe { link_flags_to_mask(p.edx) });
+    // `mov cl, [edx]`
+    r.ecx = (p.ecx & !0xFF) | unsafe { rb(p.edx as usize) } as u32;
 }
 regs_thunk!(link_flags_to_mask_thunk, link_flags_to_mask_entry);
 
@@ -468,6 +482,8 @@ unsafe fn route_current_entry(route: u32) -> u32 {
 extern "C" fn route_current_entry_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(ROUTE_CURRENT_ENTRY, &p, unsafe { route_current_entry(p.ecx) });
+    // `mov dl, [ecx + 0x3c]`
+    r.edx = (p.edx & !0xFF) | unsafe { rb(p.ecx as usize + 0x3C) } as u32;
 }
 regs_thunk!(route_current_entry_thunk, route_current_entry_entry);
 
@@ -507,6 +523,8 @@ unsafe fn cell_scratch_record(cell: u32) -> u32 {
 extern "C" fn cell_scratch_record_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(SCRATCH_RECORD, &p, unsafe { cell_scratch_record(p.eax) });
+    // `mov ecx, [eax + 0x20]` runs on both paths
+    r.ecx = unsafe { rd(p.eax as usize + 0x20) };
 }
 regs_thunk!(cell_scratch_record_thunk, cell_scratch_record_entry);
 
@@ -535,22 +553,28 @@ regs_thunk!(query_mask_thunk, query_mask_entry);
 
 /// Signed index < 0 or >= `[net]` gives 0 (net = [0x2225B64], not null-checked); else
 /// `[net + 4] + index * 0x3C`.
-unsafe fn lane_by_index(i: u32) -> u32 {
+///
+/// Returns (EAX, ECX, EDX) as the original leaves them: ECX = the network once it was loaded, EDX = index * 15
+/// when the index was in range.
+unsafe fn lane_by_index(i: u32, ecx_in: u32, edx_in: u32) -> (u32, u32, u32) {
     unsafe {
         if (i as i32) < 0 {
-            return 0;
+            return (0, ecx_in, edx_in);
         }
         let net = rd(0x0222_5B64) as usize;
         if (i as i32) >= rd(net) as i32 {
-            return 0;
+            return (0, net as u32, edx_in);
         }
-        rd(net + 4).wrapping_add(i.wrapping_mul(0x3C))
+        (rd(net + 4).wrapping_add(i.wrapping_mul(0x3C)), net as u32, i.wrapping_mul(15))
     }
 }
 
 extern "C" fn lane_by_index_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked_eax(LANE_BY_INDEX, &p, unsafe { lane_by_index(p.eax) });
+    let (eax, ecx, edx) = unsafe { lane_by_index(p.eax, p.ecx, p.edx) };
+    r.eax = checked_eax(LANE_BY_INDEX, &p, eax);
+    r.ecx = ecx;
+    r.edx = edx;
 }
 regs_thunk!(lane_by_index_thunk, lane_by_index_entry);
 
@@ -558,25 +582,29 @@ regs_thunk!(lane_by_index_thunk, lane_by_index_entry);
 
 /// Null lane, `[lane + 0x10]` bit 19 set, or no network (0x2225B64 == 0): -1. Else the signed
 /// division of `lane - [net + 4]` by 0x3C as `hi32(d * 0x88888889) + d`, sar 5, plus the sign bit.
-unsafe fn lane_index(lane: u32) -> u32 {
+///
+/// Returns (EAX, EDX): EDX = the quotient before the sign add (ECX is saved and restored).
+unsafe fn lane_index(lane: u32, edx_in: u32) -> (u32, u32) {
     unsafe {
         if lane == 0 || (rd(lane as usize + 0x10) >> 0x13) & 1 != 0 {
-            return 0xFFFF_FFFF;
+            return (0xFFFF_FFFF, edx_in);
         }
         let net = rd(0x0222_5B64) as usize;
         if net == 0 {
-            return 0xFFFF_FFFF;
+            return (0xFFFF_FFFF, edx_in);
         }
         let d = lane.wrapping_sub(rd(net + 4)) as i32;
         let hi = ((0x8888_8889u32 as i32 as i64 * d as i64) >> 32) as i32;
         let e = hi.wrapping_add(d) >> 5;
-        ((e as u32) >> 31).wrapping_add(e as u32)
+        (((e as u32) >> 31).wrapping_add(e as u32), e as u32)
     }
 }
 
 extern "C" fn lane_index_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked_eax(LANE_INDEX, &p, unsafe { lane_index(p.eax) });
+    let (eax, edx) = unsafe { lane_index(p.eax, p.edx) };
+    r.eax = checked_eax(LANE_INDEX, &p, eax);
+    r.edx = edx;
 }
 regs_thunk!(lane_index_thunk, lane_index_entry);
 
@@ -625,6 +653,8 @@ extern "C" fn route_total_length_entry(r: &mut Pushad, _: *const u32) -> f32 {
     let p = *r;
     let (mut ours, eax) = unsafe { route_total_length(p.ecx) };
     r.eax = eax;
+    // `push ecx` ... `pop ecx` pops the stack slot the sum was stored in
+    r.ecx = ours.to_bits();
     let Some((n, orig)) = shadowing(ROUTE_TOTAL_LENGTH) else { return ours };
     let inp = Regs::of(&p);
     let mut out = inp;
@@ -635,6 +665,7 @@ extern "C" fn route_total_length_entry(r: &mut Pushad, _: *const u32) -> f32 {
         r.eax = out.eax;
         ours = theirs;
     }
+    r.ecx = ours.to_bits();
     ours
 }
 regs_thunk!(route_total_length_thunk, route_total_length_entry);
@@ -644,15 +675,17 @@ regs_thunk!(route_total_length_thunk, route_total_length_entry);
 /// `n = u8[cell + 0x1C]` link refs at `[cell + 0x18]`. Ref 0, chunk 0xFFFF / >= 0x866 (unsigned) or a
 /// null record skip; else `link = (((ref & 0xFFFF) - 1) << 5) + [rec + 0x150]` (a zero sum skips) and
 /// `u8[link + 0x18] & 2` gives 1. Upper EAX: 0 / the ref / lo - 1 / the link sum from the last step.
-unsafe fn cell_has_link_flag2(cell: u32) -> u32 {
+unsafe fn cell_has_link_flag2(cell: u32, ecx_in: u32) -> (u32, u32, u32) {
     unsafe {
         let n = rb(cell as usize + 0x1C) as u32;
+        // EDX = 0 from the start; ECX is the last value the loop put there
+        let mut ecx = ecx_in;
         if n == 0 {
-            return cell & !0xFF;
+            return (cell & !0xFF, ecx, 0);
         }
         let mut p = rd(cell as usize + 0x18) as usize;
         let mut eax = cell;
-        for _ in 0..n {
+        for i in 0..n {
             let r = rd(p);
             p += 4;
             eax = r;
@@ -660,11 +693,13 @@ unsafe fn cell_has_link_flag2(cell: u32) -> u32 {
                 continue;
             }
             let hi = r >> 16;
+            ecx = hi;
             eax = (r & 0xFFFF).wrapping_sub(1);
             if hi == 0xFFFF || hi >= 0x866 {
                 continue;
             }
             let rec = rd(CHUNKS + hi as usize * 4);
+            ecx = rec;
             if rec == 0 {
                 continue;
             }
@@ -673,16 +708,19 @@ unsafe fn cell_has_link_flag2(cell: u32) -> u32 {
                 continue;
             }
             if rb(eax as usize + 0x18) & 2 != 0 {
-                return (eax & !0xFF) | 1;
+                return ((eax & !0xFF) | 1, ecx, i);
             }
         }
-        eax & !0xFF
+        (eax & !0xFF, ecx, n)
     }
 }
 
 extern "C" fn has_link_flag2_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked_eax(HAS_LINK_FLAG2, &p, unsafe { cell_has_link_flag2(p.eax) });
+    let (eax, ecx, edx) = unsafe { cell_has_link_flag2(p.eax, p.ecx) };
+    r.eax = checked_eax(HAS_LINK_FLAG2, &p, eax);
+    r.ecx = ecx;
+    r.edx = edx;
 }
 regs_thunk!(has_link_flag2_thunk, has_link_flag2_entry);
 
@@ -690,23 +728,29 @@ regs_thunk!(has_link_flag2_thunk, has_link_flag2_entry);
 
 /// Byte +0x1D: bit 0x10 -> 0; bit 2 clear -> 1; else the result of nav_cell_has_link_flag2 (our
 /// Rust version, which reproduces its EAX). Only AL is set; the rest of EAX is the input's or the callee's.
-unsafe fn cell_walkable(cell: u32) -> u32 {
+unsafe fn cell_walkable(cell: u32, ecx_in: u32, edx_in: u32) -> (u32, u32, u32) {
     unsafe {
         let f = rb(cell as usize + 0x1D);
+        let ecx = (ecx_in & !0xFF) | f as u32;
         if f & 0x10 != 0 {
-            return cell & !0xFF;
+            return (cell & !0xFF, ecx, edx_in);
         }
         if f & 2 != 0 {
-            let e = cell_has_link_flag2(cell);
-            return if e & 0xFF == 0 { e } else { (e & !0xFF) | 1 };
+            let mut r = Regs { eax: cell, ecx, edx: edx_in, ebx: 0, esi: 0, edi: 0, ebp: 0 };
+            call_full(NAV_CELL_HAS_LINK_FLAG2, &mut r, 0, false);
+            let e = r.eax;
+            return (if e & 0xFF == 0 { e } else { (e & !0xFF) | 1 }, r.ecx, r.edx);
         }
-        (cell & !0xFF) | 1
+        ((cell & !0xFF) | 1, ecx, edx_in)
     }
 }
 
 extern "C" fn cell_walkable_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked_eax(CELL_WALKABLE, &p, unsafe { cell_walkable(p.eax) });
+    let (eax, ecx, edx) = unsafe { cell_walkable(p.eax, p.ecx, p.edx) };
+    r.eax = checked_eax(CELL_WALKABLE, &p, eax);
+    r.ecx = ecx;
+    r.edx = edx;
 }
 regs_thunk!(cell_walkable_thunk, cell_walkable_entry);
 
@@ -1054,10 +1098,12 @@ regs_thunk!(pair_mark_thunk, pair_mark_entry);
 /// Unlink `node` (links +0 next, +4 prev) from the owner ring (head slot `slot`), then put it before the
 /// head of the global ring `ring` (the head stays). A single-node owner ring zeroes the node and the slot
 /// and skips the generic unlink. Same code, different ring: 0x21FC19C (path) / 0x22A9C7C (road).
-unsafe fn ring_recycle(node: u32, slot: u32, ring: usize) {
+/// Returns ECX / EDX as the original leaves them (the new head, or 0; the last link value it loaded).
+unsafe fn ring_recycle(node: u32, slot: u32, ring: usize) -> (u32, u32) {
     unsafe {
         let (n, s) = (node as usize, slot as usize);
         let mut generic = true;
+        let mut edx = slot;
         if rd(s) == node {
             let c = rd(n);
             if c == node {
@@ -1072,10 +1118,12 @@ unsafe fn ring_recycle(node: u32, slot: u32, ring: usize) {
         if generic {
             let prev = rd(n + 4) as usize;
             if prev != 0 {
+                edx = rd(n);
                 wd(prev, rd(n));
             }
             let next = rd(n) as usize;
             if next != 0 {
+                edx = rd(n + 4);
                 wd(next + 4, rd(n + 4));
             }
             wd(n, 0);
@@ -1086,13 +1134,14 @@ unsafe fn ring_recycle(node: u32, slot: u32, ring: usize) {
             wd(n, node);
             wd(n + 4, node);
             wd(ring, node);
-            return;
+            return (0, edx);
         }
         wd(n + 4, rd(h + 4));
         wd(n, h as u32);
         let t = rd(h + 4) as usize;
         wd(t, node);
         wd(h + 4, node);
+        (h as u32, t as u32)
     }
 }
 
@@ -1121,10 +1170,12 @@ fn recycle_regions(node: u32, slot: u32, ring: usize) -> Option<Vec<(usize, usiz
 extern "C" fn path_recycle_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     unsafe {
+        let ce = std::cell::Cell::new((p.ecx, p.edx));
         shadow_run(PATH_RECYCLE, &p, std::ptr::null_mut(), 0, false, || recycle_regions(p.eax, p.edx, PATH_RING), || {
-            ring_recycle(p.eax, p.edx, PATH_RING);
+            ce.set(ring_recycle(p.eax, p.edx, PATH_RING));
             0
-        })
+        });
+        (r.ecx, r.edx) = ce.get();
     };
 }
 regs_thunk!(path_recycle_thunk, path_recycle_entry);
@@ -1132,10 +1183,12 @@ regs_thunk!(path_recycle_thunk, path_recycle_entry);
 extern "C" fn road_recycle_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     unsafe {
+        let ce = std::cell::Cell::new((p.ecx, p.edx));
         shadow_run(ROAD_RECYCLE, &p, std::ptr::null_mut(), 0, false, || recycle_regions(p.eax, p.edx, ROAD_RING), || {
-            ring_recycle(p.eax, p.edx, ROAD_RING);
+            ce.set(ring_recycle(p.eax, p.edx, ROAD_RING));
             0
-        })
+        });
+        (r.ecx, r.edx) = ce.get();
     };
 }
 regs_thunk!(road_recycle_thunk, road_recycle_entry);
@@ -1291,36 +1344,50 @@ regs_thunk!(record_free_thunk, record_free_entry);
 /// every record of the ring is freed: `next = [rec + 0x1C]` unless it equals the slot's CURRENT value (the
 /// sbb idiom, read before the free), nav_route_record_free(ECX = rec, EDI = slot) through the original
 /// address (EAX = next on entry, as in the original), rec = next. Later records are validated by the callee.
-unsafe fn route_list_free(slot: u32) {
+///
+/// Returns (ECX, EDX) as the original leaves them: ECX is 0 after a full walk (the record that failed a test
+/// otherwise), EDX the last `quotient * 0x34` (the divisibility test) or the callee's leftover.
+unsafe fn route_list_free(slot: u32, ecx_in: u32, edx_in: u32, ebx: u32, ebp: u32) -> (u32, u32) {
     unsafe {
         if slot == 0 {
-            return;
+            return (ecx_in, edx_in);
         }
         let mut rec = rd(slot as usize);
         if rec == 0 {
-            return;
+            return (0, edx_in);
         }
-        if !route_rec_valid(rec) {
+        let d = rec.wrapping_sub(ROUTE_POOL as u32);
+        if (d as i32) < 0 || d as usize >= ROUTE_POOL_SIZE {
             wd(slot as usize, 0);
-            return;
+            return (rec, edx_in);
+        }
+        let mut edx = ((((d as u64) * 0x4EC4_EC4F) >> 32) as u32 >> 4).wrapping_mul(0x34);
+        if d.wrapping_sub(edx) != 0 || rb(rec as usize + 0x30) & 0x20 == 0 {
+            wd(slot as usize, 0);
+            return (rec, edx);
         }
         while rec != 0 {
             let nx = rd(rec as usize + 0x1C);
             let esi = if nx != rd(slot as usize) { nx } else { 0 };
-            call_regs(NAV_ROUTE_RECORD_FREE, nx, rec, 0, esi, slot, &[]);
+            let mut r = Regs { eax: nx, ecx: rec, edx, ebx, esi, edi: slot, ebp };
+            call_full(NAV_ROUTE_RECORD_FREE, &mut r, 0, false);
+            edx = r.edx;
             rec = esi;
         }
+        (0, edx)
     }
 }
 
 extern "C" fn list_free_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let ce = std::cell::Cell::new((p.ecx, p.edx));
     unsafe {
         shadow_run(LIST_FREE, &p, std::ptr::null_mut(), 0, false, || route_pool_regions(p.eax), || {
-            route_list_free(p.eax);
+            ce.set(route_list_free(p.eax, p.ecx, p.edx, p.ebx, p.ebp));
             0
         })
     };
+    (r.ecx, r.edx) = ce.get();
 }
 regs_thunk!(list_free_thunk, list_free_entry);
 
@@ -1345,20 +1412,27 @@ unsafe fn ww(p: usize, v: u16) {
 
 /// The compiler's `(claim - pool) / 12`: `hi32(d * 0x2AAAAAAB)`, sar 1, plus the sign bit (low 16 bits used).
 fn claim_index(claim: u32) -> u16 {
+    claim_index_full(claim).0 as u16
+}
+
+/// The same division with the whole 32-bit quotient and EDX as the original leaves it (before the sign add).
+fn claim_index_full(claim: u32) -> (u32, u32) {
     let d = claim.wrapping_sub(CLAIMS as u32) as i32;
     let hi = ((d as i64 * 0x2AAA_AAAB) >> 32) as i32;
     let q = (hi >> 1) as u32;
-    q.wrapping_add(q >> 31) as u16
+    (q.wrapping_add(q >> 31), q)
 }
 
 /// Pop the head of the free claim ring (u16 head 0xE87B4C, 0xFFFF = empty, then 0). A single-entry ring
 /// leaves the head 0xFFFF; otherwise the head takes the next index and the entry is unlinked
 /// (prev.next = next, next.prev = prev). The claim comes back with both links 0xFFFF.
-unsafe fn claim_alloc() -> u32 {
+///
+/// Returns (EAX, ECX, EDX) as the original leaves them: the claim in EAX and ECX, EDX the last link word it loaded.
+unsafe fn claim_alloc(ecx_in: u32, edx_in: u32) -> (u32, u32, u32) {
     unsafe {
         let si = rw(CLAIM_FREE_HEAD);
         if si == 0xFFFF {
-            return 0;
+            return (0, ecx_in, edx_in);
         }
         let ecx = (CLAIMS + si as usize * 12) as u32;
         let ax = claim_index(ecx);
@@ -1369,7 +1443,7 @@ unsafe fn claim_alloc() -> u32 {
                 ww(CLAIM_FREE_HEAD, 0xFFFF);
                 ww(c + 2, 0xFFFF);
                 ww(c, 0xFFFF);
-                return ecx;
+                return (ecx, ecx, nx as u32);
             }
             ww(CLAIM_FREE_HEAD, nx);
         }
@@ -1381,7 +1455,7 @@ unsafe fn claim_alloc() -> u32 {
         ww(CLAIMS + next2 * 12 + 2, prev2);
         ww(c + 2, 0xFFFF);
         ww(c, 0xFFFF);
-        ecx
+        (ecx, ecx, prev2 as u32)
     }
 }
 
@@ -1396,22 +1470,36 @@ fn claim_regions(lane_head: u32) -> Option<Vec<(usize, usize)>> {
 
 extern "C" fn claim_alloc_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = unsafe { shadow_run(CLAIM_ALLOC, &p, std::ptr::null_mut(), 0, true, || claim_regions(0), || claim_alloc()) };
+    let ce = std::cell::Cell::new((p.ecx, p.edx));
+    r.eax = unsafe {
+        shadow_run(CLAIM_ALLOC, &p, std::ptr::null_mut(), 0, true, || claim_regions(0), || {
+            let (eax, ecx, edx) = claim_alloc(p.ecx, p.edx);
+            ce.set((ecx, edx));
+            eax
+        })
+    };
+    (r.ecx, r.edx) = ce.get();
 }
 regs_thunk!(claim_alloc_thunk, claim_alloc_entry);
 
 /// EAX = the lane's u16 head word (lane + 0x2A), ECX = claim. Marks claim+4 = -1, unlinks the claim from
 /// the lane ring (the head word takes the next index, or 0xFFFF for a single entry) and appends it to the
 /// free ring before its head (an empty free ring takes it as head with both links to itself).
-unsafe fn claim_free(head: u32, claim: u32) {
+///
+/// Returns (EAX, ECX, EDX) as the original leaves them: EAX = the claim index, ECX / EDX the scaled ring
+/// indices it loaded last.
+unsafe fn claim_free(head: u32, claim: u32) -> (u32, u32, u32) {
     unsafe {
         let h = head as usize;
         let c = claim as usize;
-        let ax = claim_index(claim);
+        let (eax, _) = claim_index_full(claim);
+        let ax = eax as u16;
         wd(c + 4, 0xFFFF_FFFF);
         let mut generic = true;
+        let mut edx = 0u32;
         if rw(h) == ax {
             let dx = rw(c);
+            edx = dx as u32;
             if dx == ax {
                 ww(c, 0xFFFF);
                 ww(c + 2, 0xFFFF);
@@ -1428,6 +1516,7 @@ unsafe fn claim_free(head: u32, claim: u32) {
             let next2 = rw(c) as usize;
             let prev2 = rw(c + 2);
             ww(CLAIMS + next2 * 12 + 2, prev2);
+            edx = (next2 * 3) as u32;
             ww(c, 0xFFFF);
             ww(c + 2, 0xFFFF);
         }
@@ -1436,7 +1525,7 @@ unsafe fn claim_free(head: u32, claim: u32) {
             ww(c, ax);
             ww(c + 2, ax);
             ww(CLAIM_FREE_HEAD, ax);
-            return;
+            return (eax, claim, edx);
         }
         let e = CLAIMS + si as usize * 12;
         let di = rw(e + 2);
@@ -1445,17 +1534,20 @@ unsafe fn claim_free(head: u32, claim: u32) {
         let tail = rw(e + 2) as usize;
         ww(CLAIMS + tail * 12, ax);
         ww(e + 2, ax);
+        (eax, (tail * 3) as u32, (si as u32) * 3)
     }
 }
 
 extern "C" fn claim_free_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let ce = std::cell::Cell::new((p.eax, p.ecx, p.edx));
     unsafe {
         shadow_run(CLAIM_FREE, &p, std::ptr::null_mut(), 0, false, || claim_regions(p.eax), || {
-            claim_free(p.eax, p.ecx);
+            ce.set(claim_free(p.eax, p.ecx));
             0
         })
     };
+    (r.eax, r.ecx, r.edx) = ce.get();
 }
 regs_thunk!(claim_free_thunk, claim_free_entry);
 
@@ -1463,21 +1555,32 @@ regs_thunk!(claim_free_thunk, claim_free_entry);
 /// claim (0xA88D10, ESI kept); owner at +4, 0 at +8; an empty lane ring (u16 `[lane + 0x2A]` = 0xFFFF)
 /// takes the claim as its only member (both links to itself); otherwise the claim goes in before the
 /// ring head (claim.prev = head.prev, claim.next = head, old tail.next = head.prev = claim).
-unsafe fn claim_add(lane: u32, owner: u32) {
+///
+/// Returns (EAX, EDX) as the original leaves them (ECX is saved and restored, ESI untouched): EAX the
+/// bit-19 word (or the claim index), EDX the scaled tail index / the last callee leftover.
+unsafe fn claim_add(p: &Pushad, owner: u32) -> (u32, u32) {
     unsafe {
-        if lane == 0 || (rd(lane as usize + 0x10) >> 0x13) & 1 != 0 {
-            return;
+        let lane = p.esi;
+        if lane == 0 {
+            return (p.eax, p.edx);
         }
-        let claim = call_regs(CLAIM_ALLOC_ADDR, 0, 0, 0, lane, 0, &[]);
+        let x = rd(lane as usize + 0x10) >> 0x13;
+        if x & 1 != 0 {
+            return (x & !0xFF, p.edx);
+        }
+        let mut g = Regs { eax: (x & !0xFF) | 1, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: lane, edi: p.edi, ebp: p.ebp };
+        call_full4(CLAIM_ALLOC_ADDR, &mut g, [0; 4]);
+        let claim = g.eax;
         if claim == 0 {
-            return;
+            return (0, g.edx);
         }
         let c = claim as usize;
         let lh = lane as usize + 0x2A;
         wd(c + 4, owner);
         wd(c + 8, 0);
         let head = rw(lh);
-        let idx = claim_index(claim);
+        let (idx_full, q0) = claim_index_full(claim);
+        let idx = idx_full as u16;
         if head != 0xFFFF {
             let dx = rw(CLAIMS + head as usize * 12 + 2);
             ww(c + 2, dx);
@@ -1485,16 +1588,19 @@ unsafe fn claim_add(lane: u32, owner: u32) {
             let oldtail = rw(CLAIMS + rw(lh) as usize * 12 + 2) as usize;
             ww(CLAIMS + oldtail * 12, idx);
             ww(CLAIMS + rw(lh) as usize * 12 + 2, idx);
+            (idx_full, (oldtail * 3) as u32)
         } else {
             ww(c, idx);
             ww(c + 2, idx);
             ww(lh, idx);
+            (idx_full, q0)
         }
     }
 }
 
 extern "C" fn claim_add_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
+    let ce = std::cell::Cell::new((p.eax, p.edx));
     unsafe {
         let owner = *args;
         shadow_run(
@@ -1505,11 +1611,12 @@ extern "C" fn claim_add_entry(r: &mut Pushad, args: *const u32) {
             false,
             || claim_regions(if p.esi != 0 { p.esi + 0x2A } else { 0 }),
             || {
-                claim_add(p.esi, owner);
+                ce.set(claim_add(&p, owner));
                 0
             },
         )
     };
+    (r.eax, r.edx) = ce.get();
 }
 regs_thunk!(claim_add_thunk, claim_add_entry);
 
@@ -1517,34 +1624,45 @@ regs_thunk!(claim_add_thunk, claim_add_entry);
 /// network (`[0x2225B64] == 0`). Walks the lane's claim ring from the u16 head `[lane + 0x2A]` (stops when
 /// the next index equals the head index) for `claim+4 == owner` and tail-calls road_claim_free(EAX = head
 /// word address, ECX = claim) (0xA88DB0, ESI kept).
-unsafe fn claim_remove(lane: u32, owner: u32, esi: u32) {
+///
+/// Returns (EAX, ECX, EDX) as the original leaves them (ECX is saved and restored unless the tail call runs).
+unsafe fn claim_remove(p: &Pushad) -> (u32, u32, u32) {
     unsafe {
-        if lane == 0 || (rd(lane as usize + 0x10) >> 0x13) & 1 != 0 || rd(ROAD_NET) == 0 {
-            return;
+        let (lane, owner) = (p.eax, p.edi);
+        if lane == 0 {
+            return (0, p.ecx, p.edx);
+        }
+        if (rd(lane as usize + 0x10) >> 0x13) & 1 != 0 || rd(ROAD_NET) == 0 {
+            return (lane, p.ecx, p.edx);
         }
         let head = lane + 0x2A;
         let si = rw(head as usize);
+        let mut edx = p.edx;
         let mut ecx = if si == 0xFFFF { 0 } else { (CLAIMS + si as usize * 12) as u32 };
         while ecx != 0 {
             let dx = rw(ecx as usize);
-            let edx = if dx == si { 0 } else { (CLAIMS + dx as usize * 12) as u32 };
+            edx = if dx == si { 0 } else { (CLAIMS + dx as usize * 12) as u32 };
             if rd(ecx as usize + 4) == owner {
-                call_regs(CLAIM_FREE_ADDR, head, ecx, edx, esi, owner, &[]);
-                return;
+                let mut g = Regs { eax: head, ecx, edx, ebx: p.ebx, esi: p.esi, edi: owner, ebp: p.ebp };
+                call_full4(CLAIM_FREE_ADDR, &mut g, [0; 4]);
+                return (g.eax, g.ecx, g.edx);
             }
             ecx = edx;
         }
+        (head, p.ecx, edx)
     }
 }
 
 extern "C" fn claim_remove_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let ce = std::cell::Cell::new((p.eax, p.ecx, p.edx));
     unsafe {
         shadow_run(CLAIM_REMOVE, &p, std::ptr::null_mut(), 0, false, || claim_regions(if p.eax != 0 { p.eax + 0x2A } else { 0 }), || {
-            claim_remove(p.eax, p.edi, p.esi);
+            ce.set(claim_remove(&p));
             0
         })
     };
+    (r.eax, r.ecx, r.edx) = ce.get();
 }
 regs_thunk!(claim_remove_thunk, claim_remove_entry);
 
@@ -1564,58 +1682,89 @@ fn f32_through_x87(bits: u32) -> u32 {
 /// `arg3 & 0xFF` is non-zero, else cleared. [entry + 4] = record. Cost f32: record `[+0x10]` bit 19 set
 /// gives 1000.0 (0xE98030); clear: lane type = byte `[+0x28] >> 4`, >= 3 gives 10.0 (0xDD0550), else the
 /// f32 table 0x223E3E8[type]. The cost also lands in the (dead) first stack-argument slot.
-unsafe fn route_push(route: u32, args: *mut u32) {
+///
+/// Returns (EAX, ECX, EDX) as the original leaves them (EBX / EBP / EDI are saved and restored). At the two
+/// callee calls the registers are the ones the original has there (EBX = input with BL = the second argument,
+/// EBP = the record, ECX / EDX as computed).
+unsafe fn route_push(p: &Pushad, args: *mut u32) -> (u32, u32, u32) {
     unsafe {
+        let route = p.esi;
         let rec = *args;
         let a2 = *args.add(1) as u8;
         let a3 = *args.add(2) as u8;
         if rec == 0 {
-            return;
+            return (p.eax, p.ecx, p.edx);
         }
         let rt = route as usize;
         let cnt = rb(rt + 0x3C);
+        let ebx = (p.ebx & !0xFF) | a2 as u32;
+        let mut edx = (p.edx & !0xFF) | cnt as u32;
+        let mut eax = p.eax;
+        let mut ecx;
         let e;
         if cnt < 3 {
-            for i in 0..cnt as usize {
-                if rd(rt + 4 + 12 * i) == rec {
-                    return;
+            let n = cnt as usize;
+            ecx = route + 4;
+            for i in 0..n {
+                if rd(ecx as usize) == rec {
+                    return (i as u32, ecx, edx);
                 }
+                ecx += 12;
             }
+            edx = (edx & !0xFF) | (cnt.wrapping_add(1)) as u32;
             wb(rt + 0x3C, cnt + 1);
-            e = rt + 12 * cnt as usize;
+            e = rt + 12 * n;
+            ecx = e as u32;
         } else {
             if rb(rt + 8) & 4 != 0 {
-                call_regs(NAV_ROUTE_LIST_FREE, route + 4, 0, 0, route, 0, &[]);
+                let mut g = Regs { eax: route + 4, ecx: p.ecx, edx, ebx, esi: route, edi: p.edi, ebp: rec };
+                call_full4(NAV_ROUTE_LIST_FREE, &mut g, [0; 4]);
+                (eax, edx) = (g.eax, g.edx);
             }
-            call_regs(MEMMOVE, 0, 0, 0, 0, 0, &[route, route + 12, 0x18]);
+            let mut g = Regs { eax, ecx: route + 12, edx, ebx, esi: route, edi: p.edi, ebp: rec };
+            call_full4(MEMMOVE, &mut g, [route, route + 12, 0x18, 0]);
+            edx = g.edx;
             wb(rt + 0x30, rb(rt + 0x30).wrapping_add(0xFF));
             wb(rt + 0x24, rb(rt + 0x24).wrapping_add(0xFF));
             e = rt + 0x18;
+            ecx = route + 0x18;
         }
+        edx = (edx & !0xFF) | a3 as u32;
         let old = rb(e + 8);
         let mut f = (((a3 & 1) << 1 | (a2 & 1)) << 1) | (old & 0xE0);
         if a3 != 0 {
             let d = rb(rec as usize + 0x30).wrapping_shl(2);
             f = ((d ^ f) & 0x20) ^ f;
+            edx = (edx & !0xFF) | f as u32;
         } else {
             f &= 0xDF;
         }
         wb(e + 8, f);
         wd(e + 4, rec);
-        let bits = if (rd(rec as usize + 0x10) >> 0x13) & 1 != 0 {
+        let x = rd(rec as usize + 0x10) >> 0x13;
+        eax = (x & !0xFF) | ((x as u8 ^ 1) & 1) as u32;
+        let bits = if x & 1 != 0 {
             rd(0x00E9_8030)
         } else {
             let t = rb(rec as usize + 0x28) >> 4;
-            if t >= 3 { rd(0x00DD_0550) } else { rd(0x0223_E3E8 + t as usize * 4) }
+            eax = (eax & !0xFF) | t as u32;
+            if t >= 3 {
+                rd(0x00DD_0550)
+            } else {
+                edx = t as u32;
+                rd(0x0223_E3E8 + t as usize * 4)
+            }
         };
         let q = f32_through_x87(bits);
         *args = q;
         wd(e, q);
+        (eax, ecx, edx)
     }
 }
 
 extern "C" fn route_push_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
+    let ce = std::cell::Cell::new((p.eax, p.ecx, p.edx));
     unsafe {
         shadow_run(
             ROUTE_PUSH,
@@ -1632,11 +1781,12 @@ extern "C" fn route_push_entry(r: &mut Pushad, args: *const u32) {
                 Some(v)
             },
             || {
-                route_push(p.esi, args as *mut u32);
+                ce.set(route_push(&p, args as *mut u32));
                 0
             },
         )
     };
+    (r.eax, r.ecx, r.edx) = ce.get();
 }
 regs_thunk!(route_push_thunk, route_push_entry);
 
@@ -1656,25 +1806,43 @@ const DET_RELEASE_HULL: usize = 0x00A0_AED0;
 /// generation counter 0x21F2C00 advances by one, & 0x7FFFF), +0x18 = 0; it leaves the free ring (head
 /// moves on, 0 when it was the only one) and goes in at the FRONT of the active ring (head = entry,
 /// entry.next = old head, old tail.next = old head.prev = entry; an empty ring links the entry to itself).
-unsafe fn detour_create(owner: u32, kind: u32, extra: u16) -> u32 {
+///
+/// Returns (EAX, ECX, EDX) as the original leaves them: ECX is the kind chain's leftover (`kind - 2`, 0, the
+/// record pointer) on a failure and the new entry on success; EDX is the kind, or the old active head on success.
+unsafe fn detour_create(owner: u32, kind: u32, extra: u16) -> (u32, u32, u32) {
     unsafe {
+        let mut ecx = 0u32;
         let ok = match kind {
             0 => {
                 owner != 0 && {
                     let rec = rd(0x0214_9C64 + ((owner & 0xFFF) << 4) as usize);
+                    ecx = rec;
                     rec != 0 && rd(rec as usize + 0x44) == owner
                 }
             }
-            1 => owner != 0 && rd(0x02AE_50E0 + (owner & 0xFFFF) as usize * 0x134 + 8) == owner,
-            2 => owner != 0 && rd(0x0267_4DE0 + (owner & 0x1FF) as usize * 0x208 + 0x10) == owner,
-            _ => false,
+            1 => {
+                owner != 0 && {
+                    ecx = 0x02AE_50E0 + (owner & 0xFFFF) * 0x134;
+                    rd(ecx as usize + 8) == owner
+                }
+            }
+            2 => {
+                owner != 0 && {
+                    ecx = 0x0267_4DE0 + (owner & 0x1FF) * 0x208;
+                    rd(ecx as usize + 0x10) == owner
+                }
+            }
+            _ => {
+                ecx = kind.wrapping_sub(2);
+                false
+            }
         };
         if !ok {
-            return 0xFFFF_FFFF;
+            return (0xFFFF_FFFF, ecx, kind);
         }
         let e = rd(DET_FREE) as usize;
         if e == 0 {
-            return 0xFFFF_FFFF;
+            return (0xFFFF_FFFF, 0, kind);
         }
         wd(e + 0x10, kind);
         wd(e + 0xC, owner);
@@ -1709,7 +1877,7 @@ unsafe fn detour_create(owner: u32, kind: u32, extra: u16) -> u32 {
             wd(e + 4, e as u32);
             wd(e, e as u32);
             wd(DET_ACTIVE, e as u32);
-            return rd(e + 8);
+            return (rd(e + 8), e as u32, 0);
         }
         let tail = rd(head + 4) as usize;
         wd(tail, e as u32);
@@ -1717,7 +1885,7 @@ unsafe fn detour_create(owner: u32, kind: u32, extra: u16) -> u32 {
         wd(head + 4, e as u32);
         wd(e, head as u32);
         wd(DET_ACTIVE, e as u32);
-        rd(e + 8)
+        (rd(e + 8), e as u32, head as u32)
     }
 }
 
@@ -1751,6 +1919,7 @@ extern "C" fn detour_create_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     unsafe {
         let extra = *args as u16;
+        let ce = std::cell::Cell::new((p.ecx, p.edx));
         r.eax = shadow_run(
             DETOUR_CREATE,
             &p,
@@ -1758,8 +1927,13 @@ extern "C" fn detour_create_entry(r: &mut Pushad, args: *const u32) {
             1,
             true,
             || Some(detour_regions(rd(DET_FREE) as usize, true)),
-            || detour_create(p.eax, p.edx, extra),
+            || {
+                let (eax, ecx, edx) = detour_create(p.eax, p.edx, extra);
+                ce.set((ecx, edx));
+                eax
+            },
         );
+        (r.ecx, r.edx) = ce.get();
     }
 }
 regs_thunk!(detour_create_thunk, detour_create_entry);
@@ -1903,7 +2077,14 @@ unsafe fn route_record_alloc() -> u32 {
 
 extern "C" fn record_alloc_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    // a record: ECX = &record.next, EDX = the next link it held (`mov edx, [ecx]`)
+    let head = unsafe { rd(ROUTE_FREE_HEAD) };
+    let nx = if head != 0 { unsafe { rd(head as usize + 0x1C) } } else { 0 };
     r.eax = unsafe { shadow_run(RECORD_ALLOC, &p, std::ptr::null_mut(), 0, true, || route_pool_regions(0), || route_record_alloc()) };
+    if head != 0 {
+        r.ecx = head.wrapping_add(0x1C);
+        r.edx = nx;
+    }
 }
 regs_thunk!(record_alloc_thunk, record_alloc_entry);
 
@@ -1916,11 +2097,13 @@ const OBSTACLE_RING: usize = 0x022B_1458;
 /// ring empties the global, otherwise the global takes the next and the record is unlinked; the record's
 /// links are cleared, an empty chain makes it the head linked to itself, otherwise
 /// record.prev = tail, record.next = head, tail.next = head.prev = record.
-unsafe fn obstacle_record_alloc(vehicle: u32) -> u32 {
+///
+/// Returns (EAX, ECX, EDX) as the original leaves them: the record's link addresses, or the chain's tail / head.
+unsafe fn obstacle_record_alloc(vehicle: u32, ecx_in: u32, edx_in: u32) -> (u32, u32, u32) {
     unsafe {
         let e = rd(OBSTACLE_RING);
         if e == 0 {
-            return 0;
+            return (0, ecx_in, edx_in);
         }
         let r = e as usize;
         let next = rd(r + 0x14);
@@ -1945,7 +2128,7 @@ unsafe fn obstacle_record_alloc(vehicle: u32) -> u32 {
             wd(r + 0x14, e);
             wd(r + 0x18, e);
             wd(hp, e);
-            return e;
+            return (e, e + 0x18, e + 0x14);
         }
         let tail = rd(head + 0x18);
         wd(r + 0x18, tail);
@@ -1955,7 +2138,7 @@ unsafe fn obstacle_record_alloc(vehicle: u32) -> u32 {
         wd(t2 + 0x14, e);
         let h3 = rd(hp) as usize;
         wd(h3 + 0x18, e);
-        e
+        (e, t2 as u32, h3 as u32)
     }
 }
 
@@ -1988,6 +2171,7 @@ fn obstacle_regions(extra_head: usize) -> Vec<(usize, usize)> {
 
 extern "C" fn obstacle_alloc_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let ce = std::cell::Cell::new((p.ecx, p.edx));
     r.eax = unsafe {
         shadow_run(
             OBSTACLE_ALLOC,
@@ -2000,9 +2184,14 @@ extern "C" fn obstacle_alloc_entry(r: &mut Pushad, _: *const u32) {
                 v.push((p.edi as usize + 0x856C, 4));
                 Some(v)
             },
-            || obstacle_record_alloc(p.edi),
+            || {
+                let (eax, ecx, edx) = obstacle_record_alloc(p.edi, p.ecx, p.edx);
+                ce.set((ecx, edx));
+                eax
+            },
         )
     };
+    (r.ecx, r.edx) = ce.get();
 }
 regs_thunk!(obstacle_alloc_thunk, obstacle_alloc_entry);
 
@@ -2012,16 +2201,21 @@ regs_thunk!(obstacle_alloc_thunk, obstacle_alloc_entry);
 /// head, block slot 0). Otherwise (non-empty chain) the whole chain is spliced in before the ring head:
 /// ring tail.next = chain head, chain tail.next = ring head, chain head.prev = ring tail, ring head.prev =
 /// chain tail. The block's slot ends 0.
-unsafe fn obstacle_chain_release(block: u32) {
+///
+/// Returns (ECX, EDX) as the original leaves them: the ring head (or the chain head for an empty ring) and the
+/// chain head / 0.
+unsafe fn obstacle_chain_release(block: u32, edx_in: u32) -> (u32, u32) {
     unsafe {
         let b = block as usize;
         let ring = rd(OBSTACLE_RING);
         if ring == 0 {
-            wd(OBSTACLE_RING, rd(b + 0x18));
+            let ch = rd(b + 0x18);
+            wd(OBSTACLE_RING, ch);
             wd(b + 0x18, 0);
-            return;
+            return (ch, edx_in);
         }
         let ch = rd(b + 0x18) as usize;
+        let mut edx = 0u32;
         if ch != 0 {
             let rc = ring as usize;
             let rtail = rd(rc + 0x18) as usize;
@@ -2034,13 +2228,16 @@ unsafe fn obstacle_chain_release(block: u32) {
             let ctail2 = rd(ch3 + 0x18);
             wd(ch3 + 0x18, rtail2);
             wd(rc + 0x18, ctail2);
+            edx = ch3 as u32;
         }
         wd(b + 0x18, 0);
+        (ring, edx)
     }
 }
 
 extern "C" fn obstacle_release_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let ce = std::cell::Cell::new((p.ecx, p.edx));
     unsafe {
         shadow_run(
             OBSTACLE_RELEASE,
@@ -2054,11 +2251,12 @@ extern "C" fn obstacle_release_entry(r: &mut Pushad, _: *const u32) {
                 Some(v)
             },
             || {
-                obstacle_chain_release(p.eax);
+                ce.set(obstacle_chain_release(p.eax, p.edx));
                 0
             },
         )
     };
+    (r.ecx, r.edx) = ce.get();
 }
 regs_thunk!(obstacle_release_thunk, obstacle_release_entry);
 
@@ -2070,31 +2268,48 @@ const NAV_CHUNK_CELL_INDEX: usize = 0x00A0_52D0;
 /// `[rec + 0x248]`, skipped when null): `q = (cell - [arr + 0x14]) / 48` (hi32(d * 0x2AAAAAAB) sar 3 plus the
 /// sign bit); a q that is negative (signed) or >= u16[arr + 0x10] (signed compare) rejects. The first array
 /// that accepts stores q at `*out` and returns 1, the second returns 2, none returns 0.
-unsafe fn chunk_cell_index(cell: u32, rec: u32, out: u32) -> u32 {
+///
+/// Returns (EAX, ECX, EDX) as the original leaves them: the first array leaves ECX = the byte distance (or its
+/// u16 count) and EDX = the signed quotient; the second ECX = the array and EDX = its u16 count.
+unsafe fn chunk_cell_index(cell: u32, rec: u32, out: u32, ecx_in: u32, edx_in: u32) -> (u32, u32, u32) {
     unsafe {
         let r = rec as usize;
         if rd(cell as usize + 0x2C) as u16 != rd(r + 8) as u16 {
-            return 0;
+            return (0, ecx_in, edx_in);
         }
+        let (mut ecx, mut edx) = (ecx_in, edx_in);
         for (slot, ret) in [(0x240usize, 1u32), (0x248, 2)] {
             let arr = rd(r + slot) as usize;
             if arr == 0 {
+                ecx = 0;
                 continue;
             }
             let d = cell.wrapping_sub(rd(arr + 0x14)) as i32;
             let hi = ((d as i64 * 0x2AAA_AAAB) >> 32) as i32;
             let q0 = (hi >> 3) as u32;
             let q = q0.wrapping_add(q0 >> 31) as i32;
+            edx = q0;
+            let cnt = rd(arr + 0x10) & 0xFFFF;
+            if ret == 1 {
+                ecx = d as u32;
+            } else {
+                ecx = arr as u32;
+            }
             if q < 0 {
                 continue;
             }
-            if q >= (rd(arr + 0x10) & 0xFFFF) as i32 {
+            if ret == 1 {
+                ecx = cnt;
+            } else {
+                edx = cnt;
+            }
+            if q >= cnt as i32 {
                 continue;
             }
             wd(out as usize, q as u32);
-            return ret;
+            return (ret, ecx, edx);
         }
-        0
+        (0, ecx, edx)
     }
 }
 
@@ -2102,6 +2317,7 @@ extern "C" fn chunk_cell_index_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     unsafe {
         let (rec, out) = (*args, *args.add(1));
+        let ce = std::cell::Cell::new((p.ecx, p.edx));
         r.eax = shadow_run(
             CHUNK_CELL_INDEX,
             &p,
@@ -2109,8 +2325,13 @@ extern "C" fn chunk_cell_index_entry(r: &mut Pushad, args: *const u32) {
             2,
             true,
             || Some(vec![(out as usize, 4)]),
-            || chunk_cell_index(p.eax, rec, out),
+            || {
+                let (eax, ecx, edx) = chunk_cell_index(p.eax, rec, out, p.ecx, p.edx);
+                ce.set((ecx, edx));
+                eax
+            },
         );
+        (r.ecx, r.edx) = ce.get();
     }
 }
 regs_thunk!(chunk_cell_index_thunk, chunk_cell_index_entry);
@@ -2180,14 +2401,20 @@ macro_rules! regs_thunk_ret4 {
         #[unsafe(naked)]
         extern "C" fn $name() {
             std::arch::naked_asm!(
+                "sub esp, 128",
+                "movups [esp], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2", "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4", "movups [esp + 80], xmm5", "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
                 "pushad",
                 "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
                 "popad",
+                "movups xmm0, [esp]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]", "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]", "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "ret 4",
                 f = sym $f,
             )
@@ -2654,11 +2881,12 @@ const ROAD_LEN_SCALE: usize = 0x00E5_BF70;
 /// set skips the step; else x = f32 [rec + 0x14] (the load quiets a signalling NaN), when the flag byte == 1
 /// and ctl bit 4 is set x = f32(x * [0xE5BF70]); `sum = f32(x + sum)`. Returns the sum in ST0 and
 /// EAX = the final link (the head or 0).
-unsafe fn road_route_total_length(head: u32, flag: u8) -> (f32, u32) {
+/// Also returns the last record pointer and control word (ECX / EDX).
+unsafe fn road_route_total_length(head: u32, flag: u8, ecx_in: u32, edx_in: u32) -> (f32, u32, u32, u32) {
     unsafe {
         let mut sum = 0.0f32;
         if head == 0 {
-            return (sum, 0);
+            return (sum, 0, ecx_in, edx_in);
         }
         let scale = rd_f64(ROAD_LEN_SCALE);
         let mut p = head;
@@ -2674,7 +2902,7 @@ unsafe fn road_route_total_length(head: u32, flag: u8) -> (f32, u32) {
             }
             p = rd(p as usize);
             if p == head || p == 0 {
-                return (sum, p);
+                return (sum, p, rec as u32, ctl);
             }
         }
     }
@@ -2689,8 +2917,10 @@ extern "C" fn road_route_len_entry(r: &mut Pushad, args: *const u32) -> f32 {
     let p = *r;
     let arg0 = unsafe { *args };
     let flag = arg0 as u8;
-    let (mut ours, eax) = unsafe { road_route_total_length(p.esi, flag) };
+    let (mut ours, eax, ecx, edx) = unsafe { road_route_total_length(p.esi, flag, p.ecx, p.edx) };
     r.eax = eax;
+    r.ecx = ecx;
+    r.edx = edx;
     let Some((n, orig)) = shadowing(ROAD_ROUTE_LEN) else { return ours };
     let inp = Regs::of(&p);
     let mut out = inp;
@@ -2785,7 +3015,8 @@ regs_thunk!(record_valid_thunk, record_valid_entry);
 /// the radius is strictly greater than 0 (an x87 `fcomp` against 0.0 with `test ah, 0x41`, so <= 0 and NaN
 /// take the zero branch), else three zeros. The leading clears of +8 / +9 / +0xA are overwritten, but done
 /// in the original order.
-unsafe fn path_request_init(req: u32, flags: u32, start: u32, goal: u32, args: *const u32) {
+/// Returns EDX as the original leaves it (its low byte = the extra byte, then the last vec3 word it loaded).
+unsafe fn path_request_init(req: u32, flags: u32, start: u32, goal: u32, args: *const u32) -> u32 {
     unsafe {
         let c = req as usize;
         wb(c + 8, 0);
@@ -2798,8 +3029,10 @@ unsafe fn path_request_init(req: u32, flags: u32, start: u32, goal: u32, args: *
         wb(c + 8, lo);
         wb(c + 9, hi);
         wb(c + 0xA, ex);
+        let mut edx = (flags & !0xFF) | ex as u32;
         if rb(c + 9) & 0x80 != 0 {
             copy_vec3(c + 0xC, start as usize);
+            edx = rd(start as usize + 4);
         } else {
             for k in 0..3 {
                 wd(c + 0xC + 4 * k, 0);
@@ -2809,11 +3042,13 @@ unsafe fn path_request_init(req: u32, flags: u32, start: u32, goal: u32, args: *
         wd(c + 0x24, radius_bits);
         if f32::from_bits(radius_bits) > 0.0 {
             copy_vec3(c + 0x18, goal as usize);
+            edx = rd(goal as usize + 8);
         } else {
             for k in 0..3 {
                 wd(c + 0x18 + 4 * k, 0);
             }
         }
+        edx
     }
 }
 
@@ -2823,14 +3058,20 @@ macro_rules! regs_thunk_ret12 {
         #[unsafe(naked)]
         extern "C" fn $name() {
             std::arch::naked_asm!(
+                "sub esp, 128",
+                "movups [esp], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2", "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4", "movups [esp + 80], xmm5", "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
                 "pushad",
                 "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
                 "popad",
+                "movups xmm0, [esp]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]", "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]", "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "ret 12",
                 f = sym $f,
             )
@@ -2876,6 +3117,7 @@ unsafe fn call_full4_ret12(f: usize, r: &mut Regs, args: [u32; 4]) -> [u32; 4] {
 
 extern "C" fn path_request_init_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
+    let edx = std::cell::Cell::new(p.edx);
     r.eax = unsafe {
         shadow_run(
             PATH_REQ_INIT,
@@ -2885,11 +3127,12 @@ extern "C" fn path_request_init_entry(r: &mut Pushad, args: *const u32) {
             true,
             || Some(vec![(p.ecx as usize, 0x28)]),
             || {
-                path_request_init(p.ecx, p.edx, p.esi, p.edi, args);
+                edx.set(path_request_init(p.ecx, p.edx, p.esi, p.edi, args));
                 p.ecx
             },
         )
     };
+    r.edx = edx.get();
 }
 regs_thunk_ret12!(path_request_init_thunk, path_request_init_entry);
 
@@ -3035,6 +3278,9 @@ extern "C" fn lanes_add_entry(r: &mut Pushad, args: *const u32) {
             },
             || lanes_add_neighbours(p.eax, p.esi, cap, flag),
         );
+        // `mov ecx, cap` / `xor edx, edx; cmp [count], ecx; setge dl`
+        r.ecx = cap as u32;
+        r.edx = (rd(p.eax as usize) as i32 >= cap) as u32;
     }
 }
 regs_thunk!(lanes_add_thunk, lanes_add_entry);
@@ -3048,14 +3294,18 @@ regs_thunk!(lanes_add_thunk, lanes_add_entry);
 /// or after it whose key equals the entry's key; on a hit, a record with handle -1 gets
 /// word [rec] = u16 [owner + 8] and handle = j; then entry[+4] = rec[+0xC], entry[+8] = rec[+0x10] and the
 /// resume index becomes the hit. EAX leaves as the entries pointer (nothing done) or the final count.
-unsafe fn bind_chunk_entries(table: u32, n: i32, owner: u32) -> u32 {
+///
+/// Returns (EAX, ECX, EDX) as the original leaves them: ECX the entry count at first, then the end of the table
+/// after a failed scan or the second value of the last hit; EDX the resume index.
+unsafe fn bind_chunk_entries(table: u32, n: i32, owner: u32) -> (u32, u32, u32) {
     unsafe {
         let o = owner as usize;
         let entries = rd(o + 0x148);
         let m = rd(o + 0x144) as i32;
         if entries == 0 || n <= 0 || m <= 0 {
-            return entries;
+            return (entries, m as u32, 0);
         }
+        let mut ecx = m as u32;
         let tb = table as usize;
         let rec_at = |i: i32| tb.wrapping_add((i as u32 as usize).wrapping_mul(20));
         let mut edx = 0i32;
@@ -3076,6 +3326,9 @@ unsafe fn bind_chunk_entries(table: u32, n: i32, owner: u32) -> u32 {
                         break;
                     }
                 }
+                if !found {
+                    ecx = rec_at(n).wrapping_add(4) as u32;
+                }
                 if found && eax < n {
                     let rec = rec_at(eax);
                     if rd(rec + 4) == key {
@@ -3087,6 +3340,7 @@ unsafe fn bind_chunk_entries(table: u32, n: i32, owner: u32) -> u32 {
                         }
                         wd(edi + 4, rd(rec + 0xC));
                         wd(edi + 8, rd(rec + 0x10));
+                        ecx = rd(rec + 0x10);
                         edx = eax;
                     }
                 }
@@ -3094,7 +3348,7 @@ unsafe fn bind_chunk_entries(table: u32, n: i32, owner: u32) -> u32 {
             j += 1;
             edi = edi.wrapping_add(0x28);
             if j >= m {
-                return j as u32;
+                return (j as u32, ecx, edx as u32);
             }
         }
     }
@@ -3104,6 +3358,7 @@ extern "C" fn bind_chunk_entries_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     unsafe {
         let (table, n, owner) = (*args, *args.add(1) as i32, *args.add(2));
+        let ce = std::cell::Cell::new((p.ecx, p.edx));
         r.eax = shadow_run(
             BIND_CHUNK,
             &p,
@@ -3120,8 +3375,13 @@ extern "C" fn bind_chunk_entries_entry(r: &mut Pushad, args: *const u32) {
                 }
                 Some(vec![(entries, 0x28 * m as usize), (table as usize, 20 * n as usize)])
             },
-            || bind_chunk_entries(table, n, owner),
+            || {
+                let (eax, ecx, edx) = bind_chunk_entries(table, n, owner);
+                ce.set((ecx, edx));
+                eax
+            },
         );
+        (r.ecx, r.edx) = ce.get();
     }
 }
 regs_thunk!(bind_chunk_entries_thunk, bind_chunk_entries_entry);
@@ -3169,6 +3429,30 @@ fn checked_eax_masked(id: usize, p: &Pushad, ours: u32, mask: u32) -> u32 {
 /// `dot2 = f32(Q'.z*(-d.x) + (Q'.x*d.z + Q'.y*d.y))` must be negative or NaN for AL = 1. Bit 0 clear:
 /// `dotQ` (the same expression over Q') times `dotP` (over P') must be < 0.0 for EAX = 1 (NaN gives 0).
 /// Only AL is meaningful (the original leaves the x87 status word in AH on most paths).
+/// AH after `fnstsw ax` following an x87 compare of `a` (ST0) with `b`, with `depth` values on the x87 stack
+/// before any pop of that compare: C3 / C2 / C0 from the order (unordered sets all three), TOP = 8 - depth.
+/// x87 `fadd`: with two NaN operands the one with the larger significand wins (SSE keeps the first).
+fn x87_add(a: f64, b: f64) -> f64 {
+    if a.is_nan() && b.is_nan() {
+        const M: u64 = 0x000F_FFFF_FFFF_FFFF;
+        return if (b.to_bits() & M) > (a.to_bits() & M) { b } else { a };
+    }
+    a + b
+}
+
+fn fsw_ah(depth: u32, a: f64, b: f64) -> u32 {
+    let cc = if a.is_nan() || b.is_nan() {
+        0x45
+    } else if a > b {
+        0
+    } else if a < b {
+        1
+    } else {
+        0x40
+    };
+    cc | ((8 - depth) & 7) << 3
+}
+
 unsafe fn link_closest_point(link: u32, p: u32, q: u32, eax_in: u32) -> u32 {
     unsafe {
         let l = link as usize;
@@ -3188,11 +3472,14 @@ unsafe fn link_closest_point(link: u32, p: u32, q: u32, eax_in: u32) -> u32 {
             let (px, py, pz) = (sub(p, 0, ax), sub(p, 1, ay), sub(p, 2, az));
             let dot1 = ((px * dzd + py * dyd) + pz * ndxd) as f32;
             if dot1 < 0.0 {
-                return low;
+                // `fnstsw ax` with five values on the x87 stack (TOP = 3) and `0.0 > dot1`
+                return (eax_in & 0xFFFF_0000) | fsw_ah(5, 0.0, dot1 as f64) << 8;
             }
             let (qx, qy, qz) = (sub(q, 0, ax), sub(q, 1, ay), sub(q, 2, az));
             let dot2 = ((dyd * qy + dzd * qx) + ndxd * qz) as f32;
-            if dot2 < 0.0 || dot2.is_nan() { low | 1 } else { low }
+            // the last `fnstsw ax` follows an fcomp with the x87 stack empty again
+            let ah = fsw_ah(0, 0.0, dot2 as f64);
+            (eax_in & 0xFFFF_0000) | ah << 8 | (dot2 < 0.0 || dot2.is_nan()) as u32
         } else {
             let (px, py, pz) = (sub(p, 0, ax), sub(p, 1, ay), sub(p, 2, az));
             let (qx, qy, qz) = (sub(q, 0, ax), sub(q, 1, ay), sub(q, 2, az));
@@ -3207,6 +3494,8 @@ unsafe fn link_closest_point(link: u32, p: u32, q: u32, eax_in: u32) -> u32 {
 extern "C" fn link_closest_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax_masked(LINK_CLOSEST, &p, unsafe { link_closest_point(p.ecx, p.eax, p.esi, p.eax) }, 0xFF);
+    // `mov dl, [ecx + 0x18]`
+    r.edx = (p.edx & !0xFF) | unsafe { rb(p.ecx as usize + 0x18) } as u32;
 }
 regs_thunk!(link_closest_thunk, link_closest_entry);
 
@@ -3221,7 +3510,8 @@ regs_thunk!(link_closest_thunk, link_closest_entry);
 unsafe fn segment_intersect_xz(a: u32, b: u32, c: u32, d: u32, out: u32, eax_in: u32) -> u32 {
     unsafe {
         let (a, b, c, d) = (a as usize, b as usize, c as usize, d as usize);
-        let low = eax_in & !0xFF;
+        // failures leave AL = 0 and the x87 status word's high byte (TOP and the compare bits) in AH
+        let fail = |ah: u32| (eax_in & 0xFFFF_0000) | ah << 8;
         let f = |p: usize, k: usize| rf(p + 4 * k) as f64;
         let (ax, az, bx, bz, cx, cz, dx, dz) = (f(a, 0), f(a, 1), f(b, 0), f(b, 1), f(c, 0), f(c, 1), f(d, 0), f(d, 1));
         let s0 = ax - bx;
@@ -3232,28 +3522,34 @@ unsafe fn segment_intersect_xz(a: u32, b: u32, c: u32, d: u32, out: u32, eax_in:
         let m2 = s3 * s1;
         let det = (m1 - m2) as f32;
         if det == 0.0 {
-            return low;
+            return fail(fsw_ah(5, det as f64, 0.0));
         }
         let detd = det as f64;
         let t0 = bx - cx;
         let t1 = bz - cz;
         let n1 = (s1 * t1 - s2 * t0) as f32;
         let r = (n1 as f64 / detd) as f32;
-        if r < 0.0 || 1.0 < r {
-            return low;
+        if r < 0.0 {
+            return fail(fsw_ah(5, r as f64, 0.0));
+        }
+        if 1.0 < r {
+            return fail(fsw_ah(5, 1.0, r as f64));
         }
         let v = az - bz;
         let m1b = (t1 * s0 - t0 * v) as f32;
         let q = (m1b as f64 / detd) as f32;
-        if q < 0.0 || 1.0 < q {
-            return low;
+        if q < 0.0 {
+            return fail(fsw_ah(4, q as f64, 0.0));
+        }
+        if 1.0 < q {
+            return fail(fsw_ah(2, 1.0, q as f64));
         }
         let s0f = s0 as f32;
         let vf = v as f32;
         let w1 = (s0f as f64 * r as f64) as f32;
         let w2 = (r as f64 * vf as f64) as f32;
-        let ox = (bx + w1 as f64) as f32;
-        let oz = (w2 as f64 + bz) as f32;
+        let ox = x87_add(bx, w1 as f64) as f32;
+        let oz = x87_add(w2 as f64, bz) as f32;
         wf(out as usize, ox);
         wf(out as usize + 4, oz);
         (ox.to_bits() & !0xFF) | 1
@@ -3273,6 +3569,10 @@ extern "C" fn segment_intersect_entry(r: &mut Pushad, args: *const u32) {
             || Some(vec![(out as usize, 8)]),
             || segment_intersect_xz(p.esi, p.ecx, p.edx, p.edi, out, p.eax),
         );
+        // success leaves the stored z in ECX (`mov ecx, [esp + 8]`); failure keeps ECX
+        if r.eax & 0xFF == 1 {
+            r.ecx = rd(out as usize + 4);
+        }
     }
 }
 regs_thunk!(segment_intersect_thunk, segment_intersect_entry);
@@ -3298,17 +3598,23 @@ const RQ_FIRST_HIT_CB: usize = 0x00A8_9AB0;
 
 /// `s = [a]`; 0x632C60(EAX = [s], ECX = s + 0x1C, EDX = ESI = s, stack b) then 0x632C60(EAX = [s], ECX = s + 0x22,
 /// stack c) (EDX is the first call's leftover = b); AL = 1 on top of the second call's EAX.
-unsafe fn query_tree_cb(a: u32, b: u32, c: u32, edi: u32) -> u32 {
+///
+/// Both calls see the registers the original has and the stack above their argument (the saved ESI, then the
+/// first argument); returns (EAX, ECX, EDX) as the second call leaves them.
+unsafe fn query_tree_cb(p: &Pushad, a: u32, b: u32, c: u32) -> (u32, u32, u32) {
     unsafe {
         let s = rd(a as usize);
-        call_regs(RQ_TREE_ADD, rd(s as usize), s + 0x1C, b, s, edi, &[b]);
-        let e = call_regs(RQ_TREE_ADD, rd(s as usize), s + 0x22, b, s, edi, &[c]);
-        (e & !0xFF) | 1
+        let mut g = Regs { eax: rd(s as usize), ecx: s + 0x1C, edx: b, ebx: p.ebx, esi: s, edi: p.edi, ebp: p.ebp };
+        call_full4(RQ_TREE_ADD, &mut g, [b, p.esi, 0, 0]);
+        let mut g2 = Regs { eax: rd(s as usize), ecx: s + 0x22, edx: g.edx, ebx: p.ebx, esi: s, edi: p.edi, ebp: p.ebp };
+        call_full4(RQ_TREE_ADD, &mut g2, [c, b, 0, 0]);
+        ((g2.eax & !0xFF) | 1, g2.ecx, g2.edx)
     }
 }
 
 extern "C" fn query_tree_cb_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
+    let ce = std::cell::Cell::new((p.ecx, p.edx));
     unsafe {
         let (a, b, c) = (*args, *args.add(1), *args.add(2));
         r.eax = shadow_run(
@@ -3318,9 +3624,14 @@ extern "C" fn query_tree_cb_entry(r: &mut Pushad, args: *const u32) {
             3,
             true,
             || Some(vec![(b as usize, 12), (c as usize, 12)]),
-            || query_tree_cb(a, b, c, p.edi),
+            || {
+                let (eax, ecx, edx) = query_tree_cb(&p, a, b, c);
+                ce.set((ecx, edx));
+                eax
+            },
         );
     }
+    (r.ecx, r.edx) = ce.get();
 }
 regs_thunk!(query_tree_cb_thunk, query_tree_cb_entry);
 
@@ -3331,36 +3642,52 @@ regs_thunk!(query_tree_cb_thunk, query_tree_cb_entry);
 /// `(ctl >> 26) & 3` (EAX holds that value from then on) else 1; with [0x2FA8CD4] non-null 0xA8D010
 /// (ECX = it, stack = record) must return 0 for 1, else the result is 0. `mov al, 1` / `xor al, al`
 /// keep the rest of EAX as it stands (ctl, the shifted kind, or 0xA8D010's EAX).
-unsafe fn query_filter(rec: u32, esi: u32, edi: u32) -> u32 {
+///
+/// Returns (EAX, ECX, EDX): ECX is the wanted bits (mode 1), then the kind, then the extra-test pointer, as far
+/// as the walk got; EDX stays the record unless the extra test ran (its leftover).
+unsafe fn query_filter(p: &Pushad) -> (u32, u32, u32) {
     unsafe {
+        let rec = p.edx;
         let mut eax = rd(rec as usize + 0x10);
         let want = rd(RQ_WANT_BITS);
-        let hit = if rb(RQ_MODE) != 0 { eax & want == want } else { want & eax != 0 };
+        let mode = rb(RQ_MODE) != 0;
+        let mut ecx = p.ecx;
+        if mode {
+            ecx = want;
+        }
+        let hit = if mode { eax & want == want } else { want & eax != 0 };
         if !hit {
-            return (eax & !0xFF) | 1;
+            return ((eax & !0xFF) | 1, ecx, p.edx);
         }
         if rd(RQ_MASK_BITS) & eax != 0 {
-            return (eax & !0xFF) | 1;
+            return ((eax & !0xFF) | 1, ecx, p.edx);
         }
         let kind = rd(RQ_KIND);
+        ecx = kind;
         if kind != 0xFFFF_FFFF {
             eax = (eax >> 26) & 3;
             if eax != kind {
-                return (eax & !0xFF) | 1;
+                return ((eax & !0xFF) | 1, ecx, p.edx);
             }
         }
         let extra = rd(RQ_EXTRA);
+        ecx = extra;
         if extra == 0 {
-            return eax & !0xFF;
+            return (eax & !0xFF, ecx, p.edx);
         }
-        let e = call_regs(RQ_EXTRA_TEST, eax, extra, rec, esi, edi, &[rec]);
-        if e & 0xFF == 0 { (e & !0xFF) | 1 } else { e & !0xFF }
+        let mut g = Regs { eax, ecx: extra, edx: rec, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp };
+        call_full4(RQ_EXTRA_TEST, &mut g, [rec, 0, 0, 0]);
+        let e = g.eax;
+        (if e & 0xFF == 0 { (e & !0xFF) | 1 } else { e & !0xFF }, g.ecx, g.edx)
     }
 }
 
 extern "C" fn query_filter_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked_eax(QUERY_FILTER, &p, unsafe { query_filter(p.edx, p.esi, p.edi) });
+    let (eax, ecx, edx) = unsafe { query_filter(&p) };
+    r.eax = checked_eax(QUERY_FILTER, &p, eax);
+    r.ecx = ecx;
+    r.edx = edx;
 }
 regs_thunk!(query_filter_thunk, query_filter_entry);
 
@@ -3368,13 +3695,16 @@ regs_thunk!(query_filter_thunk, query_filter_entry);
 
 /// `rec = [a]`; the filter (0xA89A50, EDX = rec) saying 1 gives AL = 1 (EAX = the filter's with AL = 1).
 /// Else `buf[count] = rec`, count += 1, AL = (count < max, signed) with the rest of EAX = the new count.
-unsafe fn query_first_hit(a: u32, ecx: u32, esi: u32, edi: u32) -> u32 {
+///
+/// Returns (EAX, ECX, EDX) as the original leaves them: the filter's leftovers, or ECX = the continue flag and
+/// EDX = the buffer.
+unsafe fn query_first_hit(p: &Pushad, a: u32) -> (u32, u32, u32) {
     unsafe {
         let rec = rd(a as usize);
-        let e = call_regs(RQ_FILTER, a, ecx, rec, rec, edi, &[]);
-        let _ = esi;
-        if e & 0xFF != 0 {
-            return (e & !0xFF) | 1;
+        let mut g = Regs { eax: a, ecx: p.ecx, edx: rec, ebx: p.ebx, esi: rec, edi: p.edi, ebp: p.ebp };
+        call_full4(RQ_FILTER, &mut g, [0; 4]);
+        if g.eax & 0xFF != 0 {
+            return ((g.eax & !0xFF) | 1, g.ecx, g.edx);
         }
         let count = rd(RQ_COUNT);
         let buf = rd(RQ_BUF);
@@ -3382,12 +3712,13 @@ unsafe fn query_first_hit(a: u32, ecx: u32, esi: u32, edi: u32) -> u32 {
         let n = rd(RQ_COUNT).wrapping_add(1);
         let lt = (n as i32) < (rd(RQ_MAX) as i32);
         wd(RQ_COUNT, n);
-        (n & !0xFF) | lt as u32
+        ((n & !0xFF) | lt as u32, lt as u32, buf)
     }
 }
 
 extern "C" fn query_first_hit_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
+    let ce = std::cell::Cell::new((p.ecx, p.edx));
     unsafe {
         let a = *args;
         r.eax = shadow_run(
@@ -3403,9 +3734,14 @@ extern "C" fn query_first_hit_entry(r: &mut Pushad, args: *const u32) {
                 }
                 Some(vec![(RQ_COUNT, 4), (buf as usize + (count as usize).wrapping_mul(4), 4)])
             },
-            || query_first_hit(a, p.ecx, p.esi, p.edi),
+            || {
+                let (eax, ecx, edx) = query_first_hit(&p, a);
+                ce.set((ecx, edx));
+                eax
+            },
         );
     }
+    (r.ecx, r.edx) = ce.get();
 }
 regs_thunk!(query_first_hit_entry_thunk, query_first_hit_entry);
 
@@ -3416,12 +3752,15 @@ regs_thunk!(query_first_hit_entry_thunk, query_first_hit_entry);
 /// kind = -1) and the tree query 0xBF73B0 runs with (EAX = tree, ECX = a, EDX = [tree + 8]; stack [tree + 8], a,
 /// b, [tree], tree_cb 0xA89A20, first_hit_cb 0xA89AB0; it pops 0x18); `[ESI] = count`, EAX = count.
 /// No shadow: the callbacks write the buffer and whatever the tree query touches.
-unsafe fn road_network_probe(buf: u32, out: u32, args: *const u32, ecx: u32, edi: u32) -> u32 {
+///
+/// Returns (EAX, ECX, EDX): ECX = 0 on the early exit, else the tree query's leftovers.
+unsafe fn road_network_probe(p: &Pushad, args: *const u32) -> (u32, u32, u32) {
     unsafe {
+        let (buf, out) = (p.edx, p.esi);
         let net = rd(ROAD_NET);
         if net == 0 || rd(net as usize + 0x84) == 0 {
             wd(out as usize, 0);
-            return net;
+            return (net, 0, p.edx);
         }
         wd(RQ_BUF, buf);
         wd(RQ_COUNT, 0);
@@ -3434,25 +3773,23 @@ unsafe fn road_network_probe(buf: u32, out: u32, args: *const u32, ecx: u32, edi
         let tree = rd(net as usize + 0x84);
         let root = rd(tree as usize);
         let t8 = rd(tree as usize + 8);
-        let _ = ecx;
-        call_regs(
+        let g = Regs { eax: tree, ecx: *args, edx: t8, ebx: p.ebx, esi: out, edi: p.edi, ebp: p.ebp };
+        let (g, _, _) = call_orig_n::<0x18>(
             RQ_TREE_QUERY,
-            tree,
-            *args,
-            t8,
-            out,
-            edi,
-            &[t8, *args, *args.add(1), root, RQ_TREE_CB as u32, RQ_FIRST_HIT_CB as u32],
+            &g,
+            &[t8, *args, *args.add(1), root, RQ_TREE_CB as u32, RQ_FIRST_HIT_CB as u32, 0, 0],
+            false,
         );
         let c = rd(RQ_COUNT);
         wd(out as usize, c);
-        c
+        (c, g.ecx, g.edx)
     }
 }
 
 extern "C" fn road_network_probe_entry(r: &mut Pushad, args: *const u32) {
     PORTS[ROAD_PROBE].calls.fetch_add(1, Ordering::Relaxed);
-    r.eax = unsafe { road_network_probe(r.edx, r.esi, args, r.ecx, r.edi) };
+    let p = *r;
+    (r.eax, r.ecx, r.edx) = unsafe { road_network_probe(&p, args) };
 }
 regs_thunk!(road_probe_thunk, road_network_probe_entry);
 
@@ -3496,9 +3833,11 @@ extern "C" fn route_refill_entry(r: &mut Pushad, _: *const u32) {
         if rd(slot as usize) == 0 {
             return;
         }
-        call_regs(NAV_ROUTE_CLEAR_ADDR, route, p.ecx, p.edx, route, slot, &[]);
-        let mut ecx: u32;
-        let mut edx = p.edx;
+        // every callee gets the registers the original had at that point (EBP = 0, EBX the loop counter) and
+        // leaves ECX / EDX behind for the next step
+        let mut g = Regs { eax: route, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: route, edi: slot, ebp: 0 };
+        call_full4(NAV_ROUTE_CLEAR_ADDR, &mut g, [0; 4]);
+        let (mut ecx, mut edx) = (g.ecx, g.edx);
         let mut eax;
         let mut n = 0;
         loop {
@@ -3529,13 +3868,17 @@ extern "C" fn route_refill_entry(r: &mut Pushad, _: *const u32) {
             }
             wd(e + 0x1C, eax);
             wd(e + 0x20, eax);
-            eax = call_regs(NAV_ROUTE_PUSH_ADDR, eax, ecx, edx, route, slot, &[eax, 0, 1]);
+            let mut g = Regs { eax, ecx, edx, ebx: n, esi: route, edi: slot, ebp: 0 };
+            call_full4(NAV_ROUTE_PUSH_ADDR, &mut g, [eax, 0, 1, 0]);
+            (eax, ecx, edx) = (g.eax, g.ecx, g.edx);
             n += 1;
             if n >= 3 {
                 break;
             }
         }
         r.eax = eax;
+        r.ecx = ecx;
+        r.edx = edx;
     }
 }
 regs_thunk!(route_refill_thunk, route_refill_entry);
@@ -3550,20 +3893,26 @@ extern "C" fn path_mark_ends_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     unsafe {
         let (head_slot, req) = (p.esi, p.edi);
-        call_regs(NAV_PATH_SETUP_ADDR, head_slot, p.ecx, p.edx, head_slot, req, &[req]);
-        let mut eax = rd(head_slot as usize);
-        if eax == 0 {
+        // ECX is saved on entry and popped on exit; EDX / EAX are what the callees leave
+        let mut g = Regs { eax: head_slot, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: head_slot, edi: req, ebp: p.ebp };
+        call_full4(NAV_PATH_SETUP_ADDR, &mut g, [req, p.ecx, 0, 0]);
+        r.ecx = p.ecx;
+        r.edx = g.edx;
+        if rd(head_slot as usize) == 0 {
             r.eax = 0;
             return;
         }
-        let n = rd(eax as usize + 4) as usize;
+        let n = rd(rd(head_slot as usize) as usize + 4) as usize;
         wb(n + 0x37, rb(n + 0x37) | 1);
         let h = rd(head_slot as usize);
         let n2 = if h != 0 { rd(h as usize + 4) as usize } else { 0 };
         wb(n2 + 0x37, rb(n2 + 0x37) | 2);
-        eax = n2 as u32;
+        let mut eax = n2 as u32;
         if rb(req as usize + 9) & 0x10 != 0 && rd(head_slot as usize) != 0 {
-            eax = call_regs(NAV_PATH_FINISH_ADDR, req + 8, p.ecx, p.edx, head_slot, req, &[head_slot, 0, 0]);
+            let mut g2 = Regs { eax: req + 8, ecx: g.ecx, edx: g.edx, ebx: p.ebx, esi: head_slot, edi: req, ebp: p.ebp };
+            call_full4(NAV_PATH_FINISH_ADDR, &mut g2, [head_slot, 0, 0, 0]);
+            eax = g2.eax;
+            r.edx = g2.edx;
         }
         r.eax = eax;
     }
@@ -3836,21 +4185,29 @@ macro_rules! thunk4 {
     ($name:ident, $f:ident, eax, $n:literal) => { thunk4!(@ $name, $f, "nop", concat!("ret ", $n)); };
     ($name:ident, $f:ident, st0) => { thunk4!(@ $name, $f, "push eax\n fld dword ptr [esp]\n add esp, 4", "ret"); };
     ($name:ident, $f:ident, st0, $n:literal) => { thunk4!(@ $name, $f, "push eax\n fld dword ptr [esp]\n add esp, 4", concat!("ret ", $n)); };
-    ($name:ident, $f:ident, xmm0) => { thunk4!(@ $name, $f, "movd xmm0, eax", "ret"); };
-    ($name:ident, $f:ident, xmm0, $n:literal) => { thunk4!(@ $name, $f, "movd xmm0, eax", concat!("ret ", $n)); };
+    ($name:ident, $f:ident, xmm0) => { thunk4!(@ $name, $f, "movd xmm0, eax
+ movups [esp + 32], xmm0", "ret"); };
+    ($name:ident, $f:ident, xmm0, $n:literal) => { thunk4!(@ $name, $f, "movd xmm0, eax
+ movups [esp + 32], xmm0", concat!("ret ", $n)); };
     (@ $name:ident, $f:ident, $conv:expr, $ret:expr) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
             std::arch::naked_asm!(
+                "sub esp, 128",
+                "movups [esp], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2", "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4", "movups [esp + 80], xmm5", "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
                 "pushad",
                 "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
                 $conv,
                 "popad",
+                "movups xmm0, [esp]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]", "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]", "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 $ret,
                 f = sym $f,
             )
@@ -4460,12 +4817,18 @@ thunk4!(road_lane_walk_back_thunk, road_lane_walk_back_entry, eax);
 /// at 53 bits rounded to f32, centre copied dword by dword, 0x2FA8D1C = [0xE5D0A8] when +0x1E is set else
 /// -1.0, each through the x87), the tree walk runs (0xBF78B0 with 4 arguments when +0x1F is set, else 0xBF77B0
 /// with the tree callback 0xA89A20 and the nearest-lane callback 0xA89B00) and the hit count is stored in +0x28.
-unsafe fn road_network_query(q: u32) {
+///
+/// Sets ECX / EDX / EAX in `r` as the original leaves them: ECX = the network on the early exit, EDX = 0; after
+/// the tree walk ECX = the hit count and EAX / EDX the walk's leftovers.
+unsafe fn road_network_query(rg: &mut Pushad) {
     unsafe {
+        let q = rg.esi;
         let qp = q as usize;
         let net = rd(ROAD_NET) as usize;
         if net == 0 || rd(net + 0x84) == 0 {
             wd(qp + 0x28, 0);
+            rg.ecx = net as u32;
+            rg.edx = 0;
             return;
         }
         wd(RQ_COUNT, 0);
@@ -4487,18 +4850,28 @@ unsafe fn road_network_query(q: u32) {
         let tree = rd(net + 0x84);
         let (head, root) = (rd(tree as usize), rd(tree as usize + 8));
         let rad = quiet32(rd(qp + 0x10));
-        if rb(qp + 0x1F) != 0 {
-            call_regs(ROAD_TREE_WALK_B, root, 0, c as u32, 0, 0, &[root, c as u32, rad, head]);
+        let g = Regs { eax: root, ecx: head, edx: c as u32, ebx: rg.ebx, esi: q, edi: rg.edi, ebp: rg.ebp };
+        let g = if rb(qp + 0x1F) != 0 {
+            call_orig_n::<0x10>(ROAD_TREE_WALK_B, &g, &[root, c as u32, rad, head, 0, 0, 0, 0], false).0
         } else {
-            call_regs(ROAD_TREE_WALK, root, 0, c as u32, 0, 0, &[root, c as u32, rad, head, ROAD_CB_TREE as u32, ROAD_CB_NEAREST as u32]);
-        }
+            call_orig_n::<0x18>(
+                ROAD_TREE_WALK,
+                &g,
+                &[root, c as u32, rad, head, ROAD_CB_TREE as u32, ROAD_CB_NEAREST as u32, 0, 0],
+                false,
+            )
+            .0
+        };
+        rg.eax = g.eax;
+        rg.edx = g.edx;
+        rg.ecx = rd(RQ_COUNT);
         wd(qp + 0x28, rd(RQ_COUNT));
     }
 }
 
 extern "C" fn road_network_query_entry(r: &mut Pushad, _: *const u32) -> u32 {
     PORTS[ROAD_QUERY].calls.fetch_add(1, Ordering::Relaxed);
-    unsafe { road_network_query(r.esi) };
+    unsafe { road_network_query(r) };
     0
 }
 thunk4!(road_network_query_thunk, road_network_query_entry, eax);

@@ -8,6 +8,119 @@
 //! effect_object_update (0x505480) is not ported: it is a ~13 KB function with a 0x6A8-byte,
 //! 16-byte-aligned frame, not a followable call sequence.
 
+
+/// Thunks like portlib's keep_ecx_edx*, but also keeping XMM0-7 (the original leaves them alone).
+#[allow(unused_macros)]
+macro_rules! kx0 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "call {f}",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+#[allow(unused_macros)]
+macro_rules! kx1 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "push dword ptr [esp + 140]",
+            "call {f}",
+            "add esp, 4",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+#[allow(unused_macros)]
+macro_rules! kx2 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "push dword ptr [esp + 144]",
+            "push dword ptr [esp + 144]",
+            "call {f}",
+            "add esp, 8",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::portlib::*;
@@ -147,7 +260,7 @@ unsafe fn c0(f: usize) -> u32 {
 // cdecl (human, f32 dt), called for every human by humans_update_all. Doc 15, "human_update
 // porting map", corrected against the disassembly.
 
-keep_ecx_edx_arg2!(human_update_thunk, human_update);
+kx2!(human_update_thunk, human_update);
 
 extern "C" fn human_update(h: u32, dt: u32) {
     HUMAN_UPDATE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -649,7 +762,7 @@ unsafe fn human_update_hud(h: u32) {
 // against the disassembly. The state is [0x1450380]; M = [0x27B3C60], its kind M+0x3C.
 // EDI is 0 throughout the original (except around 0x699840 and 0x98CEB0), so it is passed as 0.
 
-keep_ecx_edx!(mission_fail_flow_do_frame_thunk, mission_fail_flow_do_frame);
+kx0!(mission_fail_flow_do_frame_thunk, mission_fail_flow_do_frame);
 
 extern "C" fn mission_fail_flow_do_frame() {
     MISSION_FAIL_CALLS.fetch_add(1, Ordering::Relaxed);

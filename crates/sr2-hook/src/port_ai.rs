@@ -174,12 +174,30 @@ macro_rules! regs_thunk {
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
-                "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 128]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 "ret",
                 f = sym $f,
@@ -3614,12 +3632,30 @@ macro_rules! regs_thunk_ret {
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
-                "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 128]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 "ret {n}",
                 f = sym $f,
@@ -4472,7 +4508,7 @@ const COPIES: [(usize, usize); 32] = [
 
 /// Install this module's replacements (called from hooks::install_all).
 pub fn install() {
-    let list: [(usize, &[u8], &[usize], extern "C" fn()); COUNT] = [
+    let mut list: [(usize, &[u8], &[usize], extern "C" fn()); COUNT] = [
         (FIND, &FIND_BODY, &FIND_BODY_CALLS, find_thunk),
         (CANCEL, &CANCEL_BODY, &CANCEL_BODY_CALLS, cancel_thunk),
         (MEAN, &MEAN_BODY, &MEAN_BODY_CALLS, mean_thunk),
@@ -4599,6 +4635,11 @@ pub fn install() {
         (NR_K1A, &NR_K1A_BODY, &NR_K1A_BODY_CALLS, nr_k1a_thunk),
         (NR_K00, &NR_K00_BODY, &NR_K00_BODY_CALLS, nr_k00_thunk),
     ];
+    for e in list.iter_mut() {
+        if let Some(t) = lifted::thunk_for(e.0) {
+            e.3 = t;
+        }
+    }
     // The unmodified second copy of ai_order_set_action (before its entry is replaced).
     match unsafe { detour::relocate(PORTS[SETACT].addr, &SETACT_BODY, &SETACT_BODY_CALLS) } {
         Ok(copy) => SETACT_PRISTINE.store(copy, Ordering::Relaxed),
@@ -10804,6 +10845,13474 @@ const K23_UP_BODY_CALLS: [usize; 74] = [0x76, 0xc3, 0xed, 0x10a, 0x14f, 0x15e, 0
 // The game's data windows (constants, the object pool, a few globals) are mapped at their real addresses with the exe's bytes;
 // the callees are generated (random registers, ST0 / XMM0, pointed-to floats) instead of called; the Rust body runs once with
 // them recorded and the original body, relocated, runs against the replay stubs: the same flow as the in-game shadow.
+
+
+
+
+
+
+
+
+// =============================================================================================
+// Judge fix round (2026-11-26): the ports below were re-derived from the original bytes with a
+// small lifter (one Rust statement per x86 instruction, the registers as locals, the stack frame
+// kept at the original's own addresses below the return slot, the flags computed eagerly,
+// x87 on an f64 stack, callees called BY ADDRESS with every live register and the stack
+// arguments the original passes). They reproduce the exact EAX / ECX / EDX, the argument slots
+// the originals scribble on and the order of the callee calls, which the earlier hand-written
+// bodies above (still installed for the ports that pass) did not. `lifted_thunk` replaces the old
+// thunk of each listed port at install time.
+// =============================================================================================
+#[allow(clippy::all)]
+mod lifted {
+    use super::*;
+
+    /// A thunk like `regs_thunk!` that first moves ESP down by `$fr` bytes, so that the lifted body
+    /// can keep the original's stack frame (locals, pushes) at the very addresses the original
+    /// used, below the return slot: pointers to locals that are handed to callees are then the
+    /// same as in the original. `$fr` covers the whole frame of the original.
+    macro_rules! regs_thunk_fr {
+        ($name:ident, $f:ident, $fr:literal, $n:literal) => {
+            #[unsafe(naked)]
+            extern "C" fn $name() {
+                std::arch::naked_asm!(
+                    "lea esp, [esp - {fr}]",
+                    "pushad",
+                    "sub esp, 128",
+                    "movups [esp + 0], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2", "movups [esp + 48], xmm3",
+                    "movups [esp + 64], xmm4", "movups [esp + 80], xmm5", "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
+                    "lea eax, [esp + 128]",
+                    "lea ecx, [esp + 164 + {fr}]",
+                    "push ecx",
+                    "push eax",
+                    "call {f}",
+                    "add esp, 8",
+                    "movups xmm0, [esp + 0]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]", "movups xmm3, [esp + 48]",
+                    "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]", "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                    "add esp, 128",
+                    "popad",
+                    "lea esp, [esp + {fr}]",
+                    "ret {n}",
+                    f = sym $f,
+                    fr = const $fr,
+                    n = const $n,
+                )
+            }
+        };
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct L {
+        eax: u32,
+        ecx: u32,
+        edx: u32,
+        ebx: u32,
+        esi: u32,
+        edi: u32,
+        ebp: u32,
+    }
+
+    #[repr(C)]
+    struct CallBlock {
+        l: L,
+        f: u32,
+        args: u32,
+        n: u32,
+        esp: u32,
+        st0: [u32; 2],
+        want: u32,
+    }
+
+    /// Call `f` with all seven registers from `l` and `n` stack arguments copied from `args`;
+    /// the registers come back in `l`, and with `want` the ST0 the callee returns is popped.
+    /// `offb` is where the block pointer sits (after one extra push) once the call returned:
+    /// 8 when the callee pops its arguments, `4 * n + 8` when it does not.
+    macro_rules! lcall {
+        ($f:expr, $l:ident, $args:expr, $n:literal, $offb:literal, $want:literal) => {{
+            let mut blk = CallBlock { l: $l, f: ($f) as u32, args: ($args) as u32, n: $n, esp: 0, st0: [0; 2], want: $want as u32 };
+            let bp: *mut CallBlock = &mut blk;
+            std::arch::asm!(
+                "push ebp", "push ebx", "push esi", "push edi",
+                "mov [eax + 40], esp",
+                "push eax",
+                "push dword ptr [eax + 28]",
+                "mov ecx, [eax + 36]",
+                "mov esi, [eax + 32]",
+                "2:",
+                "test ecx, ecx",
+                "jz 3f",
+                "push dword ptr [esi + ecx*4 - 4]",
+                "dec ecx",
+                "jmp 2b",
+                "3:",
+                "mov ecx, [eax + 4]", "mov edx, [eax + 8]", "mov ebx, [eax + 12]",
+                "mov esi, [eax + 16]", "mov edi, [eax + 20]", "mov ebp, [eax + 24]",
+                "mov eax, [eax]",
+                "call dword ptr [esp + {n4}]",
+                "push ebx",
+                "mov ebx, [esp + {offb}]",
+                "mov [ebx], eax", "mov [ebx + 4], ecx", "mov [ebx + 8], edx",
+                "mov [ebx + 16], esi", "mov [ebx + 20], edi", "mov [ebx + 24], ebp",
+                "pop dword ptr [ebx + 12]",
+                "cmp dword ptr [ebx + 52], 0",
+                "je 4f",
+                "fstp qword ptr [ebx + 44]",
+                "4:",
+                "mov esp, [ebx + 40]",
+                "pop edi", "pop esi", "pop ebx", "pop ebp",
+                n4 = const ($n * 4),
+                offb = const $offb,
+                inout("eax") bp => _,
+                lateout("ecx") _,
+                lateout("edx") _,
+                clobber_abi("C"),
+            );
+            $l = blk.l;
+            f64::from_bits((blk.st0[0] as u64) | ((blk.st0[1] as u64) << 32))
+        }};
+    }
+
+    /// `fld dword`: the x87 widening of an f32 (exact, denormals kept, a signalling NaN quieted). Done on the
+    /// bits because SSE conversions flush denormals when the game has DAZ / FTZ set.
+    #[inline(always)]
+    fn f32b_to_f64(b: u32) -> f64 {
+        let sign = ((b >> 31) as u64) << 63;
+        let exp = (b >> 23) & 0xFF;
+        let mant = (b & 0x7F_FFFF) as u64;
+        if exp == 0xFF {
+            let q = if mant != 0 { 0x0008_0000_0000_0000 | (mant << 29) } else { 0 };
+            return f64::from_bits(sign | 0x7FF0_0000_0000_0000 | q);
+        }
+        if exp == 0 {
+            if mant == 0 {
+                return f64::from_bits(sign);
+            }
+            let v = (mant as f64) * f64::from_bits(0x36A0_0000_0000_0000); // 2^-149
+            return if sign != 0 { -v } else { v };
+        }
+        f64::from_bits(sign | (((exp as u64) + 896) << 52) | (mant << 29))
+    }
+
+    /// `fstp dword`: the x87 narrowing of a double to an f32, round to nearest even, denormal results kept.
+    #[inline(always)]
+    fn f64_to_f32b(x: f64) -> u32 {
+        let bits = x.to_bits();
+        let sign = ((bits >> 63) as u32) << 31;
+        let exp = ((bits >> 52) & 0x7FF) as i32;
+        let mant = bits & 0x000F_FFFF_FFFF_FFFF;
+        if exp == 0x7FF {
+            return if mant != 0 { sign | 0x7FC0_0000 | ((mant >> 29) as u32) } else { sign | 0x7F80_0000 };
+        }
+        if exp == 0 {
+            return sign;
+        }
+        let mut e = exp - 1023;
+        let sig = mant | (1u64 << 52);
+        if e >= -126 {
+            let mut q = sig >> 29;
+            let rem = sig & ((1u64 << 29) - 1);
+            let half = 1u64 << 28;
+            if rem > half || (rem == half && (q & 1) == 1) {
+                q += 1;
+            }
+            if q == (1u64 << 24) {
+                q >>= 1;
+                e += 1;
+            }
+            if e > 127 {
+                return sign | 0x7F80_0000;
+            }
+            return sign | (((e + 127) as u32) << 23) | ((q as u32) & 0x7F_FFFF);
+        }
+        let shift = 29 + (-126 - e) as u32;
+        if shift > 60 {
+            return sign;
+        }
+        let mut q = sig >> shift;
+        let rem = sig & ((1u64 << shift) - 1);
+        let half = 1u64 << (shift - 1);
+        if rem > half || (rem == half && (q & 1) == 1) {
+            q += 1;
+        }
+        sign | (q as u32)
+    }
+
+    #[allow(dead_code)]
+    #[inline(always)]
+    fn q64(b: u64) -> u64 {
+        if b & 0x7FF0_0000_0000_0000 == 0x7FF0_0000_0000_0000 && b & 0x000F_FFFF_FFFF_FFFF != 0 { b | 0x0008_0000_0000_0000 } else { b }
+    }
+
+    #[inline(always)]
+    unsafe fn m8(a: u32) -> u32 {
+        unsafe { std::ptr::read_unaligned(a as *const u8) as u32 }
+    }
+    #[inline(always)]
+    unsafe fn m16(a: u32) -> u32 {
+        unsafe { std::ptr::read_unaligned(a as *const u16) as u32 }
+    }
+    #[inline(always)]
+    unsafe fn m32(a: u32) -> u32 {
+        unsafe { std::ptr::read_unaligned(a as *const u32) }
+    }
+    #[inline(always)]
+    unsafe fn w8(a: u32, v: u32) {
+        unsafe { std::ptr::write_unaligned(a as *mut u8, v as u8) }
+    }
+    #[inline(always)]
+    unsafe fn w16(a: u32, v: u32) {
+        unsafe { std::ptr::write_unaligned(a as *mut u16, v as u16) }
+    }
+    #[inline(always)]
+    unsafe fn w32(a: u32, v: u32) {
+        unsafe { std::ptr::write_unaligned(a as *mut u32, v) }
+    }
+    #[inline(always)]
+    fn parity(v: u32) -> bool {
+        (v as u8).count_ones() % 2 == 0
+    }
+
+
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_event_cancel(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x402160;
+        'run: loop {
+            match pc {
+                0x402160 => {
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m32(esp.wrapping_add(0xC));
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = m32(esp.wrapping_add(0xC));
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(0x2526A00);
+                    ecx = edi;
+                    pc = 0x402173; continue 'run;
+                }
+                0x402173 => {
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4021AA; continue 'run; }
+                    pc = 0x402177; continue 'run;
+                }
+                0x402177 => {
+                    edx = m32(ecx);
+                    eax = edx;
+                    { let a: u32 = eax; let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let r: u32 = (0u32).wrapping_sub(a) & 0xFFFFFFFF; cf = a != 0; of = a == 0x80000000;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = eax;
+                    let c: u32 = cf as u32; let r: u32 = a.wrapping_sub(b).wrapping_sub(c) & 0xFFFFFFFF; cf = (a as u64) < (b as u64 + c as u64); of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let r: u32 = (eax & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = esi; let b: u32 = 0xFFFFFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x40218D; continue 'run; }
+                    pc = 0x402188; continue 'run;
+                }
+                0x402188 => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x8)); let b: u32 = esi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4021A6; continue 'run; }
+                    pc = 0x40218D; continue 'run;
+                }
+                0x40218D => {
+                    { let r: u32 = (ebp & ebp) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x402196; continue 'run; }
+                    pc = 0x402191; continue 'run;
+                }
+                0x402191 => {
+                    { let a: u32 = m32(ecx.wrapping_add(0xC)); let b: u32 = ebp;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4021A6; continue 'run; }
+                    pc = 0x402196; continue 'run;
+                }
+                0x402196 => {
+                    { let r: u32 = (ebx & ebx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x40219F; continue 'run; }
+                    pc = 0x40219A; continue 'run;
+                }
+                0x40219A => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x10)); let b: u32 = ebx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4021A6; continue 'run; }
+                    pc = 0x40219F; continue 'run;
+                }
+                0x40219F => {
+                    w32(ecx.wrapping_add(0x8), 0xFFFFFFFF);
+                    pc = 0x4021A6; continue 'run;
+                }
+                0x4021A6 => {
+                    ecx = eax;
+                    { pc = 0x402173; continue 'run; }
+                }
+                0x4021AA => {
+                    edi = m32(0x2526A04);
+                    edx = edi;
+                    pc = 0x4021B2; continue 'run;
+                }
+                0x4021B2 => {
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4021E9; continue 'run; }
+                    pc = 0x4021B6; continue 'run;
+                }
+                0x4021B6 => {
+                    ecx = m32(edx);
+                    eax = ecx;
+                    { let a: u32 = eax; let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let r: u32 = (0u32).wrapping_sub(a) & 0xFFFFFFFF; cf = a != 0; of = a == 0x80000000;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = eax;
+                    let c: u32 = cf as u32; let r: u32 = a.wrapping_sub(b).wrapping_sub(c) & 0xFFFFFFFF; cf = (a as u64) < (b as u64 + c as u64); of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let r: u32 = (eax & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = esi; let b: u32 = 0xFFFFFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x4021CC; continue 'run; }
+                    pc = 0x4021C7; continue 'run;
+                }
+                0x4021C7 => {
+                    { let a: u32 = m32(edx.wrapping_add(0x8)); let b: u32 = esi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4021E5; continue 'run; }
+                    pc = 0x4021CC; continue 'run;
+                }
+                0x4021CC => {
+                    { let r: u32 = (ebp & ebp) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4021D5; continue 'run; }
+                    pc = 0x4021D0; continue 'run;
+                }
+                0x4021D0 => {
+                    { let a: u32 = m32(edx.wrapping_add(0xC)); let b: u32 = ebp;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4021E5; continue 'run; }
+                    pc = 0x4021D5; continue 'run;
+                }
+                0x4021D5 => {
+                    { let r: u32 = (ebx & ebx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4021DE; continue 'run; }
+                    pc = 0x4021D9; continue 'run;
+                }
+                0x4021D9 => {
+                    { let a: u32 = m32(edx.wrapping_add(0x10)); let b: u32 = ebx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4021E5; continue 'run; }
+                    pc = 0x4021DE; continue 'run;
+                }
+                0x4021DE => {
+                    w32(edx.wrapping_add(0x8), 0xFFFFFFFF);
+                    pc = 0x4021E5; continue 'run;
+                }
+                0x4021E5 => {
+                    edx = eax;
+                    { pc = 0x4021B2; continue 'run; }
+                }
+                0x4021E9 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_event_cancel, lf_ai_event_cancel, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k01_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x4025E0;
+        'run: loop {
+            match pc {
+                0x4025E0 => {
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x150))); fs[ft] = v; ft += 1; }
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m32(esp.wrapping_add(0x8));
+                    w32(esp.wrapping_add(0x4), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m16(eax);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0xC));
+                    w32(esi.wrapping_add(edx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    esi = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x154))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0xC), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0xC));
+                    esi = (esi & 0xFFFF);
+                    w32(esi.wrapping_add(edx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    esi = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x158))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0xC), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    ecx = (esi & 0xFFFF);
+                    esi = m32(esp.wrapping_add(0xC));
+                    w32(ecx.wrapping_add(edx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k01_net_write, lf_ai_order_k01_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k01_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x402640;
+        'run: loop {
+            match pc {
+                0x402640 => {
+                    edx = m32(esp.wrapping_add(0xC));
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4026A9; continue 'run; }
+                    pc = 0x40264B; continue 'run;
+                }
+                0x40264B => {
+                    eax = m32(esp.wrapping_add(0x18));
+                    ecx = m16(eax);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = (ecx & 0xFFFF);
+                    esi = m32(esi.wrapping_add(edx));
+                    w32(esp.wrapping_add(0x18), esi);
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x18))); fs[ft] = v; ft += 1; }
+                    w16(eax, (ecx & 0xFFFF));
+                    esi = (ecx & 0xFFFF);
+                    esi = m32(esi.wrapping_add(edx));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    w16(eax, (ecx & 0xFFFF));
+                    w32(esp.wrapping_add(0x4), esi);
+                    esi = (ecx & 0xFFFF);
+                    edx = m32(esi.wrapping_add(edx));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    w16(eax, (ecx & 0xFFFF));
+                    eax = m32(esp.wrapping_add(0x10));
+                    w32(esp.wrapping_add(0x8), edx);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    w32(eax.wrapping_add(0x150), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp)); fs[ft] = v; ft += 1; }
+                    w32(eax.wrapping_add(0x154), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x4))); fs[ft] = v; ft += 1; }
+                    w32(eax.wrapping_add(0x158), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x4026A9 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k01_net_read, lf_ai_order_k01_net_read, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k02_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x404060;
+        'run: loop {
+            match pc {
+                0x404060 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m8(ecx.wrapping_add(0x150));
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x14));
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x15C));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x15D));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m8(ecx.wrapping_add(0x148));
+                    { let a: u32 = edx; let b: u32 = 0x30;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    ebp = m16(eax);
+                    if zf { pc = 0x4040EF; continue 'run; }
+                    pc = 0x4040B7; continue 'run;
+                }
+                0x4040B7 => {
+                    { let a: u32 = edx; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    if !zf { pc = 0x404155; continue 'run; }
+                    pc = 0x4040C0; continue 'run;
+                }
+                0x4040C0 => {
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x164))) as u32) & 0xFF);
+                    edx = (ebp & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x168))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    ecx = (edx & 0xFFFF);
+                    edx = m32(esp.wrapping_add(0x10));
+                    w32(ecx.wrapping_add(esi), edx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x4040EF => {
+                    edx = m32(ecx.wrapping_add(0x158));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if (sf == of) { pc = 0x404101; continue 'run; }
+                    pc = 0x4040FA; continue 'run;
+                }
+                0x4040FA => {
+                    edx = 0x6B49D200;
+                    { pc = 0x404137; continue 'run; }
+                }
+                0x404101 => {
+                    ebx = m32(0xE843AC);
+                    { let a: u32 = edx; let b: u32 = ebx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x40411D; continue 'run; }
+                    pc = 0x40410B; continue 'run;
+                }
+                0x40410B => {
+                    { let a: u32 = edx; let b: u32 = ebx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let b: u32 = 0x35A4E900;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x404137; continue 'run; }
+                    pc = 0x404115; continue 'run;
+                }
+                0x404115 => {
+                    { let a: u32 = edx; let b: u32 = 0x94B62E00;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { pc = 0x404137; continue 'run; }
+                }
+                0x40411D => {
+                    edi = ebx;
+                    { let a: u32 = edi; let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    }
+                    { let a: u32 = edi; let b: u32 = 0x35A4E900;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x404133; continue 'run; }
+                    pc = 0x404129; continue 'run;
+                }
+                0x404129 => {
+                    { let a: u32 = edx; let b: u32 = ebx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { pc = 0x404137; continue 'run; }
+                }
+                0x404133 => {
+                    { let a: u32 = edi; let r: u32 = (0u32).wrapping_sub(a) & 0xFFFFFFFF; cf = a != 0; of = a == 0x80000000;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    }
+                    edx = edi;
+                    pc = 0x404137; continue 'run;
+                }
+                0x404137 => {
+                    edi = (ebp & 0xFFFF);
+                    w32(edi.wrapping_add(esi), edx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ecx = (ecx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x154))) as u32) & 0xFF);
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ecx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    pc = 0x404155; continue 'run;
+                }
+                0x404155 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k02_net_write, lf_ai_order_k02_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k02_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x404160;
+        'run: loop {
+            match pc {
+                0x404160 => {
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0x8));
+                    { let a: u32 = m32(edi.wrapping_add(0xAF0)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x404272; continue 'run; }
+                    pc = 0x404172; continue 'run;
+                }
+                0x404172 => {
+                    ecx = m32(esp.wrapping_add(0x10));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x404272; continue 'run; }
+                    pc = 0x40417E; continue 'run;
+                }
+                0x40417E => {
+                    eax = m32(esp.wrapping_add(0x14));
+                    edx = m16(eax);
+                    edx = m8(edx.wrapping_add(ecx));
+                    w8(edi.wrapping_add(0x150), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFF);
+                    edx = m8(edx.wrapping_add(ecx));
+                    w8(edi.wrapping_add(0x15C), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFF);
+                    edx = m8(edx.wrapping_add(ecx));
+                    w8(edi.wrapping_add(0x15D), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m8(edi.wrapping_add(0x148));
+                    { let a: u32 = esi; let b: u32 = 0x30;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esi = r;
+                    }
+                    if zf { pc = 0x404204; continue 'run; }
+                    pc = 0x4041CB; continue 'run;
+                }
+                0x4041CB => {
+                    { let a: u32 = esi; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esi = r;
+                    }
+                    if zf { pc = 0x4041DD; continue 'run; }
+                    pc = 0x4041D0; continue 'run;
+                }
+                0x4041D0 => {
+                    { let a: u32 = esi; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esi = r;
+                    }
+                    if !zf { pc = 0x4041DA; continue 'run; }
+                    pc = 0x4041D5; continue 'run;
+                }
+                0x4041D5 => {
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x403630, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    pc = 0x4041DA; continue 'run;
+                }
+                0x4041DA => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                0x4041DD => {
+                    edx = (edx & 0xFFFF);
+                    edx = ((m8(edx.wrapping_add(ecx)) as i8) as i32) as u32;
+                    w32(edi.wrapping_add(0x164), edx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFF);
+                    ecx = m32(edx.wrapping_add(ecx));
+                    w32(edi.wrapping_add(0x168), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                0x404204 => {
+                    esi = (edx & 0xFFFF);
+                    esi = m32(esi.wrapping_add(ecx));
+                    { let a: u32 = edx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = esi; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    w16(eax, (edx & 0xFFFF));
+                    if !zf { pc = 0x404224; continue 'run; }
+                    pc = 0x404218; continue 'run;
+                }
+                0x404218 => {
+                    w32(edi.wrapping_add(0x158), 0xFFFFFFFF);
+                    { pc = 0x40425E; continue 'run; }
+                }
+                0x404224 => {
+                    { let a: u32 = esi; let b: u32 = m32(esp.wrapping_add(0x10));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esi = r;
+                    }
+                    edx = m32(0xE843AC);
+                    if sf { pc = 0x404248; continue 'run; }
+                    pc = 0x404230; continue 'run;
+                }
+                0x404230 => {
+                    { let a: u32 = edx; let b: u32 = esi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    w32(edi.wrapping_add(0x158), edx);
+                    if (zf || sf != of) { pc = 0x40425E; continue 'run; }
+                    pc = 0x404240; continue 'run;
+                }
+                0x404240 => {
+                    { let a: u32 = edx; let b: u32 = 0x94B62E00;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { pc = 0x404258; continue 'run; }
+                }
+                0x404248 => {
+                    { let a: u32 = edx; let b: u32 = esi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    w32(edi.wrapping_add(0x158), edx);
+                    if !sf { pc = 0x40425E; continue 'run; }
+                    pc = 0x404252; continue 'run;
+                }
+                0x404252 => {
+                    { let a: u32 = edx; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    pc = 0x404258; continue 'run;
+                }
+                0x404258 => {
+                    w32(edi.wrapping_add(0x158), edx);
+                    pc = 0x40425E; continue 'run;
+                }
+                0x40425E => {
+                    edx = m16(eax);
+                    ecx = ((m8(edx.wrapping_add(ecx)) as i8) as i32) as u32;
+                    w32(edi.wrapping_add(0x154), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                0x404272 => {
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k02_net_read, lf_ai_order_k02_net_read, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_human_accumulator_mean(r: &mut Pushad, args: *const u32) -> f64 {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x4067B0;
+        'run: loop {
+            match pc {
+                0x4067B0 => {
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    eax = m32(ecx.wrapping_add(0x1120));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    w32(esp, eax);
+                    if (zf || sf != of) { pc = 0x4067CF; continue 'run; }
+                    pc = 0x4067BE; continue 'run;
+                }
+                0x4067BE => {
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x1124))); fs[ft] = v; ft += 1; }
+                    { let d = m32(esp) as i32 as f64; fs[ft - 1 - 0] = fs[ft - 1 - 0] / d; }
+                    w32(esp, f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp)); fs[ft] = v; ft += 1; }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ecx = v;
+                    }
+                    break 'run;
+                }
+                0x4067CF => {
+                    fs[ft] = 0.0; ft += 1;
+                    w32(esp, f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp)); fs[ft] = v; ft += 1; }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ecx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+        fs[0]
+    }
+}
+regs_thunk_fr!(lt_lf_ai_human_accumulator_mean, lf_ai_human_accumulator_mean, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k04_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x409840;
+        'run: loop {
+            match pc {
+                0x409840 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    ecx = m32(esp.wrapping_add(0x4));
+                    edx = m16(eax);
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m8(ecx.wrapping_add(0x150));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x151));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = (edx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x150))) as u32) & 0xFF);
+                    { let r: u32 = ((edx & 0xFF) & 0x4) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m16(eax);
+                    if zf { pc = 0x409942; continue 'run; }
+                    pc = 0x409886; continue 'run;
+                }
+                0x409886 => {
+                    { let r: u32 = ((edx & 0xFF) & (edx & 0xFF)) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !sf { pc = 0x4098EB; continue 'run; }
+                    pc = 0x40988A; continue 'run;
+                }
+                0x40988A => {
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x154))); fs[ft] = v; ft += 1; }
+                    edx = (edi & 0xFFFF);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x158))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x15C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edi = m32(ecx.wrapping_add(0x160));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    pc = 0x4098EB; continue 'run;
+                }
+                0x4098EB => {
+                    { let r: u32 = (m8(ecx.wrapping_add(0x151)) & 0x1) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x409942; continue 'run; }
+                    pc = 0x4098F4; continue 'run;
+                }
+                0x4098F4 => {
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x164))); fs[ft] = v; ft += 1; }
+                    edx = m16(eax);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x168))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x16C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    pc = 0x409942; continue 'run;
+                }
+                0x409942 => {
+                    { let a: u32 = m8(ecx.wrapping_add(0x148)); let b: u32 = 0x3F;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x409976; continue 'run; }
+                    pc = 0x40994B; continue 'run;
+                }
+                0x40994B => {
+                    edx = m16(eax);
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x17C))) as u32) & 0xFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x180))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    ecx = (edx & 0xFFFF);
+                    edx = m32(esp.wrapping_add(0x10));
+                    w32(ecx.wrapping_add(esi), edx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    pc = 0x409976; continue 'run;
+                }
+                0x409976 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k04_net_write, lf_ai_order_k04_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k04_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x409980;
+        'run: loop {
+            match pc {
+                0x409980 => {
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0x14));
+                    { let a: u32 = m32(edi.wrapping_add(0xAF0)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x409B12; continue 'run; }
+                    pc = 0x409996; continue 'run;
+                }
+                0x409996 => {
+                    ebx = m32(esp.wrapping_add(0x1C));
+                    { let r: u32 = (ebx & ebx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x409B12; continue 'run; }
+                    pc = 0x4099A2; continue 'run;
+                }
+                0x4099A2 => {
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x24));
+                    eax = m16(esi);
+                    ecx = m8(eax.wrapping_add(ebx));
+                    w8(edi.wrapping_add(0x150), (ecx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    edx = (eax & 0xFFFF);
+                    eax = (eax & 0xFFFFFF00) | (((m8(edx.wrapping_add(ebx))) as u32) & 0xFF);
+                    w8(edi.wrapping_add(0x151), (eax & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    ecx = (ecx & 0xFFFFFF00) | (((m8(edi.wrapping_add(0x150))) as u32) & 0xFF);
+                    { let r: u32 = ((ecx & 0xFF) & 0x4) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    eax = m16(esi);
+                    if zf { pc = 0x409A9F; continue 'run; }
+                    pc = 0x4099DD; continue 'run;
+                }
+                0x4099DD => {
+                    { let r: u32 = ((ecx & 0xFF) & (ecx & 0xFF)) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !sf { pc = 0x409A3F; continue 'run; }
+                    pc = 0x4099E1; continue 'run;
+                }
+                0x4099E1 => {
+                    ecx = (eax & 0xFFFF);
+                    edx = m32(ecx.wrapping_add(ebx));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    ecx = (eax & 0xFFFF);
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(esp.wrapping_add(0x18), edx);
+                    edx = m32(ecx.wrapping_add(ebx));
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x18))); fs[ft] = v; ft += 1; }
+                    w16(esi, (eax & 0xFFFF));
+                    ecx = (eax & 0xFFFF);
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(esp.wrapping_add(0xC), edx);
+                    edx = m32(ecx.wrapping_add(ebx));
+                    w16(esi, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x10), edx);
+                    w32(edi.wrapping_add(0x154), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0xC))); fs[ft] = v; ft += 1; }
+                    w32(edi.wrapping_add(0x158), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x10))); fs[ft] = v; ft += 1; }
+                    w32(edi.wrapping_add(0x15C), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    eax = m16(esi);
+                    ecx = m32(eax.wrapping_add(ebx));
+                    w32(edi.wrapping_add(0x160), ecx);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x409A3F; continue 'run;
+                }
+                0x409A3F => {
+                    { let r: u32 = (m8(edi.wrapping_add(0x151)) & 0x1) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x409ADE; continue 'run; }
+                    pc = 0x409A4C; continue 'run;
+                }
+                0x409A4C => {
+                    eax = m16(esi);
+                    edx = (eax & 0xFFFF);
+                    ecx = m32(edx.wrapping_add(ebx));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    w32(esp.wrapping_add(0x18), ecx);
+                    ecx = m32(edx.wrapping_add(ebx));
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x18))); fs[ft] = v; ft += 1; }
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    w32(esp.wrapping_add(0x10), ecx);
+                    ecx = m32(edx.wrapping_add(ebx));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0xC), ecx);
+                    w32(edi.wrapping_add(0x164), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x10))); fs[ft] = v; ft += 1; }
+                    w32(edi.wrapping_add(0x168), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0xC))); fs[ft] = v; ft += 1; }
+                    w32(edi.wrapping_add(0x16C), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { pc = 0x409ADE; continue 'run; }
+                }
+                0x409A9F => {
+                    eax = m32(edi.wrapping_add(0xAF0));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x409AC3; continue 'run; }
+                    pc = 0x409AA9; continue 'run;
+                }
+                0x409AA9 => {
+                    edx = eax;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    ecx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x409AC3; continue 'run; }
+                    pc = 0x409ABE; continue 'run;
+                }
+                0x409ABE => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x44)); let b: u32 = eax;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x409AC7; continue 'run; }
+                    pc = 0x409AC3; continue 'run;
+                }
+                0x409AC3 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x409AD5; continue 'run; }
+                }
+                0x409AC7 => {
+                    eax = m32(ecx.wrapping_add(0x4C));
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let r: u32 = (0u32).wrapping_sub(a) & 0xFFFFFFFF; cf = a != 0; of = a == 0x80000000;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = eax;
+                    let c: u32 = cf as u32; let r: u32 = a.wrapping_sub(b).wrapping_sub(c) & 0xFFFFFFFF; cf = (a as u64) < (b as u64 + c as u64); of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let r: u32 = (eax & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    pc = 0x409AD5; continue 'run;
+                }
+                0x409AD5 => {
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x407000, l, esp, 1, 12, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    pc = 0x409ADE; continue 'run;
+                }
+                0x409ADE => {
+                    { let a: u32 = m8(edi.wrapping_add(0x148)); let b: u32 = 0x3F;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x409B0B; continue 'run; }
+                    pc = 0x409AE7; continue 'run;
+                }
+                0x409AE7 => {
+                    eax = m16(esi);
+                    ecx = ((m8(eax.wrapping_add(ebx)) as i8) as i32) as u32;
+                    w32(edi.wrapping_add(0x17C), ecx);
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    edx = (eax & 0xFFFF);
+                    eax = m32(edx.wrapping_add(ebx));
+                    w32(edi.wrapping_add(0x180), eax);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x409B0B; continue 'run;
+                }
+                0x409B0B => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x409B12 => {
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k04_net_read, lf_ai_order_k04_net_read, 304, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k05_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x40D310;
+        'run: loop {
+            match pc {
+                0x40D310 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m8(ecx.wrapping_add(0x150));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x151));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x152));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x153));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x154));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ecx = (ecx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x155))) as u32) & 0xFF);
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ecx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k05_net_write, lf_ai_order_k05_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k05_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x40D3A0;
+        'run: loop {
+            match pc {
+                0x40D3A0 => {
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let a: u32 = m32(ecx.wrapping_add(0xAF0)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if zf { pc = 0x40D435; continue 'run; }
+                    pc = 0x40D3B2; continue 'run;
+                }
+                0x40D3B2 => {
+                    esi = m32(esp.wrapping_add(0x10));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x40D435; continue 'run; }
+                    pc = 0x40D3BA; continue 'run;
+                }
+                0x40D3BA => {
+                    eax = m32(esp.wrapping_add(0x14));
+                    edx = m16(eax);
+                    edx = m8(edx.wrapping_add(esi));
+                    w8(ecx.wrapping_add(0x150), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFF);
+                    edx = m8(edx.wrapping_add(esi));
+                    w8(ecx.wrapping_add(0x151), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFF);
+                    edx = m8(edx.wrapping_add(esi));
+                    w8(ecx.wrapping_add(0x152), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFF);
+                    edx = m8(edx.wrapping_add(esi));
+                    w8(ecx.wrapping_add(0x153), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFF);
+                    edx = m8(edx.wrapping_add(esi));
+                    w8(ecx.wrapping_add(0x154), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFF);
+                    edx = m8(edx.wrapping_add(esi));
+                    w8(ecx.wrapping_add(0x155), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x40D435 => {
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k05_net_read, lf_ai_order_k05_net_read, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k06_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x410B20;
+        'run: loop {
+            match pc {
+                0x410B20 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    ecx = m16(eax);
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0xC));
+                    edx = (edx & 0xFFFFFF00) | (((m8(esi.wrapping_add(0x150))) as u32) & 0xFF);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0x14));
+                    w8(ecx.wrapping_add(edi), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    ecx = m32(esi.wrapping_add(0x154));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(eax);
+                    if !zf { pc = 0x410B5D; continue 'run; }
+                    pc = 0x410B4C; continue 'run;
+                }
+                0x410B4C => {
+                    ecx = (ebx & 0xFFFF);
+                    w16(ecx.wrapping_add(edi), 0xFFFF);
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x410B5D => {
+                    edx = ecx;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x410B77; continue 'run; }
+                    pc = 0x410B72; continue 'run;
+                }
+                0x410B72 => {
+                    { let a: u32 = m32(edx.wrapping_add(0x44)); let b: u32 = ecx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x410B7E; continue 'run; }
+                    pc = 0x410B77; continue 'run;
+                }
+                0x410B77 => {
+                    ecx = 0xFFFF;
+                    { pc = 0x410B91; continue 'run; }
+                }
+                0x410B7E => {
+                    edx = m32(edx.wrapping_add(0xB0));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ecx = 0xFFFF;
+                    if zf { pc = 0x410B91; continue 'run; }
+                    pc = 0x410B8D; continue 'run;
+                }
+                0x410B8D => {
+                    ecx = m16(edx.wrapping_add(0x2));
+                    pc = 0x410B91; continue 'run;
+                }
+                0x410B91 => {
+                    { let a: u32 = (ecx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edx = (ecx & 0xFFFF);
+                    if !zf { pc = 0x410BA2; continue 'run; }
+                    pc = 0x410B9B; continue 'run;
+                }
+                0x410B9B => {
+                    edx = m16(esi.wrapping_add(0x154));
+                    pc = 0x410BA2; continue 'run;
+                }
+                0x410BA2 => {
+                    ecx = (ebx & 0xFFFF);
+                    w16(ecx.wrapping_add(edi), (edx & 0xFFFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k06_net_write, lf_ai_order_k06_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k06_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x410BC0;
+        'run: loop {
+            match pc {
+                0x410BC0 => {
+                    ecx = m32(esp.wrapping_add(0xC));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x410BD8; continue 'run; }
+                    pc = 0x410BC8; continue 'run;
+                }
+                0x410BC8 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x410BD8 => {
+                    eax = m32(esp.wrapping_add(0x10));
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFFFF00) | (((m8(edx.wrapping_add(ecx))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0xC));
+                    w8(edi.wrapping_add(0x150), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    esi = (edx & 0xFFFF);
+                    ecx = m16(esi.wrapping_add(ecx));
+                    { let a: u32 = edx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = (ecx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(eax, (edx & 0xFFFF));
+                    if !zf { pc = 0x410C14; continue 'run; }
+                    pc = 0x410C09; continue 'run;
+                }
+                0x410C09 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x410C14 => {
+                    esi = (ecx & 0xFFFF);
+                    eax = esi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = esi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = (!edx) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = edx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = m32(0x212E258);
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ecx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ecx.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x410C09; continue 'run; }
+                    pc = 0x410C55; continue 'run;
+                }
+                0x410C55 => {
+                    { let a: u32 = esi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x410C6C; continue 'run; }
+                    pc = 0x410C5A; continue 'run;
+                }
+                0x410C5A => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x410C55; continue 'run; }
+                    pc = 0x410C61; continue 'run;
+                }
+                0x410C61 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x410C6C => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x410C09; continue 'run; }
+                    pc = 0x410C72; continue 'run;
+                }
+                0x410C72 => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k06_net_read, lf_ai_order_k06_net_read, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k08_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x415E80;
+        'run: loop {
+            match pc {
+                0x415E80 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    ecx = m32(eax.wrapping_add(0x330));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x415EBD; continue 'run; }
+                    pc = 0x415E8E; continue 'run;
+                }
+                0x415E8E => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x8)); let b: u32 = 0xFFFFFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x415EBD; continue 'run; }
+                    pc = 0x415E94; continue 'run;
+                }
+                0x415E94 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x34))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ecx = (ecx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x8))) as u32) & 0xFF);
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ecx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    pc = 0x415EBD; continue 'run;
+                }
+                0x415EBD => {
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k08_net_write, lf_ai_order_k08_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k08_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x415EC0;
+        'run: loop {
+            match pc {
+                0x415EC0 => {
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x415F09; continue 'run; }
+                    pc = 0x415EC9; continue 'run;
+                }
+                0x415EC9 => {
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0xC));
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x415DA0, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    eax = m32(esp.wrapping_add(0x18));
+                    ecx = m16(eax);
+                    edx = (ecx & 0xFFFF);
+                    edx = (edx & 0xFFFFFF00) | (((m8(edx.wrapping_add(esi))) as u32) & 0xFF);
+                    { let a: u32 = ecx; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    w16(eax, (ecx & 0xFFFF));
+                    ecx = (edx & 0xFF);
+                    edx = m32(edi.wrapping_add(0x330));
+                    w32(edx.wrapping_add(0x34), ecx);
+                    ecx = m16(eax);
+                    edx = ((m8(ecx.wrapping_add(esi)) as i8) as i32) as u32;
+                    ecx = m32(edi.wrapping_add(0x330));
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(ecx.wrapping_add(0x8), edx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x415F09 => {
+                    edx = m32(esp.wrapping_add(0x8));
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k08_net_read, lf_ai_order_k08_net_read, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k08_exit(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x4165C0;
+        'run: loop {
+            match pc {
+                0x4165C0 => {
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x8));
+                    { let r: u32 = (m8(esi.wrapping_add(0x140)) & 0xFB) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    w8(esi.wrapping_add(0x140), r);
+                    }
+                    { let r: u32 = (m8(esi.wrapping_add(0x140)) & 0x4) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4165DC; continue 'run; }
+                    pc = 0x4165D5; continue 'run;
+                }
+                0x4165D5 => {
+                    eax = esi;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x9B5FF0, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    pc = 0x4165DC; continue 'run;
+                }
+                0x4165DC => {
+                    { let r: u32 = (m32(esi.wrapping_add(0xC0)) & 0xFFFFFFBF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    w32(esi.wrapping_add(0xC0), r);
+                    }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x1; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x960A80, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x1; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x1; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0xFFFFFFFF; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x96CB70, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    esi = m32(esi.wrapping_add(0x44));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = 0x4A;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x402160, l, esp, 9, 44, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x24;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k08_exit, lf_ai_order_k08_exit, 304, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k09_update(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x417BC0;
+        'run: loop {
+            match pc {
+                0x417BC0 => {
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x8));
+                    eax = m32(esi.wrapping_add(0x158));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edx = esi.wrapping_add(0x150);
+                    if zf { pc = 0x417C00; continue 'run; }
+                    pc = 0x417BD5; continue 'run;
+                }
+                0x417BD5 => {
+                    ecx = eax;
+                    { let r: u32 = (ecx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = ecx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    ecx = m32(ecx.wrapping_add(0x2149C64));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x417C00; continue 'run; }
+                    pc = 0x417BEA; continue 'run;
+                }
+                0x417BEA => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x44)); let b: u32 = eax;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x417C00; continue 'run; }
+                    pc = 0x417BEF; continue 'run;
+                }
+                0x417BEF => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x4C)); let b: u32 = 0x3;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x417C00; continue 'run; }
+                    pc = 0x417BF5; continue 'run;
+                }
+                0x417BF5 => {
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x417450, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    pc = 0x417C00; continue 'run;
+                }
+                0x417C00 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k09_update, lf_ai_order_k09_update, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0a_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x41B5D0;
+        'run: loop {
+            match pc {
+                0x41B5D0 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x8));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0xC));
+                    ebx = m8(esi.wrapping_add(0x150));
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(esi.wrapping_add(0x151));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m32(esi.wrapping_add(0x154));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(eax);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if !zf { pc = 0x41B61C; continue 'run; }
+                    pc = 0x41B611; continue 'run;
+                }
+                0x41B611 => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x41B668; continue 'run; }
+                }
+                0x41B61C => {
+                    edi = edx;
+                    { let r: u32 = (edi & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edi = r;
+                    }
+                    { let a: u32 = edi; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    } }
+                    edi = m32(edi.wrapping_add(0x2149C64));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x41B636; continue 'run; }
+                    pc = 0x41B631; continue 'run;
+                }
+                0x41B631 => {
+                    { let a: u32 = m32(edi.wrapping_add(0x44)); let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x41B63D; continue 'run; }
+                    pc = 0x41B636; continue 'run;
+                }
+                0x41B636 => {
+                    edx = 0xFFFF;
+                    { pc = 0x41B650; continue 'run; }
+                }
+                0x41B63D => {
+                    edi = m32(edi.wrapping_add(0xB0));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edx = 0xFFFF;
+                    if zf { pc = 0x41B650; continue 'run; }
+                    pc = 0x41B64C; continue 'run;
+                }
+                0x41B64C => {
+                    edx = m16(edi.wrapping_add(0x2));
+                    pc = 0x41B650; continue 'run;
+                }
+                0x41B650 => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x41B661; continue 'run; }
+                    pc = 0x41B65A; continue 'run;
+                }
+                0x41B65A => {
+                    edi = m16(esi.wrapping_add(0x154));
+                    pc = 0x41B661; continue 'run;
+                }
+                0x41B661 => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    pc = 0x41B668; continue 'run;
+                }
+                0x41B668 => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    ebx = m32(esi.wrapping_add(0x158));
+                    { let r: u32 = (ebx & ebx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edi = m16(eax);
+                    if !zf { pc = 0x41B684; continue 'run; }
+                    pc = 0x41B679; continue 'run;
+                }
+                0x41B679 => {
+                    edx = (edi & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x41B6D2; continue 'run; }
+                }
+                0x41B684 => {
+                    edx = ebx;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x41B69E; continue 'run; }
+                    pc = 0x41B699; continue 'run;
+                }
+                0x41B699 => {
+                    { let a: u32 = m32(edx.wrapping_add(0x44)); let b: u32 = ebx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x41B6A5; continue 'run; }
+                    pc = 0x41B69E; continue 'run;
+                }
+                0x41B69E => {
+                    edx = 0xFFFF;
+                    { pc = 0x41B6BA; continue 'run; }
+                }
+                0x41B6A5 => {
+                    edx = m32(edx.wrapping_add(0xB0));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41B6B6; continue 'run; }
+                    pc = 0x41B6AF; continue 'run;
+                }
+                0x41B6AF => {
+                    edx = 0xFFFF;
+                    { pc = 0x41B6BA; continue 'run; }
+                }
+                0x41B6B6 => {
+                    edx = m16(edx.wrapping_add(0x2));
+                    pc = 0x41B6BA; continue 'run;
+                }
+                0x41B6BA => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    ebx = (edx & 0xFFFF);
+                    if !zf { pc = 0x41B6CB; continue 'run; }
+                    pc = 0x41B6C4; continue 'run;
+                }
+                0x41B6C4 => {
+                    ebx = m16(esi.wrapping_add(0x158));
+                    pc = 0x41B6CB; continue 'run;
+                }
+                0x41B6CB => {
+                    edx = (edi & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (ebx & 0xFFFF));
+                    pc = 0x41B6D2; continue 'run;
+                }
+                0x41B6D2 => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x15C))); fs[ft] = v; ft += 1; }
+                    edx = m16(eax);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x160))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x164))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x168))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x16C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x170))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edi = m32(esi.wrapping_add(0x174));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let a: u32 = m8(esi.wrapping_add(0x148)); let b: u32 = 0x5A;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    edx = m16(eax);
+                    if !zf { pc = 0x41B7A7; continue 'run; }
+                    pc = 0x41B797; continue 'run;
+                }
+                0x41B797 => {
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(esi.wrapping_add(0x152))) as u32) & 0xFF);
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    pc = 0x41B7A7; continue 'run;
+                }
+                0x41B7A7 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0a_net_write, lf_ai_order_k0a_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0a_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x41B7B0;
+        'run: loop {
+            match pc {
+                0x41B7B0 => {
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0x18));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41B7D0; continue 'run; }
+                    pc = 0x41B7BC; continue 'run;
+                }
+                0x41B7BC => {
+                    eax = m32(esp.wrapping_add(0x10));
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x41B7D0 => {
+                    ecx = m32(esp.wrapping_add(0x1C));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x14));
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x41B7E0; continue 'run; }
+                }
+                0x41B7E0 => {
+                    edx = m16(ecx);
+                    edx = (edx & 0xFFFFFF00) | (((m8(edx.wrapping_add(edi))) as u32) & 0xFF);
+                    w8(eax.wrapping_add(esi).wrapping_add(0x150), (edx & 0xFF));
+                    { let a: u32 = m16(ecx); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    edx = m16(ecx);
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if cf { pc = 0x41B7E0; continue 'run; }
+                    pc = 0x41B7FC; continue 'run;
+                }
+                0x41B7FC => {
+                    eax = (edx & 0xFFFF);
+                    eax = m16(eax.wrapping_add(edi));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let a: u32 = edx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = m32(0x212E258);
+                    w16(ecx, (edx & 0xFFFF));
+                    if !zf { pc = 0x41B81B; continue 'run; }
+                    pc = 0x41B817; continue 'run;
+                }
+                0x41B817 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x41B873; continue 'run; }
+                }
+                0x41B81B => {
+                    ebx = (eax & 0xFFFF);
+                    eax = ebx;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = ebx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    edx = eax;
+                    { let a: u32 = edx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    { let r: u32 = (edx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    edx = edx.wrapping_add(edx.wrapping_mul(8));
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (edx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = edx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ebp.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ebp.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x41B86C; continue 'run; }
+                    pc = 0x41B856; continue 'run;
+                }
+                0x41B856 => {
+                    { let a: u32 = ebx; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x41B866; continue 'run; }
+                    pc = 0x41B85B; continue 'run;
+                }
+                0x41B85B => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41B856; continue 'run; }
+                    pc = 0x41B862; continue 'run;
+                }
+                0x41B862 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x41B873; continue 'run; }
+                }
+                0x41B866 => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41B870; continue 'run; }
+                    pc = 0x41B86C; continue 'run;
+                }
+                0x41B86C => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x41B873; continue 'run; }
+                }
+                0x41B870 => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    pc = 0x41B873; continue 'run;
+                }
+                0x41B873 => {
+                    w32(esi.wrapping_add(0x154), eax);
+                    edx = m16(ecx);
+                    eax = (edx & 0xFFFF);
+                    eax = m16(eax.wrapping_add(edi));
+                    { let a: u32 = edx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(ecx, (edx & 0xFFFF));
+                    if !zf { pc = 0x41B893; continue 'run; }
+                    pc = 0x41B88F; continue 'run;
+                }
+                0x41B88F => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x41B8ED; continue 'run; }
+                }
+                0x41B893 => {
+                    ebx = (eax & 0xFFFF);
+                    eax = ebx;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = ebx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    edx = eax;
+                    { let a: u32 = edx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    { let r: u32 = (edx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    edx = edx.wrapping_add(edx.wrapping_mul(8));
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (edx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = edx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ebp.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ebp.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x41B8E6; continue 'run; }
+                    pc = 0x41B8CE; continue 'run;
+                }
+                0x41B8CE => {
+                    pc = 0x41B8D0; continue 'run;
+                }
+                0x41B8D0 => {
+                    { let a: u32 = ebx; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x41B8E0; continue 'run; }
+                    pc = 0x41B8D5; continue 'run;
+                }
+                0x41B8D5 => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41B8D0; continue 'run; }
+                    pc = 0x41B8DC; continue 'run;
+                }
+                0x41B8DC => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x41B8ED; continue 'run; }
+                }
+                0x41B8E0 => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41B8EA; continue 'run; }
+                    pc = 0x41B8E6; continue 'run;
+                }
+                0x41B8E6 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x41B8ED; continue 'run; }
+                }
+                0x41B8EA => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    pc = 0x41B8ED; continue 'run;
+                }
+                0x41B8ED => {
+                    w32(esi.wrapping_add(0x158), eax);
+                    eax = m16(ecx);
+                    edx = (eax & 0xFFFF);
+                    edx = m32(edx.wrapping_add(edi));
+                    w32(esp.wrapping_add(0x24), edx);
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x24))); fs[ft] = v; ft += 1; }
+                    edx = (eax & 0xFFFF);
+                    edx = m32(edx.wrapping_add(edi));
+                    w32(esp.wrapping_add(0x10), edx);
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    edx = m32(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x14), edx);
+                    w32(esi.wrapping_add(0x15C), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0xC))); fs[ft] = v; ft += 1; }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    w32(esi.wrapping_add(0x160), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0xC))); fs[ft] = v; ft += 1; }
+                    w32(esi.wrapping_add(0x164), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    eax = m16(ecx);
+                    edx = (eax & 0xFFFF);
+                    edx = m32(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x1C), edx);
+                    edx = (eax & 0xFFFF);
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x1C))); fs[ft] = v; ft += 1; }
+                    edx = m32(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0xC), edx);
+                    edx = (eax & 0xFFFF);
+                    edx = m32(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x8), edx);
+                    w32(esi.wrapping_add(0x168), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0xC))); fs[ft] = v; ft += 1; }
+                    w32(esi.wrapping_add(0x16C), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x8))); fs[ft] = v; ft += 1; }
+                    w32(esi.wrapping_add(0x170), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    eax = m16(ecx);
+                    edx = m32(eax.wrapping_add(edi));
+                    w32(esi.wrapping_add(0x174), edx);
+                    { let a: u32 = m16(ecx); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    { let a: u32 = m8(esi.wrapping_add(0x148)); let b: u32 = 0x5A;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    eax = m16(ecx);
+                    if !zf { pc = 0x41B9C3; continue 'run; }
+                    pc = 0x41B9B3; continue 'run;
+                }
+                0x41B9B3 => {
+                    eax = (eax & 0xFFFF);
+                    edx = (edx & 0xFFFFFF00) | (((m8(eax.wrapping_add(edi))) as u32) & 0xFF);
+                    w8(esi.wrapping_add(0x152), (edx & 0xFF));
+                    { let a: u32 = m16(ecx); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    pc = 0x41B9C3; continue 'run;
+                }
+                0x41B9C3 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0a_net_read, lf_ai_order_k0a_net_read, 304, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0a_exit(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x41C380;
+        'run: loop {
+            match pc {
+                0x41C380 => {
+                    ecx = m32(esp.wrapping_add(0x8));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    eax = m32(esp.wrapping_add(0x4));
+                    if zf { pc = 0x41C397; continue 'run; }
+                    pc = 0x41C38D; continue 'run;
+                }
+                0x41C38D => {
+                    { let a: u32 = ecx; let b: u32 = 0x7;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x41C397; continue 'run; }
+                    pc = 0x41C392; continue 'run;
+                }
+                0x41C392 => {
+                    { let a: u32 = ecx; let b: u32 = 0xA;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41C3A3; continue 'run; }
+                    pc = 0x41C397; continue 'run;
+                }
+                0x41C397 => {
+                    { let r: u32 = (m8(eax.wrapping_add(0x140)) & 0xF7) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    w8(eax.wrapping_add(0x140), r);
+                    }
+                    { let a: u32 = ecx; let b: u32 = 0xA;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x41C3BC; continue 'run; }
+                    pc = 0x41C3A3; continue 'run;
+                }
+                0x41C3A3 => {
+                    { let r: u32 = (m8(eax.wrapping_add(0x140)) & 0x4) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41C3B1; continue 'run; }
+                    pc = 0x41C3AC; continue 'run;
+                }
+                0x41C3AC => {
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x9B5FF0, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    pc = 0x41C3B1; continue 'run;
+                }
+                0x41C3B1 => {
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0xFFFFFFFF; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ecx = eax;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x95BF60, l, esp, 2, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    esp = esp.wrapping_add(8);
+                    }
+                    pc = 0x41C3BC; continue 'run;
+                }
+                0x41C3BC => {
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0a_exit, lf_ai_order_k0a_exit, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0b_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x41ED90;
+        'run: loop {
+            match pc {
+                0x41ED90 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x150))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m8(ecx.wrapping_add(0x148));
+                    { let a: u32 = edi; let b: u32 = 0xFFFFFFA2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    }
+                    { let a: u32 = edi; let b: u32 = 0x9;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (!cf && !zf) { pc = 0x41EF0E; continue 'run; }
+                    pc = 0x41EDC5; continue 'run;
+                }
+                0x41EDC5 => {
+                    edi = m8(edi.wrapping_add(0x41EF28));
+                    match edi {
+                    0 => { pc = 0x41EEC0; continue 'run; }
+                    1 => { pc = 0x41EDD3; continue 'run; }
+                    2 => { pc = 0x41EE4F; continue 'run; }
+                    3 => { pc = 0x41EE11; continue 'run; }
+                    4 => { pc = 0x41EF0E; continue 'run; }
+                    _ => { panic!("jump table index"); } }
+                }
+                0x41EDD3 => {
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x170))); fs[ft] = v; ft += 1; }
+                    edx = (edx & 0xFFFF);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x174))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x178))); fs[ft] = v; ft += 1; }
+                    { pc = 0x41EEF9; continue 'run; }
+                }
+                0x41EE11 => {
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x160))); fs[ft] = v; ft += 1; }
+                    edx = (edx & 0xFFFF);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x164))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x168))); fs[ft] = v; ft += 1; }
+                    { pc = 0x41EEF9; continue 'run; }
+                }
+                0x41EE4F => {
+                    ebx = m32(ecx.wrapping_add(0x16C));
+                    { let r: u32 = (ebx & ebx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41EE6A; continue 'run; }
+                    pc = 0x41EE59; continue 'run;
+                }
+                0x41EE59 => {
+                    ecx = (edx & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w16(ecx.wrapping_add(esi), 0xFFFF);
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x41EE6A => {
+                    edi = ebx;
+                    { let r: u32 = (edi & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edi = r;
+                    }
+                    { let a: u32 = edi; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    } }
+                    edi = m32(edi.wrapping_add(0x2149C64));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x41EE84; continue 'run; }
+                    pc = 0x41EE7F; continue 'run;
+                }
+                0x41EE7F => {
+                    { let a: u32 = m32(edi.wrapping_add(0x44)); let b: u32 = ebx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x41EE8B; continue 'run; }
+                    pc = 0x41EE84; continue 'run;
+                }
+                0x41EE84 => {
+                    edi = 0xFFFF;
+                    { pc = 0x41EEA0; continue 'run; }
+                }
+                0x41EE8B => {
+                    edi = m32(edi.wrapping_add(0xB0));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41EE9C; continue 'run; }
+                    pc = 0x41EE95; continue 'run;
+                }
+                0x41EE95 => {
+                    edi = 0xFFFF;
+                    { pc = 0x41EEA0; continue 'run; }
+                }
+                0x41EE9C => {
+                    edi = m16(edi.wrapping_add(0x2));
+                    pc = 0x41EEA0; continue 'run;
+                }
+                0x41EEA0 => {
+                    { let a: u32 = (edi & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    ebx = (edi & 0xFFFF);
+                    if !zf { pc = 0x41EEB1; continue 'run; }
+                    pc = 0x41EEAA; continue 'run;
+                }
+                0x41EEAA => {
+                    ebx = m16(ecx.wrapping_add(0x16C));
+                    pc = 0x41EEB1; continue 'run;
+                }
+                0x41EEB1 => {
+                    edx = (edx & 0xFFFF);
+                    w16(edx.wrapping_add(esi), (ebx & 0xFFFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x41EEC0 => {
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x154))); fs[ft] = v; ft += 1; }
+                    edx = (edx & 0xFFFF);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x158))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x15C))); fs[ft] = v; ft += 1; }
+                    pc = 0x41EEF9; continue 'run;
+                }
+                0x41EEF9 => {
+                    edx = m16(eax);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    ecx = (edx & 0xFFFF);
+                    edx = m32(esp.wrapping_add(0x10));
+                    w32(ecx.wrapping_add(esi), edx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    pc = 0x41EF0E; continue 'run;
+                }
+                0x41EF0E => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0b_net_write, lf_ai_order_k0b_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0b_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x41EF40;
+        'run: loop {
+            match pc {
+                0x41EF40 => {
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x14));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0x10));
+                    if zf { pc = 0x41F11D; continue 'run; }
+                    pc = 0x41EF53; continue 'run;
+                }
+                0x41EF53 => {
+                    edx = edi;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x98E710, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = eax; let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x41F11D; continue 'run; }
+                    pc = 0x41EF62; continue 'run;
+                }
+                0x41EF62 => {
+                    eax = m32(esp.wrapping_add(0x1C));
+                    ecx = m16(eax);
+                    edx = (edx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(esi))) as u32) & 0xFF);
+                    w8(edi.wrapping_add(0x150), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m8(edi.wrapping_add(0x148));
+                    ecx = m16(eax);
+                    { let a: u32 = edx; let b: u32 = 0xFFFFFFA2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let b: u32 = 0x9;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (!cf && !zf) { pc = 0x41F12A; continue 'run; }
+                    pc = 0x41EF8C; continue 'run;
+                }
+                0x41EF8C => {
+                    edx = m8(edx.wrapping_add(0x41F144));
+                    match edx {
+                    0 => { pc = 0x41F0CB; continue 'run; }
+                    1 => { pc = 0x41EF9A; continue 'run; }
+                    2 => { pc = 0x41F03E; continue 'run; }
+                    3 => { pc = 0x41EFEC; continue 'run; }
+                    4 => { pc = 0x41F12A; continue 'run; }
+                    _ => { panic!("jump table index"); } }
+                }
+                0x41EF9A => {
+                    edx = (ecx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    w32(esp.wrapping_add(0x10), edx);
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x10))); fs[ft] = v; ft += 1; }
+                    w16(eax, (ecx & 0xFFFF));
+                    edx = (ecx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    w32(esp.wrapping_add(0x18), edx);
+                    w16(eax, (ecx & 0xFFFF));
+                    edx = (ecx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    w16(eax, (ecx & 0xFFFF));
+                    w32(esp.wrapping_add(0x8), edx);
+                    w32(edi.wrapping_add(0x170), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x18))); fs[ft] = v; ft += 1; }
+                    w32(edi.wrapping_add(0x174), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x8))); fs[ft] = v; ft += 1; }
+                    w32(edi.wrapping_add(0x178), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ecx = v;
+                    }
+                    break 'run;
+                }
+                0x41EFEC => {
+                    edx = (ecx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    w32(esp.wrapping_add(0x10), edx);
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x10))); fs[ft] = v; ft += 1; }
+                    w16(eax, (ecx & 0xFFFF));
+                    edx = (ecx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    w32(esp.wrapping_add(0x18), edx);
+                    w16(eax, (ecx & 0xFFFF));
+                    edx = (ecx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    w16(eax, (ecx & 0xFFFF));
+                    w32(esp.wrapping_add(0x8), edx);
+                    w32(edi.wrapping_add(0x160), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x18))); fs[ft] = v; ft += 1; }
+                    w32(edi.wrapping_add(0x164), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x8))); fs[ft] = v; ft += 1; }
+                    w32(edi.wrapping_add(0x168), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ecx = v;
+                    }
+                    break 'run;
+                }
+                0x41F03E => {
+                    edx = (ecx & 0xFFFF);
+                    edx = m16(edx.wrapping_add(esi));
+                    { let a: u32 = ecx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(eax, (ecx & 0xFFFF));
+                    if !zf { pc = 0x41F05E; continue 'run; }
+                    pc = 0x41F052; continue 'run;
+                }
+                0x41F052 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x16C), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ecx = v;
+                    }
+                    break 'run;
+                }
+                0x41F05E => {
+                    esi = (edx & 0xFFFF);
+                    eax = esi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = esi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = (!edx) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = edx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = m32(0x212E258);
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ecx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ecx.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x41F052; continue 'run; }
+                    pc = 0x41F09F; continue 'run;
+                }
+                0x41F09F => {
+                    pc = 0x41F0A0; continue 'run;
+                }
+                0x41F0A0 => {
+                    { let a: u32 = esi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x41F0B8; continue 'run; }
+                    pc = 0x41F0A5; continue 'run;
+                }
+                0x41F0A5 => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x41F0A0; continue 'run; }
+                    pc = 0x41F0AC; continue 'run;
+                }
+                0x41F0AC => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x16C), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ecx = v;
+                    }
+                    break 'run;
+                }
+                0x41F0B8 => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x41F052; continue 'run; }
+                    pc = 0x41F0BE; continue 'run;
+                }
+                0x41F0BE => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    w32(edi.wrapping_add(0x16C), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ecx = v;
+                    }
+                    break 'run;
+                }
+                0x41F0CB => {
+                    edx = (ecx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    w32(esp.wrapping_add(0x10), edx);
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x10))); fs[ft] = v; ft += 1; }
+                    w16(eax, (ecx & 0xFFFF));
+                    edx = (ecx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    w32(esp.wrapping_add(0x18), edx);
+                    w16(eax, (ecx & 0xFFFF));
+                    edx = (ecx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    w16(eax, (ecx & 0xFFFF));
+                    w32(esp.wrapping_add(0x8), edx);
+                    w32(edi.wrapping_add(0x154), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x18))); fs[ft] = v; ft += 1; }
+                    w32(edi.wrapping_add(0x158), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x8))); fs[ft] = v; ft += 1; }
+                    w32(edi.wrapping_add(0x15C), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ecx = v;
+                    }
+                    break 'run;
+                }
+                0x41F11D => {
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    pc = 0x41F12A; continue 'run;
+                }
+                0x41F12A => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ecx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0b_net_read, lf_ai_order_k0b_net_read, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k22_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x424960;
+        'run: loop {
+            match pc {
+                0x424960 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x150))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m32(ecx.wrapping_add(0x154));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(eax);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if !zf { pc = 0x424997; continue 'run; }
+                    pc = 0x42498C; continue 'run;
+                }
+                0x42498C => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(esi), 0xFFFF);
+                    { pc = 0x4249E3; continue 'run; }
+                }
+                0x424997 => {
+                    edi = edx;
+                    { let r: u32 = (edi & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edi = r;
+                    }
+                    { let a: u32 = edi; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    } }
+                    edi = m32(edi.wrapping_add(0x2149C64));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4249B1; continue 'run; }
+                    pc = 0x4249AC; continue 'run;
+                }
+                0x4249AC => {
+                    { let a: u32 = m32(edi.wrapping_add(0x44)); let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x4249B8; continue 'run; }
+                    pc = 0x4249B1; continue 'run;
+                }
+                0x4249B1 => {
+                    edx = 0xFFFF;
+                    { pc = 0x4249CB; continue 'run; }
+                }
+                0x4249B8 => {
+                    edi = m32(edi.wrapping_add(0xB0));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edx = 0xFFFF;
+                    if zf { pc = 0x4249CB; continue 'run; }
+                    pc = 0x4249C7; continue 'run;
+                }
+                0x4249C7 => {
+                    edx = m16(edi.wrapping_add(0x2));
+                    pc = 0x4249CB; continue 'run;
+                }
+                0x4249CB => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x4249DC; continue 'run; }
+                    pc = 0x4249D5; continue 'run;
+                }
+                0x4249D5 => {
+                    edi = m16(ecx.wrapping_add(0x154));
+                    pc = 0x4249DC; continue 'run;
+                }
+                0x4249DC => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(esi), (edi & 0xFFFF));
+                    pc = 0x4249E3; continue 'run;
+                }
+                0x4249E3 => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x158));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x15C));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x160));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edi = m32(ecx.wrapping_add(0x180));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m32(ecx.wrapping_add(0x158));
+                    { let a: u32 = edx; let b: u32 = 0x3;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    edi = m16(eax);
+                    if zf { pc = 0x424ACA; continue 'run; }
+                    pc = 0x424A48; continue 'run;
+                }
+                0x424A48 => {
+                    { let a: u32 = edx; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    if !zf { pc = 0x424AF5; continue 'run; }
+                    pc = 0x424A51; continue 'run;
+                }
+                0x424A51 => {
+                    ecx = m32(ecx.wrapping_add(0x178));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if (sf == of) { pc = 0x424A6E; continue 'run; }
+                    pc = 0x424A5B; continue 'run;
+                }
+                0x424A5B => {
+                    edx = (edi & 0xFFFF);
+                    ecx = 0x6B49D200;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(esi), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x424A6E => {
+                    ebx = m32(0xE843AC);
+                    { let a: u32 = ecx; let b: u32 = ebx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x424A96; continue 'run; }
+                    pc = 0x424A78; continue 'run;
+                }
+                0x424A78 => {
+                    { let a: u32 = ecx; let b: u32 = ebx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = ecx; let b: u32 = 0x35A4E900;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x424ABC; continue 'run; }
+                    pc = 0x424A82; continue 'run;
+                }
+                0x424A82 => {
+                    edx = (edi & 0xFFFF);
+                    { let a: u32 = ecx; let b: u32 = 0x94B62E00;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(esi), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x424A96 => {
+                    edx = ebx;
+                    { let a: u32 = edx; let b: u32 = ecx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let b: u32 = 0x35A4E900;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x424AB8; continue 'run; }
+                    pc = 0x424AA2; continue 'run;
+                }
+                0x424AA2 => {
+                    { let a: u32 = ecx; let b: u32 = ebx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    edx = (edi & 0xFFFF);
+                    { let a: u32 = ecx; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(esi), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x424AB8 => {
+                    { let a: u32 = edx; let r: u32 = (0u32).wrapping_sub(a) & 0xFFFFFFFF; cf = a != 0; of = a == 0x80000000;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    ecx = edx;
+                    pc = 0x424ABC; continue 'run;
+                }
+                0x424ABC => {
+                    edx = (edi & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(esi), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x424ACA => {
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x164))); fs[ft] = v; ft += 1; }
+                    edx = (edi & 0xFFFF);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ecx = (ecx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x168))) as u32) & 0xFF);
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ecx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    pc = 0x424AF5; continue 'run;
+                }
+                0x424AF5 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k22_net_write, lf_ai_order_k22_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k22_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x424B00;
+        'run: loop {
+            match pc {
+                0x424B00 => {
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0x10));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x424B1A; continue 'run; }
+                    pc = 0x424B09; continue 'run;
+                }
+                0x424B09 => {
+                    eax = m32(esp.wrapping_add(0x8));
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                0x424B1A => {
+                    ecx = m32(esp.wrapping_add(0x14));
+                    edx = m16(ecx);
+                    eax = (eax & 0xFFFFFF00) | (((m8(edx.wrapping_add(edi))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0xC));
+                    w8(esi.wrapping_add(0x150), (eax & 0xFF));
+                    { let a: u32 = m16(ecx); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    edx = m16(ecx);
+                    eax = (edx & 0xFFFF);
+                    eax = m16(eax.wrapping_add(edi));
+                    { let a: u32 = edx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(ecx, (edx & 0xFFFF));
+                    if !zf { pc = 0x424B4D; continue 'run; }
+                    pc = 0x424B49; continue 'run;
+                }
+                0x424B49 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x424BAF; continue 'run; }
+                }
+                0x424B4D => {
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = (eax & 0xFFFF);
+                    eax = ebx;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = ebx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    edx = eax;
+                    { let a: u32 = edx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    { let r: u32 = (edx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    edx = edx.wrapping_add(edx.wrapping_mul(8));
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (edx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = edx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = m32(0x212E258);
+                    { let d: u32 = m32(ebp.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ebp.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x424BA6; continue 'run; }
+                    pc = 0x424B90; continue 'run;
+                }
+                0x424B90 => {
+                    { let a: u32 = ebx; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x424BA0; continue 'run; }
+                    pc = 0x424B95; continue 'run;
+                }
+                0x424B95 => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x424B90; continue 'run; }
+                    pc = 0x424B9C; continue 'run;
+                }
+                0x424B9C => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x424BAD; continue 'run; }
+                }
+                0x424BA0 => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x424BAA; continue 'run; }
+                    pc = 0x424BA6; continue 'run;
+                }
+                0x424BA6 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x424BAD; continue 'run; }
+                }
+                0x424BAA => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    pc = 0x424BAD; continue 'run;
+                }
+                0x424BAD => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    pc = 0x424BAF; continue 'run;
+                }
+                0x424BAF => {
+                    w32(esi.wrapping_add(0x154), eax);
+                    edx = m16(ecx);
+                    eax = ((m8(edx.wrapping_add(edi)) as i8) as i32) as u32;
+                    w32(esi.wrapping_add(0x158), eax);
+                    { let a: u32 = m16(ecx); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    eax = m16(ecx);
+                    edx = (eax & 0xFFFF);
+                    eax = ((m8(edx.wrapping_add(edi)) as i8) as i32) as u32;
+                    w32(esi.wrapping_add(0x15C), eax);
+                    { let a: u32 = m16(ecx); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    eax = m16(ecx);
+                    edx = (eax & 0xFFFF);
+                    eax = ((m8(edx.wrapping_add(edi)) as i8) as i32) as u32;
+                    w32(esi.wrapping_add(0x160), eax);
+                    { let a: u32 = m16(ecx); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    eax = m16(ecx);
+                    edx = (eax & 0xFFFF);
+                    eax = m32(edx.wrapping_add(edi));
+                    w32(esi.wrapping_add(0x180), eax);
+                    { let a: u32 = m16(ecx); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    edx = m32(esi.wrapping_add(0x158));
+                    { let a: u32 = edx; let b: u32 = 0x3;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = m16(ecx);
+                    if zf { pc = 0x424C82; continue 'run; }
+                    pc = 0x424C0F; continue 'run;
+                }
+                0x424C0F => {
+                    { let a: u32 = edx; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    if !zf { pc = 0x424CA5; continue 'run; }
+                    pc = 0x424C18; continue 'run;
+                }
+                0x424C18 => {
+                    edx = (eax & 0xFFFF);
+                    edi = m32(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = edi; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    if !zf { pc = 0x424C39; continue 'run; }
+                    pc = 0x424C2C; continue 'run;
+                }
+                0x424C2C => {
+                    w32(esi.wrapping_add(0x178), 0xFFFFFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                0x424C39 => {
+                    { let a: u32 = edi; let b: u32 = m32(esp.wrapping_add(0x10));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    }
+                    if sf { pc = 0x424C61; continue 'run; }
+                    pc = 0x424C3F; continue 'run;
+                }
+                0x424C3F => {
+                    eax = m32(0xE843AC);
+                    { let a: u32 = eax; let b: u32 = edi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    w32(esi.wrapping_add(0x178), eax);
+                    if (zf || sf != of) { pc = 0x424CA5; continue 'run; }
+                    pc = 0x424C53; continue 'run;
+                }
+                0x424C53 => {
+                    { let a: u32 = eax; let b: u32 = 0x94B62E00;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(esi.wrapping_add(0x178), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                0x424C61 => {
+                    ecx = m32(0xE843AC);
+                    eax = ecx.wrapping_add(edi);
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    w32(esi.wrapping_add(0x178), eax);
+                    if (sf == of) { pc = 0x424CA5; continue 'run; }
+                    pc = 0x424C74; continue 'run;
+                }
+                0x424C74 => {
+                    { let a: u32 = eax; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(esi.wrapping_add(0x178), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                0x424C82 => {
+                    edx = (eax & 0xFFFF);
+                    eax = m32(edx.wrapping_add(edi));
+                    w32(esi.wrapping_add(0x164), eax);
+                    { let a: u32 = m16(ecx); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    eax = m16(ecx);
+                    edx = (eax & 0xFFFF);
+                    eax = (eax & 0xFFFFFF00) | (((m8(edx.wrapping_add(edi))) as u32) & 0xFF);
+                    w8(esi.wrapping_add(0x168), (eax & 0xFF));
+                    { let a: u32 = m16(ecx); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    pc = 0x424CA5; continue 'run;
+                }
+                0x424CA5 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k22_net_read, lf_ai_order_k22_net_read, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0c_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x427F00;
+        'run: loop {
+            match pc {
+                0x427F00 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x150))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x154))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0xC), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edx = (edx & 0xFFFF);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0x10));
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x158))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x15C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x160))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x164))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    edi = (edi & 0xFFFF0000) | (((m16(ecx.wrapping_add(0x168))) as u32) & 0xFFFF);
+                    edx = (edx & 0xFFFF);
+                    w16(edx.wrapping_add(esi), (edi & 0xFFFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    w16(ecx.wrapping_add(0x168), 0x0);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0c_net_write, lf_ai_order_k0c_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0d_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x42C460;
+        'run: loop {
+            match pc {
+                0x42C460 => {
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = esp;
+                    { let r: u32 = (esp & 0xFFFFFFF8) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    esp = r;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m32(ebp.wrapping_add(0x8));
+                    ecx = (ecx & 0xFFFFFF00) | (((m8(ebx.wrapping_add(0x150))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(ebp.wrapping_add(0x10));
+                    eax = m16(esi);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(ebp.wrapping_add(0xC));
+                    w8(eax.wrapping_add(edi), (ecx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    edx = (eax & 0xFFFF);
+                    eax = (eax & 0xFFFFFF00) | (((m8(ebx.wrapping_add(0x151))) as u32) & 0xFF);
+                    w8(edx.wrapping_add(edi), (eax & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    edx = (edx & 0xFFFFFF00) | (((m8(ebx.wrapping_add(0x152))) as u32) & 0xFF);
+                    ecx = (eax & 0xFFFF);
+                    w8(ecx.wrapping_add(edi), (edx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let r: u32 = (m8(ebx.wrapping_add(0x150)) & 0x20) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    eax = m16(esi);
+                    if zf { pc = 0x42C505; continue 'run; }
+                    pc = 0x42C4B7; continue 'run;
+                }
+                0x42C4B7 => {
+                    { let v = f32b_to_f64(m32(ebx.wrapping_add(0x154))); fs[ft] = v; ft += 1; }
+                    eax = (eax & 0xFFFF);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    ecx = m32(esp.wrapping_add(0x10));
+                    w32(eax.wrapping_add(edi), ecx);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    { let v = f32b_to_f64(m32(ebx.wrapping_add(0x158))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edx = (eax & 0xFFFF);
+                    eax = m32(esp.wrapping_add(0x10));
+                    w32(edx.wrapping_add(edi), eax);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    { let v = f32b_to_f64(m32(ebx.wrapping_add(0x15C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edx = m32(esp.wrapping_add(0x10));
+                    ecx = (eax & 0xFFFF);
+                    w32(ecx.wrapping_add(edi), edx);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x42C505; continue 'run;
+                }
+                0x42C505 => {
+                    { let r: u32 = (m8(ebx.wrapping_add(0x151)) & 0x10) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x42C526; continue 'run; }
+                    pc = 0x42C50E; continue 'run;
+                }
+                0x42C50E => {
+                    { let v = f32b_to_f64(m32(ebx.wrapping_add(0x160))); fs[ft] = v; ft += 1; }
+                    eax = m16(esi);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    ecx = m32(esp.wrapping_add(0x10));
+                    w32(eax.wrapping_add(edi), ecx);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x42C526; continue 'run;
+                }
+                0x42C526 => {
+                    { let r: u32 = (m8(ebx.wrapping_add(0x152)) & 0x2) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x42C57D; continue 'run; }
+                    pc = 0x42C52F; continue 'run;
+                }
+                0x42C52F => {
+                    eax = m32(ebx.wrapping_add(0x17C));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if (sf == of) { pc = 0x42C540; continue 'run; }
+                    pc = 0x42C539; continue 'run;
+                }
+                0x42C539 => {
+                    eax = 0x6B49D200;
+                    { pc = 0x42C573; continue 'run; }
+                }
+                0x42C540 => {
+                    edx = m32(0xE843AC);
+                    { let a: u32 = eax; let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x42C55A; continue 'run; }
+                    pc = 0x42C54A; continue 'run;
+                }
+                0x42C54A => {
+                    { let a: u32 = eax; let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = 0x35A4E900;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x42C573; continue 'run; }
+                    pc = 0x42C553; continue 'run;
+                }
+                0x42C553 => {
+                    { let a: u32 = eax; let b: u32 = 0x94B62E00;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x42C573; continue 'run; }
+                }
+                0x42C55A => {
+                    ecx = edx;
+                    { let a: u32 = ecx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = ecx; let b: u32 = 0x35A4E900;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x42C56F; continue 'run; }
+                    pc = 0x42C566; continue 'run;
+                }
+                0x42C566 => {
+                    { let a: u32 = eax; let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x42C573; continue 'run; }
+                }
+                0x42C56F => {
+                    { let a: u32 = ecx; let r: u32 = (0u32).wrapping_sub(a) & 0xFFFFFFFF; cf = a != 0; of = a == 0x80000000;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    pc = 0x42C573; continue 'run;
+                }
+                0x42C573 => {
+                    edx = m16(esi);
+                    w32(edx.wrapping_add(edi), eax);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x42C57D; continue 'run;
+                }
+                0x42C57D => {
+                    { let r: u32 = (m8(ebx.wrapping_add(0x152)) & 0x1) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x42C61F; continue 'run; }
+                    pc = 0x42C58A; continue 'run;
+                }
+                0x42C58A => {
+                    eax = m32(ebx.wrapping_add(0x174));
+                    ecx = m32(ebx.wrapping_add(0x170));
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0xA20F00, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    ecx = m16(esi);
+                    w8(ecx.wrapping_add(edi), (eax & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    ecx = m16(esi);
+                    w32(esp.wrapping_add(0x18), eax);
+                    ecx = (ecx & 0xFFFF);
+                    w8(ecx.wrapping_add(edi), ((eax >> 8) & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    ecx = m8(esp.wrapping_add(0x1A));
+                    eax = (eax & 0xFFFF);
+                    w8(eax.wrapping_add(edi), (ecx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    ecx = m8(esp.wrapping_add(0x1B));
+                    eax = (eax & 0xFFFF);
+                    w8(eax.wrapping_add(edi), (ecx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    eax = (eax & 0xFFFF);
+                    w8(eax.wrapping_add(edi), (edx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    ecx = (eax & 0xFFFF);
+                    w8(ecx.wrapping_add(edi), ((edx >> 8) & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    w32(esp.wrapping_add(0x1C), edx);
+                    edx = (eax & 0xFFFF);
+                    eax = (eax & 0xFFFFFF00) | (((m8(esp.wrapping_add(0x1E))) as u32) & 0xFF);
+                    w8(edx.wrapping_add(edi), (eax & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    edx = (edx & 0xFFFFFF00) | (((m8(esp.wrapping_add(0x1F))) as u32) & 0xFF);
+                    ecx = (eax & 0xFFFF);
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    w8(ecx.wrapping_add(edi), (edx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x42C61F; continue 'run;
+                }
+                0x42C61F => {
+                    { let a: u32 = m8(ebx.wrapping_add(0x148)); let b: u32 = 0x83;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x42C676; continue 'run; }
+                    pc = 0x42C628; continue 'run;
+                }
+                0x42C628 => {
+                    { let v = f32b_to_f64(m32(ebx.wrapping_add(0x164))); fs[ft] = v; ft += 1; }
+                    eax = m16(esi);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    ecx = m32(esp.wrapping_add(0x10));
+                    w32(eax.wrapping_add(edi), ecx);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    { let v = f32b_to_f64(m32(ebx.wrapping_add(0x168))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edx = (eax & 0xFFFF);
+                    eax = m32(esp.wrapping_add(0x10));
+                    w32(edx.wrapping_add(edi), eax);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    { let v = f32b_to_f64(m32(ebx.wrapping_add(0x16C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edx = m32(esp.wrapping_add(0x10));
+                    ecx = (eax & 0xFFFF);
+                    w32(ecx.wrapping_add(edi), edx);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x42C676; continue 'run;
+                }
+                0x42C676 => {
+                    eax = m16(esi);
+                    ecx = (ecx & 0xFFFF0000) | (((m16(ebx.wrapping_add(0x180))) as u32) & 0xFFFF);
+                    w16(eax.wrapping_add(edi), (ecx & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    w16(ebx.wrapping_add(0x180), 0x0);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    esp = ebp;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0d_net_write, lf_ai_order_k0d_net_write, 304, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0d_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x42C6A0;
+        'run: loop {
+            match pc {
+                0x42C6A0 => {
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = esp;
+                    { let r: u32 = (esp & 0xFFFFFFF8) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    esp = r;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x14;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m32(ebp.wrapping_add(0x8));
+                    { let a: u32 = m32(ebx.wrapping_add(0xAF0)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if zf { pc = 0x42C90B; continue 'run; }
+                    pc = 0x42C6BC; continue 'run;
+                }
+                0x42C6BC => {
+                    edi = m32(ebp.wrapping_add(0x10));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x42C90B; continue 'run; }
+                    pc = 0x42C6C7; continue 'run;
+                }
+                0x42C6C7 => {
+                    esi = m32(ebp.wrapping_add(0x14));
+                    eax = m16(esi);
+                    ecx = (ecx & 0xFFFFFF00) | (((m8(eax.wrapping_add(edi))) as u32) & 0xFF);
+                    w8(ebx.wrapping_add(0x150), (ecx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    edx = (eax & 0xFFFF);
+                    eax = (eax & 0xFFFFFF00) | (((m8(edx.wrapping_add(edi))) as u32) & 0xFF);
+                    w8(ebx.wrapping_add(0x151), (eax & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    eax = m16(esi);
+                    ecx = (eax & 0xFFFF);
+                    edx = (edx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(edi))) as u32) & 0xFF);
+                    w8(ebx.wrapping_add(0x152), (edx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let r: u32 = (m8(ebx.wrapping_add(0x152)) & 0xEF) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    w8(ebx.wrapping_add(0x152), r);
+                    }
+                    { let r: u32 = (m8(ebx.wrapping_add(0x150)) & 0x20) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x42C761; continue 'run; }
+                    pc = 0x42C710; continue 'run;
+                }
+                0x42C710 => {
+                    eax = m16(esi);
+                    ecx = (eax & 0xFFFF);
+                    edx = m32(ecx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    ecx = (eax & 0xFFFF);
+                    w32(esp.wrapping_add(0x10), edx);
+                    edx = m32(ecx.wrapping_add(edi));
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x10))); fs[ft] = v; ft += 1; }
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    ecx = (eax & 0xFFFF);
+                    w32(esp.wrapping_add(0x14), edx);
+                    edx = m32(ecx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x18), edx);
+                    w32(ebx.wrapping_add(0x154), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x14))); fs[ft] = v; ft += 1; }
+                    w32(ebx.wrapping_add(0x158), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x18))); fs[ft] = v; ft += 1; }
+                    w32(ebx.wrapping_add(0x15C), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    pc = 0x42C761; continue 'run;
+                }
+                0x42C761 => {
+                    { let r: u32 = (m8(ebx.wrapping_add(0x151)) & 0x10) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x42C77A; continue 'run; }
+                    pc = 0x42C76A; continue 'run;
+                }
+                0x42C76A => {
+                    eax = m16(esi);
+                    ecx = m32(eax.wrapping_add(edi));
+                    w32(ebx.wrapping_add(0x160), ecx);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x42C77A; continue 'run;
+                }
+                0x42C77A => {
+                    { let r: u32 = (edx | 0xFFFFFFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let r: u32 = (m8(ebx.wrapping_add(0x152)) & 0x2) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x42C7DA; continue 'run; }
+                    pc = 0x42C786; continue 'run;
+                }
+                0x42C786 => {
+                    ecx = m16(esi);
+                    eax = (ecx & 0xFFFF);
+                    eax = m32(eax.wrapping_add(edi));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    w16(esi, (ecx & 0xFFFF));
+                    if !zf { pc = 0x42C7A4; continue 'run; }
+                    pc = 0x42C79C; continue 'run;
+                }
+                0x42C79C => {
+                    w32(ebx.wrapping_add(0x17C), edx);
+                    { pc = 0x42C7DA; continue 'run; }
+                }
+                0x42C7A4 => {
+                    { let a: u32 = eax; let b: u32 = m32(ebp.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = m32(0xE843AC);
+                    if sf { pc = 0x42C7C5; continue 'run; }
+                    pc = 0x42C7AF; continue 'run;
+                }
+                0x42C7AF => {
+                    { let a: u32 = eax; let b: u32 = ecx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    w32(ebx.wrapping_add(0x17C), eax);
+                    if (zf || sf != of) { pc = 0x42C7DA; continue 'run; }
+                    pc = 0x42C7BE; continue 'run;
+                }
+                0x42C7BE => {
+                    { let a: u32 = eax; let b: u32 = 0x94B62E00;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x42C7D4; continue 'run; }
+                }
+                0x42C7C5 => {
+                    { let a: u32 = eax; let b: u32 = ecx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(ebx.wrapping_add(0x17C), eax);
+                    if !sf { pc = 0x42C7DA; continue 'run; }
+                    pc = 0x42C7CF; continue 'run;
+                }
+                0x42C7CF => {
+                    { let a: u32 = eax; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    pc = 0x42C7D4; continue 'run;
+                }
+                0x42C7D4 => {
+                    w32(ebx.wrapping_add(0x17C), eax);
+                    pc = 0x42C7DA; continue 'run;
+                }
+                0x42C7DA => {
+                    { let r: u32 = (m8(ebx.wrapping_add(0x152)) & 0x1) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x42C898; continue 'run; }
+                    pc = 0x42C7E7; continue 'run;
+                }
+                0x42C7E7 => {
+                    eax = m16(esi);
+                    w32(esp.wrapping_add(0x18), edx);
+                    w32(esp.wrapping_add(0x1C), edx);
+                    edx = (eax & 0xFFFF);
+                    ecx = m8(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w8(esp.wrapping_add(0x18), (ecx & 0xFF));
+                    ecx = m8(edx.wrapping_add(edi));
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w8(esp.wrapping_add(0x19), (ecx & 0xFF));
+                    ecx = m8(edx.wrapping_add(edi));
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w8(esp.wrapping_add(0x1A), (ecx & 0xFF));
+                    ecx = m8(edx.wrapping_add(edi));
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w8(esp.wrapping_add(0x1B), (ecx & 0xFF));
+                    ecx = m8(edx.wrapping_add(edi));
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w8(esp.wrapping_add(0x1C), (ecx & 0xFF));
+                    ecx = m8(edx.wrapping_add(edi));
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w8(esp.wrapping_add(0x1D), (ecx & 0xFF));
+                    ecx = m8(edx.wrapping_add(edi));
+                    edx = (eax & 0xFFFF);
+                    w16(esi, (eax & 0xFFFF));
+                    w8(esp.wrapping_add(0x1E), (ecx & 0xFF));
+                    ecx = m8(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w8(esp.wrapping_add(0x1F), (ecx & 0xFF));
+                    edx = m32(esp.wrapping_add(0x1C));
+                    w16(esi, (eax & 0xFFFF));
+                    eax = m32(esp.wrapping_add(0x18));
+                    { let v: u32 = edx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0xA20F90, l, esp, 2, 16, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    w32(ebx.wrapping_add(0x170), eax);
+                    w32(ebx.wrapping_add(0x174), edx);
+                    pc = 0x42C898; continue 'run;
+                }
+                0x42C898 => {
+                    { let a: u32 = m8(ebx.wrapping_add(0x148)); let b: u32 = 0x83;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x42C8F2; continue 'run; }
+                    pc = 0x42C8A1; continue 'run;
+                }
+                0x42C8A1 => {
+                    eax = m16(esi);
+                    ecx = (eax & 0xFFFF);
+                    edx = m32(ecx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    ecx = (eax & 0xFFFF);
+                    w32(esp.wrapping_add(0x18), edx);
+                    edx = m32(ecx.wrapping_add(edi));
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x18))); fs[ft] = v; ft += 1; }
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    ecx = (eax & 0xFFFF);
+                    w32(esp.wrapping_add(0x14), edx);
+                    edx = m32(ecx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x10), edx);
+                    w32(ebx.wrapping_add(0x164), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x14))); fs[ft] = v; ft += 1; }
+                    w32(ebx.wrapping_add(0x168), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x10))); fs[ft] = v; ft += 1; }
+                    w32(ebx.wrapping_add(0x16C), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    pc = 0x42C8F2; continue 'run;
+                }
+                0x42C8F2 => {
+                    eax = m16(esi);
+                    ecx = (ecx & 0xFFFF0000) | (((m16(eax.wrapping_add(edi))) as u32) & 0xFFFF);
+                    w16(ebx.wrapping_add(0x180), (ecx & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    esp = ebp;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    break 'run;
+                }
+                0x42C90B => {
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    esp = ebp;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0d_net_read, lf_ai_order_k0d_net_read, 320, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0e_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x42F960;
+        'run: loop {
+            match pc {
+                0x42F960 => {
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0xC));
+                    ecx = m32(esi.wrapping_add(0x150));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if !zf { pc = 0x42F984; continue 'run; }
+                    pc = 0x42F971; continue 'run;
+                }
+                0x42F971 => {
+                    eax = m32(esp.wrapping_add(0x18));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x14));
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x42F9D4; continue 'run; }
+                }
+                0x42F984 => {
+                    eax = ecx;
+                    { let r: u32 = (eax & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = m32(eax.wrapping_add(0x2149C64));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x42F99D; continue 'run; }
+                    pc = 0x42F998; continue 'run;
+                }
+                0x42F998 => {
+                    { let a: u32 = m32(eax.wrapping_add(0x44)); let b: u32 = ecx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x42F9A4; continue 'run; }
+                    pc = 0x42F99D; continue 'run;
+                }
+                0x42F99D => {
+                    eax = 0xFFFF;
+                    { pc = 0x42F9B9; continue 'run; }
+                }
+                0x42F9A4 => {
+                    eax = m32(eax.wrapping_add(0xB0));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x42F9B5; continue 'run; }
+                    pc = 0x42F9AE; continue 'run;
+                }
+                0x42F9AE => {
+                    eax = 0xFFFF;
+                    { pc = 0x42F9B9; continue 'run; }
+                }
+                0x42F9B5 => {
+                    eax = m16(eax.wrapping_add(0x2));
+                    pc = 0x42F9B9; continue 'run;
+                }
+                0x42F9B9 => {
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edx = (eax & 0xFFFF);
+                    if !zf { pc = 0x42F9C5; continue 'run; }
+                    pc = 0x42F9C2; continue 'run;
+                }
+                0x42F9C2 => {
+                    edx = (ecx & 0xFFFF);
+                    pc = 0x42F9C5; continue 'run;
+                }
+                0x42F9C5 => {
+                    eax = m32(esp.wrapping_add(0x18));
+                    edi = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x14));
+                    w16(edi.wrapping_add(ecx), (edx & 0xFFFF));
+                    pc = 0x42F9D4; continue 'run;
+                }
+                0x42F9D4 => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(esi.wrapping_add(0x154))) as u32) & 0xFF);
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x158))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x18), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x18));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x15C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x18), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x18));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x160))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x18), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    esi = m32(esp.wrapping_add(0x18));
+                    edx = (edx & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(ecx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0e_net_write, lf_ai_order_k0e_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0f_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x430AA0;
+        'run: loop {
+            match pc {
+                0x430AA0 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x8));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0xC));
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(esi.wrapping_add(0x150))) as u32) & 0xFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m32(esi.wrapping_add(0x154));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(eax);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if !zf { pc = 0x430AD7; continue 'run; }
+                    pc = 0x430ACC; continue 'run;
+                }
+                0x430ACC => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x430B23; continue 'run; }
+                }
+                0x430AD7 => {
+                    edi = edx;
+                    { let r: u32 = (edi & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edi = r;
+                    }
+                    { let a: u32 = edi; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    } }
+                    edi = m32(edi.wrapping_add(0x2149C64));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x430AF1; continue 'run; }
+                    pc = 0x430AEC; continue 'run;
+                }
+                0x430AEC => {
+                    { let a: u32 = m32(edi.wrapping_add(0x44)); let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x430AF8; continue 'run; }
+                    pc = 0x430AF1; continue 'run;
+                }
+                0x430AF1 => {
+                    edx = 0xFFFF;
+                    { pc = 0x430B0B; continue 'run; }
+                }
+                0x430AF8 => {
+                    edi = m32(edi.wrapping_add(0xB0));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edx = 0xFFFF;
+                    if zf { pc = 0x430B0B; continue 'run; }
+                    pc = 0x430B07; continue 'run;
+                }
+                0x430B07 => {
+                    edx = m16(edi.wrapping_add(0x2));
+                    pc = 0x430B0B; continue 'run;
+                }
+                0x430B0B => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x430B1C; continue 'run; }
+                    pc = 0x430B15; continue 'run;
+                }
+                0x430B15 => {
+                    edi = m16(esi.wrapping_add(0x154));
+                    pc = 0x430B1C; continue 'run;
+                }
+                0x430B1C => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    pc = 0x430B23; continue 'run;
+                }
+                0x430B23 => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x158))); fs[ft] = v; ft += 1; }
+                    edx = m16(eax);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x15C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(esi.wrapping_add(0x160))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    esi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(ecx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0f_net_write, lf_ai_order_k0f_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0f_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x430B80;
+        'run: loop {
+            match pc {
+                0x430B80 => {
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = m32(esp.wrapping_add(0x18));
+                    { let r: u32 = (ebp & ebp) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x430BA0; continue 'run; }
+                    pc = 0x430B8C; continue 'run;
+                }
+                0x430B8C => {
+                    eax = m32(esp.wrapping_add(0x10));
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x430BA0 => {
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m32(esp.wrapping_add(0x14));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x24));
+                    ecx = m16(esi);
+                    edx = (edx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(ebp))) as u32) & 0xFF);
+                    w8(ebx.wrapping_add(0x150), (edx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    ecx = m16(esi);
+                    eax = (ecx & 0xFFFF);
+                    eax = m16(eax.wrapping_add(ebp));
+                    { let a: u32 = ecx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(esi, (ecx & 0xFFFF));
+                    if !zf { pc = 0x430BD4; continue 'run; }
+                    pc = 0x430BD0; continue 'run;
+                }
+                0x430BD0 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x430C34; continue 'run; }
+                }
+                0x430BD4 => {
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = (eax & 0xFFFF);
+                    eax = edi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = edi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    { let r: u32 = (ecx ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = m32(0x212E258);
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ecx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    ecx = m32(ecx.wrapping_add(0x5C));
+                    edx = m32(ecx.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x430C2C; continue 'run; }
+                    pc = 0x430C16; continue 'run;
+                }
+                0x430C16 => {
+                    { let a: u32 = edi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x430C26; continue 'run; }
+                    pc = 0x430C1B; continue 'run;
+                }
+                0x430C1B => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x430C16; continue 'run; }
+                    pc = 0x430C22; continue 'run;
+                }
+                0x430C22 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x430C33; continue 'run; }
+                }
+                0x430C26 => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x430C30; continue 'run; }
+                    pc = 0x430C2C; continue 'run;
+                }
+                0x430C2C => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x430C33; continue 'run; }
+                }
+                0x430C30 => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    pc = 0x430C33; continue 'run;
+                }
+                0x430C33 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    pc = 0x430C34; continue 'run;
+                }
+                0x430C34 => {
+                    w32(ebx.wrapping_add(0x154), eax);
+                    eax = m16(esi);
+                    edx = (eax & 0xFFFF);
+                    ecx = m32(edx.wrapping_add(ebp));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    w32(esp.wrapping_add(0x20), ecx);
+                    ecx = m32(edx.wrapping_add(ebp));
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x20))); fs[ft] = v; ft += 1; }
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    w32(esp.wrapping_add(0xC), ecx);
+                    ecx = m32(edx.wrapping_add(ebp));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x10), ecx);
+                    w32(ebx.wrapping_add(0x158), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x8))); fs[ft] = v; ft += 1; }
+                    w32(ebx.wrapping_add(0x15C), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0xC))); fs[ft] = v; ft += 1; }
+                    w32(ebx.wrapping_add(0x160), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0f_net_read, lf_ai_order_k0f_net_read, 304, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k0f_exit(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x431010;
+        'run: loop {
+            match pc {
+                0x431010 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    { let r: u32 = (m8(eax.wrapping_add(0x140)) & 0x4) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x431022; continue 'run; }
+                    pc = 0x43101D; continue 'run;
+                }
+                0x43101D => {
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x9B5FF0, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    pc = 0x431022; continue 'run;
+                }
+                0x431022 => {
+                    eax = m32(eax.wrapping_add(0x44));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = 0x59;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x402160, l, esp, 2, 16, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k0f_exit, lf_ai_order_k0f_exit, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k10_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x431C00;
+        'run: loop {
+            match pc {
+                0x431C00 => {
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m32(esp.wrapping_add(0x8));
+                    ecx = m32(ebx.wrapping_add(0x154));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if !zf { pc = 0x431C24; continue 'run; }
+                    pc = 0x431C11; continue 'run;
+                }
+                0x431C11 => {
+                    eax = m32(esp.wrapping_add(0x18));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x14));
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x431C74; continue 'run; }
+                }
+                0x431C24 => {
+                    eax = ecx;
+                    { let r: u32 = (eax & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = m32(eax.wrapping_add(0x2149C64));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x431C3D; continue 'run; }
+                    pc = 0x431C38; continue 'run;
+                }
+                0x431C38 => {
+                    { let a: u32 = m32(eax.wrapping_add(0x44)); let b: u32 = ecx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x431C44; continue 'run; }
+                    pc = 0x431C3D; continue 'run;
+                }
+                0x431C3D => {
+                    eax = 0xFFFF;
+                    { pc = 0x431C59; continue 'run; }
+                }
+                0x431C44 => {
+                    eax = m32(eax.wrapping_add(0xB0));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x431C55; continue 'run; }
+                    pc = 0x431C4E; continue 'run;
+                }
+                0x431C4E => {
+                    eax = 0xFFFF;
+                    { pc = 0x431C59; continue 'run; }
+                }
+                0x431C55 => {
+                    eax = m16(eax.wrapping_add(0x2));
+                    pc = 0x431C59; continue 'run;
+                }
+                0x431C59 => {
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edx = (eax & 0xFFFF);
+                    if !zf { pc = 0x431C65; continue 'run; }
+                    pc = 0x431C62; continue 'run;
+                }
+                0x431C62 => {
+                    edx = (ecx & 0xFFFF);
+                    pc = 0x431C65; continue 'run;
+                }
+                0x431C65 => {
+                    eax = m32(esp.wrapping_add(0x18));
+                    esi = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x14));
+                    w16(esi.wrapping_add(ecx), (edx & 0xFFFF));
+                    pc = 0x431C74; continue 'run;
+                }
+                0x431C74 => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    esi = m32(ebx.wrapping_add(0x150));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edi = m16(eax);
+                    if !zf { pc = 0x431C90; continue 'run; }
+                    pc = 0x431C85; continue 'run;
+                }
+                0x431C85 => {
+                    edx = (edi & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x431CDE; continue 'run; }
+                }
+                0x431C90 => {
+                    edx = esi;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x431CAA; continue 'run; }
+                    pc = 0x431CA5; continue 'run;
+                }
+                0x431CA5 => {
+                    { let a: u32 = m32(edx.wrapping_add(0x44)); let b: u32 = esi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x431CB1; continue 'run; }
+                    pc = 0x431CAA; continue 'run;
+                }
+                0x431CAA => {
+                    edx = 0xFFFF;
+                    { pc = 0x431CC6; continue 'run; }
+                }
+                0x431CB1 => {
+                    edx = m32(edx.wrapping_add(0xB0));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x431CC2; continue 'run; }
+                    pc = 0x431CBB; continue 'run;
+                }
+                0x431CBB => {
+                    edx = 0xFFFF;
+                    { pc = 0x431CC6; continue 'run; }
+                }
+                0x431CC2 => {
+                    edx = m16(edx.wrapping_add(0x2));
+                    pc = 0x431CC6; continue 'run;
+                }
+                0x431CC6 => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    esi = (edx & 0xFFFF);
+                    if !zf { pc = 0x431CD7; continue 'run; }
+                    pc = 0x431CD0; continue 'run;
+                }
+                0x431CD0 => {
+                    esi = m16(ebx.wrapping_add(0x150));
+                    pc = 0x431CD7; continue 'run;
+                }
+                0x431CD7 => {
+                    edx = (edi & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (esi & 0xFFFF));
+                    pc = 0x431CDE; continue 'run;
+                }
+                0x431CDE => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v = f32b_to_f64(m32(ebx.wrapping_add(0x158))); fs[ft] = v; ft += 1; }
+                    edx = m16(eax);
+                    w32(esp.wrapping_add(0x18), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    esi = m32(esp.wrapping_add(0x18));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ebx.wrapping_add(0x15C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x18), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    esi = m32(esp.wrapping_add(0x18));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ebx.wrapping_add(0x160))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x18), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    esi = m32(esp.wrapping_add(0x18));
+                    edx = (edx & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(ecx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k10_net_write, lf_ai_order_k10_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k10_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x431D40;
+        'run: loop {
+            match pc {
+                0x431D40 => {
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = m32(esp.wrapping_add(0x18));
+                    { let r: u32 = (ebp & ebp) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x431D60; continue 'run; }
+                    pc = 0x431D4C; continue 'run;
+                }
+                0x431D4C => {
+                    eax = m32(esp.wrapping_add(0x10));
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x431D60 => {
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m32(0x212E258);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x24));
+                    ecx = m16(esi);
+                    edx = (ecx & 0xFFFF);
+                    eax = m16(edx.wrapping_add(ebp));
+                    { let a: u32 = ecx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    w16(esi, (ecx & 0xFFFF));
+                    if !zf { pc = 0x431D87; continue 'run; }
+                    pc = 0x431D83; continue 'run;
+                }
+                0x431D83 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x431DDF; continue 'run; }
+                }
+                0x431D87 => {
+                    edi = (eax & 0xFFFF);
+                    eax = edi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = edi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = (!edx) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = edx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ebx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ebx.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x431DD8; continue 'run; }
+                    pc = 0x431DC2; continue 'run;
+                }
+                0x431DC2 => {
+                    { let a: u32 = edi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x431DD2; continue 'run; }
+                    pc = 0x431DC7; continue 'run;
+                }
+                0x431DC7 => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x431DC2; continue 'run; }
+                    pc = 0x431DCE; continue 'run;
+                }
+                0x431DCE => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x431DDF; continue 'run; }
+                }
+                0x431DD2 => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x431DDC; continue 'run; }
+                    pc = 0x431DD8; continue 'run;
+                }
+                0x431DD8 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x431DDF; continue 'run; }
+                }
+                0x431DDC => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    pc = 0x431DDF; continue 'run;
+                }
+                0x431DDF => {
+                    edx = m32(esp.wrapping_add(0x1C));
+                    w32(edx.wrapping_add(0x154), eax);
+                    ecx = m16(esi);
+                    eax = (ecx & 0xFFFF);
+                    eax = m16(eax.wrapping_add(ebp));
+                    { let a: u32 = ecx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(esi, (ecx & 0xFFFF));
+                    if !zf { pc = 0x431E03; continue 'run; }
+                    pc = 0x431DFF; continue 'run;
+                }
+                0x431DFF => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x431E61; continue 'run; }
+                }
+                0x431E03 => {
+                    edi = (eax & 0xFFFF);
+                    eax = edi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = edi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    { let r: u32 = (ecx ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ebx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    ecx = m32(ebx.wrapping_add(0x5C));
+                    edx = m32(ecx.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x431E56; continue 'run; }
+                    pc = 0x431E3E; continue 'run;
+                }
+                0x431E3E => {
+                    pc = 0x431E40; continue 'run;
+                }
+                0x431E40 => {
+                    { let a: u32 = edi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x431E50; continue 'run; }
+                    pc = 0x431E45; continue 'run;
+                }
+                0x431E45 => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x431E40; continue 'run; }
+                    pc = 0x431E4C; continue 'run;
+                }
+                0x431E4C => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x431E5D; continue 'run; }
+                }
+                0x431E50 => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x431E5A; continue 'run; }
+                    pc = 0x431E56; continue 'run;
+                }
+                0x431E56 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x431E5D; continue 'run; }
+                }
+                0x431E5A => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    pc = 0x431E5D; continue 'run;
+                }
+                0x431E5D => {
+                    edx = m32(esp.wrapping_add(0x1C));
+                    pc = 0x431E61; continue 'run;
+                }
+                0x431E61 => {
+                    w32(edx.wrapping_add(0x150), eax);
+                    eax = m16(esi);
+                    ecx = (eax & 0xFFFF);
+                    ecx = m32(ecx.wrapping_add(ebp));
+                    w32(esp.wrapping_add(0x24), ecx);
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x24))); fs[ft] = v; ft += 1; }
+                    w16(esi, (eax & 0xFFFF));
+                    ecx = (eax & 0xFFFF);
+                    ecx = m32(ecx.wrapping_add(ebp));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x10), ecx);
+                    ecx = (eax & 0xFFFF);
+                    ecx = m32(ecx.wrapping_add(ebp));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(0x158), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x8))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0xC), ecx);
+                    w32(edx.wrapping_add(0x15C), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x8))); fs[ft] = v; ft += 1; }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    w32(edx.wrapping_add(0x160), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k10_net_read, lf_ai_order_k10_net_read, 304, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k10_exit(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x432200;
+        'run: loop {
+            match pc {
+                0x432200 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    { let r: u32 = (m8(eax.wrapping_add(0x140)) & 0x4) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x432212; continue 'run; }
+                    pc = 0x43220D; continue 'run;
+                }
+                0x43220D => {
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x9B5FF0, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    pc = 0x432212; continue 'run;
+                }
+                0x432212 => {
+                    eax = m32(eax.wrapping_add(0x44));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = 0x59;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x402160, l, esp, 2, 16, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k10_exit, lf_ai_order_k10_exit, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k11_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x432870;
+        'run: loop {
+            match pc {
+                0x432870 => {
+                    ecx = m32(esp.wrapping_add(0xC));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x432888; continue 'run; }
+                    pc = 0x432878; continue 'run;
+                }
+                0x432878 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x432888 => {
+                    eax = m32(esp.wrapping_add(0x10));
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFFFF00) | (((m8(edx.wrapping_add(ecx))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0xC));
+                    w8(edi.wrapping_add(0x150), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    esi = (edx & 0xFFFF);
+                    ecx = m16(esi.wrapping_add(ecx));
+                    { let a: u32 = edx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = (ecx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(eax, (edx & 0xFFFF));
+                    if !zf { pc = 0x4328C4; continue 'run; }
+                    pc = 0x4328B9; continue 'run;
+                }
+                0x4328B9 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x4328C4 => {
+                    esi = (ecx & 0xFFFF);
+                    eax = esi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = esi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = (!edx) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = edx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = m32(0x212E258);
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ecx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ecx.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4328B9; continue 'run; }
+                    pc = 0x432905; continue 'run;
+                }
+                0x432905 => {
+                    { let a: u32 = esi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x43291C; continue 'run; }
+                    pc = 0x43290A; continue 'run;
+                }
+                0x43290A => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x432905; continue 'run; }
+                    pc = 0x432911; continue 'run;
+                }
+                0x432911 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x43291C => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4328B9; continue 'run; }
+                    pc = 0x432922; continue 'run;
+                }
+                0x432922 => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k11_net_read, lf_ai_order_k11_net_read, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_interrupt_query(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x437890;
+        'run: loop {
+            match pc {
+                0x437890 => {
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if zf { pc = 0x43790B; continue 'run; }
+                    pc = 0x437895; continue 'run;
+                }
+                0x437895 => {
+                    esi = m32(ecx.wrapping_add(0xB0));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4378C5; continue 'run; }
+                    pc = 0x43789F; continue 'run;
+                }
+                0x43789F => {
+                    eax = m32(0x2528C14);
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4378C5; continue 'run; }
+                    pc = 0x4378A8; continue 'run;
+                }
+                0x4378A8 => {
+                    eax = m32(eax.wrapping_add(0x408));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4378C5; continue 'run; }
+                    pc = 0x4378B2; continue 'run;
+                }
+                0x4378B2 => {
+                    edx = (edx & 0xFFFFFF00) | (((m8(esi)) as u32) & 0xFF);
+                    { let a: u32 = (edx & 0xFF); let b: u32 = m8(eax.wrapping_add(0x1B0));
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x43790B; continue 'run; }
+                    pc = 0x4378BC; continue 'run;
+                }
+                0x4378BC => {
+                    { let r: u32 = (m8(esi.wrapping_add(0x67C)) & 0x1) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x43790B; continue 'run; }
+                    pc = 0x4378C5; continue 'run;
+                }
+                0x4378C5 => {
+                    eax = (eax & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x149))) as u32) & 0xFF);
+                    { let a: u32 = (eax & 0xFF); let b: u32 = 0xFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x43790B; continue 'run; }
+                    pc = 0x4378CF; continue 'run;
+                }
+                0x4378CF => {
+                    { let r: u32 = (m8(ecx.wrapping_add(0x80)) & 0xB) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x43790B; continue 'run; }
+                    pc = 0x4378D8; continue 'run;
+                }
+                0x4378D8 => {
+                    { let r: u32 = (m32(ecx.wrapping_add(0xC8)) & 0x400000) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x43790B; continue 'run; }
+                    pc = 0x4378E4; continue 'run;
+                }
+                0x4378E4 => {
+                    eax = (((eax & 0xFF) as i8) as i32) as u32;
+                    edx = eax.wrapping_mul(8);
+                    { let a: u32 = edx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = m32(edx.wrapping_mul(4).wrapping_add(0xDD5574));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x43790B; continue 'run; }
+                    pc = 0x4378FB; continue 'run;
+                }
+                0x4378FB => {
+                    edx = m32(esp.wrapping_add(0x8));
+                    { let v: u32 = edx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let t: u32 = eax; let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let _ = lcall!(t, l, esp, 2, 16, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp; }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x437910; continue 'run; }
+                    pc = 0x43790B; continue 'run;
+                }
+                0x43790B => {
+                    eax = 0x1;
+                    pc = 0x437910; continue 'run;
+                }
+                0x437910 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_interrupt_query, lf_ai_order_interrupt_query, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_human_stop_if_unflagged(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x439430;
+        'run: loop {
+            match pc {
+                0x439430 => {
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = esp;
+                    { let r: u32 = (esp & 0xFFFFFFF8) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    esp = r;
+                    }
+                    { let r: u32 = (m8(eax.wrapping_add(0x470)) & 0x10) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x43944A; continue 'run; }
+                    pc = 0x43943F; continue 'run;
+                }
+                0x43943F => {
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x993BD0, l, esp, 2, 16, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    pc = 0x43944A; continue 'run;
+                }
+                0x43944A => {
+                    esp = ebp;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_human_stop_if_unflagged, lf_ai_human_stop_if_unflagged, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_human_is_active_alive(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x439C00;
+        'run: loop {
+            match pc {
+                0x439C00 => {
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x439C4B; continue 'run; }
+                    pc = 0x439C04; continue 'run;
+                }
+                0x439C04 => {
+                    eax = m32(esi.wrapping_add(0x80));
+                    { let r: u32 = ((eax & 0xFF) & 0xB) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x439C4B; continue 'run; }
+                    pc = 0x439C0E; continue 'run;
+                }
+                0x439C0E => {
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { a >> c }; cf = if c > 32 { false } else { (a >> (c - 1)) & 1 != 0 }; of = (a & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = ((ecx & 0xFF) & 0x1) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x439C4B; continue 'run; }
+                    pc = 0x439C18; continue 'run;
+                }
+                0x439C18 => {
+                    { let a: u32 = eax; let c: u32 = (0x5) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { a >> c }; cf = if c > 32 { false } else { (a >> (c - 1)) & 1 != 0 }; of = (a & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = ((eax & 0xFF) & 0x1) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x439C4B; continue 'run; }
+                    pc = 0x439C1F; continue 'run;
+                }
+                0x439C1F => {
+                    { let r: u32 = (m32(esi.wrapping_add(0xC8)) & 0x400000) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x439C4B; continue 'run; }
+                    pc = 0x439C2B; continue 'run;
+                }
+                0x439C2B => {
+                    { let r: u32 = (m8(esi.wrapping_add(0x103)) & 0x8) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x439C4B; continue 'run; }
+                    pc = 0x439C34; continue 'run;
+                }
+                0x439C34 => {
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x985630, l, esp, 1, 12, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let r: u32 = ((eax & 0xFF) & (eax & 0xFF)) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x439C4B; continue 'run; }
+                    pc = 0x439C41; continue 'run;
+                }
+                0x439C41 => {
+                    { let a: u32 = m8(esi.wrapping_add(0x595)); let b: u32 = (eax & 0xFF);
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    eax = (eax & 0xFFFFFF00) | ((((zf) as u32) as u32) & 0xFF);
+                    break 'run;
+                }
+                0x439C4B => {
+                    { let r: u32 = ((eax & 0xFF) ^ (eax & 0xFF)) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    eax = (eax & 0xFFFFFF00) | (((r) as u32) & 0xFF);
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_human_is_active_alive, lf_ai_human_is_active_alive, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_human_gaze_at_unless_self(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x43F5C0;
+        'run: loop {
+            match pc {
+                0x43F5C0 => {
+                    { let r: u32 = (m8(eax.wrapping_add(0x140)) & 0x4) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x43F5DE; continue 'run; }
+                    pc = 0x43F5C9; continue 'run;
+                }
+                0x43F5C9 => {
+                    { let a: u32 = m32(eax.wrapping_add(0x44)); let b: u32 = ecx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x43F5DE; continue 'run; }
+                    pc = 0x43F5CE; continue 'run;
+                }
+                0x43F5CE => {
+                    edx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ecx = (ecx & 0xFFFFFF00) | (((0x1) as u32) & 0xFF);
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x9B5C80, l, esp, 2, 16, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    pc = 0x43F5DE; continue 'run;
+                }
+                0x43F5DE => {
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_human_gaze_at_unless_self, lf_ai_human_gaze_at_unless_self, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_human_has_idle_anim_override(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x43F9C0;
+        'run: loop {
+            match pc {
+                0x43F9C0 => {
+                    { let a: u32 = m8(eax.wrapping_add(0x149)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x43F9CC; continue 'run; }
+                    pc = 0x43F9C9; continue 'run;
+                }
+                0x43F9C9 => {
+                    { let r: u32 = ((eax & 0xFF) ^ (eax & 0xFF)) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    eax = (eax & 0xFFFFFF00) | (((r) as u32) & 0xFF);
+                    }
+                    break 'run;
+                }
+                0x43F9CC => {
+                    { let r: u32 = (ecx ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = m32(eax.wrapping_add(0x32C)); let b: u32 = 0xFFFFFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    ecx = (ecx & 0xFFFFFF00) | ((((!zf) as u32) as u32) & 0xFF);
+                    eax = (eax & 0xFFFFFF00) | ((((ecx & 0xFF)) as u32) & 0xFF);
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_human_has_idle_anim_override, lf_ai_human_has_idle_anim_override, 256, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_human_set_idle_anim_override(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x43FA30;
+        'run: loop {
+            match pc {
+                0x43FA30 => {
+                    { let a: u32 = m8(esi.wrapping_add(0x149)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x43FA80; continue 'run; }
+                    pc = 0x43FA39; continue 'run;
+                }
+                0x43FA39 => {
+                    eax = (eax & 0xFFFFFF00) | (((m8(esi.wrapping_add(0x148))) as u32) & 0xFF);
+                    { let a: u32 = (eax & 0xFF); let b: u32 = 0x11;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x43FA80; continue 'run; }
+                    pc = 0x43FA43; continue 'run;
+                }
+                0x43FA43 => {
+                    { let a: u32 = (eax & 0xFF); let b: u32 = 0x1C;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x43FA80; continue 'run; }
+                    pc = 0x43FA47; continue 'run;
+                }
+                0x43FA47 => {
+                    eax = m32(esi.wrapping_add(0xD4));
+                    { let r: u32 = (m16(eax.wrapping_add(0x3C)) & 0x400) & 0xFFFF;
+                    zf = r == 0; sf = (r & 0x8000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x43FA80; continue 'run; }
+                    pc = 0x43FA55; continue 'run;
+                }
+                0x43FA55 => {
+                    { let a: u32 = m32(esi.wrapping_add(0x32C)); let b: u32 = 0xFFFFFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x43FA65; continue 'run; }
+                    pc = 0x43FA5E; continue 'run;
+                }
+                0x43FA5E => {
+                    eax = esi;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x43FA90, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    pc = 0x43FA65; continue 'run;
+                }
+                0x43FA65 => {
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x1; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x1; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0xFFFFFFFF; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    w32(esi.wrapping_add(0x32C), ecx);
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x96CB70, l, esp, 5, 28, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x14;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    pc = 0x43FA80; continue 'run;
+                }
+                0x43FA80 => {
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_human_set_idle_anim_override, lf_ai_human_set_idle_anim_override, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k00_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x4469E0;
+        'run: loop {
+            match pc {
+                0x4469E0 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    ecx = m32(esp.wrapping_add(0x8));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m8(eax.wrapping_add(0x150));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x14));
+                    edx = m16(esi);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    ebx = m8(eax.wrapping_add(0x151));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    ebx = m8(eax.wrapping_add(0x152));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let r: u32 = (m8(eax.wrapping_add(0x150)) & 0x80) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(esi);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if zf { pc = 0x446A9B; continue 'run; }
+                    pc = 0x446A34; continue 'run;
+                }
+                0x446A34 => {
+                    edi = m32(eax.wrapping_add(0x154));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x446A49; continue 'run; }
+                    pc = 0x446A3E; continue 'run;
+                }
+                0x446A3E => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x446A97; continue 'run; }
+                }
+                0x446A49 => {
+                    edx = edi;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x446A63; continue 'run; }
+                    pc = 0x446A5E; continue 'run;
+                }
+                0x446A5E => {
+                    { let a: u32 = m32(edx.wrapping_add(0x44)); let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x446A6A; continue 'run; }
+                    pc = 0x446A63; continue 'run;
+                }
+                0x446A63 => {
+                    edx = 0xFFFF;
+                    { pc = 0x446A7F; continue 'run; }
+                }
+                0x446A6A => {
+                    edx = m32(edx.wrapping_add(0xB0));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x446A7B; continue 'run; }
+                    pc = 0x446A74; continue 'run;
+                }
+                0x446A74 => {
+                    edx = 0xFFFF;
+                    { pc = 0x446A7F; continue 'run; }
+                }
+                0x446A7B => {
+                    edx = m16(edx.wrapping_add(0x2));
+                    pc = 0x446A7F; continue 'run;
+                }
+                0x446A7F => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x446A90; continue 'run; }
+                    pc = 0x446A89; continue 'run;
+                }
+                0x446A89 => {
+                    edi = m16(eax.wrapping_add(0x154));
+                    pc = 0x446A90; continue 'run;
+                }
+                0x446A90 => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    pc = 0x446A97; continue 'run;
+                }
+                0x446A97 => {
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x446A9B; continue 'run;
+                }
+                0x446A9B => {
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x446B31; continue 'run; }
+                    pc = 0x446AA3; continue 'run;
+                }
+                0x446AA3 => {
+                    { let a: u32 = m8(eax.wrapping_add(0x3CC)); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x446B31; continue 'run; }
+                    pc = 0x446AB0; continue 'run;
+                }
+                0x446AB0 => {
+                    { let r: u32 = (m8(eax.wrapping_add(0x11C6)) & 0x4) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x446B31; continue 'run; }
+                    pc = 0x446AB9; continue 'run;
+                }
+                0x446AB9 => {
+                    edx = m16(esi);
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(eax.wrapping_add(0x15C))) as u32) & 0xFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m32(eax.wrapping_add(0x160));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(esi);
+                    if !zf { pc = 0x446AE1; continue 'run; }
+                    pc = 0x446AD6; continue 'run;
+                }
+                0x446AD6 => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x446B2D; continue 'run; }
+                }
+                0x446AE1 => {
+                    edi = edx;
+                    { let r: u32 = (edi & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edi = r;
+                    }
+                    { let a: u32 = edi; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    } }
+                    edi = m32(edi.wrapping_add(0x2149C64));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x446AFB; continue 'run; }
+                    pc = 0x446AF6; continue 'run;
+                }
+                0x446AF6 => {
+                    { let a: u32 = m32(edi.wrapping_add(0x44)); let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x446B02; continue 'run; }
+                    pc = 0x446AFB; continue 'run;
+                }
+                0x446AFB => {
+                    edx = 0xFFFF;
+                    { pc = 0x446B15; continue 'run; }
+                }
+                0x446B02 => {
+                    edi = m32(edi.wrapping_add(0xB0));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edx = 0xFFFF;
+                    if zf { pc = 0x446B15; continue 'run; }
+                    pc = 0x446B11; continue 'run;
+                }
+                0x446B11 => {
+                    edx = m16(edi.wrapping_add(0x2));
+                    pc = 0x446B15; continue 'run;
+                }
+                0x446B15 => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x446B26; continue 'run; }
+                    pc = 0x446B1F; continue 'run;
+                }
+                0x446B1F => {
+                    edi = m16(eax.wrapping_add(0x160));
+                    pc = 0x446B26; continue 'run;
+                }
+                0x446B26 => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    pc = 0x446B2D; continue 'run;
+                }
+                0x446B2D => {
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x446B31; continue 'run;
+                }
+                0x446B31 => {
+                    edx = m8(eax.wrapping_add(0x148));
+                    { let a: u32 = edx; let b: u32 = 0xFFFFFFF9;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let b: u32 = 0x27;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (!cf && !zf) { pc = 0x447171; continue 'run; }
+                    pc = 0x446B44; continue 'run;
+                }
+                0x446B44 => {
+                    edx = m8(edx.wrapping_add(0x4471A4));
+                    match edx {
+                    0 => { pc = 0x446FCE; continue 'run; }
+                    1 => { pc = 0x44703F; continue 'run; }
+                    2 => { pc = 0x446EFD; continue 'run; }
+                    3 => { pc = 0x446D12; continue 'run; }
+                    4 => { pc = 0x446B68; continue 'run; }
+                    5 => { pc = 0x446CA1; continue 'run; }
+                    6 => { pc = 0x446E41; continue 'run; }
+                    7 => { pc = 0x44711A; continue 'run; }
+                    8 => { pc = 0x446E57; continue 'run; }
+                    9 => { pc = 0x446B52; continue 'run; }
+                    10 => { pc = 0x447171; continue 'run; }
+                    _ => { panic!("jump table index"); } }
+                }
+                0x446B52 => {
+                    edx = m16(esi);
+                    eax = (eax & 0xFFFF0000) | (((m16(eax.wrapping_add(0x158))) as u32) & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w16(edx.wrapping_add(ecx), (eax & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x446B68 => {
+                    edx = m16(esi);
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(eax.wrapping_add(0x178))) as u32) & 0xFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x17C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x180))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x184))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x188))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x18C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x190))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    edi = (edi & 0xFFFF0000) | (((m16(eax.wrapping_add(0x194))) as u32) & 0xFFFF);
+                    edx = (edx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m32(eax.wrapping_add(0x164));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edi = m16(esi);
+                    if !zf { pc = 0x446C4D; continue 'run; }
+                    pc = 0x446C3C; continue 'run;
+                }
+                0x446C3C => {
+                    eax = (edi & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w16(eax.wrapping_add(ecx), 0xFFFF);
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x446C4D => {
+                    ebx = edx;
+                    { let r: u32 = (ebx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ebx = r;
+                    }
+                    { let a: u32 = ebx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ebx = r;
+                    } }
+                    ebx = m32(ebx.wrapping_add(0x2149C64));
+                    { let r: u32 = (ebx & ebx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x446C67; continue 'run; }
+                    pc = 0x446C62; continue 'run;
+                }
+                0x446C62 => {
+                    { let a: u32 = m32(ebx.wrapping_add(0x44)); let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x446C6E; continue 'run; }
+                    pc = 0x446C67; continue 'run;
+                }
+                0x446C67 => {
+                    edx = 0xFFFF;
+                    { pc = 0x446C81; continue 'run; }
+                }
+                0x446C6E => {
+                    ebx = m32(ebx.wrapping_add(0xB0));
+                    { let r: u32 = (ebx & ebx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edx = 0xFFFF;
+                    if zf { pc = 0x446C81; continue 'run; }
+                    pc = 0x446C7D; continue 'run;
+                }
+                0x446C7D => {
+                    edx = m16(ebx.wrapping_add(0x2));
+                    pc = 0x446C81; continue 'run;
+                }
+                0x446C81 => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    ebx = (edx & 0xFFFF);
+                    if !zf { pc = 0x446C92; continue 'run; }
+                    pc = 0x446C8B; continue 'run;
+                }
+                0x446C8B => {
+                    ebx = m16(eax.wrapping_add(0x164));
+                    pc = 0x446C92; continue 'run;
+                }
+                0x446C92 => {
+                    edx = (edi & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (ebx & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x446CA1 => {
+                    edi = m32(eax.wrapping_add(0x164));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x446CBC; continue 'run; }
+                    pc = 0x446CAB; continue 'run;
+                }
+                0x446CAB => {
+                    eax = m16(esi);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w16(eax.wrapping_add(ecx), 0xFFFF);
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x446CBC => {
+                    edx = edi;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x446CD6; continue 'run; }
+                    pc = 0x446CD1; continue 'run;
+                }
+                0x446CD1 => {
+                    { let a: u32 = m32(edx.wrapping_add(0x44)); let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x446CDD; continue 'run; }
+                    pc = 0x446CD6; continue 'run;
+                }
+                0x446CD6 => {
+                    edx = 0xFFFF;
+                    { pc = 0x446CF2; continue 'run; }
+                }
+                0x446CDD => {
+                    edx = m32(edx.wrapping_add(0xB0));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x446CEE; continue 'run; }
+                    pc = 0x446CE7; continue 'run;
+                }
+                0x446CE7 => {
+                    edx = 0xFFFF;
+                    { pc = 0x446CF2; continue 'run; }
+                }
+                0x446CEE => {
+                    edx = m16(edx.wrapping_add(0x2));
+                    pc = 0x446CF2; continue 'run;
+                }
+                0x446CF2 => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x446D03; continue 'run; }
+                    pc = 0x446CFC; continue 'run;
+                }
+                0x446CFC => {
+                    edi = m16(eax.wrapping_add(0x164));
+                    pc = 0x446D03; continue 'run;
+                }
+                0x446D03 => {
+                    eax = m16(esi);
+                    w16(eax.wrapping_add(ecx), (edi & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x446D12 => {
+                    edx = m16(esi);
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(eax.wrapping_add(0x178))) as u32) & 0xFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x17C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x180))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x184))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x188))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x18C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x190))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    edi = (edi & 0xFFFF0000) | (((m16(eax.wrapping_add(0x194))) as u32) & 0xFFFF);
+                    edx = (edx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x1A0))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x1A4))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x1A8))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    eax = (eax & 0xFFFFFF00) | (((m8(eax.wrapping_add(0x198))) as u32) & 0xFF);
+                    edx = (edx & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w8(edx.wrapping_add(ecx), (eax & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x446E41 => {
+                    edx = m16(esi);
+                    eax = (eax & 0xFFFF0000) | (((m16(eax.wrapping_add(0x178))) as u32) & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w16(edx.wrapping_add(ecx), (eax & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x446E57 => {
+                    edx = m16(esi);
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(eax.wrapping_add(0x178))) as u32) & 0xFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m32(eax.wrapping_add(0x17C));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(esi);
+                    if !zf { pc = 0x446E7F; continue 'run; }
+                    pc = 0x446E74; continue 'run;
+                }
+                0x446E74 => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x446ECB; continue 'run; }
+                }
+                0x446E7F => {
+                    edi = edx;
+                    { let r: u32 = (edi & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edi = r;
+                    }
+                    { let a: u32 = edi; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    } }
+                    edi = m32(edi.wrapping_add(0x2149C64));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x446E99; continue 'run; }
+                    pc = 0x446E94; continue 'run;
+                }
+                0x446E94 => {
+                    { let a: u32 = m32(edi.wrapping_add(0x44)); let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x446EA0; continue 'run; }
+                    pc = 0x446E99; continue 'run;
+                }
+                0x446E99 => {
+                    edx = 0xFFFF;
+                    { pc = 0x446EB3; continue 'run; }
+                }
+                0x446EA0 => {
+                    edi = m32(edi.wrapping_add(0xB0));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edx = 0xFFFF;
+                    if zf { pc = 0x446EB3; continue 'run; }
+                    pc = 0x446EAF; continue 'run;
+                }
+                0x446EAF => {
+                    edx = m16(edi.wrapping_add(0x2));
+                    pc = 0x446EB3; continue 'run;
+                }
+                0x446EB3 => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x446EC4; continue 'run; }
+                    pc = 0x446EBD; continue 'run;
+                }
+                0x446EBD => {
+                    edi = m16(eax.wrapping_add(0x17C));
+                    pc = 0x446EC4; continue 'run;
+                }
+                0x446EC4 => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    pc = 0x446ECB; continue 'run;
+                }
+                0x446ECB => {
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    edi = (edi & 0xFFFF0000) | (((m16(eax.wrapping_add(0x180))) as u32) & 0xFFFF);
+                    edx = (edx & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    eax = (eax & 0xFFFF0000) | (((m16(eax.wrapping_add(0x184))) as u32) & 0xFFFF);
+                    edx = (edx & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w16(edx.wrapping_add(ecx), (eax & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x446EFD => {
+                    edi = m32(eax.wrapping_add(0x178));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x446F12; continue 'run; }
+                    pc = 0x446F07; continue 'run;
+                }
+                0x446F07 => {
+                    edx = m16(esi);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x446F60; continue 'run; }
+                }
+                0x446F12 => {
+                    edx = edi;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x446F2C; continue 'run; }
+                    pc = 0x446F27; continue 'run;
+                }
+                0x446F27 => {
+                    { let a: u32 = m32(edx.wrapping_add(0x44)); let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x446F33; continue 'run; }
+                    pc = 0x446F2C; continue 'run;
+                }
+                0x446F2C => {
+                    edx = 0xFFFF;
+                    { pc = 0x446F48; continue 'run; }
+                }
+                0x446F33 => {
+                    edx = m32(edx.wrapping_add(0xB0));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x446F44; continue 'run; }
+                    pc = 0x446F3D; continue 'run;
+                }
+                0x446F3D => {
+                    edx = 0xFFFF;
+                    { pc = 0x446F48; continue 'run; }
+                }
+                0x446F44 => {
+                    edx = m16(edx.wrapping_add(0x2));
+                    pc = 0x446F48; continue 'run;
+                }
+                0x446F48 => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x446F59; continue 'run; }
+                    pc = 0x446F52; continue 'run;
+                }
+                0x446F52 => {
+                    edi = m16(eax.wrapping_add(0x178));
+                    pc = 0x446F59; continue 'run;
+                }
+                0x446F59 => {
+                    edx = m16(esi);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    pc = 0x446F60; continue 'run;
+                }
+                0x446F60 => {
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x17C))); fs[ft] = v; ft += 1; }
+                    edx = m16(esi);
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x180))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    { let v = f32b_to_f64(m32(eax.wrapping_add(0x184))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x10), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x10));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edx = m16(esi);
+                    eax = (eax & 0xFFFF0000) | (((m16(eax.wrapping_add(0x188))) as u32) & 0xFFFF);
+                    edx = (edx & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w16(edx.wrapping_add(ecx), (eax & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x446FCE => {
+                    edi = m32(eax.wrapping_add(0x178));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x446FE9; continue 'run; }
+                    pc = 0x446FD8; continue 'run;
+                }
+                0x446FD8 => {
+                    edx = m16(esi);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x446FE9 => {
+                    edx = edi;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x447003; continue 'run; }
+                    pc = 0x446FFE; continue 'run;
+                }
+                0x446FFE => {
+                    { let a: u32 = m32(edx.wrapping_add(0x44)); let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x44700A; continue 'run; }
+                    pc = 0x447003; continue 'run;
+                }
+                0x447003 => {
+                    edx = 0xFFFF;
+                    { pc = 0x44701F; continue 'run; }
+                }
+                0x44700A => {
+                    edx = m32(edx.wrapping_add(0xB0));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x44701B; continue 'run; }
+                    pc = 0x447014; continue 'run;
+                }
+                0x447014 => {
+                    edx = 0xFFFF;
+                    { pc = 0x44701F; continue 'run; }
+                }
+                0x44701B => {
+                    edx = m16(edx.wrapping_add(0x2));
+                    pc = 0x44701F; continue 'run;
+                }
+                0x44701F => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x447030; continue 'run; }
+                    pc = 0x447029; continue 'run;
+                }
+                0x447029 => {
+                    edi = m16(eax.wrapping_add(0x178));
+                    pc = 0x447030; continue 'run;
+                }
+                0x447030 => {
+                    eax = m16(esi);
+                    w16(eax.wrapping_add(ecx), (edi & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x44703F => {
+                    edi = m32(eax.wrapping_add(0x178));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x447054; continue 'run; }
+                    pc = 0x447049; continue 'run;
+                }
+                0x447049 => {
+                    edx = m16(esi);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x4470A2; continue 'run; }
+                }
+                0x447054 => {
+                    edx = edi;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x44706E; continue 'run; }
+                    pc = 0x447069; continue 'run;
+                }
+                0x447069 => {
+                    { let a: u32 = m32(edx.wrapping_add(0x44)); let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x447075; continue 'run; }
+                    pc = 0x44706E; continue 'run;
+                }
+                0x44706E => {
+                    edx = 0xFFFF;
+                    { pc = 0x44708A; continue 'run; }
+                }
+                0x447075 => {
+                    edx = m32(edx.wrapping_add(0xB0));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x447086; continue 'run; }
+                    pc = 0x44707F; continue 'run;
+                }
+                0x44707F => {
+                    edx = 0xFFFF;
+                    { pc = 0x44708A; continue 'run; }
+                }
+                0x447086 => {
+                    edx = m16(edx.wrapping_add(0x2));
+                    pc = 0x44708A; continue 'run;
+                }
+                0x44708A => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x44709B; continue 'run; }
+                    pc = 0x447094; continue 'run;
+                }
+                0x447094 => {
+                    edi = m16(eax.wrapping_add(0x178));
+                    pc = 0x44709B; continue 'run;
+                }
+                0x44709B => {
+                    edx = m16(esi);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    pc = 0x4470A2; continue 'run;
+                }
+                0x4470A2 => {
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    edi = m32(eax.wrapping_add(0x17C));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(esi);
+                    if !zf { pc = 0x4470C4; continue 'run; }
+                    pc = 0x4470B3; continue 'run;
+                }
+                0x4470B3 => {
+                    eax = (ebx & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w16(eax.wrapping_add(ecx), 0xFFFF);
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x4470C4 => {
+                    edx = edi;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4470DE; continue 'run; }
+                    pc = 0x4470D9; continue 'run;
+                }
+                0x4470D9 => {
+                    { let a: u32 = m32(edx.wrapping_add(0x44)); let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x4470E5; continue 'run; }
+                    pc = 0x4470DE; continue 'run;
+                }
+                0x4470DE => {
+                    edx = 0xFFFF;
+                    { pc = 0x4470FA; continue 'run; }
+                }
+                0x4470E5 => {
+                    edx = m32(edx.wrapping_add(0xB0));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4470F6; continue 'run; }
+                    pc = 0x4470EF; continue 'run;
+                }
+                0x4470EF => {
+                    edx = 0xFFFF;
+                    { pc = 0x4470FA; continue 'run; }
+                }
+                0x4470F6 => {
+                    edx = m16(edx.wrapping_add(0x2));
+                    pc = 0x4470FA; continue 'run;
+                }
+                0x4470FA => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x44710B; continue 'run; }
+                    pc = 0x447104; continue 'run;
+                }
+                0x447104 => {
+                    edi = m16(eax.wrapping_add(0x17C));
+                    pc = 0x44710B; continue 'run;
+                }
+                0x44710B => {
+                    eax = (ebx & 0xFFFF);
+                    w16(eax.wrapping_add(ecx), (edi & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x44711A => {
+                    edi = m32(eax.wrapping_add(0x2F8));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x447133; continue 'run; }
+                    pc = 0x447124; continue 'run;
+                }
+                0x447124 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x90C010, l, esp, 1, 12, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x447133 => {
+                    edx = edi;
+                    { let r: u32 = (edx & 0xFFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let b: u32 = 0x960;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (sf == of) { pc = 0x447124; continue 'run; }
+                    pc = 0x447143; continue 'run;
+                }
+                0x447143 => {
+                    { let p: i64 = (edx as i32 as i64) * (0x6C as i32 as i64); let r: u32 = p as u32; cf = p != (r as i32 as i64); of = cf; zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let b: u32 = 0x2A4E508;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    if zf { pc = 0x447124; continue 'run; }
+                    pc = 0x44714E; continue 'run;
+                }
+                0x44714E => {
+                    eax = m32(edx.wrapping_add(0x30));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x447124; continue 'run; }
+                    pc = 0x447155; continue 'run;
+                }
+                0x447155 => {
+                    { let a: u32 = m32(eax.wrapping_add(0x4)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x447124; continue 'run; }
+                    pc = 0x44715B; continue 'run;
+                }
+                0x44715B => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = m32(edx.wrapping_add(0x1C)); let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    eax = (eax & 0xFFFFFF00) | ((((!zf) as u32) as u32) & 0xFF);
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let r: u32 = (eax & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x90C010, l, esp, 1, 12, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    pc = 0x447171; continue 'run;
+                }
+                0x447171 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k00_net_write, lf_ai_order_k00_net_write, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k13_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x4543E0;
+        'run: loop {
+            match pc {
+                0x4543E0 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x150))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m32(ecx.wrapping_add(0x160));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(eax);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if !zf { pc = 0x454417; continue 'run; }
+                    pc = 0x45440C; continue 'run;
+                }
+                0x45440C => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(esi), 0xFFFF);
+                    { pc = 0x454463; continue 'run; }
+                }
+                0x454417 => {
+                    edi = edx;
+                    { let r: u32 = (edi & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edi = r;
+                    }
+                    { let a: u32 = edi; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    } }
+                    edi = m32(edi.wrapping_add(0x2149C64));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x454431; continue 'run; }
+                    pc = 0x45442C; continue 'run;
+                }
+                0x45442C => {
+                    { let a: u32 = m32(edi.wrapping_add(0x44)); let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x454438; continue 'run; }
+                    pc = 0x454431; continue 'run;
+                }
+                0x454431 => {
+                    edx = 0xFFFF;
+                    { pc = 0x45444B; continue 'run; }
+                }
+                0x454438 => {
+                    edi = m32(edi.wrapping_add(0xB0));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edx = 0xFFFF;
+                    if zf { pc = 0x45444B; continue 'run; }
+                    pc = 0x454447; continue 'run;
+                }
+                0x454447 => {
+                    edx = m16(edi.wrapping_add(0x2));
+                    pc = 0x45444B; continue 'run;
+                }
+                0x45444B => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x45445C; continue 'run; }
+                    pc = 0x454455; continue 'run;
+                }
+                0x454455 => {
+                    edi = m16(ecx.wrapping_add(0x160));
+                    pc = 0x45445C; continue 'run;
+                }
+                0x45445C => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(esi), (edi & 0xFFFF));
+                    pc = 0x454463; continue 'run;
+                }
+                0x454463 => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let a: u32 = m32(ecx.wrapping_add(0x160)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    edx = m16(eax);
+                    if zf { pc = 0x454498; continue 'run; }
+                    pc = 0x454473; continue 'run;
+                }
+                0x454473 => {
+                    ebx = m8(ecx.wrapping_add(0x164));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    ebx = m8(ecx.wrapping_add(0x168));
+                    edx = (edx & 0xFFFF);
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    pc = 0x454498; continue 'run;
+                }
+                0x454498 => {
+                    edx = m16(eax);
+                    edi = m32(ecx.wrapping_add(0x158));
+                    w32(edx.wrapping_add(esi), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    ecx = m32(ecx.wrapping_add(0x15C));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(eax);
+                    if (sf == of) { pc = 0x4544C8; continue 'run; }
+                    pc = 0x4544B5; continue 'run;
+                }
+                0x4544B5 => {
+                    edx = (ebx & 0xFFFF);
+                    ecx = 0x6B49D200;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(esi), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x4544C8 => {
+                    edi = m32(0xE843AC);
+                    { let a: u32 = ecx; let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x4544F0; continue 'run; }
+                    pc = 0x4544D2; continue 'run;
+                }
+                0x4544D2 => {
+                    { let a: u32 = ecx; let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = ecx; let b: u32 = 0x35A4E900;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x454516; continue 'run; }
+                    pc = 0x4544DC; continue 'run;
+                }
+                0x4544DC => {
+                    edx = (ebx & 0xFFFF);
+                    { let a: u32 = ecx; let b: u32 = 0x94B62E00;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(esi), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x4544F0 => {
+                    edx = edi;
+                    { let a: u32 = edx; let b: u32 = ecx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let b: u32 = 0x35A4E900;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if (zf || sf != of) { pc = 0x454512; continue 'run; }
+                    pc = 0x4544FC; continue 'run;
+                }
+                0x4544FC => {
+                    { let a: u32 = ecx; let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    edx = (ebx & 0xFFFF);
+                    { let a: u32 = ecx; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(esi), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x454512 => {
+                    { let a: u32 = edx; let r: u32 = (0u32).wrapping_sub(a) & 0xFFFFFFFF; cf = a != 0; of = a == 0x80000000;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    ecx = edx;
+                    pc = 0x454516; continue 'run;
+                }
+                0x454516 => {
+                    edx = (ebx & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(esi), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k13_net_write, lf_ai_order_k13_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k13_on_event(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x455060;
+        'run: loop {
+            match pc {
+                0x455060 => {
+                    ecx = m32(esp.wrapping_add(0x8));
+                    edx = m32(ecx.wrapping_add(0x8));
+                    { let a: u32 = edx; let b: u32 = 0x5;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    eax = m32(esp.wrapping_add(0x4));
+                    if zf { pc = 0x455087; continue 'run; }
+                    pc = 0x455070; continue 'run;
+                }
+                0x455070 => {
+                    { let a: u32 = edx; let b: u32 = 0x53;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4550A7; continue 'run; }
+                    pc = 0x455075; continue 'run;
+                }
+                0x455075 => {
+                    ecx = m32(eax.wrapping_add(0x150));
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x453F40, l, esp, 1, 12, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    break 'run;
+                }
+                0x455087 => {
+                    edx = m32(ecx.wrapping_add(0xC));
+                    { let a: u32 = edx; let b: u32 = m32(eax.wrapping_add(0x44));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x4550A7; continue 'run; }
+                    pc = 0x45508F; continue 'run;
+                }
+                0x45508F => {
+                    w32(eax.wrapping_add(0x160), edx);
+                    edx = m32(ecx.wrapping_add(0x24));
+                    w32(eax.wrapping_add(0x164), edx);
+                    ecx = (ecx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x28))) as u32) & 0xFF);
+                    w8(eax.wrapping_add(0x168), (ecx & 0xFF));
+                    pc = 0x4550A7; continue 'run;
+                }
+                0x4550A7 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k13_on_event, lf_ai_order_k13_on_event, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k14_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x455FE0;
+        'run: loop {
+            match pc {
+                0x455FE0 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x150))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    w8(edx.wrapping_add(esi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let a: u32 = m32(ecx.wrapping_add(0xAF0)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    edx = m16(eax);
+                    if zf { pc = 0x45601A; continue 'run; }
+                    pc = 0x45600A; continue 'run;
+                }
+                0x45600A => {
+                    ecx = m32(ecx.wrapping_add(0x154));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(esi), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    pc = 0x45601A; continue 'run;
+                }
+                0x45601A => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k14_net_write, lf_ai_order_k14_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k14_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x456020;
+        'run: loop {
+            match pc {
+                0x456020 => {
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x456033; continue 'run; }
+                    pc = 0x45602D; continue 'run;
+                }
+                0x45602D => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x456070, l, esp.wrapping_add(4), 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    break 'run; }
+                }
+                0x456033 => {
+                    eax = m32(esp.wrapping_add(0x14));
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFFFF00) | (((m8(edx.wrapping_add(esi))) as u32) & 0xFF);
+                    w8(ecx.wrapping_add(0x150), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let a: u32 = m32(ecx.wrapping_add(0xAF0)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    edx = m16(eax);
+                    if zf { pc = 0x456063; continue 'run; }
+                    pc = 0x456053; continue 'run;
+                }
+                0x456053 => {
+                    edx = (edx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    w32(ecx.wrapping_add(0x154), edx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    pc = 0x456063; continue 'run;
+                }
+                0x456063 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k14_net_read, lf_ai_order_k14_net_read, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k15_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x457E80;
+        'run: loop {
+            match pc {
+                0x457E80 => {
+                    edx = m32(esp.wrapping_add(0x4));
+                    ecx = m32(edx.wrapping_add(0x150));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x457EA4; continue 'run; }
+                    pc = 0x457E8E; continue 'run;
+                }
+                0x457E8E => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    ecx = m16(eax);
+                    edx = m32(esp.wrapping_add(0x8));
+                    w16(ecx.wrapping_add(edx), 0xFFFF);
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    break 'run;
+                }
+                0x457EA4 => {
+                    eax = ecx;
+                    { let r: u32 = (eax & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = m32(eax.wrapping_add(0x2149C64));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x457EBD; continue 'run; }
+                    pc = 0x457EB8; continue 'run;
+                }
+                0x457EB8 => {
+                    { let a: u32 = m32(eax.wrapping_add(0x44)); let b: u32 = ecx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x457EC4; continue 'run; }
+                    pc = 0x457EBD; continue 'run;
+                }
+                0x457EBD => {
+                    eax = 0xFFFF;
+                    { pc = 0x457ED9; continue 'run; }
+                }
+                0x457EC4 => {
+                    eax = m32(eax.wrapping_add(0xB0));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x457ED5; continue 'run; }
+                    pc = 0x457ECE; continue 'run;
+                }
+                0x457ECE => {
+                    eax = 0xFFFF;
+                    { pc = 0x457ED9; continue 'run; }
+                }
+                0x457ED5 => {
+                    eax = m16(eax.wrapping_add(0x2));
+                    pc = 0x457ED9; continue 'run;
+                }
+                0x457ED9 => {
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    ecx = (eax & 0xFFFF);
+                    if !zf { pc = 0x457EE9; continue 'run; }
+                    pc = 0x457EE2; continue 'run;
+                }
+                0x457EE2 => {
+                    ecx = m16(edx.wrapping_add(0x150));
+                    pc = 0x457EE9; continue 'run;
+                }
+                0x457EE9 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0xC));
+                    w16(edx.wrapping_add(esi), (ecx & 0xFFFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k15_net_write, lf_ai_order_k15_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k15_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x457F00;
+        'run: loop {
+            match pc {
+                0x457F00 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x457F18; continue 'run; }
+                    pc = 0x457F08; continue 'run;
+                }
+                0x457F08 => {
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    eax = m32(esp.wrapping_add(0xC));
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x457F18 => {
+                    edx = m32(esp.wrapping_add(0x10));
+                    ecx = m16(edx);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = (ecx & 0xFFFF);
+                    eax = m16(esi.wrapping_add(eax));
+                    { let a: u32 = ecx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(edx, (ecx & 0xFFFF));
+                    if !zf { pc = 0x457F41; continue 'run; }
+                    pc = 0x457F33; continue 'run;
+                }
+                0x457F33 => {
+                    edx = m32(esp.wrapping_add(0x8));
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edx.wrapping_add(0x150), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x457F41 => {
+                    esi = (eax & 0xFFFF);
+                    eax = esi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = esi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    { let r: u32 = (ecx ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = m32(0x212E258);
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ecx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    ecx = m32(ecx.wrapping_add(0x5C));
+                    edx = m32(ecx.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x457F33; continue 'run; }
+                    pc = 0x457F82; continue 'run;
+                }
+                0x457F82 => {
+                    { let a: u32 = esi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x457F9C; continue 'run; }
+                    pc = 0x457F87; continue 'run;
+                }
+                0x457F87 => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x457F82; continue 'run; }
+                    pc = 0x457F8E; continue 'run;
+                }
+                0x457F8E => {
+                    edx = m32(esp.wrapping_add(0x8));
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edx.wrapping_add(0x150), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x457F9C => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x457F33; continue 'run; }
+                    pc = 0x457FA2; continue 'run;
+                }
+                0x457FA2 => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    edx = m32(esp.wrapping_add(0x8));
+                    w32(edx.wrapping_add(0x150), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k15_net_read, lf_ai_order_k15_net_read, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k16_enter(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x459340;
+        'run: loop {
+            match pc {
+                0x459340 => {
+                    { let v = f32b_to_f64(m32(0xE87998)); fs[ft] = v; ft += 1; }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x8));
+                    { let v: u32 = 0xFFFFFFFF; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    w32(esp.wrapping_add(0x8), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    ecx = esi;
+                    fs[ft] = 1.0; ft += 1;
+                    w32(esp.wrapping_add(0x4), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    fs[ft] = 0.0; ft += 1;
+                    w32(esp, f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x340; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x96FCA0, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let v: u32 = 0xA6; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x16; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x4375B0, l, esp, 11, 52, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x2C;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k16_enter, lf_ai_order_k16_enter, 304, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k16_update(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x4593A0;
+        'run: loop {
+            match pc {
+                0x4593A0 => {
+                    edx = m32(esp.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4593D4; continue 'run; }
+                    pc = 0x4593A8; continue 'run;
+                }
+                0x4593A8 => {
+                    eax = m32(edx.wrapping_add(0x10CC));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4593D4; continue 'run; }
+                    pc = 0x4593B2; continue 'run;
+                }
+                0x4593B2 => {
+                    eax = m32(eax.wrapping_add(0xC4));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4593D4; continue 'run; }
+                    pc = 0x4593BC; continue 'run;
+                }
+                0x4593BC => {
+                    { let a: u32 = m32(eax.wrapping_add(0x8)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x4593D4; continue 'run; }
+                    pc = 0x4593C2; continue 'run;
+                }
+                0x4593C2 => {
+                    eax = edx;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x963540, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let r: u32 = ((eax & 0xFF) & (eax & 0xFF)) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4593D4; continue 'run; }
+                    pc = 0x4593CD; continue 'run;
+                }
+                0x4593CD => {
+                    eax = edx;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x459190, l, esp.wrapping_add(4), 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    break 'run; }
+                }
+                0x4593D4 => {
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k16_update, lf_ai_order_k16_update, 256, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k17_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x4595B0;
+        'run: loop {
+            match pc {
+                0x4595B0 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    ecx = m16(eax);
+                    edx = m32(esp.wrapping_add(0x8));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0xC));
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esi.wrapping_add(0x150));
+                    w32(ecx.wrapping_add(edx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    ecx = m32(esi.wrapping_add(0x154));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(eax);
+                    if !zf { pc = 0x4595E7; continue 'run; }
+                    pc = 0x4595DC; continue 'run;
+                }
+                0x4595DC => {
+                    ecx = (ebx & 0xFFFF);
+                    w16(ecx.wrapping_add(edx), 0xFFFF);
+                    { pc = 0x459633; continue 'run; }
+                }
+                0x4595E7 => {
+                    edi = ecx;
+                    { let r: u32 = (edi & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edi = r;
+                    }
+                    { let a: u32 = edi; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edi = r;
+                    } }
+                    edi = m32(edi.wrapping_add(0x2149C64));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x459601; continue 'run; }
+                    pc = 0x4595FC; continue 'run;
+                }
+                0x4595FC => {
+                    { let a: u32 = m32(edi.wrapping_add(0x44)); let b: u32 = ecx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x459608; continue 'run; }
+                    pc = 0x459601; continue 'run;
+                }
+                0x459601 => {
+                    ecx = 0xFFFF;
+                    { pc = 0x45961B; continue 'run; }
+                }
+                0x459608 => {
+                    edi = m32(edi.wrapping_add(0xB0));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ecx = 0xFFFF;
+                    if zf { pc = 0x45961B; continue 'run; }
+                    pc = 0x459617; continue 'run;
+                }
+                0x459617 => {
+                    ecx = m16(edi.wrapping_add(0x2));
+                    pc = 0x45961B; continue 'run;
+                }
+                0x45961B => {
+                    { let a: u32 = (ecx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (ecx & 0xFFFF);
+                    if !zf { pc = 0x45962C; continue 'run; }
+                    pc = 0x459625; continue 'run;
+                }
+                0x459625 => {
+                    edi = m16(esi.wrapping_add(0x154));
+                    pc = 0x45962C; continue 'run;
+                }
+                0x45962C => {
+                    ecx = (ebx & 0xFFFF);
+                    w16(ecx.wrapping_add(edx), (edi & 0xFFFF));
+                    pc = 0x459633; continue 'run;
+                }
+                0x459633 => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let a: u32 = m32(esi.wrapping_add(0x154)); let b: u32 = 0x0;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    ecx = m16(eax);
+                    if zf { pc = 0x459668; continue 'run; }
+                    pc = 0x459643; continue 'run;
+                }
+                0x459643 => {
+                    ebx = m8(esi.wrapping_add(0x158));
+                    ecx = (ecx & 0xFFFF);
+                    w8(ecx.wrapping_add(edx), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    ecx = m16(eax);
+                    ebx = m8(esi.wrapping_add(0x15C));
+                    ecx = (ecx & 0xFFFF);
+                    w8(ecx.wrapping_add(edx), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    pc = 0x459668; continue 'run;
+                }
+                0x459668 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k17_net_write, lf_ai_order_k17_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k17_exit(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x459850;
+        'run: loop {
+            match pc {
+                0x459850 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    eax = m32(eax.wrapping_add(0x44));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = 0x59;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x402160, l, esp, 2, 16, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k17_exit, lf_ai_order_k17_exit, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k17_on_event(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x459930;
+        'run: loop {
+            match pc {
+                0x459930 => {
+                    ecx = m32(esp.wrapping_add(0x8));
+                    edx = m32(ecx.wrapping_add(0x8));
+                    { let a: u32 = edx; let b: u32 = 0x5;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    eax = m32(esp.wrapping_add(0x4));
+                    if zf { pc = 0x45994D; continue 'run; }
+                    pc = 0x459940; continue 'run;
+                }
+                0x459940 => {
+                    { let a: u32 = edx; let b: u32 = 0x59;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x45996D; continue 'run; }
+                    pc = 0x459945; continue 'run;
+                }
+                0x459945 => {
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x459400, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    break 'run;
+                }
+                0x45994D => {
+                    edx = m32(ecx.wrapping_add(0xC));
+                    { let a: u32 = edx; let b: u32 = m32(eax.wrapping_add(0x44));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x45996D; continue 'run; }
+                    pc = 0x459955; continue 'run;
+                }
+                0x459955 => {
+                    w32(eax.wrapping_add(0x154), edx);
+                    edx = m32(ecx.wrapping_add(0x24));
+                    w32(eax.wrapping_add(0x158), edx);
+                    ecx = (ecx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x28))) as u32) & 0xFF);
+                    w8(eax.wrapping_add(0x15C), (ecx & 0xFF));
+                    pc = 0x45996D; continue 'run;
+                }
+                0x45996D => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k17_on_event, lf_ai_order_k17_on_event, 256, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k19_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x45AB00;
+        'run: loop {
+            match pc {
+                0x45AB00 => {
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x150))); fs[ft] = v; ft += 1; }
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m32(esp.wrapping_add(0x8));
+                    w32(esp.wrapping_add(0x4), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m16(eax);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0xC));
+                    w32(esi.wrapping_add(edx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    esi = m16(eax);
+                    { let v = f32b_to_f64(m32(ecx.wrapping_add(0x154))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0xC), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    ecx = (esi & 0xFFFF);
+                    esi = m32(esp.wrapping_add(0xC));
+                    w32(ecx.wrapping_add(edx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k19_net_write, lf_ai_order_k19_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k19_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x45AB50;
+        'run: loop {
+            match pc {
+                0x45AB50 => {
+                    ecx = m32(esp.wrapping_add(0xC));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x45AB68; continue 'run; }
+                    pc = 0x45AB58; continue 'run;
+                }
+                0x45AB58 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x45AB68 => {
+                    eax = m32(esp.wrapping_add(0x10));
+                    edx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m16(eax);
+                    esi = m32(esi.wrapping_add(ecx));
+                    w32(edx.wrapping_add(0x150), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    esi = m16(eax);
+                    esi = (esi & 0xFFFF);
+                    ecx = m32(esi.wrapping_add(ecx));
+                    w32(edx.wrapping_add(0x154), ecx);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k19_net_read, lf_ai_order_k19_net_read, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1a_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x45BC80;
+        'run: loop {
+            match pc {
+                0x45BC80 => {
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(0x15C))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x14));
+                    edx = m16(esi);
+                    eax = ecx.wrapping_add(0x150);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0x14));
+                    w8(edx.wrapping_add(edi), (ebx & 0xFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    ecx = m8(ecx.wrapping_add(0x148));
+                    { let a: u32 = ecx; let b: u32 = 0xAD;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    ebx = m16(esi);
+                    if zf { pc = 0x45BCD3; continue 'run; }
+                    pc = 0x45BCB7; continue 'run;
+                }
+                0x45BCB7 => {
+                    { let a: u32 = ecx; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    if !zf { pc = 0x45BD40; continue 'run; }
+                    pc = 0x45BCC0; continue 'run;
+                }
+                0x45BCC0 => {
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0xBDD260, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    ecx = (ebx & 0xFFFF);
+                    w32(ecx.wrapping_add(edi), eax);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x45BCD3 => {
+                    { let r: u32 = (m8(eax.wrapping_add(0xC)) & 0x3) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x45BD40; continue 'run; }
+                    pc = 0x45BCD9; continue 'run;
+                }
+                0x45BCD9 => {
+                    edx = m32(eax.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x45BCF1; continue 'run; }
+                    pc = 0x45BCE0; continue 'run;
+                }
+                0x45BCE0 => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(edi), 0xFFFF);
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x45BCF1 => {
+                    ecx = edx;
+                    { let r: u32 = (ecx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = ecx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    ecx = m32(ecx.wrapping_add(0x2149C64));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x45BD0B; continue 'run; }
+                    pc = 0x45BD06; continue 'run;
+                }
+                0x45BD06 => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x44)); let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x45BD12; continue 'run; }
+                    pc = 0x45BD0B; continue 'run;
+                }
+                0x45BD0B => {
+                    ecx = 0xFFFF;
+                    { pc = 0x45BD27; continue 'run; }
+                }
+                0x45BD12 => {
+                    ecx = m32(ecx.wrapping_add(0xB0));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x45BD23; continue 'run; }
+                    pc = 0x45BD1C; continue 'run;
+                }
+                0x45BD1C => {
+                    ecx = 0xFFFF;
+                    { pc = 0x45BD27; continue 'run; }
+                }
+                0x45BD23 => {
+                    ecx = m16(ecx.wrapping_add(0x2));
+                    pc = 0x45BD27; continue 'run;
+                }
+                0x45BD27 => {
+                    { let a: u32 = (ecx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edx = (ecx & 0xFFFF);
+                    if !zf { pc = 0x45BD35; continue 'run; }
+                    pc = 0x45BD31; continue 'run;
+                }
+                0x45BD31 => {
+                    edx = m16(eax.wrapping_add(0x4));
+                    pc = 0x45BD35; continue 'run;
+                }
+                0x45BD35 => {
+                    eax = (ebx & 0xFFFF);
+                    w16(eax.wrapping_add(edi), (edx & 0xFFFF));
+                    { let a: u32 = m16(esi); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    pc = 0x45BD40; continue 'run;
+                }
+                0x45BD40 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1a_net_write, lf_ai_order_k1a_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1a_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x45BD50;
+        'run: loop {
+            match pc {
+                0x45BD50 => {
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x10));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x45BD63; continue 'run; }
+                    pc = 0x45BD59; continue 'run;
+                }
+                0x45BD59 => {
+                    ecx = m32(esp.wrapping_add(0x8));
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x45BEB0, l, esp.wrapping_add(4), 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    break 'run; }
+                }
+                0x45BD63 => {
+                    eax = m32(esp.wrapping_add(0x14));
+                    ecx = m16(eax);
+                    edx = (edx & 0xFFFFFF00) | (((m8(ecx.wrapping_add(esi))) as u32) & 0xFF);
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0xC));
+                    w8(edi.wrapping_add(0x15C), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m8(edi.wrapping_add(0x148));
+                    { let a: u32 = edx; let b: u32 = 0xAD;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    ecx = m16(eax);
+                    if zf { pc = 0x45BE09; continue 'run; }
+                    pc = 0x45BD8E; continue 'run;
+                }
+                0x45BD8E => {
+                    { let a: u32 = edx; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    if !zf { pc = 0x45BEA6; continue 'run; }
+                    pc = 0x45BD97; continue 'run;
+                }
+                0x45BD97 => {
+                    edx = (ecx & 0xFFFF);
+                    edx = m32(edx.wrapping_add(esi));
+                    { let a: u32 = ecx; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = edx; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    w16(eax, (ecx & 0xFFFF));
+                    if !zf { pc = 0x45BDB8; continue 'run; }
+                    pc = 0x45BDAB; continue 'run;
+                }
+                0x45BDAB => {
+                    w32(edi.wrapping_add(0x150), 0xFFFFFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x45BDB8 => {
+                    { let a: u32 = edx; let b: u32 = m32(esp.wrapping_add(0x10));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    if sf { pc = 0x45BDE4; continue 'run; }
+                    pc = 0x45BDBE; continue 'run;
+                }
+                0x45BDBE => {
+                    eax = m32(0xE843AC);
+                    { let a: u32 = eax; let b: u32 = edx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    w32(edi.wrapping_add(0x150), eax);
+                    if (zf || sf != of) { pc = 0x45BEA6; continue 'run; }
+                    pc = 0x45BDD6; continue 'run;
+                }
+                0x45BDD6 => {
+                    { let a: u32 = eax; let b: u32 = 0x94B62E00;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x150), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x45BDE4 => {
+                    ecx = m32(0xE843AC);
+                    eax = ecx.wrapping_add(edx);
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    w32(edi.wrapping_add(0x150), eax);
+                    if (sf == of) { pc = 0x45BEA6; continue 'run; }
+                    pc = 0x45BDFB; continue 'run;
+                }
+                0x45BDFB => {
+                    { let a: u32 = eax; let b: u32 = 0x6B49D200;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x150), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x45BE09 => {
+                    { let r: u32 = (m8(edi.wrapping_add(0x15C)) & 0x3) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x45BE9F; continue 'run; }
+                    pc = 0x45BE16; continue 'run;
+                }
+                0x45BE16 => {
+                    edx = (ecx & 0xFFFF);
+                    edx = m16(edx.wrapping_add(esi));
+                    { let a: u32 = ecx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(eax, (ecx & 0xFFFF));
+                    if !zf { pc = 0x45BE35; continue 'run; }
+                    pc = 0x45BE2A; continue 'run;
+                }
+                0x45BE2A => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x45BE35 => {
+                    esi = (edx & 0xFFFF);
+                    eax = esi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = esi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = (!edx) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = edx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = m32(0x212E258);
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ecx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ecx.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x45BE2A; continue 'run; }
+                    pc = 0x45BE76; continue 'run;
+                }
+                0x45BE76 => {
+                    { let a: u32 = esi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x45BE8D; continue 'run; }
+                    pc = 0x45BE7B; continue 'run;
+                }
+                0x45BE7B => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x45BE76; continue 'run; }
+                    pc = 0x45BE82; continue 'run;
+                }
+                0x45BE82 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x45BE8D => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x45BE2A; continue 'run; }
+                    pc = 0x45BE93; continue 'run;
+                }
+                0x45BE93 => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x45BE9F => {
+                    w8(edi.wrapping_add(0x148), 0xAC);
+                    pc = 0x45BEA6; continue 'run;
+                }
+                0x45BEA6 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1a_net_read, lf_ai_order_k1a_net_read, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1a_exit(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x45C070;
+        'run: loop {
+            match pc {
+                0x45C070 => {
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0xC));
+                    eax = esp.wrapping_add(0x4);
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ecx = esi;
+                    w32(esp.wrapping_add(0x8), 0xFFFFFFFF);
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x9695F0, l, esp, 1, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    esp = esp.wrapping_add(4);
+                    }
+                    ecx = esp.wrapping_add(0x4);
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    w32(esp.wrapping_add(0xC), 0x1);
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x968A70, l, esp, 2, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    esp = esp.wrapping_add(8);
+                    }
+                    edx = esp.wrapping_add(0x4);
+                    { let v: u32 = edx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    w32(esp.wrapping_add(0xC), 0x55);
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x9690E0, l, esp, 2, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    esp = esp.wrapping_add(8);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ecx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1a_exit, lf_ai_order_k1a_exit, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1a_update(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x45C0C0;
+        'run: loop {
+            match pc {
+                0x45C0C0 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x45C0F8; continue 'run; }
+                    pc = 0x45C0C8; continue 'run;
+                }
+                0x45C0C8 => {
+                    edx = m32(eax.wrapping_add(0x44));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x45C0F8; continue 'run; }
+                    pc = 0x45C0CF; continue 'run;
+                }
+                0x45C0CF => {
+                    ecx = edx;
+                    { let r: u32 = (ecx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = ecx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    ecx = m32(ecx.wrapping_add(0x2149C64));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x45C0F8; continue 'run; }
+                    pc = 0x45C0E4; continue 'run;
+                }
+                0x45C0E4 => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x44)); let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x45C0F8; continue 'run; }
+                    pc = 0x45C0E9; continue 'run;
+                }
+                0x45C0E9 => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x4C)); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x45C0F8; continue 'run; }
+                    pc = 0x45C0EF; continue 'run;
+                }
+                0x45C0EF => {
+                    { let a: u32 = m8(ecx.wrapping_add(0x3CC)); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x45C11A; continue 'run; }
+                    pc = 0x45C0F8; continue 'run;
+                }
+                0x45C0F8 => {
+                    ecx = m8(eax.wrapping_add(0x148));
+                    { let a: u32 = ecx; let b: u32 = 0xAC;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    if zf { pc = 0x45C120; continue 'run; }
+                    pc = 0x45C107; continue 'run;
+                }
+                0x45C107 => {
+                    { let a: u32 = ecx; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    if zf { pc = 0x45C11B; continue 'run; }
+                    pc = 0x45C10C; continue 'run;
+                }
+                0x45C10C => {
+                    { let a: u32 = ecx; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    if !zf { pc = 0x45C11A; continue 'run; }
+                    pc = 0x45C111; continue 'run;
+                }
+                0x45C111 => {
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = eax;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x45B9E0, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    pc = 0x45C11A; continue 'run;
+                }
+                0x45C11A => {
+                    break 'run;
+                }
+                0x45C11B => {
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x45B890, l, esp.wrapping_add(4), 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    break 'run; }
+                }
+                0x45C120 => {
+                    w32(esp.wrapping_add(0x4), eax);
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x45AF10, l, esp.wrapping_add(4), 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    break 'run; }
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1a_update, lf_ai_order_k1a_update, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1c_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x45DC40;
+        'run: loop {
+            match pc {
+                0x45DC40 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m32(esp.wrapping_add(0x4));
+                    ecx = m16(eax);
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m8(edx.wrapping_add(0x150));
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0x10));
+                    w8(ecx.wrapping_add(edi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    ecx = m16(eax);
+                    ebx = m8(edx.wrapping_add(0x158));
+                    ecx = (ecx & 0xFFFF);
+                    w8(ecx.wrapping_add(edi), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    ecx = m32(edx.wrapping_add(0x154));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ebx = m16(eax);
+                    if !zf { pc = 0x45DC90; continue 'run; }
+                    pc = 0x45DC80; continue 'run;
+                }
+                0x45DC80 => {
+                    edx = (ebx & 0xFFFF);
+                    w16(edx.wrapping_add(edi), 0xFFFF);
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                0x45DC90 => {
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = ecx;
+                    { let r: u32 = (esi & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    esi = r;
+                    }
+                    { let a: u32 = esi; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esi = r;
+                    } }
+                    esi = m32(esi.wrapping_add(0x2149C64));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x45DCAB; continue 'run; }
+                    pc = 0x45DCA6; continue 'run;
+                }
+                0x45DCA6 => {
+                    { let a: u32 = m32(esi.wrapping_add(0x44)); let b: u32 = ecx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x45DCB2; continue 'run; }
+                    pc = 0x45DCAB; continue 'run;
+                }
+                0x45DCAB => {
+                    ecx = 0xFFFF;
+                    { pc = 0x45DCC5; continue 'run; }
+                }
+                0x45DCB2 => {
+                    esi = m32(esi.wrapping_add(0xB0));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    ecx = 0xFFFF;
+                    if zf { pc = 0x45DCC5; continue 'run; }
+                    pc = 0x45DCC1; continue 'run;
+                }
+                0x45DCC1 => {
+                    ecx = m16(esi.wrapping_add(0x2));
+                    pc = 0x45DCC5; continue 'run;
+                }
+                0x45DCC5 => {
+                    { let a: u32 = (ecx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    esi = (ecx & 0xFFFF);
+                    if !zf { pc = 0x45DCD6; continue 'run; }
+                    pc = 0x45DCCF; continue 'run;
+                }
+                0x45DCCF => {
+                    esi = m16(edx.wrapping_add(0x154));
+                    pc = 0x45DCD6; continue 'run;
+                }
+                0x45DCD6 => {
+                    ecx = (ebx & 0xFFFF);
+                    w16(ecx.wrapping_add(edi), (esi & 0xFFFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1c_net_write, lf_ai_order_k1c_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1c_exit(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x45E600;
+        'run: loop {
+            match pc {
+                0x45E600 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    eax = m32(eax.wrapping_add(0x44));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = 0x59;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x402160, l, esp, 2, 16, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1c_exit, lf_ai_order_k1c_exit, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1d_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x460200;
+        'run: loop {
+            match pc {
+                0x460200 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    edx = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x8));
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = m32(esp.wrapping_add(0xC));
+                    ebx = (ebx & 0xFFFFFF00) | (((m8(ebp.wrapping_add(0x150))) as u32) & 0xFF);
+                    w8(edx.wrapping_add(ecx), (ebx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m32(ebp.wrapping_add(0x158));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m16(eax);
+                    if !zf { pc = 0x460238; continue 'run; }
+                    pc = 0x46022D; continue 'run;
+                }
+                0x46022D => {
+                    edx = (edi & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x460284; continue 'run; }
+                }
+                0x460238 => {
+                    esi = edx;
+                    { let r: u32 = (esi & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    esi = r;
+                    }
+                    { let a: u32 = esi; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esi = r;
+                    } }
+                    esi = m32(esi.wrapping_add(0x2149C64));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x460252; continue 'run; }
+                    pc = 0x46024D; continue 'run;
+                }
+                0x46024D => {
+                    { let a: u32 = m32(esi.wrapping_add(0x44)); let b: u32 = edx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x460259; continue 'run; }
+                    pc = 0x460252; continue 'run;
+                }
+                0x460252 => {
+                    edx = 0xFFFF;
+                    { pc = 0x46026C; continue 'run; }
+                }
+                0x460259 => {
+                    esi = m32(esi.wrapping_add(0xB0));
+                    { let r: u32 = (esi & esi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    edx = 0xFFFF;
+                    if zf { pc = 0x46026C; continue 'run; }
+                    pc = 0x460268; continue 'run;
+                }
+                0x460268 => {
+                    edx = m16(esi.wrapping_add(0x2));
+                    pc = 0x46026C; continue 'run;
+                }
+                0x46026C => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    esi = (edx & 0xFFFF);
+                    if !zf { pc = 0x46027D; continue 'run; }
+                    pc = 0x460276; continue 'run;
+                }
+                0x460276 => {
+                    esi = m16(ebp.wrapping_add(0x158));
+                    pc = 0x46027D; continue 'run;
+                }
+                0x46027D => {
+                    edx = (edi & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (esi & 0xFFFF));
+                    pc = 0x460284; continue 'run;
+                }
+                0x460284 => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edi = m32(ebp.wrapping_add(0x154));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    esi = m16(eax);
+                    if !zf { pc = 0x4602A0; continue 'run; }
+                    pc = 0x460295; continue 'run;
+                }
+                0x460295 => {
+                    edx = (esi & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x4602EE; continue 'run; }
+                }
+                0x4602A0 => {
+                    edx = edi;
+                    { let r: u32 = (edx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = edx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = m32(edx.wrapping_add(0x2149C64));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4602BA; continue 'run; }
+                    pc = 0x4602B5; continue 'run;
+                }
+                0x4602B5 => {
+                    { let a: u32 = m32(edx.wrapping_add(0x44)); let b: u32 = edi;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x4602C1; continue 'run; }
+                    pc = 0x4602BA; continue 'run;
+                }
+                0x4602BA => {
+                    edx = 0xFFFF;
+                    { pc = 0x4602D6; continue 'run; }
+                }
+                0x4602C1 => {
+                    edx = m32(edx.wrapping_add(0xB0));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4602D2; continue 'run; }
+                    pc = 0x4602CB; continue 'run;
+                }
+                0x4602CB => {
+                    edx = 0xFFFF;
+                    { pc = 0x4602D6; continue 'run; }
+                }
+                0x4602D2 => {
+                    edx = m16(edx.wrapping_add(0x2));
+                    pc = 0x4602D6; continue 'run;
+                }
+                0x4602D6 => {
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    edi = (edx & 0xFFFF);
+                    if !zf { pc = 0x4602E7; continue 'run; }
+                    pc = 0x4602E0; continue 'run;
+                }
+                0x4602E0 => {
+                    edi = m16(ebp.wrapping_add(0x154));
+                    pc = 0x4602E7; continue 'run;
+                }
+                0x4602E7 => {
+                    edx = (esi & 0xFFFF);
+                    w16(edx.wrapping_add(ecx), (edi & 0xFFFF));
+                    pc = 0x4602EE; continue 'run;
+                }
+                0x4602EE => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v = f32b_to_f64(m32(ebp.wrapping_add(0x160))); fs[ft] = v; ft += 1; }
+                    edx = m16(eax);
+                    w32(esp.wrapping_add(0x14), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    esi = m32(esp.wrapping_add(0x14));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ebp.wrapping_add(0x164))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x14), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    esi = m32(esp.wrapping_add(0x14));
+                    edx = (edx & 0xFFFF);
+                    w32(edx.wrapping_add(ecx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    { let v = f32b_to_f64(m32(ebp.wrapping_add(0x168))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x14), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    esi = m32(esp.wrapping_add(0x14));
+                    edx = (edx & 0xFFFF);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    w32(edx.wrapping_add(ecx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1d_net_write, lf_ai_order_k1d_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1d_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x460350;
+        'run: loop {
+            match pc {
+                0x460350 => {
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = esp;
+                    { let r: u32 = (esp & 0xFFFFFFF8) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    esp = r;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(ebp.wrapping_add(0x10));
+                    { let r: u32 = (edi & edi) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x460378; continue 'run; }
+                    pc = 0x460363; continue 'run;
+                }
+                0x460363 => {
+                    eax = m32(ebp.wrapping_add(0x8));
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    esp = ebp;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    break 'run;
+                }
+                0x460378 => {
+                    ecx = m32(ebp.wrapping_add(0x14));
+                    edx = m16(ecx);
+                    eax = (eax & 0xFFFFFF00) | (((m8(edx.wrapping_add(edi))) as u32) & 0xFF);
+                    esi = m32(ebp.wrapping_add(0x8));
+                    ebx = m32(0x212E258);
+                    w8(esi.wrapping_add(0x150), (eax & 0xFF));
+                    { let a: u32 = m16(ecx); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(ecx, r);
+                    }
+                    eax = m16(ecx);
+                    edx = (eax & 0xFFFF);
+                    edx = m16(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = (edx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    if !zf { pc = 0x4603AF; continue 'run; }
+                    pc = 0x4603AB; continue 'run;
+                }
+                0x4603AB => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x46040F; continue 'run; }
+                }
+                0x4603AF => {
+                    edx = (edx & 0xFFFF);
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = edx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(esp.wrapping_add(0xC), edx);
+                    edx = eax;
+                    { let a: u32 = edx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    { let r: u32 = (edx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    edx = edx.wrapping_add(edx.wrapping_mul(8));
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (edx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = edx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ebx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ebx.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x460408; continue 'run; }
+                    pc = 0x4603EE; continue 'run;
+                }
+                0x4603EE => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    pc = 0x4603F2; continue 'run;
+                }
+                0x4603F2 => {
+                    { let a: u32 = eax; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x460402; continue 'run; }
+                    pc = 0x4603F7; continue 'run;
+                }
+                0x4603F7 => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4603F2; continue 'run; }
+                    pc = 0x4603FE; continue 'run;
+                }
+                0x4603FE => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x46040F; continue 'run; }
+                }
+                0x460402 => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x46040C; continue 'run; }
+                    pc = 0x460408; continue 'run;
+                }
+                0x460408 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x46040F; continue 'run; }
+                }
+                0x46040C => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    pc = 0x46040F; continue 'run;
+                }
+                0x46040F => {
+                    w32(esi.wrapping_add(0x158), eax);
+                    edx = m16(ecx);
+                    eax = (edx & 0xFFFF);
+                    eax = m16(eax.wrapping_add(edi));
+                    { let a: u32 = edx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(ecx, (edx & 0xFFFF));
+                    if !zf { pc = 0x46042F; continue 'run; }
+                    pc = 0x46042B; continue 'run;
+                }
+                0x46042B => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x46048F; continue 'run; }
+                }
+                0x46042F => {
+                    edx = (eax & 0xFFFF);
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = edx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(esp.wrapping_add(0xC), edx);
+                    edx = eax;
+                    { let a: u32 = edx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    { let r: u32 = (edx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    edx = edx.wrapping_add(edx.wrapping_mul(8));
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (edx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = edx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    eax = edx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ebx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ebx.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x460488; continue 'run; }
+                    pc = 0x46046E; continue 'run;
+                }
+                0x46046E => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    pc = 0x460472; continue 'run;
+                }
+                0x460472 => {
+                    { let a: u32 = eax; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x460482; continue 'run; }
+                    pc = 0x460477; continue 'run;
+                }
+                0x460477 => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x460472; continue 'run; }
+                    pc = 0x46047E; continue 'run;
+                }
+                0x46047E => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x46048F; continue 'run; }
+                }
+                0x460482 => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x46048C; continue 'run; }
+                    pc = 0x460488; continue 'run;
+                }
+                0x460488 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x46048F; continue 'run; }
+                }
+                0x46048C => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    pc = 0x46048F; continue 'run;
+                }
+                0x46048F => {
+                    w32(esi.wrapping_add(0x154), eax);
+                    eax = m16(ecx);
+                    edx = (eax & 0xFFFF);
+                    edx = m32(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0xC), edx);
+                    edx = (eax & 0xFFFF);
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0xC))); fs[ft] = v; ft += 1; }
+                    edx = m32(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x10), edx);
+                    edx = (eax & 0xFFFF);
+                    edx = m32(edx.wrapping_add(edi));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(ecx, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x14), edx);
+                    w32(esi.wrapping_add(0x160), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x10))); fs[ft] = v; ft += 1; }
+                    w32(esi.wrapping_add(0x164), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x14))); fs[ft] = v; ft += 1; }
+                    w32(esi.wrapping_add(0x168), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    eax = m32(esi.wrapping_add(0x154));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x46050A; continue 'run; }
+                    pc = 0x4604F0; continue 'run;
+                }
+                0x4604F0 => {
+                    ecx = eax;
+                    { let r: u32 = (ecx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = ecx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    ecx = m32(ecx.wrapping_add(0x2149C64));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x46050A; continue 'run; }
+                    pc = 0x460505; continue 'run;
+                }
+                0x460505 => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x44)); let b: u32 = eax;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x46050E; continue 'run; }
+                    pc = 0x46050A; continue 'run;
+                }
+                0x46050A => {
+                    { let r: u32 = (edx ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { pc = 0x46051C; continue 'run; }
+                }
+                0x46050E => {
+                    { let r: u32 = (edx ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = m32(ecx.wrapping_add(0x4C)); let b: u32 = 0x5;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    edx = (edx & 0xFFFFFF00) | ((((!zf) as u32) as u32) & 0xFF);
+                    { let a: u32 = edx; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let r: u32 = (edx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    edx = r;
+                    }
+                    pc = 0x46051C; continue 'run;
+                }
+                0x46051C => {
+                    eax = m32(esi.wrapping_add(0x158));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x460540; continue 'run; }
+                    pc = 0x460526; continue 'run;
+                }
+                0x460526 => {
+                    ecx = eax;
+                    { let r: u32 = (ecx & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = ecx; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    ecx = m32(ecx.wrapping_add(0x2149C64));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x460540; continue 'run; }
+                    pc = 0x46053B; continue 'run;
+                }
+                0x46053B => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x44)); let b: u32 = eax;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x460544; continue 'run; }
+                    pc = 0x460540; continue 'run;
+                }
+                0x460540 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x460552; continue 'run; }
+                }
+                0x460544 => {
+                    eax = m32(ecx.wrapping_add(0x4C));
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let r: u32 = (0u32).wrapping_sub(a) & 0xFFFFFFFF; cf = a != 0; of = a == 0x80000000;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let b: u32 = eax;
+                    let c: u32 = cf as u32; let r: u32 = a.wrapping_sub(b).wrapping_sub(c) & 0xFFFFFFFF; cf = (a as u64) < (b as u64 + c as u64); of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let r: u32 = (eax & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    pc = 0x460552; continue 'run;
+                }
+                0x460552 => {
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x46055A; continue 'run; }
+                    pc = 0x460556; continue 'run;
+                }
+                0x460556 => {
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x460567; continue 'run; }
+                    pc = 0x46055A; continue 'run;
+                }
+                0x46055A => {
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    pc = 0x460567; continue 'run;
+                }
+                0x460567 => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    esp = ebp;
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1d_net_read, lf_ai_order_k1d_net_read, 320, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1d_on_event(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x460D00;
+        'run: loop {
+            match pc {
+                0x460D00 => {
+                    ecx = m32(esp.wrapping_add(0x4));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x460D44; continue 'run; }
+                    pc = 0x460D08; continue 'run;
+                }
+                0x460D08 => {
+                    { let a: u32 = m32(ecx.wrapping_add(0x4C)); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x460D44; continue 'run; }
+                    pc = 0x460D0E; continue 'run;
+                }
+                0x460D0E => {
+                    { let a: u32 = m8(ecx.wrapping_add(0x3CC)); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_sub(b) & 0xFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80) != 0;
+                    zf = r == 0; sf = (r & 0x80) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x460D44; continue 'run; }
+                    pc = 0x460D17; continue 'run;
+                }
+                0x460D17 => {
+                    eax = m32(esp.wrapping_add(0x8));
+                    edx = m32(eax.wrapping_add(0x8));
+                    { let a: u32 = edx; let b: u32 = 0x37;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x460D38; continue 'run; }
+                    pc = 0x460D23; continue 'run;
+                }
+                0x460D23 => {
+                    { let a: u32 = edx; let b: u32 = 0x53;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if !zf { pc = 0x460D44; continue 'run; }
+                    pc = 0x460D28; continue 'run;
+                }
+                0x460D28 => {
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    break 'run;
+                }
+                0x460D38 => {
+                    { let r: u32 = (m8(ecx.wrapping_add(0x150)) | 0x8) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    w8(ecx.wrapping_add(0x150), r);
+                    }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x43E2C0, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    pc = 0x460D44; continue 'run;
+                }
+                0x460D44 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1d_on_event, lf_ai_order_k1d_on_event, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1e_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x461290;
+        'run: loop {
+            match pc {
+                0x461290 => {
+                    edx = m32(esp.wrapping_add(0x4));
+                    ecx = m32(edx.wrapping_add(0x150));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    if !zf { pc = 0x4612B3; continue 'run; }
+                    pc = 0x4612A0; continue 'run;
+                }
+                0x4612A0 => {
+                    eax = m32(esp.wrapping_add(0x14));
+                    esi = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x10));
+                    w16(esi.wrapping_add(ecx), 0xFFFF);
+                    { pc = 0x461303; continue 'run; }
+                }
+                0x4612B3 => {
+                    eax = ecx;
+                    { let r: u32 = (eax & 0xFFF) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { let a: u32 = eax; let c: u32 = (0x4) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = m32(eax.wrapping_add(0x2149C64));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4612CC; continue 'run; }
+                    pc = 0x4612C7; continue 'run;
+                }
+                0x4612C7 => {
+                    { let a: u32 = m32(eax.wrapping_add(0x44)); let b: u32 = ecx;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x4612D3; continue 'run; }
+                    pc = 0x4612CC; continue 'run;
+                }
+                0x4612CC => {
+                    eax = 0xFFFF;
+                    { pc = 0x4612E8; continue 'run; }
+                }
+                0x4612D3 => {
+                    eax = m32(eax.wrapping_add(0xB0));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4612E4; continue 'run; }
+                    pc = 0x4612DD; continue 'run;
+                }
+                0x4612DD => {
+                    eax = 0xFFFF;
+                    { pc = 0x4612E8; continue 'run; }
+                }
+                0x4612E4 => {
+                    eax = m16(eax.wrapping_add(0x2));
+                    pc = 0x4612E8; continue 'run;
+                }
+                0x4612E8 => {
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    esi = (eax & 0xFFFF);
+                    if !zf { pc = 0x4612F4; continue 'run; }
+                    pc = 0x4612F1; continue 'run;
+                }
+                0x4612F1 => {
+                    esi = (ecx & 0xFFFF);
+                    pc = 0x4612F4; continue 'run;
+                }
+                0x4612F4 => {
+                    eax = m32(esp.wrapping_add(0x14));
+                    edi = m16(eax);
+                    ecx = m32(esp.wrapping_add(0x10));
+                    w16(edi.wrapping_add(ecx), (esi & 0xFFFF));
+                    pc = 0x461303; continue 'run;
+                }
+                0x461303 => {
+                    { let a: u32 = m16(eax); let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v = f32b_to_f64(m32(edx.wrapping_add(0x154))); fs[ft] = v; ft += 1; }
+                    esi = m16(eax);
+                    w32(esp.wrapping_add(0x14), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x14));
+                    esi = (esi & 0xFFFF);
+                    w32(esi.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    esi = m16(eax);
+                    { let v = f32b_to_f64(m32(edx.wrapping_add(0x158))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x14), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x14));
+                    esi = (esi & 0xFFFF);
+                    w32(esi.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    esi = m16(eax);
+                    { let v = f32b_to_f64(m32(edx.wrapping_add(0x15C))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x14), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edi = m32(esp.wrapping_add(0x14));
+                    esi = (esi & 0xFFFF);
+                    w32(esi.wrapping_add(ecx), edi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    esi = m16(eax);
+                    { let v = f32b_to_f64(m32(edx.wrapping_add(0x160))); fs[ft] = v; ft += 1; }
+                    w32(esp.wrapping_add(0x14), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edx = (esi & 0xFFFF);
+                    esi = m32(esp.wrapping_add(0x14));
+                    w32(edx.wrapping_add(ecx), esi);
+                    { let a: u32 = m16(eax); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1e_net_write, lf_ai_order_k1e_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1e_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut fs = [0f64; 8]; let mut ft: usize = 0;
+        let mut pc: u32 = 0x461380;
+        'run: loop {
+            match pc {
+                0x461380 => {
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = ebp; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebp = m32(esp.wrapping_add(0x18));
+                    { let r: u32 = (ebp & ebp) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x461399; continue 'run; }
+                    pc = 0x46138C; continue 'run;
+                }
+                0x46138C => {
+                    ecx = m32(esp.wrapping_add(0x10));
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x456070, l, esp.wrapping_add(4), 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    break 'run; }
+                }
+                0x461399 => {
+                    { let v: u32 = ebx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    ebx = m32(esp.wrapping_add(0x14));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0x24));
+                    ecx = m16(esi);
+                    eax = (ecx & 0xFFFF);
+                    eax = m16(eax.wrapping_add(ebp));
+                    { let a: u32 = ecx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(esi, (ecx & 0xFFFF));
+                    if !zf { pc = 0x4613BD; continue 'run; }
+                    pc = 0x4613B9; continue 'run;
+                }
+                0x4613B9 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x46141E; continue 'run; }
+                }
+                0x4613BD => {
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = (eax & 0xFFFF);
+                    eax = edi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = edi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    { let r: u32 = (ecx ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = m32(0x212E258);
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ecx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    ecx = m32(ecx.wrapping_add(0x5C));
+                    edx = m32(ecx.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x461416; continue 'run; }
+                    pc = 0x4613FF; continue 'run;
+                }
+                0x4613FF => {
+                    pc = 0x461400; continue 'run;
+                }
+                0x461400 => {
+                    { let a: u32 = edi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x461410; continue 'run; }
+                    pc = 0x461405; continue 'run;
+                }
+                0x461405 => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x461400; continue 'run; }
+                    pc = 0x46140C; continue 'run;
+                }
+                0x46140C => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x46141D; continue 'run; }
+                }
+                0x461410 => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x46141A; continue 'run; }
+                    pc = 0x461416; continue 'run;
+                }
+                0x461416 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    { pc = 0x46141D; continue 'run; }
+                }
+                0x46141A => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    pc = 0x46141D; continue 'run;
+                }
+                0x46141D => {
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    pc = 0x46141E; continue 'run;
+                }
+                0x46141E => {
+                    w32(ebx.wrapping_add(0x150), eax);
+                    eax = m16(esi);
+                    edx = (eax & 0xFFFF);
+                    ecx = m32(edx.wrapping_add(ebp));
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(esp.wrapping_add(0x20), ecx);
+                    ecx = m32(edx.wrapping_add(ebp));
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x20))); fs[ft] = v; ft += 1; }
+                    w16(esi, (eax & 0xFFFF));
+                    edx = (eax & 0xFFFF);
+                    { let a: u32 = eax; let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(esp.wrapping_add(0xC), ecx);
+                    ecx = m32(edx.wrapping_add(ebp));
+                    w16(esi, (eax & 0xFFFF));
+                    w32(esp.wrapping_add(0x10), ecx);
+                    w32(ebx.wrapping_add(0x154), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0xC))); fs[ft] = v; ft += 1; }
+                    w32(ebx.wrapping_add(0x158), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    { let v = f32b_to_f64(m32(esp.wrapping_add(0x10))); fs[ft] = v; ft += 1; }
+                    w32(ebx.wrapping_add(0x15C), f64_to_f32b(fs[ft - 1 - 0]));
+                    ft -= 1;
+                    edx = m16(esi);
+                    eax = m32(edx.wrapping_add(ebp));
+                    w32(ebx.wrapping_add(0x160), eax);
+                    { let a: u32 = m16(esi); let b: u32 = 0x4;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(esi, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebx = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    ebp = v;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1e_net_read, lf_ai_order_k1e_net_read, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1e_exit(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x461750;
+        'run: loop {
+            match pc {
+                0x461750 => {
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0xC));
+                    eax = m32(edi.wrapping_add(0x44));
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = 0x48;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x402160, l, esp, 8, 40, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    eax = m32(edi.wrapping_add(0x44));
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = 0x6F;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x402160, l, esp, 8, 40, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    eax = m32(edi.wrapping_add(0x44));
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = 0x6E;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x402160, l, esp, 8, 40, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    edi = m32(edi.wrapping_add(0x44));
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = 0x58;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x402160, l, esp, 8, 40, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x20;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1e_exit, lf_ai_order_k1e_exit, 304, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k1f_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x462320;
+        'run: loop {
+            match pc {
+                0x462320 => {
+                    ecx = m32(esp.wrapping_add(0xC));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x462338; continue 'run; }
+                    pc = 0x462328; continue 'run;
+                }
+                0x462328 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = ecx; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x462338 => {
+                    eax = m32(esp.wrapping_add(0x10));
+                    edx = m16(eax);
+                    edx = (edx & 0xFFFFFF00) | (((m8(edx.wrapping_add(ecx))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0xC));
+                    w8(edi.wrapping_add(0x150), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    edx = m16(eax);
+                    esi = (edx & 0xFFFF);
+                    ecx = m16(esi.wrapping_add(ecx));
+                    { let a: u32 = edx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    }
+                    { let a: u32 = (ecx & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(eax, (edx & 0xFFFF));
+                    if !zf { pc = 0x462374; continue 'run; }
+                    pc = 0x462369; continue 'run;
+                }
+                0x462369 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x462374 => {
+                    esi = (ecx & 0xFFFF);
+                    eax = esi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = esi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    edx = (!edx) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = edx;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = m32(0x212E258);
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ecx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    eax = m32(ecx.wrapping_add(0x5C));
+                    edx = m32(eax.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x462369; continue 'run; }
+                    pc = 0x4623B5; continue 'run;
+                }
+                0x4623B5 => {
+                    { let a: u32 = esi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x4623CC; continue 'run; }
+                    pc = 0x4623BA; continue 'run;
+                }
+                0x4623BA => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x4623B5; continue 'run; }
+                    pc = 0x4623C1; continue 'run;
+                }
+                0x4623C1 => {
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x4623CC => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x462369; continue 'run; }
+                    pc = 0x4623D2; continue 'run;
+                }
+                0x4623D2 => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    w32(edi.wrapping_add(0x154), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k1f_net_read, lf_ai_order_k1f_net_read, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k20_net_write(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x462A60;
+        'run: loop {
+            match pc {
+                0x462A60 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    ecx = m16(eax);
+                    edx = m32(esp.wrapping_add(0x4));
+                    edx = (edx & 0xFFFFFF00) | (((m8(edx.wrapping_add(0x150))) as u32) & 0xFF);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(esp.wrapping_add(0xC));
+                    w8(ecx.wrapping_add(esi), (edx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k20_net_write, lf_ai_order_k20_net_write, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k20_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x462A80;
+        'run: loop {
+            match pc {
+                0x462A80 => {
+                    ecx = m32(esp.wrapping_add(0xC));
+                    { let r: u32 = (ecx & ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    edi = m32(esp.wrapping_add(0x8));
+                    if !zf { pc = 0x462AC9; continue 'run; }
+                    pc = 0x462A8D; continue 'run;
+                }
+                0x462A8D => {
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = m32(edi.wrapping_add(0x44));
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0xB07A30, l, esp, 0, 8, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    if zf { pc = 0x462A9E; continue 'run; }
+                    pc = 0x462A9B; continue 'run;
+                }
+                0x462A9B => {
+                    eax = m32(eax.wrapping_add(0x4));
+                    pc = 0x462A9E; continue 'run;
+                }
+                0x462A9E => {
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    if zf { pc = 0x462AC0; continue 'run; }
+                    pc = 0x462AA3; continue 'run;
+                }
+                0x462AA3 => {
+                    { let a: u32 = eax; let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    if zf { pc = 0x462AB7; continue 'run; }
+                    pc = 0x462AA8; continue 'run;
+                }
+                0x462AA8 => {
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = 0x0; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = edi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                0x462AB7 => {
+                    { let r: u32 = (m8(edi.wrapping_add(0x150)) & 0xFE) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    w8(edi.wrapping_add(0x150), r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                0x462AC0 => {
+                    { let r: u32 = (m8(edi.wrapping_add(0x150)) | 0x1) & 0xFF;
+                    zf = r == 0; sf = (r & 0x80) != 0; cf = false; of = false; pf = parity(r);
+                    w8(edi.wrapping_add(0x150), r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                0x462AC9 => {
+                    eax = m32(esp.wrapping_add(0x14));
+                    edx = m16(eax);
+                    ecx = (ecx & 0xFFFFFF00) | (((m8(edx.wrapping_add(ecx))) as u32) & 0xFF);
+                    w8(edi.wrapping_add(0x150), (ecx & 0xFF));
+                    { let a: u32 = m16(eax); let b: u32 = 0x1;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFF; cf = (a as u64 + b as u64) > 0xFFFF; of = ((a ^ r) & (b ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    w16(eax, r);
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    edi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k20_net_read, lf_ai_order_k20_net_read, 288, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k21_net_read(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x463380;
+        'run: loop {
+            match pc {
+                0x463380 => {
+                    eax = m32(esp.wrapping_add(0xC));
+                    { let r: u32 = (eax & eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x463398; continue 'run; }
+                    pc = 0x463388; continue 'run;
+                }
+                0x463388 => {
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    eax = m32(esp.wrapping_add(0xC));
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x447CD0, l, esp, 3, 20, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0xC;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    break 'run;
+                }
+                0x463398 => {
+                    edx = m32(esp.wrapping_add(0x10));
+                    ecx = m16(edx);
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = (ecx & 0xFFFF);
+                    eax = m16(esi.wrapping_add(eax));
+                    { let a: u32 = ecx; let b: u32 = 0x2;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    { let a: u32 = (eax & 0xFFFF); let b: u32 = 0xFFFF;
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x8000) != 0;
+                    zf = r == 0; sf = (r & 0x8000) != 0; pf = parity(r);
+                    }
+                    w16(edx, (ecx & 0xFFFF));
+                    if !zf { pc = 0x4633C1; continue 'run; }
+                    pc = 0x4633B3; continue 'run;
+                }
+                0x4633B3 => {
+                    edx = m32(esp.wrapping_add(0x8));
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edx.wrapping_add(0x150), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x4633C1 => {
+                    esi = (eax & 0xFFFF);
+                    eax = esi;
+                    { let a: u32 = eax; let c: u32 = (0xF) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = eax; let b: u32 = esi;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = eax;
+                    { let a: u32 = ecx; let c: u32 = (0xA) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    } }
+                    { let r: u32 = (ecx ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    ecx = ecx.wrapping_add(ecx.wrapping_mul(8));
+                    edx = ecx;
+                    { let a: u32 = edx; let c: u32 = (0x6) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    edx = r;
+                    } }
+                    { let r: u32 = (ecx ^ edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0xB) & 31;
+                    if c != 0 {
+                    let r: u32 = if c >= 32 { 0 } else { (a << c) & 0xFFFFFFFF }; cf = if c > 32 { false } else { ((a as u64) >> (32 - c)) & 1 != 0 }; of = ((r & 0x80000000) != 0) != cf;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    eax = (!eax) & 0xFFFFFFFF;
+                    { let a: u32 = ecx; let b: u32 = eax;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    ecx = r;
+                    }
+                    eax = ecx;
+                    { let a: u32 = eax; let c: u32 = (0x10) & 31;
+                    if c != 0 {
+                    let sa: i32 = (a as i32) as i32; let r: u32 = ((sa >> c.min(31)) as u32) & 0xFFFFFFFF; cf = ((sa >> (c - 1).min(31)) & 1) != 0; of = false;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    eax = r;
+                    } }
+                    { let r: u32 = (eax ^ ecx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    ecx = m32(0x212E258);
+                    edx = (((eax as i32) >> 31) as u32);
+                    { let d: u32 = m32(ecx.wrapping_add(0x60)); unsafe { std::arch::asm!("idiv {d:e}", d = in(reg) d, inout("eax") eax, inout("edx") edx); } }
+                    ecx = m32(ecx.wrapping_add(0x5C));
+                    edx = m32(ecx.wrapping_add(edx.wrapping_mul(4)));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4633B3; continue 'run; }
+                    pc = 0x463402; continue 'run;
+                }
+                0x463402 => {
+                    { let a: u32 = esi; let b: u32 = m32(edx.wrapping_add(0xC));
+                    let r: u32 = a.wrapping_sub(b) & 0xFFFFFFFF; cf = a < b; of = ((a ^ b) & (a ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    }
+                    if zf { pc = 0x46341C; continue 'run; }
+                    pc = 0x463407; continue 'run;
+                }
+                0x463407 => {
+                    edx = m32(edx.wrapping_add(0x4));
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if !zf { pc = 0x463402; continue 'run; }
+                    pc = 0x46340E; continue 'run;
+                }
+                0x46340E => {
+                    edx = m32(esp.wrapping_add(0x8));
+                    { let r: u32 = (eax ^ eax) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    eax = r;
+                    }
+                    w32(edx.wrapping_add(0x150), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                0x46341C => {
+                    edx = m32(edx);
+                    { let r: u32 = (edx & edx) & 0xFFFFFFFF;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; cf = false; of = false; pf = parity(r);
+                    }
+                    if zf { pc = 0x4633B3; continue 'run; }
+                    pc = 0x463422; continue 'run;
+                }
+                0x463422 => {
+                    eax = m32(edx.wrapping_add(0x4));
+                    edx = m32(esp.wrapping_add(0x8));
+                    w32(edx.wrapping_add(0x150), eax);
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k21_net_read, lf_ai_order_k21_net_read, 272, 0);
+#[allow(unused_assignments, unused_mut, unused_variables, unused_parens, unused_unsafe, unused_labels, unreachable_code, clippy::all)]
+extern "C" fn lf_ai_order_k21_exit(r: &mut Pushad, args: *const u32) {
+    unsafe {
+        let (mut eax, mut ecx, mut edx, mut ebx, mut esi, mut edi, mut ebp) = (r.eax, r.ecx, r.edx, r.ebx, r.esi, r.edi, r.ebp);
+        let mut esp: u32 = (args as u32).wrapping_sub(4);
+        let (mut zf, mut sf, mut cf, mut of, mut pf) = (false, false, false, false, false);
+        let mut pc: u32 = 0x4636C0;
+        'run: loop {
+            match pc {
+                0x4636C0 => {
+                    eax = m32(esp.wrapping_add(0x4));
+                    eax = m32(eax.wrapping_add(0x44));
+                    { let v: u32 = esi; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    { let v: u32 = eax; esp = esp.wrapping_sub(4); w32(esp, v); }
+                    esi = 0x59;
+                    { let mut l = L { eax, ecx, edx, ebx, esi, edi, ebp };
+                    let st = lcall!(0x402160, l, esp, 2, 16, false);
+                    eax = l.eax; ecx = l.ecx; edx = l.edx; ebx = l.ebx; esi = l.esi; edi = l.edi; ebp = l.ebp;
+                    }
+                    { let a: u32 = esp; let b: u32 = 0x8;
+                    let r: u32 = a.wrapping_add(b) & 0xFFFFFFFF; cf = (a as u64 + b as u64) > 0xFFFFFFFF; of = ((a ^ r) & (b ^ r) & 0x80000000) != 0;
+                    zf = r == 0; sf = (r & 0x80000000) != 0; pf = parity(r);
+                    esp = r;
+                    }
+                    { let v: u32 = m32(esp); esp = esp.wrapping_add(4);
+                    esi = v;
+                    }
+                    break 'run;
+                }
+                _ => panic!("lifted pc"),
+            }
+            break 'run;
+        }
+        r.eax = eax; r.ecx = ecx; r.edx = edx; r.ebx = ebx; r.esi = esi; r.edi = edi; r.ebp = ebp;
+    }
+}
+regs_thunk_fr!(lt_lf_ai_order_k21_exit, lf_ai_order_k21_exit, 272, 0);
+    pub fn thunk_for(id: usize) -> Option<extern "C" fn()> {
+        match id {
+        1 => Some(lt_lf_ai_event_cancel),   // ai_event_cancel
+        51 => Some(lt_lf_ai_order_k01_net_write),   // ai_order_k01_net_write
+        76 => Some(lt_lf_ai_order_k01_net_read),   // ai_order_k01_net_read
+        105 => Some(lt_lf_ai_order_k02_net_write),   // ai_order_k02_net_write
+        120 => Some(lt_lf_ai_order_k02_net_read),   // ai_order_k02_net_read
+        2 => Some(lt_lf_ai_human_accumulator_mean),   // ai_human_accumulator_mean
+        103 => Some(lt_lf_ai_order_k04_net_write),   // ai_order_k04_net_write
+        119 => Some(lt_lf_ai_order_k04_net_read),   // ai_order_k04_net_read
+        53 => Some(lt_lf_ai_order_k05_net_write),   // ai_order_k05_net_write
+        77 => Some(lt_lf_ai_order_k05_net_read),   // ai_order_k05_net_read
+        54 => Some(lt_lf_ai_order_k06_net_write),   // ai_order_k06_net_write
+        79 => Some(lt_lf_ai_order_k06_net_read),   // ai_order_k06_net_read
+        49 => Some(lt_lf_ai_order_k08_net_write),   // ai_order_k08_net_write
+        91 => Some(lt_lf_ai_order_k08_net_read),   // ai_order_k08_net_read
+        88 => Some(lt_lf_ai_order_k08_exit),   // ai_order_k08_exit
+        73 => Some(lt_lf_ai_order_k09_update),   // ai_order_k09_update
+        98 => Some(lt_lf_ai_order_k0a_net_write),   // ai_order_k0a_net_write
+        115 => Some(lt_lf_ai_order_k0a_net_read),   // ai_order_k0a_net_read
+        87 => Some(lt_lf_ai_order_k0a_exit),   // ai_order_k0a_exit
+        99 => Some(lt_lf_ai_order_k0b_net_write),   // ai_order_k0b_net_write
+        116 => Some(lt_lf_ai_order_k0b_net_read),   // ai_order_k0b_net_read
+        100 => Some(lt_lf_ai_order_k22_net_write),   // ai_order_k22_net_write
+        118 => Some(lt_lf_ai_order_k22_net_read),   // ai_order_k22_net_read
+        56 => Some(lt_lf_ai_order_k0c_net_write),   // ai_order_k0c_net_write
+        97 => Some(lt_lf_ai_order_k0d_net_write),   // ai_order_k0d_net_write
+        121 => Some(lt_lf_ai_order_k0d_net_read),   // ai_order_k0d_net_read
+        107 => Some(lt_lf_ai_order_k0e_net_write),   // ai_order_k0e_net_write
+        108 => Some(lt_lf_ai_order_k0f_net_write),   // ai_order_k0f_net_write
+        113 => Some(lt_lf_ai_order_k0f_net_read),   // ai_order_k0f_net_read
+        63 => Some(lt_lf_ai_order_k0f_exit),   // ai_order_k0f_exit
+        104 => Some(lt_lf_ai_order_k10_net_write),   // ai_order_k10_net_write
+        112 => Some(lt_lf_ai_order_k10_net_read),   // ai_order_k10_net_read
+        64 => Some(lt_lf_ai_order_k10_exit),   // ai_order_k10_exit
+        80 => Some(lt_lf_ai_order_k11_net_read),   // ai_order_k11_net_read
+        74 => Some(lt_lf_ai_order_interrupt_query),   // ai_order_interrupt_query
+        7 => Some(lt_lf_ai_human_stop_if_unflagged),   // ai_human_stop_if_unflagged
+        3 => Some(lt_lf_ai_human_is_active_alive),   // ai_human_is_active_alive
+        6 => Some(lt_lf_ai_human_gaze_at_unless_self),   // ai_human_gaze_at_unless_self
+        5 => Some(lt_lf_ai_human_has_idle_anim_override),   // ai_human_has_idle_anim_override
+        8 => Some(lt_lf_ai_human_set_idle_anim_override),   // ai_human_set_idle_anim_override
+        110 => Some(lt_lf_ai_order_k00_net_write),   // ai_order_k00_net_write
+        101 => Some(lt_lf_ai_order_k13_net_write),   // ai_order_k13_net_write
+        69 => Some(lt_lf_ai_order_k13_on_event),   // ai_order_k13_on_event
+        48 => Some(lt_lf_ai_order_k14_net_write),   // ai_order_k14_net_write
+        78 => Some(lt_lf_ai_order_k14_net_read),   // ai_order_k14_net_read
+        52 => Some(lt_lf_ai_order_k15_net_write),   // ai_order_k15_net_write
+        82 => Some(lt_lf_ai_order_k15_net_read),   // ai_order_k15_net_read
+        61 => Some(lt_lf_ai_order_k16_enter),   // ai_order_k16_enter
+        92 => Some(lt_lf_ai_order_k16_update),   // ai_order_k16_update
+        57 => Some(lt_lf_ai_order_k17_net_write),   // ai_order_k17_net_write
+        21 => Some(lt_lf_ai_order_k17_exit),   // ai_order_k17_exit
+        68 => Some(lt_lf_ai_order_k17_on_event),   // ai_order_k17_on_event
+        50 => Some(lt_lf_ai_order_k19_net_write),   // ai_order_k19_net_write
+        75 => Some(lt_lf_ai_order_k19_net_read),   // ai_order_k19_net_read
+        109 => Some(lt_lf_ai_order_k1a_net_write),   // ai_order_k1a_net_write
+        123 => Some(lt_lf_ai_order_k1a_net_read),   // ai_order_k1a_net_read
+        89 => Some(lt_lf_ai_order_k1a_exit),   // ai_order_k1a_exit
+        93 => Some(lt_lf_ai_order_k1a_update),   // ai_order_k1a_update
+        55 => Some(lt_lf_ai_order_k1c_net_write),   // ai_order_k1c_net_write
+        22 => Some(lt_lf_ai_order_k1c_exit),   // ai_order_k1c_exit
+        102 => Some(lt_lf_ai_order_k1d_net_write),   // ai_order_k1d_net_write
+        117 => Some(lt_lf_ai_order_k1d_net_read),   // ai_order_k1d_net_read
+        72 => Some(lt_lf_ai_order_k1d_on_event),   // ai_order_k1d_on_event
+        106 => Some(lt_lf_ai_order_k1e_net_write),   // ai_order_k1e_net_write
+        114 => Some(lt_lf_ai_order_k1e_net_read),   // ai_order_k1e_net_read
+        65 => Some(lt_lf_ai_order_k1e_exit),   // ai_order_k1e_exit
+        81 => Some(lt_lf_ai_order_k1f_net_read),   // ai_order_k1f_net_read
+        47 => Some(lt_lf_ai_order_k20_net_write),   // ai_order_k20_net_write
+        90 => Some(lt_lf_ai_order_k20_net_read),   // ai_order_k20_net_read
+        83 => Some(lt_lf_ai_order_k21_net_read),   // ai_order_k21_net_read
+        23 => Some(lt_lf_ai_order_k21_exit),   // ai_order_k21_exit
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod dc_difftest {
     use super::*;

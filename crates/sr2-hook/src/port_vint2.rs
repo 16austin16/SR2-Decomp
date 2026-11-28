@@ -135,6 +135,44 @@ unsafe fn call_full(f: usize, r: &mut Regs, arg: u32) {
     *r = b.r;
 }
 
+/// `call_full` for a cdecl callee with two stack arguments (the block layout differs: `a` at +32,
+/// `b` at +36; the callee's EAX / ECX / EDX / ESI / EDI / EBP / EBX are captured into `r`).
+unsafe fn call_cdecl2(f: usize, r: &mut Regs, a: u32, b: u32) {
+    #[repr(C)]
+    struct B2 {
+        f: u32,
+        r: Regs,
+        a: u32,
+        b: u32,
+    }
+    let mut blk = B2 { f: f as u32, r: *r, a, b };
+    unsafe {
+        std::arch::asm!(
+            "push ebp", "push ebx", "push esi", "push edi",
+            "push eax",
+            "push dword ptr [eax]",
+            "push dword ptr [eax + 36]",
+            "push dword ptr [eax + 32]",
+            "mov ecx, [eax + 8]", "mov edx, [eax + 12]", "mov ebx, [eax + 16]",
+            "mov esi, [eax + 20]", "mov edi, [eax + 24]", "mov ebp, [eax + 28]",
+            "mov eax, [eax + 4]",
+            "call dword ptr [esp + 8]",
+            "push ebx",
+            "mov ebx, [esp + 16]",
+            "mov [ebx + 4], eax", "mov [ebx + 8], ecx", "mov [ebx + 12], edx",
+            "mov [ebx + 20], esi", "mov [ebx + 24], edi", "mov [ebx + 28], ebp",
+            "pop dword ptr [ebx + 16]",
+            "add esp, 16",
+            "pop edi", "pop esi", "pop ebx", "pop ebp",
+            inout("eax") &mut blk as *mut B2 => _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    *r = blk.r;
+}
+
 /// A naked thunk: `pushad`, then `f(&mut block, &stack args)`, then `popad`. The Rust body puts
 /// its result in the block's EAX.
 macro_rules! regs_thunk {
@@ -146,12 +184,30 @@ macro_rules! regs_thunk {
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
-                "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 128]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
@@ -414,10 +470,25 @@ lookup_entry!(bitmap_of_value_entry, bitmap_of_value_thunk, BITMAP_OF_VALUE, eax
 lookup_entry!(font_of_value_entry, font_of_value_thunk, FONT_OF_VALUE, eax, font_of_value);
 // 0xB9BE50, 0xB9B860, 0xBA0540, 0xB95220, 0xB91C60 (ECX = handle)
 lookup_entry!(bitmap_by_handle_entry, bitmap_by_handle_thunk, BITMAP_BY_HANDLE, ecx, bitmap_by_handle);
-lookup_entry!(font_by_handle_entry, font_by_handle_thunk, FONT_BY_HANDLE, ecx, font_by_handle);
-lookup_entry!(sound_by_handle_entry, sound_by_handle_thunk, SOUND_BY_HANDLE, ecx, sound_by_handle);
+/// The handle lookups that end `setne dl / sub edx, 1 / and eax, edx`: EDX = 0xFFFFFFFF on a hit and
+/// 0 on a miss once the index is in range (a zero handle or an index out of range leaves EDX).
+macro_rules! handle_entry {
+    ($entry:ident, $thunk:ident, $id:ident, $f:ident, $count:expr) => {
+        extern "C" fn $entry(r: &mut Pushad, _: *const u32) {
+            let p = *r;
+            let eax = checked_eax($id, &p, 0, unsafe { $f(p.ecx) });
+            r.eax = eax;
+            if p.ecx != 0 && (p.ecx & 0xFFFF) < $count {
+                r.edx = if eax != 0 { u32::MAX } else { 0 };
+            }
+        }
+        regs_thunk!($thunk, $entry);
+    };
+}
+handle_entry!(font_by_handle_entry, font_by_handle_thunk, FONT_BY_HANDLE, font_by_handle, 0xA);
+handle_entry!(sound_by_handle_entry, sound_by_handle_thunk, SOUND_BY_HANDLE, sound_by_handle, 0x32);
 lookup_entry!(dataitem_by_handle_entry, dataitem_by_handle_thunk, DATAITEM_BY_HANDLE, ecx, dataitem_by_handle);
-lookup_entry!(lua_call_by_handle_entry, lua_call_by_handle_thunk, LUA_CALL_BY_HANDLE, ecx, lua_call_by_handle);
+handle_entry!(lua_call_by_handle_entry, lua_call_by_handle_thunk, LUA_CALL_BY_HANDLE, lua_call_by_handle, 0x20);
 
 // --- 0xB9B890 vint_font_find_by_platform_id (EDX = platform id -> EAX) ----------------------------
 
@@ -435,7 +506,16 @@ unsafe fn font_by_platform(id: u32) -> u32 {
     }
     0
 }
-lookup_entry!(font_by_platform_entry, font_by_platform_thunk, FONT_BY_PLATFORM, edx, font_by_platform);
+extern "C" fn font_by_platform_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let eax = checked_eax(FONT_BY_PLATFORM, &p, 0, unsafe { font_by_platform(p.edx) });
+    r.eax = eax;
+    // ECX = the scan pointer: the hit, or the end of the table; untouched for a zero id
+    if p.edx != 0 {
+        r.ecx = if eax != 0 { eax } else { FONTS_END };
+    }
+}
+regs_thunk!(font_by_platform_thunk, font_by_platform_entry);
 
 // --- by-name finders: crc32 then a ring walk ------------------------------------------------------
 
@@ -468,18 +548,83 @@ unsafe fn find_by_name(name: u32, head: usize, hoff: u32, next: u32, zero_hash_o
     }
 }
 
-unsafe fn doc_find(name: u32) -> u32 {
-    unsafe { find_by_name(name, 0x0252_A1AC, 0x48, 0, true) }
-}
-unsafe fn lua_call_by_name(name: u32) -> u32 {
-    unsafe { find_by_name(name, 0x0252_A1C8, 8, 0, false) }
-}
 unsafe fn dataitem_by_name(name: u32) -> u32 {
     unsafe { find_by_name(name, 0x0252_A1F4, 0x10, 0xC, false) }
 }
 // 0xB8B3F0, 0xB91C20, 0xB951E0 (ECX = name)
-lookup_entry!(doc_find_entry, doc_find_thunk, DOC_FIND, ecx, doc_find);
-lookup_entry!(lua_call_by_name_entry, lua_call_by_name_thunk, LUA_CALL_BY_NAME, ecx, lua_call_by_name);
+
+/// 0xB8B3F0 with its exit registers: a null name leaves ECX = 0 and EDX alone; otherwise ECX = the
+/// ring head (read after the hash call) and EDX = the hash. Returns (eax, ecx, edx).
+unsafe fn doc_find_regs(p: &Pushad) -> (u32, u32, u32) {
+    let (name, edx_in) = (p.ecx, p.edx);
+    unsafe {
+        if name == 0 {
+            return (0, 0, edx_in);
+        }
+        let hash = call_regs(STRING_CRC32_LOWER, p.eax, name, p.edx, p.esi, p.edi, &[]);
+        let head = rd(0x0252_A1AC);
+        if head == 0 {
+            return (0, 0, hash);
+        }
+        let mut n = head;
+        loop {
+            if rd(n as usize + 0x48) == hash {
+                return (n, head, hash);
+            }
+            n = rd(n as usize);
+            if n == head || n == 0 {
+                return (0, head, hash);
+            }
+        }
+    }
+}
+
+extern "C" fn doc_find_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let (eax, ecx, edx) = unsafe { doc_find_regs(&p) };
+    r.eax = checked_eax(DOC_FIND, &p, 0, eax);
+    r.ecx = ecx;
+    r.edx = edx;
+}
+regs_thunk!(doc_find_thunk, doc_find_entry);
+
+/// 0xB91C20 with its exit registers. A zero hash leaves ECX / EDX as the callee left them (not
+/// compared). Otherwise EDX = the ring head and ECX = the node the walk ended on (0 on a null link).
+unsafe fn lua_call_by_name_regs(p: &Pushad) -> (u32, u32, u32) {
+    let (name, edx_in) = (p.ecx, p.edx);
+    unsafe {
+        if name == 0 {
+            return (0, 0, edx_in);
+        }
+        let hash = call_regs(STRING_CRC32_LOWER, p.eax, name, p.edx, p.esi, p.edi, &[]);
+        if hash == 0 {
+            return (0, name, edx_in);
+        }
+        let head = rd(0x0252_A1C8);
+        if head == 0 {
+            return (0, 0, 0);
+        }
+        let mut n = head;
+        loop {
+            if rd(n as usize + 8) == hash {
+                return (n, n, head);
+            }
+            n = rd(n as usize);
+            if n == head || n == 0 {
+                return (0, n, head);
+            }
+        }
+    }
+}
+
+extern "C" fn lua_call_by_name_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
+    let (eax, ecx, edx) = unsafe { lua_call_by_name_regs(&p) };
+    r.eax = checked_eax(LUA_CALL_BY_NAME, &p, 0, eax);
+    r.ecx = ecx;
+    r.edx = edx;
+}
+regs_thunk!(lua_call_by_name_thunk, lua_call_by_name_entry);
 lookup_entry!(dataitem_by_name_entry, dataitem_by_name_thunk, DATAITEM_BY_NAME, ecx, dataitem_by_name);
 
 // --- 0xB93920 vint_value_equals (EAX = &a, EDX = &b -> AL) ----------------------------------------
@@ -490,49 +635,83 @@ lookup_entry!(dataitem_by_name_entry, dataitem_by_name_thunk, DATAITEM_BY_NAME, 
 /// 1); 4 compares the string pointers, then byte pairs (EAX = 1 when equal; a difference leaves
 /// the `sbb` sign mask: 0xFFFFFF00 when a's byte is the lower, else 0); 5 the payload byte (EAX =
 /// &a with AL replaced); 6 / 7 tail-jump to the original vec3 / vec2 equality (EAX theirs).
-unsafe fn value_equals(a: u32, b: u32) -> u32 {
+unsafe fn value_equals(a: u32, b: u32, out: &mut [u32; 2]) -> u32 {
     unsafe {
+        // out = [ecx, edx] as the original leaves them
         let ta = rd(a as usize);
-        if ta != rd(b as usize) || ta == 0 || ta.wrapping_sub(1) > 10 {
+        out[0] = ta;
+        out[1] = b;
+        let tb = std::ptr::read_volatile(b as *const u32);
+        if ta != tb || ta == 0 {
+            return lo(a, false);
+        }
+        out[0] = ta.wrapping_sub(1);
+        if ta.wrapping_sub(1) > 10 {
             return lo(a, false);
         }
         let (pa, pb) = (a as usize + 4, b as usize + 4);
         match ta {
-            3 => (f32::from_bits(rd(pa)) == f32::from_bits(rd(pb))) as u32,
+            3 => {
+                out[0] = 2;
+                (f32::from_bits(rd(pa)) == f32::from_bits(rd(pb))) as u32
+            }
             4 => {
                 let (mut p, mut q) = (rd(pa), rd(pb));
+                out[0] = q;
                 if p == q {
                     return lo(p, true);
                 }
                 if p == 0 || q == 0 {
                     return lo(p, false);
                 }
+                // EDX's low byte follows the byte loaded from a; ECX walks b
                 let differ = |d: u8, e: u8| if d < e { 0xFFFF_FF00 } else { 0 };
                 loop {
                     let (d, e) = (rb(p as usize), rb(q as usize));
+                    out[0] = q;
                     if d != e {
+                        out[1] = 0;
                         return differ(d, e);
                     }
                     if d == 0 {
+                        out[1] = 1;
                         return 1;
                     }
                     let (d, e) = (rb(p as usize + 1), rb(q as usize + 1));
                     if d != e {
+                        out[1] = 0;
                         return differ(d, e);
                     }
                     p = p.wrapping_add(2);
                     q = q.wrapping_add(2);
                     if d == 0 {
+                        out[0] = q;
+                        out[1] = 1;
                         return 1;
                     }
                 }
             }
-            5 => lo(a, rb(pa) == rb(pb)),
-            6 => call_regs(VEC3_EQUAL, a, pa as u32, pb as u32, 0, 0, &[]),
-            7 => call_regs(VEC2_EQUAL, a, pa as u32, pb as u32, 0, 0, &[]),
+            5 => {
+                let eq = rb(pa) == rb(pb);
+                out[0] = eq as u32;
+                lo(a, eq)
+            }
+            // tail-jumps into the vec3 / vec2 equality: its ECX / EDX are the callee's
+            6 => {
+                out[0] = pa as u32;
+                out[1] = pb as u32;
+                call_regs(VEC3_EQUAL, a, pa as u32, pb as u32, 0, 0, &[])
+            }
+            7 => {
+                out[0] = pa as u32;
+                out[1] = pb as u32;
+                call_regs(VEC2_EQUAL, a, pa as u32, pb as u32, 0, 0, &[])
+            }
             _ => {
                 let x = rd(pa);
-                lo(x, x == rd(pb))
+                let eq = x == rd(pb);
+                out[0] = eq as u32;
+                lo(x, eq)
             }
         }
     }
@@ -540,7 +719,11 @@ unsafe fn value_equals(a: u32, b: u32) -> u32 {
 
 extern "C" fn value_equals_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked_eax(VALUE_EQUALS, &p, 0, unsafe { value_equals(p.eax, p.edx) });
+    let mut out = [p.ecx, p.edx];
+    let ours = unsafe { value_equals(p.eax, p.edx, &mut out) };
+    r.eax = checked_eax(VALUE_EQUALS, &p, 0, ours);
+    r.ecx = out[0];
+    r.edx = out[1];
 }
 regs_thunk!(value_equals_thunk, value_equals_entry);
 
@@ -640,7 +823,10 @@ unsafe fn set_bool(v: u32, b: u32) -> u32 {
 extern "C" fn set_bool_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let b = unsafe { *args };
+    let t = unsafe { rd(p.eax as usize) };
     r.eax = checked_writer(SET_BOOL, &p, b, &[(p.eax as usize, 16)], || unsafe { set_bool(p.eax, b) });
+    // the original reads the tag into ECX, then `mov cl, arg` on the paths that store
+    r.ecx = if t == 0 || t == 5 { b & 0xFF } else { t };
 }
 regs_thunk!(set_bool_thunk, set_bool_entry, "ret 4");
 
@@ -665,7 +851,16 @@ unsafe fn set_color_bytes(v: u32, packed: u32) -> u32 {
 extern "C" fn set_color_bytes_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let c = unsafe { *args };
+    let t = unsafe { rd(p.eax as usize) };
     r.eax = checked_writer(SET_COLOR_BYTES, &p, c, &[(p.eax as usize, 16)], || unsafe { set_color_bytes(p.eax, c) });
+    if t == 0 || t == 6 {
+        // ECX = byte 2, EDX = byte 1, and the stack argument ends as byte 2 (the original reuses it)
+        r.ecx = (c >> 16) & 0xFF;
+        r.edx = (c >> 8) & 0xFF;
+        unsafe { *(args as *mut u32) = (c >> 16) & 0xFF };
+    } else {
+        r.ecx = t;
+    }
 }
 regs_thunk!(set_color_bytes_thunk, set_color_bytes_entry, "ret 4");
 
@@ -696,7 +891,11 @@ extern "C" fn set_callback_entry(r: &mut Pushad, _: *const u32) {
     if unsafe { matches!(rd(p.eax as usize), 0 | 8) } && p.edx != 0 {
         ranges.push((p.edx as usize + 0x18, 8));
     }
+    let t = unsafe { rd(p.eax as usize) };
+    let cb_handle = if matches!(t, 0 | 8) && p.edx != 0 { unsafe { rd(p.edx as usize + 0x18) } } else { t };
     r.eax = checked_writer(SET_CALLBACK, &p, 0, &ranges, || unsafe { set_callback(p.eax, p.edx) });
+    // ECX = the tag, or the callback's handle once it is loaded
+    r.ecx = cb_handle;
 }
 regs_thunk!(set_callback_thunk, set_callback_entry);
 
@@ -807,7 +1006,19 @@ macro_rules! stream_u32_entry {
             let p = *r;
             let out = unsafe { *args };
             let ranges = unsafe { stream_ranges(p.ecx, out, 4, 4) };
+            // EDX: base + size on a failed read, else the dword that was read
+            let edx = unsafe {
+                let a = p.ecx as usize;
+                let end = rd(a + 4).wrapping_add(rd(a));
+                let cur = rd(a + 8);
+                if cur.wrapping_add(4) >= end {
+                    end
+                } else {
+                    u32::from_le_bytes([rb(cur as usize), rb(cur as usize + 1), rb(cur as usize + 2), rb(cur as usize + 3)])
+                }
+            };
             r.eax = checked_writer($id, &p, out, &ranges, || unsafe { stream_u32(p.ecx, out, $early) });
+            r.edx = edx;
         }
         regs_thunk!($thunk, $entry, "ret 4");
     };
@@ -838,7 +1049,21 @@ extern "C" fn stream_u8_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let out = unsafe { *args };
     let ranges = unsafe { stream_ranges(p.eax, out, 1, 1) };
+    // ECX = the cursor (low byte replaced by the byte read on success), EDX = cursor + 1
+    let (ecx, edx) = unsafe {
+        let a = p.eax as usize;
+        let cur = rd(a + 8);
+        let next = cur.wrapping_add(1);
+        if next >= rd(a + 4).wrapping_add(rd(a)) {
+            (cur, next)
+        } else {
+            let byte = rb(cur as usize) as u32;
+            ((cur & 0xFFFF_FF00) | byte, next)
+        }
+    };
     r.eax = checked_writer(STREAM_U8, &p, out, &ranges, || unsafe { stream_u8(p.eax, out) });
+    r.ecx = ecx;
+    r.edx = edx;
 }
 regs_thunk!(stream_u8_thunk, stream_u8_entry, "ret 4");
 
@@ -868,6 +1093,7 @@ const FONT_ACQUIRE_FN: usize = 0x00B9_B6F0; // cdecl (name)
 const SOUND_ACQUIRE_FN: usize = 0x00BA_03F0; // cdecl (name)
 const HASH_LOWER: usize = 0x00BD_CB30; // ECX = name, EAX = seed, stdcall (u32* out)
 const BITMAP_FIND_CACHED: usize = 0x00B9_BBC0; // EDI = &hash -> EAX = record or 0
+const DATAITEM_BY_NAME_FN: usize = 0x00B9_51E0; // ECX = name -> EAX = item or 0
 const DATAITEM_INIT: usize = 0x00B9_4910; // ESI = item, ECX = name
 const DATAGROUP_INIT: usize = 0x00B9_3B00; // ESI = group, ECX = name
 const PLATFORM: usize = 0x0252_A1D4; // platform hook table pointer
@@ -1467,12 +1693,13 @@ const GROUP_POOL: usize = 0x031B_ACF0; // 0x20 records of 0x20
 /// initialises it (`dataitem_init`, by address), then moves every waiting node whose key (+4)
 /// equals the new item's hash from the waiting ring into the item's subscriber ring (+0x220),
 /// storing the item's handle in the node. 0 for a null name or an empty free ring.
-unsafe fn dataitem_get_or_create(name: u32) -> u32 {
+unsafe fn dataitem_get_or_create(name: u32, edx_in: u32, esi_in: u32, out: &mut [u32; 2]) -> u32 {
     unsafe {
         if name == 0 {
             return 0;
         }
-        let found = dataitem_by_name(name);
+        // the by-name finder, by address, with the registers the original has at that call
+        let found = call_regs(DATAITEM_BY_NAME_FN, name, name, edx_in, esi_in, name, &[]);
         if found != 0 {
             return found;
         }
@@ -1518,6 +1745,8 @@ unsafe fn dataitem_get_or_create(name: u32) -> u32 {
             let mut edx = rd(a + 0x14);
             let key = rd(a + 4);
             let ecx = if edx != ebx { edx } else { 0 };
+            // ECX ends 0 (the loop runs until it is); EDX is the last one loaded
+            *out = [ecx, edx];
             if key == rd(s + 0x10) {
                 let mut neighbours = true;
                 if ebx == eax {
@@ -1543,6 +1772,7 @@ unsafe fn dataitem_get_or_create(name: u32) -> u32 {
                 wd(a + 0x14, 0);
                 wd(a, rd(s + 0x224));
                 let head = rd(s + 0x220);
+                out[1] = head;
                 if head == 0 {
                     wd(a + 0x14, eax);
                     wd(a + 0x18, eax);
@@ -1556,6 +1786,7 @@ unsafe fn dataitem_get_or_create(name: u32) -> u32 {
                     let t3 = rd(h3 as usize + 0x18);
                     wd(t3 as usize + 0x14, eax);
                     let h4 = rd(s + 0x220);
+                    out[1] = h4;
                     wd(h4 as usize + 0x18, eax);
                 }
             }
@@ -1591,17 +1822,20 @@ unsafe fn waiting_ranges(out: &mut Vec<(usize, usize)>) -> bool {
 extern "C" fn item_get_or_create_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let name = p.eax;
+    let mut out = [p.ecx, p.edx];
     r.eax = if window_open(P_ITEM_GET_OR_CREATE) {
         let mut ranges = vec![(ITEM_LIVE, 0x20), (ITEM_POOL, 0x80 * 0x22C)];
         if unsafe { waiting_ranges(&mut ranges) } {
-            checked_writer(P_ITEM_GET_OR_CREATE, &p, 0, &ranges, || unsafe { dataitem_get_or_create(name) })
+            checked_writer(P_ITEM_GET_OR_CREATE, &p, 0, &ranges, || unsafe { dataitem_get_or_create(name, p.edx, p.esi, &mut out) })
         } else {
             br(P_ITEM_GET_OR_CREATE, 0);
-            unsafe { dataitem_get_or_create(name) }
+            unsafe { dataitem_get_or_create(name, p.edx, p.esi, &mut out) }
         }
     } else {
-        unsafe { dataitem_get_or_create(name) }
+        unsafe { dataitem_get_or_create(name, p.edx, p.esi, &mut out) }
     };
+    r.ecx = out[0];
+    r.edx = out[1];
 }
 regs_thunk!(item_get_or_create_thunk, item_get_or_create_entry);
 
@@ -1612,13 +1846,21 @@ regs_thunk!(item_get_or_create_thunk, item_get_or_create_entry);
 /// the group's hash into the group's subscriber ring (+0x18), storing the group's handle (+0x14)
 /// in each. 0 for a null name. An empty free ring returns 0 at once (the original would go on
 /// to read `[8]` when the waiting ring is not empty, and fault).
-unsafe fn datagroup_create(name: u32) -> u32 {
+unsafe fn datagroup_create(name: u32, out: &mut [u32; 2]) -> u32 {
     unsafe {
         if name == 0 {
             return 0;
         }
         let esi = rd(GROUP_FREE);
         if esi == 0 {
+            // No group to take: the original still walks the waiting ring, reading `[node + 0x14]`,
+            // `[node]` and then `[0x8]` (the group's hash slot through a null group), which faults.
+            let w = rd(WAITING);
+            if w != 0 {
+                let _ = std::ptr::read_volatile((w as usize + 0x14) as *const u32);
+                let _ = std::ptr::read_volatile(w as *const u32);
+                let _ = std::ptr::read_volatile(8usize as *const u32);
+            }
             return 0;
         }
         let s = esi as usize;
@@ -1656,6 +1898,8 @@ unsafe fn datagroup_create(name: u32) -> u32 {
             let mut edx = rd(a + 0x14);
             let key = rd(a);
             let ecx = if edx != ebx { edx } else { 0 };
+            // ECX ends 0 (the loop runs until it is); EDX is the last one loaded
+            *out = [ecx, edx];
             if key == rd(s + 8) {
                 let mut neighbours = true;
                 if ebx == eax {
@@ -1681,6 +1925,7 @@ unsafe fn datagroup_create(name: u32) -> u32 {
                 wd(a + 0x14, 0);
                 wd(a, rd(s + 0x14));
                 let head = rd(s + 0x18);
+                out[1] = head;
                 if head == 0 {
                     wd(a + 0x14, eax);
                     wd(a + 0x18, eax);
@@ -1694,6 +1939,7 @@ unsafe fn datagroup_create(name: u32) -> u32 {
                     let t3 = rd(h3 as usize + 0x18);
                     wd(t3 as usize + 0x14, eax);
                     let h4 = rd(s + 0x18);
+                    out[1] = h4;
                     wd(h4 as usize + 0x18, eax);
                 }
             }
@@ -1707,19 +1953,22 @@ unsafe fn datagroup_create(name: u32) -> u32 {
 extern "C" fn group_create_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let name = p.ecx;
+    let mut out = [p.ecx, p.edx];
     r.eax = if window_open(P_GROUP_CREATE) {
         // The empty-free-ring fault path of the original is never shadowed.
         let mut ranges = vec![(GROUP_FREE, 0x14), (GROUP_POOL, 0x20 * 0x20)];
         let ok = unsafe { name == 0 || rd(GROUP_FREE) != 0 } && unsafe { waiting_ranges(&mut ranges) };
         if ok {
-            checked_writer(P_GROUP_CREATE, &p, 0, &ranges, || unsafe { datagroup_create(name) })
+            checked_writer(P_GROUP_CREATE, &p, 0, &ranges, || unsafe { datagroup_create(name, &mut out) })
         } else {
             br(P_GROUP_CREATE, 0);
-            unsafe { datagroup_create(name) }
+            unsafe { datagroup_create(name, &mut out) }
         }
     } else {
-        unsafe { datagroup_create(name) }
+        unsafe { datagroup_create(name, &mut out) }
     };
+    r.ecx = out[0];
+    r.edx = out[1];
 }
 regs_thunk!(group_create_thunk, group_create_entry);
 
@@ -1727,8 +1976,11 @@ regs_thunk!(group_create_thunk, group_create_entry);
 
 /// Pop the head of a free ring (links `next` / `prev` as dword offsets) and push the record at
 /// the back of the live ring: the common tail of the three `acquire_by_name` functions.
-unsafe fn ring_take(esi: u32, free: usize, live: usize, next: usize, prev: usize) -> u32 {
+unsafe fn ring_take(esi: u32, free: usize, live: usize, next: usize, prev: usize, bm: bool, out: &mut [u32; 2]) -> u32 {
     unsafe {
+        // out = [ecx, edx]. The font / sound tails zero ECX after the relink block (`xor ecx, ecx`);
+        // the bitmap tail uses EBP = 0 instead, so its ECX / EDX keep the handle / generation values
+        // the caller put in `out` unless the relink loads them.
         let s = esi as usize;
         let mut relink = true;
         if rd(free) == esi {
@@ -1743,16 +1995,29 @@ unsafe fn ring_take(esi: u32, free: usize, live: usize, next: usize, prev: usize
             }
         }
         if relink {
+            if !bm {
+                out[0] = 0;
+            }
             let pv = rd(s + prev);
             if pv != 0 {
-                wd(pv as usize + next, rd(s + next));
+                let nx = rd(s + next);
+                if bm {
+                    out[0] = nx;
+                } else {
+                    out[1] = nx;
+                }
+                wd(pv as usize + next, nx);
             }
             let nx = rd(s + next);
             if nx != 0 {
-                wd(nx as usize + prev, rd(s + prev));
+                let pv2 = rd(s + prev);
+                out[1] = pv2;
+                wd(nx as usize + prev, pv2);
             }
             wd(s + next, 0);
             wd(s + prev, 0);
+        } else if !bm {
+            out[0] = 0;
         }
         let head = rd(live);
         if head == 0 {
@@ -1761,9 +2026,11 @@ unsafe fn ring_take(esi: u32, free: usize, live: usize, next: usize, prev: usize
             wd(live, esi);
         } else {
             let t = rd(head as usize + prev);
+            out[0] = t;
             wd(s + next, head);
             wd(s + prev, t);
             let t2 = rd(head as usize + prev);
+            out[1] = t2;
             wd(t2 as usize + next, esi);
             wd(head as usize + prev, esi);
         }
@@ -1817,12 +2084,17 @@ const SOUND_GEN: usize = 0x0252_A2A0;
 /// (+0x10). A miss takes a free record, asks the platform hook +0x10 for an id (-1 gives 0) and
 /// hook +0x24 to fill +0xC, then stamps handle (+8) = generation << 16 + index, id (+0), hash
 /// (+4), count = 1 and rings it in.
-unsafe fn font_acquire(name: u32) -> u32 {
+unsafe fn font_acquire(name: u32, p: &Pushad, out: &mut [u32; 2]) -> u32 {
     unsafe {
         if name == 0 {
             return 0;
         }
-        let hit = cache_lookup(FONT_LIVE, crc_lower(name), 0x14);
+        // EBP = the name argument throughout
+        let mut rg = Regs { eax: p.eax, ecx: name, edx: p.edx, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: name };
+        call_full(STRING_CRC32_LOWER, &mut rg, 0);
+        let hash = rg.eax;
+        *out = [rd(FONT_LIVE), hash];
+        let hit = cache_lookup(FONT_LIVE, hash, 0x14);
         if hit != 0 {
             wd(hit as usize + 0x10, rd(hit as usize + 0x10).wrapping_add(1));
             return hit;
@@ -1844,8 +2116,8 @@ unsafe fn font_acquire(name: u32) -> u32 {
         let s = esi as usize;
         if f2 != 0 {
             let old = rd(s);
-            let out = esi + 0xC;
-            let al = call_regs(f2 as usize, 0, 0, 0, 0, 0, &[out, old]) as u8;
+            let o = esi + 0xC;
+            let al = call_regs(f2 as usize, 0, 0, 0, 0, 0, &[o, old]) as u8;
             if al == 0 {
                 wd(s + 0xC, 0);
             }
@@ -1860,21 +2132,26 @@ unsafe fn font_acquire(name: u32) -> u32 {
         wd(s + 8, (idx & 0xFFFF).wrapping_add((di as u32) << 16));
         ww(FONT_GEN, di);
         wd(s, id);
-        let h = crc_lower(name);
-        wd(s + 4, h);
+        let mut rg = Regs { eax: idx, ecx: name, edx: (di as u32) << 16, ebx: id, esi, edi: (p.edi & 0xFFFF_0000) | di as u32, ebp: name };
+        call_full(STRING_CRC32_LOWER, &mut rg, 0);
+        wd(s + 4, rg.eax);
         wd(s + 0x10, 1);
-        ring_take(esi, FONT_FREE, FONT_LIVE, 0x14, 0x18)
+        ring_take(esi, FONT_FREE, FONT_LIVE, 0x14, 0x18, false, out)
     }
 }
 
 /// 0xBA03F0: as the font cache, with next +0x10, count +0xC, hook +0x2C (a 16-bit id, 0xFFFF
 /// gives 0) and a word id at +0.
-unsafe fn sound_acquire(name: u32) -> u32 {
+unsafe fn sound_acquire(name: u32, p: &Pushad, out: &mut [u32; 2]) -> u32 {
     unsafe {
         if name == 0 {
             return 0;
         }
-        let hit = cache_lookup(SOUND_LIVE, crc_lower(name), 0x10);
+        let mut rg = Regs { eax: p.eax, ecx: name, edx: p.edx, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: name };
+        call_full(STRING_CRC32_LOWER, &mut rg, 0);
+        let hash = rg.eax;
+        *out = [rd(SOUND_LIVE), hash];
+        let hit = cache_lookup(SOUND_LIVE, hash, 0x10);
         if hit != 0 {
             wd(hit as usize + 0xC, rd(hit as usize + 0xC).wrapping_add(1));
             return hit;
@@ -1901,10 +2178,11 @@ unsafe fn sound_acquire(name: u32) -> u32 {
         wd(s + 8, (idx & 0xFFFF).wrapping_add((di as u32) << 16));
         ww(SOUND_GEN, di);
         ww(s, id as u16);
-        let h = crc_lower(name);
-        wd(s + 4, h);
+        let mut rg = Regs { eax: idx, ecx: name, edx: (di as u32) << 16, ebx: id, esi, edi: (p.edi & 0xFFFF_0000) | di as u32, ebp: name };
+        call_full(STRING_CRC32_LOWER, &mut rg, 0);
+        wd(s + 4, rg.eax);
         wd(s + 0xC, 1);
-        ring_take(esi, SOUND_FREE, SOUND_LIVE, 0x10, 0x14)
+        ring_take(esi, SOUND_FREE, SOUND_LIVE, 0x10, 0x14, false, out)
     }
 }
 
@@ -1912,15 +2190,21 @@ unsafe fn sound_acquire(name: u32) -> u32 {
 /// finds or loads a cached record (count +0x18, ring next +0x1C). A zero result takes a free
 /// record, asks hook +0 for a texture id (-1 gives 0; the id is stored at +4 even then) and
 /// stamps count = 1, hash (+0x10), handle (+0x14), flag (+0xC) = 0, then rings it in.
-unsafe fn bitmap_acquire(name: u32, esi0: u32) -> u32 {
+unsafe fn bitmap_acquire(name: u32, args: *mut u32, p: &Pushad, out: &mut [u32; 2]) -> u32 {
     unsafe {
         if name == 0 {
             return 0;
         }
-        let mut hash = 0u32;
-        let hp = &mut hash as *mut u32 as u32;
-        call_regs(HASH_LOWER, 0, name, 0, esi0, 0, &[hp]);
-        let found = call_regs(BITMAP_FIND_CACHED, 0, 0, 0, esi0, hp, &[]);
+        // The hash goes into the caller's stack argument slot (the original passes its address).
+        let hp = args as u32;
+        let mut rg = Regs { eax: 0, ecx: name, edx: p.edx, ebx: name, esi: p.esi, edi: p.edi, ebp: 0 };
+        call_full(HASH_LOWER, &mut rg, hp);
+        rg.edi = hp;
+        rg.esi = p.esi;
+        rg.ebx = name;
+        rg.ebp = 0;
+        call_full(BITMAP_FIND_CACHED, &mut rg, 0);
+        let found = rg.eax;
         if found != 0 {
             return found;
         }
@@ -1944,13 +2228,15 @@ unsafe fn bitmap_acquire(name: u32, esi0: u32) -> u32 {
         }
         let di = rw(BITMAP_GEN).wrapping_add(1);
         let idx = pool_index(esi.wrapping_sub(0x031B_C518), 0x38E3_8E39, 3, false);
-        let handle = (idx & 0xFFFF).wrapping_add((di as u32) << 16);
+        let handle = idx.wrapping_add((di as u32) << 16);
         wd(s + 0xC, 0);
         ww(BITMAP_GEN, di);
         wd(s + 0x14, handle);
-        wd(s + 0x10, hash);
+        wd(s + 0x10, rd(hp as usize));
         wd(s + 0x18, 1);
-        ring_take(esi, BITMAP_FREE, BITMAP_LIVE, 0x1C, 0x20)
+        // ECX = the handle, EDX = generation << 16 (until the relink loads other values)
+        *out = [handle, (di as u32) << 16];
+        ring_take(esi, BITMAP_FREE, BITMAP_LIVE, 0x1C, 0x20, true, out)
     }
 }
 
@@ -1961,17 +2247,20 @@ macro_rules! acquire_entry {
         extern "C" fn $entry(r: &mut Pushad, args: *const u32) {
             let p = *r;
             let name = unsafe { *args };
+            let mut out = [p.ecx, p.edx];
             r.eax = if window_open($id) {
                 let hit = unsafe { if name == 0 { 0 } else { cache_lookup($live, crc_lower(name), $next) } };
                 if hit != 0 {
-                    checked_writer($id, &p, name, &[(hit as usize + $count, 4)], || unsafe { $f(name) })
+                    checked_writer($id, &p, name, &[(hit as usize + $count, 4)], || unsafe { $f(name, &p, &mut out) })
                 } else {
                     br($id, 0);
-                    unsafe { $f(name) }
+                    unsafe { $f(name, &p, &mut out) }
                 }
             } else {
-                unsafe { $f(name) }
+                unsafe { $f(name, &p, &mut out) }
             };
+            r.ecx = out[0];
+            r.edx = out[1];
         }
         regs_thunk!($thunk, $entry);
     };
@@ -1982,6 +2271,7 @@ acquire_entry!(sound_acquire_entry, sound_acquire_thunk, P_SOUND_ACQUIRE, sound_
 extern "C" fn bitmap_acquire_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let name = unsafe { *args };
+    let mut out = [p.ecx, p.edx];
     r.eax = if window_open(P_BITMAP_ACQUIRE) {
         // Only a hit in the live ring (0xB9BBC0's first loop: key +0x10, next +0x1C) is shadowed.
         let hit = unsafe {
@@ -2007,14 +2297,18 @@ extern "C" fn bitmap_acquire_entry(r: &mut Pushad, args: *const u32) {
             }
         };
         if hit != 0 {
-            checked_writer(P_BITMAP_ACQUIRE, &p, name, &[(hit as usize + 0x18, 4)], || unsafe { bitmap_acquire(name, p.esi) })
+            checked_writer(P_BITMAP_ACQUIRE, &p, name, &[(hit as usize + 0x18, 4)], || unsafe {
+                bitmap_acquire(name, args as *mut u32, &p, &mut out)
+            })
         } else {
             br(P_BITMAP_ACQUIRE, 0);
-            unsafe { bitmap_acquire(name, p.esi) }
+            unsafe { bitmap_acquire(name, args as *mut u32, &p, &mut out) }
         }
     } else {
-        unsafe { bitmap_acquire(name, p.esi) }
+        unsafe { bitmap_acquire(name, args as *mut u32, &p, &mut out) }
     };
+    r.ecx = out[0];
+    r.edx = out[1];
 }
 regs_thunk!(bitmap_acquire_thunk, bitmap_acquire_entry);
 
@@ -2395,6 +2689,7 @@ const P_GROUP_UNSUBSCRIBE: usize = 46;
 const NAME_BUCKETS: usize = 0x022E_F1B8; // 64 object-name buckets (ring links +4 next, +8 prev)
 const CALLBACK_BUCKETS: usize = 0x022F_2670; // 64 callback buckets (handle +0x18, next +8)
 const NODE_FREE: usize = 0x0252_A20C; // subscriber-node free ring (links +0x14 next, +0x18 prev)
+const REHASH_FN: usize = 0x00B9_7570; // EAX = object, ECX = new name hash
 const STRNCPY: usize = 0x00C9_90F0;
 const STRICMP: usize = 0x00C9_9030;
 const DELIVER_ONE: usize = 0x00B9_45E0; // stdcall (group)
@@ -2410,16 +2705,19 @@ fn count_only(id: usize) {
 /// Out of the old name bucket's ring (when the old hash is not 0), store the new hash at +0x2C,
 /// into the new bucket's ring as its last node (when the new hash is not 0). Nothing when the
 /// hash is unchanged.
-unsafe fn object_rehash(obj: u32, newh: u32) -> u32 {
+unsafe fn object_rehash(obj: u32, newh: u32, out: &mut [u32; 2]) -> u32 {
     unsafe {
+        // out = [ecx, edx] as the original leaves them: EDX starts as the old hash
         let o = obj as usize;
         let old = rd(o + 0x2C);
+        *out = [newh, old];
         if old == newh {
             return obj;
         }
         if old != 0 {
             let b = NAME_BUCKETS + (old & 0x3F) as usize * 4;
             let mut unlink = true;
+            out[1] = old & 0x3F;
             if rd(b) == obj {
                 let nx = rd(o + 4);
                 if nx == obj {
@@ -2436,6 +2734,7 @@ unsafe fn object_rehash(obj: u32, newh: u32) -> u32 {
                 let nx = rd(o + 4);
                 wd(pv as usize + 4, nx);
                 let nx2 = rd(o + 4);
+                out[1] = nx2;
                 let pv2 = rd(o + 8);
                 wd(nx2 as usize + 8, pv2);
                 wd(o + 4, 0);
@@ -2447,7 +2746,9 @@ unsafe fn object_rehash(obj: u32, newh: u32) -> u32 {
             return obj;
         }
         let b2 = NAME_BUCKETS + (newh & 0x3F) as usize * 4;
+        out[0] = newh & 0x3F;
         let head = rd(b2);
+        out[1] = head;
         if head == 0 {
             wd(o + 4, obj);
             wd(o + 8, obj);
@@ -2458,8 +2759,10 @@ unsafe fn object_rehash(obj: u32, newh: u32) -> u32 {
             wd(o + 4, rd(b2));
             let h3 = rd(b2);
             let t3 = rd(h3 as usize + 8);
+            out[1] = t3;
             wd(t3 as usize + 4, obj);
             let h4 = rd(b2);
+            out[0] = h4;
             wd(h4 as usize + 8, obj);
         }
         obj
@@ -2501,13 +2804,16 @@ unsafe fn rehash_ranges(obj: u32, newh: u32, v: &mut Vec<(usize, usize)>) {
 extern "C" fn rehash_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let (obj, h) = (p.eax, p.ecx);
+    let mut out = [p.ecx, p.edx];
     r.eax = if window_open(P_REHASH) {
         let mut ranges = Vec::new();
         unsafe { rehash_ranges(obj, h, &mut ranges) };
-        checked_writer(P_REHASH, &p, 0, &ranges, || unsafe { object_rehash(obj, h) })
+        checked_writer(P_REHASH, &p, 0, &ranges, || unsafe { object_rehash(obj, h, &mut out) })
     } else {
-        unsafe { object_rehash(obj, h) }
+        unsafe { object_rehash(obj, h, &mut out) }
     };
+    r.ecx = out[0];
+    r.edx = out[1];
 }
 regs_thunk!(rehash_thunk, rehash_entry);
 
@@ -2521,10 +2827,11 @@ unsafe fn object_set_name(obj: u32, name: u32, eax_in: u32) -> u32 {
         if name == 0 {
             return eax_in;
         }
-        call_regs(STRNCPY, 0, 0, 0, 0, 0, &[obj + 0x34, name, 0x20]);
+        call_regs(STRNCPY, 0, 0, 0, obj + 0x34, name, &[obj + 0x34, name, 0x20]);
         wb(obj as usize + 0x53, 0);
-        let h = crc_lower(name);
-        object_rehash(obj, h)
+        let h = call_regs(STRING_CRC32_LOWER, 0, name, 0, obj + 0x34, name, &[]);
+        // the rehash is a callee here: the original calls it by address
+        call_regs(REHASH_FN, obj, h, 0, obj + 0x34, name, &[])
     }
 }
 
@@ -2617,16 +2924,24 @@ regs_thunk!(set_document_rec_thunk, set_document_rec_entry, "ret 4");
 
 /// A case-insensitive search (`_stricmp`, by address) of the raw binding names (table pointer
 /// 0x252A240, stride 0x18, name pointer at +0x14, count 0x252A23C); a null name or no match gives -1.
-unsafe fn raw_input_index(name: u32) -> u32 {
+unsafe fn raw_input_index(name: u32, regs: &mut Regs) -> u32 {
     unsafe {
+        // EBX = the name (the original loads it from the stack); ESI = index, EDI = byte offset
+        regs.ebx = name;
         if name == 0 {
             return u32::MAX;
         }
         let count = rd(0x0252_A23C);
         let mut off = 0usize;
         for i in 0..count {
-            let s = rd(rd(0x0252_A240) as usize + off + 0x14);
-            if call_regs(STRICMP, 0, 0, 0, 0, 0, &[name, s]) == 0 {
+            let table = rd(0x0252_A240);
+            let s = rd(table as usize + off + 0x14);
+            regs.eax = table;
+            regs.ecx = s;
+            regs.esi = i;
+            regs.edi = off as u32;
+            call_cdecl2(STRICMP, regs, name, s);
+            if regs.eax == 0 {
                 return i;
             }
             off += 0x18;
@@ -2638,7 +2953,11 @@ unsafe fn raw_input_index(name: u32) -> u32 {
 extern "C" fn raw_input_index_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let name = unsafe { *args };
-    r.eax = checked_eax(P_RAW_INPUT_INDEX, &p, name, unsafe { raw_input_index(name) });
+    let mut regs = Regs::of(&p);
+    let ours = unsafe { raw_input_index(name, &mut regs) };
+    r.eax = checked_eax(P_RAW_INPUT_INDEX, &p, name, ours);
+    r.ecx = regs.ecx;
+    r.edx = regs.edx;
 }
 regs_thunk!(raw_input_index_thunk, raw_input_index_entry);
 
@@ -2646,29 +2965,36 @@ regs_thunk!(raw_input_index_thunk, raw_input_index_entry);
 
 /// `crc32_lower(name)` against the first dword of the project entries (0x88 bytes from 0x22EF628,
 /// count 0x252A244, signed); a hit gives `0x22EF630 + index * 0x88`.
-unsafe fn project_find(name: u32) -> u32 {
+unsafe fn project_find(p: &Pushad, out: &mut [u32; 2]) -> u32 {
     unsafe {
-        let h = crc_lower(name);
+        let h = call_regs(STRING_CRC32_LOWER, p.eax, p.ecx, p.edx, p.esi, p.edi, &[]);
         let count = rd(0x0252_A244) as i32;
+        out[1] = count as u32;
         if count <= 0 {
             return 0;
         }
         let mut i = 0i32;
         let mut e = 0x022E_F628u32;
         while i < count {
+            out[0] = e;
             if rd(e as usize) == h {
                 return 0x022E_F630u32.wrapping_add((i as u32).wrapping_mul(0x88));
             }
             i += 1;
             e = e.wrapping_add(0x88);
         }
+        out[0] = e;
         0
     }
 }
 
 extern "C" fn project_find_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked_eax(P_PROJECT_FIND, &p, 0, unsafe { project_find(p.ecx) });
+    let mut out = [p.ecx, p.edx];
+    let ours = unsafe { project_find(&p, &mut out) };
+    r.eax = checked_eax(P_PROJECT_FIND, &p, 0, ours);
+    r.ecx = out[0];
+    r.edx = out[1];
 }
 regs_thunk!(project_find_thunk, project_find_entry);
 
@@ -2896,28 +3222,35 @@ regs_thunk!(group_destroy_thunk, group_destroy_entry, "ret 4");
 /// 0xB94560: for every live datagroup (ring 0x252A204, link +0), deliver it (0xB945E0, by
 /// address) and, when its byte +0x1C is 1 afterwards, destroy it. The next link is read before
 /// the delivery. EAX is the last callee's, or the caller's when no group is live.
-unsafe fn deliver_all(eax_in: u32) -> u32 {
+unsafe fn deliver_all(regs: &mut Regs) {
     unsafe {
-        let mut eax = eax_in;
         let mut edi = rd(GROUP_LIVE);
         while edi != 0 {
-            eax = rd(edi as usize);
+            let eax = rd(edi as usize);
             let head = rd(GROUP_LIVE);
             let esi = if eax != head { eax } else { 0 };
-            eax = call_regs(DELIVER_ONE, eax, 0, 0, esi, edi, &[edi]);
+            // EAX / ECX / EDX flow from one callee into the next, as in the original
+            regs.eax = eax;
+            regs.esi = esi;
+            regs.edi = edi;
+            call_full(DELIVER_ONE, regs, edi);
             if rb(edi as usize + 0x1C) == 1 {
-                eax = call_regs(GROUP_DESTROY_FN, eax, 0, 0, esi, edi, &[edi]);
+                regs.esi = esi;
+                regs.edi = edi;
+                call_full(GROUP_DESTROY_FN, regs, edi);
             }
             edi = esi;
         }
-        eax
     }
 }
 
 extern "C" fn deliver_all_entry(r: &mut Pushad, _: *const u32) {
-    let p = *r;
+    let mut regs = Regs::of(r);
     count_only(P_DELIVER_ALL);
-    r.eax = unsafe { deliver_all(p.eax) };
+    unsafe { deliver_all(&mut regs) };
+    r.eax = regs.eax;
+    r.ecx = regs.ecx;
+    r.edx = regs.edx;
 }
 regs_thunk!(deliver_all_thunk, deliver_all_entry);
 

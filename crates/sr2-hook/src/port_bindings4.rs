@@ -30,6 +30,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+use crate::port_bindings3::{arg0_addr, binding_thunk, call_regs, entry_ecx, flag_slot, set_ecx, set_edx};
 use crate::portlib::*;
 use crate::{detour, log};
 
@@ -143,24 +144,43 @@ unsafe fn is_nil(p: u32) -> bool {
 
 unsafe fn number_arg(l: u32, i: i32) -> f64 {
     let mut out = 0f64;
+    let (ec, ed): (u32, u32);
     unsafe {
         std::arch::asm!(
             "call {f}",
             "fstp qword ptr [edi]",
             f = in(reg) LUA_TONUMBER,
             in("eax") i,
-            in("ecx") l,
+            inout("ecx") l => ec,
+            lateout("edx") ed,
             in("edi") &mut out as *mut f64,
             clobber_abi("C"),
         );
     }
+    set_ecx(ec);
+    set_edx(ed);
     out
 }
 
 /// `_ftol2(lua_tonumber(i))`: truncation, the low dword of the 64-bit result.
 unsafe fn int_arg(l: u32, i: i32) -> u32 {
-    let out = unsafe { number_arg(l, i) };
-    if out.abs() < 9.2e18 { out as i64 as u32 } else { 0 }
+    let r: u32;
+    let (ec, ed): (u32, u32);
+    unsafe {
+        std::arch::asm!(
+            "call {f}",
+            "call {g}",
+            f = in(reg) LUA_TONUMBER,
+            g = in(reg) 0x00DA_0176usize,
+            inout("eax") i => r,
+            inout("ecx") l => ec,
+            lateout("edx") ed,
+            clobber_abi("C"),
+        );
+    }
+    set_ecx(ec);
+    set_edx(ed);
+    r
 }
 
 /// The truth test of a slot pointer: missing, nil or false -> false.
@@ -331,9 +351,8 @@ unsafe fn vehicle_from_name(name: u32) -> u32 {
 /// EAX = &found)`, else `script_object_to_human(ESI = name)` (follower, then script object).
 unsafe fn human_named(name: u32) -> u32 {
     unsafe {
-        let mut found: u32 = 0;
-        let obj = call_regs(SCRIPT_FIND_OBJECT_BY_NAME, &mut found as *mut u32 as u32, name, 0, 0, 0, &[]);
-        if found as u8 != 0 { obj } else { call_regs(SCRIPT_OBJECT_TO_HUMAN, obj, 0, 0, name, 0, &[]) }
+        let (obj, fb) = crate::port_bindings3::find_with_byte(arg0_addr(), name, true);
+        if fb != 0 { obj } else { call_regs(SCRIPT_OBJECT_TO_HUMAN, obj, 0, 0, name, 0, &[]) }
     }
 }
 
@@ -351,8 +370,11 @@ unsafe fn follower_or_object_human(name: u32) -> Option<u32> {
 }
 
 unsafe fn cb_set(f: usize, ecx: u32, ty: u32, name: u32) {
-    let mut t = ty;
-    unsafe { call_regs(f, &mut t as *mut u32 as u32, ecx, 0, 0, 0, &[name]) };
+    // The original stores the type in its own argument slot and passes that address.
+    unsafe {
+        wd(arg0_addr() as usize, ty);
+        call_regs(f, arg0_addr(), ecx, 0, 0, 0, &[name]);
+    }
 }
 
 unsafe fn current_document() -> u32 {
@@ -434,18 +456,31 @@ unsafe fn shadowed(i: usize, l: u32, rust: unsafe fn(u32) -> i32) -> i32 {
 
 macro_rules! counted {
     ($name:ident, $idx:expr, $body:ident) => {
-        extern "C" fn $name(l: u32) -> i32 {
+        binding_thunk!($name, l, {
             CALLS[$idx].fetch_add(1, Ordering::Relaxed);
             unsafe { $body(l) }
-        }
+        });
+    };
+    ($name:ident, $idx:expr, $body:ident, pop_ecx) => {
+        binding_thunk!($name, l, {
+            CALLS[$idx].fetch_add(1, Ordering::Relaxed);
+            let r = unsafe { $body(l) };
+            set_ecx(entry_ecx());
+            r
+        });
     };
 }
 
 macro_rules! shadow_checked {
     ($name:ident, $idx:expr, $body:ident) => {
-        extern "C" fn $name(l: u32) -> i32 {
-            unsafe { shadowed($idx, l, $body) }
-        }
+        binding_thunk!($name, l, unsafe { shadowed($idx, l, $body) });
+    };
+    ($name:ident, $idx:expr, $body:ident, pop_ecx) => {
+        binding_thunk!($name, l, {
+            let r = unsafe { shadowed($idx, l, $body) };
+            set_ecx(entry_ecx());
+            r
+        });
     };
 }
 
@@ -600,7 +635,7 @@ unsafe fn spawning_vehicles_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(spawning_vehicles, I_SPAWNING_VEHICLES, spawning_vehicles_impl);
+counted!(spawning_vehicles, I_SPAWNING_VEHICLES, spawning_vehicles_impl, pop_ecx);
 
 // --- 87 follower_make_independent ------------------------------------------------------------
 
@@ -619,12 +654,12 @@ unsafe fn follower_make_independent_impl(l: u32) -> i32 {
             None => return 0,
         };
         if h != 0 {
-            call_regs(0x009D_23E0, 0, 0, 0, 0, 0, &[h, (l & !0xFF) | flag as u32]);
+            call_regs(0x009D_23E0, 0, 0, 0, 0, 0, &[h, flag_slot(flag)]);
         }
     }
     0
 }
-counted!(follower_make_independent, I_FOLLOWER_MAKE_INDEPENDENT, follower_make_independent_impl);
+counted!(follower_make_independent, I_FOLLOWER_MAKE_INDEPENDENT, follower_make_independent_impl, pop_ecx);
 
 // --- 88 vehicle_exists -----------------------------------------------------------------------
 
@@ -639,7 +674,7 @@ unsafe fn vehicle_exists_impl(l: u32) -> i32 {
     }
     1
 }
-shadow_checked!(vehicle_exists, I_VEHICLE_EXISTS, vehicle_exists_impl);
+shadow_checked!(vehicle_exists, I_VEHICLE_EXISTS, vehicle_exists_impl, pop_ecx);
 
 // --- 89 hud_bar_set_value --------------------------------------------------------------------
 
@@ -863,9 +898,10 @@ unsafe fn vehicle_infinite_mass_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, true);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
         let v = vehicle_from_name(name);
         if v != 0 {
-            call_regs(0x00AB_9BE0, 0, 0, 0, 0, 0, &[v, (l & !0xFF) | flag as u32]);
+            call_regs(0x00AB_9BE0, 0, 0, 0, 0, 0, &[v, flag_slot(flag)]);
         }
     }
     0
@@ -947,7 +983,7 @@ unsafe fn vehicle_max_speed_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(vehicle_max_speed, I_VEHICLE_MAX_SPEED, vehicle_max_speed_impl);
+counted!(vehicle_max_speed, I_VEHICLE_MAX_SPEED, vehicle_max_speed_impl, pop_ecx);
 
 // --- 101 mesh_mover_hide ---------------------------------------------------------------------
 
@@ -985,7 +1021,7 @@ unsafe fn inv_weapon_remove_temporary_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(inv_weapon_remove_temporary, I_INV_WEAPON_REMOVE_TEMPORARY, inv_weapon_remove_temporary_impl);
+counted!(inv_weapon_remove_temporary, I_INV_WEAPON_REMOVE_TEMPORARY, inv_weapon_remove_temporary_impl, pop_ecx);
 
 // --- 103 set_attack_player_flag --------------------------------------------------------------
 
@@ -997,6 +1033,7 @@ unsafe fn set_attack_player_flag_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, true);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
         let o = object_find(name);
         if o == 0 {
             return 0;
@@ -1007,7 +1044,7 @@ unsafe fn set_attack_player_flag_impl(l: u32) -> i32 {
             return 0;
         }
         let h = vcall(o, 13);
-        call_regs(0x0044_02E0, 0, 0, 0, 0, 0, &[h + 0xF8, (l & !0xFF) | flag as u32]);
+        call_regs(0x0044_02E0, 0, 0, 0, 0, 0, &[h + 0xF8, flag_slot(flag)]);
     }
     0
 }
@@ -1069,7 +1106,7 @@ unsafe fn on_mover_destroyed_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(on_mover_destroyed, I_ON_MOVER_DESTROYED, on_mover_destroyed_impl);
+counted!(on_mover_destroyed, I_ON_MOVER_DESTROYED, on_mover_destroyed_impl, pop_ecx);
 
 // --- 107 npc_leash_remove --------------------------------------------------------------------
 
@@ -1283,7 +1320,7 @@ unsafe fn character_kill_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(character_kill, I_CHARACTER_KILL, character_kill_impl);
+counted!(character_kill, I_CHARACTER_KILL, character_kill_impl, pop_ecx);
 
 // --- 112 character_show ----------------------------------------------------------------------
 
@@ -1304,7 +1341,7 @@ unsafe fn character_show_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(character_show, I_CHARACTER_SHOW, character_show_impl);
+counted!(character_show, I_CHARACTER_SHOW, character_show_impl, pop_ecx);
 
 // --- 113 mission_help_clear ------------------------------------------------------------------
 
@@ -1475,7 +1512,7 @@ struct Binding {
     body: &'static [u8],
     /// The body's `call rel32` offsets, for the relocated shadow copy (shadow-checked ones only).
     shadow_calls: Option<&'static [usize]>,
-    f: extern "C" fn(u32) -> i32,
+    f: extern "C" fn(),
 }
 
 const BINDINGS: [Binding; COUNT] = [

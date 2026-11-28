@@ -77,3 +77,10 @@ These run as Rust and pass their tests, but they are one-statement-per-instructi
 | remote_do_frame bodies: item 0x843C20, mover 0x84C0A0, npc 0x852580, pipebomb 0x85CCA0, player 0x8633D0, prop 0x86C0F0, rocket 0x86F310, vehicle 0x874310 | 0.9-8 KB of SSE quaternion maths on overlapping stack buffers |
 | distant_peds_update 0xB7CA80 | __alloca_probe and stack out-buffers filled by callees |
 
+## Machine-lifted AI ports (2026-11-27)
+
+The judge fix round replaced 71 hand-written AI ports in port_ai.rs with machine-lifted bodies (`mod lifted`;
+lifter at scratchpad/fix/fix_ai/lift.py). They pass the strict judge and the 2026-11-27 play test, but they are
+one-statement-per-instruction translations. The hand versions are still in the file, bypassed by
+`lifted::thunk_for`. To do: hand-rewrite them with the judge as referee, then delete `mod lifted`.
+

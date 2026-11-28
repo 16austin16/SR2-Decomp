@@ -21,6 +21,7 @@ use crate::portlib::*;
 const LUAA_INDEX: usize = 0x00CD_BE80; // EAX = index, ECX = L
 const LUA_TOSTRING: usize = 0x00CD_CA80; // EAX = index, ECX = L
 const LUA_TONUMBER: usize = 0x00CD_C250; // EAX = index, ECX = L -> ST0
+const FTOL2: usize = 0x00DA_0176; // _ftol2: ST0 -> EAX
 const PRINTF: usize = 0x00C9_9400; // CRT printf
 const SQRTF: usize = 0x0040_EA20; // cdecl (f32) -> ST0
 const U32_BIAS: usize = 0x00E5_C0E0; // f64 2^32 (for unsigned pushes)
@@ -112,7 +113,10 @@ unsafe fn number_arg(l: u32, i: i32) -> f64 {
     let mut out = 0f64;
     unsafe {
         std::arch::asm!(
+            "push ebx",
+            "mov ebx, ecx",
             "call {f}",
+            "pop ebx",
             "fstp qword ptr [edi]",
             f = in(reg) LUA_TONUMBER,
             in("eax") i,
@@ -126,8 +130,23 @@ unsafe fn number_arg(l: u32, i: i32) -> f64 {
 
 /// `_ftol2(lua_tonumber(i))`: truncation, the low dword of the 64-bit result.
 unsafe fn int_arg(l: u32, i: i32) -> u32 {
-    let out = unsafe { number_arg(l, i) };
-    if out.abs() < 9.2e18 { out as i64 as u32 } else { 0 }
+    // `call lua_tonumber; call _ftol2` as the originals do (the conversion is a call they make).
+    let r: u32;
+    let targets = [LUA_TONUMBER as u32, FTOL2 as u32];
+    unsafe {
+        std::arch::asm!(
+            "push ebx",
+            "mov ebx, ecx",
+            "call dword ptr [edi]",
+            "call dword ptr [edi + 4]",
+            "pop ebx",
+            in("edi") targets.as_ptr(),
+            inout("eax") i => r,
+            in("ecx") l,
+            clobber_abi("C"),
+        );
+    }
+    r
 }
 
 /// The truth test of a slot pointer: missing, nil or false -> false.
@@ -567,23 +586,56 @@ extern "C" fn teleport(l: u32) -> i32 {
 
 static CALLS: [AtomicU32; 9] = [const { AtomicU32::new(0) }; 9];
 
+/// A thunk that keeps XMM0-7 around a Rust `extern "C" fn(u32) -> i32` (the cdecl binding): the originals are
+/// x87 / integer code and never touch the XMM registers, but Rust code may.
+macro_rules! xmm_thunk {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 128",
+                "movups [esp], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2", "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4", "movups [esp + 80], xmm5", "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
+                "push dword ptr [esp + 132]",
+                "call {f}",
+                "add esp, 4",
+                "movups xmm0, [esp]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]", "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]", "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "ret",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+xmm_thunk!(vint_object_clone_thunk, vint_object_clone);
+xmm_thunk!(mission_end_failure_thunk, mission_end_failure);
+xmm_thunk!(vint_subscribe_to_input_event_thunk, vint_subscribe_to_input_event);
+xmm_thunk!(get_dist_thunk, get_dist);
+xmm_thunk!(notoriety_force_no_spawn_thunk, notoriety_force_no_spawn);
+xmm_thunk!(group_destroy_thunk, group_destroy);
+xmm_thunk!(character_is_in_vehicle_thunk, character_is_in_vehicle);
+xmm_thunk!(effect_play_thunk, effect_play);
+xmm_thunk!(teleport_thunk, teleport);
+
 struct Binding {
     name: &'static str,
     addr: usize,
     body: &'static [u8],
-    f: extern "C" fn(u32) -> i32,
+    f: extern "C" fn(),
 }
 
 const BINDINGS: [Binding; 9] = [
-    Binding { name: "vint_object_clone", addr: 0x00B8_E690, body: &BODY_VINT_OBJECT_CLONE, f: vint_object_clone },
-    Binding { name: "mission_end_failure", addr: 0x00A3_98F0, body: &BODY_MISSION_END_FAILURE, f: mission_end_failure },
-    Binding { name: "vint_subscribe_to_input_event", addr: 0x00B9_0250, body: &BODY_VINT_SUBSCRIBE, f: vint_subscribe_to_input_event },
-    Binding { name: "get_dist", addr: 0x00A3_04D0, body: &BODY_GET_DIST, f: get_dist },
-    Binding { name: "notoriety_force_no_spawn", addr: 0x00A3_B750, body: &BODY_NOTORIETY_FORCE_NO_SPAWN, f: notoriety_force_no_spawn },
-    Binding { name: "group_destroy", addr: 0x00A2_D6A0, body: &BODY_GROUP_DESTROY, f: group_destroy },
-    Binding { name: "character_is_in_vehicle", addr: 0x00A3_5910, body: &BODY_CHARACTER_IS_IN_VEHICLE, f: character_is_in_vehicle },
-    Binding { name: "effect_play", addr: 0x00A4_12C0, body: &BODY_EFFECT_PLAY, f: effect_play },
-    Binding { name: "teleport", addr: 0x00A4_7310, body: &BODY_TELEPORT, f: teleport },
+    Binding { name: "vint_object_clone", addr: 0x00B8_E690, body: &BODY_VINT_OBJECT_CLONE, f: vint_object_clone_thunk },
+    Binding { name: "mission_end_failure", addr: 0x00A3_98F0, body: &BODY_MISSION_END_FAILURE, f: mission_end_failure_thunk },
+    Binding { name: "vint_subscribe_to_input_event", addr: 0x00B9_0250, body: &BODY_VINT_SUBSCRIBE, f: vint_subscribe_to_input_event_thunk },
+    Binding { name: "get_dist", addr: 0x00A3_04D0, body: &BODY_GET_DIST, f: get_dist_thunk },
+    Binding { name: "notoriety_force_no_spawn", addr: 0x00A3_B750, body: &BODY_NOTORIETY_FORCE_NO_SPAWN, f: notoriety_force_no_spawn_thunk },
+    Binding { name: "group_destroy", addr: 0x00A2_D6A0, body: &BODY_GROUP_DESTROY, f: group_destroy_thunk },
+    Binding { name: "character_is_in_vehicle", addr: 0x00A3_5910, body: &BODY_CHARACTER_IS_IN_VEHICLE, f: character_is_in_vehicle_thunk },
+    Binding { name: "effect_play", addr: 0x00A4_12C0, body: &BODY_EFFECT_PLAY, f: effect_play_thunk },
+    Binding { name: "teleport", addr: 0x00A4_7310, body: &BODY_TELEPORT, f: teleport_thunk },
 ];
 
 /// Install this module's replacements (called from hooks::install_all).

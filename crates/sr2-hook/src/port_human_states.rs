@@ -9,6 +9,119 @@
 //! destructor 0x4080B0): they get a zeroed frame buffer with the original's offsets, and the
 //! constructors / methods are still the game's own, called by address.
 
+
+/// Thunks like portlib's keep_ecx_edx*, but also keeping XMM0-7 (the original leaves them alone).
+#[allow(unused_macros)]
+macro_rules! kx0 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "call {f}",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+#[allow(unused_macros)]
+macro_rules! kx1 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "push dword ptr [esp + 140]",
+            "call {f}",
+            "add esp, 4",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+#[allow(unused_macros)]
+macro_rules! kx2 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "push dword ptr [esp + 144]",
+            "push dword ptr [esp + 144]",
+            "call {f}",
+            "add esp, 8",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::portlib::*;
@@ -187,9 +300,27 @@ extern "C" fn human_state4_thunk() {
     std::arch::naked_asm!(
         "push ecx",
         "push edx",
+        "sub esp, 128",
+        "movups [esp + 0], xmm0",
+        "movups [esp + 16], xmm1",
+        "movups [esp + 32], xmm2",
+        "movups [esp + 48], xmm3",
+        "movups [esp + 64], xmm4",
+        "movups [esp + 80], xmm5",
+        "movups [esp + 96], xmm6",
+        "movups [esp + 112], xmm7",
         "push eax",
         "call {f}",
         "add esp, 4",
+        "movups xmm0, [esp + 0]",
+        "movups xmm1, [esp + 16]",
+        "movups xmm2, [esp + 32]",
+        "movups xmm3, [esp + 48]",
+        "movups xmm4, [esp + 64]",
+        "movups xmm5, [esp + 80]",
+        "movups xmm6, [esp + 96]",
+        "movups xmm7, [esp + 112]",
+        "add esp, 128",
         "pop edx",
         "pop ecx",
         "ret",
@@ -274,10 +405,28 @@ extern "C" fn human_state2_thunk() {
     std::arch::naked_asm!(
         "push ecx",
         "push edx",
+        "sub esp, 128",
+        "movups [esp + 0], xmm0",
+        "movups [esp + 16], xmm1",
+        "movups [esp + 32], xmm2",
+        "movups [esp + 48], xmm3",
+        "movups [esp + 64], xmm4",
+        "movups [esp + 80], xmm5",
+        "movups [esp + 96], xmm6",
+        "movups [esp + 112], xmm7",
         "push esi",
         "push eax",
         "call {f}",
         "add esp, 8",
+        "movups xmm0, [esp + 0]",
+        "movups xmm1, [esp + 16]",
+        "movups xmm2, [esp + 32]",
+        "movups xmm3, [esp + 48]",
+        "movups xmm4, [esp + 64]",
+        "movups xmm5, [esp + 80]",
+        "movups xmm6, [esp + 96]",
+        "movups xmm7, [esp + 112]",
+        "add esp, 128",
         "pop edx",
         "pop ecx",
         "ret",
@@ -393,7 +542,7 @@ unsafe fn state2_body(h: u32, esi_in: u32) {
 
 // --- state 3 (0x99E490) --------------------------------------------------------------------------
 
-keep_ecx_edx_arg1!(human_state3_thunk, human_state3_update);
+kx1!(human_state3_thunk, human_state3_update);
 
 extern "C" fn human_state3_update(h: u32) {
     bump(S3);
@@ -514,7 +663,7 @@ unsafe fn play_anim(h: u32, id: u32, esi: u32, edi: u32) -> bool {
 // and the audio params (0x5C bytes) at +0x20; the same +0x14 area is the move step's output vec3
 // and the finish's exit velocity.
 
-keep_ecx_edx_arg1!(human_state5_thunk, human_state5_update);
+kx1!(human_state5_thunk, human_state5_update);
 
 extern "C" fn human_state5_update(h: u32) {
     bump(S5);
@@ -773,9 +922,27 @@ extern "C" fn human_state6_thunk() {
     std::arch::naked_asm!(
         "push ecx",
         "push edx",
+        "sub esp, 128",
+        "movups [esp + 0], xmm0",
+        "movups [esp + 16], xmm1",
+        "movups [esp + 32], xmm2",
+        "movups [esp + 48], xmm3",
+        "movups [esp + 64], xmm4",
+        "movups [esp + 80], xmm5",
+        "movups [esp + 96], xmm6",
+        "movups [esp + 112], xmm7",
         "push esi",
         "call {f}",
         "add esp, 4",
+        "movups xmm0, [esp + 0]",
+        "movups xmm1, [esp + 16]",
+        "movups xmm2, [esp + 32]",
+        "movups xmm3, [esp + 48]",
+        "movups xmm4, [esp + 64]",
+        "movups xmm5, [esp + 80]",
+        "movups xmm6, [esp + 96]",
+        "movups xmm7, [esp + 112]",
+        "add esp, 128",
         "pop edx",
         "pop ecx",
         "ret",
@@ -1015,7 +1182,7 @@ unsafe fn state6_body(h: u32) {
 // offsets at +0x1C, the fall point W at +0x4C, the recovery point L at +0x40, the carried-record
 // direction at +0x1C and its orientation M at +0xB4. ESI / EDI follow the original per call.
 
-keep_ecx_edx_arg1!(human_state7_thunk, human_state7_update);
+kx1!(human_state7_thunk, human_state7_update);
 
 extern "C" fn human_state7_update(h: u32) {
     bump(S7);

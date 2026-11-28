@@ -7,6 +7,119 @@
 //! arithmetic are reproduced here; every `fstp dword` of the original is an `as f32`, every
 //! `fld dword` / `fstp dword` copy a `q32`.
 
+
+/// Thunks like portlib's keep_ecx_edx*, but also keeping XMM0-7 (the original leaves them alone).
+#[allow(unused_macros)]
+macro_rules! kx0 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "call {f}",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+#[allow(unused_macros)]
+macro_rules! kx1 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "push dword ptr [esp + 140]",
+            "call {f}",
+            "add esp, 4",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+#[allow(unused_macros)]
+macro_rules! kx2 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+            "push ecx",
+            "push edx",
+            "sub esp, 128",
+            "movups [esp + 0], xmm0",
+            "movups [esp + 16], xmm1",
+            "movups [esp + 32], xmm2",
+            "movups [esp + 48], xmm3",
+            "movups [esp + 64], xmm4",
+            "movups [esp + 80], xmm5",
+            "movups [esp + 96], xmm6",
+            "movups [esp + 112], xmm7",
+            "push dword ptr [esp + 144]",
+            "push dword ptr [esp + 144]",
+            "call {f}",
+            "add esp, 8",
+            "movups xmm0, [esp + 0]",
+            "movups xmm1, [esp + 16]",
+            "movups xmm2, [esp + 32]",
+            "movups xmm3, [esp + 48]",
+            "movups xmm4, [esp + 64]",
+            "movups xmm5, [esp + 80]",
+            "movups xmm6, [esp + 96]",
+            "movups xmm7, [esp + 112]",
+            "add esp, 128",
+            "pop edx",
+            "pop ecx",
+            "ret",
+            f = sym $f,
+            )
+        }
+    };
+}
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::portlib::*;
@@ -173,7 +286,7 @@ unsafe fn listed(h: u32, base: usize) -> bool {
 // porting map", corrected against the disassembly. The original keeps EBP = human and, from
 // 0x9A8391 on, EDI = -1; those are passed to the callees that see them.
 
-keep_ecx_edx_arg2!(human_update_core_thunk, human_update_core);
+kx2!(human_update_core_thunk, human_update_core);
 
 extern "C" fn human_update_core(h: u32, dt: u32) {
     CORE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -831,9 +944,29 @@ extern "C" fn human_state_machine_update_thunk() {
     std::arch::naked_asm!(
         "push ecx",
         "push edx",
+        "sub esp, 128",
+        "movups [esp + 0], xmm0",
+        "movups [esp + 16], xmm1",
+        "movups [esp + 32], xmm2",
+        "movups [esp + 48], xmm3",
+        "movups [esp + 64], xmm4",
+        "movups [esp + 80], xmm5",
+        "movups [esp + 96], xmm6",
+        "movups [esp + 112], xmm7",
+        "push edx",
+        "push ebx",
         "push eax",
         "call {f}",
-        "add esp, 4",
+        "add esp, 12",
+        "movups xmm0, [esp + 0]",
+        "movups xmm1, [esp + 16]",
+        "movups xmm2, [esp + 32]",
+        "movups xmm3, [esp + 48]",
+        "movups xmm4, [esp + 64]",
+        "movups xmm5, [esp + 80]",
+        "movups xmm6, [esp + 96]",
+        "movups xmm7, [esp + 112]",
+        "add esp, 128",
         "pop edx",
         "pop ecx",
         "ret",
@@ -841,59 +974,57 @@ extern "C" fn human_state_machine_update_thunk() {
     )
 }
 
-extern "C" fn human_state_machine_update(h: u32) {
-    STATE_MACHINE_CALLS.fetch_add(1, Ordering::Relaxed);
-    unsafe { state_machine_body(h) };
+/// `call_regs` with EBX passed through (callees read the caller's EBX); the other registers as given.
+unsafe fn crb(ebx: u32, f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> u32 {
+    let mut g = CRegs { eax, ecx, edx, ebx, esi, edi, ebp: 0 };
+    unsafe { call_all(f, &mut g, args, false) };
+    g.eax
 }
 
-unsafe fn state_machine_body(h: u32) {
+extern "C" fn human_state_machine_update(h: u32, ebx: u32, edx: u32) -> u32 {
+    STATE_MACHINE_CALLS.fetch_add(1, Ordering::Relaxed);
+    unsafe { state_machine_body(h, ebx, edx) }
+}
+
+unsafe fn state_machine_body(h: u32, ebx: u32, edx0: u32) -> u32 {
     unsafe {
         let p = h as usize;
         let bit = rb(p + 0x4A0) & 4 != 0;
         wb(p + 0x53E, 0);
         if bit && rb(p + 0x595) == 0 && rb(p + 0x591) == 0 {
-            let r = call_regs(0x00BD_D230, h + 0x4E4, 0, 0, h, 0, &[]);
+            let r = crb(ebx, 0x00BD_D230, h + 0x4E4, 0, edx0, h, 0, &[]);
             if al(r) {
-                call_regs(0x00A1_E5B0, r, 0, 0, h, 0, &[]);
+                crb(ebx, 0x00A1_E5B0, r, 0, 0, h, 0, &[]);
             }
         }
         let st = rb(p + 0x591) as i8 as i32;
         // The handlers' registers: the tail-jumped ones (1, 2, 4, 8) see the caller's ESI, which
         // none of them reads; ESI = human for the called ones.
         match st {
-            1 => {
-                call_regs(HUMAN_STATE1_UPDATE, 0, h, 0, h, 0, &[]);
-            }
+            1 => return crb(ebx, HUMAN_STATE1_UPDATE, 0, h, 0, h, 0, &[]),
             2 | 3 => {
-                if !al(call_regs(0x0080_6720, h, 0, 0, h, 0, &[])) {
-                    return;
+                let r = crb(ebx, 0x0080_6720, h, 0, 0, h, 0, &[]);
+                if !al(r) {
+                    return r;
                 }
-                if rb(p + 0x470) & 0x40 != 0 {
-                    call_regs(0x0096_CB70, 0, 0, 0, h, 0, &[h, 0, 1, 1, 0]);
+                return if rb(p + 0x470) & 0x40 != 0 {
+                    crb(ebx, 0x0096_CB70, 0, 0, 0, h, 0, &[h, 0, 1, 1, 0])
                 } else if st == 2 {
-                    call_regs(0x0099_CFF0, h, 0, 0, h, 0, &[]);
+                    crb(ebx, 0x0099_CFF0, h, 0, 0, h, 0, &[])
                 } else {
-                    call_regs(0x0099_E490, 0, 0, 0, h, 0, &[h]);
-                }
+                    crb(ebx, 0x0099_E490, 0, 0, 0, h, 0, &[h])
+                };
             }
-            4 => {
-                call_regs(0x0099_9980, h, 0, 0, h, 0, &[]);
-            }
-            5 => {
-                call_regs(0x0099_76E0, 0, 0, 0, h, 0, &[h]);
-            }
-            6 => {
-                // EAX is still the switch index (state - 1).
-                call_regs(0x0099_89E0, 5, 0, 0, h, 0, &[]);
-            }
-            7 => {
-                call_regs(0x0099_A2D0, 0, 0, 0, h, 0, &[h]);
-            }
-            8 => {
-                call_regs(HUMAN_STATE8_UPDATE, h, 0, 0, h, 0, &[]);
-            }
+            4 => return crb(ebx, 0x0099_9980, h, 0, 0, h, 0, &[]),
+            5 => return crb(ebx, 0x0099_76E0, 0, 0, 0, h, 0, &[h]),
+            // EAX is still the switch index (state - 1).
+            6 => return crb(ebx, 0x0099_89E0, 5, 0, 0, h, 0, &[]),
+            7 => return crb(ebx, 0x0099_A2D0, 0, 0, 0, h, 0, &[h]),
+            8 => return crb(ebx, HUMAN_STATE8_UPDATE, h, 0, 0, h, 0, &[]),
             _ => {}
         }
+        // `movsx eax, [+0x591]; add eax, -1` is what the default arm leaves in EAX.
+        (st as u32).wrapping_sub(1)
     }
 }
 
@@ -902,14 +1033,115 @@ unsafe fn state_machine_body(h: u32) {
 // ECX = human. For a script-controlled player (its handle +0x44 resolves to a type-1 object with
 // +0x3CC == 1): 0x994340(EAX = that object, ECX = human, EDX = &+0x564, cdecl &+0x564, 0, 0, 1).
 
+/// The seven general registers in and out of `call_all`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CRegs {
+    pub eax: u32,
+    pub ecx: u32,
+    pub edx: u32,
+    pub ebx: u32,
+    pub esi: u32,
+    pub edi: u32,
+    pub ebp: u32,
+}
+
+#[repr(C)]
+struct AllBlk {
+    f: u32,
+    r: CRegs,
+    args: u32,
+    nargs: u32,
+    esp: u32,
+    st0: [u32; 2],
+    want_st0: u32,
+}
+
+/// Call `f` with all seven general registers from `r` and cdecl / stdcall stack arguments, then
+/// capture all seven registers back into `r` (and ST0 when `want_st0`; else the x87 stack is left
+/// as the callee leaves it). Works for callees that pop their arguments. The block pointer is
+/// parked in the TEB's ArbitraryUserPointer (fs:[0x14]) across the call, restored afterwards.
+unsafe fn call_all(f: usize, r: &mut CRegs, args: &[u32], want_st0: bool) -> f64 {
+    let mut b = AllBlk { f: f as u32, r: *r, args: args.as_ptr() as u32, nargs: args.len() as u32, esp: 0, st0: [0; 2], want_st0: want_st0 as u32 };
+    unsafe {
+        std::arch::asm!(
+            "push ebp", "push ebx", "push esi", "push edi",
+            "push dword ptr fs:[0x14]",
+            "mov fs:[0x14], eax",
+            "mov [eax + 40], esp",
+            "mov ecx, [eax + 36]",
+            "mov esi, [eax + 32]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "call 4f",
+            // the callee returns here
+            "push eax",
+            "mov eax, fs:[0x14]",
+            "pop dword ptr [eax + 4]",
+            "mov [eax + 8], ecx", "mov [eax + 12], edx", "mov [eax + 16], ebx",
+            "mov [eax + 20], esi", "mov [eax + 24], edi", "mov [eax + 28], ebp",
+            "cmp dword ptr [eax + 52], 0",
+            "je 5f",
+            "fstp qword ptr [eax + 44]",
+            "5:",
+            "mov esp, [eax + 40]",
+            "pop dword ptr fs:[0x14]",
+            "pop edi", "pop esi", "pop ebx", "pop ebp",
+            "jmp 6f",
+            "4:",
+            "push dword ptr [eax]",
+            "mov ecx, [eax + 8]", "mov edx, [eax + 12]", "mov ebx, [eax + 16]",
+            "mov esi, [eax + 20]", "mov edi, [eax + 24]", "mov ebp, [eax + 28]",
+            "mov eax, [eax + 4]",
+            "ret",
+            "6:",
+            inout("eax") &mut b as *mut AllBlk => _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    *r = b.r;
+    f64::from_bits(b.st0[0] as u64 | (b.st0[1] as u64) << 32)
+}
+
+/// The thunk keeps EAX / EDX / ECX in three stack slots the Rust body can rewrite (it gets their
+/// address: [eax, edx, ecx]); they are the registers the original leaves.
 #[unsafe(naked)]
 extern "C" fn human_state1_update_thunk() {
     std::arch::naked_asm!(
         "push ecx",
         "push edx",
+        "push eax",
+        "sub esp, 128",
+        "movups [esp + 0], xmm0",
+        "movups [esp + 16], xmm1",
+        "movups [esp + 32], xmm2",
+        "movups [esp + 48], xmm3",
+        "movups [esp + 64], xmm4",
+        "movups [esp + 80], xmm5",
+        "movups [esp + 96], xmm6",
+        "movups [esp + 112], xmm7",
+        "lea eax, [esp + 128]",
+        "push eax",
         "push ecx",
         "call {f}",
-        "add esp, 4",
+        "add esp, 8",
+        "movups xmm0, [esp + 0]",
+        "movups xmm1, [esp + 16]",
+        "movups xmm2, [esp + 32]",
+        "movups xmm3, [esp + 48]",
+        "movups xmm4, [esp + 64]",
+        "movups xmm5, [esp + 80]",
+        "movups xmm6, [esp + 96]",
+        "movups xmm7, [esp + 112]",
+        "add esp, 128",
+        "pop eax",
         "pop edx",
         "pop ecx",
         "ret",
@@ -917,18 +1149,36 @@ extern "C" fn human_state1_update_thunk() {
     )
 }
 
-extern "C" fn human_state1_update(h: u32) {
+extern "C" fn human_state1_update(h: u32, s: *mut u32) {
     STATE1_CALLS.fetch_add(1, Ordering::Relaxed);
     unsafe {
         if h == 0 {
             return;
         }
-        let o = obj_from_handle(rd(h as usize + 0x44));
-        if o == 0 || rd(o as usize + 0x4C) != 1 || rb(o as usize + 0x3CC) != 1 {
+        let hd = rd(h as usize + 0x44);
+        if hd == 0 {
+            *s.add(1) = 0;
+            return;
+        }
+        let o = rd(0x0214_9C64 + ((hd & 0xFFF) << 4) as usize);
+        *s.add(1) = hd;
+        if o == 0 {
+            *s = 0;
+            return;
+        }
+        *s = o;
+        if rd(o as usize + 0x44) != hd {
+            return;
+        }
+        *s.add(1) = 1;
+        if rd(o as usize + 0x4C) != 1 || rb(o as usize + 0x3CC) != 1 {
             return;
         }
         let v = h + 0x564;
-        call_regs(0x0099_4340, o, h, v, 0, 0, &[v, 0, 0, 1]);
+        let mut g = CRegs { eax: o, ecx: h, edx: v, ..Default::default() };
+        call_all(0x0099_4340, &mut g, &[v, 0, 0, 1], false);
+        *s = g.eax;
+        *s.add(1) = g.edx;
     }
 }
 
@@ -942,9 +1192,28 @@ extern "C" fn human_state8_update_thunk() {
     std::arch::naked_asm!(
         "push ecx",
         "push edx",
+        "sub esp, 128",
+        "movups [esp + 0], xmm0",
+        "movups [esp + 16], xmm1",
+        "movups [esp + 32], xmm2",
+        "movups [esp + 48], xmm3",
+        "movups [esp + 64], xmm4",
+        "movups [esp + 80], xmm5",
+        "movups [esp + 96], xmm6",
+        "movups [esp + 112], xmm7",
+        "push ebx",
         "push eax",
         "call {f}",
-        "add esp, 4",
+        "add esp, 8",
+        "movups xmm0, [esp + 0]",
+        "movups xmm1, [esp + 16]",
+        "movups xmm2, [esp + 32]",
+        "movups xmm3, [esp + 48]",
+        "movups xmm4, [esp + 64]",
+        "movups xmm5, [esp + 80]",
+        "movups xmm6, [esp + 96]",
+        "movups xmm7, [esp + 112]",
+        "add esp, 128",
         "pop edx",
         "pop ecx",
         "ret",
@@ -952,13 +1221,14 @@ extern "C" fn human_state8_update_thunk() {
     )
 }
 
-extern "C" fn human_state8_update(h: u32) {
+extern "C" fn human_state8_update(h: u32, ebx: u32) -> u32 {
     STATE8_CALLS.fetch_add(1, Ordering::Relaxed);
     unsafe {
         if rb(h as usize + 0x592) == 0xF {
-            call_regs(0x0099_54C0, h, 8, 0x10, 0, 0, &[h]);
+            return crb(ebx, 0x0099_54C0, h, 8, 0x10, 0, 0, &[h]);
         }
     }
+    h
 }
 
 // --- pinned original bodies ------------------------------------------------------------------

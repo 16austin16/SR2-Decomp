@@ -201,6 +201,70 @@ unsafe fn call_full2(f: usize, r: &mut Regs, a0: u32, a1: u32) {
     *r = b.r;
 }
 
+#[repr(C)]
+struct AllBlk {
+    f: u32,
+    r: Regs,
+    args: u32,
+    nargs: u32,
+    esp: u32,
+    st0: [u32; 2],
+    want_st0: u32,
+}
+
+/// Call `f` with all seven general registers from `r` and cdecl / stdcall stack arguments, then
+/// capture all seven registers back into `r` (and ST0 when `want_st0`; else the x87 stack is left
+/// as the callee leaves it). Works for callees that pop their arguments. The block pointer is
+/// parked in the TEB's ArbitraryUserPointer (fs:[0x14]) across the call, restored afterwards.
+unsafe fn call_all(f: usize, r: &mut Regs, args: &[u32], want_st0: bool) -> f64 {
+    let mut b = AllBlk { f: f as u32, r: *r, args: args.as_ptr() as u32, nargs: args.len() as u32, esp: 0, st0: [0; 2], want_st0: want_st0 as u32 };
+    unsafe {
+        std::arch::asm!(
+            "push ebp", "push ebx", "push esi", "push edi",
+            "push dword ptr fs:[0x14]",
+            "mov fs:[0x14], eax",
+            "mov [eax + 40], esp",
+            "mov ecx, [eax + 36]",
+            "mov esi, [eax + 32]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "call 4f",
+            // the callee returns here
+            "push eax",
+            "mov eax, fs:[0x14]",
+            "pop dword ptr [eax + 4]",
+            "mov [eax + 8], ecx", "mov [eax + 12], edx", "mov [eax + 16], ebx",
+            "mov [eax + 20], esi", "mov [eax + 24], edi", "mov [eax + 28], ebp",
+            "cmp dword ptr [eax + 52], 0",
+            "je 5f",
+            "fstp qword ptr [eax + 44]",
+            "5:",
+            "mov esp, [eax + 40]",
+            "pop dword ptr fs:[0x14]",
+            "pop edi", "pop esi", "pop ebx", "pop ebp",
+            "jmp 6f",
+            "4:",
+            "push dword ptr [eax]",
+            "mov ecx, [eax + 8]", "mov edx, [eax + 12]", "mov ebx, [eax + 16]",
+            "mov esi, [eax + 20]", "mov edi, [eax + 24]", "mov ebp, [eax + 28]",
+            "mov eax, [eax + 4]",
+            "ret",
+            "6:",
+            inout("eax") &mut b as *mut AllBlk => _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    *r = b.r;
+    f64::from_bits(b.st0[0] as u64 | (b.st0[1] as u64) << 32)
+}
+
 /// A naked thunk: `pushad`, then `f(&mut block, &stack args)`, then `popad`. The Rust body puts
 /// its result in the block's EAX; an `f32` return stays on ST0.
 macro_rules! regs_thunk {
@@ -214,13 +278,63 @@ macro_rules! regs_thunk {
                 "pushad",
                 "mov eax, esp",
                 "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
+            )
+        }
+    };
+}
+
+/// Like `regs_thunk`, but 0x5C bytes are reserved below the return address first, as the
+/// originals' own stack frame: the buffer starts at the Pushad block's address + 32 and sits at
+/// the same address as the original's, so the pointers the callees see are the same.
+macro_rules! frame_thunk {
+    ($name:ident, $f:ident, $ret:literal, $n:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {n}",
+                "pushad",
+                "mov eax, esp",
+                "lea ecx, [esp + 36 + {n}]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2", "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4", "movups [esp + 80], xmm5", "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
+                "push ecx",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, [esp + 0]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]", "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]", "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "popad",
+                "add esp, {n}",
+                $ret,
+                f = sym $f,
+                n = const $n,
             )
         }
     };
@@ -511,30 +625,10 @@ fn lo(eax: u32, al: bool) -> u32 {
 
 /// The entry address (base + 12 * i) whose type hash is `hash`, or None.
 unsafe fn store_scan(store: u32, hash: u32) -> Option<u32> {
-    unsafe {
-        let n = rd(AMMO_TYPE_COUNT) as i32;
-        if n <= 0 {
-            return None;
-        }
-        let base = rd(store as usize);
-        let mut i = 0i32;
-        let mut e = base;
-        loop {
-            let ty = rd(e as usize);
-            if rd(ty as usize + 4) == hash {
-                return Some(e);
-            }
-            i += 1;
-            e = e.wrapping_add(12);
-            if i >= n {
-                return None;
-            }
-        }
-    }
+    unsafe { store_scan_regs(store, hash).found }
 }
 
-/// 0xB68EB0 ammo_store_count (ECX = &store, EDI = hash -> EAX entry +4, 0 when absent). The `lea`
-/// result is tested for 0 before the field is read.
+/// ammo_store_count's result: the entry's +4, 0 when absent.
 unsafe fn store_count(store: u32, hash: u32) -> u32 {
     unsafe {
         match store_scan(store, hash) {
@@ -544,21 +638,73 @@ unsafe fn store_count(store: u32, hash: u32) -> u32 {
     }
 }
 
+/// What the three store scans (0xB68EB0 / 0xB68CE0 / 0xB68F60) leave behind: the count `n` (EDX
+/// at the start), the entry index `i` reached, ECX (the entry pointer reached, or the store
+/// pointer when the count is not positive) and the found entry.
+struct Scan {
+    n: u32,
+    i: u32,
+    ecx: u32,
+    found: Option<u32>,
+}
+
+unsafe fn store_scan_regs(store: u32, hash: u32) -> Scan {
+    unsafe {
+        let n = rd(AMMO_TYPE_COUNT);
+        if (n as i32) <= 0 {
+            return Scan { n, i: 0, ecx: store, found: None };
+        }
+        let base = rd(store as usize);
+        let mut i = 0u32;
+        let mut e = base;
+        loop {
+            let ty = rd(e as usize);
+            if rd(ty as usize + 4) == hash {
+                return Scan { n, i, ecx: e, found: Some(e) };
+            }
+            i = i.wrapping_add(1);
+            e = e.wrapping_add(12);
+            if (i as i32) >= (n as i32) {
+                return Scan { n, i, ecx: e, found: None };
+            }
+        }
+    }
+}
+
+/// EDX after a found entry: `lea edx, [eax + eax*2]`; after a miss: the count.
+fn scan_edx(sc: &Scan) -> u32 {
+    if sc.found.is_some() { sc.i.wrapping_mul(3) } else { sc.n }
+}
+
+/// 0xB68EB0 ammo_store_count (ECX = &store, EDI = hash -> EAX entry +4, 0 when absent). The `lea`
+/// result is tested for 0 before the field is read. ECX / EDX come back as the scan leaves them.
 extern "C" fn store_count_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked_eax(STORE_COUNT, &p, 0, unsafe { store_count(p.ecx, p.edi) });
+    let sc = unsafe { store_scan_regs(p.ecx, p.edi) };
+    let ours = unsafe {
+        match sc.found {
+            Some(e) if e != 0 => rd(e as usize + 4),
+            _ => 0,
+        }
+    };
+    r.eax = checked_eax(STORE_COUNT, &p, 0, ours);
+    r.ecx = sc.ecx;
+    r.edx = scan_edx(&sc);
 }
 regs_thunk!(store_count_thunk, store_count_entry);
 
 /// 0xB68CE0 ammo_store_find (ECX = &store, EDI = hash -> EAX the entry address, 0 when absent;
 /// unlike the other two it does not test the address for 0).
 unsafe fn store_find(store: u32, hash: u32) -> u32 {
-    unsafe { store_scan(store, hash).unwrap_or(0) }
+    unsafe { store_scan_regs(store, hash).found.unwrap_or(0) }
 }
 
 extern "C" fn store_find_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let sc = unsafe { store_scan_regs(p.ecx, p.edi) };
     r.eax = checked_eax(STORE_FIND, &p, 0, unsafe { store_find(p.ecx, p.edi) });
+    r.ecx = sc.ecx;
+    r.edx = scan_edx(&sc);
 }
 regs_thunk!(store_find_thunk, store_find_entry);
 
@@ -571,22 +717,33 @@ unsafe fn type_limit(ty: u32) -> u32 {
 }
 
 /// 0xB68F60 ammo_store_capacity (ECX = &store, EDI = hash -> EAX entry bonus +8 + type limit).
-unsafe fn store_capacity(store: u32, hash: u32) -> u32 {
+/// ECX leaves as the limit, EDX with its low byte the multiplayer flag byte last read (DL).
+extern "C" fn store_capacity_entry(r: &mut Pushad, _: *const u32) {
+    let p = *r;
     unsafe {
-        match store_scan(store, hash) {
+        let sc = store_scan_regs(p.ecx, p.edi);
+        let (mut ecx, mut edx) = (sc.ecx, scan_edx(&sc));
+        let ours = match sc.found {
             Some(e) if e != 0 => {
                 let ty = rd(e as usize);
-                let lim = type_limit(ty);
+                let a = rb(MP_FLAG_A);
+                edx = (edx & !0xFF) | a as u32;
+                let lim = if a == 1 {
+                    let b = rb(MP_FLAG_B);
+                    edx = (edx & !0xFF) | b as u32;
+                    if b == 0 { rd(ty as usize + 0x10) } else { rd(ty as usize + 0xC) }
+                } else {
+                    rd(ty as usize + 0xC)
+                };
+                ecx = lim;
                 rd(e as usize + 8).wrapping_add(lim)
             }
             _ => 0,
-        }
+        };
+        r.eax = checked_eax(STORE_CAPACITY, &p, 0, ours);
+        r.ecx = ecx;
+        r.edx = edx;
     }
-}
-
-extern "C" fn store_capacity_entry(r: &mut Pushad, _: *const u32) {
-    let p = *r;
-    r.eax = checked_eax(STORE_CAPACITY, &p, 0, unsafe { store_capacity(p.ecx, p.edi) });
 }
 regs_thunk!(store_capacity_thunk, store_capacity_entry);
 
@@ -637,30 +794,38 @@ regs_thunk!(total_ammo_thunk, total_ammo_entry, "ret 8");
 /// at 32 bits like the `imul`): the quotient comes from `imul 0x6F74AE27; sar edx, 9` plus the
 /// sign bit, as in the original. Null, below the table or above it: `or al, 0xFF` (the rest of
 /// EAX stays the pointer).
-unsafe fn info_index(info: u32) -> u32 {
+unsafe fn info_index(info: u32, ecx: &mut u32, edx: &mut u32) -> u32 {
     unsafe {
         let invalid = info | 0xFF;
         if info == 0 {
             return invalid;
         }
         let base = rd(WEAPON_INFOS);
+        *ecx = base;
         if info < base {
             return invalid;
         }
         let end = rd(WEAPON_INFO_COUNT).wrapping_mul(0x498).wrapping_add(base);
+        *edx = end;
         if info >= end {
             return invalid;
         }
         let d = info.wrapping_sub(base) as i32 as i64;
         let hi = ((d * 0x6F74_AE27i64) >> 32) as i32;
         let q = hi >> 9;
+        *ecx = d as u32;
+        *edx = q as u32;
         (((q as u32) >> 31) as i32).wrapping_add(q) as u32
     }
 }
 
 extern "C" fn info_index_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked_eax(INFO_INDEX, &p, 0, unsafe { info_index(p.eax) });
+    let (mut ecx, mut edx) = (p.ecx, p.edx);
+    let ours = unsafe { info_index(p.eax, &mut ecx, &mut edx) };
+    r.eax = checked_eax(INFO_INDEX, &p, 0, ours);
+    r.ecx = ecx;
+    r.edx = edx;
 }
 regs_thunk!(info_index_thunk, info_index_entry);
 
@@ -697,6 +862,15 @@ extern "C" fn is_lethal_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let arg = unsafe { *args };
     r.eax = checked_eax(IS_LETHAL, &p, arg, unsafe { is_lethal(p.eax, p.ecx, arg as u8) });
+    // Past the early exits the original loads DL = 4 and, when the primary type misses, ECX = the alt type.
+    let info = p.ecx;
+    if info != 0 && unsafe { rd(info as usize + 0x10) } & 0x400 == 0 && arg as u8 == 0 {
+        r.edx = (p.edx & !0xFF) | 4;
+        let primary = unsafe { rd(info as usize + 0xD4) };
+        if !(primary != 0 && unsafe { rb(primary as usize + 8) } & 4 != 0) {
+            r.ecx = unsafe { rd(info as usize + 0xD8) };
+        }
+    }
 }
 regs_thunk!(is_lethal_thunk, is_lethal_entry);
 
@@ -709,12 +883,18 @@ unsafe fn uses_flag(info: u32, mask: u8) -> u32 {
 extern "C" fn uses_sewage_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(USES_SEWAGE, &p, 0, unsafe { uses_flag(p.ecx, 0x80) });
+    if p.ecx != 0 {
+        r.edx = (p.edx & !0xFF) | 0x80;
+    }
 }
 regs_thunk!(uses_sewage_thunk, uses_sewage_entry);
 
 extern "C" fn uses_bullet_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(USES_BULLET, &p, 0, unsafe { uses_flag(p.ecx, 8) });
+    if p.ecx != 0 {
+        r.edx = (p.edx & !0xFF) | 8;
+    }
 }
 regs_thunk!(uses_bullet_thunk, uses_bullet_entry);
 
@@ -756,6 +936,11 @@ unsafe fn has_ammo(inst: u32) -> u32 {
 extern "C" fn has_ammo_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(HAS_AMMO, &p, 0, unsafe { has_ammo(p.eax) });
+    // ECX = the info once both counts are <= 0.
+    let i = p.eax as usize;
+    if unsafe { (rd(i + 0x10) as i32) <= 0 && (rd(i + 0x14) as i32) <= 0 } {
+        r.ecx = unsafe { rd(i + 8) };
+    }
 }
 regs_thunk!(has_ammo_thunk, has_ammo_entry);
 
@@ -780,14 +965,18 @@ unsafe fn ai_range_sq(info: u32) -> f32 {
 extern "C" fn ai_range_sq_entry(r: &mut Pushad, _: *const u32) -> f32 {
     let p = *r;
     let ours = unsafe { ai_range_sq(p.eax) };
-    shadow_st0(AI_RANGE_SQ, &p, ours)
+    let v = shadow_st0(AI_RANGE_SQ, &p, ours);
+    r.ecx = v.to_bits(); // `pop ecx` reloads the stored f32
+    v
 }
 regs_thunk!(ai_range_sq_thunk, ai_range_sq_entry);
 
 extern "C" fn ai_range_entry(r: &mut Pushad, _: *const u32) -> f32 {
     let p = *r;
     let ours = unsafe { ai_range_of(p.eax) };
-    shadow_st0(AI_RANGE, &p, ours)
+    let v = shadow_st0(AI_RANGE, &p, ours);
+    r.ecx = v.to_bits(); // `pop ecx` reloads the stored f32
+    v
 }
 regs_thunk!(ai_range_thunk, ai_range_entry);
 
@@ -810,7 +999,7 @@ fn shadow_st0(id: usize, p: &Pushad, ours: f32) -> f32 {
 /// Unlink the node from the live list (circular, +0 prev / +4 next, head 0x22D7B6C) and insert it
 /// before the head of the free list (0x22D7BC4), in the original's order of reads and writes
 /// (so the aliasing cases come out the same, including the fault when the node is the free head).
-unsafe fn instance_free(node: u32) {
+unsafe fn instance_free(node: u32) -> (u32, u32) {
     unsafe {
         let n = node as usize;
         let mut skip_unlink = false;
@@ -840,6 +1029,7 @@ unsafe fn instance_free(node: u32) {
             wd(n + 4, node);
             wd(n, node);
             wd(INST_FREE, node);
+            (0, 0)
         } else {
             let fp = rd(f as usize);
             wd(n, fp);
@@ -847,6 +1037,7 @@ unsafe fn instance_free(node: u32) {
             let fp2 = rd(f as usize);
             wd(fp2 as usize + 4, node);
             wd(f as usize, node);
+            (f, fp2)
         }
     }
 }
@@ -854,7 +1045,8 @@ unsafe fn instance_free(node: u32) {
 extern "C" fn instance_free_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let Some((n, orig)) = shadowing(INSTANCE_FREE) else {
-        unsafe { instance_free(p.eax) };
+        // ECX = the free head read at the end, EDX = its predecessor (0 for an empty free list).
+        (r.ecx, r.edx) = unsafe { instance_free(p.eax) };
         return;
     };
     unsafe {
@@ -884,7 +1076,7 @@ extern "C" fn instance_free_entry(r: &mut Pushad, _: *const u32) {
         for (&a, &v) in addrs.iter().zip(&before) {
             wd(a, v);
         }
-        instance_free(node);
+        (r.ecx, r.edx) = instance_free(node);
         let ours = read(&addrs);
         if ours != theirs || t.eax != p.eax {
             mismatch(INSTANCE_FREE, n, format!("node {node:#x}: original {theirs:x?}, Rust {ours:x?}"));
@@ -916,6 +1108,17 @@ extern "C" fn max_reserve_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let arg = unsafe { *args };
     r.eax = checked_eax(MAX_RESERVE, &p, arg, unsafe { max_reserve(p.eax, arg as u8) });
+    // Past the null checks the original loads CL (and, in multiplayer, DL) with the flag bytes.
+    if p.eax != 0 {
+        let ty = unsafe { rd(p.eax as usize + if arg as u8 != 0 { 0xD8 } else { 0xD4 }) };
+        if ty != 0 {
+            let a = unsafe { rb(MP_FLAG_A) };
+            r.ecx = (p.ecx & !0xFF) | a as u32;
+            if a == 1 {
+                r.edx = (p.edx & !0xFF) | unsafe { rb(MP_FLAG_B) } as u32;
+            }
+        }
+    }
 }
 regs_thunk!(max_reserve_thunk, max_reserve_entry);
 
@@ -944,10 +1147,23 @@ unsafe fn find_hash(count_addr: usize, hash_ptr: u32, entry: impl Fn(usize) -> u
     }
 }
 
+/// ECX = the caller's with CX = the table count (`mov cx, [count]`); EDX = the hash once the count
+/// is not 0 (`mov edx, [edx]`).
+unsafe fn find_regs(r: &mut Pushad, p: &Pushad, count_addr: usize) {
+    unsafe {
+        let n = rw(count_addr) as u32;
+        r.ecx = (p.ecx & 0xFFFF_0000) | n;
+        if n != 0 {
+            r.edx = rd(p.edx as usize);
+        }
+    }
+}
+
 extern "C" fn foley_find_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let ours = unsafe { find_hash(FOLEY_COUNT, p.edx, |i| rd(FOLEY_TABLE + i * 4) as usize) };
     r.eax = checked_eax(FOLEY_FIND, &p, 0, ours);
+    unsafe { find_regs(r, &p, FOLEY_COUNT) };
 }
 regs_thunk!(foley_find_thunk, foley_find_entry);
 
@@ -955,6 +1171,7 @@ extern "C" fn music_find_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let ours = unsafe { find_hash(MUSIC_COUNT, p.edx, |i| rd(MUSIC_TABLE + i * 4) as usize) };
     r.eax = checked_eax(MUSIC_FIND, &p, 0, ours);
+    unsafe { find_regs(r, &p, MUSIC_COUNT) };
 }
 regs_thunk!(music_find_thunk, music_find_entry);
 
@@ -962,6 +1179,7 @@ extern "C" fn line_find_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let ours = unsafe { find_hash(LINE_COUNT, p.edx, |i| LINE_TABLE + (i << 4)) };
     r.eax = checked_eax(LINE_FIND, &p, 0, ours);
+    unsafe { find_regs(r, &p, LINE_COUNT) };
 }
 regs_thunk!(line_find_thunk, line_find_entry);
 
@@ -974,6 +1192,12 @@ regs_thunk!(line_find_thunk, line_find_entry);
 /// 0) clear AL of the caller's EAX; the later ones and the success leave the slot offset in EAX
 /// (AL = 0 / 1). The volume is stored through `fld` / `fstp` (quiet NaN), the flags word is
 /// read BEFORE the volume store and bit 1 is set with a separate store, as the original does.
+/// ECX after the handle prologue (`mov ecx, [ecx]; shr ecx, 8`): the generation, or the caller's
+/// ECX when the slot byte is 0xFF.
+unsafe fn h_ecx(ecx: u32) -> u32 {
+    unsafe { if rb(ecx as usize) == 0xFF { ecx } else { rd(ecx as usize) >> 8 } }
+}
+
 unsafe fn set_volume_on(slots: usize, eax: u32, h: usize, vol: u32) -> u32 {
     unsafe {
         let al = rb(h);
@@ -1004,6 +1228,11 @@ extern "C" fn set_volume_entry(r: &mut Pushad, args: *const u32) {
     let h = p.ecx as usize;
     let Some((n, orig)) = shadowing(SET_VOLUME) else {
         r.eax = unsafe { set_volume_on(VOICE_SLOTS, p.eax, h, vol) };
+        r.ecx = unsafe { h_ecx(p.ecx) };
+        if r.eax & 0xFF == 1 {
+            // good: ECX = the flags word read before the stores (|1 when 0x800 was clear)
+            r.ecx = unsafe { rw(VOICE_SLOTS + rb(h) as usize * SLOT_SIZE + 0x196) } as u32;
+        }
         return;
     };
     unsafe {
@@ -1061,6 +1290,7 @@ extern "C" fn get_volume_entry(r: &mut Pushad, _: *const u32) -> f32 {
     let (ours, eax) = unsafe { get_volume(p.eax, p.ecx as usize) };
     let Some((n, orig)) = shadowing(GET_VOLUME) else {
         r.eax = eax;
+        r.ecx = ours.to_bits(); // `pop ecx` reloads the stored f32
         return ours;
     };
     let inp = Regs::of(&p);
@@ -1074,9 +1304,11 @@ extern "C" fn get_volume_entry(r: &mut Pushad, _: *const u32) -> f32 {
             format!("handle {:#x}: original {:#x} eax {:#x}, Rust {:#x} eax {eax:#x}", unsafe { rd(p.ecx as usize) }, theirs.to_bits(), out.eax, ours.to_bits()),
         );
         r.eax = out.eax;
+        r.ecx = theirs.to_bits();
         return theirs;
     }
     r.eax = eax;
+    r.ecx = ours.to_bits();
     ours
 }
 regs_thunk!(get_volume_thunk, get_volume_entry);
@@ -1106,13 +1338,15 @@ unsafe fn stop_category_on(slots: usize, cat: u32) -> u32 {
 
 /// For every in-use slot whose flags word (+0x196) has no 0x800: set bit 1 (load, test, store).
 /// Returns the EAX the original ends with.
-unsafe fn mark_dirty_on(slots: usize) -> u32 {
+unsafe fn mark_dirty_on(slots: usize, ecx: &mut u32) -> u32 {
     unsafe {
         for k in 0..SLOT_COUNT {
             let s = slots + k * SLOT_SIZE;
             if slot_in_use(s) {
                 let fl = rw(s + 0x196);
+                *ecx = fl as u32;
                 if fl & 0x800 == 0 {
+                    *ecx |= 1;
                     ww(s + 0x196, fl | 1);
                 }
             }
@@ -1149,6 +1383,7 @@ fn slots_shadow(id: usize, n: u32, orig: usize, p: &Pushad, ours: impl FnOnce(us
 
 extern "C" fn stop_category_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    r.ecx = 0xFF7F; // the mask loaded before the loop
     let Some((n, orig)) = shadowing(STOP_CATEGORY) else {
         r.eax = unsafe { stop_category_on(VOICE_SLOTS, p.edx) };
         return;
@@ -1159,11 +1394,15 @@ regs_thunk!(stop_category_thunk, stop_category_entry);
 
 extern "C" fn mark_dirty_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let mut ecx = p.ecx;
+    r.edx = 0x200;
     let Some((n, orig)) = shadowing(MARK_DIRTY) else {
-        r.eax = unsafe { mark_dirty_on(VOICE_SLOTS) };
+        r.eax = unsafe { mark_dirty_on(VOICE_SLOTS, &mut ecx) };
+        r.ecx = ecx;
         return;
     };
-    r.eax = slots_shadow(MARK_DIRTY, n, orig, &p, |b| unsafe { mark_dirty_on(b) });
+    r.eax = slots_shadow(MARK_DIRTY, n, orig, &p, |b| unsafe { mark_dirty_on(b, &mut ecx) });
+    r.ecx = ecx;
 }
 regs_thunk!(mark_dirty_thunk, mark_dirty_entry);
 
@@ -1184,13 +1423,44 @@ unsafe fn throttle_on(table: usize, cat: u32, vbits: u32) {
     }
 }
 
+/// EAX as the original leaves it (the x87 status word of its last `fnstsw ax`; the x87 stack is
+/// empty at entry, so TOP is 6 at the first compare against 0 and 7 at the second against 1).
+fn throttle_ax(cat: u32, eax: u32, vbits: u32) -> u32 {
+    if cat >= 4 {
+        return eax;
+    }
+    let eax = eax & 0xFFFF_0000; // only AX is written
+    let v = f32::from_bits(vbits);
+    // sticky exception flags raised by the operand: IE (bit 0) for a NaN, DE (bit 1) for a denormal
+    let exc = v.is_nan() as u32 | (v.is_subnormal() as u32) << 1;
+    // fcom flags: 0 greater, C0 less, C3 equal, C0|C2|C3 unordered
+    let cc = |a: f32, b: f32| -> u32 {
+        if a.is_nan() || b.is_nan() {
+            0x4500
+        } else if a > b {
+            0
+        } else if a < b {
+            0x100
+        } else {
+            0x4000
+        }
+    };
+    let c1 = cc(v, 0.0);
+    if c1 & 0x100 != 0 {
+        return eax | 0x3000 | c1 | exc;
+    }
+    eax | 0x3800 | cc(1.0, v) | exc
+}
+
 extern "C" fn throttle_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let vbits = unsafe { *args };
     let Some((n, orig)) = shadowing(THROTTLE_SET) else {
         unsafe { throttle_on(THROTTLE, p.ecx, vbits) };
+        r.eax = throttle_ax(p.ecx, p.eax, vbits);
         return;
     };
+    r.eax = throttle_ax(p.ecx, p.eax, vbits);
     unsafe {
         let mut buf = [0u32; 4];
         std::ptr::copy_nonoverlapping(THROTTLE as *const u32, buf.as_mut_ptr(), 4);
@@ -1394,7 +1664,7 @@ unsafe fn shadow_slot_op(
 /// then `test ah, 5 / jp`: only C0 alone, current < new, falls through to the store). Reads and
 /// writes: flags, (+0xC4), +0x1C, flags, +0xA8, (+0xA8). The x87 status word the original leaves
 /// in AX is not reproduced.
-unsafe fn slot_fade_out_on(slots: usize, idx: u32, ms: u32) {
+unsafe fn slot_fade_out_on(slots: usize, idx: u32, ms: u32) -> (u32, u32, u32) {
     unsafe {
         let s = slots.wrapping_add(idx.wrapping_mul(SLOT_SIZE as u32) as usize);
         let fl = vr16(s + 0x196) as u32;
@@ -1418,6 +1688,18 @@ unsafe fn slot_fade_out_on(slots: usize, idx: u32, ms: u32) {
         if old < new {
             vw32(s + 0xA8, new.to_bits());
         }
+        // The `fcomp old, new` status word (TOP = 7), `pop ecx` reloading the stored f32, and EDX
+        // shifted down when ms >= 0x20.
+        let cc = if old.is_nan() || new.is_nan() {
+            0x4500
+        } else if old > new {
+            0
+        } else if old < new {
+            0x100
+        } else {
+            0x4000
+        };
+        (0x3800 | cc, new.to_bits(), if ms < 0x20 { ms } else { ms >> 5 })
     }
 }
 
@@ -1426,14 +1708,16 @@ const FADE_FIELDS: &[(usize, usize)] = &[(0xA8, 4), (0xC4, 4), (0x196, 2)];
 extern "C" fn slot_fade_out_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let Some((n, orig)) = shadowing(SLOT_FADE_OUT) else {
-        unsafe { slot_fade_out_on(VOICE_SLOTS, p.eax, p.edx) };
+        let (a, c, d) = unsafe { slot_fade_out_on(VOICE_SLOTS, p.eax, p.edx) };
+        r.eax = a;
+        r.ecx = c;
+        r.edx = d;
         return;
     };
     unsafe {
         let idx = Some(p.eax as usize);
         shadow_slot_op(SLOT_FADE_OUT, n, orig, &p, &[], idx, FADE_FIELDS, false, |b| {
-            slot_fade_out_on(b, p.eax, p.edx);
-            0
+            slot_fade_out_on(b, p.eax, p.edx).0
         });
     }
 }
@@ -1449,12 +1733,45 @@ unsafe fn fade_out_on(slots: usize, h: usize, ms: u32) {
     }
 }
 
+/// The live path: the handle check with the registers the original leaves, then (a good handle) the
+/// tail `jmp 0x47C740` as a call by address with EAX = slot byte, ECX = slot * 0x19C, EDX = ms.
+unsafe fn fade_out_live(p: &Pushad, ms: u32) -> Regs {
+    unsafe {
+        let h = p.ecx as usize;
+        let mut g = Regs::of(p);
+        let al = rb(h);
+        if al == 0xFF {
+            g.eax = (p.eax & !0xFF) | al as u32;
+            return g;
+        }
+        let gen_ = rd(h) >> 8;
+        g.edx = gen_;
+        if gen_ == 0 {
+            g.eax = (p.eax & !0xFF) | al as u32;
+            return g;
+        }
+        let off = al as u32 * SLOT_SIZE as u32;
+        let s = VOICE_SLOTS + off as usize;
+        g.eax = al as u32;
+        g.ecx = off;
+        if gen_ != vr32(s + 0xB4) || vr32(s) == 0xFFFF_FFFF {
+            return g;
+        }
+        g.edx = ms;
+        call_all(SLOT_FADE_OUT_ADDR, &mut g, &[], false);
+        g
+    }
+}
+
 fn fade_out_common(id: usize, r: &mut Pushad, args: *const u32) {
     let p = *r;
     let ms = unsafe { *args };
     let h = p.ecx as usize;
     let Some((n, orig)) = shadowing(id) else {
-        unsafe { fade_out_on(VOICE_SLOTS, h, ms) };
+        let g = unsafe { fade_out_live(&p, ms) };
+        r.eax = g.eax;
+        r.ecx = g.ecx;
+        r.edx = g.edx;
         return;
     };
     unsafe {
@@ -1494,12 +1811,49 @@ unsafe fn set_orientation_on(slots: usize, eax: u32, h: usize, transform: u32) -
 
 const ORIENT_FIELDS: &[(usize, usize)] = &[(0x44, 0x18)];
 
+/// The live path: the handle check with the registers the original leaves, then (a good slot)
+/// `push slot; call 0x47D3A0` with ECX = transform, and ECX = the slot pointer afterwards (`pop ecx`).
+unsafe fn orient_live(p: &Pushad, transform: u32) -> Regs {
+    unsafe {
+        let h = p.ecx as usize;
+        let mut g = Regs::of(p);
+        let al = rb(h);
+        if al == 0xFF {
+            g.eax = (p.eax & !0xFF) | al as u32;
+            return g;
+        }
+        let gen_ = rd(h) >> 8;
+        g.ecx = gen_;
+        if gen_ == 0 {
+            g.eax = (p.eax & !0xFF) | al as u32;
+            return g;
+        }
+        let off = al as u32 * SLOT_SIZE as u32;
+        let s = VOICE_SLOTS + off as usize;
+        g.eax = off;
+        if gen_ != vr32(s + 0xB4) {
+            return g;
+        }
+        g.eax = s as u32;
+        if vr32(s) == 0xFFFF_FFFF {
+            return g;
+        }
+        g.ecx = transform;
+        call_all(SLOT_SET_ORIENTATION, &mut g, &[s as u32], false);
+        g.ecx = s as u32;
+        g
+    }
+}
+
 fn orient_common(id: usize, r: &mut Pushad, args: *const u32) {
     let p = *r;
     let transform = unsafe { *args };
     let h = p.ecx as usize;
     let Some((n, orig)) = shadowing(id) else {
-        r.eax = unsafe { set_orientation_on(VOICE_SLOTS, p.eax, h, transform) };
+        let g = unsafe { orient_live(&p, transform) };
+        r.eax = g.eax;
+        r.ecx = g.ecx;
+        r.edx = g.edx;
         return;
     };
     unsafe {
@@ -1540,6 +1894,7 @@ unsafe fn is_2d(eax: u32, h: usize) -> u32 {
 extern "C" fn is_2d_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(IS_2D, &p, 0, unsafe { is_2d(p.eax, p.ecx as usize) });
+    r.ecx = unsafe { h_ecx(p.ecx) };
 }
 regs_thunk!(is_2d_thunk, is_2d_entry);
 
@@ -1565,6 +1920,7 @@ extern "C" fn get_param_30_entry(r: &mut Pushad, _: *const u32) -> f32 {
     let (ours, eax) = unsafe { get_param_30(p.eax, p.ecx as usize) };
     let Some((n, orig)) = shadowing(GET_P30) else {
         r.eax = eax;
+        r.ecx = ours.to_bits(); // `pop ecx` reloads the stored f32
         return ours;
     };
     let inp = Regs::of(&p);
@@ -1578,9 +1934,11 @@ extern "C" fn get_param_30_entry(r: &mut Pushad, _: *const u32) -> f32 {
             format!("handle {:#x}: original {:#x} eax {:#x}, Rust {:#x} eax {eax:#x}", unsafe { rd(p.ecx as usize) }, theirs.to_bits(), out.eax, ours.to_bits()),
         );
         r.eax = out.eax;
+        r.ecx = theirs.to_bits();
         return theirs;
     }
     r.eax = eax;
+    r.ecx = ours.to_bits();
     ours
 }
 regs_thunk!(get_param_30_thunk, get_param_30_entry);
@@ -1620,6 +1978,15 @@ fn set_param_common(id: usize, r: &mut Pushad, args: *const u32, field: usize, f
     let h = p.ecx as usize;
     let Some((n, orig)) = shadowing(id) else {
         r.eax = unsafe { set_param_on(VOICE_SLOTS, p.eax, h, vbits, field, flag, shift) };
+        r.ecx = unsafe { h_ecx(p.ecx) };
+        if r.eax & 0xFF == 1 {
+            // good: ECX = bit `shift` of the byte at +0x194, EDX = !(flags >> 11)
+            let sl = VOICE_SLOTS + unsafe { rb(h) } as usize * SLOT_SIZE;
+            unsafe {
+                r.ecx = (rb(sl + 0x194) as u32 >> shift) & 1;
+                r.edx = !((rw(sl + 0x196) as u32) >> 11);
+            }
+        }
         return;
     };
     unsafe {
@@ -1644,12 +2011,13 @@ regs_thunk!(set_param_30_thunk, set_param_30_entry);
 /// cleared and 0x100 set, +0xC4 = 0.0, +0xA8 = (1 - start) / (ms / 32) with the signed divide by 32
 /// of `cdq / and 0x1f / add / sar 5` and `fidiv` (division by zero gives the x87 result: +-inf or
 /// the default NaN, as SSE does). The writes come in that order.
-unsafe fn slot_fade_in_on(slots: usize, idx: u32, ms: u32, start: u32) {
+unsafe fn slot_fade_in_on(slots: usize, idx: u32, ms: u32, start: u32) -> (u32, u32, u32) {
     unsafe {
         let s = slots.wrapping_add(idx.wrapping_mul(SLOT_SIZE as u32) as usize);
         let fl = vr16(s + 0x196) as u32;
         if fl & 0x100 != 0 {
-            return;
+            // EAX = the flags word, ECX restored by `pop ecx`, EDX untouched
+            return (fl, idx, u32::MAX);
         }
         let st = f32::from_bits(start) as f64;
         vw32(s + 0x1C, q32(start));
@@ -1659,6 +2027,8 @@ unsafe fn slot_fade_in_on(slots: usize, idx: u32, ms: u32, start: u32) {
         let k = m.wrapping_add(((m >> 31) as u32 & 0x1F) as i32) >> 5;
         let rate = ((1.0 - st) / k as f64) as f32;
         vw32(s + 0xA8, rate.to_bits());
+        // EAX = ECX (popped from the slot the divisor was stored in) = k; EDX = the cdq mask & 0x1F
+        (k as u32, k as u32, (m >> 31) as u32 & 0x1F)
     }
 }
 
@@ -1668,14 +2038,18 @@ extern "C" fn slot_fade_in_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let (ms, start) = unsafe { (*args, *args.add(1)) };
     let Some((n, orig)) = shadowing(FADE_IN) else {
-        unsafe { slot_fade_in_on(VOICE_SLOTS, p.ecx, ms, start) };
+        let (a, c, d) = unsafe { slot_fade_in_on(VOICE_SLOTS, p.ecx, ms, start) };
+        r.eax = a;
+        r.ecx = c;
+        if d != u32::MAX {
+            r.edx = d;
+        }
         return;
     };
     unsafe {
         let idx = Some(p.ecx as usize);
         shadow_slot_op(FADE_IN, n, orig, &p, &[ms, start], idx, FADE_IN_FIELDS, false, |b| {
-            slot_fade_in_on(b, p.ecx, ms, start);
-            0
+            slot_fade_in_on(b, p.ecx, ms, start).0
         });
     }
 }
@@ -1688,8 +2062,28 @@ regs_thunk!(slot_fade_in_thunk, slot_fade_in_entry);
 // caller's buffer is written, so the shadow runs the Rust version on a scratch buffer and the
 // original on the real one, then compares the 0x5C bytes.
 
+thread_local! {
+    /// (ECX, EDX, EDI) of the params function being run: memset reads EDI, and the builders leave
+    /// ECX / EDX as the original's last loads do.
+    static PIN: std::cell::Cell<[u32; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
 unsafe fn pm(esi: usize) -> u32 {
-    unsafe { call_regs(MEMSET, 0, 0, 0, 0, 0, &[esi as u32, 0, 0x5C]) }
+    let edi = PIN.with(|c| c.get()[2]);
+    unsafe { call_regs(MEMSET, 0, 0, 0, esi as u32, edi, &[esi as u32, 0, 0x5C]) }
+}
+
+fn setcd(ecx: u32, edx: u32) {
+    PIN.with(|c| {
+        let mut v = c.get();
+        v[0] = ecx;
+        v[1] = edx;
+        c.set(v);
+    });
+}
+
+fn hi16(hi: u32, lo: u32) -> u32 {
+    (hi & 0xFFFF_0000) | (lo & 0xFFFF)
 }
 
 unsafe fn p32(esi: usize, off: usize, v: u32) {
@@ -1746,6 +2140,7 @@ unsafe fn build_basic(esi: usize, _edi: usize, a: *const u32) -> u32 {
         p32(esi, 0x54, 0);
         p32(esi, 0x18, parg(a, 1));
         p32(esi, 0x4C, parg(a, 2));
+        setcd(parg(a, 1), parg(a, 2));
         esi as u32
     }
 }
@@ -1763,6 +2158,7 @@ unsafe fn build_volume(esi: usize, _edi: usize, a: *const u32) -> u32 {
         p32(esi, 0x54, 0);
         p32(esi, 0x18, parg(a, 1));
         p32(esi, 0x4C, parg(a, 2));
+        setcd(parg(a, 1), parg(a, 2));
         esi as u32
     }
 }
@@ -1780,6 +2176,7 @@ unsafe fn build_variant(esi: usize, _edi: usize, a: *const u32) -> u32 {
         p32(esi, 0x54, 0);
         p32(esi, 0x18, parg(a, 1));
         p32(esi, 0x4C, parg(a, 2));
+        setcd(parg(a, 1), parg(a, 2));
         esi as u32
     }
 }
@@ -1797,6 +2194,7 @@ unsafe fn build_variant_volume(esi: usize, _edi: usize, a: *const u32) -> u32 {
         p32(esi, 0x18, 0);
         p32(esi, 0x4C, parg(a, 1));
         p32(esi, 0x28, parg(a, 2));
+        setcd(parg(a, 1), parg(a, 2));
         esi as u32
     }
 }
@@ -1816,6 +2214,7 @@ unsafe fn build_ext(esi: usize, _edi: usize, a: *const u32) -> u32 {
         p32(esi, 0x54, 0);
         p32(esi, 0x4C, parg(a, 2));
         p32(esi, 4, parg(a, 5));
+        setcd(parg(a, 5), parg(a, 2));
         esi as u32
     }
 }
@@ -1834,6 +2233,7 @@ unsafe fn build_3d(esi: usize, edi: usize, a: *const u32) -> u32 {
         p32(esi, 0x18, parg(a, 1));
         p32(esi, 0x4C, parg(a, 2));
         ppos(esi, edi);
+        setcd(rd(edi + 4), rd(edi + 8));
         esi as u32
     }
 }
@@ -1853,6 +2253,7 @@ unsafe fn build_3d_chan(esi: usize, edi: usize, a: *const u32) -> u32 {
         p32(esi, 0x54, 0);
         ppos(esi, edi);
         p16(esi, 0x30, parg(a, 2) as u16);
+        setcd(rd(edi + 8), hi16(rd(edi + 4), parg(a, 2)));
         esi as u32
     }
 }
@@ -1873,6 +2274,7 @@ unsafe fn build_3d_chan2(esi: usize, edi: usize, a: *const u32) -> u32 {
         ppos(esi, edi);
         p16(esi, 0x30, parg(a, 2) as u16);
         p16(esi, 0x32, parg(a, 3) as u16);
+        setcd(hi16(rd(edi + 8), parg(a, 3)), hi16(rd(edi + 4), parg(a, 2)));
         esi as u32
     }
 }
@@ -1901,6 +2303,7 @@ unsafe fn build_3d_chan_flag(esi: usize, edi: usize, a: *const u32) -> u32 {
         let w = rw(esi + 0x58);
         let t = (((flag << 6) ^ (w as u8)) & 0x40) as u16;
         p16(esi, 0x58, (t ^ w) | 1);
+        setcd(hi16(rd(edi + 8), parg(a, 3)), ((t ^ w) | 1) as u32);
         esi as u32
     }
 }
@@ -1920,6 +2323,7 @@ unsafe fn build_3d_volume(esi: usize, edi: usize, a: *const u32) -> u32 {
         p32(esi, 0x4C, parg(a, 2));
         p32(esi, 0xC, q32(parg(a, 3)));
         ppos(esi, edi);
+        setcd(rd(edi + 4), rd(edi + 8));
         esi as u32
     }
 }
@@ -1941,6 +2345,7 @@ unsafe fn build_3d_ext(esi: usize, edi: usize, a: *const u32) -> u32 {
         ppos(esi, edi);
         p16(esi, 2, parg(a, 4) as u16);
         p32(esi, 4, parg(a, 5));
+        setcd(hi16(rd(edi + 4), parg(a, 4)), parg(a, 5));
         esi as u32
     }
 }
@@ -1960,6 +2365,7 @@ unsafe fn build_3d_variant(esi: usize, edi: usize, a: *const u32) -> u32 {
         p32(esi, 0x18, 0);
         ppos(esi, edi);
         p32(esi, 0x28, parg(a, 2));
+        setcd(rd(edi + 8), parg(a, 2));
         esi as u32
     }
 }
@@ -1980,6 +2386,7 @@ unsafe fn build_3d_variant_volume(esi: usize, edi: usize, a: *const u32) -> u32 
         ppos(esi, edi);
         p32(esi, 0xC, q32(parg(a, 3)));
         p32(esi, 0x28, parg(a, 2));
+        setcd(rd(edi + 8), parg(a, 2));
         esi as u32
     }
 }
@@ -2003,6 +2410,7 @@ unsafe fn build_3d_variant_ext(esi: usize, edi: usize, a: *const u32) -> u32 {
         p32(esi, 0x28, parg(a, 3));
         p16(esi, 2, parg(a, 5) as u16);
         p32(esi, 4, parg(a, 6));
+        setcd(parg(a, 6), hi16(rd(edi + 8), parg(a, 5)));
         esi as u32
     }
 }
@@ -2011,6 +2419,7 @@ unsafe fn build_3d_variant_ext(esi: usize, edi: usize, a: *const u32) -> u32 {
 /// the real one. The original's bytes stand.
 unsafe fn params_run(id: usize, p: &Pushad, a: *const u32, nargs: usize, build: Build) -> u32 {
     unsafe {
+        PIN.with(|c| c.set([p.ecx, p.edx, p.edi]));
         let Some((n, orig)) = shadowing(id) else { return build(p.esi as usize, p.edi as usize, a) };
         let mut scratch = [0xCCCC_CCCCu32; 0x5C / 4];
         let sp = scratch.as_mut_ptr() as usize;
@@ -2036,6 +2445,9 @@ macro_rules! params_port {
         extern "C" fn $entry(r: &mut Pushad, a: *const u32) {
             let p = *r;
             r.eax = unsafe { params_run($id, &p, a, $nargs, $build) };
+            let cd = PIN.with(|c| c.get());
+            r.ecx = cd[0];
+            r.edx = cd[1];
         }
         regs_thunk!($thunk, $entry, $ret);
     };
@@ -2252,7 +2664,23 @@ extern "C" fn fade_all_entry(r: &mut Pushad, args: *const u32) {
         unsafe {
             add1_32(PAUSE_DEPTH);
             let ms = *args;
-            fade_all_on(VOICE_SLOTS, ms);
+            let mut g = Regs::of(&p);
+            for k in 0..SLOT_COUNT {
+                let s = VOICE_SLOTS + k * SLOT_SIZE;
+                if vr32(s) != 0xFFFF_FFFF || vr16(s + 0x196) & 0x200 != 0 {
+                    or16(s + 0x194, 1);
+                    // `mov edx, ebp; mov eax, edi; call 0x47C740` with ESI = byte offset, EDI = index
+                    g.edx = ms;
+                    g.eax = k as u32;
+                    g.esi = (k * SLOT_SIZE) as u32;
+                    g.edi = k as u32;
+                    g.ebp = ms;
+                    call_all(SLOT_FADE_OUT_ADDR, &mut g, &[], false);
+                }
+            }
+            r.eax = g.eax;
+            r.ecx = g.ecx;
+            r.edx = g.edx;
         }
         return;
     };
@@ -2421,6 +2849,12 @@ fn entry_addrs(e: u32) -> Vec<usize> {
 /// room) (signed compare); count += added; with overflow and room < amount the bonus is set to
 /// amount - room.
 unsafe fn entry_add(entry: u32, amount: u32, ovf: u32) -> u32 {
+    unsafe { entry_add_regs(entry, amount, ovf).0 }
+}
+
+/// `entry_add` with the registers the original leaves: (EAX added, ECX = room, EDX = the overflow
+/// remainder when overflow is allowed, else the clipped amount / room).
+unsafe fn entry_add_regs(entry: u32, amount: u32, ovf: u32) -> (u32, u32, u32) {
     unsafe {
         let e = entry as usize;
         let ovf = ovf as u8 != 0;
@@ -2431,10 +2865,12 @@ unsafe fn entry_add(entry: u32, amount: u32, ovf: u32) -> u32 {
         let amt = amount as i32;
         let added = if ovf || amt < room { amt } else { room };
         wd(e + 4, count.wrapping_add(added as u32));
+        let mut edx = if ovf { amt } else { room };
         if ovf && room < amt {
             wd(e + 8, amt.wrapping_sub(room) as u32);
+            edx = amt.wrapping_sub(room);
         }
-        added as u32
+        (added as u32, room as u32, edx as u32)
     }
 }
 
@@ -2442,7 +2878,10 @@ extern "C" fn entry_add_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let ovf = unsafe { *args };
     let Some((n, orig)) = shadowing(ENTRY_ADD) else {
-        r.eax = unsafe { entry_add(p.esi, p.eax, ovf) };
+        let (a, c, d) = unsafe { entry_add_regs(p.esi, p.eax, ovf) };
+        r.eax = a;
+        r.ecx = c;
+        r.edx = d;
         return;
     };
     unsafe { r.eax = snap_shadow(ENTRY_ADD, n, orig, &p, &[ovf], &entry_addrs(p.esi), || entry_add(p.esi, p.eax, ovf)) };
@@ -2467,7 +2906,22 @@ extern "C" fn add_type_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let (amount, ovf) = unsafe { (*args, *args.add(1)) };
     let Some((n, orig)) = shadowing(ADD_TYPE) else {
-        r.eax = unsafe { add_type(p.ecx, p.edi, amount, ovf) };
+        unsafe {
+            let sc = store_scan_regs(p.ecx, p.edi);
+            r.ecx = sc.ecx;
+            r.edx = scan_edx(&sc);
+            r.eax = 0;
+            if let Some(e) = sc.found {
+                if e != 0 {
+                    // `call 0xB68C20` with ESI = entry, EBX = its type pointer, EAX = amount
+                    let mut g = Regs { eax: amount, ecx: sc.ecx, edx: scan_edx(&sc), ebx: rd(e as usize), esi: e, edi: p.edi, ebp: p.ebp };
+                    call_all(ENTRY_ADD_ADDR, &mut g, &[ovf], false);
+                    r.eax = g.eax;
+                    r.ecx = g.ecx;
+                    r.edx = g.edx;
+                }
+            }
+        }
         return;
     };
     unsafe {
@@ -2504,7 +2958,20 @@ extern "C" fn store_remove_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let amount = unsafe { *args };
     let Some((n, orig)) = shadowing(STORE_REMOVE) else {
-        r.eax = unsafe { store_remove(p.ecx, p.edi, amount) };
+        unsafe {
+            let sc = store_scan_regs(p.ecx, p.edi);
+            r.ecx = sc.ecx;
+            r.edx = scan_edx(&sc);
+            r.eax = store_remove(p.ecx, p.edi, amount);
+            if let Some(e) = sc.found {
+                if e != 0 {
+                    // EDX = the bonus after the removal (the bonus itself when it was 0)
+                    r.edx = rd(e as usize + 8);
+                }
+            } else {
+                r.eax = 0;
+            }
+        }
         return;
     };
     unsafe {
@@ -2539,7 +3006,28 @@ extern "C" fn weapon_store_remove_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     let store = unsafe { *args };
     let Some((n, orig)) = shadowing(WEAPON_STORE_REMOVE) else {
-        r.eax = unsafe { weapon_store_remove(p.ecx, p.eax, store) };
+        unsafe {
+            if p.ecx == 0 {
+                return;
+            }
+            let info = rd(p.ecx as usize + 8);
+            let mut ty = 0;
+            if info != 0 {
+                ty = rd(info as usize + 0xD4);
+            }
+            if ty == 0 {
+                r.eax = 0;
+                r.ecx = ty;
+                return;
+            }
+            let hash = rd(ty as usize + 4);
+            // `push edi; mov edi, hash; mov ecx, store; push eax; call 0xB69190` (stdcall (amount))
+            let mut g = Regs { eax: p.eax, ecx: store, edx: p.edx, ebx: p.ebx, esi: p.esi, edi: hash, ebp: p.ebp };
+            call_all(STORE_REMOVE_ADDR, &mut g, &[p.eax], false);
+            r.eax = g.eax;
+            r.ecx = g.ecx;
+            r.edx = g.edx;
+        }
         return;
     };
     unsafe {
@@ -2589,6 +3077,14 @@ extern "C" fn store_clear_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let Some((n, orig)) = shadowing(STORE_CLEAR) else {
         r.eax = unsafe { store_clear(p.edi, p.eax) };
+        // ECX = the loop counter (0 when the count is not positive), EDX = 12 * counter
+        let cnt = unsafe { rd(AMMO_TYPE_COUNT) } as i32;
+        if cnt > 0 {
+            r.ecx = cnt as u32;
+            r.edx = (cnt as u32).wrapping_mul(12);
+        } else {
+            r.ecx = 0;
+        }
         return;
     };
     unsafe {
@@ -2621,6 +3117,9 @@ unsafe fn is_thrown(info: u32) -> u32 {
 extern "C" fn is_thrown_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(IS_THROWN, &p, 0, unsafe { is_thrown(p.eax) });
+    if p.eax != 0 {
+        r.ecx = unsafe { (rd(p.eax as usize + 0x34) == 5) as u32 }; // the `sete cl` before `mov al, cl`
+    }
 }
 regs_thunk!(is_thrown_thunk, is_thrown_entry);
 
@@ -3532,6 +4031,8 @@ const RETICULE_UPDATE_FN: usize = 0x00B6_A8B0; // ECX, EDX, cdecl (f32)
 const VOICE_STOP_FN: usize = 0x0047_FEB0; // ECX = &handle
 const LOCK_HANDLE: u32 = 0x00EB_D05C;
 const HUMAN_IS_PLAYER_FN: usize = 0x0092_6600; // ECX = human -> AL
+const ENTRY_ADD_ADDR: usize = 0x00B6_8C20;
+const STORE_REMOVE_ADDR: usize = 0x00B6_9190;
 const AMMO_STORE_REMOVE_FN: usize = 0x00B6_9230; // ECX = instance, EAX = amount, stdcall (store)
 const CUE_BANK_FIND_FN: usize = 0x0048_1760; // ECX = bank name -> EAX bank (0xFF none)
 const CUE_IN_BANK_FN: usize = 0x0047_0230; // cdecl (bank record, cue name) -> AX cue or 0xFFFF
@@ -3569,6 +4070,12 @@ unsafe fn handle_valid(eax: u32, h: usize) -> u32 {
 extern "C" fn handle_valid_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked_eax(HANDLE_VALID_ID, &p, 0, unsafe { handle_valid(p.eax, p.ecx as usize) });
+    // ECX = the handle's generation once the slot byte is not 0xFF.
+    unsafe {
+        if rb(p.ecx as usize) != 0xFF {
+            r.ecx = rd(p.ecx as usize) >> 8;
+        }
+    }
 }
 regs_thunk!(handle_valid_thunk, handle_valid_entry);
 
@@ -3649,117 +4156,144 @@ regs_thunk!(mount_find_thunk, mount_find_entry);
 
 // --- the four play wrappers ------------------------------------------------------------------------------
 
-/// A zeroed params struct for audio_play: the CRT memset by address, as the originals do.
-unsafe fn zeroed_params(buf: &mut [u32; 24]) -> usize {
-    let p = buf.as_mut_ptr() as usize;
-    unsafe { call_regs(MEMSET, 0, 0, 0, 0, 0, &[p as u32, 0, PLAY_PARAMS_SIZE as u32]) };
-    p
-}
-
-/// 0x465C40 audio_play_foley_2d (ESI = &out, cdecl (u16 cue) -> EAX = ESI).
-unsafe fn play_foley_2d(out: u32, cue: u32) -> u32 {
+/// 0x465C40 audio_play_foley_2d (ESI = &out, cdecl (u16 cue) -> EAX = ESI). The params live in the
+/// 0x5C bytes below the return address (EDI is 0 for the calls).
+unsafe fn play_foley_2d(p: &Pushad, buf: usize, cue: u32) -> Regs {
     unsafe {
         bump(PLAY_FOLEY_2D_ID, 0);
-        let mut buf = [0u32; 24];
-        let p = zeroed_params(&mut buf);
-        wd(p + 0xC, ONE_BITS);
-        ww(p, cue as u16);
-        wd(p + 0x10, ONE_BITS);
-        wd(p + 0x28, 0);
-        ww(p + 0x30, 0xFFFF);
-        ww(p + 0x32, 1);
-        wd(p + 0x54, 0);
-        wd(p + 0x18, 0);
-        wd(p + 0x4C, 0);
-        call_regs(AUDIO_PLAY_FN, p as u32, out, 0, 0, 0, &[]);
-        out
+        let mut g = Regs { eax: buf as u32, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: p.esi, edi: 0, ebp: p.ebp };
+        call_all(MEMSET, &mut g, &[buf as u32, 0, PLAY_PARAMS_SIZE as u32], false);
+        wd(buf + 0xC, ONE_BITS);
+        ww(buf, cue as u16);
+        wd(buf + 0x10, ONE_BITS);
+        wd(buf + 0x28, 0);
+        ww(buf + 0x30, 0xFFFF);
+        ww(buf + 0x32, 1);
+        wd(buf + 0x54, 0);
+        wd(buf + 0x18, 0);
+        wd(buf + 0x4C, 0);
+        g.eax = buf as u32;
+        g.ecx = p.esi;
+        call_all(AUDIO_PLAY_FN, &mut g, &[], false);
+        g
     }
 }
 
 extern "C" fn play_foley_2d_entry(r: &mut Pushad, a: *const u32) {
-    r.eax = unsafe { play_foley_2d(r.esi, parg(a, 0)) };
+    let buf = r as *mut Pushad as usize + 32;
+    let p = *r;
+    let g = unsafe { play_foley_2d(&p, buf, parg(a, 0)) };
+    r.eax = p.esi;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
-regs_thunk!(play_foley_2d_thunk, play_foley_2d_entry);
+frame_thunk!(play_foley_2d_thunk, play_foley_2d_entry, "ret", 0x5C);
 
-/// 0x465CD0 audio_play_foley_2d_tagged (ESI = &out, cdecl (u16 cue, tag) -> EAX = ESI).
-unsafe fn play_foley_2d_tagged(out: u32, cue: u32, tag: u32) -> u32 {
+/// 0x465CD0 audio_play_foley_2d_tagged (ESI = &out, cdecl (u16 cue, tag) -> EAX = ESI). EDI is the
+/// caller's for both calls; EDX = the tag at the play call.
+unsafe fn play_foley_2d_tagged(p: &Pushad, buf: usize, cue: u32, tag: u32) -> Regs {
     unsafe {
         bump(PLAY_FOLEY_2D_TAGGED_ID, 0);
-        let mut buf = [0u32; 24];
-        let p = zeroed_params(&mut buf);
-        wd(p + 0xC, ONE_BITS);
-        ww(p, cue as u16);
-        wd(p + 0x10, ONE_BITS);
-        wd(p + 0x28, 0);
-        ww(p + 0x30, 0xFFFF);
-        ww(p + 0x32, 1);
-        wd(p + 0x54, 0);
-        wd(p + 0x18, 0);
-        wd(p + 0x4C, tag);
-        call_regs(AUDIO_PLAY_FN, p as u32, out, 0, 0, 0, &[]);
-        out
+        let mut g = Regs::of(p);
+        g.eax = buf as u32;
+        call_all(MEMSET, &mut g, &[buf as u32, 0, PLAY_PARAMS_SIZE as u32], false);
+        wd(buf + 0xC, ONE_BITS);
+        ww(buf, cue as u16);
+        wd(buf + 0x10, ONE_BITS);
+        wd(buf + 0x28, 0);
+        ww(buf + 0x30, 0xFFFF);
+        ww(buf + 0x32, 1);
+        wd(buf + 0x54, 0);
+        wd(buf + 0x18, 0);
+        wd(buf + 0x4C, tag);
+        g.eax = buf as u32;
+        g.ecx = p.esi;
+        g.edx = tag;
+        call_all(AUDIO_PLAY_FN, &mut g, &[], false);
+        g
     }
 }
 
 extern "C" fn play_foley_2d_tagged_entry(r: &mut Pushad, a: *const u32) {
-    r.eax = unsafe { play_foley_2d_tagged(r.esi, parg(a, 0), parg(a, 1)) };
+    let buf = r as *mut Pushad as usize + 32;
+    let p = *r;
+    let g = unsafe { play_foley_2d_tagged(&p, buf, parg(a, 0), parg(a, 1)) };
+    r.eax = p.esi;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
-regs_thunk!(play_foley_2d_tagged_thunk, play_foley_2d_tagged_entry);
+frame_thunk!(play_foley_2d_tagged_thunk, play_foley_2d_tagged_entry, "ret", 0x5C);
 
 /// 0x465D40 audio_play_foley_3d (ECX = cue, EAX = tag, EDI = &position, cdecl (&out) -> EAX = out).
-unsafe fn play_foley_3d(out: u32, cue: u32, tag: u32, pos: u32) -> u32 {
+unsafe fn play_foley_3d(p: &Pushad, buf: usize, out: u32) -> Regs {
     unsafe {
         bump(PLAY_FOLEY_3D_ID, 0);
-        let mut buf = [0u32; 24];
-        let p = buf.as_mut_ptr() as usize;
-        call_regs(PLAY_PARAMS_INIT_3D_FN, 0, 0, 0, p as u32, pos, &[cue, 0, tag]);
-        call_regs(AUDIO_PLAY_FN, p as u32, out, 0, 0, 0, &[]);
-        out
+        let mut g = Regs { eax: p.eax, ecx: p.ecx, edx: p.edx, ebx: out, esi: buf as u32, edi: p.edi, ebp: p.ebp };
+        call_all(PLAY_PARAMS_INIT_3D_FN, &mut g, &[p.ecx, 0, p.eax], false);
+        g.eax = buf as u32;
+        g.ecx = out;
+        call_all(AUDIO_PLAY_FN, &mut g, &[], false);
+        g
     }
 }
 
 extern "C" fn play_foley_3d_entry(r: &mut Pushad, a: *const u32) {
-    r.eax = unsafe { play_foley_3d(parg(a, 0), r.ecx, r.eax, r.edi) };
+    let buf = r as *mut Pushad as usize + 32;
+    let p = *r;
+    let g = unsafe { play_foley_3d(&p, buf, parg(a, 0)) };
+    r.eax = unsafe { parg(a, 0) };
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
-regs_thunk!(play_foley_3d_thunk, play_foley_3d_entry);
+frame_thunk!(play_foley_3d_thunk, play_foley_3d_entry, "ret", 0x5C);
 
 /// 0x465D70 audio_play_voice_line_2d (ESI = &out, cdecl (u16 voice line id) -> EAX = ESI).
-unsafe fn play_voice_line_2d(out: u32, cue: u32) -> u32 {
+unsafe fn play_voice_line_2d(p: &Pushad, buf: usize, cue: u32) -> Regs {
     unsafe {
         bump(PLAY_LINE_2D_ID, 0);
-        let mut buf = [0u32; 24];
-        let p = zeroed_params(&mut buf);
-        wd(p + 0x10, ONE_BITS);
-        wd(p + 0xC, ONE_BITS);
-        ww(p + 0x32, 1);
-        ww(p, cue as u16);
-        wd(p + 0x18, 1);
-        wd(p + 0x28, 0);
-        ww(p + 0x30, 0xFFFF);
-        wd(p + 0x54, 0);
-        wd(p + 0x4C, 0);
-        call_regs(AUDIO_PLAY_FN, p as u32, out, 0, 0, 0, &[]);
-        out
+        let mut g = Regs { eax: buf as u32, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp };
+        call_all(MEMSET, &mut g, &[buf as u32, 0, PLAY_PARAMS_SIZE as u32], false);
+        wd(buf + 0x10, ONE_BITS);
+        wd(buf + 0xC, ONE_BITS);
+        ww(buf + 0x32, 1);
+        ww(buf, cue as u16);
+        wd(buf + 0x18, 1);
+        wd(buf + 0x28, 0);
+        ww(buf + 0x30, 0xFFFF);
+        wd(buf + 0x54, 0);
+        wd(buf + 0x4C, 0);
+        g.eax = buf as u32;
+        g.ecx = p.esi;
+        call_all(AUDIO_PLAY_FN, &mut g, &[], false);
+        g
     }
 }
 
 extern "C" fn play_voice_line_2d_entry(r: &mut Pushad, a: *const u32) {
-    r.eax = unsafe { play_voice_line_2d(r.esi, parg(a, 0)) };
+    let buf = r as *mut Pushad as usize + 32;
+    let p = *r;
+    let g = unsafe { play_voice_line_2d(&p, buf, parg(a, 0)) };
+    r.eax = p.esi;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
-regs_thunk!(play_voice_line_2d_thunk, play_voice_line_2d_entry);
+frame_thunk!(play_voice_line_2d_thunk, play_voice_line_2d_entry, "ret", 0x5C);
 
 // --- 0x465B00 audio_prepare (EAX = params, ECX = &out -> EAX = out) ----------------------------------------
 
-unsafe fn audio_prepare(params: u32, out: u32) -> u32 {
+unsafe fn audio_prepare(params: u32, out: u32, ebp: u32) -> Regs {
     unsafe {
         let p = params as usize;
         let o = out as usize;
+        // The original's state at the common tail: ECX = 0xFF, EDX = -1, ESI = out, EDI = -1.
+        let mut g = Regs { eax: out, ecx: 0xFF, edx: !0, ebx: 0, esi: out, edi: !0, ebp };
+        let base = g;
         let fail = |k: usize| {
             bump(AUDIO_PREPARE_ID, k);
             wd(o, 0xFF);
             wd(o + 4, !0);
             wd(o + 8, !0);
-            out
+            base
         };
         if rw(p) == 0xFFFF {
             return fail(0);
@@ -3767,27 +4301,33 @@ unsafe fn audio_prepare(params: u32, out: u32) -> u32 {
         if (rd(PAUSE_DEPTH_ADDR) as i32) > 0 && rb(p + 0x58) & 2 == 0 {
             return fail(1);
         }
+        g.eax = params;
         match rd(p + 0x18) {
             0 => {
                 bump(AUDIO_PREPARE_ID, 2);
-                call_regs(FOLEY_CUE_FN, params, 0, 0xFFFF_FFFF, out, out, &[params, 1]);
+                g.edi = out;
+                call_all(FOLEY_CUE_FN, &mut g, &[params, 1], false);
             }
             1 => {
                 bump(AUDIO_PREPARE_ID, 3);
-                call_regs(VOICE_LINE_FN, params, 0, 0xFFFF_FFFF, out, 0xFFFF_FFFF, &[params, 1]);
+                call_all(VOICE_LINE_FN, &mut g, &[params, 1], false);
             }
             2 => {
                 bump(AUDIO_PREPARE_ID, 4);
-                call_regs(MUSIC_CUE_FN, params, 0, 0xFFFF_FFFF, out, 0xFFFF_FFFF, &[params, 1]);
+                call_all(MUSIC_CUE_FN, &mut g, &[params, 1], false);
             }
             _ => return fail(5),
         }
-        out
+        g.eax = out;
+        g
     }
 }
 
 extern "C" fn audio_prepare_entry(r: &mut Pushad, _: *const u32) {
-    r.eax = unsafe { audio_prepare(r.eax, r.ecx) };
+    let g = unsafe { audio_prepare(r.eax, r.ecx, r.ebp) };
+    r.eax = g.eax;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
 regs_thunk!(audio_prepare_thunk, audio_prepare_entry);
 
@@ -3819,29 +4359,45 @@ unsafe fn set_listener(basis: usize, vel: usize, pos: usize, a1: u32, a2: u32, a
 
 extern "C" fn set_listener_entry(r: &mut Pushad, a: *const u32) {
     unsafe { set_listener(r.eax as usize, r.ecx as usize, parg(a, 0) as usize, parg(a, 1), parg(a, 2), parg(a, 3)) };
+    // The original ends with EAX = a1, ECX = a2, EDX = a3 (its last loads).
+    unsafe {
+        r.eax = parg(a, 1);
+        r.ecx = parg(a, 2);
+        r.edx = parg(a, 3);
+    }
 }
 regs_thunk!(set_listener_thunk, set_listener_entry);
 
 // --- 0x48D900 radio_vehicle_station_stop (EAX = vehicle) ----------------------------------------------------
 
-unsafe fn station_stop(obj: u32) {
+unsafe fn station_stop(p: &Pushad) -> Regs {
     unsafe {
+        let obj = p.eax;
+        let mut g = Regs::of(p);
         if obj == 0 {
             bump(STATION_STOP_ID, 0);
-            return;
+            return g;
         }
-        if rd(obj as usize + 0x44) != rd(STATION_OWNER) {
+        let o = rd(obj as usize + 0x44);
+        g.eax = o;
+        if o != rd(STATION_OWNER) {
             bump(STATION_STOP_ID, 1);
-            return;
+            return g;
         }
         let al = rb(STATION_HANDLE);
+        g.eax = (o & !0xFF) | al as u32;
         if al != 0xFF {
-            let g = rd(STATION_HANDLE) >> 8;
-            if g != 0 {
-                let s = VOICE_SLOTS + al as usize * SLOT_SIZE;
-                if g == vr32(s + 0xB4) && vr32(s) != 0xFFFF_FFFF {
+            let gen_ = rd(STATION_HANDLE) >> 8;
+            g.edx = gen_;
+            if gen_ != 0 {
+                let off = al as u32 * SLOT_SIZE as u32;
+                let s = VOICE_SLOTS + off as usize;
+                g.eax = al as u32;
+                g.ecx = off;
+                if gen_ == vr32(s + 0xB4) && vr32(s) != 0xFFFF_FFFF {
                     bump(STATION_STOP_ID, 2);
-                    call_regs(SLOT_FADE_OUT_ADDR, al as u32, 0, 0x2EE, 0, 0, &[]);
+                    g.edx = 0x2EE;
+                    call_all(SLOT_FADE_OUT_ADDR, &mut g, &[], false);
                 }
             }
         }
@@ -3849,11 +4405,16 @@ unsafe fn station_stop(obj: u32) {
         wd(STATION_FLAG, 0);
         wd(STATION_VOLUME, 0);
         wd(STATION_OWNER, 0);
+        g
     }
 }
 
 extern "C" fn station_stop_entry(r: &mut Pushad, _: *const u32) {
-    unsafe { station_stop(r.eax) };
+    let p = *r;
+    let g = unsafe { station_stop(&p) };
+    r.eax = g.eax;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
 regs_thunk!(station_stop_thunk, station_stop_entry);
 
@@ -3861,54 +4422,78 @@ regs_thunk!(station_stop_thunk, station_stop_entry);
 
 /// With a lock set: the reticule update with 0.0, both lock words cleared, then (tail call) the
 /// voice stop of the lock-on sound handle. Returns the EAX of that last call, `None` with no lock.
-unsafe fn target_lock_clear() -> Option<u32> {
+unsafe fn target_lock_clear(p: &Pushad) -> Option<Regs> {
     unsafe {
         if rd(TARGET_LOCK_A) == 0 {
             bump(LOCK_CLEAR_ID, 0);
             return None;
         }
         bump(LOCK_CLEAR_ID, 1);
-        call_regs(RETICULE_UPDATE_FN, 0, 0, 0, 0, 0, &[0]);
+        // Both calls carry the caller's other registers and whatever the first call left.
+        let mut g = Regs::of(p);
+        g.ecx = 0;
+        g.edx = 0;
+        call_all(RETICULE_UPDATE_FN, &mut g, &[0], false);
         wd(TARGET_LOCK_B, 0);
         wd(TARGET_LOCK_A, 0);
-        Some(call_regs(VOICE_STOP_FN, 0, LOCK_HANDLE, 0, 0, 0, &[]))
+        g.ecx = LOCK_HANDLE;
+        call_all(VOICE_STOP_FN, &mut g, &[], false);
+        Some(g)
     }
 }
 
 extern "C" fn target_lock_clear_entry(r: &mut Pushad, _: *const u32) {
-    if let Some(e) = unsafe { target_lock_clear() } {
-        r.eax = e;
+    let p = *r;
+    if let Some(g) = unsafe { target_lock_clear(&p) } {
+        r.eax = g.eax;
+        r.ecx = g.ecx;
+        r.edx = g.edx;
     }
 }
 regs_thunk!(target_lock_clear_thunk, target_lock_clear_entry);
 
 // --- 0x9C3E50 weapon_remove_reserve_ammo (ECX = human, ESI = instance, EDX = amount -> EAX removed) -------
 
-unsafe fn remove_reserve_ammo(human: u32, inst: u32, amount: u32) -> u32 {
+unsafe fn remove_reserve_ammo(p: &Pushad) -> Regs {
     unsafe {
-        if human == 0 || inst == 0 || (amount as i32) <= 0 {
+        let mut g = Regs::of(p);
+        if p.ecx == 0 || p.esi == 0 || (p.edx as i32) <= 0 {
             bump(REMOVE_RESERVE_ID, 0);
-            return 0;
+            g.eax = 0;
+            return g;
         }
-        let i = inst as usize;
-        if call_regs(HUMAN_IS_PLAYER_FN, 0, human, 0, 0, 0, &[]) as u8 != 0 {
+        let i = p.esi as usize;
+        call_all(HUMAN_IS_PLAYER_FN, &mut g, &[], false);
+        if g.eax as u8 != 0 {
             let info = rd(i + 8) as usize;
+            g.eax = info as u32;
             if rd(info + 0x34) != 0x16 {
                 bump(REMOVE_RESERVE_ID, 1);
-                let store = rd(human as usize + 0x11DC);
-                return call_regs(AMMO_STORE_REMOVE_FN, amount, inst, 0, 0, 0, &[store]);
+                let store = rd(g.ecx as usize + 0x11DC);
+                g.ecx = store;
+                g.eax = g.edx;
+                g.ecx = p.esi;
+                call_all(AMMO_STORE_REMOVE_FN, &mut g, &[store], false);
+                return g;
             }
         }
         bump(REMOVE_RESERVE_ID, 2);
         let have = rd(i + 0x14) as i32;
-        let take = if (amount as i32) < have { amount as i32 } else { have };
+        let amount = g.edx as i32;
+        let take = if amount < have { amount } else { have };
         wd(i + 0x14, (have - take) as u32);
-        take as u32
+        g.eax = take as u32;
+        g.ecx = (have - take) as u32;
+        g
     }
 }
 
 extern "C" fn remove_reserve_ammo_entry(r: &mut Pushad, _: *const u32) {
-    r.eax = unsafe { remove_reserve_ammo(r.ecx, r.esi, r.edx) };
+    let p = *r;
+    let g = unsafe { remove_reserve_ammo(&p) };
+    r.eax = g.eax;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
 regs_thunk!(remove_reserve_ammo_thunk, remove_reserve_ammo_entry);
 
@@ -4011,27 +4596,24 @@ const DJ_FLAG: usize = 0x00E9_A548;
 const STATION_STOP_FN: usize = 0x0048_D900; // EAX = vehicle
 const DJ_STOP_FN: usize = 0x0048_D970; // cdecl (fade ms)
 
-/// The string hash of 0xBDCB30 with seed 0 (ECX = the name).
-unsafe fn name_hash(name: u32) -> u32 {
-    let mut h: u32 = 0;
-    unsafe {
-        call_regs(NAME_HASH_FN, 0, name, 0, 0, 0, &[&mut h as *mut u32 as u32]);
-        std::ptr::read_volatile(&h)
-    }
-}
-
 // --- 0x48F780 radio_track_find_by_name (ECX = name -> AX track index, 0xFFFF when absent) --------------
 
-unsafe fn radio_track_find(name: u32) -> u32 {
+unsafe fn radio_track_find(p: &Pushad, buf: usize) -> Regs {
     unsafe {
-        let hash = name_hash(name);
+        wd(buf, p.ecx);
+        let mut g = Regs { eax: 0, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp };
+        call_all(NAME_HASH_FN, &mut g, &[buf as u32], false);
+        let hash = rd(buf);
         let count = rw(RADIO_TRACK_COUNT) as u32;
         let mut i = 0u32;
+        let mut out = Regs { eax: 0xFFFF, ecx: p.ecx, edx: g.edx, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp };
         if count != 0 {
+            out.edx = hash;
             let base = rd(RADIO_TRACKS) as usize;
             loop {
                 if rd(base + (i as usize & 0xFFFF) * 0x14) == hash {
-                    return i;
+                    out.eax = i;
+                    return out;
                 }
                 i += 1;
                 if (i as u16) >= count as u16 {
@@ -4039,28 +4621,41 @@ unsafe fn radio_track_find(name: u32) -> u32 {
                 }
             }
         }
-        0xFFFF
+        out
     }
 }
 
 extern "C" fn radio_track_find_entry(r: &mut Pushad, _: *const u32) {
+    let buf = r as *mut Pushad as usize + 32;
     let p = *r;
-    r.eax = checked_eax(RADIO_TRACK_FIND_ID, &p, 0, unsafe { radio_track_find(p.ecx) });
+    let g = unsafe { radio_track_find(&p, buf) };
+    r.eax = g.eax;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
-regs_thunk!(radio_track_find_thunk, radio_track_find_entry);
+frame_thunk!(radio_track_find_thunk, radio_track_find_entry, "ret", 4);
 
 // --- 0x4904F0 radio_station_find_by_name (ECX = name -> AX station index, the default when absent) ------
 
-unsafe fn radio_station_find(name: u32) -> u32 {
+/// The hash goes to the stack slot of the original's `push ecx` (the 4 bytes below the return
+/// address, reserved by the thunk; the slot starts as the caller's ECX), so the callee sees the same
+/// pointer. Registers: ECX = the caller's again, EDX = the hash (when the table is not empty).
+unsafe fn radio_station_find(p: &Pushad, buf: usize) -> Regs {
     unsafe {
-        let hash = name_hash(name);
+        wd(buf, p.ecx);
+        let mut g = Regs { eax: 0, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp };
+        call_all(NAME_HASH_FN, &mut g, &[buf as u32], false);
+        let hash = rd(buf);
         let count = rw(RADIO_STATION_COUNT) as u32;
         let mut i = 0u32;
+        let mut out = Regs { eax: 0, ecx: p.ecx, edx: g.edx, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp };
         if count != 0 {
+            out.edx = hash;
             let base = rd(RADIO_STATIONS) as usize;
             loop {
                 if rd(base + (i as usize & 0xFFFF) * 0x48 + 4) == hash {
-                    return i;
+                    out.eax = i;
+                    return out;
                 }
                 i += 1;
                 if (i as u16) >= count as u16 {
@@ -4069,29 +4664,42 @@ unsafe fn radio_station_find(name: u32) -> u32 {
             }
         }
         // `mov ax, [default]` keeps the upper half of EAX, which is the loop's count (< 0x10000) or 0
-        rw(RADIO_STATION_DEFAULT) as u32
+        out.eax = rw(RADIO_STATION_DEFAULT) as u32;
+        out
     }
 }
 
 extern "C" fn radio_station_find_entry(r: &mut Pushad, _: *const u32) {
+    let buf = r as *mut Pushad as usize + 32;
     let p = *r;
-    r.eax = checked_eax(RADIO_STATION_FIND_ID, &p, 0, unsafe { radio_station_find(p.ecx) });
+    let g = unsafe { radio_station_find(&p, buf) };
+    r.eax = g.eax;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
-regs_thunk!(radio_station_find_thunk, radio_station_find_entry);
+frame_thunk!(radio_station_find_thunk, radio_station_find_entry, "ret", 4);
+
 
 // --- 0x48D970 radio_dj_voice_stop (cdecl (fade ms)) ---------------------------------------------------
 
-unsafe fn dj_voice_stop(ms: u32) {
+unsafe fn dj_voice_stop(p: &Pushad, ms: u32) -> Regs {
     unsafe {
         let h = rd(DJ_HANDLE);
         let al = h as u8;
+        let mut g = Regs::of(p);
+        g.eax = h;
         if al != 0xFF {
-            let g = h >> 8;
-            if g != 0 {
-                let s = VOICE_SLOTS + al as usize * SLOT_SIZE;
-                if g == vr32(s + 0xB4) && vr32(s) != 0xFFFF_FFFF {
+            let gen_ = h >> 8;
+            g.edx = gen_;
+            if gen_ != 0 {
+                let off = al as u32 * SLOT_SIZE as u32;
+                let s = VOICE_SLOTS + off as usize;
+                g.eax = al as u32;
+                g.ecx = off;
+                if gen_ == vr32(s + 0xB4) && vr32(s) != 0xFFFF_FFFF {
                     bump(DJ_STOP_ID, 0);
-                    call_regs(SLOT_FADE_OUT_FN, al as u32, 0, ms, 0, 0, &[]);
+                    g.edx = ms;
+                    call_all(SLOT_FADE_OUT_FN, &mut g, &[], false);
                 }
             }
         }
@@ -4099,72 +4707,103 @@ unsafe fn dj_voice_stop(ms: u32) {
         wd(0x0252_7CD0, 0);
         wd(DJ_FLAG, 0);
         wd(DJ_OWNER, 0);
+        g.eax = 0;
+        g
     }
 }
 
 extern "C" fn dj_voice_stop_entry(r: &mut Pushad, a: *const u32) {
-    unsafe { dj_voice_stop(parg(a, 0)) };
+    let p = *r;
+    let g = unsafe { dj_voice_stop(&p, parg(a, 0)) };
     r.eax = 0;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
 regs_thunk!(dj_voice_stop_thunk, dj_voice_stop_entry);
 
 // --- 0x48E330 vehicle_radio_turn_off (ESI = vehicle -> AL) / 0x490EB0 vehicle_radio_block (ESI = vehicle) ---
 
 /// Stop the three radio voices at +0x8D40 / +0x8D4C / +0x8D58, the station voice, and the DJ voice
-/// (750 ms) when this vehicle owns it. Returns the EAX the last call leaves.
-unsafe fn stop_radio_voices(veh: u32) -> u32 {
+/// (750 ms) when this vehicle owns it; every call by address with ESI = the vehicle and the
+/// registers the previous call left. `block`: 0x490EB0 (EAX = the owner id compared; ECX = 0x2EE after
+/// the DJ call's `pop ecx`), else 0x48E330 (ECX = the owner id; AL = 1 at the end).
+unsafe fn stop_radio_voices(g: &mut Regs, veh: u32, block: bool) {
     unsafe {
         let v = veh as usize;
-        call_regs(VOICE_STOP_FN, 0, veh + 0x8D40, 0, 0, 0, &[]);
-        call_regs(VOICE_STOP_FN, 0, veh + 0x8D4C, 0, 0, 0, &[]);
-        call_regs(VOICE_STOP_FN, 0, veh + 0x8D58, 0, 0, 0, &[]);
-        let mut e = call_regs(STATION_STOP_FN, veh, 0, 0, 0, 0, &[]);
-        if rd(v + 0x44) == rd(DJ_OWNER) {
-            e = call_regs(DJ_STOP_FN, 0, 0, 0, 0, 0, &[0x2EE]);
+        for off in [0x8D40u32, 0x8D4C, 0x8D58] {
+            g.ecx = veh + off;
+            call_all(VOICE_STOP_FN, g, &[], false);
         }
-        e
+        g.eax = veh;
+        call_all(STATION_STOP_FN, g, &[], false);
+        if block {
+            g.eax = rd(v + 0x44);
+            if g.eax == rd(DJ_OWNER) {
+                call_all(DJ_STOP_FN, g, &[0x2EE], false);
+                g.ecx = 0x2EE;
+            }
+        } else {
+            g.ecx = rd(v + 0x44);
+            if g.ecx == rd(DJ_OWNER) {
+                call_all(DJ_STOP_FN, g, &[0x2EE], false);
+            }
+            g.eax = (g.eax & !0xFF) | 1;
+        }
     }
 }
 
-unsafe fn vehicle_radio_turn_off(veh: u32) -> u32 {
+unsafe fn vehicle_radio_turn_off(p: &Pushad) -> Regs {
     unsafe {
+        let veh = p.esi;
         let v = veh as usize;
         let info = rd(v + 0x84E4);
-        if rd(info as usize + 0x5B0) & 0x0400_0000 == 0 {
+        let mut g = Regs::of(p);
+        g.eax = info;
+        if rd(info as usize + 0x5B0) & 0x0400_0000 == 0 || rb(v + 0x8D84) & 1 != 0 {
             bump(RADIO_OFF_ID, 0);
-            return info & !0xFF;
-        }
-        if rb(v + 0x8D84) & 1 != 0 {
-            bump(RADIO_OFF_ID, 0);
-            return info & !0xFF;
+            g.eax = info & !0xFF;
+            return g;
         }
         bump(RADIO_OFF_ID, 1);
-        let e = stop_radio_voices(veh);
-        (e & !0xFF) | 1
+        stop_radio_voices(&mut g, veh, false);
+        g
     }
 }
 
 extern "C" fn vehicle_radio_turn_off_entry(r: &mut Pushad, _: *const u32) {
-    r.eax = unsafe { vehicle_radio_turn_off(r.esi) };
+    let p = *r;
+    let g = unsafe { vehicle_radio_turn_off(&p) };
+    r.eax = g.eax;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
 regs_thunk!(vehicle_radio_turn_off_thunk, vehicle_radio_turn_off_entry);
 
-unsafe fn vehicle_radio_block(veh: u32) {
+unsafe fn vehicle_radio_block(p: &Pushad) -> Regs {
     unsafe {
+        let veh = p.esi;
         let v = veh as usize;
         let al = rb(v + 0x8D84);
+        let mut g = Regs::of(p);
+        g.eax = (p.eax & !0xFF) | (al | 1) as u32;
         if al & 1 != 0 {
             bump(RADIO_BLOCK_ID, 0);
-            return;
+            g.eax = (p.eax & !0xFF) | al as u32;
+            return g;
         }
         bump(RADIO_BLOCK_ID, 1);
         wb(v + 0x8D84, al | 1);
-        stop_radio_voices(veh);
+        stop_radio_voices(&mut g, veh, true);
+        g
     }
 }
 
 extern "C" fn vehicle_radio_block_entry(r: &mut Pushad, _: *const u32) {
-    unsafe { vehicle_radio_block(r.esi) };
+    let p = *r;
+    let g = unsafe { vehicle_radio_block(&p) };
+    r.eax = g.eax;
+    r.ecx = g.ecx;
+    r.edx = g.edx;
 }
 regs_thunk!(vehicle_radio_block_thunk, vehicle_radio_block_entry);
 

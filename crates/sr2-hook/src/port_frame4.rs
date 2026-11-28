@@ -23,6 +23,685 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::portlib::*;
+include!("fix_thunks.inc");
+
+// Thunks that keep XMM0-7, give the Rust body `out: *mut [u32; 7]` = entry [ecx, edx, eax, ebx, esi, edi, ebp] as FIRST parameter
+// (the original's ECX/EDX at exit are whatever the body leaves in out[0]/out[1]; EAX at exit is the body's u32 return value).
+// kzN: N stack arguments follow `out`. kzf/kzfa: the thunk first reserves the original's local frame (`sub esp, FRAME`, or the
+// original's `mov eax, FRAME; call 0xca0820` probe for kzfa), the body gets (out, x, args...) with x = esp right after that
+// reservation, and the thunk releases the frame before `ret`.
+
+#[allow(unused_macros)]
+macro_rules! kz_thunk0 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 128 + 0]",
+                "push eax",
+                "call {f}",
+                "add esp, 4",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "ret",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kz_thunk1 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + 160]",
+                "lea eax, [esp + 128 + 4]",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "ret",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kz_thunk2 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + 164]",
+                "push dword ptr [esp + 164]",
+                "lea eax, [esp + 128 + 8]",
+                "push eax",
+                "call {f}",
+                "add esp, 12",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "ret",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kz_thunk3 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + 168]",
+                "push dword ptr [esp + 168]",
+                "push dword ptr [esp + 168]",
+                "lea eax, [esp + 128 + 12]",
+                "push eax",
+                "call {f}",
+                "add esp, 16",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "ret",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzf_thunk0 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {fr}",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 156 + 0]",
+                "push eax",
+                "lea eax, [esp + 128 + 4]",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzf_thunk1 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {fr}",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 160]",
+                "lea eax, [esp + 156 + 4]",
+                "push eax",
+                "lea eax, [esp + 128 + 8]",
+                "push eax",
+                "call {f}",
+                "add esp, 12",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzf_thunk2 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {fr}",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 164]",
+                "push dword ptr [esp + {fr} + 164]",
+                "lea eax, [esp + 156 + 8]",
+                "push eax",
+                "lea eax, [esp + 128 + 12]",
+                "push eax",
+                "call {f}",
+                "add esp, 16",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzf_thunk3 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {fr}",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 168]",
+                "push dword ptr [esp + {fr} + 168]",
+                "push dword ptr [esp + {fr} + 168]",
+                "lea eax, [esp + 156 + 12]",
+                "push eax",
+                "lea eax, [esp + 128 + 16]",
+                "push eax",
+                "call {f}",
+                "add esp, 20",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzfa_thunk0 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "mov eax, {fr}",
+                "call dword ptr [{alloca}]",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 156 + 0]",
+                "push eax",
+                "lea eax, [esp + 128 + 4]",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+                alloca = sym ALLOCA_PROBE,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzfa_thunk1 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "mov eax, {fr}",
+                "call dword ptr [{alloca}]",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 160]",
+                "lea eax, [esp + 156 + 4]",
+                "push eax",
+                "lea eax, [esp + 128 + 8]",
+                "push eax",
+                "call {f}",
+                "add esp, 12",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+                alloca = sym ALLOCA_PROBE,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzfa_thunk2 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "mov eax, {fr}",
+                "call dword ptr [{alloca}]",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 164]",
+                "push dword ptr [esp + {fr} + 164]",
+                "lea eax, [esp + 156 + 8]",
+                "push eax",
+                "lea eax, [esp + 128 + 12]",
+                "push eax",
+                "call {f}",
+                "add esp, 16",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+                alloca = sym ALLOCA_PROBE,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzfa_thunk3 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "mov eax, {fr}",
+                "call dword ptr [{alloca}]",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 168]",
+                "push dword ptr [esp + {fr} + 168]",
+                "push dword ptr [esp + {fr} + 168]",
+                "lea eax, [esp + 156 + 12]",
+                "push eax",
+                "lea eax, [esp + 128 + 16]",
+                "push eax",
+                "call {f}",
+                "add esp, 20",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+                alloca = sym ALLOCA_PROBE,
+            )
+        }
+    };
+}
+
+#[allow(dead_code)]
+static ALLOCA_PROBE: usize = 0x00CA_0820;
+
+/// `call_regs` with EBX and EBP set too (any callee-saved register can be an LTCG callee input); returns the
+/// callee's (EAX, ECX, EDX). ESP is restored by scanning for a marker pushed above the arguments (cdecl and ret N).
+#[inline(never)]
+unsafe fn call_xr(f: usize, eax: u32, ecx: u32, edx: u32, ebx: u32, esi: u32, edi: u32, ebp: u32, args: &[u32]) -> (u32, u32, u32) {
+    #[cfg(test)]
+    let f = fa(f);
+    let mut block: [u32; 12] = [f as u32, ecx, edx, esi, edi, args.as_ptr() as u32, args.len() as u32, eax, ebx, ebp, 0, 0];
+    let r: u32;
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "push eax",
+            "push 0x5EC0DE01",
+            "mov ebx, eax",
+            "mov ecx, [ebx + 24]",
+            "mov esi, [ebx + 20]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]", "mov esi, [ebx + 12]", "mov edi, [ebx + 16]",
+            "mov ebp, [ebx + 36]", "mov eax, [ebx + 28]",
+            "call 6f",
+            "mov esi, esp",
+            "4:",
+            "cmp dword ptr [esi], 0x5EC0DE01",
+            "je 5f",
+            "add esi, 4",
+            "jmp 4b",
+            "5:",
+            "lea esp, [esi + 4]",
+            "pop ebx",
+            "mov [ebx + 40], ecx",
+            "mov [ebx + 44], edx",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            "jmp 9f",
+            "6:",
+            "push dword ptr [ebx]",
+            "mov ebx, [ebx + 32]",
+            "ret",
+            "9:",
+            inout("eax") block.as_mut_ptr() => r, lateout("ecx") _, lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    (r, block[10], block[11])
+}
 
 // The offline differential test (module `difftest`) keeps the game's globals (0xD00000..0x350000)
 // at a fixed offset, because their addresses are taken in a test process; the Rust ports read
@@ -177,7 +856,7 @@ unsafe fn ah_set(item: u32, index: u32, ty: u32, val: u32) {
     ah(3);
 }
 
-keep_ecx_edx!(activity_hud_markers_thunk, activity_hud_markers_apply);
+kxs0!(activity_hud_markers_thunk, activity_hud_markers_apply);
 
 extern "C" fn activity_hud_markers_apply() {
     unsafe {
@@ -232,7 +911,7 @@ extern "C" fn activity_hud_markers_apply() {
 
 hits!(NR_HITS, NR_NAMES, nr, ["calls", "types", "objs", "remote", "own"]);
 
-keep_ecx_edx!(net_remote_objects_thunk, net_remote_objects_do_frame);
+kxs0!(net_remote_objects_thunk, net_remote_objects_do_frame);
 
 extern "C" fn net_remote_objects_do_frame() {
     unsafe {
@@ -303,7 +982,7 @@ fn nu_hash(key: u32) -> u32 {
     (((ecx as i32) >> 16) as u32) ^ ecx
 }
 
-keep_ecx_edx!(net_registered_objects_thunk, net_registered_objects_update);
+kxs0!(net_registered_objects_thunk, net_registered_objects_update);
 
 extern "C" fn net_registered_objects_update() {
     unsafe {
@@ -397,7 +1076,7 @@ extern "C" fn net_registered_objects_update() {
 
 hits!(SD_HITS, SD_NAMES, sd, ["calls", "entries", "freed", "nodes", "due", "spawn"]);
 
-keep_ecx_edx!(septic_decals_thunk, septic_decals_update);
+kxs0!(septic_decals_thunk, septic_decals_update);
 
 extern "C" fn septic_decals_update() {
     unsafe {
@@ -462,7 +1141,7 @@ extern "C" fn septic_decals_update() {
 
 hits!(RZ_HITS, RZ_NAMES, rz, ["calls", "run", "zone", "setting", "set_changed", "cur_changed"]);
 
-keep_ecx_edx!(restricted_zones_thunk, restricted_zones_update);
+kxs0!(restricted_zones_thunk, restricted_zones_update);
 
 extern "C" fn restricted_zones_update() {
     unsafe {
@@ -529,7 +1208,7 @@ extern "C" fn restricted_zones_update() {
 
 hits!(HN_HITS, HN_NAMES, hn, ["calls", "humans", "active", "none", "store"]);
 
-keep_ecx_edx_arg1!(humans_update_neighborhoods_thunk, humans_update_neighborhoods);
+kxs1!(humans_update_neighborhoods_thunk, humans_update_neighborhoods);
 
 extern "C" fn humans_update_neighborhoods(dt: u32) {
     unsafe {
@@ -586,7 +1265,7 @@ extern "C" fn humans_update_neighborhoods(dt: u32) {
 
 hits!(HD_HITS, HD_NAMES, hd, ["calls", "release", "float", "chain", "item", "request", "req_clear"]);
 
-keep_ecx_edx!(hud_do_frame_thunk, hud_do_frame);
+kxs0!(hud_do_frame_thunk, hud_do_frame);
 
 extern "C" fn hud_do_frame() {
     unsafe {
@@ -881,7 +1560,7 @@ extern "C" fn humans_character_step(dt: u32, flag: u32) {
 
 hits!(PO_HITS, PO_NAMES, po, ["calls", "groups", "slots", "busy", "freed", "owner_empty", "update"]);
 
-keep_ecx_edx!(population_update_thunk, population_update);
+kxs0!(population_update_thunk, population_update);
 
 extern "C" fn population_update() -> u32 {
     unsafe {

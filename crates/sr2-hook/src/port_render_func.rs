@@ -229,12 +229,30 @@ macro_rules! regs_thunk {
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
-                "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 128]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 "ret",
                 f = sym $f,
@@ -300,27 +318,43 @@ fn check_preserved(id: usize, inp: &Regs, out: &Regs) {
 
 // --- 0x4B4A60 tod_occlusion_allowed (no args -> EAX = 0 / 1) --------------------------------------
 
+/// x87 NaN propagation for a binary op: a lone NaN operand comes out quieted; with two NaNs the one
+/// with the larger significand wins (SSE would take the first operand).
+fn nm(a: f64, b: f64, r: f64) -> f64 {
+    if !(a.is_nan() || b.is_nan()) {
+        return r;
+    }
+    let q = |x: f64| x.to_bits() | 0x0008_0000_0000_0000;
+    let sig = |x: f64| x.to_bits() & 0x000F_FFFF_FFFF_FFFF;
+    let pick = if a.is_nan() && b.is_nan() { if sig(b) > sig(a) { b } else { a } } else if a.is_nan() { a } else { b };
+    f64::from_bits(q(pick))
+}
+
 /// v1 = f32(b + (a - b) * t), v = f32((v1 - 1) * s + 1), all in 53-bit arithmetic (a = [0x26128F8],
 /// b = [0x26128FC], t = [0x2612900], s = [0x2612908]). The original compares v with the constant
 /// at 0xDD32C0 (0.0) by `fcomp; fnstsw; test ah, 0x41; je`: the jump (result 1) is taken when
 /// neither C0 (v < c) nor C3 (v == c) is set, i.e. v > c; a NaN sets both, so it falls through to
 /// the byte test. Result 1 when v > 0.0, or when the byte [0x2612904] is 0; else 0.
-unsafe fn tod_occlusion_allowed() -> bool {
+unsafe fn tod_occlusion_allowed() -> (bool, u32) {
     unsafe {
         let a = f32::from_bits(rd(0x0261_28F8)) as f64;
         let b = f32::from_bits(rd(0x0261_28FC)) as f64;
         let t = f32::from_bits(rd(0x0261_2900)) as f64;
         let s = f32::from_bits(rd(0x0261_2908)) as f64;
-        let v1 = ((a - b) * t + b) as f32;
-        let v = ((v1 as f64 - 1.0) * s + 1.0) as f32;
-        v > 0.0 || rb(0x0261_2904) == 0
+        let v1 = nm(nm(nm(a, b, a - b), t, nm(a, b, a - b) * t), b, nm(nm(a, b, a - b), t, nm(a, b, a - b) * t) + b) as f32;
+        let d = nm(v1 as f64, 1.0, v1 as f64 - 1.0);
+        let m = nm(d, s, d * s);
+        let v = nm(m, 1.0, m + 1.0) as f32;
+        (v > 0.0 || rb(0x0261_2904) == 0, v.to_bits())
     }
 }
 
 extern "C" fn tod_occlusion_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    let ours = unsafe { tod_occlusion_allowed() } as u32;
+    let (ok, vbits) = unsafe { tod_occlusion_allowed() };
+    let ours = ok as u32;
     r.eax = ours;
+    r.ecx = vbits; // `fstp dword [esp]` overwrote the pushed ECX; `pop ecx` leaves the value bits
     let Some((n, orig)) = shadowing(TOD) else { return };
     let inp = Regs::of(&p);
     let mut out = inp;
@@ -381,6 +415,21 @@ extern "C" fn camera_get_entry(r: &mut Pushad, args: *const u32) {
         }
     }
     unsafe { human_camera_get(p.ecx, p.eax, mat) };
+    // Exit ECX / EDX as the original's last writes leave them (the `rep movsd` leaves ECX = 0).
+    unsafe {
+        let local = p.ecx == rd(LOCAL_PLAYER);
+        if p.eax != 0 {
+            if local {
+                r.ecx = rd(CAMERA_POS + 8);
+                r.edx = rd(CAMERA_POS + 4);
+            } else {
+                r.edx = rd(p.ecx as usize + 0x12A8);
+            }
+        }
+        if mat != 0 {
+            r.ecx = 0;
+        }
+    }
     if let Some((n, _)) = shadow {
         unsafe {
             for i in 0..3 {
@@ -477,7 +526,7 @@ extern "C" fn game_render_func() {
         // 9. The occlusion flag [0xE99382]: 0 unless [0xE996E4] is set and DL is 0; then
         //    [0x2526CC4] when [0x2526CC3] == 1, else tod_occlusion_allowed() (AL).
         let flag = if rb(TOD_ENABLED) != 0 && no_occlusion == 0 {
-            if rb(TOD_FORCE_A) == 1 { rb(TOD_FORCE_B) } else { tod_occlusion_allowed() as u8 }
+            if rb(TOD_FORCE_A) == 1 { rb(TOD_FORCE_B) } else { tod_occlusion_allowed().0 as u8 }
         } else {
             0
         };

@@ -64,6 +64,84 @@ fn tgt(a: usize) -> usize {
     }
 }
 
+/// The seven general registers as a straight-line asm function would hold them. `call` runs a game
+/// function with exactly these registers (EBX / EBP and the callee's own stack arguments included)
+/// and leaves in the struct what the callee left, so a port threads the original's register flow:
+/// the original passes the caller's EBX / EBP to its callees, reads the ECX / EDX a callee leaves,
+/// and sees a callee's changes to registers it never saved. ESP is restored from a TEB scratch slot
+/// (`fs:[0x14]`, saved and restored around the call), so the callee may pop its own arguments or
+/// not. The callee sees `args` (at most 8) and zero padding above them.
+#[derive(Clone, Copy)]
+pub(crate) struct St {
+    pub eax: u32,
+    pub ecx: u32,
+    pub edx: u32,
+    pub ebx: u32,
+    pub esi: u32,
+    pub edi: u32,
+    pub ebp: u32,
+}
+
+impl St {
+    #[inline(always)]
+    fn of(r: &Pushad) -> St {
+        St { eax: r.eax, ecx: r.ecx, edx: r.edx, ebx: r.ebx, esi: r.esi, edi: r.edi, ebp: r.ebp }
+    }
+
+    /// Call a game function by address (the offline test may redirect it); returns its EAX.
+    #[inline(always)]
+    unsafe fn call(&mut self, f: usize, args: &[u32]) -> u32 {
+        unsafe { call_regs_st(tgt(f), self, args) };
+        self.eax
+    }
+
+    /// Call through a function pointer read from game memory.
+    #[inline(always)]
+    unsafe fn calli(&mut self, f: u32, args: &[u32]) -> u32 {
+        unsafe { call_regs_st(f as usize, self, args) };
+        self.eax
+    }
+}
+
+#[inline(never)]
+unsafe fn call_regs_st(f: usize, st: &mut St, args: &[u32]) {
+    let mut a8 = [0u32; 8];
+    a8[..args.len()].copy_from_slice(args);
+    let block: [u32; 3] = [f as u32, a8.as_ptr() as u32, st as *mut St as u32];
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "push dword ptr [eax + 8]",
+            "push dword ptr fs:[0x14]",
+            "mov ebx, eax",
+            "mov fs:[0x14], esp",
+            "push dword ptr [ebx]",
+            "mov esi, [ebx + 4]",
+            "mov ecx, 8",
+            "2:",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jnz 2b",
+            "mov ebx, [ebx + 8]",
+            "mov eax, [ebx]", "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]",
+            "mov esi, [ebx + 16]", "mov edi, [ebx + 20]", "mov ebp, [ebx + 24]", "mov ebx, [ebx + 12]",
+            "call dword ptr [esp + 32]",
+            "push edi",
+            "mov edi, fs:[0x14]",
+            "mov edi, [edi + 4]",
+            "mov [edi], eax", "mov [edi + 4], ecx", "mov [edi + 8], edx", "mov [edi + 12], ebx",
+            "mov [edi + 16], esi", "mov [edi + 24], ebp",
+            "pop dword ptr [edi + 20]",
+            "mov esp, fs:[0x14]",
+            "pop dword ptr fs:[0x14]",
+            "add esp, 4",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("eax") block.as_ptr() => _, lateout("ecx") _, lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+}
+
 #[inline(always)]
 unsafe fn cr(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> u32 {
     unsafe { call_regs(tgt(f), eax, ecx, edx, esi, edi, args) }
@@ -1150,8 +1228,16 @@ const B_large_convoy_objective_get_start_message: [u8; 20] = [0x56, 0x57, 0xBF, 
 unsafe fn f_large_convoy_objective_get_start_message(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    // push esi/edi; edi = fallback, esi = id; call lstr_get*; ESI/EDI restored by popad
-    cr(0x7f49e0, r.eax, r.ecx, r.edx, 0xde88c8, 0xde8898, &[])
+    let mut s = St::of(r);
+    s.esi = 0xde88c8;
+    s.edi = 0xde8898;
+    s.call(0x7f49e0, &[]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_large_convoy_objective_get_start_message, f_large_convoy_objective_get_start_message, c_large_convoy_objective_get_start_message, "ret");
@@ -1161,8 +1247,16 @@ const B_liberator_objective_get_start_message: [u8; 20] = [0x56, 0x57, 0xBF, 0xB
 unsafe fn f_liberator_objective_get_start_message(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    // push esi/edi; edi = fallback, esi = id; call lstr_get*; ESI/EDI restored by popad
-    cr(0x7f4ad0, r.eax, r.ecx, r.edx, 0xde8b20, 0xde8ab8, &[])
+    let mut s = St::of(r);
+    s.esi = 0xde8b20;
+    s.edi = 0xde8ab8;
+    s.call(0x7f4ad0, &[]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_liberator_objective_get_start_message, f_liberator_objective_get_start_message, c_liberator_objective_get_start_message, "ret");
@@ -1172,8 +1266,16 @@ const B_hostage_diversion_get_title: [u8; 20] = [0x56, 0x57, 0xBF, 0x48, 0x54, 0
 unsafe fn f_hostage_diversion_get_title(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    // push esi/edi; edi = fallback, esi = id; call lstr_get*; ESI/EDI restored by popad
-    cr(0x7f49e0, r.eax, r.ecx, r.edx, 0xdf5458, 0xdf5448, &[])
+    let mut s = St::of(r);
+    s.esi = 0xdf5458;
+    s.edi = 0xdf5448;
+    s.call(0x7f49e0, &[]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_hostage_diversion_get_title, f_hostage_diversion_get_title, c_hostage_diversion_get_title, "ret");
@@ -1183,8 +1285,16 @@ const B_mugging_diversion_get_title: [u8; 20] = [0x56, 0x57, 0xBF, 0x60, 0x57, 0
 unsafe fn f_mugging_diversion_get_title(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    // push esi/edi; edi = fallback, esi = id; call lstr_get*; ESI/EDI restored by popad
-    cr(0x7f4ad0, r.eax, r.ecx, r.edx, 0xdf5768, 0xdf5760, &[])
+    let mut s = St::of(r);
+    s.esi = 0xdf5768;
+    s.edi = 0xdf5760;
+    s.call(0x7f4ad0, &[]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_mugging_diversion_get_title, f_mugging_diversion_get_title, c_mugging_diversion_get_title, "ret");
@@ -1194,8 +1304,16 @@ const B_poker_diversion_get_title: [u8; 20] = [0x56, 0x57, 0xBF, 0x0C, 0x98, 0xD
 unsafe fn f_poker_diversion_get_title(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    // push esi/edi; edi = fallback, esi = id; call lstr_get*; ESI/EDI restored by popad
-    cr(0x7f4ad0, r.eax, r.ecx, r.edx, 0xdf9818, 0xdf980c, &[])
+    let mut s = St::of(r);
+    s.esi = 0xdf9818;
+    s.edi = 0xdf980c;
+    s.call(0x7f4ad0, &[]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_poker_diversion_get_title, f_poker_diversion_get_title, c_poker_diversion_get_title, "ret");
@@ -1205,8 +1323,16 @@ const B_hitman_diversion_get_title: [u8; 20] = [0x56, 0x57, 0xBF, 0x10, 0x9F, 0x
 unsafe fn f_hitman_diversion_get_title(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    // push esi/edi; edi = fallback, esi = id; call lstr_get*; ESI/EDI restored by popad
-    cr(0x7f49e0, r.eax, r.ecx, r.edx, 0xdf9f34, 0xdf9f10, &[])
+    let mut s = St::of(r);
+    s.esi = 0xdf9f34;
+    s.edi = 0xdf9f10;
+    s.call(0x7f49e0, &[]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_hitman_diversion_get_title, f_hitman_diversion_get_title, c_hitman_diversion_get_title, "ret");
@@ -1217,8 +1343,20 @@ unsafe fn f_hostage_diversion_get_start_message(r: &mut Pushad, a: *const u32) -
     let _ = a;
     unsafe {
     // esi = lstr_get(esi=0xdf5428, edi=0xdf53c8); then esi = arg1, edi = arg0, snwprintf(eax = the string)
-    let s = cr(0x7f49e0, r.eax, r.ecx, r.edx, 0xdf5428, 0xdf53c8, &[]);
-    cr(0xc14c40, s, r.ecx, r.edx, arg(a, 1), arg(a, 0), &[s])
+    let mut s = St::of(r);
+    s.esi = 0xdf5428;
+    s.edi = 0xdf53c8;
+    s.call(0x7f49e0, &[]);
+    s.esi = arg(a, 1);
+    s.edi = arg(a, 0);
+    let str = s.eax;
+    s.call(0xc14c40, &[str]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_hostage_diversion_get_start_message, f_hostage_diversion_get_start_message, c_hostage_diversion_get_start_message, "ret 8");
@@ -1229,7 +1367,16 @@ unsafe fn f_mugging_diversion_get_start_message(r: &mut Pushad, a: *const u32) -
     let _ = a;
     unsafe {
     // esi = arg0, edi = arg1, util_sprintf-like(0xc14b50)(0xdc5797)
-    cr(0xc14b50, r.eax, r.ecx, r.edx, arg(a, 0), arg(a, 1), &[0xdc5797])
+    let mut s = St::of(r);
+    s.esi = arg(a, 0);
+    s.edi = arg(a, 1);
+    s.call(0xc14b50, &[0xdc5797]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_mugging_diversion_get_start_message, f_mugging_diversion_get_start_message, c_mugging_diversion_get_start_message, "ret 8");
@@ -1315,13 +1462,21 @@ unsafe fn f_near_miss_complication_load_from_table(r: &mut Pushad, a: *const u32
     let _ = a;
     unsafe {
     // drive_complication::load_from_table(arg0); xtbl_get_int(ecx = 0xddd1e8, esi = this+0x24, arg0); this[0x28] = 0
-    let this = r.ecx;
     let x = arg(a, 0);
-    let ret = cr(0x66db90, r.eax, this, r.edx, x, this, &[x]);
-    let ret = cr(0xb747d0, ret, 0xddd1e8, r.edx, this + 0x24, this, &[x]);
-    wb(this as usize + 0x28, 0);
-    r.ecx = 0xddd1e8;
-    ret
+    let mut s = St::of(r);
+    s.esi = x;
+    s.edi = r.ecx;
+    s.call(0x66db90, &[x]);
+    s.esi = s.edi + 0x24;
+    s.ecx = 0xddd1e8;
+    s.call(0xb747d0, &[x]);
+    wb(s.edi as usize + 0x28, 0);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_near_miss_complication_load_from_table, f_near_miss_complication_load_from_table, c_near_miss_complication_load_from_table, "ret 4");
@@ -1430,13 +1585,22 @@ const B_ovl_framerate_hide: [u8; 49] = [0x56, 0x8B, 0x35, 0x54, 0xF5, 0xF9, 0x00
 unsafe fn f_ovl_framerate_hide(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    let esi = rd(ga(0xf9f554));
-    let e1 = cr(0xc15720, r.eax, r.ecx, r.edx, esi, r.edi, &[]);
-    let e2 = cr(0x739930, e1, 0xde0190, r.edx, esi, r.edi, &[0x75]);
-    let _ = e2;
+    // push esi only: EDI / EBX / EBP flow through
+    let mut s = St::of(r);
+    s.esi = rd(ga(0xf9f554));
+    s.call(0xc15720, &[]);
+    s.ecx = 0xde0190;
+    s.call(0x739930, &[0x75]);
+    s.esi = 7;
     wd(ga(0xf9f54c), 0);
-    r.ecx = 0xde0190;
-    cr(0x699910, e2, 0xde0190, r.edx, 7, r.edi, &[])
+    s.call(0x699910, &[]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.edi = s.edi;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_ovl_framerate_hide, f_ovl_framerate_hide, c_ovl_framerate_hide, "ret");
@@ -1446,10 +1610,20 @@ const B_ovl_selection_menu_hide: [u8; 25] = [0xE8, 0xEB, 0x70, 0xFE, 0xFF, 0xE8,
 unsafe fn f_ovl_selection_menu_hide(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    let e1 = cr(0x7483e0, r.eax, r.ecx, r.edx, r.esi, r.edi, &[]);
-    let e2 = cr(0x747930, e1, r.ecx, r.edx, r.esi, r.edi, &[]);
-    let _ = e2;
-    cr(0x740730, 0, r.ecx, r.edx, r.esi, r.edi, &[1, 0])
+    // nothing pushed: every register flows out
+    let mut s = St::of(r);
+    s.call(0x7483e0, &[]);
+    s.call(0x747930, &[]);
+    s.eax = 0;
+    s.call(0x740730, &[1, 0]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.esi = s.esi;
+    r.edi = s.edi;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_ovl_selection_menu_hide, f_ovl_selection_menu_hide, c_ovl_selection_menu_hide, "ret");
@@ -1648,19 +1822,29 @@ const B_havok_navmesh_shape_sdd: [u8; 66] = [0x56, 0x8B, 0xF1, 0x85, 0xF6, 0x74,
 unsafe fn f_havok_navmesh_shape_sdd(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
+    // push esi only
     let this = r.ecx;
-    // eax = this ? this + 0x10 : 0; [eax] = 0xe18d38; [this] = 0xdbe44c (a null this would fault)
+    // eax = this ? this + 0x10 : 0; [eax] = 0xe18d38; [this] = 0xdbe44c. A null this faults at the
+    // first store, as the original does.
     if this == 0 {
-        return 0;
+        std::ptr::write_volatile(std::ptr::null_mut::<u32>(), 0xe18d38);
     }
     wd(this as usize + 0x10, 0xe18d38);
     wd(this as usize, 0xdbe44c);
     if arg(a, 0) & 1 != 0 {
-        let tls = rd(ga(0x31bf2bc));
-        let tm = crp(rd(ga(0xdb807c)), tls, r.ecx, r.edx, this, r.edi, &[tls]);
-        let size = rd(this as usize + 4) & 0xFFFF;
-        r.ecx = tm;
-        cr(0xd2b7d0, tm, tm, r.edx, this, r.edi, &[this, size, 0x27]);
+        let mut s = St::of(r);
+        s.esi = this;
+        s.eax = rd(ga(0x31bf2bc));
+        s.calli(rd(ga(0xdb807c)), &[s.eax]);
+        let size = rd(s.esi as usize + 4) & 0xFFFF;
+        s.ecx = s.eax;
+        s.call(0xd2b7d0, &[s.esi, size, 0x27]);
+        r.ecx = s.ecx;
+        r.edx = s.edx;
+        r.edi = s.edi;
+        r.ebx = s.ebx;
+        r.ebp = s.ebp;
+        return s.esi;
     }
     this
     }
@@ -1893,12 +2077,20 @@ const B_page_mempool_can_alloc: [u8; 76] = [0x56, 0x57, 0x8D, 0x44, 0x24, 0x10, 
 unsafe fn f_page_mempool_can_alloc(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
+    // push esi / edi: EBX / EBP flow out.
     // size = 0xc1cba0(eax = arg0, ecx = arg1, esi = this, &arg1); walk the free list for a block >= size
     let this = r.ecx;
-    let size = cr(0xc1cba0, arg(a, 0), arg(a, 1), r.edx, this, r.edi, &[a.add(1) as u32]);
-    let t = this as usize;
+    let mut s = St::of(r);
+    s.eax = arg(a, 0);
+    s.ecx = arg(a, 1);
+    s.esi = this;
+    s.call(0xc1cba0, &[a.add(1) as u32]);
+    let size = s.eax;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    let t = s.esi as usize;
     let mut edx = rd(t + 0x54);
-    r.ecx = arg(a, 1);
+    r.ecx = s.ecx;
     r.edx = edx;
     if edx == 0xFFFF_FFFF {
         return lo8(size, 0);
@@ -1907,11 +2099,8 @@ unsafe fn f_page_mempool_can_alloc(r: &mut Pushad, a: *const u32) -> u32 {
     loop {
         let ecx = if edx < count { rd(t + 0x4c).wrapping_mul(edx).wrapping_add(rd(t + 0x38)) } else { 0 };
         r.ecx = ecx;
-        if ecx == 0 {
-            // the original reads [0] here (a crash); report "no block" instead
-            return lo8(size, 0);
-        }
-        if rd(ecx as usize) >= size {
+        // ecx == 0 reads address 0 and faults, as the original does
+        if std::ptr::read_volatile(ecx as usize as *const u32) >= size {
             return lo8(size, 1);
         }
         edx = rd(ecx as usize + 4);
@@ -1929,22 +2118,29 @@ const B_page_mempool_reset: [u8; 73] = [0x56, 0x8B, 0xF1, 0x8B, 0x46, 0x3C, 0x8B
 unsafe fn f_page_mempool_reset(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
+    // push esi only: EDI / EBX / EBP flow out.
     // memset(base, 0, size); count/first-free reset; the first block's header = (count, -1)
     let this = r.ecx;
     let t = this as usize;
-    let size = rd(t + 0x3c);
-    let base = rd(t + 0x38);
-    cr(0xca0bc0, size, base, r.edx, this, r.edi, &[base, 0, size]);
+    let mut s = St::of(r);
+    s.esi = this;
+    s.eax = rd(t + 0x3c);
+    s.ecx = rd(t + 0x38);
+    let (size, base) = (s.eax, s.ecx);
+    s.call(0xca0bc0, &[base, 0, size]);
+    let t = s.esi as usize;
     let count = rd(t + 0x50);
     wd(t + 0x44, 0);
     wd(t + 0x54, 0);
-    r.ecx = base;
-    if count == 0 {
-        // the original stores through a null pointer here (a crash)
-        return lo8(count, 1);
-    }
-    wd(base as usize, count);
-    wd(base as usize + 4, 0xFFFF_FFFF);
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.edi = s.edi;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    // count == 0 stores through a null pointer (a crash in the original, kept)
+    let hdr = if count == 0 { 0 } else { rd(t + 0x38) as usize };
+    std::ptr::write_volatile(hdr as *mut u32, count);
+    wd(hdr + 4, 0xFFFF_FFFF);
     lo8(count, 1)
     }
 }
@@ -2000,16 +2196,27 @@ const B_ovl_ingame_main_menu_show: [u8; 69] = [0x56, 0x8B, 0xF1, 0x6A, 0x01, 0xC
 unsafe fn f_ovl_ingame_main_menu_show(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
+    // push esi only
     let this = r.ecx;
+    let mut s = St::of(r);
+    s.esi = this;
     wd(this as usize + 8, 0);
-    let e1 = cr(0x793d60, r.eax, this, r.edx, this, r.edi, &[1]);
+    s.call(0x793d60, &[1]);
     let f1 = q(rd(ga(0xdd1c50)));
-    let f2 = q(rd(this as usize + 0x3c));
-    let e2 = cr(0x4959a0, this + 0xc, this, r.edx, this, r.edi, &[this + 0x18, f2, 0, f1]);
-    let _ = e1;
-    let pl = rd(ga(0x21703d4));
-    r.ecx = pl;
-    cr(0x926860, e2, pl, r.edx, this, r.edi, &[1, 1, 0])
+    let esi = s.esi;
+    let f2 = q(rd(esi as usize + 0x3c));
+    s.eax = esi + 0xc;
+    s.call(0x4959a0, &[esi + 0x18, f2, 0, f1]);
+    s.ecx = rd(ga(0x21703d4));
+    // cdecl 4959a0 leaves its four argument words in place, so 926860 sees them above its own three
+    s.call(0x926860, &[1, 1, 0, esi + 0x18, f2, 0, f1]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.edi = s.edi;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_ovl_ingame_main_menu_show, f_ovl_ingame_main_menu_show, c_ovl_ingame_main_menu_show, "ret");
@@ -2019,24 +2226,33 @@ const B_ovl_ingame_main_menu_hide: [u8; 115] = [0x6A, 0x00, 0xE8, 0x49, 0x95, 0x
 unsafe fn f_ovl_ingame_main_menu_hide(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    let mut ax = cr(0x793d60, r.eax, r.ecx, r.edx, r.esi, r.edi, &[0]);
+    // nothing pushed: every register flows out
+    let mut s = St::of(r);
+    s.call(0x793d60, &[0]);
     let skip = rd(ga(0x25f5b0c)) != 0;
     wd(ga(0x25f5b10), 0);
     if !skip && rd(ga(0x25f5ae8)) != 0 {
         let f1 = q(rd(ga(0xdd1c50)));
         wd(ga(0x25f5be8), rd(ga(0x25f5be8)) & 0xFFFF_FFFD);
         wd(ga(0x25f5ae8), 0);
-        ax = cr(0x4a33f0, ax, r.ecx, r.edx, r.esi, r.edi, &[f1]);
+        s.call(0x4a33f0, &[f1]);
         let idx = rd(ga(0x25f5ae8));
         let f = rd(ga(0xdd5250 + (idx.wrapping_mul(5) as usize).wrapping_mul(4)));
-        ax = f;
+        s.eax = f;
         if f != 0 {
-            ax = crp(f, f, r.ecx, r.edx, r.esi, r.edi, &[]);
+            s.calli(f, &[]);
         }
     }
-    let pl = rd(ga(0x21703d4));
-    r.ecx = pl;
-    cr(0x926860, ax, pl, r.edx, r.esi, r.edi, &[0, 1, 0])
+    s.ecx = rd(ga(0x21703d4));
+    s.call(0x926860, &[0, 1, 0]);
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.esi = s.esi;
+    r.edi = s.edi;
+    r.ebx = s.ebx;
+    r.ebp = s.ebp;
+    s.eax
     }
 }
 port!(th_ovl_ingame_main_menu_hide, f_ovl_ingame_main_menu_hide, c_ovl_ingame_main_menu_hide, "ret");
@@ -2046,37 +2262,52 @@ const B_ovl_ingame_main_menu_update: [u8; 124] = [0x53, 0xBB, 0x01, 0x00, 0x00, 
 unsafe fn f_ovl_ingame_main_menu_update(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
+    // push ebx, esi: EDI / EBP flow out; ebx = 1 (bl = 0 after the last branch), esi = this
     let this = r.ecx;
-    let a1 = cr(0x4ffa30, 0x36, this, r.edx, this, r.edi, &[]);
-    if a1 & 0xFF != 0 {
-        let v = rd(this as usize + 8).wrapping_sub(1);
-        wd(this as usize + 8, if (v as i32) < 0 { 4 } else { v });
-        let e = cr(0x5002b0, a1, this, r.edx, this, r.edi, &[]);
-        return lo8(e, 1);
+    let mut s = St::of(r);
+    s.ebx = 1;
+    s.esi = this;
+    s.eax = 0x36;
+    let fin = |r: &mut Pushad, s: &St, bl: u32| -> u32 {
+        r.ecx = s.ecx;
+        r.edx = s.edx;
+        r.edi = s.edi;
+        r.ebp = s.ebp;
+        let v = lo8(s.eax, bl);
+        r.eax = v;
+        v
+    };
+    s.call(0x4ffa30, &[]);
+    if s.eax & 0xFF != 0 {
+        let v = rd(s.esi as usize + 8).wrapping_sub(1);
+        wd(s.esi as usize + 8, if (v as i32) < 0 { 4 } else { v });
+        s.call(0x5002b0, &[]);
+        return fin(r, &s, 1);
     }
-    let a2 = cr(0x4ffa30, 0x37, this, r.edx, this, r.edi, &[]);
-    if a2 & 0xFF != 0 {
-        let v = rd(this as usize + 8).wrapping_add(1);
-        wd(this as usize + 8, if (v as i32) < 5 { v } else { 0 });
-        let e = cr(0x5002b0, a2, this, r.edx, this, r.edi, &[]);
-        return lo8(e, 1);
+    s.eax = 0x37;
+    s.call(0x4ffa30, &[]);
+    if s.eax & 0xFF != 0 {
+        let v = rd(s.esi as usize + 8).wrapping_add(1);
+        wd(s.esi as usize + 8, if (v as i32) < 5 { v } else { 0 });
+        s.call(0x5002b0, &[]);
+        return fin(r, &s, 1);
     }
-    let a3 = cr(0x500860, a2, this, r.edx, this, r.edi, &[]);
-    if a3 & 0xFF == 0 {
-        let e = cr(0x5002b0, a3, this, r.edx, this, r.edi, &[]);
-        return lo8(e, 1);
+    s.call(0x500860, &[]);
+    if s.eax & 0xFF == 0 {
+        s.call(0x5002b0, &[]);
+        return fin(r, &s, 1);
     }
-    let s = rd(this as usize + 8).wrapping_sub(1);
-    let mut ax = a3;
-    if s == 0 {
+    s.esi = rd(s.esi as usize + 8).wrapping_sub(1);
+    if s.esi == 0 {
         let b = rb(ga(0x2528b48)) as u32;
-        ax = lo8(a3, b);
+        s.eax = lo8(s.eax, b);
         if b == 1 {
-            ax = cr(0x7f7830, ax, this, r.edx, 0, r.edi, &[]);
+            s.call(0x7f7830, &[]);
         }
     }
-    let e = cr(0x5002b0, ax, this, r.edx, s, r.edi, &[]);
-    lo8(e, 0)
+    s.ebx = 0;
+    s.call(0x5002b0, &[]);
+    fin(r, &s, 0)
     }
 }
 port!(th_ovl_ingame_main_menu_update, f_ovl_ingame_main_menu_update, c_ovl_ingame_main_menu_update, "ret");
@@ -2234,34 +2465,50 @@ const B_killed_data_compressor_compress: [u8; 121] = [0x53, 0x8B, 0x5C, 0x24, 0x
 unsafe fn f_killed_data_compressor_compress(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
+    // push ebx / esi / edi: only EAX / ECX / EDX / EBP flow out
     let (a0, a1, a3) = (arg(a, 0), arg(a, 1), arg(a, 3));
     if a0 == 0 || a1 == 0 || a3 == 0 {
         return r.eax;
     }
     let e = a1 as usize;
-    let ecx = r.ecx;
-    let mut dx = lo8(r.edx, rb(e) as u32);
-    let mut ax = cr(0x7fd100, a0, ecx, dx, a1, a3, &[]);
-    let c1 = rd(e + 4);
-    ax = cr(0x804f70, ax, c1, dx, a1, a3, &[]);
-    dx = ax;
-    ax = cr(0x7fd3c0, ax, a0, dx, a1, a3, &[]);
-    let c2 = rd(e + 8);
-    ax = cr(0x804f70, ax, c2, dx, a1, a3, &[]);
-    dx = ax;
-    ax = cr(0x7fd3c0, ax, a0, dx, a1, a3, &[]);
-    let v = rd(e + 0xc);
-    ax = cr(0xb73b70, v, a0, dx, a1, a3, &[]);
-    dx = lo8(dx, ax);
-    cr(0x7fd100, a0, a0, dx, a1, a3, &[]);
-    wd(a3 as usize, rd(e));
-    wd(a3 as usize + 4, rd(e + 4));
-    wd(a3 as usize + 8, rd(e + 8));
-    wd(a3 as usize + 0xc, rd(e + 0xc));
-    wd(a3 as usize + 0x10, rd(e + 0x10));
-    r.ecx = rd(e + 0x10);
-    r.edx = rd(e + 8);
-    rd(e + 0xc)
+    let mut s = St::of(r);
+    s.ebx = a0;
+    s.esi = a1;
+    s.edi = a3;
+    s.edx = lo8(s.edx, rb(e) as u32);
+    s.eax = a0;
+    s.call(0x7fd100, &[]);
+    s.ecx = rd(s.esi as usize + 4);
+    s.call(0x804f70, &[]);
+    s.ecx = a0;
+    s.edx = s.eax;
+    s.call(0x7fd3c0, &[]);
+    s.ecx = rd(s.esi as usize + 8);
+    s.call(0x804f70, &[]);
+    s.ecx = a0;
+    s.edx = s.eax;
+    s.call(0x7fd3c0, &[]);
+    s.eax = rd(s.esi as usize + 0xc);
+    s.call(0xb73b70, &[]);
+    s.edx = lo8(s.edx, s.eax);
+    s.eax = a0;
+    s.call(0x7fd100, &[]);
+    // loads and stores interleaved as in the original (the destination may overlap the source)
+    let (e, d) = (s.esi as usize, s.edi as usize);
+    let mut ax = rd(e);
+    wd(d, ax);
+    let mut cx = rd(e + 4);
+    wd(d + 4, cx);
+    let dx = rd(e + 8);
+    wd(d + 8, dx);
+    ax = rd(e + 0xc);
+    wd(d + 0xc, ax);
+    cx = rd(e + 0x10);
+    wd(d + 0x10, cx);
+    r.ecx = cx;
+    r.edx = dx;
+    r.ebp = s.ebp;
+    ax
     }
 }
 port!(th_killed_data_compressor_compress, f_killed_data_compressor_compress, c_killed_data_compressor_compress, "ret 16");
@@ -2271,36 +2518,48 @@ const B_human_torch_instance_load_from_table: [u8; 185] = [0x53, 0x55, 0x56, 0x5
 unsafe fn f_human_torch_instance_load_from_table(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    // [this+4] = 1; equip slot 0 on the player and (when there is one) the co-op partner
+    // [this+4] = 1; equip slot 0 on the player and (when there is one) the co-op partner.
+    // Everything but EAX / ECX / EDX is pushed and popped.
     let this = r.ecx;
+    let mut s = St::of(r);
     let pl = rd(ga(0x21703d4));
+    s.edi = pl;
+    s.ebx = 1;
     wb(this as usize + 4, 1);
-    let partner = cr(0x9d7bd0, r.eax, this, r.edx, r.esi, pl, &[]);
-    let mut ax = cr(0x9ded00, partner, this, r.edx, partner, pl, &[pl, 0]);
-    let inv = pl + 0x10c4;
-    ax = cr(0x55a930, ax, this, r.edx, partner, pl, &[inv, 0, 1, 0]);
+    s.call(0x9d7bd0, &[]);
+    s.esi = s.eax;
+    let partner = s.eax;
+    s.call(0x9ded00, &[pl, 0]);
+    s.ebp = pl + 0x10c4;
+    let inv = s.ebp;
+    s.call(0x55a930, &[inv, 0, 1, 0]);
     if partner != 0 {
-        ax = cr(0x9ded00, ax, this, r.edx, partner, pl, &[partner, 0]);
-        ax = cr(0x55a930, partner + 0x10c4, this, r.edx, partner, pl, &[partner + 0x10c4, 0, 1, 0]);
+        s.call(0x9ded00, &[partner, 0]);
+        s.eax = partner + 0x10c4;
+        s.call(0x55a930, &[partner + 0x10c4, 0, 1, 0]);
     }
-    r.edx = pl;
-    ax = cr(0x9c3a90, ax, this, pl, partner, pl, &[]);
-    if ax & 0xFF != 0 {
-        ax = cr(0x9c3b00, ax, this, pl, partner, pl, &[pl]);
+    s.edx = pl;
+    s.call(0x9c3a90, &[]);
+    if s.eax & 0xFF != 0 {
+        s.call(0x9c3b00, &[pl]);
     } else {
-        ax = cr(0x55a930, ax, this, pl, partner, pl, &[inv, 0, 1, 0]);
+        s.call(0x55a930, &[inv, 0, 1, 0]);
     }
     if partner != 0 {
-        r.edx = partner;
-        ax = cr(0x9c3a90, ax, this, partner, partner, pl, &[]);
-        if ax & 0xFF != 0 {
-            ax = cr(0x9c3b00, ax, this, partner, partner, pl, &[partner]);
+        s.edx = partner;
+        s.call(0x9c3a90, &[]);
+        if s.eax & 0xFF != 0 {
+            s.call(0x9c3b00, &[partner]);
         } else {
-            ax = cr(0x55a930, ax, this, partner, partner + 0x10c4, pl, &[partner + 0x10c4, 0, 1, 0]);
+            s.esi = partner + 0x10c4;
+            s.call(0x55a930, &[partner + 0x10c4, 0, 1, 0]);
         }
     }
     wb(ga(0x2529623), 1);
-    ax
+    r.eax = s.eax;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    s.eax
     }
 }
 port!(th_human_torch_instance_load_from_table, f_human_torch_instance_load_from_table, c_human_torch_instance_load_from_table, "ret 8");
@@ -2310,30 +2569,40 @@ const B_pimping_instance_load_from_table: [u8; 143] = [0x8B, 0x44, 0x24, 0x04, 0
 unsafe fn f_pimping_instance_load_from_table(r: &mut Pushad, a: *const u32) -> u32 {
     let _ = a;
     unsafe {
-    let this = r.ecx;
+    // push ebx / esi / edi: only EAX / ECX / EDX / EBP flow out
     let a0 = arg(a, 0);
+    let mut s = St::of(r);
+    let this = r.ecx;
+    s.eax = a0;
+    s.esi = this;
     wb(this as usize + 4, 1);
-    let e0 = cr(0x656590, a0, this, r.edx, this, r.edi, &[this, a0]);
-    let pl = rd(ga(0x21703d4));
-    let partner = cr(0x9d7bd0, e0, this, r.edx, this, pl, &[]);
-    let mut ax = cr(0x9de310, partner, pl, r.edx, this, pl, &[3]);
-    ax = cr(0x9e0350, ax, pl, r.edx, this, pl, &[pl, 1]);
-    ax = cr(0x9ded00, ax, pl, r.edx, this, pl, &[pl, 0]);
-    r.ecx = pl;
+    s.call(0x656590, &[this, a0]);
+    s.edi = rd(ga(0x21703d4));
+    let pl = s.edi;
+    s.call(0x9d7bd0, &[]);
+    s.ecx = pl;
+    s.ebx = s.eax;
+    let partner = s.ebx;
+    s.call(0x9de310, &[3]);
+    s.call(0x9e0350, &[pl, 1]);
+    s.call(0x9ded00, &[pl, 0]);
     if partner != 0 {
-        ax = cr(0x9de310, ax, partner, r.edx, this, pl, &[3]);
-        ax = cr(0x9e0350, ax, partner, r.edx, this, pl, &[partner, 1]);
-        ax = cr(0x9ded00, ax, partner, r.edx, this, pl, &[partner, 0]);
-        r.ecx = partner;
+        s.ecx = partner;
+        s.call(0x9de310, &[3]);
+        s.call(0x9e0350, &[partner, 1]);
+        s.call(0x9ded00, &[partner, 0]);
     }
-    let _ = ax;
-    let t = this as usize;
+    let t = s.esi as usize;
     wd(t + 0x210, 0);
     wd(t + 0x214, 0);
     wd(t + 0x218, 0);
     wd(t + 0x21c, 0);
     wd(t + 0x220, 0);
     wd(t + 0x224, 0);
+    r.eax = 0;
+    r.ecx = s.ecx;
+    r.edx = s.edx;
+    r.ebp = s.ebp;
     0
     }
 }

@@ -93,6 +93,8 @@ Where things are:
 - State on the render thread must be atomics.
 
 ## Rules
+- NEVER launch sub-agents (no Agent tool, no forks). Do all the work yourself. Helper agents
+  multiply plan usage: on 2026-11-26, 9 agents started 15 helpers and used 27% of a 5-hour window in 30 minutes.
 - Edit ONLY your own file(s), named in your task. Do not commit, do not run the game, and do not touch docs
   or functions.csv.
 - install() logs "<module>: replaced N/M with Rust".

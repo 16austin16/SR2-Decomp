@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::portlib::*;
 use crate::{detour, log};
 
-const SHADOW_CALLS: u32 = 3000;
+/// The shadow check is off: `sr2-judge` is the test now (the shadow's call_regs clobbered ECX / EDX / XMM).
+const SHADOW_CALLS: u32 = 0;
 
 // --- the offline test shifts the game's data (see `mod tests`) ------------------------------------
 
@@ -63,11 +64,13 @@ unsafe fn call_regs(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, 
     unsafe { crate::portlib::call_regs(tests::redirect(f), eax, ecx, edx, esi, edi, args) }
 }
 
-/// The `pushad` block, lowest address first.
+/// What a thunk hands to its handler: XMM0-7, then the `pushad` block (lowest address first). The handler
+/// plays the original's register effects on it; `cx` keeps XMM0-7 and every register current across a call.
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 struct Pushad {
+    xmm: [[u32; 4]; 8],
     edi: u32,
     esi: u32,
     ebp: u32,
@@ -78,35 +81,37 @@ struct Pushad {
     eax: u32,
 }
 
-/// `pushad`, XMM1-7 saved, `f(&mut block, &stack args)`, XMM1-7 restored, `popad`.
+/// `pushad`, XMM0-7 saved, `f(&mut block, &stack args)`, XMM0-7 restored, `popad`.
 macro_rules! hot_thunk {
     ($name:ident, $f:ident, $ret:literal) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
-                "sub esp, 112",
-                "movups xmmword ptr [esp], xmm1",
-                "movups xmmword ptr [esp + 16], xmm2",
-                "movups xmmword ptr [esp + 32], xmm3",
-                "movups xmmword ptr [esp + 48], xmm4",
-                "movups xmmword ptr [esp + 64], xmm5",
-                "movups xmmword ptr [esp + 80], xmm6",
-                "movups xmmword ptr [esp + 96], xmm7",
-                "lea eax, [esp + 112]",
-                "lea ecx, [esp + 148]",
+                "sub esp, 128",
+                "movups xmmword ptr [esp], xmm0",
+                "movups xmmword ptr [esp + 16], xmm1",
+                "movups xmmword ptr [esp + 32], xmm2",
+                "movups xmmword ptr [esp + 48], xmm3",
+                "movups xmmword ptr [esp + 64], xmm4",
+                "movups xmmword ptr [esp + 80], xmm5",
+                "movups xmmword ptr [esp + 96], xmm6",
+                "movups xmmword ptr [esp + 112], xmm7",
+                "mov eax, esp",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
-                "movups xmm1, xmmword ptr [esp]",
-                "movups xmm2, xmmword ptr [esp + 16]",
-                "movups xmm3, xmmword ptr [esp + 32]",
-                "movups xmm4, xmmword ptr [esp + 48]",
-                "movups xmm5, xmmword ptr [esp + 64]",
-                "movups xmm6, xmmword ptr [esp + 80]",
-                "movups xmm7, xmmword ptr [esp + 96]",
-                "add esp, 112",
+                "movups xmm0, xmmword ptr [esp]",
+                "movups xmm1, xmmword ptr [esp + 16]",
+                "movups xmm2, xmmword ptr [esp + 32]",
+                "movups xmm3, xmmword ptr [esp + 48]",
+                "movups xmm4, xmmword ptr [esp + 64]",
+                "movups xmm5, xmmword ptr [esp + 80]",
+                "movups xmm6, xmmword ptr [esp + 96]",
+                "movups xmm7, xmmword ptr [esp + 112]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
@@ -122,29 +127,30 @@ macro_rules! hot_thunk_x0 {
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
-                "sub esp, 112",
-                "movups xmmword ptr [esp], xmm1",
-                "movups xmmword ptr [esp + 16], xmm2",
-                "movups xmmword ptr [esp + 32], xmm3",
-                "movups xmmword ptr [esp + 48], xmm4",
-                "movups xmmword ptr [esp + 64], xmm5",
-                "movups xmmword ptr [esp + 80], xmm6",
-                "movups xmmword ptr [esp + 96], xmm7",
-                "lea eax, [esp + 112]",
-                "lea ecx, [esp + 148]",
+                "sub esp, 128",
+                "movups xmmword ptr [esp], xmm0",
+                "movups xmmword ptr [esp + 16], xmm1",
+                "movups xmmword ptr [esp + 32], xmm2",
+                "movups xmmword ptr [esp + 48], xmm3",
+                "movups xmmword ptr [esp + 64], xmm4",
+                "movups xmmword ptr [esp + 80], xmm5",
+                "movups xmmword ptr [esp + 96], xmm6",
+                "movups xmmword ptr [esp + 112], xmm7",
+                "mov eax, esp",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
-                "movups xmm1, xmmword ptr [esp]",
-                "movups xmm2, xmmword ptr [esp + 16]",
-                "movups xmm3, xmmword ptr [esp + 32]",
-                "movups xmm4, xmmword ptr [esp + 48]",
-                "movups xmm5, xmmword ptr [esp + 64]",
-                "movups xmm6, xmmword ptr [esp + 80]",
-                "movups xmm7, xmmword ptr [esp + 96]",
-                "movd xmm0, dword ptr [esp + 124]",
-                "add esp, 112",
+                "movups xmm1, xmmword ptr [esp + 16]",
+                "movups xmm2, xmmword ptr [esp + 32]",
+                "movups xmm3, xmmword ptr [esp + 48]",
+                "movups xmm4, xmmword ptr [esp + 64]",
+                "movups xmm5, xmmword ptr [esp + 80]",
+                "movups xmm6, xmmword ptr [esp + 96]",
+                "movups xmm7, xmmword ptr [esp + 112]",
+                "movd xmm0, dword ptr [esp + 140]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
@@ -152,6 +158,191 @@ macro_rules! hot_thunk_x0 {
         }
     };
 }
+
+/// Stack words handed to every callee: its own arguments, then what the original's frame holds above them.
+const FW: usize = 12;
+
+/// The words the original has on the stack at a call: `own` (top first), then its return address and the
+/// caller's own stack arguments.
+unsafe fn fr(a: *const u32, own: &[u32]) -> [u32; FW] {
+    let mut w = [0u32; FW];
+    let mut n = 0;
+    for &v in own {
+        w[n] = v;
+        n += 1;
+    }
+    w[n] = unsafe { *a.sub(1) };
+    n += 1;
+    let mut i = 0;
+    while n < FW {
+        w[n] = unsafe { *a.add(i) };
+        n += 1;
+        i += 1;
+    }
+    w
+}
+
+/// The words a callee entered by a tail `jmp` sees: the original's own stack arguments.
+unsafe fn fr_tail(a: *const u32) -> [u32; FW] {
+    let mut w = [0u32; FW];
+    for (i, v) in w.iter_mut().enumerate() {
+        *v = unsafe { *a.add(i) };
+    }
+    w
+}
+
+macro_rules! cx_fn {
+    ($name:ident, $skip:literal) => {
+        /// Call `f` with every register and XMM0-7 of `c`, the stack words `w` pushed, and load what
+        /// the callee leaves back into `c`. The callee pops 0..3 of the words (see the instances).
+        unsafe fn $name(f: usize, c: &mut Pushad, w: &[u32; FW]) {
+            let blk: [u32; 3] = [f as u32, w.as_ptr() as u32, c as *mut Pushad as u32];
+            unsafe {
+                std::arch::asm!(
+                    "push ebx", "push esi", "push edi", "push ebp",
+                    "mov ebx, eax",
+                    "push dword ptr [ebx + 8]",
+                    "push dword ptr [ebx]",
+                    "mov esi, [ebx + 4]",
+                    "mov ecx, 12",
+                    "2:",
+                    "push dword ptr [esi + ecx*4 - 4]",
+                    "dec ecx",
+                    "jnz 2b",
+                    "mov eax, [ebx + 8]",
+                    "movups xmm0, [eax]", "movups xmm1, [eax + 16]", "movups xmm2, [eax + 32]", "movups xmm3, [eax + 48]",
+                    "movups xmm4, [eax + 64]", "movups xmm5, [eax + 80]", "movups xmm6, [eax + 96]", "movups xmm7, [eax + 112]",
+                    "mov edi, [eax + 128]", "mov esi, [eax + 132]", "mov ebp, [eax + 136]", "mov ebx, [eax + 144]",
+                    "mov edx, [eax + 148]", "mov ecx, [eax + 152]", "mov eax, [eax + 156]",
+                    "call dword ptr [esp + 48]",
+                    "add esp, {skip}",
+                    "push eax",
+                    "mov eax, [esp + 8]",
+                    "movups [eax], xmm0", "movups [eax + 16], xmm1", "movups [eax + 32], xmm2", "movups [eax + 48], xmm3",
+                    "movups [eax + 64], xmm4", "movups [eax + 80], xmm5", "movups [eax + 96], xmm6", "movups [eax + 112], xmm7",
+                    "mov [eax + 128], edi", "mov [eax + 132], esi", "mov [eax + 136], ebp", "mov [eax + 144], ebx",
+                    "mov [eax + 148], edx", "mov [eax + 152], ecx",
+                    "pop ecx",
+                    "mov [eax + 156], ecx",
+                    "add esp, 8",
+                    "pop ebp", "pop edi", "pop esi", "pop ebx",
+                    skip = const $skip,
+                    inout("eax") blk.as_ptr() => _,
+                    out("ecx") _, out("edx") _,
+                    clobber_abi("C"),
+                );
+            }
+        }
+    };
+}
+cx_fn!(cx, 48);
+cx_fn!(cx_p1, 44);
+cx_fn!(cx_p2, 40);
+cx_fn!(cx_p3, 36);
+
+/// `hot_thunk` with the original's frame reserved below its return address (`$fr` bytes): locals the original
+/// passes by address live at the same addresses here.
+macro_rules! hot_thunk_fr {
+    ($name:ident, $f:ident, $ret:literal, $fr:literal) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {fr}",
+                "pushad",
+                "sub esp, 128",
+                "movups xmmword ptr [esp], xmm0",
+                "movups xmmword ptr [esp + 16], xmm1",
+                "movups xmmword ptr [esp + 32], xmm2",
+                "movups xmmword ptr [esp + 48], xmm3",
+                "movups xmmword ptr [esp + 64], xmm4",
+                "movups xmmword ptr [esp + 80], xmm5",
+                "movups xmmword ptr [esp + 96], xmm6",
+                "movups xmmword ptr [esp + 112], xmm7",
+                "mov eax, esp",
+                "lea ecx, [esp + 164 + {fr}]",
+                "push ecx",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, xmmword ptr [esp]",
+                "movups xmm1, xmmword ptr [esp + 16]",
+                "movups xmm2, xmmword ptr [esp + 32]",
+                "movups xmm3, xmmword ptr [esp + 48]",
+                "movups xmm4, xmmword ptr [esp + 64]",
+                "movups xmm5, xmmword ptr [esp + 80]",
+                "movups xmm6, xmmword ptr [esp + 96]",
+                "movups xmm7, xmmword ptr [esp + 112]",
+                "add esp, 128",
+                "popad",
+                "add esp, {fr}",
+                $ret,
+                f = sym $f,
+                fr = const $fr,
+            )
+        }
+    };
+}
+
+/// The address of the original's stack slot `k` dwords below its return address.
+fn slot(a: *const u32, k: usize) -> usize {
+    (a as usize).wrapping_sub(4 + 4 * k)
+}
+
+/// unlockable_parse_weapon_primary / _secondary (same body): look the name up, then 0xB716E0 on it.
+unsafe fn unlock_pre_b716e0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        if r.eax == 0 {
+            r.eax &= !0xff;
+            return;
+        }
+        let edi0 = r.edi;
+        r.edi = 0x00DC_5804;
+        cx(0x00BF_BEE0, r, &fr(a, &[edi0]));
+        r.edi = edi0;
+        if r.eax != 0 {
+            r.eax = rd(r.eax as usize + 0xc);
+        }
+        let v = r.eax;
+        cx(0x00B7_16E0, r, &fr(a, &[v]));
+        r.ecx = *a;
+        wd(r.ecx as usize + 8, r.eax);
+        r.eax = (r.eax & !0xff) | (r.eax != 0) as u32;
+    }
+}
+
+/// unlockable_parse_gang_type / _vehicle_group / _style / _item: one stack local (the pushed ECX), filled by
+/// 0xBDCB30 through its address; `item` runs the result through 0x91C290 as well.
+unsafe fn unlock_str_local(r: &mut Pushad, a: *const u32, edi_const: u32, item: bool) {
+    unsafe {
+        let ecx0 = r.ecx;
+        let loc = slot(a, 1);
+        wd(loc, ecx0);
+        if r.eax == 0 {
+            r.eax &= !0xff;
+            return;
+        }
+        let edi0 = r.edi;
+        r.edi = edi_const;
+        cx(0x00BF_BEE0, r, &fr(a, &[edi0, ecx0]));
+        r.edi = edi0;
+        r.ecx = if r.eax != 0 { rd(r.eax as usize + 0xc) } else { 0 };
+        r.eax = 0;
+        cx_p1(0x00BD_CB30, r, &fr(a, &[loc as u32, ecx0]));
+        if item {
+            r.ecx = r.eax;
+            cx(0x0091_C290, r, &fr(a, &[rd(loc)]));
+            let e = r.eax;
+            wd(*a as usize + 8, e);
+            r.eax = (e & !0xff) | (e != 0) as u32;
+        } else {
+            wd(*a as usize + 8, rd(loc));
+            r.edx = *a;
+            r.eax = (r.eax & !0xff) | 1;
+        }
+        r.ecx = rd(loc);
+    }
+}
+
 
 struct Port {
     name: &'static str,
@@ -322,15 +513,16 @@ const GAME_EVENT_23_JMPS: [usize; 0] = [];
 const ID_GAME_EVENT_23: usize = 0;
 hot_thunk!(thunk_game_event_23, port_game_event_23, "ret");
 unsafe extern "C" fn port_game_event_23(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_GAME_EVENT_23);
         let fp = rd(evt_entry() + 0x5c);
+        r.eax = fp;
         if fp == 0 {
-            r.eax = 0;
             return;
         }
-        r.eax = call_regs(fp as usize, fp, r.ecx, r.edx, r.esi, r.edi, &[r.ecx]);
+        let ecx0 = r.ecx;
+        cx(fp as usize, r, &fr(a, &[ecx0]));
+        r.ecx = ecx0;
     }
 }
 
@@ -398,16 +590,17 @@ const GAME_EVENT_26_JMPS: [usize; 0] = [];
 const ID_GAME_EVENT_26: usize = 3;
 hot_thunk!(thunk_game_event_26, port_game_event_26, "ret");
 unsafe extern "C" fn port_game_event_26(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_GAME_EVENT_26);
         let fp = rd(evt_entry() + 0x68);
+        r.eax = fp;
         if fp == 0 {
-            r.eax = 0;
             return;
         }
         let a0 = *a;
-        r.eax = call_regs(fp as usize, fp, a0, r.edx, r.esi, r.edi, &[a0, r.edx]);
+        let ecx0 = r.ecx;
+        r.ecx = a0;
+        cx(fp as usize, r, &fr(a, &[a0, r.edx, ecx0]));
     }
 }
 
@@ -425,14 +618,18 @@ const GAME_EVENT_3_JMPS: [usize; 0] = [];
 const ID_GAME_EVENT_3: usize = 4;
 hot_thunk!(thunk_game_event_3, port_game_event_3, "ret");
 unsafe extern "C" fn port_game_event_3(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_GAME_EVENT_3);
+        let esi0 = r.esi;
         let e = evt_entry() as u32;
+        r.esi = e;
         let fp1 = rd(e as usize + 0xc);
-        let e1 = call_regs(fp1 as usize, fp1, r.ecx, r.edx, e, r.edi, &[]);
+        r.eax = fp1;
+        cx(fp1 as usize, r, &fr(a, &[esi0]));
         let fp2 = rd(e as usize + 8);
-        r.eax = call_regs(fp2 as usize, e1, fp2, r.edx, e, r.edi, &[0]);
+        r.ecx = fp2;
+        cx(fp2 as usize, r, &fr(a, &[0, esi0]));
+        r.esi = esi0;
     }
 }
 
@@ -558,16 +755,18 @@ const GAME_EVENT_16_JMPS: [usize; 0] = [];
 const ID_GAME_EVENT_16: usize = 9;
 hot_thunk!(thunk_game_event_16, port_game_event_16, "ret");
 unsafe extern "C" fn port_game_event_16(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_GAME_EVENT_16);
         let fp = rd(evt_entry() + 0x40);
+        r.ecx = fp;
+        r.eax = 0;
         if fp == 0 {
-            r.eax = 0;
             return;
         }
         let a0 = *a;
-        r.eax = call_regs(fp as usize, a0, fp, r.edx, r.esi, r.edi, &[a0, r.edx, 0x02F3_0B60, rd(0x0252_9E00)]);
+        let g = rd(0x0252_9E00);
+        r.eax = a0;
+        cx(fp as usize, r, &fr(a, &[a0, r.edx, 0x02F3_0B60, g]));
     }
 }
 
@@ -909,11 +1108,11 @@ const GFX_RING_HAS_DATA_JMPS: [usize; 0] = [];
 const ID_GFX_RING_HAS_DATA: usize = 21;
 hot_thunk!(thunk_gfx_ring_has_data, port_gfx_ring_has_data, "ret");
 unsafe extern "C" fn port_gfx_ring_has_data(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         let o = r.eax as usize;
-        let v = (rd(o + 0x14) < rd(o + 8)) as u32;
-        r.eax = pure_done(ID_GFX_RING_HAS_DATA, r, a, 0, v);
+        let ecx = rd(o + 0x14);
+        r.ecx = ecx;
+        r.eax = (ecx < rd(o + 8)) as u32;
     }
 }
 
@@ -1032,30 +1231,30 @@ const PCU_ITEM_FIND_MATERIAL_BY_ID_JMPS: [usize; 0] = [];
 const ID_PCU_ITEM_FIND_MATERIAL_BY_ID: usize = 26;
 hot_thunk!(thunk_pcu_item_find_material_by_id, port_pcu_item_find_material_by_id, "ret");
 unsafe extern "C" fn port_pcu_item_find_material_by_id(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         let item = r.edx as usize;
-        let v = if item == 0 {
-            0
-        } else {
-            let mut ecx = rd(item + 0x28);
-            let cnt = rd(item + 0x2c);
-            let mut i = 0u32;
-            if (cnt as i32) > 0 {
-                loop {
-                    if rd(ecx as usize + 0x10) == r.esi {
-                        break;
-                    }
-                    i = i.wrapping_add(1);
-                    ecx = ecx.wrapping_add(0x70);
-                    if (i as i32) >= (cnt as i32) {
-                        break;
-                    }
+        r.eax = 0;
+        if item == 0 {
+            return;
+        }
+        let mut ecx = rd(item + 0x28);
+        let cnt = rd(item + 0x2c);
+        let mut i = 0u32;
+        if (cnt as i32) > 0 {
+            loop {
+                if rd(ecx as usize + 0x10) == r.esi {
+                    break;
+                }
+                i = i.wrapping_add(1);
+                ecx = ecx.wrapping_add(0x70);
+                if (i as i32) >= (cnt as i32) {
+                    break;
                 }
             }
-            if i != cnt { ecx } else { 0 }
-        };
-        r.eax = pure_done(ID_PCU_ITEM_FIND_MATERIAL_BY_ID, r, a, 0, v);
+        }
+        r.ecx = ecx;
+        r.edx = cnt;
+        r.eax = if i != cnt { ecx } else { 0 };
     }
 }
 
@@ -1072,17 +1271,15 @@ const GFX_RING_READ_U32_JMPS: [usize; 0] = [];
 const ID_GFX_RING_READ_U32: usize = 27;
 hot_thunk!(thunk_gfx_ring_read_u32, port_gfx_ring_read_u32, "ret 4");
 unsafe extern "C" fn port_gfx_ring_read_u32(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         let ring = r.eax as usize;
         let dst = *a as usize;
-        r.eax = snap_done(ID_GFX_RING_READ_U32, r, a, 1, &[(dst, 4), (ring + 0x14, 4)], || {
-            let p = rd(ring + 0x14);
-            let v = rd(p as usize);
-            wd(dst, v);
-            wd(ring + 0x14, rd(ring + 0x14).wrapping_add(4));
-            ring as u32
-        });
+        let p = rd(ring + 0x14);
+        let v = rd(p as usize);
+        wd(dst, v);
+        wd(ring + 0x14, rd(ring + 0x14).wrapping_add(4));
+        r.ecx = dst as u32;
+        r.edx = v;
     }
 }
 
@@ -1124,22 +1321,17 @@ const HUMAN_FLAG_C8_STAMP_SET_JMPS: [usize; 0] = [];
 const ID_HUMAN_FLAG_C8_STAMP_SET: usize = 29;
 hot_thunk!(thunk_human_flag_c8_stamp_set, port_human_flag_c8_stamp_set, "ret");
 unsafe extern "C" fn port_human_flag_c8_stamp_set(r: &mut Pushad, a: *const u32) {
-
     unsafe {
-        let h = r.eax as usize;
-        let (edx, eax) = (r.edx, r.eax);
-        r.eax = snap_done(ID_HUMAN_FLAG_C8_STAMP_SET, r, a, 0, &[(h + 0xc8, 4), (h + 0xd68, 8)], || {
-            let c8 = (rd(h + 0xc8) & 0xFFFF_F7FF) | 0x400;
-            wd(h + 0xc8, c8);
-            let mut t = rd(0x00E8_43AC);
-            wd(h + 0xd68, t);
-            if (t as i32) > 0x6B49_D200 {
-                t = t.wrapping_add(0x94B6_2E00);
-                wd(h + 0xd68, t);
-            }
-            wd(h + 0xd6c, edx);
-            eax
-        });
+        let o = r.eax as usize;
+        wd(o + 0xc8, (rd(o + 0xc8) & 0xFFFF_F7FF) | 0x400);
+        let mut t = rd(0x00E8_43AC);
+        wd(o + 0xd68, t);
+        if (t as i32) > 0x6B49_D200 {
+            t = t.wrapping_add(0x94B6_2E00);
+            wd(o + 0xd68, t);
+        }
+        wd(o + 0xd6c, r.edx);
+        r.ecx = t;
     }
 }
 
@@ -1289,7 +1481,6 @@ const TRAFFIC_RECORD_RELEASE_JMPS: [usize; 0] = [];
 const ID_TRAFFIC_RECORD_RELEASE: usize = 33;
 hot_thunk!(thunk_traffic_record_release, port_traffic_record_release, "ret");
 unsafe extern "C" fn port_traffic_record_release(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_TRAFFIC_RECORD_RELEASE);
         let rec = r.eax as usize;
@@ -1317,6 +1508,8 @@ unsafe extern "C" fn port_traffic_record_release(r: &mut Pushad, a: *const u32) 
         wd(0x0215_D7A8, rd(0x0215_D7A8).wrapping_sub(1));
         wd(rec + 4, 0);
         wd(rec, 0);
+        r.ecx = head_a;
+        r.edx = 0;
         if head_a == 0 {
             wd(rec, rec as u32);
             wd(rec + 4, rec as u32);
@@ -1329,6 +1522,7 @@ unsafe extern "C" fn port_traffic_record_release(r: &mut Pushad, a: *const u32) 
             let tail = rd(h + 4);
             wd(tail as usize, rec as u32);
             wd(h + 4, rec as u32);
+            r.edx = tail;
         }
     }
 }
@@ -1348,23 +1542,27 @@ const TRAFFIC_RECORD_RELEASE_BY_VEHICLE_JMPS: [usize; 1] = [42];
 const ID_TRAFFIC_RECORD_RELEASE_BY_VEHICLE: usize = 34;
 hot_thunk!(thunk_traffic_record_release_by_vehicle, port_traffic_record_release_by_vehicle, "ret");
 unsafe extern "C" fn port_traffic_record_release_by_vehicle(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_TRAFFIC_RECORD_RELEASE_BY_VEHICLE);
+        let esi0 = r.esi;
         let head = rd(0x0215_DA30);
         let mut eax = head;
         loop {
+            r.eax = eax;
             if eax == 0 {
-                r.eax = 0;
+                r.esi = esi0;
                 return;
             }
             let edx = rd(eax as usize);
-            let next = if edx != head { edx } else { 0 };
+            let ecx = if edx != head { edx } else { 0 };
+            r.edx = edx;
+            r.ecx = ecx;
             if rd(eax as usize + 8) == r.edi {
-                r.eax = call_regs(0x0093_8CB0, eax, next, edx, r.esi, r.edi, &[]);
+                r.esi = esi0;
+                cx(0x0093_8CB0, r, &fr_tail(a));
                 return;
             }
-            eax = next;
+            eax = ecx;
         }
     }
 }
@@ -1386,10 +1584,10 @@ const TOD_OBJECT_NODE_ALLOC_JMPS: [usize; 0] = [];
 const ID_TOD_OBJECT_NODE_ALLOC: usize = 35;
 hot_thunk!(thunk_tod_object_node_alloc, port_tod_object_node_alloc, "ret");
 unsafe extern "C" fn port_tod_object_node_alloc(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_TOD_OBJECT_NODE_ALLOC);
         let eax = rd(0x00F9_9924) as usize;
+        r.ecx = 0;
         if eax == 0 {
             r.eax = 0;
             return;
@@ -1418,6 +1616,7 @@ unsafe extern "C" fn port_tod_object_node_alloc(r: &mut Pushad, a: *const u32) {
         wd(eax + 0x10, 0);
         wd(eax + 0x14, 0);
         r.eax = eax as u32;
+        r.edx = edx as u32;
     }
 }
 
@@ -1509,32 +1708,35 @@ const CUTSCENE_SEEN_FLAGS_STORE_BITS_JMPS: [usize; 0] = [];
 const ID_CUTSCENE_SEEN_FLAGS_STORE_BITS: usize = 37;
 hot_thunk!(thunk_cutscene_seen_flags_store_bits, port_cutscene_seen_flags_store_bits, "ret");
 unsafe extern "C" fn port_cutscene_seen_flags_store_bits(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_CUTSCENE_SEEN_FLAGS_STORE_BITS);
-        let count = rd(0x0145_A4AC) as i32;
-        if count <= 0 {
-            r.eax = 0;
+        let mut eax = 0u32;
+        r.eax = 0;
+        if (rd(0x0145_A4AC) as i32) <= 0 {
             return;
         }
-        let mut eax = 0i32;
         let mut edi = 0usize;
         loop {
-            let tbl = rd(0x0145_A4A4) as usize;
-            let bit = rd(0x00DC_8558 + (eax as usize & 7) * 4) as u8;
-            let byte = (rd(r.esi as usize) as usize).wrapping_add((eax >> 3) as usize);
-            if rb(edi.wrapping_add(tbl) + 8) != 0 {
-                wb(byte, rb(byte) | bit);
+            let base = rd(0x0145_A4A4) as usize;
+            let set = rb(edi.wrapping_add(base).wrapping_add(8)) != 0;
+            let bytep = rd(r.esi as usize).wrapping_add(eax >> 3);
+            let bit = rb(0x00DC_8558 + (eax & 7) as usize * 4);
+            let dl = if set {
+                wb(bytep as usize, rb(bytep as usize) | bit);
+                bit
             } else {
-                wb(byte, rb(byte) & !bit);
-            }
-            eax += 1;
+                wb(bytep as usize, rb(bytep as usize) & !bit);
+                !bit
+            };
+            r.ecx = bytep;
+            r.edx = dl as u32;
+            eax = eax.wrapping_add(1);
             edi = edi.wrapping_add(0x14);
-            if eax >= rd(0x0145_A4AC) as i32 {
+            if (eax as i32) >= rd(0x0145_A4AC) as i32 {
                 break;
             }
         }
-        r.eax = eax as u32;
+        r.eax = eax;
     }
 }
 
@@ -1587,21 +1789,32 @@ const CURRENT_SPAWN_GROUP_QUERY_JMPS: [usize; 0] = [];
 const ID_CURRENT_SPAWN_GROUP_QUERY: usize = 39;
 hot_thunk!(thunk_current_spawn_group_query, port_current_spawn_group_query, "ret");
 unsafe extern "C" fn port_current_spawn_group_query(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_CURRENT_SPAWN_GROUP_QUERY);
+        let (esi0, ebx0) = (r.esi, r.ebx);
         let this = rd(0x0215_E5BC);
+        r.ecx = this;
         if this == 0 {
-            r.eax = r.eax & !0xff;
+            r.eax &= !0xff;
             return;
         }
+        r.esi = this;
         let vt = rd(this as usize);
         let f1 = rd(vt as usize + 0x34);
-        let e1 = call_regs(f1 as usize, vt, this, f1, this, r.edi, &[]);
+        r.eax = vt;
+        r.edx = f1;
+        cx(f1 as usize, r, &fr(a, &[ebx0, esi0]));
+        r.ebx = (ebx0 & !0xff) | (r.eax & 0xff);
         let vt2 = rd(this as usize);
         let f2 = rd(vt2 as usize + 0x38);
-        let e2 = call_regs(f2 as usize, vt2, this, f2, this, r.edi, &[]);
-        r.eax = ((e1 & 0xff) != 0 && (e2 as i32) > 0) as u32;
+        r.eax = vt2;
+        r.edx = f2;
+        r.ecx = this;
+        cx(f2 as usize, r, &fr(a, &[ebx0, esi0]));
+        let ok = (r.ebx & 0xff) != 0 && (r.eax as i32) > 0;
+        r.eax = ok as u32;
+        r.ebx = ebx0;
+        r.esi = esi0;
     }
 }
 
@@ -1620,30 +1833,30 @@ const CURRENT_SPAWN_GROUP_VEHICLE_INDEX_JMPS: [usize; 0] = [];
 const ID_CURRENT_SPAWN_GROUP_VEHICLE_INDEX: usize = 40;
 hot_thunk!(thunk_current_spawn_group_vehicle_index, port_current_spawn_group_vehicle_index, "ret");
 unsafe extern "C" fn port_current_spawn_group_vehicle_index(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_CURRENT_SPAWN_GROUP_VEHICLE_INDEX);
         let neg = |r: &mut Pushad| r.eax = 0xFFFF_FFFF;
         if rd(0x0215_E5BC) == 0 {
             return neg(r);
         }
-        let q = call_regs(0x0095_7660, r.eax, r.ecx, r.edx, r.esi, r.edi, &[]);
-        if (q & 0xff) == 0 {
+        cx(0x0095_7660, r, &fr(a, &[]));
+        if (r.eax & 0xff) == 0 {
             return neg(r);
         }
         let this = rd(0x0215_E5BC);
+        r.ecx = this;
         if this == 0 {
             return neg(r);
         }
         let vt = rd(this as usize);
         let f = rd(vt as usize + 0x14);
-        let e = call_regs(f as usize, vt, this, f, r.esi, r.edi, &[]);
-        if (e as i32) < 0 {
+        r.eax = vt;
+        r.edx = f;
+        cx(f as usize, r, &fr(a, &[]));
+        if (r.eax as i32) < 0 {
             return neg(r);
         }
-        if (e as i32) < rd(0x0252_A0D8) as i32 {
-            r.eax = e;
-        } else {
+        if (r.eax as i32) >= rd(0x0252_A0D8) as i32 {
             neg(r)
         }
     }
@@ -1662,11 +1875,10 @@ const HUMAN_IS_NON_ALLY_STATE7_JMPS: [usize; 0] = [];
 const ID_HUMAN_IS_NON_ALLY_STATE7: usize = 41;
 hot_thunk!(thunk_human_is_non_ally_state7, port_human_is_non_ally_state7, "ret");
 unsafe extern "C" fn port_human_is_non_ally_state7(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_HUMAN_IS_NON_ALLY_STATE7);
-        let e = call_regs(0x0098_E8A0, r.eax, r.ecx, r.edx, r.esi, r.edi, &[]);
-        r.eax = if (e & 0xff) != 0 { e & !0xff } else { (e & !0xff) | (rb(r.edx as usize + 0x111c) == 7) as u32 };
+        cx(0x0098_E8A0, r, &fr(a, &[]));
+        r.eax = if (r.eax & 0xff) != 0 { r.eax & !0xff } else { (r.eax & !0xff) | (rb(r.edx as usize + 0x111c) == 7) as u32 };
     }
 }
 
@@ -1683,16 +1895,20 @@ const HUMAN_IS_FOLLOWER_JMPS: [usize; 0] = [];
 const ID_HUMAN_IS_FOLLOWER: usize = 42;
 hot_thunk!(thunk_human_is_follower, port_human_is_follower, "ret");
 unsafe extern "C" fn port_human_is_follower(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_HUMAN_IS_FOLLOWER);
+        let edi0 = r.edi;
         let edi = r.eax;
         if edi == 0 {
-            r.eax = r.eax & !0xff;
+            r.eax &= !0xff;
             return;
         }
-        let e = call_regs(0x0098_E7C0, r.eax, r.ecx, r.edx, r.esi, edi, &[]);
-        r.eax = (e & !0xff) | (e != edi) as u32;
+        r.edi = edi;
+        cx(0x0098_E7C0, r, &fr(a, &[edi0]));
+        let c = (r.eax != edi) as u32;
+        r.ecx = c;
+        r.eax = (r.eax & !0xff) | c;
+        r.edi = edi0;
     }
 }
 
@@ -1710,15 +1926,17 @@ const HUMAN_ACTION_FLAG_BIT4_JMPS: [usize; 0] = [];
 const ID_HUMAN_ACTION_FLAG_BIT4: usize = 43;
 hot_thunk!(thunk_human_action_flag_bit4, port_human_action_flag_bit4, "ret");
 unsafe extern "C" fn port_human_action_flag_bit4(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_HUMAN_ACTION_FLAG_BIT4);
-        let e = call_regs(0x0096_F3A0, r.eax, r.ecx, r.edx, r.esi, r.edi, &[r.eax]);
-        if e == 0xFFFF_FFFF {
-            r.eax = e & !0xff;
+        let eax0 = r.eax;
+        cx(0x0096_F3A0, r, &fr(a, &[eax0]));
+        if r.eax == 0xFFFF_FFFF {
+            r.eax &= !0xff;
             return;
         }
-        let v = rd(0x00E9_0E48usize.wrapping_add((e.wrapping_mul(3) as usize).wrapping_mul(4))) >> 4;
+        let ecx = r.eax.wrapping_mul(3);
+        r.ecx = ecx;
+        let v = rd(0x00E9_0E48usize.wrapping_add((ecx as usize).wrapping_mul(4))) >> 4;
         r.eax = (v & !0xff) | (v & 1);
     }
 }
@@ -1738,7 +1956,6 @@ const WEATHER_FORCE_STAGE_AND_SYNC_JMPS: [usize; 1] = [44];
 const ID_WEATHER_FORCE_STAGE_AND_SYNC: usize = 44;
 hot_thunk!(thunk_weather_force_stage_and_sync, port_weather_force_stage_and_sync, "ret");
 unsafe extern "C" fn port_weather_force_stage_and_sync(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_WEATHER_FORCE_STAGE_AND_SYNC);
         let eax = r.eax.wrapping_mul(0xd8).wrapping_add(rd(0x0252_6DD0));
@@ -1749,7 +1966,8 @@ unsafe extern "C" fn port_weather_force_stage_and_sync(r: &mut Pushad, a: *const
             t = t.wrapping_add(0x94B6_2E00);
             wd(0x00E9_D460, t);
         }
-        r.eax = call_regs(0x004D_E390, t, r.ecx, r.edx, r.esi, r.edi, &[]);
+        r.eax = t;
+        cx(0x004D_E390, r, &fr_tail(a));
     }
 }
 
@@ -1769,7 +1987,6 @@ const INPUT_ACTIONS_RESET_JMPS: [usize; 1] = [64];
 const ID_INPUT_ACTIONS_RESET: usize = 45;
 hot_thunk!(thunk_input_actions_reset, port_input_actions_reset, "ret");
 unsafe extern "C" fn port_input_actions_reset(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_INPUT_ACTIONS_RESET);
         let mut o = 0usize;
@@ -1782,7 +1999,10 @@ unsafe extern "C" fn port_input_actions_reset(r: &mut Pushad, a: *const u32) {
         }
         let al = (rb(0x00F8_549B) & 0xf1) | 1;
         wb(0x00F8_549B, al);
-        r.eax = call_regs(0x004F_F3F0, 0x800 | al as u32, 0xFFFF_FFFF, 0, r.esi, r.edi, &[]);
+        r.edx = 0;
+        r.ecx = 0xFFFF_FFFF;
+        r.eax = 0x800 | al as u32;
+        cx(0x004F_F3F0, r, &fr_tail(a));
     }
 }
 
@@ -2081,17 +2301,9 @@ const UNLOCKABLE_PARSE_WEAPON_PRIMARY_JMPS: [usize; 0] = [];
 const ID_UNLOCKABLE_PARSE_WEAPON_PRIMARY: usize = 54;
 hot_thunk!(thunk_unlockable_parse_weapon_primary, port_unlockable_parse_weapon_primary, "ret 4");
 unsafe extern "C" fn port_unlockable_parse_weapon_primary(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_UNLOCKABLE_PARSE_WEAPON_PRIMARY);
-        if r.eax == 0 {
-            return;
-        }
-        let f = call_regs(0x00BF_BEE0, r.eax, r.ecx, r.edx, r.esi, 0xdc5804, &[]);
-        let v = if f != 0 { rd(f as usize + 0xc) } else { f };
-        let e = call_regs(0xb716e0, v, r.ecx, r.edx, r.esi, r.edi, &[v]);
-        wd(*a as usize + 8, e);
-        r.eax = (e & !0xff) | (e != 0) as u32;
+        unlock_pre_b716e0(r, a);
     }
 }
 
@@ -2110,17 +2322,9 @@ const UNLOCKABLE_PARSE_WEAPON_SECONDARY_JMPS: [usize; 0] = [];
 const ID_UNLOCKABLE_PARSE_WEAPON_SECONDARY: usize = 55;
 hot_thunk!(thunk_unlockable_parse_weapon_secondary, port_unlockable_parse_weapon_secondary, "ret 4");
 unsafe extern "C" fn port_unlockable_parse_weapon_secondary(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_UNLOCKABLE_PARSE_WEAPON_SECONDARY);
-        if r.eax == 0 {
-            return;
-        }
-        let f = call_regs(0x00BF_BEE0, r.eax, r.ecx, r.edx, r.esi, 0xdc5804, &[]);
-        let v = if f != 0 { rd(f as usize + 0xc) } else { f };
-        let e = call_regs(0xb716e0, v, r.ecx, r.edx, r.esi, r.edi, &[v]);
-        wd(*a as usize + 8, e);
-        r.eax = (e & !0xff) | (e != 0) as u32;
+        unlock_pre_b716e0(r, a);
     }
 }
 
@@ -2140,17 +2344,23 @@ const UNLOCKABLE_PARSE_CONTACT_JMPS: [usize; 0] = [];
 const ID_UNLOCKABLE_PARSE_CONTACT: usize = 56;
 hot_thunk!(thunk_unlockable_parse_contact, port_unlockable_parse_contact, "ret 4");
 unsafe extern "C" fn port_unlockable_parse_contact(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_UNLOCKABLE_PARSE_CONTACT);
         if r.eax == 0 {
+            r.eax &= !0xff;
             return;
         }
-        let f = call_regs(0x00BF_BEE0, r.eax, r.ecx, r.edx, r.esi, 0x00DC_5804, &[]);
-        let v = if f != 0 { rd(f as usize + 0xc) } else { 0 };
-        let e = call_regs(0x0078_6FB0, v, r.ecx, r.edx, r.esi, r.edi, &[]);
-        wd(*a as usize + 8, e);
-        r.eax = (e & !0xff) | (e != 0xFFFF_FFFF) as u32;
+        let edi0 = r.edi;
+        r.edi = 0x00DC_5804;
+        cx(0x00BF_BEE0, r, &fr(a, &[edi0]));
+        r.edi = edi0;
+        if r.eax != 0 {
+            r.eax = rd(r.eax as usize + 0xc);
+        }
+        cx(0x0078_6FB0, r, &fr(a, &[]));
+        r.ecx = *a;
+        wd(r.ecx as usize + 8, r.eax);
+        r.eax = (r.eax & !0xff) | (r.eax != 0xFFFF_FFFF) as u32;
     }
 }
 
@@ -2169,17 +2379,24 @@ const UNLOCKABLE_PARSE_CRIB_REF_JMPS: [usize; 0] = [];
 const ID_UNLOCKABLE_PARSE_CRIB_REF: usize = 57;
 hot_thunk!(thunk_unlockable_parse_crib_ref, port_unlockable_parse_crib_ref, "ret 4");
 unsafe extern "C" fn port_unlockable_parse_crib_ref(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_UNLOCKABLE_PARSE_CRIB_REF);
         if r.eax == 0 {
+            r.eax &= !0xff;
             return;
         }
-        let f = call_regs(0x00BF_BEE0, r.eax, r.ecx, r.edx, r.esi, 0x00DC_5804, &[]);
-        let v = if f != 0 { rd(f as usize + 0xc) } else { f };
-        let e = call_regs(0x0054_8330, v, v, r.edx, r.esi, r.edi, &[]);
-        wd(*a as usize + 8, e);
-        r.eax = (e & !0xff) | (e != 0xFFFF_FFFF) as u32;
+        let edi0 = r.edi;
+        r.edi = 0x00DC_5804;
+        cx(0x00BF_BEE0, r, &fr(a, &[edi0]));
+        r.edi = edi0;
+        if r.eax != 0 {
+            r.eax = rd(r.eax as usize + 0xc);
+        }
+        r.ecx = r.eax;
+        cx(0x0054_8330, r, &fr(a, &[]));
+        r.ecx = *a;
+        wd(r.ecx as usize + 8, r.eax);
+        r.eax = (r.eax & !0xff) | (r.eax != 0xFFFF_FFFF) as u32;
     }
 }
 
@@ -2196,20 +2413,11 @@ const UNLOCKABLE_PARSE_GANG_TYPE_ABS: [usize; 1] = [13];
 #[cfg(test)]
 const UNLOCKABLE_PARSE_GANG_TYPE_JMPS: [usize; 0] = [];
 const ID_UNLOCKABLE_PARSE_GANG_TYPE: usize = 58;
-hot_thunk!(thunk_unlockable_parse_gang_type, port_unlockable_parse_gang_type, "ret 4");
+hot_thunk_fr!(thunk_unlockable_parse_gang_type, port_unlockable_parse_gang_type, "ret 4", 4);
 unsafe extern "C" fn port_unlockable_parse_gang_type(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_UNLOCKABLE_PARSE_GANG_TYPE);
-        if r.eax == 0 {
-            return;
-        }
-        let f = call_regs(0x00BF_BEE0, r.eax, r.ecx, r.edx, r.esi, 0xe0c3f4, &[]);
-        let str_ = if f != 0 { rd(f as usize + 0xc) } else { 0 };
-        let mut local = 0u32;
-        let p = call_regs(0x00BD_CB30, 0, str_, r.edx, r.esi, r.edi, &[&mut local as *mut u32 as u32]);
-        wd(*a as usize + 8, local);
-        r.eax = (p & !0xff) | 1;
+        unlock_str_local(r, a, 0x00E0_C3F4, false);
     }
 }
 
@@ -2226,20 +2434,11 @@ const UNLOCKABLE_PARSE_VEHICLE_GROUP_ABS: [usize; 1] = [13];
 #[cfg(test)]
 const UNLOCKABLE_PARSE_VEHICLE_GROUP_JMPS: [usize; 0] = [];
 const ID_UNLOCKABLE_PARSE_VEHICLE_GROUP: usize = 59;
-hot_thunk!(thunk_unlockable_parse_vehicle_group, port_unlockable_parse_vehicle_group, "ret 4");
+hot_thunk_fr!(thunk_unlockable_parse_vehicle_group, port_unlockable_parse_vehicle_group, "ret 4", 4);
 unsafe extern "C" fn port_unlockable_parse_vehicle_group(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_UNLOCKABLE_PARSE_VEHICLE_GROUP);
-        if r.eax == 0 {
-            return;
-        }
-        let f = call_regs(0x00BF_BEE0, r.eax, r.ecx, r.edx, r.esi, 0xdff158, &[]);
-        let str_ = if f != 0 { rd(f as usize + 0xc) } else { 0 };
-        let mut local = 0u32;
-        let p = call_regs(0x00BD_CB30, 0, str_, r.edx, r.esi, r.edi, &[&mut local as *mut u32 as u32]);
-        wd(*a as usize + 8, local);
-        r.eax = (p & !0xff) | 1;
+        unlock_str_local(r, a, 0x00DF_F158, false);
     }
 }
 
@@ -2256,20 +2455,11 @@ const UNLOCKABLE_PARSE_STYLE_ABS: [usize; 1] = [13];
 #[cfg(test)]
 const UNLOCKABLE_PARSE_STYLE_JMPS: [usize; 0] = [];
 const ID_UNLOCKABLE_PARSE_STYLE: usize = 60;
-hot_thunk!(thunk_unlockable_parse_style, port_unlockable_parse_style, "ret 4");
+hot_thunk_fr!(thunk_unlockable_parse_style, port_unlockable_parse_style, "ret 4", 4);
 unsafe extern "C" fn port_unlockable_parse_style(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_UNLOCKABLE_PARSE_STYLE);
-        if r.eax == 0 {
-            return;
-        }
-        let f = call_regs(0x00BF_BEE0, r.eax, r.ecx, r.edx, r.esi, 0xdd5a40, &[]);
-        let str_ = if f != 0 { rd(f as usize + 0xc) } else { 0 };
-        let mut local = 0u32;
-        let p = call_regs(0x00BD_CB30, 0, str_, r.edx, r.esi, r.edi, &[&mut local as *mut u32 as u32]);
-        wd(*a as usize + 8, local);
-        r.eax = (p & !0xff) | 1;
+        unlock_str_local(r, a, 0x00DD_5A40, false);
     }
 }
 
@@ -2287,21 +2477,11 @@ const UNLOCKABLE_PARSE_ITEM_ABS: [usize; 1] = [13];
 #[cfg(test)]
 const UNLOCKABLE_PARSE_ITEM_JMPS: [usize; 0] = [];
 const ID_UNLOCKABLE_PARSE_ITEM: usize = 61;
-hot_thunk!(thunk_unlockable_parse_item, port_unlockable_parse_item, "ret 4");
+hot_thunk_fr!(thunk_unlockable_parse_item, port_unlockable_parse_item, "ret 4", 4);
 unsafe extern "C" fn port_unlockable_parse_item(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_UNLOCKABLE_PARSE_ITEM);
-        if r.eax == 0 {
-            return;
-        }
-        let f = call_regs(0x00BF_BEE0, r.eax, r.ecx, r.edx, r.esi, 0x00DC_5804, &[]);
-        let str_ = if f != 0 { rd(f as usize + 0xc) } else { 0 };
-        let mut local = 0u32;
-        let p = call_regs(0x00BD_CB30, 0, str_, r.edx, r.esi, r.edi, &[&mut local as *mut u32 as u32]);
-        let e = call_regs(0x0091_C290, p, p, r.edx, r.esi, r.edi, &[]);
-        wd(*a as usize + 8, e);
-        r.eax = (e & !0xff) | (e != 0) as u32;
+        unlock_str_local(r, a, 0x00DC_5804, true);
     }
 }
 
@@ -2350,19 +2530,25 @@ const ACT_HOLDUP_START_MSG_TEXT_JMPS: [usize; 0] = [];
 const ID_ACT_HOLDUP_START_MSG_TEXT: usize = 63;
 hot_thunk!(thunk_act_holdup_start_msg_text, port_act_holdup_start_msg_text, "ret");
 unsafe extern "C" fn port_act_holdup_start_msg_text(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_ACT_HOLDUP_START_MSG_TEXT);
+        let (esi0, edi0) = (r.esi, r.edi);
+        r.eax = 0;
+        r.edi = 0;
+        r.esi = 0x00DF_BD38;
         wd(0x0140_C7E4, 0);
         wd(0x0140_C7E0, 0);
-        let e1 = call_regs(0x007F_49E0, 0, r.ecx, r.edx, 0x00DF_BD38, 0, &[]);
-        wd(0x0140_C7D4, e1);
-        let e2 = call_regs(0x007F_49E0, e1, r.ecx, r.edx, 0x00DF_BEB8, 0, &[]);
-        wd(0x0140_C7D8, e2);
-        let e3 = call_regs(0x007F_49E0, e2, r.ecx, r.edx, 0x00DF_BED0, 0, &[]);
-        wd(0x0140_C7DC, e3);
+        cx(0x007F_49E0, r, &fr(a, &[edi0, esi0]));
+        r.esi = 0x00DF_BEB8;
+        wd(0x0140_C7D4, r.eax);
+        cx(0x007F_49E0, r, &fr(a, &[edi0, esi0]));
+        r.esi = 0x00DF_BED0;
+        wd(0x0140_C7D8, r.eax);
+        cx(0x007F_49E0, r, &fr(a, &[edi0, esi0]));
+        r.edi = edi0;
+        wd(0x0140_C7DC, r.eax);
         wd(0x00EA_A79C, 0xFFFF_FFFF);
-        r.eax = e3;
+        r.esi = esi0;
     }
 }
 
@@ -2385,7 +2571,6 @@ const ACT_LEVEL_TEXT_JMPS: [usize; 0] = [];
 const ID_ACT_LEVEL_TEXT: usize = 64;
 hot_thunk!(thunk_act_level_text, port_act_level_text, "ret");
 unsafe extern "C" fn port_act_level_text(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_ACT_LEVEL_TEXT);
         const T: [(u32, u32, usize); 6] = [
@@ -2396,12 +2581,15 @@ unsafe extern "C" fn port_act_level_text(r: &mut Pushad, a: *const u32) {
             (0x00DE_2EA0, 0x00DE_2EA8, 0x0252_7424),
             (0x00DE_2EB4, 0x00DE_2EBC, 0x0252_7428),
         ];
-        let mut eax = r.eax;
+        let (esi0, edi0) = (r.esi, r.edi);
         for (edi, esi, dst) in T {
-            eax = call_regs(0x007F_4AD0, eax, r.ecx, r.edx, esi, edi, &[]);
-            wd(dst, eax);
+            r.edi = edi;
+            r.esi = esi;
+            cx(0x007F_4AD0, r, &fr(a, &[edi0, esi0]));
+            wd(dst, r.eax);
         }
-        r.eax = eax;
+        r.edi = edi0;
+        r.esi = esi0;
     }
 }
 
@@ -2719,13 +2907,16 @@ const AUDIO_JOB_WORKERS_MODE_RESET_JMPS: [usize; 0] = [];
 const ID_AUDIO_JOB_WORKERS_MODE_RESET: usize = 74;
 hot_thunk!(thunk_audio_job_workers_mode_reset, port_audio_job_workers_mode_reset, "ret");
 unsafe extern "C" fn port_audio_job_workers_mode_reset(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_AUDIO_JOB_WORKERS_MODE_RESET);
+        let esi0 = r.esi;
+        r.esi = 0x033D_63F8;
         wd(0x033D_6430, 3);
-        call_regs(0x00BF_3760, r.eax, r.ecx, r.edx, 0x033D_63F8, r.edi, &[]);
+        cx(0x00BF_3760, r, &fr(a, &[esi0]));
+        r.esi = 0x033D_64C8;
         wd(0x033D_6500, 3);
-        r.eax = call_regs(0x00BF_3760, r.eax, r.ecx, r.edx, 0x033D_64C8, r.edi, &[]);
+        cx(0x00BF_3760, r, &fr(a, &[esi0]));
+        r.esi = esi0;
     }
 }
 
@@ -2765,17 +2956,20 @@ const HAVOK_ENTITY_REFRESH_COLLISION_FILTER_JMPS: [usize; 0] = [];
 const ID_HAVOK_ENTITY_REFRESH_COLLISION_FILTER: usize = 76;
 hot_thunk!(thunk_havok_entity_refresh_collision_filter, port_havok_entity_refresh_collision_filter, "ret");
 unsafe extern "C" fn port_havok_entity_refresh_collision_filter(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_HAVOK_ENTITY_REFRESH_COLLISION_FILTER);
+        let ecx0 = r.ecx;
         if rd(0x0252_7DAC) > 0 {
             hit(ID_HAVOK_ENTITY_REFRESH_COLLISION_FILTER, 0);
-            r.eax = call_regs(0x006F_5740, r.eax, r.ecx, r.edx, r.esi, r.edi, &[]);
+            cx(0x006F_5740, r, &fr(a, &[ecx0]));
+            r.ecx = ecx0;
             return;
         }
         hit(ID_HAVOK_ENTITY_REFRESH_COLLISION_FILTER, 1);
         let g = rd(0x0252_7D94);
-        r.eax = call_regs(0x00D5_CC40, 0, r.ecx, r.edx, r.esi, r.edi, &[g, r.edx, 1]);
+        r.eax = 0;
+        cx_p3(0x00D5_CC40, r, &fr(a, &[g, r.edx, 1, ecx0]));
+        r.ecx = ecx0;
     }
 }
 
@@ -2794,20 +2988,21 @@ const VIDEO_STOP_JMPS: [usize; 0] = [];
 const ID_VIDEO_STOP: usize = 77;
 hot_thunk!(thunk_video_stop, port_video_stop, "ret");
 unsafe extern "C" fn port_video_stop(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_VIDEO_STOP);
-        call_regs(0x0068_88D0, r.eax, r.ecx, r.edx, r.esi, r.edi, &[]);
-        let mut eax = call_regs(0x0047_F170, r.eax, r.ecx, r.edx, r.esi, r.edi, &[]);
+        let ecx0 = r.ecx;
+        cx(0x0068_88D0, r, &fr(a, &[ecx0]));
+        cx(0x0047_F170, r, &fr(a, &[ecx0]));
         let flag = rb(0x0252_7B76);
         wb(0x00E9_4D3E, 1);
         if flag != 0 {
             hit(ID_VIDEO_STOP, 0);
-            eax = call_regs(0x0052_2B80, eax, r.ecx, r.edx, r.esi, r.edi, &[0]);
-            eax = call_regs(0x00A8_0CC0, (eax & !0xff) | 1, r.ecx, r.edx, r.esi, r.edi, &[]);
+            cx(0x0052_2B80, r, &fr(a, &[0, ecx0]));
+            r.eax = (r.eax & !0xff) | 1;
+            cx(0x00A8_0CC0, r, &fr(a, &[ecx0]));
             wb(0x0252_7B76, 0);
         }
-        r.eax = eax;
+        r.ecx = ecx0;
     }
 }
 
@@ -2826,23 +3021,21 @@ const CUTSCENE_ACTION_DOOR_OPEN_JMPS: [usize; 0] = [];
 const ID_CUTSCENE_ACTION_DOOR_OPEN: usize = 78;
 hot_thunk!(thunk_cutscene_action_door_open, port_cutscene_action_door_open, "ret");
 unsafe extern "C" fn port_cutscene_action_door_open(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_CUTSCENE_ACTION_DOOR_OPEN);
-        let act = *a as usize;
-        let name = rd(act + 0x10);
-        if name == 0 {
-            r.eax = 0;
+        r.eax = rd(*a as usize + 0x10);
+        if r.eax == 0 {
             return;
         }
-        let door = call_regs(0x00A5_B6E0, name, r.ecx, r.edx, r.esi, r.edi, &[]);
-        if door == 0 {
-            r.eax = 0;
+        cx(0x00A5_B6E0, r, &fr(a, &[]));
+        if r.eax == 0 {
             return;
         }
-        let ecx = rd(door as usize + 0x94);
-        let e = call_regs(0x0091_B590, door, ecx, r.edx, r.esi, r.edi, &[ecx, 0, 1]);
-        r.eax = call_regs(0x0091_AD80, e, e, r.edx, r.esi, r.edi, &[0, 1]);
+        let ecx = rd(r.eax as usize + 0x94);
+        r.ecx = ecx;
+        cx(0x0091_B590, r, &fr(a, &[ecx, 0, 1]));
+        r.ecx = r.eax;
+        cx(0x0091_AD80, r, &fr(a, &[0, 1]));
     }
 }
 
@@ -2860,23 +3053,21 @@ const CUTSCENE_ACTION_DOOR_CLOSE_JMPS: [usize; 1] = [37];
 const ID_CUTSCENE_ACTION_DOOR_CLOSE: usize = 79;
 hot_thunk!(thunk_cutscene_action_door_close, port_cutscene_action_door_close, "ret");
 unsafe extern "C" fn port_cutscene_action_door_close(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_CUTSCENE_ACTION_DOOR_CLOSE);
-        let act = *a as usize;
-        let name = rd(act + 0x10);
-        if name == 0 {
-            r.eax = 0;
+        r.eax = rd(*a as usize + 0x10);
+        if r.eax == 0 {
             return;
         }
-        let door = call_regs(0x00A5_B6E0, name, r.ecx, r.edx, r.esi, r.edi, &[]);
-        if door == 0 {
-            r.eax = 0;
+        cx(0x00A5_B6E0, r, &fr(a, &[]));
+        if r.eax == 0 {
             return;
         }
-        let ecx = rd(door as usize + 0x94);
-        let e = call_regs(0x0091_B590, door, ecx, r.edx, r.esi, r.edi, &[ecx]);
-        r.eax = call_regs(0x0091_B140, e, e, r.edx, r.esi, r.edi, &[*a]);
+        let ecx = rd(r.eax as usize + 0x94);
+        r.ecx = ecx;
+        cx(0x0091_B590, r, &fr(a, &[ecx]));
+        r.ecx = r.eax;
+        cx(0x0091_B140, r, &fr_tail(a));
     }
 }
 
@@ -2894,25 +3085,22 @@ const CUTSCENE_ACTION_MESH_MOVER_PLAY_UPDATE_JMPS: [usize; 0] = [];
 const ID_CUTSCENE_ACTION_MESH_MOVER_PLAY_UPDATE: usize = 80;
 hot_thunk!(thunk_cutscene_action_mesh_mover_play_update, port_cutscene_action_mesh_mover_play_update, "ret");
 unsafe extern "C" fn port_cutscene_action_mesh_mover_play_update(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_CUTSCENE_ACTION_MESH_MOVER_PLAY_UPDATE);
-        let name = rd(*a as usize + 8);
-        if name == 0 {
-            r.eax = 1;
-            return;
+        r.eax = rd(*a as usize + 8);
+        let done = |r: &mut Pushad| r.eax = (r.eax & !0xff) | 1;
+        if r.eax == 0 {
+            return done(r);
         }
-        let door = call_regs(0x00A5_B6E0, name, r.ecx, r.edx, r.esi, r.edi, &[]);
-        if door == 0 {
-            r.eax = 1;
-            return;
+        cx(0x00A5_B6E0, r, &fr(a, &[]));
+        if r.eax == 0 {
+            return done(r);
         }
-        let p = rd(door as usize + 0x94);
-        if p == 0 {
-            r.eax = 1;
-            return;
+        r.eax = rd(r.eax as usize + 0x94);
+        if r.eax == 0 {
+            return done(r);
         }
-        r.eax = (rb(p as usize + 0xa) as u32 >> 1) & 1;
+        r.eax = (rb(r.eax as usize + 0xa) as u32 >> 1) & 1;
     }
 }
 
@@ -2929,20 +3117,18 @@ const CUTSCENE_ACTION_MESH_MOVER_STOP_JMPS: [usize; 1] = [22];
 const ID_CUTSCENE_ACTION_MESH_MOVER_STOP: usize = 81;
 hot_thunk!(thunk_cutscene_action_mesh_mover_stop, port_cutscene_action_mesh_mover_stop, "ret");
 unsafe extern "C" fn port_cutscene_action_mesh_mover_stop(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_CUTSCENE_ACTION_MESH_MOVER_STOP);
-        let name = rd(*a as usize + 8);
-        if name == 0 {
-            r.eax = 0;
+        r.eax = rd(*a as usize + 8);
+        if r.eax == 0 {
             return;
         }
-        let door = call_regs(0x00A5_B6E0, name, r.ecx, r.edx, r.esi, r.edi, &[]);
-        if door == 0 {
-            r.eax = 0;
+        cx(0x00A5_B6E0, r, &fr(a, &[]));
+        if r.eax == 0 {
             return;
         }
-        r.eax = call_regs(0x00A5_BF40, door, door, r.edx, r.esi, r.edi, &[*a]);
+        r.ecx = r.eax;
+        cx(0x00A5_BF40, r, &fr_tail(a));
     }
 }
 
@@ -2959,22 +3145,22 @@ const CUTSCENE_ACTION_MESH_MOVER_RESET_JMPS: [usize; 0] = [];
 const ID_CUTSCENE_ACTION_MESH_MOVER_RESET: usize = 82;
 hot_thunk!(thunk_cutscene_action_mesh_mover_reset, port_cutscene_action_mesh_mover_reset, "ret");
 unsafe extern "C" fn port_cutscene_action_mesh_mover_reset(r: &mut Pushad, a: *const u32) {
-
     unsafe {
         cnt(ID_CUTSCENE_ACTION_MESH_MOVER_RESET);
-        let name = rd(*a as usize + 8);
-        if name == 0 {
-            r.eax = 0;
+        r.eax = rd(*a as usize + 8);
+        if r.eax == 0 {
             return;
         }
-        let door = call_regs(0x00A5_B6E0, name, r.ecx, r.edx, r.esi, r.edi, &[]);
-        if door == 0 {
-            r.eax = 0;
+        cx(0x00A5_B6E0, r, &fr(a, &[]));
+        if r.eax == 0 {
             return;
         }
-        let vt = rd(door as usize);
-        let f = rd(vt as usize + 0x24);
-        r.eax = call_regs(f as usize, f, door, vt, r.esi, r.edi, &[*a]);
+        let edx = rd(r.eax as usize);
+        r.edx = edx;
+        r.ecx = r.eax;
+        let f = rd(edx as usize + 0x24);
+        r.eax = f;
+        cx(f as usize, r, &fr_tail(a));
     }
 }
 

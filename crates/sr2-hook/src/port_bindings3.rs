@@ -123,6 +123,184 @@ static CALLS: [AtomicU32; COUNT] = [const { AtomicU32::new(0) }; COUNT];
 static MISMATCHES: [AtomicU32; COUNT] = [const { AtomicU32::new(0) }; COUNT];
 static ORIGINALS: [AtomicUsize; COUNT] = [const { AtomicUsize::new(0) }; COUNT];
 
+// --- Register model and thunk ----------------------------------------------------------------
+//
+// The originals are lua_CFunctions: they leave XMM0-7 alone, and leave ECX / EDX as whatever the
+// last instruction or callee put there. The thunk saves XMM0-7, hands the entry ECX / EDX to the
+// Rust body and loads the model's ECX / EDX on the way out. `call_regs` below shadows portlib's
+// and records the ECX / EDX each callee leaves behind in the model; a body overrides the model
+// with `set_ecx` / `set_edx` where the original's own instructions decide them.
+
+pub(crate) static MODEL_ECX: AtomicU32 = AtomicU32::new(0);
+pub(crate) static MODEL_EDX: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ENTRY_ECX: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ENTRY_EDX: AtomicU32 = AtomicU32::new(0);
+/// Address of the original's first stack argument (L): the return address is at `ARGP - 4`.
+pub(crate) static ARGP: AtomicU32 = AtomicU32::new(0);
+
+/// ECX / EDX the binding was entered with.
+pub(crate) fn entry_ecx() -> u32 {
+    ENTRY_ECX.load(Ordering::Relaxed)
+}
+/// Set the ECX / EDX the binding will leave behind (the register model).
+pub(crate) fn set_ecx(v: u32) {
+    MODEL_ECX.store(v, Ordering::Relaxed);
+}
+pub(crate) fn set_edx(v: u32) {
+    MODEL_EDX.store(v, Ordering::Relaxed);
+}
+/// The original's ESP on entry (pointing at the return address). A local the original keeps at
+/// `[esp + k]` once it has moved ESP by `d` bytes below the entry value lives at
+/// `entry_esp() - d + k`. The thunk reserves 256 bytes below the entry ESP for those, so the
+/// port can pass the same stack addresses the original passes.
+pub(crate) fn entry_esp() -> u32 {
+    ARGP.load(Ordering::Relaxed).wrapping_sub(4)
+}
+/// The address of the original's `[esp + 4]` argument slot (L); the original may reuse the slot
+/// as scratch, and the judge compares it after the return.
+pub(crate) fn arg0_addr() -> u32 {
+    ARGP.load(Ordering::Relaxed)
+}
+
+pub(crate) fn enter(ecx: u32, edx: u32, argp: u32) -> [u32; 5] {
+    [
+        ENTRY_ECX.swap(ecx, Ordering::Relaxed),
+        ENTRY_EDX.swap(edx, Ordering::Relaxed),
+        MODEL_ECX.swap(ecx, Ordering::Relaxed),
+        MODEL_EDX.swap(edx, Ordering::Relaxed),
+        ARGP.swap(argp, Ordering::Relaxed),
+    ]
+}
+
+pub(crate) unsafe fn leave(saved: [u32; 5], out: *mut u32) {
+    unsafe {
+        *out = MODEL_ECX.load(Ordering::Relaxed);
+        *out.add(1) = MODEL_EDX.load(Ordering::Relaxed);
+    }
+    ENTRY_ECX.store(saved[0], Ordering::Relaxed);
+    ENTRY_EDX.store(saved[1], Ordering::Relaxed);
+    MODEL_ECX.store(saved[2], Ordering::Relaxed);
+    MODEL_EDX.store(saved[3], Ordering::Relaxed);
+    ARGP.store(saved[4], Ordering::Relaxed);
+}
+
+/// `script_find_object_by_name(ECX = name, EAX = &found)` with the found byte at `slot` (an
+/// address in the original's frame; the arg slot for most bindings). `clear` writes the byte 0
+/// first (`mov byte [slot], 0`). Returns (object, found byte).
+pub(crate) unsafe fn find_with_byte(slot: u32, name: u32, clear: bool) -> (u32, u8) {
+    unsafe {
+        if clear {
+            wb(slot as usize, 0);
+        }
+        let obj = call_regs(0x00A5_2BB0, slot, name, 0, 0, 0, &[]);
+        (obj, rb(slot as usize))
+    }
+}
+
+/// A flag the original stores as a byte in its argument slot (L's upper three bytes stay) and
+/// passes as the whole dword.
+pub(crate) unsafe fn flag_slot(flag: bool) -> u32 {
+    unsafe {
+        wb(arg0_addr() as usize, flag as u8);
+        rd(arg0_addr() as usize)
+    }
+}
+
+/// Like portlib's `call_regs`, and the callee's ECX / EDX go into the register model.
+pub(crate) unsafe fn call_regs(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> u32 {
+    let block: [u32; 8] = [f as u32, ecx, edx, esi, edi, args.as_ptr() as u32, args.len() as u32, eax];
+    let r: u32;
+    let (ec, ed): (u32, u32);
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "mov ebp, esp",
+            "mov ebx, eax",
+            "mov ecx, [ebx + 24]",
+            "mov esi, [ebx + 20]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]", "mov esi, [ebx + 12]", "mov edi, [ebx + 16]",
+            "mov eax, [ebx + 28]",
+            "call dword ptr [ebx]",
+            "mov esp, ebp",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("eax") block.as_ptr() => r, lateout("ecx") ec, lateout("edx") ed,
+            clobber_abi("C"),
+        );
+    }
+    MODEL_ECX.store(ec, Ordering::Relaxed);
+    MODEL_EDX.store(ed, Ordering::Relaxed);
+    r
+}
+
+/// Defines the naked entry `$name` (the game's convention: cdecl `(L)`, XMM0-7 kept, the
+/// register model's ECX / EDX out) around `$name::run`, which evaluates `$e` with `$l` = L.
+macro_rules! binding_thunk {
+    ($name:ident, $l:ident, $e:expr) => {
+        #[allow(non_snake_case)]
+        mod $name {
+            use super::*;
+            pub extern "C" fn run(l: u32, ecx: u32, edx: u32, out: *mut u32, argp: u32) -> i32 {
+                let saved = crate::port_bindings3::enter(ecx, edx, argp);
+                let r: i32 = {
+                    let $l = l;
+                    $e
+                };
+                unsafe { crate::port_bindings3::leave(saved, out) };
+                r
+            }
+        }
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 256",
+                "push ecx",
+                "push edx",
+                "sub esp, 128",
+                "movups [esp], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push 0",
+                "push 0",
+                "lea eax, [esp + 404]",
+                "push eax",
+                "lea eax, [esp + 4]",
+                "push eax",
+                "push dword ptr [esp + 144]",
+                "push dword ptr [esp + 152]",
+                "push dword ptr [esp + 420]",
+                "call {f}",
+                "add esp, 20",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "movups xmm0, [esp + 8]",
+                "movups xmm1, [esp + 24]",
+                "movups xmm2, [esp + 40]",
+                "movups xmm3, [esp + 56]",
+                "movups xmm4, [esp + 72]",
+                "movups xmm5, [esp + 88]",
+                "movups xmm6, [esp + 104]",
+                "movups xmm7, [esp + 120]",
+                "add esp, 400",
+                "ret",
+                f = sym $name::run,
+            )
+        }
+    };
+}
+pub(crate) use binding_thunk;
+
 // --- Lua 5.0 argument access (as in port_bindings2.rs) -------------------------------------
 
 unsafe fn top(l: u32) -> u32 {
@@ -157,24 +335,43 @@ unsafe fn is_nil(p: u32) -> bool {
 
 unsafe fn number_arg(l: u32, i: i32) -> f64 {
     let mut out = 0f64;
+    let (ec, ed): (u32, u32);
     unsafe {
         std::arch::asm!(
             "call {f}",
             "fstp qword ptr [edi]",
             f = in(reg) LUA_TONUMBER,
             in("eax") i,
-            in("ecx") l,
+            inout("ecx") l => ec,
+            lateout("edx") ed,
             in("edi") &mut out as *mut f64,
             clobber_abi("C"),
         );
     }
+    set_ecx(ec);
+    set_edx(ed);
     out
 }
 
 /// `_ftol2(lua_tonumber(i))`: truncation, the low dword of the 64-bit result.
 unsafe fn int_arg(l: u32, i: i32) -> u32 {
-    let out = unsafe { number_arg(l, i) };
-    if out.abs() < 9.2e18 { out as i64 as u32 } else { 0 }
+    let r: u32;
+    let (ec, ed): (u32, u32);
+    unsafe {
+        std::arch::asm!(
+            "call {f}",
+            "call {g}",
+            f = in(reg) LUA_TONUMBER,
+            g = in(reg) 0x00DA_0176usize,
+            inout("eax") i => r,
+            inout("ecx") l => ec,
+            lateout("edx") ed,
+            clobber_abi("C"),
+        );
+    }
+    set_ecx(ec);
+    set_edx(ed);
+    r
 }
 
 /// The truth test of a slot pointer: missing, nil or false -> false.
@@ -309,16 +506,29 @@ unsafe fn follower_or_object_human(name: u32) -> Option<u32> {
 }
 
 unsafe fn cb_set(f: usize, ecx: u32, ty: u32, name: u32) {
-    let mut t = ty;
-    unsafe { call_regs(f, &mut t as *mut u32 as u32, ecx, 0, 0, 0, &[name]) };
+    // The original stores the type in its own argument slot and passes that address.
+    unsafe {
+        wd(arg0_addr() as usize, ty);
+        call_regs(f, arg0_addr(), ecx, 0, 0, 0, &[name]);
+    }
 }
 
 /// `script_lua_opt_int`: EDI = L, cdecl (&args left, &default 3).
-unsafe fn opt_int(f: usize, l: u32, left: i32) -> u32 {
-    let mut left = left;
-    let mut def = 3u32;
-    unsafe { call_regs(f, 0, 0, 0, 0, l, &[&mut left as *mut i32 as u32, &mut def as *mut u32 as u32]) }
+/// `opt_int` with the two out-slots at the original's own frame addresses (`left_addr` holds the
+/// count, `def_addr` the default 3).
+unsafe fn opt_int_at(f: usize, l: u32, left: i32, left_addr: u32, def_addr: u32) -> u32 {
+    unsafe {
+        wd(left_addr as usize, left as u32);
+        wd(def_addr as usize, 3);
+        call_regs(f, 0, 0, 0, 0, l, &[left_addr, def_addr])
+    }
 }
+
+/// ESP of a `push ebp; mov ebp, esp; and esp, -8` frame right after the `and`.
+pub(crate) fn aligned_base() -> u32 {
+    entry_esp().wrapping_sub(4) & !7
+}
+
 
 /// The game's `_ftol2_sse` on a float (cvttsd2si: out of range gives 0x80000000).
 unsafe fn ftol2_sse(x: f32) -> u32 {
@@ -428,18 +638,31 @@ unsafe fn shadowed(i: usize, l: u32, rust: unsafe fn(u32) -> i32, restore: &[usi
 
 macro_rules! counted {
     ($name:ident, $idx:expr, $body:ident) => {
-        extern "C" fn $name(l: u32) -> i32 {
+        binding_thunk!($name, l, {
             CALLS[$idx].fetch_add(1, Ordering::Relaxed);
             unsafe { $body(l) }
-        }
+        });
+    };
+    ($name:ident, $idx:expr, $body:ident, pop_ecx) => {
+        binding_thunk!($name, l, {
+            CALLS[$idx].fetch_add(1, Ordering::Relaxed);
+            let r = unsafe { $body(l) };
+            set_ecx(entry_ecx());
+            r
+        });
     };
 }
 
 macro_rules! shadow_checked {
     ($name:ident, $idx:expr, $body:ident, $restore:expr) => {
-        extern "C" fn $name(l: u32) -> i32 {
-            unsafe { shadowed($idx, l, $body, $restore) }
-        }
+        binding_thunk!($name, l, unsafe { shadowed($idx, l, $body, $restore) });
+    };
+    ($name:ident, $idx:expr, $body:ident, $restore:expr, pop_ecx) => {
+        binding_thunk!($name, l, {
+            let r = unsafe { shadowed($idx, l, $body, $restore) };
+            set_ecx(entry_ecx());
+            r
+        });
     };
 }
 
@@ -474,7 +697,7 @@ unsafe fn on_take_damage_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(on_take_damage, I_ON_TAKE_DAMAGE, on_take_damage_impl);
+counted!(on_take_damage, I_ON_TAKE_DAMAGE, on_take_damage_impl, pop_ecx);
 
 // --- 42 set_max_hit_points -------------------------------------------------------------------
 
@@ -575,8 +798,9 @@ unsafe fn effect_stop_impl(l: u32) -> i32 {
     unsafe {
         let n = nargs(l).min(2);
         let handle = int_arg(l, -n);
-        let flags = opt_int(0x00A5_3EB0, l, n - 1);
-        call_regs(0x0050_DDB0, 0, 0, 0, handle, 0, &[1, flags, 0]);
+        let b = aligned_base();
+        let flags = opt_int_at(0x00A5_3EB0, l, n - 1, b - 4, b - 8);
+        call_regs(0x0050_DDB0, 0, 0, 0, handle, 0, &[1, flags, 0, b - 4, b - 8]);
     }
     0
 }
@@ -680,12 +904,13 @@ unsafe fn notoriety_set_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let team = tostring(l, -n);
         let level = number_arg(l, 1 - n) as f32;
+        wd(arg0_addr() as usize, level.to_bits()); // `fstp dword [esp+0x14]`: the arg slot
         let id = call_regs(0x0055_F5E0, 0, 0, 0, 0, team, &[]);
         call_regs(0x0055_F870, 0, 0, 0, 0, 0, &[id, level.to_bits()]);
     }
     0
 }
-counted!(notoriety_set, I_NOTORIETY_SET, notoriety_set_impl);
+counted!(notoriety_set, I_NOTORIETY_SET, notoriety_set_impl, pop_ecx);
 
 // --- 49 mission_end_success ------------------------------------------------------------------
 
@@ -915,9 +1140,8 @@ unsafe fn inv_item_equip_impl(l: u32) -> i32 {
             return 0;
         }
         // The found byte is the low byte of L's own argument slot, cleared first.
-        let mut found: u32 = l & !0xFF;
-        let obj = call_regs(SCRIPT_FIND_OBJECT_BY_NAME, &mut found as *mut u32 as u32, who, 0, 0, 0, &[]);
-        let h = if found as u8 != 0 { obj } else { call_regs(SCRIPT_OBJECT_TO_HUMAN, obj, 0, 0, who, 0, &[]) };
+        let (obj, fb) = find_with_byte(arg0_addr(), who, true);
+        let h = if fb != 0 { obj } else { call_regs(SCRIPT_OBJECT_TO_HUMAN, obj, 0, 0, who, 0, &[]) };
         if h == 0 {
             return 0;
         }
@@ -944,7 +1168,8 @@ unsafe fn mission_set_checkpoint_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, false);
-        call_regs(0x006A_7D90, 0, 0, 0, 0, 0, &[name, (l & !0xFF) | flag as u32]);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
+        call_regs(0x006A_7D90, 0, 0, 0, 0, 0, &[name, flag_slot(flag)]);
     }
     0
 }
@@ -972,7 +1197,7 @@ unsafe fn on_trigger_exit_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(on_trigger_exit, I_ON_TRIGGER_EXIT, on_trigger_exit_impl);
+counted!(on_trigger_exit, I_ON_TRIGGER_EXIT, on_trigger_exit_impl, pop_ecx);
 
 // --- 56 vehicle_chase ------------------------------------------------------------------------
 
@@ -999,9 +1224,8 @@ unsafe fn vehicle_chase_impl(l: u32) -> i32 {
         let cc = flag_run(l, &mut c, true);
         let d = flag_run(l, &mut c, false);
         let human = if target != 0 {
-            let mut found: u32 = l & !0xFF;
-            let obj = call_regs(SCRIPT_FIND_OBJECT_BY_NAME, &mut found as *mut u32 as u32, target, 0, 0, 0, &[]);
-            if found as u8 != 0 { obj } else { call_regs(SCRIPT_OBJECT_TO_HUMAN, obj, 0, 0, target, 0, &[]) }
+            let (obj, fb) = find_with_byte(arg0_addr(), target, true);
+            if fb != 0 { obj } else { call_regs(SCRIPT_OBJECT_TO_HUMAN, obj, 0, 0, target, 0, &[]) }
         } else {
             0
         };
@@ -1047,6 +1271,9 @@ counted!(vehicle_chase, I_VEHICLE_CHASE, vehicle_chase_impl);
 /// The shared argument read of peg_load / peg_unload: missing, nil or NULL -> no name.
 unsafe fn peg_name(l: u32) -> u32 {
     unsafe {
+        // The original loads ECX = L->top and EDX = L->base before anything else.
+        set_ecx(top(l));
+        set_edx(rd(l as usize + 0xC));
         let n = nargs(l).min(1);
         if n <= 0 || is_nil(slot(l, -n)) {
             return 0;
@@ -1085,6 +1312,7 @@ unsafe fn vehicle_speed_override_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let mph = number_arg(l, 1 - n) as f32;
+        wf(arg0_addr() as usize, mph);
         let v = call_regs(SCRIPT_VEHICLE_FROM_NAME, name, 0, 0, 0, 0, &[]);
         if v == 0 {
             return 0;
@@ -1094,13 +1322,14 @@ unsafe fn vehicle_speed_override_impl(l: u32) -> i32 {
         if !((s as f64) < rf64(0x00E5_C0D8)) {
             s = rf(0x00E9_8030);
         }
+        wf(arg0_addr() as usize, s);
         wb(ai as usize + 0x16, rb(ai as usize + 0x16) & 0xEF);
         wf(ai as usize + 0x88, s);
         call_regs(0x00B2_B8A0, 0, 0, 0, 0, ai, &[1]);
     }
     0
 }
-counted!(vehicle_speed_override, I_VEHICLE_SPEED_OVERRIDE, vehicle_speed_override_impl);
+counted!(vehicle_speed_override, I_VEHICLE_SPEED_OVERRIDE, vehicle_speed_override_impl, pop_ecx);
 
 // --- 60 / 63 player_controls_enable / disable -------------------------------------------------
 
@@ -1213,6 +1442,7 @@ unsafe fn set_unjackable_flag_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, true);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
         let v = vehicle_find(name);
         if v == 0 {
             return 0;
@@ -1221,7 +1451,7 @@ unsafe fn set_unjackable_flag_impl(l: u32) -> i32 {
         wb(vp + 0x74, (rb(vp + 0x74) & !2) | ((flag as u8) << 1));
         if vcall(v, 11) as u8 != 0 {
             let veh = vcall(v, 13);
-            call_regs(0x00AB_A230, 0, 0, 0, 0, 0, &[veh, (l & !0xFF) | flag as u32]);
+            call_regs(0x00AB_A230, 0, 0, 0, 0, 0, &[veh, flag_slot(flag)]);
         }
     }
     0
@@ -1383,17 +1613,18 @@ unsafe fn door_open_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, false);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
         let d = door_find(name);
         if d == 0 {
             push_bool(l, false);
             return 1;
         }
-        let r = call_regs(0x00A5_C040, 0, d, 0, 0, 0, &[(l & !0xFF) | flag as u32]) as u8;
+        let r = call_regs(0x00A5_C040, 0, d, 0, 0, 0, &[flag_slot(flag)]) as u8;
         push_bool(l, r != 0);
     }
     1
 }
-counted!(door_open, I_DOOR_OPEN, door_open_impl);
+counted!(door_open, I_DOOR_OPEN, door_open_impl, pop_ecx);
 
 // --- 66 set_current_hit_points ---------------------------------------------------------------
 
@@ -1403,10 +1634,11 @@ unsafe fn set_current_hit_points_impl(l: u32) -> i32 {
     unsafe {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
-        let mut hp = number_arg(l, 1 - n) as f32;
+        let hp = number_arg(l, 1 - n) as f32;
+        wf(arg0_addr() as usize, hp);
         let h = human_chain(name, true, false);
         if h != 0 {
-            call_regs(0x0096_9C90, 0, h, 0, 0, 0, &[&mut hp as *mut f32 as u32]);
+            call_regs(0x0096_9C90, 0, h, 0, 0, 0, &[arg0_addr()]);
             return 0;
         }
         let v = vehicle_find(name);
@@ -1442,7 +1674,7 @@ unsafe fn on_dismiss_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(on_dismiss, I_ON_DISMISS, on_dismiss_impl);
+counted!(on_dismiss, I_ON_DISMISS, on_dismiss_impl, pop_ecx);
 
 // --- 68 spawning_pedestrians -----------------------------------------------------------------
 
@@ -1453,6 +1685,7 @@ unsafe fn spawning_pedestrians_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let enable = truth(slot(l, -n));
         let despawn = flag_at(l, n - 1, true);
+        wb(arg0_addr() as usize, enable as u8); // `setne [esp+0x14]` of the first argument's truth
         if enable {
             wb(0x0215_DA25, 1);
             wb(0x0215_DA05, 1);
@@ -1552,7 +1785,8 @@ unsafe fn npc_weapon_spread_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let m = n - 1;
-        let mut spread: f32 = if m <= 0 || is_nil(slot(l, -m)) { 1.0 } else { number_arg(l, -m) as f32 };
+        let spread: f32 = if m <= 0 || is_nil(slot(l, -m)) { 1.0 } else { number_arg(l, -m) as f32 };
+        wd(arg0_addr() as usize, spread.to_bits()); // the original keeps it in its arg slot
         if name == 0 {
             return 0;
         }
@@ -1561,12 +1795,12 @@ unsafe fn npc_weapon_spread_impl(l: u32) -> i32 {
             None => return 0,
         };
         if h != 0 {
-            call_regs(0x009D_3310, 0, 0, 0, 0, 0, &[h, &mut spread as *mut f32 as u32]);
+            call_regs(0x009D_3310, 0, 0, 0, 0, 0, &[h, arg0_addr()]);
         }
     }
     0
 }
-counted!(npc_weapon_spread, I_NPC_WEAPON_SPREAD, npc_weapon_spread_impl);
+counted!(npc_weapon_spread, I_NPC_WEAPON_SPREAD, npc_weapon_spread_impl, pop_ecx);
 
 // --- 74 waypoint_remove ----------------------------------------------------------------------
 
@@ -1574,7 +1808,8 @@ counted!(npc_weapon_spread, I_NPC_WEAPON_SPREAD, npc_weapon_spread_impl);
 unsafe fn waypoint_remove_impl(l: u32) -> i32 {
     unsafe {
         let n = nargs(l).min(1);
-        let sync = opt_int(0x00A5_4020, l, n);
+        // The original keeps the count in its own argument slot and the default at entry_esp() - 4.
+        let sync = opt_int_at(0x00A5_4020, l, n, arg0_addr(), entry_esp() - 4);
         call_regs(0x0077_1350, 0, 0, 0, sync, 0, &[]);
     }
     0
@@ -1594,7 +1829,8 @@ unsafe fn waypoint_add_impl(l: u32) -> i32 {
     unsafe {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
-        let sync = opt_int(0x00A5_4020, l, n - 1);
+        let b = aligned_base();
+        let sync = opt_int_at(0x00A5_4020, l, n - 1, b - 4, b - 8);
         let object_handle = |human_obj: u32| -> f64 {
             let veh = vcall(human_obj, 13);
             let handle = rd(veh as usize + 0x44);
@@ -1616,8 +1852,7 @@ unsafe fn waypoint_add_impl(l: u32) -> i32 {
             push_number(l, 0.0);
             return 1;
         }
-        let mut hash = 0u32;
-        let ph = &mut hash as *mut u32 as u32;
+        let ph = b - 4;
         call_regs(STRING_CRC32, ph, 0, 0, 0, 0, &[name]);
         let nav = call_regs(NAVPOINT_FIND, ph, 0, 0, 0, 0, &[]);
         if nav != 0 {
@@ -1637,7 +1872,7 @@ counted!(waypoint_add, I_WAYPOINT_ADD, waypoint_add_impl);
 unsafe fn hud_timer_set_impl(l: u32) -> i32 {
     unsafe {
         let mut c = nargs(l).min(5);
-        let mut i = int_arg(l, -c);
+        let i = int_arg(l, -c);
         c -= 1;
         let ms = int_arg(l, -c);
         c -= 1;
@@ -1655,9 +1890,13 @@ unsafe fn hud_timer_set_impl(l: u32) -> i32 {
             slot(l, -c); // argument 4: fetched and dropped
             c -= 1;
         }
-        let sync = opt_int(0x00A5_3960, l, c);
-        call_regs(0x0078_DEE0, 0, 0, 0, 0, 0, &[i, ms, sync]);
-        call_regs(0x00A5_2FD0, &mut i as *mut u32 as u32, 0, 0, 0, callback, &[]);
+        let b = aligned_base();
+        let (left_addr, def_addr) = (b - 16, b - 12);
+        let sync = opt_int_at(0x00A5_3960, l, c, left_addr, def_addr);
+        call_regs(0x0078_DEE0, 0, 0, 0, 0, 0, &[i, ms, sync, left_addr, def_addr]);
+        wd((b - 4) as usize, i);
+        wd((b - 8) as usize, ms);
+        call_regs(0x00A5_2FD0, b - 4, 0, 0, 0, callback, &[]);
     }
     0
 }
@@ -1757,7 +1996,7 @@ unsafe fn on_vehicle_exit_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(on_vehicle_exit, I_ON_VEHICLE_EXIT, on_vehicle_exit_impl);
+counted!(on_vehicle_exit, I_ON_VEHICLE_EXIT, on_vehicle_exit_impl, pop_ecx);
 
 // --- 80 character_exists ---------------------------------------------------------------------
 
@@ -1767,9 +2006,8 @@ unsafe fn character_exists_impl(l: u32) -> i32 {
     unsafe {
         let n = nargs(l).min(1);
         let name = tostring(l, -n);
-        let mut found: u32 = l;
-        let obj = call_regs(SCRIPT_FIND_OBJECT_BY_NAME, &mut found as *mut u32 as u32, name, 0, 0, 0, &[]);
-        let r = if found as u8 != 0 {
+        let (obj, fb) = find_with_byte(arg0_addr(), name, false);
+        let r = if fb != 0 {
             obj
         } else {
             let o = object_find(name);
@@ -1793,7 +2031,7 @@ struct Binding {
     body: &'static [u8],
     /// The body's `call rel32` offsets, for the relocated shadow copy (shadow-checked ones only).
     shadow_calls: Option<&'static [usize]>,
-    f: extern "C" fn(u32) -> i32,
+    f: extern "C" fn(),
 }
 
 const BINDINGS: [Binding; COUNT] = [

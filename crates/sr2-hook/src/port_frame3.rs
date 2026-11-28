@@ -12,6 +12,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::portlib::*;
+include!("fix_thunks.inc");
 
 // The offline differential test (module `difftest`) keeps the game's globals (0xD00000..0x350000)
 // at a fixed offset, because their addresses are taken in a test process; the Rust ports read
@@ -204,7 +205,7 @@ unsafe fn effect_release(rec: usize) {
     wb(rec + 0x4C, rb(rec + 0x4C) & 0xFE);
 }
 
-keep_ecx_edx!(chunk_effects_thunk, chunk_effects_update);
+kxs0!(chunk_effects_thunk, chunk_effects_update);
 
 extern "C" fn chunk_effects_update() {
     unsafe {
@@ -421,7 +422,7 @@ hits!(PC_HITS, PC_NAMES, pc, [
     "co_flag", "dispatch", "cb8", "camera_pair", "pre_update", "tail", "no_tail",
 ]);
 
-keep_ecx_edx!(player_controls_thunk, player_controls_do_frame);
+kxs0!(player_controls_thunk, player_controls_do_frame);
 
 extern "C" fn player_controls_do_frame() {
     unsafe {
@@ -610,7 +611,7 @@ unsafe fn siren_restart_delay() {
     siren_deadline(r.wrapping_mul(1000));
 }
 
-keep_ecx_edx!(vehicle_siren_thunk, vehicle_siren_update);
+kxs0!(vehicle_siren_thunk, vehicle_siren_update);
 
 extern "C" fn vehicle_siren_update() {
     unsafe {
@@ -871,7 +872,7 @@ unsafe fn lock_reset() {
     wd(0x0252_A130, 0);
 }
 
-keep_ecx_edx!(weapon_target_lock_thunk, weapon_target_lock_update);
+kxs0!(weapon_target_lock_thunk, weapon_target_lock_update);
 
 extern "C" fn weapon_target_lock_update() {
     unsafe {
@@ -1039,7 +1040,7 @@ unsafe fn lock_lost() {
 
 hits!(NF_HITS, NF_NAMES, nf, ["calls", "net_off", "session_tick", "session_ok", "import"]);
 
-keep_ecx_edx!(net_frame_update_thunk, net_frame_update);
+kxs0!(net_frame_update_thunk, net_frame_update);
 
 extern "C" fn net_frame_update() {
     unsafe {
@@ -1101,7 +1102,7 @@ unsafe fn vcall(this: usize, off: usize) -> u32 {
     call_regs(f, vt as u32, this as u32, f as u32, 0, 0, &[])
 }
 
-keep_ecx_edx!(game_mode_activity_thunk, game_mode_activity_frame);
+kxs0!(game_mode_activity_thunk, game_mode_activity_frame);
 
 extern "C" fn game_mode_activity_frame() {
     unsafe {

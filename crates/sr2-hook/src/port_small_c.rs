@@ -76,6 +76,84 @@ fn tgt(a: usize) -> usize {
     }
 }
 
+/// The seven general registers as a straight-line asm function would hold them. `call` runs a game
+/// function with exactly these registers (EBX / EBP and the callee's own stack arguments included)
+/// and leaves in the struct what the callee left, so a port threads the original's register flow:
+/// the original passes the caller's EBX / EBP to its callees, reads the ECX / EDX a callee leaves,
+/// and sees a callee's changes to registers it never saved. ESP is restored from a TEB scratch slot
+/// (`fs:[0x14]`, saved and restored around the call), so the callee may pop its own arguments or
+/// not. The callee sees `args` (at most 8) and zero padding above them.
+#[derive(Clone, Copy)]
+pub(crate) struct St {
+    pub eax: u32,
+    pub ecx: u32,
+    pub edx: u32,
+    pub ebx: u32,
+    pub esi: u32,
+    pub edi: u32,
+    pub ebp: u32,
+}
+
+impl St {
+    #[inline(always)]
+    fn of(r: &Pushad) -> St {
+        St { eax: r.eax, ecx: r.ecx, edx: r.edx, ebx: r.ebx, esi: r.esi, edi: r.edi, ebp: r.ebp }
+    }
+
+    /// Call a game function by address (the offline test may redirect it); returns its EAX.
+    #[inline(always)]
+    unsafe fn call(&mut self, f: usize, args: &[u32]) -> u32 {
+        unsafe { call_regs_st(tgt(f), self, args) };
+        self.eax
+    }
+
+    /// Call through a function pointer read from game memory.
+    #[inline(always)]
+    unsafe fn calli(&mut self, f: u32, args: &[u32]) -> u32 {
+        unsafe { call_regs_st(f as usize, self, args) };
+        self.eax
+    }
+}
+
+#[inline(never)]
+unsafe fn call_regs_st(f: usize, st: &mut St, args: &[u32]) {
+    let mut a8 = [0u32; 8];
+    a8[..args.len()].copy_from_slice(args);
+    let block: [u32; 3] = [f as u32, a8.as_ptr() as u32, st as *mut St as u32];
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "push dword ptr [eax + 8]",
+            "push dword ptr fs:[0x14]",
+            "mov ebx, eax",
+            "mov fs:[0x14], esp",
+            "push dword ptr [ebx]",
+            "mov esi, [ebx + 4]",
+            "mov ecx, 8",
+            "2:",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jnz 2b",
+            "mov ebx, [ebx + 8]",
+            "mov eax, [ebx]", "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]",
+            "mov esi, [ebx + 16]", "mov edi, [ebx + 20]", "mov ebp, [ebx + 24]", "mov ebx, [ebx + 12]",
+            "call dword ptr [esp + 32]",
+            "push edi",
+            "mov edi, fs:[0x14]",
+            "mov edi, [edi + 4]",
+            "mov [edi], eax", "mov [edi + 4], ecx", "mov [edi + 8], edx", "mov [edi + 12], ebx",
+            "mov [edi + 16], esi", "mov [edi + 24], ebp",
+            "pop dword ptr [edi + 20]",
+            "mov esp, fs:[0x14]",
+            "pop dword ptr fs:[0x14]",
+            "add esp, 4",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("eax") block.as_ptr() => _, lateout("ecx") _, lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+}
+
 #[inline(always)]
 unsafe fn cr(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> u32 {
     unsafe { call_regs(tgt(f), eax, ecx, edx, esi, edi, args) }
@@ -95,6 +173,22 @@ unsafe fn sdd_free(this: u32) {
             cr(FREE, this, 0, 0, 0, 0, &[]);
             crv(rd(tgt(IMP_LEAVE)) as usize, 0, 0, 0, 0, 0, &[LOCK_ARG]);
         }
+    }
+}
+
+/// `sdd_free` with the registers the original has at each call (the destructor's leftovers, AL =
+/// the flag byte, ESI = this) and the leftovers it leaves behind.
+unsafe fn sdd_free_e(s: &mut St, this: u32) {
+    unsafe {
+        let flag = rb(tgt(NO_FREE_FLAG));
+        if flag == 1 {
+            return;
+        }
+        s.eax = (s.eax & !0xFF) | flag as u32;
+        s.calli(rd(tgt(IMP_ENTER)), &[LOCK_ARG]);
+        s.eax = this;
+        s.call(FREE, &[]);
+        s.calli(rd(tgt(IMP_LEAVE)), &[LOCK_ARG]);
     }
 }
 
@@ -180,11 +274,21 @@ macro_rules! sdd_d {
             unsafe {
                 count($i);
                 let this = r.ecx;
-                cr($dtor, r.eax, this, r.edx, this, r.edi, &[]);
-                if rb(a as usize) & 1 != 0 && this != 0 {
-                    sdd_free(this);
+                // push esi only: EDI / EBX / EBP flow out
+                let mut s = St::of(r);
+                s.esi = this;
+                s.ecx = this;
+                s.call($dtor, &[]);
+                if rb(a as usize) & 1 != 0 && s.esi != 0 {
+                    let esi = s.esi;
+                    sdd_free_e(&mut s, esi);
                 }
-                r.eax = this;
+                r.eax = s.esi;
+                r.ecx = s.ecx;
+                r.edx = s.edx;
+                r.edi = s.edi;
+                r.ebx = s.ebx;
+                r.ebp = s.ebp;
             }
         }
         thunk!($t, $e, $ret);
@@ -322,7 +426,16 @@ macro_rules! gt {
         extern "C" fn $e(r: &mut Pushad, _a: *const u32) {
             unsafe {
                 count($i);
-                r.eax = cr($f, r.eax, r.ecx, r.edx, $esi, $edi, &[]);
+                // push esi / edi: EBX / EBP flow out
+                let mut s = St::of(r);
+                s.esi = $esi;
+                s.edi = $edi;
+                s.call($f, &[]);
+                r.eax = s.eax;
+                r.ecx = s.ecx;
+                r.edx = s.edx;
+                r.ebx = s.ebx;
+                r.ebp = s.ebp;
             }
         }
         thunk!($t, $e, $ret);
@@ -799,7 +912,6 @@ pub fn summary() -> String {
     }
     format!("port_small_c: {}", parts.join(", "))
 }
-
 
 // =================================================================================================
 // Offline differential test

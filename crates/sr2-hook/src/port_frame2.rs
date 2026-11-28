@@ -16,11 +16,689 @@
 //! 4-entry stack array without a bounds check; an out-of-range index would scribble on the
 //! original's stack, here it is clamped to bucket 3 (counted as `tick_oob`).
 
-#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(unsafe_op_in_unsafe_fn, unused_assignments, dead_code)]
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::portlib::*;
+include!("fix_thunks.inc");
+// Thunks that keep XMM0-7, give the Rust body `out: *mut [u32; 7]` = entry [ecx, edx, eax, ebx, esi, edi, ebp] as FIRST parameter
+// (the original's ECX/EDX at exit are whatever the body leaves in out[0]/out[1]; EAX at exit is the body's u32 return value).
+// kzN: N stack arguments follow `out`. kzf/kzfa: the thunk first reserves the original's local frame (`sub esp, FRAME`, or the
+// original's `mov eax, FRAME; call 0xca0820` probe for kzfa), the body gets (out, x, args...) with x = esp right after that
+// reservation, and the thunk releases the frame before `ret`.
+
+#[allow(unused_macros)]
+macro_rules! kz_thunk0 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 128 + 0]",
+                "push eax",
+                "call {f}",
+                "add esp, 4",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "ret",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kz_thunk1 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + 160]",
+                "lea eax, [esp + 128 + 4]",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "ret",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kz_thunk2 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + 164]",
+                "push dword ptr [esp + 164]",
+                "lea eax, [esp + 128 + 8]",
+                "push eax",
+                "call {f}",
+                "add esp, 12",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "ret",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kz_thunk3 {
+    ($name:ident, $f:ident) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + 168]",
+                "push dword ptr [esp + 168]",
+                "push dword ptr [esp + 168]",
+                "lea eax, [esp + 128 + 12]",
+                "push eax",
+                "call {f}",
+                "add esp, 16",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "ret",
+                f = sym $f,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzf_thunk0 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {fr}",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 156 + 0]",
+                "push eax",
+                "lea eax, [esp + 128 + 4]",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzf_thunk1 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {fr}",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 160]",
+                "lea eax, [esp + 156 + 4]",
+                "push eax",
+                "lea eax, [esp + 128 + 8]",
+                "push eax",
+                "call {f}",
+                "add esp, 12",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzf_thunk2 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {fr}",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 164]",
+                "push dword ptr [esp + {fr} + 164]",
+                "lea eax, [esp + 156 + 8]",
+                "push eax",
+                "lea eax, [esp + 128 + 12]",
+                "push eax",
+                "call {f}",
+                "add esp, 16",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzf_thunk3 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "sub esp, {fr}",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 168]",
+                "push dword ptr [esp + {fr} + 168]",
+                "push dword ptr [esp + {fr} + 168]",
+                "lea eax, [esp + 156 + 12]",
+                "push eax",
+                "lea eax, [esp + 128 + 16]",
+                "push eax",
+                "call {f}",
+                "add esp, 20",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzfa_thunk0 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "mov eax, {fr}",
+                "call dword ptr [{alloca}]",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 156 + 0]",
+                "push eax",
+                "lea eax, [esp + 128 + 4]",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+                alloca = sym ALLOCA_PROBE,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzfa_thunk1 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "mov eax, {fr}",
+                "call dword ptr [{alloca}]",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 160]",
+                "lea eax, [esp + 156 + 4]",
+                "push eax",
+                "lea eax, [esp + 128 + 8]",
+                "push eax",
+                "call {f}",
+                "add esp, 12",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+                alloca = sym ALLOCA_PROBE,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzfa_thunk2 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "mov eax, {fr}",
+                "call dword ptr [{alloca}]",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 164]",
+                "push dword ptr [esp + {fr} + 164]",
+                "lea eax, [esp + 156 + 8]",
+                "push eax",
+                "lea eax, [esp + 128 + 12]",
+                "push eax",
+                "call {f}",
+                "add esp, 16",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+                alloca = sym ALLOCA_PROBE,
+            )
+        }
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! kzfa_thunk3 {
+    ($name:ident, $f:ident, $fr:expr) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "mov eax, {fr}",
+                "call dword ptr [{alloca}]",
+                "sub esp, 28",
+                "mov [esp], ecx",
+                "mov [esp + 4], edx",
+                "mov [esp + 8], eax",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "push dword ptr [esp + {fr} + 168]",
+                "push dword ptr [esp + {fr} + 168]",
+                "push dword ptr [esp + {fr} + 168]",
+                "lea eax, [esp + 156 + 12]",
+                "push eax",
+                "lea eax, [esp + 128 + 16]",
+                "push eax",
+                "call {f}",
+                "add esp, 20",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
+                "mov ecx, [esp]",
+                "mov edx, [esp + 4]",
+                "add esp, 28",
+                "add esp, {fr}",
+                "ret",
+                f = sym $f,
+                fr = const $fr,
+                alloca = sym ALLOCA_PROBE,
+            )
+        }
+    };
+}
+
+#[allow(dead_code)]
+static ALLOCA_PROBE: usize = 0x00CA_0820;
+
+/// `call_regs` with EBX and EBP set too (any callee-saved register can be an LTCG callee input); returns the
+/// callee's (EAX, ECX, EDX). ESP is restored by scanning for a marker pushed above the arguments (cdecl and ret N).
+#[inline(never)]
+unsafe fn call_xr(f: usize, eax: u32, ecx: u32, edx: u32, ebx: u32, esi: u32, edi: u32, ebp: u32, args: &[u32]) -> (u32, u32, u32) {
+    #[cfg(test)]
+    let f = difftest::redirect(f);
+    let mut block: [u32; 12] = [f as u32, ecx, edx, esi, edi, args.as_ptr() as u32, args.len() as u32, eax, ebx, ebp, 0, 0];
+    let r: u32;
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "push eax",
+            "push 0x5EC0DE01",
+            "mov ebx, eax",
+            "mov ecx, [ebx + 24]",
+            "mov esi, [ebx + 20]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]", "mov esi, [ebx + 12]", "mov edi, [ebx + 16]",
+            "mov ebp, [ebx + 36]", "mov eax, [ebx + 28]",
+            "call 6f",
+            "mov esi, esp",
+            "4:",
+            "cmp dword ptr [esi], 0x5EC0DE01",
+            "je 5f",
+            "add esi, 4",
+            "jmp 4b",
+            "5:",
+            "lea esp, [esi + 4]",
+            "pop ebx",
+            "mov [ebx + 40], ecx",
+            "mov [ebx + 44], edx",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            "jmp 9f",
+            "6:",
+            "push dword ptr [ebx]",
+            "mov ebx, [ebx + 32]",
+            "ret",
+            "9:",
+            inout("eax") block.as_mut_ptr() => r, lateout("ecx") _, lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    (r, block[10], block[11])
+}
 
 // The offline differential test (module `difftest`, bottom of the file) keeps the game's globals
 // (0xD00000..0x350000) at a fixed offset, because their addresses are taken in a test process;
@@ -208,7 +886,7 @@ unsafe fn f32rt(p: usize) -> f32 {
 
 // --- zone_watchers_update (0xA93FF0) ----------------------------------------------------------
 
-keep_ecx_edx!(zone_watchers_thunk, zone_watchers);
+kxs0!(zone_watchers_thunk, zone_watchers);
 
 extern "C" fn zone_watchers() {
     unsafe {
@@ -323,7 +1001,7 @@ extern "C" fn zone_watchers() {
 
 // --- persona_events_update (0x6ADB10) ---------------------------------------------------------
 
-keep_ecx_edx!(persona_thunk, persona_events);
+kxs0!(persona_thunk, persona_events);
 
 extern "C" fn persona_events() {
     unsafe {
@@ -471,112 +1149,185 @@ extern "C" fn persona_events() {
 
 // --- nav_detours_update (0xA0AFF0) ------------------------------------------------------------
 
-keep_ecx_edx!(nav_detours_thunk, nav_detours);
+kzf_thunk0!(nav_detours_thunk, nav_detours, 0xC);
 
-extern "C" fn nav_detours() {
+extern "C" fn nav_detours(out: *mut [u32; 7], x: usize) -> u32 {
     unsafe {
         bump(C::NdCalls);
         const H: usize = 0x021F_2C08;
-        let mut cnt: i32 = 0;
-        let mut edi = rd(H) as usize;
+        let [e_c, e_d, _e_a, e_b, e_s, _e_i, e_p] = *out;
+        let mut ecx = e_c;
+        let mut edx;
+        let mut esi = e_s;
+        let mut ebp = e_p;
+        let mut eax = rd(H);
+        edx = 0u32;
+        let mut edi = eax;
+        let mut ebx = e_b;
+        let outp = x + 4; // the original's local at [esp + 0x14]
+        let _ = e_d;
+        macro_rules! callx {
+            ($f:expr, $a:expr, $c:expr, $args:expr) => {{
+                let r = call_xr($f, $a, $c, edx, ebx, esi, edi, ebp, $args);
+                eax = r.0;
+                ecx = r.1;
+                edx = r.2;
+            }};
+        }
         loop {
             if edi == 0 {
-                return;
+                break;
             }
-            let c = rd(edi);
-            let next = if c != rd(H) { c as usize } else { 0 };
-            let prior = cnt;
-            cnt += 1;
-            if prior > 0x96 {
+            ecx = rd(edi as usize);
+            ebx = if ecx != eax { ecx } else { 0 };
+            ecx = edx;
+            edx = edx.wrapping_add(1);
+            let counter1 = edx;
+            if (ecx as i32) > 0x96 {
                 // Rotate the circular list so that this record becomes the head.
                 bump(C::NdRotate);
-                let eax = rd(H) as usize;
                 if eax == 0 {
-                    wd(H, 0);
-                    return;
+                    edi = eax;
+                    wd(H, edi);
+                    break;
                 }
-                if eax != edi {
-                    let edx = rd(edi + 4) as usize;
-                    let ecx = rd(eax + 4);
-                    wd(edx, eax as u32);
-                    let edx2 = rd(edi + 4);
-                    wd(eax + 4, edx2);
-                    wd(edi + 4, ecx);
-                    wd(ecx as usize, edi as u32);
-                    let ecx2 = rd(edi + 4) as usize;
-                    wd(ecx2, eax as u32);
-                    let edx3 = rd(eax + 4) as usize;
-                    wd(edx3, edi as u32);
-                    let edx4 = rd(edi + 4);
-                    let ecx3 = rd(eax + 4);
-                    wd(eax + 4, edx4);
-                    wd(edi + 4, ecx3);
+                if eax == edi {
+                    edi = eax;
+                    eax = 0;
+                } else {
+                    edx = rd(edi as usize + 4);
+                    ecx = rd(eax as usize + 4);
+                    wd(edx as usize, eax);
+                    edx = rd(edi as usize + 4);
+                    wd(eax as usize + 4, edx);
+                    wd(edi as usize + 4, ecx);
+                    wd(ecx as usize, edi);
                 }
-                wd(H, edi as u32);
-                return;
+                if edi == 0 {
+                    edi = eax;
+                    wd(H, edi);
+                    break;
+                }
+                if eax == 0 {
+                    wd(H, edi);
+                    break;
+                }
+                ecx = rd(edi as usize + 4);
+                wd(ecx as usize, eax);
+                edx = rd(eax as usize + 4);
+                wd(edx as usize, edi);
+                edx = rd(edi as usize + 4);
+                ecx = rd(eax as usize + 4);
+                wd(eax as usize + 4, edx);
+                wd(edi as usize + 4, ecx);
+                wd(H, edi);
+                break;
             }
-            let ty = rd(edi + 0x10) as i32;
-            let valid = match ty {
+            let ty = rd(edi as usize + 0x10) as i32;
+            // validity of the target handle, with the registers the original leaves behind
+            let mut valid = false;
+            eax = ty as u32;
+            match ty {
                 0 => {
-                    let h = rd(edi + 0xC);
-                    h != 0 && {
-                        let s = slot(h);
-                        s != 0 && rd(s + 0x44) == h
+                    eax = rd(edi as usize + 0xC);
+                    if eax != 0 {
+                        edx = (eax & 0xFFF) << 4;
+                        ecx = rd(edx as usize + 0x0214_9C64);
+                        if ecx != 0 && rd(ecx as usize + 0x44) == eax {
+                            valid = true;
+                        }
                     }
                 }
                 1 => {
-                    let h = rd(edi + 0xC);
-                    h != 0 && rd(0x02AE_50E0 + (h & 0xFFFF) as usize * 0x134 + 8) == h
+                    eax = 0;
+                    ecx = rd(edi as usize + 0xC);
+                    if ecx != 0 {
+                        eax = (ecx & 0xFFFF).wrapping_mul(0x134).wrapping_add(0x02AE_50E0);
+                        if rd(eax as usize + 8) == ecx {
+                            valid = true;
+                        }
+                    }
                 }
                 2 => {
-                    let h = rd(edi + 0xC);
-                    h != 0 && rd(0x0267_4DE0 + (h & 0x1FF) as usize * 0x208 + 0x10) == h
+                    eax = 0;
+                    ecx = rd(edi as usize + 0xC);
+                    if ecx != 0 {
+                        eax = (ecx & 0x1FF).wrapping_mul(0x208).wrapping_add(0x0267_4DE0);
+                        if rd(eax as usize + 0x10) == ecx {
+                            valid = true;
+                        }
+                    }
                 }
-                _ => false,
-            };
+                _ => {
+                    eax = (ty as u32).wrapping_sub(2);
+                }
+            }
             if !valid {
                 bump(C::NdInvalid);
-                call_regs(0x00A0_E0C0, 0, rd(edi + 8), 0, 0, 0, &[]);
-                edi = next;
+                ecx = rd(edi as usize + 8);
+                callx!(0x00A0_E0C0, eax, ecx, &[]);
+                eax = rd(H);
+                edx = counter1;
+                edi = ebx;
                 continue;
             }
-            let mut out: u32 = 0;
-            let al = call_regs(0x00A0_9B10, edi as u32, 0, 0, 0, 0, &[&mut out as *mut u32 as u32]) as u8;
-            if al != 0 {
+            callx!(0x00A0_9B10, edi, ecx, &[outp as u32]);
+            let o = rd(outp);
+            if eax as u8 != 0 {
                 bump(C::NdActive);
-                if rd(edi + 0x18) != 0 {
-                    let r = call_regs(0x00A0_9FE0, 0, 0, 0, edi as u32, 0, &[out]) as u8;
-                    if r != 0 {
-                        call_regs(0x00A0_AED0, 0, 0, 0, 0, edi as u32, &[]);
-                        call_regs(0x00A0_A760, 0, 0, 0, 0, 0, &[edi as u32, out]);
+                if rd(edi as usize + 0x18) != 0 {
+                    ebp = o;
+                    esi = edi;
+                    callx!(0x00A0_9FE0, eax, ecx, &[o]);
+                    if eax as u8 == 0 {
+                        eax = rd(H);
+                        edx = counter1;
+                        edi = ebx;
+                        continue;
                     }
-                } else {
-                    call_regs(0x00A0_A760, 0, 0, 0, 0, 0, &[edi as u32, out]);
+                    callx!(0x00A0_AED0, eax, ecx, &[]);
+                    callx!(0x00A0_A760, eax, ecx, &[edi, ebp]);
+                    eax = rd(H);
+                    edx = counter1;
+                    edi = ebx;
+                    continue;
                 }
-            } else {
-                bump(C::NdInactive);
-                if rd(edi + 0x18) != 0 {
-                    let h = rd(edi + 0xC);
-                    let mut ok = false;
-                    if h != 0 {
-                        let s = slot(h);
-                        ok = s != 0 && rd(s + 0x44) == h && rd(s + 0x4C) == 1;
-                    }
-                    if ok {
-                        call_regs(0x00A0_E1D0, 0, rd(edi + 8), 0, 0, 0, &[]);
-                    } else {
-                        call_regs(0x00A0_AED0, 0, 0, 0, 0, edi as u32, &[]);
-                    }
+                ecx = o;
+                callx!(0x00A0_A760, eax, ecx, &[edi, o]);
+                eax = rd(H);
+                edx = counter1;
+                edi = ebx;
+                continue;
+            }
+            bump(C::NdInactive);
+            if rd(edi as usize + 0x18) != 0 {
+                ecx = rd(edi as usize + 0xC);
+                let mut ok = false;
+                if ecx != 0 {
+                    edx = (ecx & 0xFFF) << 4;
+                    eax = rd(edx as usize + 0x0214_9C64);
+                    ok = eax != 0 && rd(eax as usize + 0x44) == ecx && rd(eax as usize + 0x4C) == 1;
+                }
+                if ok {
+                    ecx = rd(edi as usize + 8);
+                    callx!(0x00A0_E1D0, eax, ecx, &[]);
+                } else {
+                    callx!(0x00A0_AED0, eax, ecx, &[]);
                 }
             }
-            edi = next;
+            eax = rd(H);
+            edx = counter1;
+            edi = ebx;
         }
+        (*out)[0] = ecx;
+        (*out)[1] = edx;
+        eax
     }
 }
 
 // --- vehicle_attached_effects_update (0x4D1D50) -----------------------------------------------
 
-keep_ecx_edx!(vae_thunk, vehicle_attached_effects);
+kxs0!(vae_thunk, vehicle_attached_effects);
 
 extern "C" fn vehicle_attached_effects() {
     unsafe {
@@ -680,221 +1431,322 @@ extern "C" fn vehicle_attached_effects() {
 
 // --- ai_scheduled_tasks_tick (0x452820) -------------------------------------------------------
 
-keep_ecx_edx!(tasks_tick_thunk, tasks_tick);
+kz_thunk0!(tasks_tick_thunk, tasks_tick);
 
-extern "C" fn tasks_tick() {
+extern "C" fn tasks_tick(out: *mut [u32; 7]) -> u32 {
     unsafe {
         bump(C::TkCalls);
         const H: usize = 0x00EE_2C0C;
-        let esi0 = rd(H) as usize;
-        if esi0 != 0 {
-            let now = rd(0x00E8_43AC) as i32;
-            let mut eax = esi0;
+        let mut ecx = (*out)[0];
+        let mut edx = (*out)[1];
+        let mut esi = rd(H);
+        let mut eax = esi;
+        // Phase A: count down every due task.
+        if esi != 0 {
+            edx = rd(0x00E8_43AC);
+            let edi = 0xFFFF_FFFFu32;
             loop {
-                let t = rd(eax + 0x14) as i32;
-                if t >= 0 && time_due(t, now) {
-                    bump(C::TkFire);
-                    let cnt = (rd(eax + 0x10) as i32).wrapping_sub(1);
-                    wd(eax + 0x10, cnt as u32);
-                    if cnt > 0 {
-                        let mut ecx = now.wrapping_add(0x29A);
-                        wd(eax + 0x14, ecx as u32);
-                        if ecx > 0x6B49_D200 {
-                            ecx = ecx.wrapping_add(0x94B6_2E00u32 as i32);
-                            wd(eax + 0x14, ecx as u32);
-                        }
+                let t = rd(eax as usize + 0x14);
+                if (t as i32) >= 0 {
+                    ecx = t;
+                    let fire = if (ecx as i32) > (edx as i32) {
+                        ecx = ecx.wrapping_sub(edx);
+                        (ecx as i32) >= 0x35A4_E900
                     } else {
-                        wd(eax + 0x14, 0xFFFF_FFFF);
+                        (edx.wrapping_sub(ecx) as i32) < 0x35A4_E900
+                    };
+                    if fire {
+                        bump(C::TkFire);
+                        let cnt = rd(eax as usize + 0x10).wrapping_add(edi);
+                        wd(eax as usize + 0x10, cnt);
+                        if (cnt as i32) <= 0 {
+                            wd(eax as usize + 0x14, edi);
+                        } else {
+                            ecx = edx.wrapping_add(0x29A);
+                            wd(eax as usize + 0x14, ecx);
+                            if (ecx as i32) > 0x6B49_D200 {
+                                ecx = ecx.wrapping_add(0x94B6_2E00);
+                                wd(eax as usize + 0x14, ecx);
+                            }
+                        }
                     }
                 }
-                eax = rd(eax) as usize;
-                if eax == esi0 || eax == 0 {
+                eax = rd(eax as usize);
+                if eax == esi || eax == 0 {
                     break;
                 }
             }
         }
-        // Re-bucket the list by [node+0x10] and concatenate the buckets in order.
-        let mut b = [0usize; 4];
-        let mut esi = rd(H) as usize;
-        while esi != 0 {
-            let eax = esi;
-            let edi = rd(esi) as usize;
-            if edi == esi {
-                wd(esi, 0);
-                esi = 0;
-            } else {
-                let prev = rd(eax + 4) as usize;
-                esi = edi;
-                if prev != 0 {
-                    wd(prev, edi as u32);
+        // Phase B: re-bucket the list by [node+0x10] into 4 stack buckets (index unchecked, like the original).
+        ecx = 0;
+        edx = 0;
+        let mut edi = 0u32;
+        let mut ebx = 0u32;
+        let mut bk = [0u32; 4];
+        let bka = bk.as_mut_ptr() as usize;
+        eax = esi;
+        if esi != 0 {
+            loop {
+                edi = rd(esi as usize);
+                if edi == esi {
+                    wd(esi as usize, 0);
+                    ecx = esi.wrapping_add(4);
+                    esi = 0;
+                } else {
+                    edx = rd(eax as usize + 4);
+                    ecx = eax.wrapping_add(4);
+                    esi = edi;
+                    if edx != 0 {
+                        wd(edx as usize, edi);
+                    }
+                    edx = rd(eax as usize);
+                    if edx != 0 {
+                        edi = rd(ecx as usize);
+                        wd(edx as usize + 4, edi);
+                    }
+                    wd(eax as usize, 0);
                 }
-                let nxt = rd(eax) as usize;
-                if nxt != 0 {
-                    wd(nxt + 4, rd(eax + 4));
+                edi = rd(eax as usize + 0x10);
+                let slot_a = bka.wrapping_add((edi as usize).wrapping_mul(4));
+                edx = rd(slot_a);
+                edi = slot_a as u32;
+                wd(ecx as usize, 0);
+                if edx != 0 {
+                    edi = rd(edx as usize + 4);
+                    wd(ecx as usize, edi);
+                    wd(eax as usize, edx);
+                    ecx = rd(edx as usize + 4);
+                    wd(ecx as usize, eax);
+                    edx = rd(eax as usize + 0x10);
+                    ecx = rd(bka.wrapping_add((edx as usize).wrapping_mul(4)));
+                    wd(ecx as usize + 4, eax);
+                } else {
+                    wd(eax as usize, eax);
+                    wd(ecx as usize, eax);
+                    wd(edi as usize, eax);
                 }
-                wd(eax, 0);
+                eax = esi;
+                if esi == 0 {
+                    break;
+                }
             }
-            let mut idx = rd(eax + 0x10) as usize;
-            if idx > 3 {
-                bump(C::TkOob);
-                idx = 3;
-            }
-            let head = b[idx];
-            wd(eax + 4, 0);
-            if head == 0 {
-                wd(eax, eax as u32);
-                wd(eax + 4, eax as u32);
-                b[idx] = eax;
-            } else {
-                let hp = rd(head + 4);
-                wd(eax + 4, hp);
-                wd(eax, head as u32);
-                let hp2 = rd(head + 4) as usize;
-                wd(hp2, eax as u32);
-                wd(head + 4, eax as u32);
-            }
+            ebx = rd(bka + 12);
+            edi = rd(bka + 8);
+            edx = rd(bka + 4);
+            ecx = rd(bka);
         }
-        // Concatenate b[0], b[1], b[2], b[3].
-        let splice = |a: usize, c: usize| {
-            let at = rd(a + 4) as usize;
-            wd(at, c as u32);
-            let ct = rd(c + 4) as usize;
-            wd(ct, a as u32);
-            let at2 = rd(c + 4);
-            let ct2 = rd(a + 4);
-            wd(c + 4, ct2);
-            wd(a + 4, at2);
-        };
-        let mut r = b[0];
-        for k in 1..4 {
-            if r == 0 {
-                r = b[k];
-            } else if b[k] != 0 {
-                splice(r, b[k]);
+        // Phase C: concatenate b0..b3 and store the new head.
+        eax = ecx;
+        wd(H, eax);
+        if ecx != 0 {
+            if edx != 0 {
+                esi = rd(ecx as usize + 4);
+                wd(esi as usize, edx);
+                esi = rd(edx as usize + 4);
+                wd(esi as usize, ecx);
+                esi = rd(edx as usize + 4);
+                let ebp = rd(ecx as usize + 4);
+                wd(edx as usize + 4, ebp);
+                wd(ecx as usize + 4, esi);
             }
+        } else {
+            eax = edx;
+            wd(H, eax);
         }
-        wd(H, r as u32);
+        if eax == 0 {
+            eax = edi;
+            wd(H, eax);
+        } else if edi != 0 {
+            edx = rd(eax as usize + 4);
+            wd(edx as usize, edi);
+            ecx = rd(edi as usize + 4);
+            wd(ecx as usize, eax);
+            edx = rd(eax as usize + 4);
+            ecx = rd(edi as usize + 4);
+            wd(edi as usize + 4, edx);
+            wd(eax as usize + 4, ecx);
+        }
+        if eax == 0 {
+            wd(H, ebx);
+        } else if ebx != 0 {
+            ecx = rd(eax as usize + 4);
+            wd(ecx as usize, ebx);
+            edx = rd(ebx as usize + 4);
+            wd(edx as usize, eax);
+            edx = rd(eax as usize + 4);
+            ecx = rd(ebx as usize + 4);
+            wd(ebx as usize + 4, edx);
+            wd(eax as usize + 4, ecx);
+        }
+        (*out)[0] = ecx;
+        (*out)[1] = edx;
+        eax
     }
 }
 
 // --- explosions_flush_queue (0x4C2BF0) --------------------------------------------------------
 
-keep_ecx_edx!(explosions_thunk, explosions_flush);
+kzfa_thunk0!(explosions_thunk, explosions_flush, 0x3B0C);
 
-extern "C" fn explosions_flush() {
+extern "C" fn explosions_flush(out: *mut [u32; 7], x: usize) -> u32 {
     unsafe {
         bump(C::ExCalls);
         const COUNT: usize = 0x0252_6D08;
         const QUEUE: usize = 0x0261_E418;
         const REC: usize = 0x1D8;
+        // stack cookie, as in the original's prologue
+        wd(x + 0x3B04, rd(0x00E8_0B50) ^ x as u32);
         let n = rd(COUNT) as usize;
-        if n == 0 {
-            return;
-        }
-        let mut buf = vec![0u8; n * REC + 16];
-        std::ptr::copy_nonoverlapping(QUEUE as *const u8, buf.as_mut_ptr(), n * REC);
-        wd(COUNT, 0);
-        let lookup = |h: u32| -> u32 {
-            if h == 0 {
-                return 0;
-            }
-            let s = slot(h);
-            if s != 0 && rd(s + 0x44) == h { s as u32 } else { 0 }
-        };
-        for i in 0..n {
-            bump(C::ExRecords);
-            let r = buf.as_ptr() as usize + i * REC;
-            let (edi, ebp) = if rb(r + 0x41) == 1 {
-                let o = lookup(rd(r + 0x48));
-                (r + 0x44, o)
-            } else {
-                (0usize, 0u32)
+        let mut edx = (*out)[1];
+        if n != 0 {
+            // the queue copy lives in the original's frame: buffer at x + 4, record i at x + 4 + i * 0x1D8
+            let buf = x + 4;
+            call_regs(0x00CA_0850, 0, 0, 0, 0, 0, &[buf as u32, ga(QUEUE), (n as u32).wrapping_mul(REC as u32)]);
+            wd(COUNT, 0);
+            let lookup = |h: u32| -> u32 {
+                if h == 0 {
+                    return 0;
+                }
+                let s = slot(h);
+                if s != 0 && rd(s + 0x44) == h { s as u32 } else { 0 }
             };
-            let edx = lookup(rd(r + 8));
-            let eax = lookup(rd(r + 4));
-            call_regs(
-                0x004C_2600,
-                eax,
-                0,
-                0,
-                0,
-                0,
-                &[
-                    rd(r),
+            for i in 0..n {
+                bump(C::ExRecords);
+                let r = buf.wrapping_add(i.wrapping_mul(REC));
+                let (edi, ebp) = if rb(r + 0x41) == 1 {
+                    let o = lookup(rd(r + 0x48));
+                    (r + 0x44, o)
+                } else {
+                    (0usize, 0u32)
+                };
+                let edx_l = lookup(rd(r + 8));
+                let eax = lookup(rd(r + 4));
+                edx = rd(r);
+                call_regs(
+                    0x004C_2600,
                     eax,
-                    edx,
                     (r + 0xC) as u32,
-                    (r + 0x30) as u32,
-                    rd(r + 0x3C),
+                    edx,
                     0,
-                    rb(r + 0x40) as u32,
-                    edi as u32,
-                    ebp,
-                    rd(r + 0x1D0),
                     0,
-                    1,
-                    rb(r + 0x1D5) as u32,
-                ],
-            );
+                    &[
+                        edx,
+                        eax,
+                        edx_l,
+                        (r + 0xC) as u32,
+                        (r + 0x30) as u32,
+                        rd(r + 0x3C),
+                        0,
+                        rb(r + 0x40) as u32,
+                        edi as u32,
+                        ebp,
+                        rd(r + 0x1D0),
+                        0,
+                        1,
+                        rb(r + 0x1D5) as u32,
+                    ],
+                );
+            }
         }
+        let ecx = rd(x + 0x3B04) ^ x as u32;
+        let eax = call_regs(0x00C9_604F, 0, ecx, 0, 0, 0, &[]);
+        (*out)[0] = ecx;
+        (*out)[1] = edx;
+        eax
     }
 }
 
 // --- wiretap_triggers_update (0x54CCA0) -------------------------------------------------------
 
-keep_ecx_edx!(wiretap_thunk, wiretap);
+kz_thunk0!(wiretap_thunk, wiretap);
 
-extern "C" fn wiretap() {
+extern "C" fn wiretap(out: *mut [u32; 7]) -> u32 {
     unsafe {
         bump(C::WtCalls);
+        let [e_c, e_d, _e_a, e_b, e_s, e_i, e_p] = *out;
         let f = rb(0x00FA_239B);
         let a = f & 1 != 0;
         let c = (f >> 2) & 1 != 0;
         let d = (f >> 3) & 1 != 0;
         let e = (f >> 4) & 1 != 0;
-        let esi = call_regs(0x00A6_C870, 0x00DE_44A8, 0, 0, 0, 0, &[]);
-        let edi = call_regs(0x00A6_C870, 0x00DE_44D0, 0, 0, 0, 0, &[]);
-        let ebp = call_regs(0x00A6_C870, 0x00DE_44F8, 0, 0, 0, 0, &[]);
-        let edx = call_regs(0x00A6_C870, 0x00DE_4520, 0, 0, 0, 0, &[]);
+        let ebx = (e_b & !0xFF) | c as u32;
+        let mut ecx = (e_c & !0xFF) | d as u32;
+        let mut edx = e_d;
+        let (mut eax, c1, d1) = call_xr(0x00A6_C870, 0x00DE_44A8, ecx, edx, ebx, e_s, e_i, e_p, &[]);
+        let mut esi = eax;
+        let r = call_xr(0x00A6_C870, 0x00DE_44D0, c1, d1, ebx, esi, e_i, e_p, &[]);
+        let mut edi = r.0;
+        let r = call_xr(0x00A6_C870, 0x00DE_44F8, r.1, r.2, ebx, esi, edi, e_p, &[]);
+        let mut ebp = r.0;
+        let r = call_xr(0x00A6_C870, 0x00DE_4520, r.1, r.2, ebx, esi, edi, ebp, &[]);
+        let h4 = r.0;
+        edx = h4;
+        ecx = r.1;
         let v = rd(0x00E9_DA40);
-        let k = {
-            let lo = v & 0xFF;
-            lo != 0xFF && (v >> 8) != 0 && {
-                let rec = lo as usize * 0x19C;
-                (v >> 8) == rd(rec + 0x00EE_B9AC) && rd(rec + 0x00EE_B8F8) != 0xFFFF_FFFF
+        eax = v;
+        let mut k = false;
+        if (v & 0xFF) != 0xFF {
+            ecx = v >> 8;
+            if ecx != 0 {
+                eax = (v & 0xFF).wrapping_mul(0x19C);
+                k = ecx == rd(eax as usize + 0x00EE_B9AC) && rd(eax as usize + 0x00EE_B8F8) != 0xFFFF_FFFF;
             }
-        };
+        }
         if esi == 0 || edi == 0 || ebp == 0 || edx == 0 {
             bump(C::WtSkip);
-            return;
+            (*out)[0] = ecx;
+            (*out)[1] = edx;
+            return eax;
         }
-        let show = |x: u32, hide: bool| {
-            if hide {
-                call_regs(0x00A6_BCE0, 0, 0, 0, x, 0, &[]);
-            } else {
-                call_regs(0x00A6_BD60, x, 0, 0, 0, 0, &[]);
-            }
-        };
-        show(esi, !a && !k);
-        show(edi, !c && !k);
-        show(ebp, !d && !k);
-        if e {
-            call_regs(0x00A6_BD60, edx, 0, 0, 0, 0, &[]);
-            call_regs(0x0078_9570, 1, 0, 0, 0, 0, &[]);
-            return;
+        macro_rules! cx {
+            ($f:expr, $a:expr, $s:expr) => {{
+                let r = call_xr($f, $a, ecx, edx, ebx, $s, edi, ebp, &[]);
+                eax = r.0;
+                ecx = r.1;
+                edx = r.2;
+            }};
         }
-        if a && c && d && !k {
-            call_regs(0x00A6_BCE0, 0, 0, 0, edx, 0, &[]);
+        if !a && !k {
+            cx!(0x00A6_BCE0, eax, esi);
         } else {
-            call_regs(0x00A6_BD60, edx, 0, 0, 0, 0, &[]);
+            cx!(0x00A6_BD60, esi, esi);
         }
-        call_regs(0x0078_9570, 0, 0, 0, 0, 0, &[]);
+        if !c && !k {
+            esi = edi;
+            cx!(0x00A6_BCE0, eax, esi);
+        } else {
+            cx!(0x00A6_BD60, edi, esi);
+        }
+        if !d && !k {
+            esi = ebp;
+            cx!(0x00A6_BCE0, eax, esi);
+        } else {
+            cx!(0x00A6_BD60, ebp, esi);
+        }
+        let _ = &mut edi;
+        let _ = &mut ebp;
+        if e {
+            cx!(0x00A6_BD60, h4, esi);
+            eax = (eax & !0xFF) | 1;
+        } else if a && c && d && !k {
+            esi = h4;
+            cx!(0x00A6_BCE0, eax, esi);
+            eax &= !0xFF;
+        } else {
+            cx!(0x00A6_BD60, h4, esi);
+            eax &= !0xFF;
+        }
+        // tail jump to 0x789570 with the entry callee-saved registers restored
+        let r = call_xr(0x0078_9570, eax, ecx, edx, e_b, e_s, e_i, e_p, &[]);
+        (*out)[0] = r.1;
+        (*out)[1] = r.2;
+        r.0
     }
 }
 
 // --- cellphone_do_frame (0xA66340) ------------------------------------------------------------
 
-keep_ecx_edx!(cellphone_thunk, cellphone_do_frame);
+kxs0!(cellphone_thunk, cellphone_do_frame);
 
 extern "C" fn cellphone_do_frame() {
     unsafe {
@@ -1057,7 +1909,7 @@ unsafe fn hv_test_bit(b: usize, idx: u32) -> bool {
     rb(b + HV_BITS + (idx >> 3) as usize) & (1u8 << (idx & 7)) != 0
 }
 
-keep_ecx_edx!(havok_thunk, havok_triggers_update);
+kxs0!(havok_thunk, havok_triggers_update);
 
 extern "C" fn havok_triggers_update() {
     unsafe {
@@ -1220,7 +2072,7 @@ unsafe fn cheat_flag() -> u32 {
     if r as u8 != 0 { (r & !0xFF) | 1 } else { r & !0xFF }
 }
 
-keep_ecx_edx!(cheats_thunk, cheats_do_frame);
+kxs0!(cheats_thunk, cheats_do_frame);
 
 extern "C" fn cheats_do_frame() {
     unsafe {
@@ -1340,7 +2192,7 @@ unsafe fn rp_find(head: u32, value: u32) -> u32 {
     0
 }
 
-keep_ecx_edx!(rich_thunk, rich_presence_update);
+kxs0!(rich_thunk, rich_presence_update);
 
 extern "C" fn rich_presence_update() {
     unsafe {
@@ -1518,7 +2370,7 @@ unsafe fn ga_vehicle(h: u32) -> usize {
     if p != 0 && rd(p + 0x44) == h && rd(p + 0x4C) == 5 { p } else { 0 }
 }
 
-keep_ecx_edx!(garage_thunk, garage_exit_tutorial);
+kxs0!(garage_thunk, garage_exit_tutorial);
 
 extern "C" fn garage_exit_tutorial() {
     unsafe {
@@ -1718,7 +2570,7 @@ unsafe fn ga_state2(ebp: usize, player: u32, lb: usize) {
 // `jmp 0xA6E810` (0xA6C481) and the code after it belongs to other functions. Checked with
 // per-branch counters only (callees have side effects).
 
-keep_ecx_edx!(triggers_thunk, triggers_do_frame);
+kxs0!(triggers_thunk, triggers_do_frame);
 
 extern "C" fn triggers_do_frame() {
     unsafe {
@@ -1777,7 +2629,7 @@ extern "C" fn triggers_do_frame() {
 // vehicle-interaction records (0xC84 bytes, 8 rider slots of 0xA8 bytes each) and a tail call to
 // 0xB0A7B0. Checked with per-branch counters only.
 
-keep_ecx_edx!(vehint_thunk, vehicle_interactions_update);
+kxs0!(vehint_thunk, vehicle_interactions_update);
 
 extern "C" fn vehicle_interactions_update() {
     unsafe {
@@ -1849,6 +2701,43 @@ extern "C" fn vehicle_interactions_update() {
 }
 
 // --- x87 helper ---------------------------------------------------------------------------------
+
+/// `call_regs_st0` that also returns the callee's EAX.
+unsafe fn call_regs_st0e(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> (f64, u32) {
+    #[cfg(test)]
+    let f = difftest::redirect(f);
+    let mut out = 0f64;
+    let mut eaxo = 0u32;
+    let block: [u32; 10] = [f as u32, ecx, edx, esi, edi, args.as_ptr() as u32, args.len() as u32, eax, &mut out as *mut f64 as u32, &mut eaxo as *mut u32 as u32];
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "mov ebp, esp",
+            "mov ebx, eax",
+            "mov ecx, [ebx + 24]",
+            "mov esi, [ebx + 20]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]", "mov esi, [ebx + 12]", "mov edi, [ebx + 16]",
+            "mov eax, [ebx + 28]",
+            "call dword ptr [ebx]",
+            "mov ecx, [ebx + 36]",
+            "mov [ecx], eax",
+            "mov ecx, [ebx + 32]",
+            "fstp qword ptr [ecx]",
+            "mov esp, ebp",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("eax") block.as_ptr() => _, lateout("ecx") _, lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    (out, eaxo)
+}
 
 /// `call_regs` for a callee that returns on the x87 stack (popped as a qword).
 unsafe fn call_regs_st0(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> f64 {
@@ -1925,56 +2814,135 @@ unsafe fn tasks_human_changed(h: u32, flags: u8, shift: u32) -> bool {
     (cl ^ dl) & 1 != 0
 }
 
-/// Range test: true means the object is out of range of the task's point (expire).
-unsafe fn tasks_out_of_range(task_pt: usize, obj: usize) -> bool {
-    let dist = call_regs_st0(0x00BD_EA30, task_pt as u32, (obj + 0x14) as u32, 0, 0, 0, &[]) as f32;
+/// Range test: the x87 status word (cond bits) and the callee's EAX; `expire` is "threshold < dist".
+unsafe fn tasks_out_of_range(task_pt: usize, obj: usize) -> (bool, u32, u32) {
+    let (d, ceax) = call_regs_st0e(0x00BD_EA30, task_pt as u32, (obj + 0x14) as u32, 0, 0, 0, &[]);
+    let dist = d as f32;
     let near = rd(obj + 0x4C) == 1 && rb(obj + 0x3CC) == 1;
     let thresh = if near { rf(0x00DD_32B8) } else { rf(0x00ED_B934) };
-    (thresh as f64) < (dist as f64)
+    let (t, dd) = (thresh as f64, dist as f64);
+    // fcompp (ST0 = thresh against ST1 = dist) then fnstsw ax: C0 = 0x100, C3 = 0x4000, C2 = 0x400
+    let sw: u32 = if t.is_nan() || dd.is_nan() { 0x4500 } else if t < dd { 0x0100 } else if t == dd { 0x4000 } else { 0 };
+    (t < dd, (ceax & 0xFFFF_0000) | sw, ceax)
 }
 
-keep_ecx_edx!(tasks_expire_thunk, ai_scheduled_tasks_expire);
+kz_thunk0!(tasks_expire_thunk, ai_scheduled_tasks_expire);
 
-extern "C" fn ai_scheduled_tasks_expire() {
+extern "C" fn ai_scheduled_tasks_expire(out: *mut [u32; 7]) -> u32 {
     unsafe {
         bump(C::TeCalls);
         const HEAD: usize = 0x00EE_2C00;
+        const SLOT: usize = 0x0214_9C64;
+        let mut eax = (*out)[2];
+        let mut ecx = (*out)[0];
+        (*out)[1] = 0; // EDX: `xor edx, edx` at every loop top
         let mut edi = rd(HEAD) as usize;
         while edi != 0 {
             bump(C::TeTasks);
-            let n = rd(edi);
-            let next = if n != rd(HEAD) { n as usize } else { 0 };
-            let deadline = rd(edi + 0x28) as i32;
-            let now = rd(0x00E8_43AC) as i32;
-            let expire = 'chk: {
-                if deadline >= 0 && time_due(deadline, now) {
-                    bump(C::TeDue);
-                    break 'chk true;
+            eax = rd(edi);
+            ecx = if eax != rd(HEAD) { eax } else { 0 };
+            let next = ecx as usize;
+            let deadline = rd(edi + 0x28);
+            eax = deadline;
+            let mut expire = false;
+            if (deadline as i32) >= 0 {
+                let now = rd(0x00E8_43AC);
+                ecx = now;
+                if (deadline as i32) > (now as i32) {
+                    eax = deadline.wrapping_sub(now);
+                    if (eax as i32) >= 0x35A4_E900 {
+                        bump(C::TeDue);
+                        expire = true;
+                    }
+                } else {
+                    ecx = now.wrapping_sub(deadline);
+                    if (ecx as i32) < 0x35A4_E900 {
+                        bump(C::TeDue);
+                        expire = true;
+                    }
+                }
+            }
+            'chk: {
+                if expire {
+                    break 'chk;
                 }
                 let ha = rd(edi + 8);
+                ecx = ha;
+                let mut obj1 = 0usize;
+                if ha != 0 {
+                    eax = (ha & 0xFFF) << 4;
+                    eax = rd(SLOT + eax as usize);
+                    if eax != 0 && rd(eax as usize + 0x44) == ha {
+                        obj1 = eax as usize;
+                    }
+                }
                 let hb = rd(edi + 0xC);
-                let obj1 = live_obj(ha);
-                let obj2 = live_obj(hb);
+                let mut obj2 = 0usize;
+                if hb != 0 {
+                    eax = (hb & 0xFFF) << 4;
+                    eax = rd(SLOT + eax as usize);
+                    if eax != 0 && rd(eax as usize + 0x44) == hb {
+                        obj2 = eax as usize;
+                    }
+                }
                 if obj1 == 0 || obj2 == 0 {
                     bump(C::TeStale);
-                    break 'chk true;
+                    expire = true;
+                    break 'chk;
                 }
                 let flags = rb(edi + 0x2C);
-                if tasks_human_changed(ha, flags, 1) || tasks_human_changed(hb, flags, 2) {
-                    bump(C::TeHuman);
-                    break 'chk true;
+                // the two "human changed state" tests (shift 1 for handle a, 2 for handle b)
+                for (h, shift) in [(ha, 1u32), (hb, 2u32)] {
+                    if h == 0 {
+                        continue;
+                    }
+                    eax = (h & 0xFFF) << 4;
+                    let s = rd(SLOT + eax as usize) as usize;
+                    if s == 0 || rd(s + 0x44) != h || rd(s + 0x4C) != 1 {
+                        continue;
+                    }
+                    let ebx = rd(s + 0x80);
+                    if ebx & 0xB != 0 {
+                        continue;
+                    }
+                    eax = call_regs(0x0098_5630, 0, 0, 0, 0, 0, &[s as u32]);
+                    if eax as u8 != 0 {
+                        continue;
+                    }
+                    if (ebx >> 4) & 1 != 0 || rd(s + 0xC8) & 0x0040_0000 == 0 {
+                        continue;
+                    }
+                    ecx = rd(s + 0xC0) >> 7;
+                    let dl = flags >> shift;
+                    let cl = (ecx as u8) ^ dl;
+                    ecx = (ecx & !0xFF) | cl as u32;
+                    if cl & 1 != 0 {
+                        bump(C::TeHuman);
+                        expire = true;
+                        break 'chk;
+                    }
                 }
-                if tasks_out_of_range(edi + 0x10, obj1) || tasks_out_of_range(edi + 0x1C, obj2) {
+                let (e1, _, _) = tasks_out_of_range(edi + 0x10, obj1);
+                if e1 {
                     bump(C::TeRange);
-                    break 'chk true;
+                    expire = true;
+                    break 'chk;
                 }
-                false
-            };
+                let (e2, ax2, _) = tasks_out_of_range(edi + 0x1C, obj2);
+                eax = ax2;
+                if e2 {
+                    bump(C::TeRange);
+                    expire = true;
+                }
+            }
             if expire {
-                call_regs(0x0045_2570, edi as u32, 0, 0, 0, 0, &[]);
+                eax = call_regs(0x0045_2570, edi as u32, 0, 0, 0, 0, &[]);
             }
             edi = next;
         }
+        let _ = ecx;
+        (*out)[0] = ecx;
+        eax
     }
 }
 
@@ -2030,7 +2998,7 @@ unsafe fn sw_insert(head: usize, n: usize) {
     }
 }
 
-keep_ecx_edx!(sched_events_thunk, scheduled_world_events_update);
+kxs0!(sched_events_thunk, scheduled_world_events_update);
 
 extern "C" fn scheduled_world_events_update() {
     unsafe {
@@ -3107,7 +4075,7 @@ unsafe fn fsw(b: usize, off: usize, v: u16) {
     *((b + off) as *mut u16) = v
 }
 
-keep_ecx_edx!(humans_post_thunk, humans_post_update);
+kxs0!(humans_post_thunk, humans_post_update);
 
 extern "C" fn humans_post_update() -> u32 {
     unsafe {
@@ -4844,7 +5812,7 @@ unsafe fn now_plus_500() -> u32 {
     eax
 }
 
-keep_ecx_edx!(object_items_thunk, object_items_update);
+kxs0!(object_items_thunk, object_items_update);
 
 extern "C" fn object_items_update() {
     unsafe {
@@ -5545,7 +6513,7 @@ fn hm(i: usize) {
     HM_HITS[i].fetch_add(1, Ordering::Relaxed);
 }
 
-keep_ecx_edx_arg1!(humans_movement_thunk, humans_movement_update);
+kxs1!(humans_movement_thunk, humans_movement_update);
 
 extern "C" fn humans_movement_update(dt_bits: u32) {
     unsafe {
@@ -5860,7 +6828,7 @@ fn op(i: usize) {
     OP_HITS[i].fetch_add(1, Ordering::Relaxed);
 }
 
-keep_ecx_edx!(object_props_thunk, object_props_update);
+kxs0!(object_props_thunk, object_props_update);
 
 extern "C" fn object_props_update() {
     unsafe {
@@ -6180,7 +7148,7 @@ unsafe fn shop_chain(v: u32, f: u32) {
     );
 }
 
-keep_ecx_edx!(shops_frame_thunk, shops_do_frame);
+kxs0!(shops_frame_thunk, shops_do_frame);
 
 extern "C" fn shops_do_frame() {
     unsafe {
@@ -6372,12 +7340,12 @@ fn td(i: usize) {
 /// `fld dword [0xE84380]; fmul qword [0xE5C0D8]; call 0xDA0140` (the float to int conversion
 /// takes ST0): returns its EAX.
 #[inline(never)]
-unsafe fn tutorial_ftol() -> u32 {
+unsafe fn tutorial_ftol(ecx: u32, edx: u32) -> (u32, u32, u32) {
     #[cfg(test)]
     let (f, a, b) = (difftest::redirect(0x00DA_0140), tr(0x00E8_4380), tr(0x00E5_C0D8));
     #[cfg(not(test))]
     let (f, a, b) = (0x00DA_0140usize, 0x00E8_4380usize, 0x00E5_C0D8usize);
-    let r: u32;
+    let (r, c, d): (u32, u32, u32);
     std::arch::asm!(
         "fld dword ptr [{a}]",
         "fmul qword ptr [{b}]",
@@ -6385,97 +7353,112 @@ unsafe fn tutorial_ftol() -> u32 {
         a = in(reg) a,
         b = in(reg) b,
         f = in(reg) f,
+        inout("ecx") ecx => c,
+        inout("edx") edx => d,
         out("eax") r,
         clobber_abi("C"),
     );
-    r
+    (r, c, d)
 }
 
-keep_ecx_edx!(tutorial_frame_thunk, tutorial_do_frame);
+kz_thunk0!(tutorial_frame_thunk, tutorial_do_frame);
 
-extern "C" fn tutorial_do_frame() {
+extern "C" fn tutorial_do_frame(out: *mut [u32; 7]) -> u32 {
     unsafe {
         td(0);
         const CUR: usize = 0x0145_1ADC;
-        let al = call_regs(0x006B_6AF0, 0, 0, 0, 0, 0, &[]) as u8;
-        if al == 0 {
+        let [e_c, e_d, e_a, e_b, e_s, e_i, e_p] = *out;
+        let (mut eax, mut ecx, mut edx) = call_xr(0x006B_6AF0, e_a, e_c, e_d, e_b, e_s, e_i, e_p, &[]);
+        macro_rules! finish {
+            () => {{
+                (*out)[0] = ecx;
+                (*out)[1] = edx;
+                return eax;
+            }};
+        }
+        if eax as u8 == 0 {
             td(1);
-            let eax = rd(CUR) as usize;
-            if eax != 0 && rd(eax + 0xC) == 3 {
-                td(2);
-                wd(eax + 0xC, 2);
-                call_regs(0x0069_9910, 0, 0, 0, 0x13, 0, &[]);
+            eax = rd(CUR);
+            if eax == 0 || rd(eax as usize + 0xC) != 3 {
+                finish!();
             }
-            return;
+            td(2);
+            wd(eax as usize + 0xC, 2);
+            (eax, ecx, edx) = call_xr(0x0069_9910, eax, ecx, edx, e_b, 0x13, e_i, e_p, &[]);
+            finish!();
         }
         let esi = rd(CUR) as usize;
-        let state = rd(esi + 0xC);
-        if state == 4 {
+        eax = rd(esi + 0xC);
+        if eax != 2 {
+            eax = eax.wrapping_sub(4);
+            if eax != 0 {
+                finish!();
+            }
             td(3);
-            call_regs(0x006B_6A40, 0, 0, 0, 0, 0, &[esi as u32]);
-            return;
-        }
-        if state != 2 {
-            return;
+            (eax, ecx, edx) = call_xr(0x006B_6A40, 0, ecx, edx, e_b, esi as u32, e_i, e_p, &[esi as u32]);
+            finish!();
         }
         td(4);
-        let bl = call_regs(0x006B_6900, esi as u32, 0, 0, 0, 0, &[]) as u8;
-        let mut edi = rd(esi + 0x14) as i32;
-        if edi > 0 {
+        (eax, ecx, edx) = call_xr(0x006B_6900, esi as u32, ecx, edx, e_b, esi as u32, e_i, e_p, &[]);
+        let bl = eax as u8;
+        let mut edi = rd(esi + 0x14);
+        if (edi as i32) > 0 {
             if bl != 0 {
                 td(5);
-                let eax = tutorial_ftol();
-                edi = edi.wrapping_sub(eax as i32);
-                wd(esi + 0x14, edi as u32);
+                (eax, ecx, edx) = tutorial_ftol(ecx, edx);
+                edi = edi.wrapping_sub(eax);
+                wd(esi + 0x14, edi);
             }
             if (rd(esi + 0x14) as i32) > 0 {
                 // time left: rotate the node to the back of the list
-                let ecx = rd(esi) as usize;
-                let p = esi + 4;
-                if ecx == esi {
+                ecx = rd(esi);
+                eax = (esi + 4) as u32;
+                if ecx as usize == esi {
                     td(6);
                     wd(esi, 0);
-                    wd(p, 0);
+                    wd(eax as usize, 0);
                     wd(esi, esi as u32);
-                    wd(p, esi as u32);
+                    wd(eax as usize, esi as u32);
                     wd(CUR, esi as u32);
-                    return;
+                    finish!();
                 }
                 td(7);
-                let edx = rd(p) as usize;
-                wd(CUR, ecx as u32);
+                edx = rd(eax as usize);
+                wd(CUR, ecx);
                 if edx != 0 {
-                    wd(edx, ecx as u32);
+                    wd(edx as usize, ecx);
                 }
-                let edx = rd(esi) as usize;
+                edx = rd(esi);
                 if edx != 0 {
-                    let e = rd(p);
-                    wd(edx + 4, e);
+                    wd(edx as usize + 4, rd(eax as usize));
                 }
                 wd(esi, 0);
-                wd(p, 0);
-                if ecx != 0 {
-                    let edx = rd(ecx + 4);
-                    wd(p, edx);
-                    wd(esi, ecx as u32);
-                    let eax = rd(ecx + 4) as usize;
-                    wd(eax, esi as u32);
-                    wd(ecx + 4, esi as u32);
-                } else {
+                wd(eax as usize, 0);
+                if ecx == 0 {
                     wd(esi, esi as u32);
-                    wd(p, esi as u32);
+                    wd(eax as usize, esi as u32);
                     wd(CUR, esi as u32);
+                    finish!();
                 }
-                return;
+                edx = rd(ecx as usize + 4);
+                wd(eax as usize, edx);
+                wd(esi, ecx);
+                eax = rd(ecx as usize + 4);
+                wd(eax as usize, esi as u32);
+                wd(ecx as usize + 4, esi as u32);
+                finish!();
             }
             wd(esi + 0x14, 0);
         }
-        if bl != 0 {
-            td(8);
-            call_regs(0x006B_69B0, esi as u32, 0, 0, 0, 0, &[]);
+        if bl == 0 {
+            finish!();
         }
+        td(8);
+        (eax, ecx, edx) = call_xr(0x006B_69B0, esi as u32, ecx, edx, e_b, e_s, e_i, e_p, &[]);
+        finish!();
     }
 }
+
 
 #[cfg(test)]
 mod tdf_test {

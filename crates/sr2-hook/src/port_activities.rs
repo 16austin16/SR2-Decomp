@@ -589,12 +589,30 @@ extern "C" fn fraud_load_rs(this: u32, a1: u32, elem: u32, a3: u32) {
 #[unsafe(naked)]
 extern "C" fn fraud_load_thunk() {
     std::arch::naked_asm!(
-        "push dword ptr [esp + 12]",
-        "push dword ptr [esp + 12]",
-        "push dword ptr [esp + 12]",
+        "sub esp, 128",
+        "movups [esp + 0], xmm0",
+        "movups [esp + 16], xmm1",
+        "movups [esp + 32], xmm2",
+        "movups [esp + 48], xmm3",
+        "movups [esp + 64], xmm4",
+        "movups [esp + 80], xmm5",
+        "movups [esp + 96], xmm6",
+        "movups [esp + 112], xmm7",
+        "push dword ptr [esp + 140]",
+        "push dword ptr [esp + 140]",
+        "push dword ptr [esp + 140]",
         "push ecx",
         "call {f}",
         "add esp, 16",
+        "movups xmm0, [esp + 0]",
+        "movups xmm1, [esp + 16]",
+        "movups xmm2, [esp + 32]",
+        "movups xmm3, [esp + 48]",
+        "movups xmm4, [esp + 64]",
+        "movups xmm5, [esp + 80]",
+        "movups xmm6, [esp + 96]",
+        "movups xmm7, [esp + 112]",
+        "add esp, 128",
         "ret 12",
         f = sym fraud_load_rs,
     )
@@ -2675,7 +2693,32 @@ extern "C" fn mrc_rust(ecx: u32, arg: u32) -> u32 {
 /// The original is cdecl with ECX live (the first callee reads `[ecx]`).
 #[unsafe(naked)]
 extern "C" fn mrc_entry() {
-    std::arch::naked_asm!("push dword ptr [esp + 4]", "push ecx", "call {f}", "add esp, 8", "ret", f = sym mrc_rust)
+    std::arch::naked_asm!(
+        "sub esp, 128",
+        "movups [esp + 0], xmm0",
+        "movups [esp + 16], xmm1",
+        "movups [esp + 32], xmm2",
+        "movups [esp + 48], xmm3",
+        "movups [esp + 64], xmm4",
+        "movups [esp + 80], xmm5",
+        "movups [esp + 96], xmm6",
+        "movups [esp + 112], xmm7",
+        "push dword ptr [esp + 132]",
+        "push ecx",
+        "call {f}",
+        "add esp, 8",
+        "movups xmm0, [esp + 0]",
+        "movups xmm1, [esp + 16]",
+        "movups xmm2, [esp + 32]",
+        "movups xmm3, [esp + 48]",
+        "movups xmm4, [esp + 64]",
+        "movups xmm5, [esp + 80]",
+        "movups xmm6, [esp + 96]",
+        "movups xmm7, [esp + 112]",
+        "add esp, 128",
+        "ret",
+        f = sym mrc_rust,
+    )
 }
 
 const MRC_BODY: [u8; 4508] = [

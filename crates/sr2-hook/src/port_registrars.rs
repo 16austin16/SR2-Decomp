@@ -22,10 +22,16 @@ const SETTABLE: usize = 0xcd68d0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
-    /// Name in EAX, function in ECX, top-2 in EAX and top-1 in EDX at the settable call.
+    /// Name in EAX, function in ECX, top-2 in EAX and top-1 in EDX at the settable call;
+    /// ESI = L, EBP = L+0x40, EBX = entries left, EDI = pointer into the stack table.
     Std,
-    /// The vint registrar keeps the name in ECX, the function in EDX, top-1 in ECX, L+0x40 in EDX.
+    /// The vint registrar keeps the name in ECX, the function in EDX, top-1 in ECX, L+0x40 in EDX;
+    /// EBX = L+8, EBP = entries left.
     Vint,
+    /// mp_misc: a four-entry table indexed by EDI, EBX = L+0x40, EBP untouched.
+    Index,
+    /// interface_register_lua_functions at 0x7f35a0: L on the stack, one inline entry, no table.
+    Inline,
 }
 
 struct Reg {
@@ -46,45 +52,178 @@ struct Reg {
     first: AtomicBool,
 }
 
-/// Register one `{name, fn}` entry the way the loop body does.
-unsafe fn register_one(kind: Kind, l: u32, name: u32, f: u32) {
+/// Bytes the original reserves below its return address for the stack table (`sub esp, N`);
+/// the table sits at the bottom of that area. 0 = computed in `run` (the 0xa4ee00 frame).
+static FRAME: [u32; 29] = [
+    0, 0x3bc, 0x1ac, 0x154, 0x13c, 0xb4, 0xa4, 0x84, 0x84, 0x84, 0x74, 0x4c, 0x3c, 0, 0x34, 0x34, 0x34, 0x2c, 0x2c,
+    0x2c, 0x2c, 0x24, 0x24, 0x24, 0x20, 0x1c, 0x14, 0x14, 0x14,
+];
+
+/// Register state the original carries from call to call. EAX/ECX/EDX flow from each callee's
+/// result into the next call (LTCG code never reloads what it does not need).
+#[derive(Clone, Copy)]
+struct M {
+    eax: u32,
+    ecx: u32,
+    edx: u32,
+    ebx: u32,
+    esi: u32,
+    edi: u32,
+    ebp: u32,
+}
+
+/// Call a game function with every register set as the original has it, cdecl arguments (up to
+/// four, extras are dead stack), and take EAX/ECX/EDX back from the callee. EBX/ESI/EDI/EBP are
+/// callee-saved and left as they were.
+unsafe fn cf(f: usize, m: &mut M, args: &[u32]) {
+    let mut b = [0u32; 20];
+    b[0] = f as u32;
+    b[1] = m.ecx;
+    b[2] = m.edx;
+    b[3] = m.esi;
+    b[4] = m.edi;
+    b[5] = m.ebp;
+    b[6] = m.ebx;
+    b[7] = m.eax;
+    for (i, a) in args.iter().take(6).enumerate() {
+        b[8 + i] = *a;
+    }
     unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "push dword ptr [eax]",
+            "push eax",
+            "push dword ptr [eax + 52]", "push dword ptr [eax + 48]", "push dword ptr [eax + 44]",
+            "push dword ptr [eax + 40]", "push dword ptr [eax + 36]", "push dword ptr [eax + 32]",
+            "mov ecx, [eax + 4]", "mov edx, [eax + 8]", "mov esi, [eax + 12]", "mov edi, [eax + 16]",
+            "mov ebp, [eax + 20]", "mov ebx, [eax + 24]", "mov eax, [eax + 28]",
+            "call dword ptr [esp + 28]",
+            "mov ebx, [esp + 24]",
+            "mov [ebx + 56], eax", "mov [ebx + 60], ecx", "mov [ebx + 64], edx",
+            "add esp, 32",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            inout("eax") b.as_mut_ptr() => _, lateout("ecx") _, lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    m.eax = b[14];
+    m.ecx = b[15];
+    m.edx = b[16];
+}
+
+/// Register one `{name, fn}` entry the way the loop body does; `m` holds the registers the loop
+/// has at the top of the iteration (ESI, EDI, EBX/EBP already set).
+unsafe fn register_one(kind: Kind, m: &mut M, l: u32, name: u32, f: u32) {
+    unsafe {
+        let args_pc = [f, 0];
         match kind {
-            Kind::Std => call_regs(PUSHSTRING, name, 0, 0, l, 0, &[name]),
-            Kind::Vint => call_regs(PUSHSTRING, 0, name, 0, l, 0, &[name]),
-        };
-        match kind {
-            Kind::Std => call_regs(PUSHCCLOSURE, 0, f, 0, l, 0, &[f, 0]),
-            Kind::Vint => call_regs(PUSHCCLOSURE, 0, 0, f, l, 0, &[f, 0]),
-        };
-        let top = rd(l as usize + 8);
-        let (t2, t1) = (top.wrapping_sub(0x20), top.wrapping_sub(0x10));
-        match kind {
-            Kind::Std => call_regs(SETTABLE, t2, 0, t1, l, 0, &[l, l + 0x40, t2, t1]),
-            Kind::Vint => call_regs(SETTABLE, t2, t1, l + 0x40, l, 0, &[l, l + 0x40, t2, t1]),
-        };
+            Kind::Std | Kind::Index | Kind::Inline => {
+                if kind != Kind::Inline {
+                    m.eax = name;
+                }
+                cf(PUSHSTRING, m, &[name]);
+                if kind != Kind::Inline {
+                    m.ecx = f;
+                }
+                cf(PUSHCCLOSURE, m, &args_pc);
+                let top = rd(l as usize + 8);
+                let (t2, t1) = (top.wrapping_sub(0x20), top.wrapping_sub(0x10));
+                m.eax = t2;
+                if kind == Kind::Inline {
+                    m.ecx = t1;
+                } else {
+                    m.edx = t1;
+                }
+                cf(SETTABLE, m, &[l, l + 0x40, t2, t1, f, 0]);
+            }
+            Kind::Vint => {
+                m.ecx = name;
+                cf(PUSHSTRING, m, &[name]);
+                m.edx = f;
+                cf(PUSHCCLOSURE, m, &args_pc);
+                let top = rd(l as usize + 8);
+                let (t2, t1) = (top.wrapping_sub(0x20), top.wrapping_sub(0x10));
+                m.eax = t2;
+                m.ecx = t1;
+                m.edx = l + 0x40;
+                cf(SETTABLE, m, &[l, l + 0x40, t2, t1, f, 0]);
+            }
+        }
         wd(l as usize + 8, rd(l as usize + 8).wrapping_sub(0x20));
     }
 }
 
-extern "C" fn run(idx: u32, l_arg: u32) {
+/// `regs` = [eax, ecx, edx, ebx, esi, edi, ebp] at entry; the first three are loaded back as the
+/// exit values. `e` is ESP at entry (the address of the return address).
+extern "C" fn run(idx: u32, e: u32, regs: *mut [u32; 7]) {
     let r = &REGS[idx as usize];
     unsafe {
-        let l = if r.l_global != 0 { rd(r.l_global) } else { l_arg };
+        let rg = &mut *regs;
+        let mut m = M { eax: rg[0], ecx: rg[1], edx: rg[2], ebx: rg[3], esi: rg[4], edi: rg[5], ebp: rg[6] };
+        let l = if r.l_global != 0 {
+            rd(r.l_global)
+        } else if r.kind == Kind::Inline {
+            rd(e as usize + 4)
+        } else {
+            m.eax
+        };
+        // The stack table of the original: its address is what EDI carries into every callee.
+        let base = match FRAME[idx as usize] {
+            0 if r.kind == Kind::Inline => 0,
+            0 => (e.wrapping_sub(4) & !7).wrapping_sub(0x1618),
+            fr if r.kind == Kind::Vint => e.wrapping_sub(fr).wrapping_add(8),
+            fr => e.wrapping_sub(fr),
+        };
         let top0 = if l != 0 { rd(l as usize + 8) } else { 0 };
         let before = r.registered.load(Ordering::Relaxed);
+        m.esi = l;
+        if r.kind == Kind::Inline {
+            m.ebp = e.wrapping_sub(4);
+        }
+        if idx == 0 {
+            m.ecx = 0xe411e0;
+        }
         for &p in r.pre {
-            call_regs(p, l, 0, 0, l, 0, &[]);
+            m.eax = l;
+            cf(p, &mut m, &[]);
         }
         if !(r.null_check && l == 0) {
-            for &(name, f) in r.entries {
-                register_one(r.kind, l, name, f);
+            let n = r.entries.len() as u32;
+            for (i, &(name, f)) in r.entries.iter().enumerate() {
+                let left = n - i as u32;
+                match r.kind {
+                    Kind::Std => {
+                        m.ebp = l.wrapping_add(0x40);
+                        m.ebx = left;
+                        m.edi = base.wrapping_add(8 * i as u32);
+                    }
+                    Kind::Vint => {
+                        m.ebx = l.wrapping_add(8);
+                        m.ebp = left;
+                        m.edi = base.wrapping_add(8 * i as u32);
+                        if i == 0 {
+                            m.eax = l.wrapping_add(0x40);
+                        }
+                    }
+                    Kind::Index => {
+                        m.ebx = l.wrapping_add(0x40);
+                        m.edi = i as u32;
+                    }
+                    Kind::Inline => {
+                        m.edi = l.wrapping_add(0x40);
+                    }
+                }
+                register_one(r.kind, &mut m, l, name, f);
                 r.registered.fetch_add(1, Ordering::Relaxed);
             }
         }
         for &p in r.post {
-            call_regs(p, l, 0, 0, l, 0, &[]);
+            m.eax = l;
+            cf(p, &mut m, &[]);
         }
+        rg[0] = m.eax;
+        rg[1] = m.ecx;
+        rg[2] = m.edx;
         r.calls.fetch_add(1, Ordering::Relaxed);
         if !r.first.swap(true, Ordering::Relaxed) {
             let got = r.registered.load(Ordering::Relaxed) - before;
@@ -97,22 +236,51 @@ extern "C" fn run(idx: u32, l_arg: u32) {
     }
 }
 
-/// Thunk for the registrars that take L in EAX.
-macro_rules! thunk_eax {
+/// Thunk: keeps XMM0-7, hands `run` the entry registers and ESP, and loads EAX/ECX/EDX back from
+/// what `run` leaves (the original's exit values). EBX/ESI/EDI/EBP survive the Rust call.
+macro_rules! thunk_regs {
     ($name:ident, $idx:expr) => {
         #[unsafe(naked)]
         extern "C" fn $name() {
-            std::arch::naked_asm!("push eax", "push {i}", "call {f}", "add esp, 8", "ret", i = const $idx, f = sym run)
-        }
-    };
-}
-
-/// Thunk for the registrar that takes L as a cdecl stack argument.
-macro_rules! thunk_stack {
-    ($name:ident, $idx:expr) => {
-        #[unsafe(naked)]
-        extern "C" fn $name() {
-            std::arch::naked_asm!("push dword ptr [esp + 4]", "push {i}", "call {f}", "add esp, 8", "ret", i = const $idx, f = sym run)
+            std::arch::naked_asm!(
+                "sub esp, 156",
+                "mov [esp], eax",
+                "mov [esp + 4], ecx",
+                "mov [esp + 8], edx",
+                "mov [esp + 12], ebx",
+                "mov [esp + 16], esi",
+                "mov [esp + 20], edi",
+                "mov [esp + 24], ebp",
+                "movups [esp + 28], xmm0",
+                "movups [esp + 44], xmm1",
+                "movups [esp + 60], xmm2",
+                "movups [esp + 76], xmm3",
+                "movups [esp + 92], xmm4",
+                "movups [esp + 108], xmm5",
+                "movups [esp + 124], xmm6",
+                "movups [esp + 140], xmm7",
+                "mov eax, esp",
+                "lea ecx, [esp + 156]",
+                "push eax",
+                "push ecx",
+                "push {i}",
+                "call {f}",
+                "add esp, 12",
+                "movups xmm0, [esp + 28]",
+                "movups xmm1, [esp + 44]",
+                "movups xmm2, [esp + 60]",
+                "movups xmm3, [esp + 76]",
+                "movups xmm4, [esp + 92]",
+                "movups xmm5, [esp + 108]",
+                "movups xmm6, [esp + 124]",
+                "movups xmm7, [esp + 140]",
+                "mov eax, [esp]",
+                "mov ecx, [esp + 4]",
+                "mov edx, [esp + 8]",
+                "add esp, 156",
+                "ret",
+                i = const $idx, f = sym run,
+            )
         }
     };
 }
@@ -1930,7 +2098,7 @@ static REGS: [Reg; 29] = [
     Reg { name: "gang_customization_lua_register", addr: 0x7de960, body: &B10, entries: &E10, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "pause_menu_lua_register", addr: 0x77adc0, body: &B11, entries: &E11, null_check: true, l_global: 0x0, pre: &[0x78a220,0x777110], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "cellphone_lua_register", addr: 0x78a220, body: &B12, entries: &E12, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
-    Reg { name: "interface_register_lua_functions_7f35a0", addr: 0x7f35a0, body: &B13, entries: &E13, null_check: true, l_global: 0x0, pre: &[0x7a8460,0x750360,0x7d6020,0x751e40,0x7aabb0,0x5477a0,0x7cd9a0,0x5eea10,0x7537a0,0x7de960,0x556d40,0x7ae530,0x891930,0x884b00,0x7af9e0,0x775a40,0x77adc0], post: &[0x7ba220,0x7b3c50], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
+    Reg { name: "interface_register_lua_functions_7f35a0", addr: 0x7f35a0, body: &B13, entries: &E13, null_check: true, l_global: 0x0, pre: &[0x7a8460,0x750360,0x7d6020,0x751e40,0x7aabb0,0x5477a0,0x7cd9a0,0x5eea10,0x7537a0,0x7de960,0x556d40,0x7ae530,0x891930,0x884b00,0x7af9e0,0x775a40,0x77adc0], post: &[0x7ba220,0x7b3c50], kind: Kind::Inline, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "playlist_lua_register", addr: 0x777110, body: &B14, entries: &E14, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "weapon_store_lua_register", addr: 0x7b3c50, body: &B15, entries: &E15, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "mp_popup_lua_register", addr: 0x884b00, body: &B16, entries: &E16, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
@@ -1941,40 +2109,40 @@ static REGS: [Reg; 29] = [
     Reg { name: "credits_lua_register", addr: 0x751e40, body: &B21, entries: &E21, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "cdl_lua_register", addr: 0x7a8460, body: &B22, entries: &E22, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "crib_customization_lua_register", addr: 0x7aabb0, body: &B23, entries: &E23, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
-    Reg { name: "mp_misc_lua_register", addr: 0x89da60, body: &B24, entries: &E24, null_check: false, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
+    Reg { name: "mp_misc_lua_register", addr: 0x89da60, body: &B24, entries: &E24, null_check: false, l_global: 0x0, pre: &[], post: &[], kind: Kind::Index, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "mp_object_lua_register", addr: 0xa4ed70, body: &B25, entries: &E25, null_check: false, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "crib_purchase_lua_register", addr: 0x5477a0, body: &B26, entries: &E26, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "liquor_store_lua_register", addr: 0x7ae530, body: &B27, entries: &E27, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
     Reg { name: "music_store_lua_register", addr: 0x7af9e0, body: &B28, entries: &E28, null_check: true, l_global: 0x0, pre: &[], post: &[], kind: Kind::Std, calls: AtomicU32::new(0), registered: AtomicU32::new(0), first: AtomicBool::new(false) },
 ];
 
-thunk_eax!(t0, 0);
-thunk_eax!(t1, 1);
-thunk_eax!(t2, 2);
-thunk_eax!(t3, 3);
-thunk_eax!(t4, 4);
-thunk_eax!(t5, 5);
-thunk_eax!(t6, 6);
-thunk_eax!(t7, 7);
-thunk_eax!(t8, 8);
-thunk_eax!(t9, 9);
-thunk_eax!(t10, 10);
-thunk_eax!(t11, 11);
-thunk_eax!(t12, 12);
-thunk_stack!(t13, 13);
-thunk_eax!(t14, 14);
-thunk_eax!(t15, 15);
-thunk_eax!(t16, 16);
-thunk_eax!(t17, 17);
-thunk_eax!(t18, 18);
-thunk_eax!(t19, 19);
-thunk_eax!(t20, 20);
-thunk_eax!(t21, 21);
-thunk_eax!(t22, 22);
-thunk_eax!(t23, 23);
-thunk_eax!(t24, 24);
-thunk_eax!(t25, 25);
-thunk_eax!(t26, 26);
-thunk_eax!(t27, 27);
-thunk_eax!(t28, 28);
+thunk_regs!(t0, 0);
+thunk_regs!(t1, 1);
+thunk_regs!(t2, 2);
+thunk_regs!(t3, 3);
+thunk_regs!(t4, 4);
+thunk_regs!(t5, 5);
+thunk_regs!(t6, 6);
+thunk_regs!(t7, 7);
+thunk_regs!(t8, 8);
+thunk_regs!(t9, 9);
+thunk_regs!(t10, 10);
+thunk_regs!(t11, 11);
+thunk_regs!(t12, 12);
+thunk_regs!(t13, 13);
+thunk_regs!(t14, 14);
+thunk_regs!(t15, 15);
+thunk_regs!(t16, 16);
+thunk_regs!(t17, 17);
+thunk_regs!(t18, 18);
+thunk_regs!(t19, 19);
+thunk_regs!(t20, 20);
+thunk_regs!(t21, 21);
+thunk_regs!(t22, 22);
+thunk_regs!(t23, 23);
+thunk_regs!(t24, 24);
+thunk_regs!(t25, 25);
+thunk_regs!(t26, 26);
+thunk_regs!(t27, 27);
+thunk_regs!(t28, 28);
 static THUNKS: [extern "C" fn(); 29] = [t0, t1, t2, t3, t4, t5, t6, t7, t8, t9, t10, t11, t12, t13, t14, t15, t16, t17, t18, t19, t20, t21, t22, t23, t24, t25, t26, t27, t28];

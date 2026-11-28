@@ -21,6 +21,7 @@
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+use crate::port_bindings3::{arg0_addr, binding_thunk, call_regs, entry_ecx, entry_esp, flag_slot, set_ecx, set_edx};
 use crate::portlib::*;
 use crate::{detour, log};
 
@@ -147,24 +148,43 @@ unsafe fn is_nil(p: u32) -> bool {
 
 unsafe fn number_arg(l: u32, i: i32) -> f64 {
     let mut out = 0f64;
+    let (ec, ed): (u32, u32);
     unsafe {
         std::arch::asm!(
             "call {f}",
             "fstp qword ptr [edi]",
             f = in(reg) LUA_TONUMBER,
             in("eax") i,
-            in("ecx") l,
+            inout("ecx") l => ec,
+            lateout("edx") ed,
             in("edi") &mut out as *mut f64,
             clobber_abi("C"),
         );
     }
+    set_ecx(ec);
+    set_edx(ed);
     out
 }
 
 /// `_ftol2(lua_tonumber(i))`: truncation, the low dword of the 64-bit result.
 unsafe fn int_arg(l: u32, i: i32) -> u32 {
-    let out = unsafe { number_arg(l, i) };
-    if out.abs() < 9.2e18 { out as i64 as u32 } else { 0 }
+    let r: u32;
+    let (ec, ed): (u32, u32);
+    unsafe {
+        std::arch::asm!(
+            "call {f}",
+            "call {g}",
+            f = in(reg) LUA_TONUMBER,
+            g = in(reg) 0x00DA_0176usize,
+            inout("eax") i => r,
+            inout("ecx") l => ec,
+            lateout("edx") ed,
+            clobber_abi("C"),
+        );
+    }
+    set_ecx(ec);
+    set_edx(ed);
+    r
 }
 
 /// The truth test of a slot pointer: missing, nil or false -> false.
@@ -247,9 +267,8 @@ unsafe fn vehicle_from_name(name: u32) -> u32 {
 /// EAX = &found)`, else `script_object_to_human(ESI = name)` (follower, then script object).
 unsafe fn human_named(name: u32) -> u32 {
     unsafe {
-        let mut found: u32 = 0;
-        let obj = call_regs(SCRIPT_FIND_OBJECT_BY_NAME, &mut found as *mut u32 as u32, name, 0, 0, 0, &[]);
-        if found as u8 != 0 { obj } else { call_regs(SCRIPT_OBJECT_TO_HUMAN, obj, 0, 0, name, 0, &[]) }
+        let (obj, fb) = crate::port_bindings3::find_with_byte(arg0_addr(), name, true);
+        if fb != 0 { obj } else { call_regs(SCRIPT_OBJECT_TO_HUMAN, obj, 0, 0, name, 0, &[]) }
     }
 }
 
@@ -267,8 +286,11 @@ unsafe fn follower_or_object_human(name: u32) -> Option<u32> {
 }
 
 unsafe fn cb_set(f: usize, ecx: u32, ty: u32, name: u32) {
-    let mut t = ty;
-    unsafe { call_regs(f, &mut t as *mut u32 as u32, ecx, 0, 0, 0, &[name]) };
+    // The original stores the type in its own argument slot and passes that address.
+    unsafe {
+        wd(arg0_addr() as usize, ty);
+        call_regs(f, arg0_addr(), ecx, 0, 0, 0, &[name]);
+    }
 }
 
 // --- Shadow harness ------------------------------------------------------------------------
@@ -346,18 +368,31 @@ unsafe fn shadowed(i: usize, l: u32, rust: unsafe fn(u32) -> i32) -> i32 {
 
 macro_rules! counted {
     ($name:ident, $idx:expr, $body:ident) => {
-        extern "C" fn $name(l: u32) -> i32 {
+        binding_thunk!($name, l, {
             CALLS[$idx].fetch_add(1, Ordering::Relaxed);
             unsafe { $body(l) }
-        }
+        });
+    };
+    ($name:ident, $idx:expr, $body:ident, pop_ecx) => {
+        binding_thunk!($name, l, {
+            CALLS[$idx].fetch_add(1, Ordering::Relaxed);
+            let r = unsafe { $body(l) };
+            set_ecx(entry_ecx());
+            r
+        });
     };
 }
 
 macro_rules! shadow_checked {
     ($name:ident, $idx:expr, $body:ident) => {
-        extern "C" fn $name(l: u32) -> i32 {
-            unsafe { shadowed($idx, l, $body) }
-        }
+        binding_thunk!($name, l, unsafe { shadowed($idx, l, $body) });
+    };
+    ($name:ident, $idx:expr, $body:ident, pop_ecx) => {
+        binding_thunk!($name, l, {
+            let r = unsafe { shadowed($idx, l, $body) };
+            set_ecx(entry_ecx());
+            r
+        });
     };
 }
 
@@ -425,7 +460,7 @@ unsafe fn on_door_opened_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(on_door_opened, I_ON_DOOR_OPENED, on_door_opened_impl);
+counted!(on_door_opened, I_ON_DOOR_OPENED, on_door_opened_impl, pop_ecx);
 
 // --- 126 set_perfect_aim ---------------------------------------------------------------------
 
@@ -436,18 +471,19 @@ unsafe fn set_perfect_aim_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, true);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
         if name == 0 {
             return 0;
         }
         if let Some(h) = follower_or_object_human(name) {
             if h != 0 {
-                call_regs(0x0096_65D0, 0, 0, 0, 0, 0, &[h, (l & !0xFF) | flag as u32]);
+                call_regs(0x0096_65D0, 0, 0, 0, 0, 0, &[h, flag_slot(flag)]);
             }
         }
     }
     0
 }
-counted!(set_perfect_aim, I_SET_PERFECT_AIM, set_perfect_aim_impl);
+counted!(set_perfect_aim, I_SET_PERFECT_AIM, set_perfect_aim_impl, pop_ecx);
 
 // --- 127 vehicle_pathfind_check_done ---------------------------------------------------------
 
@@ -606,8 +642,7 @@ unsafe fn radio_post_event_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = truth(slot(l, 1 - n));
-        let mut hash = 0u32;
-        let ph = &mut hash as *mut u32 as u32;
+        let ph = arg0_addr();
         call_regs(STRING_HASH_LOWER, 0, name, 0, 0, 0, &[ph]);
         call_regs(0x0048_B1C0, 0, ph, 0, 0, 0, &[flag as u32, 0]);
     }
@@ -624,18 +659,19 @@ unsafe fn set_cant_flee_flag_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, true);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
         if name == 0 {
             return 0;
         }
         if let Some(h) = follower_or_object_human(name) {
             if h != 0 {
-                call_regs(0x0044_0A60, 0, 0, 0, 0, 0, &[h + 0xF8, (l & !0xFF) | flag as u32]);
+                call_regs(0x0044_0A60, 0, 0, 0, 0, 0, &[h + 0xF8, flag_slot(flag)]);
             }
         }
     }
     0
 }
-counted!(set_cant_flee_flag, I_SET_CANT_FLEE_FLAG, set_cant_flee_flag_impl);
+counted!(set_cant_flee_flag, I_SET_CANT_FLEE_FLAG, set_cant_flee_flag_impl, pop_ecx);
 
 // --- 138 trigger_type_enable -----------------------------------------------------------------
 
@@ -750,15 +786,16 @@ unsafe fn vehicle_lights_on_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, true);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
         let v = vehicle_from_name(name);
         if v != 0 {
-            call_regs(0x00AB_9D20, 0, 0, 0, 0, 0, &[v, (l & !0xFF) | flag as u32]);
+            call_regs(0x00AB_9D20, 0, 0, 0, 0, 0, &[v, flag_slot(flag)]);
             call_regs(0x00AB_9E60, 0, 0, 0, 0, 0, &[v, 0]);
         }
     }
     0
 }
-counted!(vehicle_lights_on, I_VEHICLE_LIGHTS_ON, vehicle_lights_on_impl);
+counted!(vehicle_lights_on, I_VEHICLE_LIGHTS_ON, vehicle_lights_on_impl, pop_ecx);
 
 // --- 143 character_hide ----------------------------------------------------------------------
 
@@ -777,7 +814,7 @@ unsafe fn character_hide_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(character_hide, I_CHARACTER_HIDE, character_hide_impl);
+counted!(character_hide, I_CHARACTER_HIDE, character_hide_impl, pop_ecx);
 
 // --- 144 group_hide --------------------------------------------------------------------------
 
@@ -793,7 +830,7 @@ unsafe fn group_hide_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(group_hide, I_GROUP_HIDE, group_hide_impl);
+counted!(group_hide, I_GROUP_HIDE, group_hide_impl, pop_ecx);
 
 // --- 146 vehicle_set_sirens ------------------------------------------------------------------
 
@@ -807,7 +844,7 @@ unsafe fn vehicle_set_sirens_impl(l: u32) -> i32 {
         let v = vehicle_from_name(name);
         if v != 0 {
             let handle = rd(v as usize + 0x44);
-            let f = (l & !0xFF) | flag as u32;
+            let f = flag_slot(flag);
             call_regs(0x00AB_7140, handle, 0, 0, handle, f, &[f]);
             call_regs(0x0048_8900, handle, 0, 0, handle, f, &[f]);
         }
@@ -840,13 +877,13 @@ unsafe fn clear_animation_state_impl(l: u32) -> i32 {
         }
         let h = human_named(name);
         if h != 0 {
-            let mut v = 0xFFFF_FFFFu32;
-            call_regs(0x0096_95F0, 0, h, 0, 0, 0, &[&mut v as *mut u32 as u32]);
+            wd(arg0_addr() as usize, 0xFFFF_FFFF);
+            call_regs(0x0096_95F0, 0, h, 0, 0, 0, &[arg0_addr()]);
         }
     }
     0
 }
-counted!(clear_animation_state, I_CLEAR_ANIMATION_STATE, clear_animation_state_impl);
+counted!(clear_animation_state, I_CLEAR_ANIMATION_STATE, clear_animation_state_impl, pop_ecx);
 
 // --- 151 door_close --------------------------------------------------------------------------
 
@@ -883,7 +920,7 @@ unsafe fn npc_unholster_best_weapon_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(npc_unholster_best_weapon, I_NPC_UNHOLSTER_BEST_WEAPON, npc_unholster_best_weapon_impl);
+counted!(npc_unholster_best_weapon, I_NPC_UNHOLSTER_BEST_WEAPON, npc_unholster_best_weapon_impl, pop_ecx);
 
 // --- 154 party_dismiss_all -------------------------------------------------------------------
 
@@ -899,7 +936,7 @@ unsafe fn party_dismiss_all_impl(_l: u32) -> i32 {
     }
     0
 }
-counted!(party_dismiss_all, I_PARTY_DISMISS_ALL, party_dismiss_all_impl);
+counted!(party_dismiss_all, I_PARTY_DISMISS_ALL, party_dismiss_all_impl, pop_ecx);
 
 // --- 155 character_set_damage_multiplier -----------------------------------------------------
 
@@ -919,7 +956,7 @@ unsafe fn character_set_damage_multiplier_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(character_set_damage_multiplier, I_CHARACTER_SET_DAMAGE_MULTIPLIER, character_set_damage_multiplier_impl);
+counted!(character_set_damage_multiplier, I_CHARACTER_SET_DAMAGE_MULTIPLIER, character_set_damage_multiplier_impl, pop_ecx);
 
 // --- 156 crouch_stop -------------------------------------------------------------------------
 
@@ -938,7 +975,7 @@ unsafe fn crouch_stop_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(crouch_stop, I_CROUCH_STOP, crouch_stop_impl);
+counted!(crouch_stop, I_CROUCH_STOP, crouch_stop_impl, pop_ecx);
 
 // --- 157 set_seatbelt_flag -------------------------------------------------------------------
 
@@ -948,18 +985,19 @@ unsafe fn set_seatbelt_flag_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, true);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
         if name == 0 {
             return 0;
         }
         if let Some(h) = follower_or_object_human(name) {
             if h != 0 {
-                call_regs(0x0096_8010, 0, 0, 0, 0, 0, &[h, (l & !0xFF) | flag as u32]);
+                call_regs(0x0096_8010, 0, 0, 0, 0, 0, &[h, flag_slot(flag)]);
             }
         }
     }
     0
 }
-counted!(set_seatbelt_flag, I_SET_SEATBELT_FLAG, set_seatbelt_flag_impl);
+counted!(set_seatbelt_flag, I_SET_SEATBELT_FLAG, set_seatbelt_flag_impl, pop_ecx);
 
 // --- 160 audio_play_persona_line -------------------------------------------------------------
 
@@ -1004,8 +1042,7 @@ unsafe fn minimap_icon_remove_navpoint_impl(l: u32) -> i32 {
         let name = tostring(l, -n);
         let m = n - 1;
         let icon: u32 = if m <= 0 || is_nil(slot(l, -m)) { 3 } else { int_arg(l, -m) };
-        let mut hash = 0u32;
-        let ph = &mut hash as *mut u32 as u32;
+        let ph = entry_esp() - 12;
         call_regs(STRING_CRC32, ph, 0, 0, 0, 0, &[name]);
         let nav = call_regs(NAVPOINT_FIND, ph, 0, 0, 0, 0, &[]);
         if nav != 0 {
@@ -1024,8 +1061,8 @@ unsafe fn tailing_callback(l: u32, ty: u32) {
     unsafe {
         let n = nargs(l).min(1);
         let name = tostring(l, -n);
-        let mut t = ty;
-        call_regs(0x00A5_3190, &mut t as *mut u32 as u32, 0, 0, 0, name, &[]);
+        wd(arg0_addr() as usize, ty);
+        call_regs(0x00A5_3190, arg0_addr(), 0, 0, 0, name, &[]);
     }
 }
 
@@ -1033,13 +1070,13 @@ unsafe fn on_tailing_good_impl(l: u32) -> i32 {
     unsafe { tailing_callback(l, 2) };
     0
 }
-counted!(on_tailing_good, I_ON_TAILING_GOOD, on_tailing_good_impl);
+counted!(on_tailing_good, I_ON_TAILING_GOOD, on_tailing_good_impl, pop_ecx);
 
 unsafe fn on_tailing_too_far_impl(l: u32) -> i32 {
     unsafe { tailing_callback(l, 4) };
     0
 }
-counted!(on_tailing_too_far, I_ON_TAILING_TOO_FAR, on_tailing_too_far_impl);
+counted!(on_tailing_too_far, I_ON_TAILING_TOO_FAR, on_tailing_too_far_impl, pop_ecx);
 
 // --- 163 set_always_sees_player_flag ---------------------------------------------------------
 
@@ -1050,18 +1087,19 @@ unsafe fn set_always_sees_player_flag_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, true);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
         if name == 0 {
             return 0;
         }
         if let Some(h) = follower_or_object_human(name) {
             if h != 0 {
-                call_regs(0x0043_FF20, 0, 0, 0, 0, 0, &[h + 0xF8, (l & !0xFF) | flag as u32]);
+                call_regs(0x0043_FF20, 0, 0, 0, 0, 0, &[h + 0xF8, flag_slot(flag)]);
             }
         }
     }
     0
 }
-counted!(set_always_sees_player_flag, I_SET_ALWAYS_SEES_PLAYER_FLAG, set_always_sees_player_flag_impl);
+counted!(set_always_sees_player_flag, I_SET_ALWAYS_SEES_PLAYER_FLAG, set_always_sees_player_flag_impl, pop_ecx);
 
 // --- 164 thread_check_done -------------------------------------------------------------------
 
@@ -1131,7 +1169,7 @@ unsafe fn get_language_impl(l: u32) -> i32 {
     }
     1
 }
-shadow_checked!(get_language, I_GET_LANGUAGE, get_language_impl);
+shadow_checked!(get_language, I_GET_LANGUAGE, get_language_impl, pop_ecx);
 
 // --- 176 on_detection ------------------------------------------------------------------------
 
@@ -1184,7 +1222,7 @@ unsafe fn on_respawn_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(on_respawn, I_ON_RESPAWN, on_respawn_impl);
+counted!(on_respawn, I_ON_RESPAWN, on_respawn_impl, pop_ecx);
 
 // --- 178 set_animation_state -----------------------------------------------------------------
 
@@ -1196,14 +1234,15 @@ unsafe fn set_animation_state_impl(l: u32) -> i32 {
         let name = tostring(l, -n);
         let state = tostring(l, 1 - n);
         let h = if name != 0 { human_named(name) } else { 0 };
-        let mut id = call_regs(0x006E_F510, 0, 0, 0, 0, 0, &[state]);
+        let id = call_regs(0x006E_F510, 0, 0, 0, 0, 0, &[state]);
+        wd(arg0_addr() as usize, id);
         if h != 0 && id != 0xFFFF_FFFF {
-            call_regs(0x0096_95F0, 0, h, 0, 0, 0, &[&mut id as *mut u32 as u32]);
+            call_regs(0x0096_95F0, 0, h, 0, 0, 0, &[arg0_addr()]);
         }
     }
     0
 }
-counted!(set_animation_state, I_SET_ANIMATION_STATE, set_animation_state_impl);
+counted!(set_animation_state, I_SET_ANIMATION_STATE, set_animation_state_impl, pop_ecx);
 
 // --- 180 set_unrecruitable_flag --------------------------------------------------------------
 
@@ -1214,18 +1253,19 @@ unsafe fn set_unrecruitable_flag_impl(l: u32) -> i32 {
         let n = nargs(l).min(2);
         let name = tostring(l, -n);
         let flag = flag_at(l, n - 1, true);
+        wb(arg0_addr() as usize, flag as u8); // early flag store
         if name == 0 {
             return 0;
         }
         if let Some(h) = follower_or_object_human(name) {
             if h != 0 {
-                call_regs(0x009D_1C40, 0, 0, 0, 0, 0, &[h, (l & !0xFF) | flag as u32]);
+                call_regs(0x009D_1C40, 0, 0, 0, 0, 0, &[h, flag_slot(flag)]);
             }
         }
     }
     0
 }
-counted!(set_unrecruitable_flag, I_SET_UNRECRUITABLE_FLAG, set_unrecruitable_flag_impl);
+counted!(set_unrecruitable_flag, I_SET_UNRECRUITABLE_FLAG, set_unrecruitable_flag_impl, pop_ecx);
 
 // --- 181 action_nodes_restrict_spawning ------------------------------------------------------
 
@@ -1252,7 +1292,7 @@ unsafe fn character_is_player_impl(l: u32) -> i32 {
     }
     1
 }
-shadow_checked!(character_is_player, I_CHARACTER_IS_PLAYER, character_is_player_impl);
+shadow_checked!(character_is_player, I_CHARACTER_IS_PLAYER, character_is_player_impl, pop_ecx);
 
 // --- 187 notoriety_get_decimal ---------------------------------------------------------------
 
@@ -1296,7 +1336,7 @@ unsafe fn on_district_changed_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(on_district_changed, I_ON_DISTRICT_CHANGED, on_district_changed_impl);
+counted!(on_district_changed, I_ON_DISTRICT_CHANGED, on_district_changed_impl, pop_ecx);
 
 // --- 190 on_searchlight_track ----------------------------------------------------------------
 
@@ -1332,7 +1372,7 @@ unsafe fn on_searchlight_track_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(on_searchlight_track, I_ON_SEARCHLIGHT_TRACK, on_searchlight_track_impl);
+counted!(on_searchlight_track, I_ON_SEARCHLIGHT_TRACK, on_searchlight_track_impl, pop_ecx);
 
 // --- 169 vehicle_speed_cancel ----------------------------------------------------------------
 
@@ -1353,7 +1393,7 @@ unsafe fn vehicle_speed_cancel_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(vehicle_speed_cancel, I_VEHICLE_SPEED_CANCEL, vehicle_speed_cancel_impl);
+counted!(vehicle_speed_cancel, I_VEHICLE_SPEED_CANCEL, vehicle_speed_cancel_impl, pop_ecx);
 
 // --- 173 crouch_start ------------------------------------------------------------------------
 
@@ -1365,13 +1405,18 @@ unsafe fn crouch_start_impl(l: u32) -> i32 {
         let name = tostring(l, -n);
         let m = n - 1;
         let flag = m > 0 && truth(slot(l, -m));
+        // The flag byte replaces the low byte of the ECX the original pushed on entry, and
+        // `pop ecx` at the end restores that changed value.
+        let slotv = (entry_ecx() & !0xFF) | flag as u32;
+        set_ecx(slotv);
         if name == 0 {
             return 0;
         }
         let h = human_named(name);
         if h != 0 {
-            call_regs(0x0099_4F50, 0, h, 0, 0, 0, &[flag as u32]);
+            call_regs(0x0099_4F50, 0, h, 0, 0, 0, &[slotv]);
         }
+        set_ecx(slotv);
     }
     0
 }
@@ -1424,7 +1469,7 @@ unsafe fn vehicle_flee_impl(l: u32) -> i32 {
     }
     0
 }
-counted!(vehicle_flee, I_VEHICLE_FLEE, vehicle_flee_impl);
+counted!(vehicle_flee, I_VEHICLE_FLEE, vehicle_flee_impl, pop_ecx);
 
 // --- 199 Completion_is_coop ------------------------------------------------------------------
 
@@ -1451,6 +1496,9 @@ unsafe fn crouch_is_crouching_impl(l: u32) -> i32 {
         let name = tostring(l, -n);
         let h = if name != 0 { human_named(name) } else { 0 };
         let r = h != 0 && (rd(h as usize + 0xC0) >> 7) & 1 != 0;
+        if h != 0 {
+            set_ecx(r as u32); // `mov ecx, 0; setne cl`
+        }
         push_bool(l, r);
     }
     1
@@ -1465,7 +1513,7 @@ struct Binding {
     body: &'static [u8],
     /// The body's `call rel32` offsets, for the relocated shadow copy (shadow-checked ones only).
     shadow_calls: Option<&'static [usize]>,
-    f: extern "C" fn(u32) -> i32,
+    f: extern "C" fn(),
 }
 
 const BINDINGS: [Binding; COUNT] = [

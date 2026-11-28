@@ -136,8 +136,13 @@ unsafe fn cr(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &
 
 /// Call a game function that returns a double on ST0 (popped).
 unsafe fn call_st0(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> f64 {
+    unsafe { call_st0e(f, eax, ecx, edx, esi, edi, args).0 }
+}
+
+/// As `call_st0`, and also returns the callee's EAX.
+unsafe fn call_st0e(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, args: &[u32]) -> (f64, u32) {
     let f = tgt(f);
-    let mut block: [u32; 10] = [f as u32, ecx, edx, esi, edi, args.as_ptr() as u32, args.len() as u32, eax, 0, 0];
+    let mut block: [u32; 11] = [f as u32, ecx, edx, esi, edi, args.as_ptr() as u32, args.len() as u32, eax, 0, 0, 0];
     unsafe {
         std::arch::asm!(
             "push ebx", "push esi", "push edi", "push ebp",
@@ -155,6 +160,7 @@ unsafe fn call_st0(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, a
             "mov ecx, [ebx + 4]", "mov edx, [ebx + 8]", "mov esi, [ebx + 12]", "mov edi, [ebx + 16]",
             "mov eax, [ebx + 28]",
             "call dword ptr [ebx]",
+            "mov [ebx + 40], eax",
             "fstp qword ptr [ebx + 32]",
             "mov esp, ebp",
             "pop ebp", "pop edi", "pop esi", "pop ebx",
@@ -162,7 +168,7 @@ unsafe fn call_st0(f: usize, eax: u32, ecx: u32, edx: u32, esi: u32, edi: u32, a
             clobber_abi("C"),
         );
     }
-    f64::from_bits(block[8] as u64 | (block[9] as u64) << 32)
+    (f64::from_bits(block[8] as u64 | (block[9] as u64) << 32), block[10])
 }
 
 /// What `fld dword` / `fstp dword` does to a signalling NaN.
@@ -193,14 +199,29 @@ unsafe fn movsd(dst: usize, src: usize, n: usize) {
     }
 }
 
+/// Aligned load / store (`movaps`): the originals fault on a misaligned operand and so do we. The
+/// compiler emits `movups` for the store, so the store is preceded by an aligned (volatile) load of the
+/// same 16 bytes, which takes the fault the original's `movaps` store takes.
 #[inline(always)]
-unsafe fn ld(p: usize) -> __m128 {
-    unsafe { _mm_loadu_ps(p as *const f32) }
+unsafe fn lda(p: usize) -> __m128 {
+    unsafe {
+        let v: __m128;
+        std::arch::asm!("movaps {v}, xmmword ptr [{p}]", v = out(xmm_reg) v, p = in(reg) p, options(nostack, readonly, preserves_flags));
+        v
+    }
 }
 
 #[inline(always)]
-unsafe fn st(p: usize, v: __m128) {
-    unsafe { _mm_storeu_ps(p as *mut f32, v) }
+unsafe fn sta(p: usize, v: __m128) {
+    unsafe {
+        std::arch::asm!("movaps xmmword ptr [{p}], {v}", v = in(xmm_reg) v, p = in(reg) p, options(nostack, preserves_flags));
+    }
+}
+
+/// Set XMM register `i` of the thunk's output array (the stack is only 4-byte aligned).
+#[inline(always)]
+unsafe fn xo_set(xo: *mut f32, i: usize, v: __m128) {
+    unsafe { _mm_storeu_ps(xo.add(i * 4), v) }
 }
 
 // --- registers, thunks, shadow machinery ---------------------------------------------------------
@@ -218,43 +239,6 @@ struct Pushad {
     edx: u32,
     ecx: u32,
     eax: u32,
-}
-
-/// `pushad`, XMM1-7 saved, `f(&mut block, &stack args)`, restored, `popad`.
-macro_rules! thunk_x1 {
-    ($name:ident, $f:ident, $ret:literal) => {
-        #[unsafe(naked)]
-        extern "C" fn $name() {
-            std::arch::naked_asm!(
-                "pushad",
-                "sub esp, 112",
-                "movups xmmword ptr [esp], xmm1",
-                "movups xmmword ptr [esp + 16], xmm2",
-                "movups xmmword ptr [esp + 32], xmm3",
-                "movups xmmword ptr [esp + 48], xmm4",
-                "movups xmmword ptr [esp + 64], xmm5",
-                "movups xmmword ptr [esp + 80], xmm6",
-                "movups xmmword ptr [esp + 96], xmm7",
-                "lea eax, [esp + 112]",
-                "lea ecx, [esp + 148]",
-                "push ecx",
-                "push eax",
-                "call {f}",
-                "add esp, 8",
-                "movups xmm1, xmmword ptr [esp]",
-                "movups xmm2, xmmword ptr [esp + 16]",
-                "movups xmm3, xmmword ptr [esp + 32]",
-                "movups xmm4, xmmword ptr [esp + 48]",
-                "movups xmm5, xmmword ptr [esp + 64]",
-                "movups xmm6, xmmword ptr [esp + 80]",
-                "movups xmm7, xmmword ptr [esp + 96]",
-                "add esp, 112",
-                "popad",
-                $ret,
-                f = sym $f,
-            )
-        }
-    };
 }
 
 /// Same, and XMM0 = the dword in the block's `esp` slot (the function's float result).
@@ -334,6 +318,48 @@ macro_rules! thunk_all {
     };
 }
 
+/// `pushad`, XMM0-7 saved, `f(&mut block, &stack args, &mut [__m128; 8])` where the array holds the
+/// entry XMM0-7 and is what the thunk loads back: the body overwrites the registers the original
+/// leaves changed.
+macro_rules! thunk_xo {
+    ($name:ident, $f:ident, $ret:literal) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "pushad",
+                "sub esp, 128",
+                "movups xmmword ptr [esp], xmm0",
+                "movups xmmword ptr [esp + 16], xmm1",
+                "movups xmmword ptr [esp + 32], xmm2",
+                "movups xmmword ptr [esp + 48], xmm3",
+                "movups xmmword ptr [esp + 64], xmm4",
+                "movups xmmword ptr [esp + 80], xmm5",
+                "movups xmmword ptr [esp + 96], xmm6",
+                "movups xmmword ptr [esp + 112], xmm7",
+                "lea eax, [esp + 128]",
+                "lea ecx, [esp + 164]",
+                "push esp",
+                "push ecx",
+                "push eax",
+                "call {f}",
+                "add esp, 12",
+                "movups xmm0, xmmword ptr [esp]",
+                "movups xmm1, xmmword ptr [esp + 16]",
+                "movups xmm2, xmmword ptr [esp + 32]",
+                "movups xmm3, xmmword ptr [esp + 48]",
+                "movups xmm4, xmmword ptr [esp + 64]",
+                "movups xmm5, xmmword ptr [esp + 80]",
+                "movups xmm6, xmmword ptr [esp + 96]",
+                "movups xmm7, xmmword ptr [esp + 112]",
+                "add esp, 128",
+                "popad",
+                $ret,
+                f = sym $f,
+            )
+        }
+    };
+}
+
 /// Integer-only body: XMM0-7 are saved only while the port's shadow window is open (the shadow
 /// machinery uses SSE); afterwards just `pushad` / `popad`.
 macro_rules! thunk_win {
@@ -383,27 +409,6 @@ macro_rules! thunk_win {
                 p = sym PORTS,
                 off = const ($id * std::mem::size_of::<Port>() + std::mem::offset_of!(Port, calls)),
                 n = const SHADOW_CALLS,
-            )
-        }
-    };
-}
-
-/// `pushad` only: the original clobbers XMM0-7 itself.
-macro_rules! thunk_none {
-    ($name:ident, $f:ident, $ret:literal) => {
-        #[unsafe(naked)]
-        extern "C" fn $name() {
-            std::arch::naked_asm!(
-                "pushad",
-                "mov eax, esp",
-                "lea ecx, [esp + 36]",
-                "push ecx",
-                "push eax",
-                "call {f}",
-                "add esp, 8",
-                "popad",
-                $ret,
-                f = sym $f,
             )
         }
     };
@@ -838,123 +843,231 @@ extern "C" fn scale_entry(r: &mut Pushad, args: *const u32) {
 thunk_all!(scale_thunk, scale_entry, "ret 4");
 
 // --- 0x485C30 hkvector4_sub_store -------------------------------------------------------------------
-// ECX = &out, stack (&a, &b), ret 8: out = a - b (subps). ECX preserved.
+// ECX = &out, stack (&a, &b), ret 8: out = a - b (subps, aligned loads and store like the original).
+// Exit: EAX = &a, EDX = &b, ECX = &out, XMM0 = result, XMM1 = b.
 
-extern "C" fn sub_entry(r: &mut Pushad, args: *const u32) {
-    let (out, a, b) = (r.ecx as usize, unsafe { *args }, unsafe { *args.add(1) });
+unsafe fn sub_op(out: usize, a: usize, b: usize) -> (__m128, __m128) {
     unsafe {
-        shadowed(SUB, r, &[a, b], &[(out, 16)], M_FMEM, || {
-            st(out, _mm_sub_ps(ld(a as usize), ld(b as usize)));
-            Res::default()
-        });
+        let va = lda(a);
+        let vb = lda(b);
+        let res = _mm_sub_ps(va, vb);
+        sta(out, res);
+        (res, vb)
     }
 }
-thunk_x1!(sub_thunk, sub_entry, "ret 8");
+
+extern "C" fn sub_entry(r: &mut Pushad, args: *const u32, xo: *mut f32) {
+    let (out, a, b) = (r.ecx as usize, unsafe { *args }, unsafe { *args.add(1) });
+    let mut o = (unsafe { _mm_setzero_ps() }, unsafe { _mm_setzero_ps() });
+    unsafe {
+        shadowed(SUB, r, &[a, b], &[(out, 16)], M_FMEM, || {
+            o = sub_op(out, a as usize, b as usize);
+            Res::default()
+        });
+        xo_set(xo, 0, o.0);
+        xo_set(xo, 1, o.1);
+    }
+    r.eax = a;
+    r.edx = b;
+}
+thunk_xo!(sub_thunk, sub_entry, "ret 8");
 
 // --- 0xBB8A10 hkvector4_equal_store -----------------------------------------------------------------
 // ECX = &a, stack (&out, &b), ret 8: out = cmpeqps(b, a) per lane (NaN lanes are 0).
+// Exit: EAX = &out, XMM0 = result, XMM1 = a.
 
-extern "C" fn eq_entry(r: &mut Pushad, args: *const u32) {
-    let (a, out, b) = (r.ecx as usize, unsafe { *args }, unsafe { *args.add(1) });
+unsafe fn eq_op(a: usize, out: usize, b: usize) -> (__m128, __m128) {
     unsafe {
-        shadowed(EQ, r, &[out, b], &[(out as usize, 16)], 0, || {
-            st(out as usize, _mm_cmpeq_ps(ld(b as usize), ld(a)));
-            Res::default()
-        });
+        let vb = lda(b);
+        let va = lda(a);
+        let res = _mm_cmpeq_ps(vb, va);
+        sta(out, res);
+        (res, va)
     }
 }
-thunk_x1!(eq_thunk, eq_entry, "ret 8");
+
+extern "C" fn eq_entry(r: &mut Pushad, args: *const u32, xo: *mut f32) {
+    let (a, out, b) = (r.ecx as usize, unsafe { *args }, unsafe { *args.add(1) });
+    let mut o = (unsafe { _mm_setzero_ps() }, unsafe { _mm_setzero_ps() });
+    unsafe {
+        shadowed(EQ, r, &[out, b], &[(out as usize, 16)], 0, || {
+            o = eq_op(a, out as usize, b as usize);
+            Res::default()
+        });
+        xo_set(xo, 0, o.0);
+        xo_set(xo, 1, o.1);
+    }
+    r.eax = out;
+}
+thunk_xo!(eq_thunk, eq_entry, "ret 8");
 
 // --- 0x72A100 hkvector4_less_store ------------------------------------------------------------------
 // ECX = &a, stack (&out, &b), ret 8: out = cmpltps(a, b) (all ones where a < b).
+// Exit: EAX = &out, EDX = &b, XMM0 = b, XMM1 = result.
 
-extern "C" fn less_entry(r: &mut Pushad, args: *const u32) {
-    let (a, out, b) = (r.ecx as usize, unsafe { *args }, unsafe { *args.add(1) });
+unsafe fn less_op(a: usize, out: usize, b: usize) -> (__m128, __m128) {
     unsafe {
-        shadowed(LESS, r, &[out, b], &[(out as usize, 16)], 0, || {
-            st(out as usize, _mm_cmplt_ps(ld(a), ld(b as usize)));
-            Res::default()
-        });
+        let vb = lda(b);
+        let va = lda(a);
+        let res = _mm_cmplt_ps(va, vb);
+        sta(out, res);
+        (vb, res)
     }
 }
-thunk_x1!(less_thunk, less_entry, "ret 8");
+
+extern "C" fn less_entry(r: &mut Pushad, args: *const u32, xo: *mut f32) {
+    let (a, out, b) = (r.ecx as usize, unsafe { *args }, unsafe { *args.add(1) });
+    let mut o = (unsafe { _mm_setzero_ps() }, unsafe { _mm_setzero_ps() });
+    unsafe {
+        shadowed(LESS, r, &[out, b], &[(out as usize, 16)], 0, || {
+            o = less_op(a, out as usize, b as usize);
+            Res::default()
+        });
+        xo_set(xo, 0, o.0);
+        xo_set(xo, 1, o.1);
+    }
+    r.eax = out;
+    r.edx = b;
+}
+thunk_xo!(less_thunk, less_entry, "ret 8");
 
 // --- 0x729A60 hkvector4_dot4_store ------------------------------------------------------------------
 // ECX = &a, stack (&out, &b), ret 8: t = b*a, u = t + shuf(t, 0x4E), out = u + shuf(u, 0xB1).
+// Exit: EAX = &out, EDX = &b, XMM0 = u, XMM1 = result.
 
-extern "C" fn dot4_entry(r: &mut Pushad, args: *const u32) {
+unsafe fn dot4_op(a: usize, out: usize, b: usize) -> (__m128, __m128) {
+    unsafe {
+        let va = lda(a);
+        let vb = lda(b);
+        let t = _mm_mul_ps(vb, va);
+        let u = _mm_add_ps(_mm_shuffle_ps::<0x4E>(t, t), t);
+        let w = _mm_add_ps(_mm_shuffle_ps::<0xB1>(u, u), u);
+        sta(out, w);
+        (u, w)
+    }
+}
+
+extern "C" fn dot4_entry(r: &mut Pushad, args: *const u32, xo: *mut f32) {
     let (a, out, b) = (r.ecx as usize, unsafe { *args }, unsafe { *args.add(1) });
+    let mut o = (unsafe { _mm_setzero_ps() }, unsafe { _mm_setzero_ps() });
     unsafe {
         shadowed(DOT4, r, &[out, b], &[(out as usize, 16)], M_FMEM, || {
-            let t = _mm_mul_ps(ld(b as usize), ld(a));
-            let u = _mm_add_ps(_mm_shuffle_ps::<0x4E>(t, t), t);
-            let w = _mm_add_ps(_mm_shuffle_ps::<0xB1>(u, u), u);
-            st(out as usize, w);
+            o = dot4_op(a, out as usize, b as usize);
             Res::default()
         });
+        xo_set(xo, 0, o.0);
+        xo_set(xo, 1, o.1);
     }
+    r.eax = out;
+    r.edx = b;
 }
-thunk_x1!(dot4_thunk, dot4_entry, "ret 8");
+thunk_xo!(dot4_thunk, dot4_entry, "ret 8");
 
 // --- 0x71A0A0 hkvector4_madd_splat_x ----------------------------------------------------------------
-// ECX = &out, stack (&s, &v), ret 8: out = splat(s.x) * v + out. EAX = out on exit (ECX and EDX are
-// clobbered by the original; the thunk preserves them).
+// ECX = &out, stack (&s, &v), ret 8: out = splat(s.x) * v + out.
+// Exit: EAX = &out, ECX = &s, EDX = &v, XMM0 = the old out, XMM1 = result.
 
-extern "C" fn madd_entry(r: &mut Pushad, args: *const u32) {
+unsafe fn madd_op(out: usize, s: usize, v: usize) -> (__m128, __m128) {
+    unsafe {
+        let vs = lda(s);
+        let sp = _mm_shuffle_ps::<0>(vs, vs);
+        let vv = lda(v);
+        let prod = _mm_mul_ps(sp, vv);
+        let old = lda(out);
+        let res = _mm_add_ps(prod, old);
+        sta(out, res);
+        (old, res)
+    }
+}
+
+extern "C" fn madd_entry(r: &mut Pushad, args: *const u32, xo: *mut f32) {
     let (out, s, v) = (r.ecx as usize, unsafe { *args }, unsafe { *args.add(1) });
+    let mut o = (unsafe { _mm_setzero_ps() }, unsafe { _mm_setzero_ps() });
     unsafe {
         shadowed(MADD, r, &[s, v], &[(out, 16)], M_EAX | M_FMEM, || {
-            let sp = _mm_shuffle_ps::<0>(ld(s as usize), ld(s as usize));
-            st(out, _mm_add_ps(_mm_mul_ps(sp, ld(v as usize)), ld(out)));
+            o = madd_op(out, s as usize, v as usize);
             Res { eax: out as u32, ..Res::default() }
         });
+        xo_set(xo, 0, o.0);
+        xo_set(xo, 1, o.1);
     }
     r.eax = out as u32;
+    r.ecx = s;
+    r.edx = v;
 }
-thunk_x1!(madd_thunk, madd_entry, "ret 8");
+thunk_xo!(madd_thunk, madd_entry, "ret 8");
 
 // --- 0x485D30 hkvector4_add_in_place ----------------------------------------------------------------
-// ECX = &a, stack (&b), ret 4: a = a + b. EAX = a on exit.
+// ECX = &a, stack (&b), ret 4: a = a + b.
+// Exit: EAX = &a, ECX = &b, XMM0 = result, XMM1 = b.
 
-extern "C" fn add_entry(r: &mut Pushad, args: *const u32) {
+unsafe fn add_op(a: usize, b: usize) -> (__m128, __m128) {
+    unsafe {
+        let va = lda(a);
+        let vb = lda(b);
+        let res = _mm_add_ps(va, vb);
+        sta(a, res);
+        (res, vb)
+    }
+}
+
+extern "C" fn add_entry(r: &mut Pushad, args: *const u32, xo: *mut f32) {
     let (a, b) = (r.ecx as usize, unsafe { *args });
+    let mut o = (unsafe { _mm_setzero_ps() }, unsafe { _mm_setzero_ps() });
     unsafe {
         shadowed(ADD, r, &[b], &[(a, 16)], M_EAX | M_FMEM, || {
-            st(a, _mm_add_ps(ld(a), ld(b as usize)));
+            o = add_op(a, b as usize);
             Res { eax: a as u32, ..Res::default() }
         });
+        xo_set(xo, 0, o.0);
+        xo_set(xo, 1, o.1);
     }
     r.eax = a as u32;
+    r.ecx = b;
 }
-thunk_x1!(add_thunk, add_entry, "ret 4");
+thunk_xo!(add_thunk, add_entry, "ret 4");
 
 // --- 0xBB8970 hkvector4_and_mask_table --------------------------------------------------------------
-// ECX = &v, stack (index), ret 4: v = row(0xE538F0 + index*16) & v. (EAX = the row address on exit,
-// scratch.)
+// ECX = &v, stack (index), ret 4: v = row(0xE538F0 + index*16) & v.
+// Exit: EAX = the row address, XMM0 = result, XMM1 = the old v.
 
-extern "C" fn andm_entry(r: &mut Pushad, args: *const u32) {
-    let (v, idx) = (r.ecx as usize, unsafe { *args });
+unsafe fn andm_op(v: usize, row: usize) -> (__m128, __m128) {
     unsafe {
-        shadowed(ANDM, r, &[idx], &[(v, 16)], 0, || {
-            let row = k(MASK_TABLE).wrapping_add((idx << 4) as usize);
-            st(v, _mm_and_ps(ld(row), ld(v)));
-            Res::default()
-        });
+        let old = lda(v);
+        let m = lda(row);
+        let res = _mm_and_ps(m, old);
+        sta(v, res);
+        (res, old)
     }
 }
-thunk_x1!(andm_thunk, andm_entry, "ret 4");
+
+extern "C" fn andm_entry(r: &mut Pushad, args: *const u32, xo: *mut f32) {
+    let (v, idx) = (r.ecx as usize, unsafe { *args });
+    let row = k(MASK_TABLE).wrapping_add((idx << 4) as usize);
+    let mut o = (unsafe { _mm_setzero_ps() }, unsafe { _mm_setzero_ps() });
+    unsafe {
+        shadowed(ANDM, r, &[idx], &[(v, 16)], 0, || {
+            o = andm_op(v, row);
+            Res::default()
+        });
+        xo_set(xo, 0, o.0);
+        xo_set(xo, 1, o.1);
+    }
+    r.eax = row as u32;
+}
+thunk_xo!(andm_thunk, andm_entry, "ret 4");
 
 // --- 0xD93F20 hkrotation_from_quaternion_store ------------------------------------------------------
 // ECX = &out (three 16-byte rows), stack (&quat), ret 4. Intrinsic-for-intrinsic translation of the
 // SSE body (constants: 1.0 row at 0xDC9C20, sign rows at 0xE57460 / 0xE57470). The original clobbers
-// XMM0-7, so the thunk saves none.
+// XMM0-7 and leaves EAX = &quat; the final value of every XMM register is handed back through `xo`.
+// (The original also spills the sign row to a dead 16-byte stack slot below its frame; not repeated.)
 
-unsafe fn rot(out: usize, quat: usize) {
+unsafe fn rot(out: usize, quat: usize) -> [__m128; 8] {
     unsafe {
-        let q = ld(quat);
-        let c1 = ld(k(ROT_ONE));
-        let s0 = ld(k(ROT_S0));
-        let s1 = ld(k(ROT_S1));
+        let q = lda(quat);
+        let c1 = lda(k(ROT_ONE));
+        let s0 = lda(k(ROT_S0));
         let d = _mm_add_ps(q, q);
         let x3 = _mm_shuffle_ps::<0x41>(q, q);
         let x2 = _mm_shuffle_ps::<0xA5>(d, d);
@@ -962,44 +1075,56 @@ unsafe fn rot(out: usize, quat: usize) {
         let x0 = _mm_shuffle_ps::<0xFE>(q, q);
         let x1 = _mm_shuffle_ps::<0x1A>(d, d);
         let x0 = _mm_mul_ps(x0, x1);
+        let s1 = lda(k(ROT_S1));
         let x0 = _mm_xor_ps(x0, s1);
         let x2 = _mm_mul_ps(x2, x3);
         let x0 = _mm_add_ss(x0, c1);
         let x5 = x2;
-        let x2 = _mm_xor_ps(x2, s0);
+        let x2 = _mm_xor_ps(x2, lda(k(ROT_S0)));
         let row0 = _mm_sub_ps(x0, x2);
-        st(out, row0);
         let x0 = _mm_xor_ps(x0, s0);
         let x2 = _mm_move_ss(x2, x4);
-        let x3 = c1;
+        sta(out, row0);
         let x0 = _mm_sub_ps(x0, x2);
         let x0 = _mm_shuffle_ps::<0xB1>(x0, x0);
-        let x3 = _mm_sub_ss(x3, x4);
+        let x3 = _mm_sub_ss(c1, x4);
         let x1 = _mm_movehl_ps(row0, x0);
         let x3 = _mm_sub_ss(x3, x5);
         let x1 = _mm_shuffle_ps::<0x8D>(x1, x3);
-        st(out + 0x10, x0);
-        st(out + 0x20, x1);
+        sta(out + 0x10, x0);
+        sta(out + 0x20, x1);
+        [x0, x1, x2, x3, x4, x5, c1, s0]
     }
 }
 
-extern "C" fn rot_entry(r: &mut Pushad, args: *const u32) {
+extern "C" fn rot_entry(r: &mut Pushad, args: *const u32, xo: *mut f32) {
     let (out, quat) = (r.ecx as usize, unsafe { *args });
+    let mut o = [unsafe { _mm_setzero_ps() }; 8];
+    for (i, v) in o.iter_mut().enumerate() {
+        *v = unsafe { _mm_loadu_ps(xo.add(i * 4)) };
+    }
     unsafe {
         shadowed(ROT, r, &[quat], &[(out, 48)], M_FMEM, || {
-            rot(out, quat as usize);
+            o = rot(out, quat as usize);
             Res::default()
         });
+        for (i, v) in o.iter().enumerate() {
+            xo_set(xo, i, *v);
+        }
     }
+    r.eax = quat;
 }
-thunk_none!(rot_thunk, rot_entry, "ret 4");
+thunk_xo!(rot_thunk, rot_entry, "ret 4");
 
 // --- 0x9149A0 action_node_from_handle ---------------------------------------------------------------
 // EDX = handle, plain ret, EAX = record (0x6C bytes at 0x2A4E508 + (handle & 0xFFFF) * 0x6C) or 0:
 // handle 0, index >= 0x960 (signed), [rec+0x30] == 0, [[rec+0x30]+4] == 0, or [rec+0x1C] != handle
 // all give 0. ECX is clobbered (the thunk preserves it).
 
-unsafe fn action_node(h: u32) -> u32 {
+// Exit ECX: untouched on the h == 0 / index-too-big paths, the loaded [rec+0x30] pointer on the two
+// early-out paths after it, and (mismatch ? 0 : -1) on the last path.
+
+unsafe fn action_node(h: u32, ecx: &mut u32) -> u32 {
     unsafe {
         if h == 0 {
             return 0;
@@ -1010,17 +1135,22 @@ unsafe fn action_node(h: u32) -> u32 {
         }
         let rec = k(ACTION_TABLE) + idx as usize * 0x6C;
         let n = rd(rec + 0x30) as usize;
+        *ecx = n as u32;
         if n == 0 || rd(n + 4) == 0 {
             return 0;
         }
-        if rd(rec + 0x1C) != h { 0 } else { rec as u32 }
+        let same = rd(rec + 0x1C) == h;
+        *ecx = if same { 0xFFFF_FFFF } else { 0 };
+        if same { rec as u32 } else { 0 }
     }
 }
 
 extern "C" fn actn_entry(r: &mut Pushad, _args: *const u32) {
     let h = r.edx;
-    let res = unsafe { shadowed(ACTN, r, &[], &[], M_EAX, || Res { eax: action_node(h), ..Res::default() }) };
+    let mut ecx = r.ecx;
+    let res = unsafe { shadowed(ACTN, r, &[], &[], M_EAX, || Res { eax: action_node(h, &mut ecx), ..Res::default() }) };
     r.eax = res.eax;
+    r.ecx = ecx;
 }
 thunk_win!(actn_thunk, actn_entry, ACTN, "ret");
 
@@ -1053,6 +1183,9 @@ extern "C" fn inst_entry(r: &mut Pushad, args: *const u32) {
             Res::default()
         });
     }
+    // Exit: ECX = 0 (`xor ecx, ecx`), EDX = a2 with its low word replaced by a0's (`mov dx, ...`).
+    r.ecx = 0;
+    r.edx = (a2 & 0xFFFF_0000) | (a0 & 0xFFFF);
 }
 thunk_win!(inst_thunk, inst_entry, INST, "ret 0x10");
 
@@ -1061,10 +1194,16 @@ thunk_win!(inst_thunk, inst_entry, INST, "ret 0x10");
 // (each stored through the stack as f32, so the differences are rounded to f32 first). y is ignored.
 
 unsafe fn dist_sq_xz(a: usize, b: usize) -> f32 {
+    unsafe { dist_sq_dz(a, b).0 }
+}
+
+/// The squared distance and the f32 `dz` the original keeps in a stack slot.
+unsafe fn dist_sq_dz(a: usize, b: usize) -> (f32, f32) {
     unsafe {
         let dx = (fx(a) - fx(b)) as f32 as f64;
-        let dz = (fx(a + 8) - fx(b + 8)) as f32 as f64;
-        (dx * dx + dz * dz) as f32
+        let dzf = (fx(a + 8) - fx(b + 8)) as f32;
+        let dz = dzf as f64;
+        ((dx * dx + dz * dz) as f32, dzf)
     }
 }
 
@@ -1078,19 +1217,30 @@ thunk_all!(dsq_thunk, dsq_entry, "ret");
 // --- 0xBDEAB0 vec3_dist_xz_regs ---------------------------------------------------------------------
 // Same inputs; ST0 = sqrtf_wrapper(f32(dx*dx + dz*dz)) (0x40EA20, cdecl f32 on the stack, ST0).
 
-unsafe fn dist_xz(a: usize, b: usize) -> f32 {
+// Exit EAX is whatever the callee left in it; ECX / EDX come from the callee too (not compared).
+unsafe fn dist_xz(a: usize, b: usize, r: &Pushad) -> (f32, u32) {
     unsafe {
-        let sum = dist_sq_xz(a, b);
-        call_st0(SQRTF, 0, 0, 0, 0, 0, &[sum.to_bits()]) as f32
+        let (sum, dz) = dist_sq_dz(a, b);
+        // The original calls with its whole 16-byte frame on the stack: sum, an unwritten slot, dz, sum.
+        let (v, eax) = call_st0e(SQRTF, b as u32, a as u32, r.edx, r.esi, r.edi, &[sum.to_bits(), 0, dz.to_bits(), sum.to_bits()]);
+        (v as f32, eax)
     }
 }
 
 extern "C" fn dxz_entry(r: &mut Pushad, _args: *const u32) -> f32 {
     let (a, b) = (r.ecx as usize, r.eax as usize);
-    let res = unsafe { shadowed(DXZ, r, &[], &[], M_ST0, || Res { st0: dist_xz(a, b).to_bits(), ..Res::default() }) };
+    let mut eax = r.eax;
+    let res = unsafe {
+        shadowed(DXZ, r, &[], &[], M_ST0, || {
+            let (v, e) = dist_xz(a, b, r);
+            eax = e;
+            Res { st0: v.to_bits(), ..Res::default() }
+        })
+    };
+    r.eax = eax;
     f32::from_bits(res.st0)
 }
-thunk_x1!(dxz_thunk, dxz_entry, "ret");
+thunk_all!(dxz_thunk, dxz_entry, "ret");
 
 // --- 0x40EA60 vec3_length_sq_eax --------------------------------------------------------------------
 // EAX = &v, plain ret, ST0 = f32((x*x + y*y) + z*z) (x87, one f32 store). ECX preserved.
@@ -1105,6 +1255,8 @@ unsafe fn length_sq(v: usize) -> f32 {
 extern "C" fn lsq_entry(r: &mut Pushad, _args: *const u32) -> f32 {
     let v = r.eax as usize;
     let res = unsafe { shadowed(LSQ, r, &[], &[], M_ST0, || Res { st0: length_sq(v).to_bits(), ..Res::default() }) };
+    // `fstp dword [esp]` overwrites the pushed ECX; the final `pop ecx` leaves the result bits there.
+    r.ecx = res.st0;
     f32::from_bits(res.st0)
 }
 thunk_all!(lsq_thunk, lsq_entry, "ret");
@@ -1166,7 +1318,9 @@ thunk_win!(heli_thunk, heli_entry, HELI, "ret");
 // pos at +4 and the matrix at +0x10. Dword copies, no float conversion. ECX / EDX end up clobbered in
 // the original (EDX = pos.z on the slot path), the thunk preserves them.
 
-unsafe fn xform_store(veh: usize, pos: usize, mat: usize) {
+// Returns the exit (EAX, ECX, EDX): early path (id 0 or > 0x80) EAX = id, ECX = pos.z, EDX = pos; slot
+// path EAX = slot, ECX = 0 (rep movsd), EDX = pos.z.
+unsafe fn xform_store(veh: usize, pos: usize, mat: usize) -> (u32, u32, u32) {
     unsafe {
         movsd(veh + 0xEC, mat, 9);
         wd(veh + 0x110, rd(pos));
@@ -1174,7 +1328,7 @@ unsafe fn xform_store(veh: usize, pos: usize, mat: usize) {
         wd(veh + 0x118, rd(pos + 8));
         let id = rd(veh + 0xA4);
         if id == 0 || id > 0x80 {
-            return;
+            return (id, rd(pos + 8), pos as u32);
         }
         let slot = k(SLOT_TABLE) + id as usize * 0x4C;
         wd(slot + 4, rd(pos));
@@ -1182,6 +1336,7 @@ unsafe fn xform_store(veh: usize, pos: usize, mat: usize) {
         let z = rd(pos + 8);
         wd(slot + 0xC, z);
         movsd(slot + 0x10, mat, 9);
+        (slot as u32, 0, z)
     }
 }
 
@@ -1191,10 +1346,14 @@ extern "C" fn xfs_entry(r: &mut Pushad, args: *const u32) {
         let id = rd(veh + 0xA4);
         let rg = [(veh + 0xEC, 48usize), (k(SLOT_TABLE) + id as usize * 0x4C + 4, 0x30usize)];
         let n = if id == 0 || id > 0x80 { 1 } else { 2 };
+        let mut ex = (r.eax, r.ecx, r.edx);
         shadowed(XFS, r, &[mat], &rg[..n], 0, || {
-            xform_store(veh, pos, mat as usize);
+            ex = xform_store(veh, pos, mat as usize);
             Res::default()
         });
+        r.eax = ex.0;
+        r.ecx = ex.1;
+        r.edx = ex.2;
     }
 }
 thunk_win!(xfs_thunk, xfs_entry, XFS, "ret 4");
@@ -1209,14 +1368,16 @@ thunk_win!(xfs_thunk, xfs_entry, XFS, "ret 4");
 // argument slot and EAX = (state & 0xFFFF0000) | (x87 status high byte << 8) | AL, the status being
 // the compare's C0/C2/C3 plus TOP = 7 (an empty stack on entry).
 
-unsafe fn sphere(count: i32, planes: usize, center: usize, radius: u32, slot: *mut u32) -> u32 {
+// Exit ECX = start + 0xC + 0x1C * EDX and EDX = the number of planes stepped past (the loop counter).
+unsafe fn sphere(count: i32, planes: usize, edx0: u32, center: usize, radius: u32, slot: *mut u32) -> (u32, u32, u32) {
     unsafe {
-        let state = cr(THREAD_STATE, 0, 0, 0, 0, 0, &[]);
+        let state = cr(THREAD_STATE, count as u32, planes as u32, edx0, planes as u32, count as u32, &[]);
         let (mut n, mut p) = (count, planes);
         if planes == 0 {
             n = rd(state as usize + 0x1684) as i32;
             p = state as usize + 0x15DC;
         }
+        let start = p;
         let rad = f32::from_bits(radius) as f64;
         let (cx, cy, cz) = (fx(center), fx(center + 4), fx(center + 8));
         let mut i = 0i32;
@@ -1236,12 +1397,12 @@ unsafe fn sphere(count: i32, planes: usize, center: usize, radius: u32, slot: *m
             };
             let hi = (state & 0xFFFF_0000) | ((cc | 0x38) << 8);
             if cc & 0x41 == 0 {
-                return hi | 1;
+                return (hi | 1, (start + 0xC + i as usize * 0x1C) as u32, i as u32);
             }
             i += 1;
             p += 0x1C;
             if i >= n {
-                return hi;
+                return (hi, (start + 0xC + i as usize * 0x1C) as u32, i as u32);
             }
         }
     }
@@ -1251,10 +1412,17 @@ extern "C" fn sph_entry(r: &mut Pushad, args: *const u32) {
     let (count, planes) = (r.eax as i32, r.ecx as usize);
     let (center, radius) = unsafe { (*args as usize, *args.add(1)) };
     let slot = args as *mut u32;
+    let edx0 = r.edx;
+    let mut ex = (0u32, 0u32, 0u32);
     let res = unsafe {
-        shadowed(SPH, r, &[center as u32, radius], &[], M_AL, || Res { eax: sphere(count, planes, center, radius, slot), ..Res::default() })
+        shadowed(SPH, r, &[center as u32, radius], &[], M_AL, || {
+            ex = sphere(count, planes, edx0, center, radius, slot);
+            Res { eax: ex.0, ..Res::default() }
+        })
     };
     r.eax = res.eax;
+    r.ecx = ex.1;
+    r.edx = ex.2;
 }
 thunk_all!(sph_thunk, sph_entry, "ret");
 

@@ -699,15 +699,21 @@ macro_rules! thunk {
         #[unsafe(naked)]
         extern "C" fn $name() {
             std::arch::naked_asm!(
+                "sub esp, 128",
+                "movups [esp], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2", "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4", "movups [esp + 80], xmm5", "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
                 "pushad",
                 "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "push {id}",
                 "call {f}",
                 "add esp, 12",
                 "popad",
+                "movups xmm0, [esp]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]", "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]", "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 $ret,
                 id = const $id,
                 f = sym entry,

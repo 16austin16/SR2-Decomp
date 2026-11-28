@@ -32,15 +32,35 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::portlib::*;
 use crate::{detour, log};
 
-const SHADOW_CALLS: u32 = 3000;
+// Memory accesses are volatile here: the originals' loops store in program order and fault at a definite
+// element, and the compiler must not merge or reorder the stores (a partial copy up to a fault would differ).
+unsafe fn rd(p: usize) -> u32 {
+    unsafe { std::ptr::read_volatile(p as *const u32) }
+}
+unsafe fn rb(p: usize) -> u8 {
+    unsafe { std::ptr::read_volatile(p as *const u8) }
+}
+unsafe fn wd(p: usize, v: u32) {
+    unsafe { std::ptr::write_volatile(p as *mut u32, v) }
+}
+unsafe fn wb(p: usize, v: u8) {
+    unsafe { std::ptr::write_volatile(p as *mut u8, v) }
+}
+
+/// The shadow check (original vs Rust, first N calls) is off: `sr2-judge` is the test now, and the shadow
+/// made its runs depend on where the relocated copy landed.
+const SHADOW_CALLS: u32 = 0;
 
 // --- registers -------------------------------------------------------------------------------------
 
-/// The `pushad` block, lowest address first.
+/// The state a thunk hands to its handler: XMM0-7, then the `pushad` block (lowest address first).
+/// The handler plays the original's register effects on this block (calls through `cx` keep it
+/// current, XMM0-7 included); the thunk loads the block back into the CPU on return.
 #[repr(C)]
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // esp is never read
 pub(crate) struct Pushad {
+    xmm: [[u32; 4]; 8],
     edi: u32,
     esi: u32,
     ebp: u32,
@@ -51,25 +71,44 @@ pub(crate) struct Pushad {
     eax: u32,
 }
 
-/// The registers a callee can read, as the original has them at a call.
-#[derive(Clone, Copy)]
-struct R {
-    eax: u32,
-    ecx: u32,
-    edx: u32,
-    esi: u32,
-    edi: u32,
-}
+/// Stack words handed to every callee: its own arguments, then what the original's frame holds above
+/// them (saved registers, locals, the return address, the caller's arguments).
+const FW: usize = 12;
 
-impl R {
-    fn of(p: &Pushad) -> R {
-        R { eax: p.eax, ecx: p.ecx, edx: p.edx, esi: p.esi, edi: p.edi }
+/// The words the original has on the stack at a call: `own` (top first: arguments, then pushed
+/// registers and locals), then the original's return address and the caller's own stack arguments.
+unsafe fn fr(a: *const u32, own: &[u32]) -> [u32; FW] {
+    let mut w = [0u32; FW];
+    let mut n = 0;
+    for &v in own {
+        w[n] = v;
+        n += 1;
     }
+    w[n] = unsafe { *a.sub(1) };
+    n += 1;
+    let mut i = 0;
+    while n < FW {
+        w[n] = unsafe { *a.add(i) };
+        n += 1;
+        i += 1;
+    }
+    w
 }
 
-/// Call a game function with `r` and cdecl stack arguments; the result is EAX.
-unsafe fn cl(f: usize, r: &R, args: &[u32]) -> u32 {
-    unsafe { call_regs(f, r.eax, r.ecx, r.edx, r.esi, r.edi, args) }
+/// The words a callee entered by a tail `jmp` sees: the original's own stack arguments.
+unsafe fn fr_tail(a: *const u32) -> [u32; FW] {
+    let mut w = [0u32; FW];
+    for (i, v) in w.iter_mut().enumerate() {
+        *v = unsafe { *a.add(i) };
+    }
+    w
+}
+
+/// The address of the original's stack slot `k` dwords below its return address (1 = the first
+/// word it pushes). The thunk reserves the original's frame there, so locals can live at the same
+/// addresses and a pointer to one can be handed to a callee unchanged.
+fn slot(a: *const u32, k: usize) -> usize {
+    (a as usize).wrapping_sub(4 + 4 * k)
 }
 
 /// Stack argument `i` of the call (0 = the first, just above the return address).
@@ -77,18 +116,79 @@ unsafe fn arg(a: *const u32, i: usize) -> u32 {
     unsafe { *a.add(i) }
 }
 
-/// Six stack words from the first argument on: what a tail `jmp` hands its callee unchanged.
-unsafe fn tail_args(a: *const u32) -> [u32; 6] {
-    let mut o = [0u32; 6];
-    for (i, v) in o.iter_mut().enumerate() {
-        *v = unsafe { *a.add(i) };
-    }
-    o
+macro_rules! cx_fn {
+    ($name:ident, $skip:literal) => {
+        /// Call `f` with every register and XMM0-7 of `c`, the stack words `w` pushed, and
+        /// load the registers and XMM0-7 the callee leaves back into `c`.
+        unsafe fn $name(f: usize, c: &mut Pushad, w: &[u32; FW]) {
+            let blk: [u32; 3] = [f as u32, w.as_ptr() as u32, c as *mut Pushad as u32];
+            unsafe {
+                std::arch::asm!(
+                    "push ebx", "push esi", "push edi", "push ebp",
+                    "mov ebx, eax",
+                    "push dword ptr [ebx + 8]",
+                    "push dword ptr [ebx]",
+                    "mov esi, [ebx + 4]",
+                    "mov ecx, 12",
+                    "2:",
+                    "push dword ptr [esi + ecx*4 - 4]",
+                    "dec ecx",
+                    "jnz 2b",
+                    "mov eax, [ebx + 8]",
+                    "movups xmm0, [eax]", "movups xmm1, [eax + 16]", "movups xmm2, [eax + 32]", "movups xmm3, [eax + 48]",
+                    "movups xmm4, [eax + 64]", "movups xmm5, [eax + 80]", "movups xmm6, [eax + 96]", "movups xmm7, [eax + 112]",
+                    "mov edi, [eax + 128]", "mov esi, [eax + 132]", "mov ebp, [eax + 136]", "mov ebx, [eax + 144]",
+                    "mov edx, [eax + 148]", "mov ecx, [eax + 152]", "mov eax, [eax + 156]",
+                    "call dword ptr [esp + 48]",
+                    "add esp, {skip}",
+                    "push eax",
+                    "mov eax, [esp + 8]",
+                    "movups [eax], xmm0", "movups [eax + 16], xmm1", "movups [eax + 32], xmm2", "movups [eax + 48], xmm3",
+                    "movups [eax + 64], xmm4", "movups [eax + 80], xmm5", "movups [eax + 96], xmm6", "movups [eax + 112], xmm7",
+                    "mov [eax + 128], edi", "mov [eax + 132], esi", "mov [eax + 136], ebp", "mov [eax + 144], ebx",
+                    "mov [eax + 148], edx", "mov [eax + 152], ecx",
+                    "pop ecx",
+                    "mov [eax + 156], ecx",
+                    "add esp, 8",
+                    "pop ebp", "pop edi", "pop esi", "pop ebx",
+                    skip = const $skip,
+                    inout("eax") blk.as_ptr() => _,
+                    out("ecx") _, out("edx") _,
+                    clobber_abi("C"),
+                );
+            }
+        }
+    };
 }
+// The callee pops 0 / 1 / 2 / 3 of the words (a cdecl callee, or one ending in `ret 4 / 8 / 12`).
+cx_fn!(cx, 48);
+cx_fn!(cx_p1, 44);
+cx_fn!(cx_p2, 40);
+cx_fn!(cx_p3, 36);
 
 /// A `fld dword` / `fstp dword` round trip: the bits, except that a signalling NaN is quieted.
 fn q32(bits: u32) -> u32 {
     if bits & 0x7F80_0000 == 0x7F80_0000 && bits & 0x007F_FFFF != 0 { bits | 0x0040_0000 } else { bits }
+}
+
+/// `fld dword [lo]; fld dword [hi]; fcom st(1); fnstsw ax` and the two pops: the status word.
+unsafe fn fcom_status(lo: usize, hi: usize) -> u32 {
+    let sw: u32;
+    unsafe {
+        std::arch::asm!(
+            "fld dword ptr [{lo}]",
+            "fld dword ptr [{hi}]",
+            "fcom st(1)",
+            "fnstsw ax",
+            "fstp st(0)",
+            "fstp st(0)",
+            lo = in(reg) lo,
+            hi = in(reg) hi,
+            out("eax") sw,
+            options(nostack),
+        );
+    }
+    sw & 0xFFFF
 }
 
 // --- the port table ----------------------------------------------------------------------------------
@@ -154,30 +254,40 @@ impl Port {
     }
 }
 
-/// A naked thunk: `pushad`, then `f(&mut block, &stack args)`, then `popad`. The Rust body puts its
-/// result in the block's EAX.
+/// A naked thunk: reserve the original's frame ($fr bytes), `pushad`, save XMM0-7, then
+/// `f(&mut block, &stack args)`, then reload XMM0-7 and `popad`. The Rust body plays the original's
+/// register effects on the block.
 macro_rules! regs_thunk {
-    ($f:ident, $ret:literal) => {
+    ($f:ident, $ret:literal, $fr:literal) => {
         #[unsafe(naked)]
         pub extern "C" fn thunk() {
             std::arch::naked_asm!(
+                "sub esp, {fr}",
                 "pushad",
+                "sub esp, 128",
+                "movups [esp], xmm0", "movups [esp + 16], xmm1", "movups [esp + 32], xmm2", "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4", "movups [esp + 80], xmm5", "movups [esp + 96], xmm6", "movups [esp + 112], xmm7",
                 "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "lea ecx, [esp + 164 + {fr}]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp]", "movups xmm1, [esp + 16]", "movups xmm2, [esp + 32]", "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]", "movups xmm5, [esp + 80]", "movups xmm6, [esp + 96]", "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
+                "add esp, {fr}",
                 $ret,
                 f = sym $f,
+                fr = const $fr,
             )
         }
     };
 }
 
 macro_rules! ports {
-    ($([$id:ident, $name:literal, $addr:expr, $body:ident, $ext:ident, $mode:expr, $eax_out:expr, $ranges:expr, $h:ident]),* $(,)?) => {
+    ($([$id:ident, $name:literal, $addr:expr, $body:ident, $ext:ident, $mode:expr, $eax_out:expr, $ranges:expr, $h:ident, $fr:literal]),* $(,)?) => {
         #[allow(non_camel_case_types, dead_code, clippy::enum_variant_names)]
         #[repr(usize)]
         enum Id { $($id),* }
@@ -187,7 +297,7 @@ macro_rules! ports {
                 pub extern "C" fn entry(r: &mut super::Pushad, a: *const u32) {
                     unsafe { super::dispatch(super::Id::$id as usize, r, a) }
                 }
-                regs_thunk!(entry, "ret");
+                regs_thunk!(entry, "ret", $fr);
             }
         )*
         const COUNT: usize = [$(stringify!($id)),*].len();
@@ -235,7 +345,7 @@ unsafe fn put_back(r: (usize, usize), b: &[u8]) {
 
 /// The shadow (see the module comment): the original's result and writes win on a mismatch.
 unsafe fn shadow(port: &Port, n: u32, orig: usize, p: &mut Pushad, a: *const u32) {
-    let args = unsafe { tail_args(a) };
+    let args = unsafe { fr_tail(a) };
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     if let Some(f) = port.ranges {
         f(p, a, &mut ranges);
@@ -252,7 +362,7 @@ unsafe fn shadow(port: &Port, n: u32, orig: usize, p: &mut Pushad, a: *const u32
     let mem_ok = o_mem == x_mem;
     let eax_ok = !port.eax_out || q.eax == o_eax;
     if mem_ok && eax_ok {
-        p.eax = q.eax;
+        *p = q;
         return;
     }
     mismatch(port, n, format!("eax original {o_eax:#x} Rust {:#x}, memory equal: {mem_ok}", q.eax));
@@ -290,7 +400,7 @@ unsafe fn relocate(addr: usize, body: &[u8], ext: &[usize]) -> Result<usize, det
 pub fn install() {
     // The shadow copies first: replacing patches the entry.
     for port in PORTS.iter() {
-        if port.mode == Mode::Count {
+        if port.mode == Mode::Count || SHADOW_CALLS == 0 {
             continue;
         }
         match unsafe { relocate(port.addr, port.body, port.ext) } {
@@ -1208,51 +1318,73 @@ unsafe fn dbl(a: usize) -> f64 {
     unsafe { f64::from_bits(rd(a) as u64 | (rd(a + 4) as u64) << 32) }
 }
 
-/// The child lookup shared by the readers: the child of `node` (list at +8, next at +4) whose name
-/// (first dword) equals `find`, or 0. `r.eax` ends as the original leaves it (the last compare).
-unsafe fn find_child(r: &mut R, node: u32, find: u32) -> u32 {
+//// The child lookup shared by the readers: the child of `node` (list at +8, next at +4) whose name
+/// (first dword) equals `find`, or 0. `tail` is what the original has pushed below its return address
+/// (saved registers, top first); `s` ends as the original's registers do after the loop.
+unsafe fn find_child(s: &mut Pushad, a: *const u32, find: u32, tail: &[u32]) -> u32 {
     unsafe {
-        if node == 0 {
+        if s.eax == 0 {
             return 0;
         }
-        let mut s = rd(node as usize + 8);
-        while s != 0 {
-            let name = rd(s as usize);
-            r.eax = name;
-            r.esi = s;
-            let res = cl(STRCMP, r, &[name, find]);
-            r.eax = res;
-            if res == 0 {
-                return s;
+        let mut e = rd(s.eax as usize + 8);
+        s.esi = e;
+        while e != 0 {
+            let name = rd(e as usize);
+            s.eax = name;
+            let mut own = [0u32; 8];
+            own[0] = name;
+            own[1] = find;
+            own[2..2 + tail.len()].copy_from_slice(tail);
+            cx(STRCMP, s, &fr(a, &own[..2 + tail.len()]));
+            if s.eax == 0 {
+                return e;
             }
-            s = rd(s as usize + 4);
+            e = rd(e as usize + 4);
+            s.esi = e;
         }
         0
     }
 }
 
-/// One parser call per field: (parser, ECX name string, ESI destination), the node on the stack.
-unsafe fn run_ops(r: &mut R, node: u32, ops: &[(usize, u32, u32)]) {
-    for &(f, ecx, esi) in ops {
-        r.ecx = ecx;
-        r.esi = esi;
-        r.eax = unsafe { cl(f, r, &[node]) };
+/// One parser call per field: (parser, ECX name string, ESI destination); the node is pushed once more
+/// for every call (the original pops them all at the end). `mid(k, s)` runs after call `k`.
+unsafe fn seq(s: &mut Pushad, a: *const u32, node: u32, tail: &[u32], ops: &[(usize, u32, u32)], mid: &mut dyn FnMut(usize, &mut Pushad)) {
+    for (k, &(f, ecx, esi)) in ops.iter().enumerate() {
+        s.ecx = ecx;
+        s.esi = esi;
+        let mut own = [0u32; FW];
+        let mut n = 0;
+        for _ in 0..=k {
+            own[n] = node;
+            n += 1;
+        }
+        own[n..n + tail.len()].copy_from_slice(tail);
+        n += tail.len();
+        unsafe {
+            cx(f, s, &fr(a, &own[..n]));
+        }
+        mid(k, s);
     }
 }
 
 /// A `gameplay_constants_parse_*` reader: find the child named `find`, then the fixed field list.
-/// `edi` is true when the original keeps the found node in EDI (two saved registers).
+/// `two` is true when the original keeps the found node in EDI (two saved registers).
 macro_rules! gc {
-    ($h:ident, $rg:ident, $find:expr, $edi:expr, [$(($f:expr, $s:expr, $d:expr)),* $(,)?]) => {
-        unsafe fn $h(p: &mut Pushad, _a: *const u32) {
+    ($h:ident, $rg:ident, $find:expr, $two:expr, [$(($f:expr, $s:expr, $d:expr)),* $(,)?]) => {
+        unsafe fn $h(p: &mut Pushad, a: *const u32) {
             unsafe {
-                let mut r = R::of(p);
-                let node = find_child(&mut r, p.eax, $find);
-                if $edi {
-                    r.edi = node;
+                let mut s = *p;
+                let tail: &[u32] = if $two { &[p.edi, p.esi] } else { &[p.esi] };
+                let node = find_child(&mut s, a, $find, tail);
+                if $two {
+                    s.edi = node;
+                } else {
+                    s.esi = node;
                 }
-                run_ops(&mut r, node, &[$(($f, $s, $d)),*]);
-                p.eax = r.eax;
+                seq(&mut s, a, node, tail, &[$(($f, $s, $d)),*], &mut |_, _| {});
+                s.esi = p.esi;
+                s.edi = p.edi;
+                *p = s;
             }
         }
         fn $rg(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -1345,39 +1477,51 @@ gc!(h_gc_fall, rg_gc_fall, 0xDE5D1C, true, [
     (PARSE_F, 0xDE5D28, 0x2797BC4), (PARSE_F, 0xDE5D38, 0x2797BC8), (PARSE_F, 0xDE5D54, 0x2797BCC),
 ]);
 
-// 0x54d1f0: two float fields, each scaled by the double at 0xDD50E8 after its parse.
-unsafe fn h_gc_fat_bones(p: &mut Pushad, _a: *const u32) {
+/// 0x54d1f0: two float fields, each scaled by the double at 0xDD50E8 after its parse.
+unsafe fn h_gc_fat_bones(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let mut r = R::of(p);
-        let node = find_child(&mut r, p.eax, 0xDE4674);
-        r.edi = node;
+        let mut s = *p;
+        let tail = [p.edi, p.esi];
+        let node = find_child(&mut s, a, 0xDE4674, &tail);
+        s.edi = node;
         let c = dbl(0xDD50E8);
-        run_ops(&mut r, node, &[(PARSE_F, 0xDE4680, 0x2797458)]);
-        wf(0x2797458, (rf(0x2797458) as f64 * c) as f32);
-        run_ops(&mut r, node, &[(PARSE_F, 0xDE4690, 0x2797454)]);
-        wf(0x2797454, (rf(0x2797454) as f64 * c) as f32);
-        p.eax = r.eax;
+        seq(&mut s, a, node, &tail, &[(PARSE_F, 0xDE4680, 0x2797458), (PARSE_F, 0xDE4690, 0x2797454)], &mut |k, _| {
+            let d = if k == 0 { 0x2797458 } else { 0x2797454 };
+            wf(d, (rf(d) as f64 * c) as f32);
+        });
+        s.esi = p.esi;
+        s.edi = p.edi;
+        *p = s;
     }
 }
 fn rg_gc_fat_bones(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
     v.push((0x2797454, 8));
 }
 
-// 0x54dba0: three ints parsed into one stack local, each converted (int * 0xE5C4F0) into a float.
-unsafe fn h_gc_item_drops(p: &mut Pushad, _a: *const u32) {
+// 0x54dba0: three ints parsed into one stack local (the slot of the pushed ECX), each converted
+// (int * 0xE5C4F0) into a float; the final `pop ecx` takes the local back.
+unsafe fn h_gc_item_drops(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let mut r = R::of(p);
-        let node = find_child(&mut r, p.eax, 0xDE4CD0);
-        r.edi = node;
+        let mut s = *p;
+        let loc = slot(a, 1);
+        wd(loc, p.ecx);
+        let tail = [p.edi, p.esi, p.ecx];
+        let node = find_child(&mut s, a, 0xDE4CD0, &tail);
+        s.edi = node;
         let c = dbl(0xE5C4F0);
-        let mut loc: u32 = 0;
-        r.esi = &mut loc as *mut u32 as u32;
-        for (ecx, dest) in [(0xDE4CDCu32, 0x279770Cusize), (0xDE4CF0, 0x2797710), (0xDE4D08, 0x2797714)] {
-            r.ecx = ecx;
-            r.eax = cl(PARSE_I, &r, &[node]);
-            wf(dest, (std::ptr::read_volatile(&loc) as i32 as f64 * c) as f32);
-        }
-        p.eax = r.eax;
+        let dests = [0x279770Cusize, 0x2797710, 0x2797714];
+        seq(
+            &mut s,
+            a,
+            node,
+            &tail,
+            &[(PARSE_I, 0xDE4CDC, loc as u32), (PARSE_I, 0xDE4CF0, loc as u32), (PARSE_I, 0xDE4D08, loc as u32)],
+            &mut |k, _| wf(dests[k], (rd(loc) as i32 as f64 * c) as f32),
+        );
+        s.esi = p.esi;
+        s.edi = p.edi;
+        s.ecx = rd(loc);
+        *p = s;
     }
 }
 fn rg_gc_item_drops(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -1385,18 +1529,30 @@ fn rg_gc_item_drops(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // 0x54f9a0: a float parsed into a stack local and scaled (0xE5CA98) into 0x2797A7C, then two more.
-unsafe fn h_gc_kneecap(p: &mut Pushad, _a: *const u32) {
+unsafe fn h_gc_kneecap(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let mut r = R::of(p);
-        let node = find_child(&mut r, p.eax, 0xDE567C);
-        r.edi = node;
-        let mut loc: u32 = 0;
-        r.ecx = 0xDE5688;
-        r.esi = &mut loc as *mut u32 as u32;
-        r.eax = cl(PARSE_F, &r, &[node]);
-        wf(0x2797A7C, (f32::from_bits(std::ptr::read_volatile(&loc)) as f64 * dbl(0xE5CA98)) as f32);
-        run_ops(&mut r, node, &[(PARSE_X, 0xDE5698, 0x2797A80), (PARSE_X, 0xDE56A4, 0x2797A84)]);
-        p.eax = r.eax;
+        let mut s = *p;
+        let loc = slot(a, 1);
+        wd(loc, p.ecx);
+        let tail = [p.edi, p.esi, p.ecx];
+        let node = find_child(&mut s, a, 0xDE567C, &tail);
+        s.edi = node;
+        seq(
+            &mut s,
+            a,
+            node,
+            &tail,
+            &[(PARSE_F, 0xDE5688, loc as u32), (PARSE_X, 0xDE5698, 0x2797A80), (PARSE_X, 0xDE56A4, 0x2797A84)],
+            &mut |k, _| {
+                if k == 0 {
+                    wf(0x2797A7C, (f32::from_bits(rd(loc)) as f64 * dbl(0xE5CA98)) as f32);
+                }
+            },
+        );
+        s.esi = p.esi;
+        s.edi = p.edi;
+        s.ecx = rd(loc);
+        *p = s;
     }
 }
 fn rg_gc_kneecap(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -1404,17 +1560,30 @@ fn rg_gc_kneecap(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // 0x550240: three floats; then the second (0x2797BA0) is clamped down to the third (0x2797BA4).
-unsafe fn h_gc_watercraft(p: &mut Pushad, _a: *const u32) {
+unsafe fn h_gc_watercraft(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let mut r = R::of(p);
-        let node = find_child(&mut r, p.eax, 0xDE5C20);
-        r.edi = node;
-        run_ops(&mut r, node, &[(PARSE_F, 0xDE5C34, 0x2797B9C), (PARSE_F, 0xDE5C48, 0x2797BA0), (PARSE_F, 0xDE5C60, 0x2797BA4)]);
-        // fcom: the store happens only when 0x2797BA4 < 0x2797BA0 (not on equal, greater or NaN).
+        let mut s = *p;
+        let tail = [p.edi, p.esi];
+        let node = find_child(&mut s, a, 0xDE5C20, &tail);
+        s.edi = node;
+        seq(
+            &mut s,
+            a,
+            node,
+            &tail,
+            &[(PARSE_F, 0xDE5C34, 0x2797B9C), (PARSE_F, 0xDE5C48, 0x2797BA0), (PARSE_F, 0xDE5C60, 0x2797BA4)],
+            &mut |_, _| {},
+        );
+        // fcom: the store happens only when 0x2797BA4 < 0x2797BA0 (not on equal, greater or NaN);
+        // `fnstsw ax` leaves the status word in AX.
+        let sw = fcom_status(0x2797BA0, 0x2797BA4);
+        s.eax = (s.eax & 0xFFFF_0000) | sw;
         if rf(0x2797BA4) < rf(0x2797BA0) {
             wd(0x2797BA0, q32(rd(0x2797BA4)));
         }
-        p.eax = r.eax;
+        s.esi = p.esi;
+        s.edi = p.edi;
+        *p = s;
     }
 }
 fn rg_gc_watercraft(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -1422,31 +1591,40 @@ fn rg_gc_watercraft(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // 0x54d5f0: four floats, then a tail jump to 0x54d580 with EAX = the node.
-unsafe fn h_gc_sticky(p: &mut Pushad, _a: *const u32) {
+unsafe fn h_gc_sticky(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let mut r = R::of(p);
-        let node = find_child(&mut r, p.eax, 0xDE49FC);
-        r.edi = node;
-        run_ops(
-            &mut r,
+        let mut s = *p;
+        let tail = [p.edi, p.esi];
+        let node = find_child(&mut s, a, 0xDE49FC, &tail);
+        s.edi = node;
+        seq(
+            &mut s,
+            a,
             node,
+            &tail,
             &[(PARSE_F, 0xDDBEC0, 0x27974C4), (PARSE_F, 0xDDBEF8, 0x27974C8), (PARSE_F, 0xDDBF30, 0x27974CC), (PARSE_F, 0xDDBF68, 0x27974D0)],
+            &mut |_, _| {},
         );
-        // pop edi / pop esi, then the jump: the callee sees the caller's ESI / EDI
-        let t = R { eax: node, ecx: r.ecx, edx: p.edx, esi: p.esi, edi: p.edi };
-        p.eax = cl(0x0054_D580, &t, &[]);
+        // mov eax, edi; pop edi; pop esi; jmp: the callee sees the caller's ESI / EDI and arguments
+        s.eax = node;
+        s.esi = p.esi;
+        s.edi = p.edi;
+        cx(0x0054_D580, &mut s, &fr_tail(a));
+        *p = s;
     }
 }
 
 // camera_free_*: the node is in EDI (or EAX) already; the fields are fixed.
 macro_rules! cam {
     ($h:ident, $rg:ident, $node:ident, [$(($f:expr, $s:expr, $d:expr)),* $(,)?]) => {
-        unsafe fn $h(p: &mut Pushad, _a: *const u32) {
+        unsafe fn $h(p: &mut Pushad, a: *const u32) {
             unsafe {
-                let mut r = R::of(p);
+                let mut s = *p;
                 let node = p.$node;
-                run_ops(&mut r, node, &[$(($f, $s, $d)),*]);
-                p.eax = r.eax;
+                // `push esi` first; the one-field readers push EAX, the others EDI (the node)
+                seq(&mut s, a, node, &[p.esi], &[$(($f, $s, $d)),*], &mut |_, _| {});
+                s.esi = p.esi;
+                *p = s;
             }
         }
         fn $rg(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -1466,22 +1644,25 @@ cam!(h_cam_swing, rg_cam_swing, eax, [(PARSE_F, 0xDD9B58, 0xE999DC)]);
 cam!(h_cam_aggr, rg_cam_aggr, eax, [(PARSE_F, 0xDD9B6C, 0xE999E0)]);
 
 // 0x4961e0: eight floats, then two of them scaled (doubles at 0xE5C4E8 / 0xE5C2A8).
-unsafe fn h_cam_pitch(p: &mut Pushad, _a: *const u32) {
+unsafe fn h_cam_pitch(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let mut r = R::of(p);
-        let node = p.edi;
-        run_ops(
-            &mut r,
-            node,
+        let mut s = *p;
+        seq(
+            &mut s,
+            a,
+            p.edi,
+            &[p.esi],
             &[
                 (PARSE_F, 0xDD9B80, 0xE999E4), (PARSE_F, 0xDD9B94, 0xE999E8), (PARSE_F, 0xDD9BA4, 0xF539D8),
                 (PARSE_F, 0xDD9BC0, 0xE999A8), (PARSE_F, 0xDD9BDC, 0xE999AC), (PARSE_F, 0xDD9BFC, 0xE999B0),
                 (PARSE_F, 0xDD9C1C, 0xE9985C), (PARSE_F, 0xDD9C34, 0xE99860),
             ],
+            &mut |_, _| {},
         );
         wf(0xE9985C, (rf(0xE9985C) as f64 * dbl(0xE5C4E8)) as f32);
         wf(0xF539D8, (rf(0xF539D8) as f64 * dbl(0xE5C2A8)) as f32);
-        p.eax = r.eax;
+        s.esi = p.esi;
+        *p = s;
     }
 }
 fn rg_cam_pitch(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -1491,7 +1672,10 @@ fn rg_cam_pitch(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // --- gamesave sections -----------------------------------------------------------------------------------
-// Every `h_gs*` takes the buffer pointer as stack argument 0.
+// Every `h_gs*` takes the buffer pointer as stack argument 0. Each handler plays the original's register
+// effects on `s` (the pushad block plus XMM0-7): what the original loads into a register is set there, what
+// it saves and restores comes back from `p`, and every callee is called by address through `cx` with the
+// stack words the original has at that call (`fr`).
 
 fn rg_buf(a: *const u32, v: &mut Vec<(usize, usize)>, off: usize, len: usize) {
     let dst = unsafe { *a } as usize;
@@ -1499,15 +1683,19 @@ fn rg_buf(a: *const u32, v: &mut Vec<(usize, usize)>, off: usize, len: usize) {
 }
 
 // 0x6924f0: the district list from the replicated copy 0x27ABD00 (count) / 0x27ABD0C (entries).
-unsafe fn h_gs04c(_p: &mut Pushad, a: *const u32) {
+unsafe fn h_gs04c(p: &mut Pushad, a: *const u32) {
     unsafe {
         let dst = arg(a, 0) as usize;
-        wd(dst + 0x17304, rd(0x27ABD00));
+        let count = rd(0x27ABD00);
+        wd(dst + 0x17304, count);
+        p.ecx = count;
+        p.eax = dst as u32;
         if (rd(0x27ABD00) as i32) > 0 {
             let mut edi = (rd(0x2526C94) as usize).wrapping_add(0x59);
             let mut eax = dst + 0x17310;
             let mut esi = 0x27ABD0Cusize;
             let mut ebp = 0i32;
+            let (mut ecx, mut edx);
             loop {
                 wd(eax - 8, rd(esi - 8));
                 wd(eax - 4, rd(esi - 4));
@@ -1524,6 +1712,8 @@ unsafe fn h_gs04c(_p: &mut Pushad, a: *const u32) {
                 dl2 &= 2;
                 dl2 ^= cl2;
                 wb(eax, dl2);
+                ecx = cl2 as u32;
+                edx = dl2 as u32;
                 ebp += 1;
                 esi += 12;
                 eax += 12;
@@ -1532,6 +1722,9 @@ unsafe fn h_gs04c(_p: &mut Pushad, a: *const u32) {
                     break;
                 }
             }
+            p.eax = eax as u32;
+            p.ecx = ecx;
+            p.edx = edx;
         }
     }
 }
@@ -1543,57 +1736,71 @@ fn rg_gs04c(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usize)>) {
 // 0x692b00 / 0x692b40 (identical bodies): the activity-levels pointer (or the default block).
 unsafe fn h_gs09_save(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let dst = arg(a, 0) as usize;
         let ptr = rd(0x2527C88);
-        let eax = if ptr == 0 { rd(0x33D630C) } else { rd(ptr as usize) };
-        wd(dst + 0x74, eax);
-        let r = R { eax, ecx: p.ecx, edx: p.edx, esi: dst as u32, edi: p.edi };
-        let res = cl(0x696B50, &r, &[]);
-        wd(dst + 0x78, res);
-        p.eax = res;
+        s.eax = if ptr == 0 { rd(0x33D630C) } else { rd(ptr as usize) };
+        s.esi = dst as u32;
+        wd(dst + 0x74, s.eax);
+        cx(0x696B50, &mut s, &fr(a, &[p.esi]));
+        wd(dst + 0x78, s.eax);
+        s.esi = p.esi;
+        *p = s;
     }
 }
 
-// 0x692b80: a two-dword local {0xE008D0, buffer} is passed in EDI.
+// 0x692b80: a two-dword local {0xE008D0, buffer} (the original's frame) is passed in EDI.
 unsafe fn h_gs10_save(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let loc: [u32; 2] = [0x00E0_08D0, arg(a, 0)];
-        let r = R { eax: arg(a, 0), ecx: p.ecx, edx: p.edx, esi: p.esi, edi: loc.as_ptr() as u32 };
-        p.eax = cl(0x00A6_EA00, &r, &[]);
-        std::hint::black_box(&loc);
+        let mut s = *p;
+        let buf = arg(a, 0);
+        wd(slot(a, 2), 0x00E0_08D0);
+        wd(slot(a, 1), buf);
+        s.eax = buf;
+        s.edi = slot(a, 2) as u32;
+        cx(0x00A6_EA00, &mut s, &fr(a, &[p.edi, 0x00E0_08D0, buf]));
+        s.edi = p.edi;
+        *p = s;
     }
 }
 
 // 0x692c60: the cribs (co-op client copy) and the clamped cash.
 unsafe fn h_gs11c_save(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let dst = arg(a, 0) as usize;
         (dst + 0x382A4).wr16(rb(0x27AC238) as u16);
         let cnt16 = (0x27ABFDCusize).rd16();
         (dst + 0x382A6).wr16(cnt16);
-        let mut ebx = 0u32;
-        let mut r = R::of(p);
+        s.ecx = (p.ecx & 0xFFFF_0000) | cnt16 as u32;
+        s.ebx = 0;
+        s.ebp = dst as u32;
         if rd(0x27ABFDC) != 0 {
             let mut esi = 0x27ABFE0u32;
             let mut edi = (dst + 0x382A8) as u32;
             loop {
-                r.ecx = esi;
-                r.eax = edi;
-                r.esi = esi;
-                r.edi = edi;
-                r.eax = cl(0x692D00, &r, &[]);
-                ebx += 1;
+                s.ecx = esi;
+                s.eax = edi;
+                s.esi = esi;
+                s.edi = edi;
+                cx(0x692D00, &mut s, &fr(a, &[p.edi, p.esi, p.ebp, p.ebx]));
+                s.ebx = s.ebx.wrapping_add(1);
                 esi += 0x28;
                 edi += 0x28;
-                if ebx >= rd(0x27ABFDC) {
+                if s.ebx >= rd(0x27ABFDC) {
                     break;
                 }
             }
+            s.esi = p.esi;
+            s.edi = p.edi;
         }
         let cash = rd(0x27973CC) as i32;
         let v = cash.clamp(0x88CA_6C00u32 as i32, 0x7735_9400);
         wd(dst + 0x38500, v as u32);
-        p.eax = cash as u32;
+        s.eax = cash as u32;
+        s.ebx = p.ebx;
+        s.ebp = p.ebp;
+        *p = s;
     }
 }
 
@@ -1613,24 +1820,30 @@ impl Mem16 for usize {
 // 0x692e80
 unsafe fn h_gs00_save(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let dst = arg(a, 0);
         let ptr = dst + 0x3767C;
-        let r = R { eax: ptr, ecx: p.ecx, edx: p.edx, esi: dst, edi: p.edi };
-        let res = cl(0x542940, &r, &[ptr]);
-        wd(dst as usize + 0x37678, res);
-        p.eax = res;
+        s.esi = dst;
+        s.eax = ptr;
+        cx(0x542940, &mut s, &fr(a, &[ptr, p.esi]));
+        wd(dst as usize + 0x37678, s.eax);
+        s.esi = p.esi;
+        *p = s;
     }
 }
 
 // 0x692ea0: EDI = buffer + 0x38C38
 unsafe fn h_gs14_save(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let r = R { eax: p.eax, ecx: p.ecx, edx: p.edx, esi: p.esi, edi: arg(a, 0).wrapping_add(0x38C38) };
-        p.eax = cl(0x6AB5C0, &r, &[]);
+        let mut s = *p;
+        s.edi = arg(a, 0).wrapping_add(0x38C38);
+        cx(0x6AB5C0, &mut s, &fr(a, &[p.edi]));
+        s.edi = p.edi;
+        *p = s;
     }
 }
 
-// 0x692ec0 / 0x694b10: the cutscene-seen list through a 3-dword local {ptr, 0x20, 0}.
+// 0x692ec0 / 0x694b10: the cutscene-seen list through a 3-dword local {ptr, 0x20, 0}, ESI = its address.
 unsafe fn cutscene_seen(p: &mut Pushad, a: *const u32, f: usize, gate: bool) {
     unsafe {
         if gate && rb(a.add(1) as usize) == 0 {
@@ -1639,11 +1852,16 @@ unsafe fn cutscene_seen(p: &mut Pushad, a: *const u32, f: usize, gate: bool) {
         if (rd(0x145A4AC) as i32) >= 0x100 {
             return;
         }
+        let mut s = *p;
         let eax = arg(a, 0).wrapping_add(0x39B68);
-        let loc: [u32; 3] = [eax, 0x20, 0];
-        let r = R { eax, ecx: p.ecx, edx: p.edx, esi: loc.as_ptr() as u32, edi: p.edi };
-        p.eax = cl(f, &r, &[]);
-        std::hint::black_box(&loc);
+        wd(slot(a, 3), eax);
+        wd(slot(a, 2), 0x20);
+        wb(slot(a, 1), 0);
+        s.eax = eax;
+        s.esi = slot(a, 3) as u32;
+        cx(f, &mut s, &fr(a, &[p.esi, eax, 0x20, rd(slot(a, 1))]));
+        s.esi = p.esi;
+        *p = s;
     }
 }
 unsafe fn h_gs15_save(p: &mut Pushad, a: *const u32) {
@@ -1654,15 +1872,19 @@ unsafe fn h_gs15_load(p: &mut Pushad, a: *const u32) {
 }
 
 // 0x692f00 / 0x694ae0: the persistent objects through a 3-dword local {ptr, 0xED, 0}, whose address
-// is the stack argument.
+// is the stack argument (and ECX).
 unsafe fn persistent(p: &mut Pushad, a: *const u32, f: usize) {
     unsafe {
+        let mut s = *p;
         let eax = arg(a, 0).wrapping_add(0x39B88);
-        let loc: [u32; 3] = [eax, 0xED, 0];
-        let ptr = loc.as_ptr() as u32;
-        let r = R { eax, ecx: ptr, edx: p.edx, esi: p.esi, edi: p.edi };
-        p.eax = cl(f, &r, &[ptr]);
-        std::hint::black_box(&loc);
+        let ptr = slot(a, 3) as u32;
+        wd(slot(a, 3), eax);
+        wd(slot(a, 2), 0xED);
+        wb(slot(a, 1), 0);
+        s.eax = eax;
+        s.ecx = ptr;
+        cx(f, &mut s, &fr(a, &[ptr, eax, 0xED, rd(slot(a, 1))]));
+        *p = s;
     }
 }
 unsafe fn h_gs16_save(p: &mut Pushad, a: *const u32) {
@@ -1683,7 +1905,7 @@ unsafe fn h_gs17_save(p: &mut Pushad, a: *const u32) {
         wd(dst + 0x3A0D0, q32(rd(0x140B230)));
         wd(dst + 0x3A0D4, q32(rd(0x140B240)));
         p.eax = dst as u32;
-        let _ = ecx;
+        p.ecx = ecx;
     }
 }
 fn rg_gs17_save(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -1696,8 +1918,11 @@ unsafe fn h_gs18_save(p: &mut Pushad, a: *const u32) {
     unsafe {
         let esi = arg(a, 0).wrapping_add(0x39DB8);
         if esi != 0 {
-            let r = R { eax: p.eax, ecx: p.ecx, edx: p.edx, esi, edi: p.edi };
-            p.eax = cl(0x563040, &r, &[]);
+            let mut s = *p;
+            s.esi = esi;
+            cx(0x563040, &mut s, &fr(a, &[p.esi]));
+            s.esi = p.esi;
+            *p = s;
         }
     }
 }
@@ -1705,11 +1930,14 @@ unsafe fn h_gs18_save(p: &mut Pushad, a: *const u32) {
 // 0x693450
 unsafe fn h_gs20_save(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let dst = arg(a, 0);
-        let r = R { eax: p.eax, ecx: p.ecx, edx: dst.wrapping_add(0x39DC8), esi: dst, edi: p.edi };
-        let res = cl(0x688220, &r, &[]);
-        wd(dst as usize + 0x39DC4, res);
-        p.eax = res;
+        s.esi = dst;
+        s.edx = dst.wrapping_add(0x39DC8);
+        cx(0x688220, &mut s, &fr(a, &[p.esi]));
+        wd(dst as usize + 0x39DC4, s.eax);
+        s.esi = p.esi;
+        *p = s;
     }
 }
 
@@ -1717,17 +1945,21 @@ unsafe fn h_gs20_save(p: &mut Pushad, a: *const u32) {
 unsafe fn h_gs12_save(p: &mut Pushad, a: *const u32) {
     unsafe {
         let dst = arg(a, 0) as usize;
-        let mut ecx = dst + 0x385F8;
+        let mut ecx = dst.wrapping_add(0x385F8);
         let mut eax = 0usize;
+        let mut edx;
         loop {
-            wd(ecx, rd(eax.wrapping_add(0x27DAEA4)));
+            edx = rd(eax.wrapping_add(0x27DAEA4));
+            wd(ecx, edx);
             eax += 0x20;
-            ecx += 4;
+            ecx = ecx.wrapping_add(4);
             if eax >= 0x10C0 {
                 break;
             }
         }
         p.eax = eax as u32;
+        p.ecx = ecx as u32;
+        p.edx = edx;
     }
 }
 fn rg_gs12_save(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -1737,104 +1969,136 @@ fn rg_gs12_save(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usize)>) {
 // 0x693570
 unsafe fn h_gs01_save(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let dst = arg(a, 0);
-        let r = R { eax: p.eax, ecx: p.ecx, edx: dst.wrapping_add(0x38508), esi: dst, edi: p.edi };
-        let res = cl(0xA7C910, &r, &[]);
-        wd(dst as usize + 0x38504, res);
-        p.eax = res;
+        s.esi = dst;
+        s.edx = dst.wrapping_add(0x38508);
+        cx(0xA7C910, &mut s, &fr(a, &[p.esi]));
+        wd(dst as usize + 0x38504, s.eax);
+        s.esi = p.esi;
+        *p = s;
     }
 }
 
-/// A tail `jmp callee` after setting one register: the callee gets the original stack arguments.
-unsafe fn tail(p: &mut Pushad, a: *const u32, f: usize, r: R) {
-    unsafe { p.eax = cl(f, &r, &tail_args(a)) }
+/// A tail `jmp callee` after the register set-up in `s`: the callee gets the original stack arguments.
+unsafe fn tail(p: &mut Pushad, a: *const u32, f: usize, mut s: Pushad) {
+    unsafe {
+        cx(f, &mut s, &fr_tail(a));
+        *p = s;
+    }
 }
 
 unsafe fn h_gs05_save(p: &mut Pushad, a: *const u32) {
-    unsafe { tail(p, a, 0x7DECD0, R { ecx: arg(a, 0).wrapping_add(0x3A148), ..R::of(p) }) }
+    unsafe {
+        let mut s = *p;
+        s.ecx = arg(a, 0).wrapping_add(0x3A148);
+        tail(p, a, 0x7DECD0, s)
+    }
 }
 unsafe fn h_gs23_save(p: &mut Pushad, a: *const u32) {
-    unsafe { tail(p, a, 0x48B7D0, R { eax: arg(a, 0).wrapping_add(0x3A16C), ..R::of(p) }) }
+    unsafe {
+        let mut s = *p;
+        s.eax = arg(a, 0).wrapping_add(0x3A16C);
+        tail(p, a, 0x48B7D0, s)
+    }
 }
 unsafe fn h_gs24_save(p: &mut Pushad, a: *const u32) {
-    unsafe { tail(p, a, 0x491140, R { eax: arg(a, 0).wrapping_add(0x3A1CC), ..R::of(p) }) }
+    unsafe {
+        let mut s = *p;
+        s.eax = arg(a, 0).wrapping_add(0x3A1CC);
+        tail(p, a, 0x491140, s)
+    }
 }
 
 // 0x693740: ESI = buffer + 0x3A9CC
 unsafe fn h_gs25_save(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let r = R { esi: arg(a, 0).wrapping_add(0x3A9CC), ..R::of(p) };
-        p.eax = cl(0x491200, &r, &[]);
+        let mut s = *p;
+        s.esi = arg(a, 0).wrapping_add(0x3A9CC);
+        cx(0x491200, &mut s, &fr(a, &[p.esi]));
+        s.esi = p.esi;
+        *p = s;
     }
 }
 
 // 0x693760: ECX = the address of a local holding 0x5A; the pointer is the stack argument.
 unsafe fn h_gs26_save(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let ptr = arg(a, 0).wrapping_add(0x3AA0C);
-        let loc: u32 = 0x5A;
-        let r = R { eax: ptr, ecx: &loc as *const u32 as u32, edx: p.edx, esi: p.esi, edi: p.edi };
-        p.eax = cl(0x7AEBD0, &r, &[ptr]);
-        std::hint::black_box(&loc);
+        wd(slot(a, 1), 0x5A);
+        s.eax = ptr;
+        s.ecx = slot(a, 1) as u32;
+        cx(0x7AEBD0, &mut s, &fr(a, &[ptr, 0x5A]));
+        *p = s;
     }
 }
 
 // 0x6937a0: EDI = buffer + 0x3AA68
 unsafe fn h_gs27_save(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let r = R { edi: arg(a, 0).wrapping_add(0x3AA68), ..R::of(p) };
-        p.eax = cl(0x7B07F0, &r, &[]);
+        let mut s = *p;
+        s.edi = arg(a, 0).wrapping_add(0x3AA68);
+        cx(0x7B07F0, &mut s, &fr(a, &[p.edi]));
+        s.edi = p.edi;
+        *p = s;
     }
 }
 
 // 0x694470: the garage load: free records (first dword zero) get 0x5556F0.
 unsafe fn h_gs07_load(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let mut r = R::of(p);
-        r.eax = cl(0x5558F0, &r, &[]);
+        let mut s = *p;
+        cx(0x5558F0, &mut s, &fr(a, &[p.esi, p.ebx]));
         let ebx = arg(a, 0) as usize;
-        let eax = rd(ebx + 0x37270);
-        wd(0x1409998, eax);
-        r.eax = eax;
-        let mut esi = 0i32;
+        s.ebx = ebx as u32;
+        s.eax = rd(ebx + 0x37270);
+        s.esi = 0;
+        wd(0x1409998, s.eax);
         if (rd(ebx + 0x175D8) as i32) > 0 {
             let mut edi = ebx + 0x175DC;
             loop {
-                r.esi = esi as u32;
-                r.edi = edi as u32;
+                s.edi = edi as u32;
                 if rd(edi) == 0 {
-                    r.eax = cl(0x5556F0, &r, &[edi as u32]);
+                    cx(0x5556F0, &mut s, &fr(a, &[edi as u32, p.edi, p.esi, p.ebx]));
                 }
-                esi += 1;
+                s.esi = s.esi.wrapping_add(1);
                 edi += 0x434;
-                if esi >= rd(ebx + 0x175D8) as i32 {
+                if (s.esi as i32) >= rd(ebx + 0x175D8) as i32 {
                     break;
                 }
             }
+            s.edi = p.edi;
         }
-        p.eax = r.eax;
+        s.esi = p.esi;
+        s.ebx = p.ebx;
+        *p = s;
     }
 }
 
 // 0x6944c0: the wiretap flag byte, then a tail jump (EAX = the buffer).
 unsafe fn h_gs22_load(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let dst = arg(a, 0);
         let cl_ = rb(dst as usize + 0x379C8);
         wb(0xFA239B, cl_);
-        tail(p, a, 0x54CCA0, R { eax: dst, ecx: (p.ecx & !0xFF) | cl_ as u32, ..R::of(p) });
+        s.eax = dst;
+        s.ecx = (p.ecx & !0xFF) | cl_ as u32;
+        tail(p, a, 0x54CCA0, s);
     }
 }
 
 // 0x6947c0 / 0x6947e0: the activity-levels object from the buffer; kept unless it has +0x3C set.
 unsafe fn h_gs09_load(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let r = R { ecx: arg(a, 0).wrapping_add(0x74), ..R::of(p) };
-        let eax = cl(0x69E1C0, &r, &[]);
-        if eax == 0 || rd(eax as usize + 0x3C) == 0 {
-            wd(0x2527C88, eax);
+        let mut s = *p;
+        s.ecx = arg(a, 0).wrapping_add(0x74);
+        cx(0x69E1C0, &mut s, &fr(a, &[]));
+        if s.eax == 0 || rd(s.eax as usize + 0x3C) == 0 {
+            wd(0x2527C88, s.eax);
         }
-        p.eax = eax;
+        *p = s;
     }
 }
 
@@ -1845,108 +2109,116 @@ unsafe fn h_gs10_load(p: &mut Pushad, a: *const u32) {
         if (rd(dst + 0x37AD0) as i32) <= 0 {
             return;
         }
-        let mut r = R::of(p);
-        r.edi = dst as u32;
-        let mut eax = rd(0x2F8E88C);
-        let mut ebx = dst + 0x37AD8;
-        let mut ebp = 0i32;
+        let mut s = *p;
+        let saved = [p.esi, p.ebx, p.edi, p.ebp];
+        s.edi = dst as u32;
+        s.ebp = 0;
+        s.eax = rd(0x2F8E88C);
+        s.ebx = (dst + 0x37AD8) as u32;
         loop {
             // 0x694821
-            let mut esi = eax;
+            s.esi = s.eax;
             'body: {
-                if eax == 0 {
+                if s.eax == 0 {
                     break 'body;
                 }
-                let ecx = rd(ebx - 4);
-                r.ecx = ecx;
+                s.ecx = rd(s.ebx as usize - 4);
                 loop {
-                    if rd(esi as usize + 0xC0) == ecx {
+                    if rd(s.esi as usize + 0xC0) == s.ecx {
                         break;
                     }
-                    esi = rd(esi as usize + 0x188);
-                    if esi == eax || esi == 0 {
+                    s.esi = rd(s.esi as usize + 0x188);
+                    if s.esi == s.eax || s.esi == 0 {
                         break 'body;
                     }
                 }
-                if esi == 0 {
-                    break 'body;
-                }
                 // 0x694848
-                if rb(ebx) & 2 != 0 {
-                    let mut al = rb(esi as usize + 0x110);
+                if rb(s.ebx as usize) & 2 != 0 {
+                    let al = rb(s.esi as usize + 0x110);
+                    s.eax = (s.eax & !0xFF) | al as u32;
                     if al & 0x10 == 0 {
-                        let edi = rd(esi as usize + 0x17C);
-                        al |= 0x10;
-                        wb(esi as usize + 0x110, al);
-                        eax = rd(esi as usize + 0x180);
-                        r.eax = eax;
-                        r.esi = esi;
-                        r.edi = edi;
-                        eax = cl(0x7A4DC0, &r, &[]);
-                        r.edi = dst as u32;
-                    } else {
-                        eax = (eax & !0xFF) | al as u32;
+                        s.edi = rd(s.esi as usize + 0x17C);
+                        wb(s.esi as usize + 0x110, al | 0x10);
+                        s.eax = rd(s.esi as usize + 0x180);
+                        cx(0x7A4DC0, &mut s, &fr(a, &saved_frame(&saved)));
+                        s.edi = dst as u32;
                     }
                 }
-                r.esi = esi;
-                if rb(ebx) & 1 != 0 {
-                    r.eax = esi;
-                    cl(0xA6BD60, &r, &[]);
+                if rb(s.ebx as usize) & 1 != 0 {
+                    s.eax = s.esi;
+                    cx(0xA6BD60, &mut s, &fr(a, &saved_frame(&saved)));
                 } else {
-                    r.eax = eax;
-                    cl(0xA6BCE0, &r, &[]);
+                    cx(0xA6BCE0, &mut s, &fr(a, &saved_frame(&saved)));
                 }
-                eax = rd(0x2F8E88C);
+                s.eax = rd(0x2F8E88C);
             }
             // 0x694890
-            ebp += 1;
-            ebx += 8;
-            if ebp >= rd(dst + 0x37AD0) as i32 {
+            s.ebp = s.ebp.wrapping_add(1);
+            s.ebx = s.ebx.wrapping_add(8);
+            if (s.ebp as i32) >= rd(dst + 0x37AD0) as i32 {
                 break;
             }
         }
-        p.eax = eax;
+        s.esi = saved[0];
+        s.ebx = saved[1];
+        s.edi = saved[2];
+        s.ebp = saved[3];
+        *p = s;
     }
+}
+
+/// `push ebp; push edi; push ebx; push esi` as the original's frame at a call, top first.
+fn saved_frame(s: &[u32; 4]) -> [u32; 4] {
+    [s[0], s[1], s[2], s[3]]
 }
 
 // 0x6948b0: the co-op client cribs.
 unsafe fn h_gs11c_load(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let dst = arg(a, 0) as usize;
         wb(0x27AC238, ((dst + 0x382A4).rd16() != 0) as u8);
         let cnt = (dst + 0x382A6).rd16() as u32;
+        s.eax = cnt;
+        s.ebx = 0;
+        s.ebp = dst as u32;
         wd(0x27ABFDC, cnt);
-        let mut r = R { eax: cnt, ..R::of(p) };
         if cnt != 0 {
-            let mut ebx = 0u32;
             let mut esi = (dst + 0x382A8) as u32;
             let mut edi = 0x27ABFE0u32;
             loop {
-                r.ecx = esi;
-                r.eax = edi;
-                r.esi = esi;
-                r.edi = edi;
-                r.eax = cl(0x692D00, &r, &[]);
-                ebx += 1;
+                s.ecx = esi;
+                s.eax = edi;
+                s.esi = esi;
+                s.edi = edi;
+                cx(0x692D00, &mut s, &fr(a, &[p.edi, p.esi, p.ebp, p.ebx]));
+                s.ebx = s.ebx.wrapping_add(1);
                 esi += 0x28;
                 edi += 0x28;
-                if ebx >= rd(0x27ABFDC) {
+                if s.ebx >= rd(0x27ABFDC) {
                     break;
                 }
             }
+            s.esi = p.esi;
+            s.edi = p.edi;
         }
         let ecx = rd(dst + 0x38500);
-        let r2 = R { eax: r.eax, ecx, edx: p.edx, esi: p.esi, edi: p.edi };
-        p.eax = cl(0x548F00, &r2, &[ecx]);
+        s.ecx = ecx;
+        cx(0x548F00, &mut s, &fr(a, &[ecx, p.ebp, p.ebx]));
+        s.ebx = p.ebx;
+        s.ebp = p.ebp;
+        *p = s;
     }
 }
 
 // 0x694ab0
 unsafe fn h_gs00_load(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let dst = arg(a, 0);
-        let eax = rd(dst as usize + 0x37678);
-        tail(p, a, 0x542A10, R { eax, ecx: dst.wrapping_add(0x3767C), ..R::of(p) });
+        s.eax = rd(dst as usize + 0x37678);
+        s.ecx = dst.wrapping_add(0x3767C);
+        tail(p, a, 0x542A10, s);
     }
 }
 
@@ -1956,37 +2228,41 @@ unsafe fn h_gs17_load(p: &mut Pushad, a: *const u32) {
         if rb(a.add(1) as usize) == 0 {
             return;
         }
+        let mut s = *p;
         let dst = arg(a, 0) as usize;
         let ecx = rd(dst + 0x39CB8);
         wd(0x140B204, ecx);
-        let mut r = R::of(p);
-        r.ecx = ecx;
-        r.eax = dst as u32;
-        let mut esi = 0u32;
+        s.eax = dst as u32;
+        s.ecx = ecx;
+        s.esi = 0;
         let mut edi = dst + 0x3A0C8;
         loop {
-            if (esi as i32) > -1 {
-                r.eax = esi;
-                r.esi = esi;
-                r.edi = edi as u32;
-                r.eax = cl(0x605CA0, &r, &[q32(rd(edi)), 1]);
+            s.edi = edi as u32;
+            if (s.esi as i32) > -1 {
+                s.eax = s.esi;
+                cx(0x605CA0, &mut s, &fr(a, &[q32(rd(edi)), 1, p.edi, p.esi]));
             }
-            esi += 1;
+            s.esi = s.esi.wrapping_add(1);
             edi += 4;
-            if esi >= 4 {
+            if s.esi >= 4 {
                 break;
             }
         }
-        p.eax = r.eax;
+        s.esi = p.esi;
+        s.edi = p.edi;
+        *p = s;
     }
 }
 
 // 0x694bd0: ECX = buffer + 0x39DB8, a tail jump unless that wraps to zero.
 unsafe fn h_gs18_load(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let ecx = arg(a, 0).wrapping_add(0x39DB8);
-        if ecx != 0 {
-            tail(p, a, 0x5630D0, R { ecx, ..R::of(p) });
+        let mut s = *p;
+        s.ecx = arg(a, 0).wrapping_add(0x39DB8);
+        if s.ecx != 0 {
+            tail(p, a, 0x5630D0, s);
+        } else {
+            *p = s;
         }
     }
 }
@@ -1994,10 +2270,14 @@ unsafe fn h_gs18_load(p: &mut Pushad, a: *const u32) {
 // 0x694e20
 unsafe fn h_gs20_load(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let dst = arg(a, 0);
         let ecx = rd(dst as usize + 0x39DC4);
-        let r = R { eax: dst.wrapping_add(0x39DC8), ecx, ..R::of(p) };
-        p.eax = cl(0x688260, &r, &[ecx]);
+        s.eax = dst.wrapping_add(0x39DC8);
+        s.ecx = ecx;
+        cx(0x688260, &mut s, &fr(a, &[ecx]));
+        s.ecx = ecx; // pop ecx: the pushed word
+        *p = s;
     }
 }
 
@@ -2005,17 +2285,21 @@ unsafe fn h_gs20_load(p: &mut Pushad, a: *const u32) {
 unsafe fn h_gs12_load(p: &mut Pushad, a: *const u32) {
     unsafe {
         let dst = arg(a, 0) as usize;
-        let mut ecx = dst + 0x385F8;
+        let mut ecx = dst.wrapping_add(0x385F8);
         let mut eax = 0usize;
+        let mut edx;
         loop {
-            wd(eax.wrapping_add(0x27DAEA4), rd(ecx));
+            edx = rd(ecx);
+            wd(eax.wrapping_add(0x27DAEA4), edx);
             eax += 0x20;
-            ecx += 4;
+            ecx = ecx.wrapping_add(4);
             if eax >= 0x10C0 {
                 break;
             }
         }
         p.eax = eax as u32;
+        p.ecx = ecx as u32;
+        p.edx = edx;
     }
 }
 fn rg_gs12_load(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -2024,13 +2308,19 @@ fn rg_gs12_load(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
     }
 }
 
-// 0x694e70: eight debug-display option words.
+// 0x694e70: eight debug-display option words (ECX / EDX alternate).
 unsafe fn h_gs13_load(p: &mut Pushad, a: *const u32) {
     unsafe {
         let dst = arg(a, 0) as usize;
         const D: [usize; 8] = [0x27ABA94, 0x27ABAAC, 0x27ABAC4, 0x27ABADC, 0x27ABAF4, 0x27ABB0C, 0x27ABB24, 0x27ABB3C];
         for (i, d) in D.iter().enumerate() {
-            wd(*d, rd(dst + 0x38810 + 4 * i));
+            let v = rd(dst + 0x38810 + 4 * i);
+            wd(*d, v);
+            if i % 2 == 0 {
+                p.ecx = v;
+            } else {
+                p.edx = v;
+            }
         }
         p.eax = dst as u32;
     }
@@ -2048,17 +2338,24 @@ unsafe fn h_gs01c_load(p: &mut Pushad, a: *const u32) {
         let count = rd(dst + 0x38504);
         wd(0x27AC23C, count);
         let mut eax = 0usize;
-        let mut ecx = dst + 0x38508;
+        p.edx = dst as u32;
+        p.ecx = count;
         if (count as i32) > 0 {
+            let mut ecx = dst + 0x38508;
+            let mut edx;
             loop {
-                wd(eax * 8 + 0x27AC240, rd(ecx));
-                wd(eax * 8 + 0x27AC244, rd(ecx + 4));
+                edx = rd(ecx);
+                wd(eax * 8 + 0x27AC240, edx);
+                edx = rd(ecx + 4);
+                wd(eax * 8 + 0x27AC244, edx);
                 eax += 1;
                 ecx += 8;
                 if eax as i32 >= rd(0x27AC23C) as i32 {
                     break;
                 }
             }
+            p.ecx = ecx as u32;
+            p.edx = edx;
         }
         p.eax = eax as u32;
     }
@@ -2073,36 +2370,63 @@ fn rg_gs01c_load(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usize)>) {
 // 0x694f30: a tail jump with EDX = the count, ECX = the pairs, EAX = the buffer.
 unsafe fn h_gs01_load(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let dst = arg(a, 0);
-        let edx = rd(dst as usize + 0x38504);
-        tail(p, a, 0xA7C9D0, R { eax: dst, ecx: dst.wrapping_add(0x38508), edx, ..R::of(p) });
+        s.eax = dst;
+        s.edx = rd(dst as usize + 0x38504);
+        s.ecx = dst.wrapping_add(0x38508);
+        tail(p, a, 0xA7C9D0, s);
     }
 }
 
 unsafe fn h_gs05_load(p: &mut Pushad, a: *const u32) {
-    unsafe { tail(p, a, 0x7DED80, R { eax: arg(a, 0).wrapping_add(0x3A148), ..R::of(p) }) }
+    unsafe {
+        let mut s = *p;
+        s.eax = arg(a, 0).wrapping_add(0x3A148);
+        tail(p, a, 0x7DED80, s)
+    }
 }
 unsafe fn h_gs23_load(p: &mut Pushad, a: *const u32) {
-    unsafe { tail(p, a, 0x48B870, R { eax: arg(a, 0).wrapping_add(0x3A16C), ..R::of(p) }) }
+    unsafe {
+        let mut s = *p;
+        s.eax = arg(a, 0).wrapping_add(0x3A16C);
+        tail(p, a, 0x48B870, s)
+    }
 }
 unsafe fn h_gs24_load(p: &mut Pushad, a: *const u32) {
-    unsafe { tail(p, a, 0x491180, R { eax: arg(a, 0).wrapping_add(0x3A1CC), ..R::of(p) }) }
+    unsafe {
+        let mut s = *p;
+        s.eax = arg(a, 0).wrapping_add(0x3A1CC);
+        tail(p, a, 0x491180, s)
+    }
 }
 unsafe fn h_gs25_load(p: &mut Pushad, a: *const u32) {
-    unsafe { tail(p, a, 0x491260, R { eax: arg(a, 0).wrapping_add(0x3A9CC), ..R::of(p) }) }
+    unsafe {
+        let mut s = *p;
+        s.eax = arg(a, 0).wrapping_add(0x3A9CC);
+        tail(p, a, 0x491260, s)
+    }
 }
 
-// 0x6950f0 / 0x695130: EAX = the pointer, which is also the stack argument.
+// 0x6950f0 / 0x695130: EAX = the pointer, which is also the stack argument (popped into ECX after).
 unsafe fn h_gs26_load(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let ptr = arg(a, 0).wrapping_add(0x3AA0C);
-        p.eax = cl(0x7AED60, &R { eax: ptr, ..R::of(p) }, &[ptr]);
+        s.eax = ptr;
+        cx(0x7AED60, &mut s, &fr(a, &[ptr]));
+        s.ecx = ptr;
+        *p = s;
     }
 }
 unsafe fn h_gs27_load(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let ptr = arg(a, 0).wrapping_add(0x3AA68);
-        p.eax = cl(0x7B08C0, &R { eax: ptr, ..R::of(p) }, &[ptr]);
+        s.eax = ptr;
+        cx(0x7B08C0, &mut s, &fr(a, &[ptr]));
+        s.ecx = ptr;
+        *p = s;
     }
 }
 
@@ -2130,10 +2454,13 @@ fn ag(a: *const u32, i: usize) -> u32 {
 // 0x80b5b0: the connection's QoS word.
 unsafe fn h_recv_qos(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let edx = arg(a, 0);
         let ecx = rd(arg(a, 1) as usize + 4);
-        let eax = rd(arg(a, 0) as usize);
+        let eax = rd(edx as usize);
         wd(ecx as usize + 0x1DC0, eax);
         p.eax = eax;
+        p.ecx = ecx;
+        p.edx = edx;
     }
 }
 fn rg_recv_qos(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -2143,32 +2470,41 @@ fn rg_recv_qos(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usize)>) {
 // 0x80b5e0: the bandwidth word, then net_send_upd_conn (0x816B50, EDI = the connection) when it asks.
 unsafe fn h_recv_bw_info(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let ecx = arg(a, 1);
-        let mut eax = rd(ecx as usize + 4);
-        if eax == 0 {
-            p.eax = 0;
+        s.ecx = ecx;
+        s.eax = rd(ecx as usize + 4);
+        if s.eax == 0 {
+            *p = s;
             return;
         }
-        let edx = rd(arg(a, 0) as usize);
-        wd(eax as usize + 0x1DBC, edx);
-        eax = rd(ecx as usize + 4);
-        if rd(eax as usize + 0x1A8) == 0 {
-            p.eax = eax;
+        s.edx = rd(arg(a, 0) as usize);
+        wd(s.eax as usize + 0x1DBC, s.edx);
+        s.eax = rd(ecx as usize + 4);
+        if rd(s.eax as usize + 0x1A8) == 0 {
+            *p = s;
             return;
         }
-        p.eax = cl(0x816B50, &R { eax, ecx, edx, esi: p.esi, edi: eax }, &[]);
+        s.edi = s.eax;
+        cx(0x816B50, &mut s, &fr(a, &[p.edi]));
+        s.edi = p.edi;
+        *p = s;
     }
 }
 
 // 0x810a20 (32 bytes): copy a field of the session.
-unsafe fn h_recv_next_srv(_p: &mut Pushad, a: *const u32) {
+unsafe fn h_recv_next_srv(p: &mut Pushad, a: *const u32) {
     unsafe {
         let c = rd(arg(a, 1) as usize + 4);
         if c == 0 {
+            p.eax = arg(a, 1);
             return;
         }
         let o = rd(c as usize + 0x1AC) as usize;
-        wd(o + 0xA10, rd(o + 0x408));
+        let ecx = rd(o + 0x408);
+        wd(o + 0xA10, ecx);
+        p.eax = o as u32;
+        p.ecx = ecx;
     }
 }
 fn rg_recv_next_srv(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -2181,10 +2517,12 @@ fn rg_recv_next_srv(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // 0x810bd0: append the sender's 9-dword record (+ one more dword) to the session's list of 40-byte entries.
-unsafe fn h_recv_modified_session(_p: &mut Pushad, a: *const u32) {
+unsafe fn h_recv_modified_session(p: &mut Pushad, a: *const u32) {
     unsafe {
         let ecx = rd(arg(a, 1) as usize + 4) as usize;
         let eax = rd(ecx + 0x1AC) as usize;
+        p.eax = eax as u32;
+        p.ecx = ecx as u32;
         if rd(eax + 0x2C) != 2 {
             return;
         }
@@ -2196,6 +2534,8 @@ unsafe fn h_recv_modified_session(_p: &mut Pushad, a: *const u32) {
         }
         wd(dst.wrapping_add(0x24), ebx);
         wd(eax + 0xBF8, rd(eax + 0xBF8).wrapping_add(1));
+        p.ecx = 0; // rep movsd ran ECX down to zero
+        p.edx = dst as u32;
     }
 }
 fn rg_recv_modified_session(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -2211,13 +2551,19 @@ fn rg_recv_modified_session(_p: &Pushad, a: *const u32, v: &mut Vec<(usize, usiz
 }
 
 // 0x924d30: bit i of the word marks entry i of the table at 0xE88B68 (byte +0x2A4).
-unsafe fn h_recv_notor_active(_p: &mut Pushad, a: *const u32) {
+unsafe fn h_recv_notor_active(p: &mut Pushad, a: *const u32) {
     unsafe {
         let eax = rd16(arg(a, 0) as usize) as u32;
+        let mut edx = 0u32;
         for i in 0..14u32 {
             let esi = rd(0xE8_8B68 + i as usize * 4) as usize;
-            wb(esi + 0x2A4, (eax & (1 << i) != 0) as u8);
+            let flag = (eax & (1 << i) != 0) as u32;
+            wb(esi + 0x2A4, flag as u8);
+            edx = (1u32 << i & !0xFF) | flag;
         }
+        p.eax = eax;
+        p.ecx = 14;
+        p.edx = edx;
     }
 }
 fn rg_recv_notor_active(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -2226,12 +2572,15 @@ fn rg_recv_notor_active(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>
     }
 }
 
-// 0x548580: EDX = the first dword of the data, one stack argument (1).
+// 0x548580: EDX = the first dword of the data, one stack argument (1), popped into ECX after.
 unsafe fn h_misc_pkt_05(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let eax = arg(a, 0);
-        let edx = rd(eax as usize);
-        p.eax = cl(0x548590, &R { eax, edx, ..R::of(p) }, &[1]);
+        let mut s = *p;
+        s.eax = arg(a, 0);
+        s.edx = rd(s.eax as usize);
+        cx(0x548590, &mut s, &fr(a, &[1]));
+        s.ecx = 1;
+        *p = s;
     }
 }
 
@@ -2247,64 +2596,75 @@ fn rg_misc_pkt_17(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 unsafe fn h_hud_pkt_16(p: &mut Pushad, a: *const u32) {
     unsafe {
         wb(0x252849F, 0);
-        tail(p, a, 0x794230, R::of(p));
+        tail(p, a, 0x794230, *p);
     }
 }
 
 // 0x7fb150: each u16 in the packet (count byte first) is an ack for the connection (net_conn_ack_record).
 unsafe fn h_recv_acks(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let ebp = arg(a, 1) as usize;
         if rd(ebp + 4) == 0 {
             return;
         }
         let ecx = arg(a, 0);
+        s.ecx = ecx;
         let al = rb(ecx as usize);
-        p.eax = (p.eax & !0xFF) | al as u32;
+        s.eax = (p.eax & !0xFF) | al as u32;
         if al == 0 {
+            *p = s;
             return;
         }
+        s.ebp = ebp as u32;
         let mut edi = ecx as usize + 1;
-        let mut ebx = al as u32;
-        let mut r = R { ecx, ..R::of(p) };
+        s.ebx = al as u32;
         loop {
-            let esi = rd16(edi) as u32;
-            let eax = rd(ebp + 4);
+            s.esi = rd16(edi) as u32;
+            s.eax = rd(ebp + 4);
             edi += 2;
-            r.eax = eax;
-            r.esi = esi;
-            r.edi = edi as u32;
-            r.eax = cl(0x7F8270, &r, &[]);
-            ebx -= 1;
-            if ebx == 0 {
+            s.edi = edi as u32;
+            cx(0x7F8270, &mut s, &fr(a, &[p.edi, p.esi, p.ebx, p.ebp]));
+            s.ebx = s.ebx.wrapping_sub(1);
+            if s.ebx == 0 {
                 break;
             }
         }
-        p.eax = r.eax;
+        s.edi = p.edi;
+        s.esi = p.esi;
+        s.ebx = p.ebx;
+        s.ebp = p.ebp;
+        *p = s;
     }
 }
 
 // 0x835930: a tail jump with EAX = the session, ECX = the connection.
 unsafe fn h_recv_sessionstart(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let ecx = rd(arg(a, 1) as usize + 4);
-        let eax = rd(ecx as usize + 0x1AC);
-        tail(p, a, 0x80C9A0, R { eax, ecx, ..R::of(p) });
+        s.ecx = ecx;
+        s.eax = rd(ecx as usize + 0x1AC);
+        tail(p, a, 0x80C9A0, s);
     }
 }
 
 // 0x5af3f0
-unsafe fn h_act_3f(_p: &mut Pushad, _a: *const u32) {
+unsafe fn h_act_3f(p: &mut Pushad, _a: *const u32) {
     unsafe {
         let e = rd(0x1408E88) as usize;
+        p.eax = e as u32;
         if e == 0 {
             return;
         }
         let o = rd(e + 0x10) as usize;
+        p.eax = o as u32;
         if o == 0 {
             return;
         }
-        wd(o + 0x44, rd(o + 0x40));
+        let ecx = rd(o + 0x40);
+        wd(o + 0x44, ecx);
+        p.ecx = ecx;
     }
 }
 fn rg_act_3f(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -2320,9 +2680,10 @@ fn rg_act_3f(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // 0x5af390: up to 12 u16 values (count first, then the values) into the local player's table at +0x19C.
-unsafe fn h_act_3e(_p: &mut Pushad, a: *const u32) {
+unsafe fn h_act_3e(p: &mut Pushad, a: *const u32) {
     unsafe {
         let w = rd(0x27B3C60) as usize;
+        p.eax = w as u32;
         if w == 0 || rd(w + 0x3C) != 1 {
             return;
         }
@@ -2343,6 +2704,9 @@ unsafe fn h_act_3e(_p: &mut Pushad, a: *const u32) {
             dst += 2;
         }
         wb(edi + 0x19A, (n > 0) as u8);
+        p.eax = (n > 0) as u32; // eax = 12, then `setg al`
+        p.ecx = dst as u32;
+        p.edx = src as u32;
     }
 }
 fn rg_act_3e(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -2358,15 +2722,20 @@ fn rg_act_3e(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // 0x5bbba0: four dwords into the local player's record at +0x2BC; +0x2C0 only ever grows.
-unsafe fn h_act_44(_p: &mut Pushad, a: *const u32) {
+unsafe fn h_act_44(p: &mut Pushad, a: *const u32) {
     unsafe {
         let m = arg(a, 0) as usize;
-        let (edx, esi, edi, eax) = (rd(m), rd(m + 4), rd(m + 8), rd(m + 12));
-        let w = rd(0x27B3C60) as usize;
-        if w == 0 || rd(w + 0x3C) != 1 {
+        let edx = rd(m);
+        let ecx0 = rd(0x27B3C60) as usize;
+        let (esi, edi, eax) = (rd(m + 4), rd(m + 8), rd(m + 12));
+        p.eax = eax;
+        p.edx = edx;
+        p.ecx = ecx0 as u32;
+        if ecx0 == 0 || rd(ecx0 + 0x3C) != 1 {
             return;
         }
-        let ecx = rd(w + 0x90) as usize;
+        let ecx = rd(ecx0 + 0x90) as usize;
+        p.ecx = ecx as u32;
         if ecx == 0 {
             return;
         }
@@ -2392,13 +2761,21 @@ fn rg_act_44(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
     }
 }
 
-// 0x5f7e30: three floats (through the x87: a signalling NaN comes out quiet).
-unsafe fn h_act_4a(_p: &mut Pushad, a: *const u32) {
+// 0x5f7e30: three floats (through the x87: a signalling NaN comes out quiet). The original stages them in
+// its frame (two locals and the caller's first argument slot).
+unsafe fn h_act_4a(p: &mut Pushad, a: *const u32) {
     unsafe {
         let m = arg(a, 0) as usize;
-        wd(0x252A67C, q32(rd(m)));
-        wd(0x252A680, q32(rd(m + 4)));
-        wd(0x252A684, q32(rd(m + 8)));
+        let (ecx, edx, eax) = (rd(m), rd(m + 4), rd(m + 8));
+        *(a as *mut u32) = ecx;
+        wd(slot(a, 2), edx);
+        wd(slot(a, 1), eax);
+        wd(0x252A67C, q32(ecx));
+        wd(0x252A680, q32(edx));
+        wd(0x252A684, q32(eax));
+        p.eax = eax;
+        p.ecx = ecx;
+        p.edx = edx;
     }
 }
 fn rg_act_4a(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
@@ -2406,10 +2783,12 @@ fn rg_act_4a(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // 0x5e7f10: a one-byte command in the packet sets mode flags.
-unsafe fn h_act_1a(_p: &mut Pushad, a: *const u32) {
+unsafe fn h_act_1a(p: &mut Pushad, a: *const u32) {
     unsafe {
         let m = arg(a, 0) as usize;
         let al = rb(m);
+        p.ecx = m as u32;
+        p.eax = (p.eax & !0xFF) | al as u32;
         match al {
             5 => wb(0x252773E, 1),
             9 => wb(0x252771D, al),
@@ -2417,10 +2796,15 @@ unsafe fn h_act_1a(_p: &mut Pushad, a: *const u32) {
                 wb(0x252771D, al);
                 let eax = rb(m + 1) as i8 as i32 as u32;
                 wd(0xE97D04, eax);
+                p.eax = eax;
                 if eax == 2 {
-                    wd(0x140A5E4, rdu(m + 2));
+                    let v = rdu(m + 2);
+                    wd(0x140A5E4, v);
+                    p.eax = v;
                 } else {
-                    wd(0x2527820, rdu(m + 2));
+                    let v = rdu(m + 2);
+                    wd(0x2527820, v);
+                    p.ecx = v;
                 }
             }
             7 | 8 => wb(0x252771D, al),
@@ -2437,9 +2821,10 @@ fn rg_act_1a(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // 0x609790: a signed byte in -1..=2 is stored.
-unsafe fn h_act_48(_p: &mut Pushad, a: *const u32) {
+unsafe fn h_act_48(p: &mut Pushad, a: *const u32) {
     unsafe {
         let eax = rb(arg(a, 0) as usize) as i8 as i32;
+        p.eax = eax as u32;
         if (-1..=2).contains(&eax) {
             wd(0xE97B68, eax as u32);
         }
@@ -2450,13 +2835,15 @@ fn rg_act_48(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // 0x5bbd20
-unsafe fn h_act_46(_p: &mut Pushad, _a: *const u32) {
+unsafe fn h_act_46(p: &mut Pushad, _a: *const u32) {
     unsafe {
         let e = rd(0x1408E88) as usize;
+        p.eax = e as u32;
         if e == 0 {
             return;
         }
         let o = rd(e + 0x10) as usize;
+        p.eax = o as u32;
         if o != 0 {
             wb(o + 0x1D, 1);
         }
@@ -2475,10 +2862,11 @@ fn rg_act_46(_p: &Pushad, _a: *const u32, v: &mut Vec<(usize, usize)>) {
 }
 
 // 0x7faf30: walks the connection's list looking for a matching id and does nothing with the result
-// (reads only; kept so that a bad list faults the same way).
-unsafe fn h_recv_no_connect(_p: &mut Pushad, a: *const u32) {
+// (reads only; kept so that a bad list faults the same way). Leaves EAX / ECX / EDX as the walk does.
+unsafe fn h_recv_no_connect(p: &mut Pushad, a: *const u32) {
     unsafe {
         let s = rd(0x2528C14) as usize;
+        p.eax = s as u32;
         if s == 0 {
             return;
         }
@@ -2489,93 +2877,127 @@ unsafe fn h_recv_no_connect(_p: &mut Pushad, a: *const u32) {
             return;
         }
         let c = rd(arg(a, 1) as usize + 4) as usize;
+        p.eax = c as u32;
         if c == 0 {
             return;
         }
+        let sess = rd(c + 0x1AC) as usize;
         let dl = rb(arg(a, 0) as usize);
-        let ecx = rd(rd(c + 0x1AC) as usize + 0x400) as usize;
+        p.ecx = rd(sess + 0x400);
+        p.edx = (p.edx & !0xFF) | dl as u32;
+        let ecx = p.ecx as usize;
         let mut eax = ecx;
+        p.eax = eax as u32;
         if eax == 0 {
             return;
         }
         loop {
             if rb(eax + 0x1B0) == dl {
-                return;
+                break;
             }
             eax = rd(eax + 0x22CC) as usize;
+            p.eax = eax as u32;
             if eax == ecx || eax == 0 {
-                return;
+                break;
             }
         }
     }
 }
 
-// 0x677bb0: (data) with the local player on the stack.
+// 0x677bb0: (data) with the local player on the stack, popped into ECX after.
 unsafe fn h_act_1d(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let pl = rd(0x21703D4);
-        p.eax = cl(0x66FB80, &R { eax: arg(a, 0), ..R::of(p) }, &[pl]);
+        s.eax = arg(a, 0);
+        cx(0x66FB80, &mut s, &fr(a, &[pl]));
+        s.ecx = pl;
+        *p = s;
     }
 }
 
 // 0x677bd0: ECX = the local player, the stack argument is ECX with its low byte replaced by "byte != 0".
 unsafe fn h_act_1e(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let b = (rb(arg(a, 0) as usize) != 0) as u32;
         let pushed = (p.ecx & !0xFF) | b;
-        p.eax = cl(0x66FC30, &R { eax: arg(a, 0), ecx: rd(0x21703D4), ..R::of(p) }, &[pushed]);
+        s.eax = arg(a, 0);
+        s.ecx = rd(0x21703D4);
+        cx(0x66FC30, &mut s, &fr(a, &[pushed]));
+        s.ecx = pushed;
+        *p = s;
     }
 }
 
 // 0x566b70 / 0x566c00 / 0x566bd0 / 0x566c30: forward to the callee only when the mode (0xE9E3F8) is 1 or 2,
 // with the object 0xE9E3F4 as an argument.
-unsafe fn h_act_15(p: &mut Pushad, _a: *const u32) {
+unsafe fn h_act_15(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let eax = rd(0xE9E3F8);
-        p.eax = eax;
+        s.eax = eax;
         if eax == 1 || eax == 2 {
-            p.eax = cl(0x5644B0, &R { eax, ..R::of(p) }, &[0xE9E3F4]);
+            cx_p1(0x5644B0, &mut s, &fr(a, &[0xE9E3F4]));
         }
+        *p = s;
     }
 }
 unsafe fn h_act_18(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let ecx = rd(arg(a, 0) as usize);
         let eax = rd(0xE9E3F8);
-        p.eax = eax;
+        s.ecx = ecx;
+        s.eax = eax;
         if eax == 1 || eax == 2 {
-            p.eax = cl(0x5631B0, &R { eax, ecx, ..R::of(p) }, &[0xE9E3F4, ecx]);
+            cx_p2(0x5631B0, &mut s, &fr(a, &[0xE9E3F4, ecx]));
         }
+        *p = s;
     }
 }
 unsafe fn h_act_17(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let m = arg(a, 0) as usize;
         let edx = rd(m);
         let eax = rb(m + 4) as i8 as i32 as u32;
         let ecx = rd16(m + 5) as u32;
         let esi = rd(0xE9E3F8);
-        p.eax = eax;
+        s.eax = eax;
+        s.ecx = ecx;
+        s.edx = edx;
+        s.esi = esi;
         if esi == 1 || esi == 2 {
-            p.eax = cl(0x5632D0, &R { eax, ecx, edx, esi, edi: p.edi }, &[0xE9E3F4, edx, ecx]);
+            cx_p3(0x5632D0, &mut s, &fr(a, &[0xE9E3F4, edx, ecx, p.esi]));
         }
+        s.esi = p.esi;
+        *p = s;
     }
 }
-unsafe fn h_act_19(p: &mut Pushad, _a: *const u32) {
+unsafe fn h_act_19(p: &mut Pushad, a: *const u32) {
     unsafe {
+        let mut s = *p;
         let eax = rd(0xE9E3F8);
-        p.eax = eax;
+        s.eax = eax;
         if eax == 1 || eax == 2 {
-            p.eax = cl(0x5642A0, &R { eax, esi: 0xE9E3F4, ..R::of(p) }, &[]);
+            s.esi = 0xE9E3F4;
+            cx(0x5642A0, &mut s, &fr(a, &[p.esi]));
+            s.esi = p.esi;
         }
+        *p = s;
     }
 }
 
 // 0x5c2600: ESI = the first dword of the data.
 unsafe fn h_act_41(p: &mut Pushad, a: *const u32) {
     unsafe {
-        let eax = arg(a, 0);
-        p.eax = cl(0x5C2560, &R { eax, esi: rd(eax as usize), ..R::of(p) }, &[]);
+        let mut s = *p;
+        s.eax = arg(a, 0);
+        s.esi = rd(s.eax as usize);
+        cx(0x5C2560, &mut s, &fr(a, &[p.esi]));
+        s.esi = p.esi;
+        *p = s;
     }
 }
 // --- the table ---------------------------------------------------------------------------------------------
@@ -2583,107 +3005,107 @@ unsafe fn h_act_41(p: &mut Pushad, a: *const u32) {
 use Mode::{Count, Pure, Snap};
 
 ports! {
-    [gc_death, "gameplay_constants_parse_death_and_busted", 0x54D150, B_GC_DEATH, X_GC_DEATH, Snap, false, Some(rg_gc_death), h_gc_death],
-    [gc_fat_bones, "gameplay_constants_parse_fat_bones", 0x54D1F0, B_GC_FAT_BONES, X_GC_FAT_BONES, Snap, false, Some(rg_gc_fat_bones), h_gc_fat_bones],
-    [gc_drunk, "gameplay_constants_parse_drunk_sway", 0x54D270, B_GC_DRUNK, X_GC_DRUNK, Snap, false, Some(rg_gc_drunk), h_gc_drunk],
-    [gc_hit_car, "gameplay_constants_parse_hit_by_car", 0x54D2E0, B_GC_HIT_CAR, X_GC_HIT_CAR, Snap, false, Some(rg_gc_hit_car), h_gc_hit_car],
-    [gc_veh_coll, "gameplay_constants_parse_vehicle_collision", 0x54D3A0, B_GC_VEH_COLL, X_GC_VEH_COLL, Snap, false, Some(rg_gc_veh_coll), h_gc_veh_coll],
-    [gc_fire, "gameplay_constants_parse_fire", 0x54D420, B_GC_FIRE, X_GC_FIRE, Snap, false, Some(rg_gc_fire), h_gc_fire],
-    [gc_sticky, "gameplay_constants_parse_sticky_fire", 0x54D5F0, B_GC_STICKY, X_GC_STICKY, Count, true, None, h_gc_sticky],
-    [gc_pimp_ai, "gameplay_constants_parse_ho_pimp_ai", 0x54D8D0, B_GC_PIMP_AI, X_GC_PIMP_AI, Snap, false, Some(rg_gc_pimp_ai), h_gc_pimp_ai],
-    [gc_throwing, "gameplay_constants_parse_throwing_constants", 0x54DB20, B_GC_THROWING, X_GC_THROWING, Snap, false, Some(rg_gc_throwing), h_gc_throwing],
-    [gc_item_drops, "gameplay_constants_parse_item_drops", 0x54DBA0, B_GC_ITEM_DROPS, X_GC_ITEM_DROPS, Snap, false, Some(rg_gc_item_drops), h_gc_item_drops],
-    [gc_shader_lod, "gameplay_constants_parse_shader_lod", 0x54DF50, B_GC_SHADER_LOD, X_GC_SHADER_LOD, Snap, false, Some(rg_gc_shader_lod), h_gc_shader_lod],
-    [gc_shadows, "gameplay_constants_parse_shadows", 0x54DFB0, B_GC_SHADOWS, X_GC_SHADOWS, Snap, false, Some(rg_gc_shadows), h_gc_shadows],
-    [gc_ctrlpat, "gameplay_constants_parse_controlpatterns", 0x54E140, B_GC_CTRLPAT, X_GC_CTRLPAT, Snap, false, Some(rg_gc_ctrlpat), h_gc_ctrlpat],
-    [gc_taunt, "gameplay_constants_parse_tauntreactions", 0x54E1A0, B_GC_TAUNT, X_GC_TAUNT, Snap, false, Some(rg_gc_taunt), h_gc_taunt],
-    [gc_fine_coll, "gameplay_constants_parse_human_fine_collision", 0x54E210, B_GC_FINE_COLL, X_GC_FINE_COLL, Snap, false, Some(rg_gc_fine_coll), h_gc_fine_coll],
-    [gc_flame, "gameplay_constants_parse_flamethrower", 0x54F430, B_GC_FLAME, X_GC_FLAME, Snap, false, Some(rg_gc_flame), h_gc_flame],
-    [gc_veh_inter, "gameplay_constants_parse_vehicle_interaction", 0x54F6D0, B_GC_VEH_INTER, X_GC_VEH_INTER, Snap, false, Some(rg_gc_veh_inter), h_gc_veh_inter],
-    [gc_controls, "gameplay_constants_parse_controls", 0x54F730, B_GC_CONTROLS, X_GC_CONTROLS, Snap, false, Some(rg_gc_controls), h_gc_controls],
-    [gc_stungun, "gameplay_constants_parse_stungun", 0x54F780, B_GC_STUNGUN, X_GC_STUNGUN, Snap, false, Some(rg_gc_stungun), h_gc_stungun],
-    [gc_rocket, "gameplay_constants_parse_rocket_accuracy", 0x54F7E0, B_GC_ROCKET, X_GC_ROCKET, Snap, false, Some(rg_gc_rocket), h_gc_rocket],
-    [gc_activity, "gameplay_constants_parse_activity_constants", 0x54F850, B_GC_ACTIVITY, X_GC_ACTIVITY, Snap, false, Some(rg_gc_activity), h_gc_activity],
-    [gc_kneecap, "gameplay_constants_parse_kneecapper", 0x54F9A0, B_GC_KNEECAP, X_GC_KNEECAP, Snap, false, Some(rg_gc_kneecap), h_gc_kneecap],
-    [gc_evade, "gameplay_constants_parse_vehicle_evade_ai", 0x54FC20, B_GC_EVADE, X_GC_EVADE, Snap, false, Some(rg_gc_evade), h_gc_evade],
-    [gc_pepper, "gameplay_constants_parse_pepperspray", 0x54FEC0, B_GC_PEPPER, X_GC_PEPPER, Snap, false, Some(rg_gc_pepper), h_gc_pepper],
-    [gc_prop_throw, "gameplay_constants_parse_wieldable_prop_throw", 0x5501A0, B_GC_PROP_THROW, X_GC_PROP_THROW, Snap, false, Some(rg_gc_prop_throw), h_gc_prop_throw],
-    [gc_watercraft, "gameplay_constants_parse_watercraft_params", 0x550240, B_GC_WATERCRAFT, X_GC_WATERCRAFT, Snap, false, Some(rg_gc_watercraft), h_gc_watercraft],
-    [gc_siren, "gameplay_constants_parse_siren_whoop_params", 0x5502D0, B_GC_SIREN, X_GC_SIREN, Snap, false, Some(rg_gc_siren), h_gc_siren],
-    [gc_garage, "gameplay_constants_parse_garage", 0x550370, B_GC_GARAGE, X_GC_GARAGE, Snap, false, Some(rg_gc_garage), h_gc_garage],
-    [gc_fall, "gameplay_constants_parse_fall_damage", 0x5503C0, B_GC_FALL, X_GC_FALL, Snap, false, Some(rg_gc_fall), h_gc_fall],
-    [cam_stationary, "camera_free_read_stationary_times", 0x496110, B_CAM_STATIONARY, X_CAM_STATIONARY, Snap, false, Some(rg_cam_stationary), h_cam_stationary],
-    [cam_crouch, "camera_free_parse_crouch_y_offset", 0x496150, B_CAM_CROUCH, X_CAM_CROUCH, Snap, false, Some(rg_cam_crouch), h_cam_crouch],
-    [cam_swing, "camera_free_read_default_swing_rate", 0x4961A0, B_CAM_SWING, X_CAM_SWING, Snap, false, Some(rg_cam_swing), h_cam_swing],
-    [cam_aggr, "camera_free_read_default_aggression", 0x4961C0, B_CAM_AGGR, X_CAM_AGGR, Snap, false, Some(rg_cam_aggr), h_cam_aggr],
-    [cam_pitch, "camera_free_parse_pitch_reset_time", 0x4961E0, B_CAM_PITCH, X_CAM_PITCH, Snap, false, Some(rg_cam_pitch), h_cam_pitch],
-    [gs04c, "gamesave_s04_districts_save_coop", 0x6924F0, B_GS04C, X_GS04C, Snap, false, Some(rg_gs04c), h_gs04c],
-    [gs09c_save, "gamesave_s09_activity_levels_save_coop", 0x692B00, B_GS09C_SAVE, X_GS09C_SAVE, Count, true, None, h_gs09_save],
-    [gs09_save, "gamesave_s09_activity_levels_save", 0x692B40, B_GS09_SAVE, X_GS09_SAVE, Count, true, None, h_gs09_save],
-    [gs10_save, "gamesave_s10_script_triggers_save", 0x692B80, B_GS10_SAVE, X_GS10_SAVE, Count, true, None, h_gs10_save],
-    [gs11c_save, "gamesave_s11_cribs_save_coop", 0x692C60, B_GS11C_SAVE, X_GS11C_SAVE, Count, true, None, h_gs11c_save],
-    [gs00_save, "gamesave_s00_timers_save", 0x692E80, B_GS00_SAVE, X_GS00_SAVE, Count, true, None, h_gs00_save],
-    [gs14_save, "gamesave_s14_playlists_save", 0x692EA0, B_GS14_SAVE, X_GS14_SAVE, Count, true, None, h_gs14_save],
-    [gs15_save, "gamesave_s15_cutscene_seen_save", 0x692EC0, B_GS15_SAVE, X_GS15_SAVE, Count, true, None, h_gs15_save],
-    [gs16_save, "gamesave_s16_persistent_objects_save", 0x692F00, B_GS16_SAVE, X_GS16_SAVE, Count, true, None, h_gs16_save],
-    [gs17_save, "gamesave_s17_rewards_save", 0x692F30, B_GS17_SAVE, X_GS17_SAVE, Snap, false, Some(rg_gs17_save), h_gs17_save],
-    [gs18_save, "gamesave_s18_activity_instances_save", 0x692FB0, B_GS18_SAVE, X_GS18_SAVE, Count, true, None, h_gs18_save],
-    [gs20_save, "gamesave_s20_cheats_save", 0x693450, B_GS20_SAVE, X_GS20_SAVE, Count, true, None, h_gs20_save],
-    [gs12_save, "gamesave_s12_tutorials_save", 0x693470, B_GS12_SAVE, X_GS12_SAVE, Snap, false, Some(rg_gs12_save), h_gs12_save],
-    [gs01_save, "gamesave_s01_world_grid_save", 0x693570, B_GS01_SAVE, X_GS01_SAVE, Count, true, None, h_gs01_save],
-    [gs05_save, "gamesave_s05_options_save", 0x6935C0, B_GS05_SAVE, X_GS05_SAVE, Count, true, None, h_gs05_save],
-    [gs23_save, "gamesave_s23_audio_a_save", 0x693720, B_GS23_SAVE, X_GS23_SAVE, Count, true, None, h_gs23_save],
-    [gs24_save, "gamesave_s24_audio_b_save", 0x693730, B_GS24_SAVE, X_GS24_SAVE, Count, true, None, h_gs24_save],
-    [gs25_save, "gamesave_s25_audio_c_save", 0x693740, B_GS25_SAVE, X_GS25_SAVE, Count, true, None, h_gs25_save],
-    [gs26_save, "gamesave_s26_music_store_save", 0x693760, B_GS26_SAVE, X_GS26_SAVE, Count, true, None, h_gs26_save],
-    [gs27_save, "gamesave_s27_store_discounts_save", 0x6937A0, B_GS27_SAVE, X_GS27_SAVE, Count, true, None, h_gs27_save],
-    [gs07_load, "gamesave_s07_garage_load", 0x694470, B_GS07_LOAD, X_GS07_LOAD, Count, true, None, h_gs07_load],
-    [gs22_load, "gamesave_s22_wiretap_load", 0x6944C0, B_GS22_LOAD, X_GS22_LOAD, Count, true, None, h_gs22_load],
-    [gs09c_load, "gamesave_s09_activity_levels_load_coop", 0x6947C0, B_GS09C_LOAD, X_GS09C_LOAD, Count, true, None, h_gs09_load],
-    [gs09_load, "gamesave_s09_activity_levels_load", 0x6947E0, B_GS09_LOAD, X_GS09_LOAD, Count, true, None, h_gs09_load],
-    [gs10_load, "gamesave_s10_script_triggers_load", 0x694800, B_GS10_LOAD, X_GS10_LOAD, Count, true, None, h_gs10_load],
-    [gs11c_load, "gamesave_s11_cribs_load_coop", 0x6948B0, B_GS11C_LOAD, X_GS11C_LOAD, Count, true, None, h_gs11c_load],
-    [gs00_load, "gamesave_s00_timers_load", 0x694AB0, B_GS00_LOAD, X_GS00_LOAD, Count, true, None, h_gs00_load],
-    [gs16_load, "gamesave_s16_persistent_objects_load", 0x694AE0, B_GS16_LOAD, X_GS16_LOAD, Count, true, None, h_gs16_load],
-    [gs15_load, "gamesave_s15_cutscene_seen_load", 0x694B10, B_GS15_LOAD, X_GS15_LOAD, Count, true, None, h_gs15_load],
-    [gs17_load, "gamesave_s17_rewards_load", 0x694B50, B_GS17_LOAD, X_GS17_LOAD, Count, true, None, h_gs17_load],
-    [gs18_load, "gamesave_s18_activity_instances_load", 0x694BD0, B_GS18_LOAD, X_GS18_LOAD, Count, true, None, h_gs18_load],
-    [gs20_load, "gamesave_s20_cheats_load", 0x694E20, B_GS20_LOAD, X_GS20_LOAD, Count, true, None, h_gs20_load],
-    [gs12_load, "gamesave_s12_tutorials_load", 0x694E40, B_GS12_LOAD, X_GS12_LOAD, Snap, false, Some(rg_gs12_load), h_gs12_load],
-    [gs13_load, "gamesave_s13_debug_display_options_load", 0x694E70, B_GS13_LOAD, X_GS13_LOAD, Snap, false, Some(rg_gs13_load), h_gs13_load],
-    [gs01c_load, "gamesave_s01_world_grid_load_coop", 0x694EE0, B_GS01C_LOAD, X_GS01C_LOAD, Snap, false, Some(rg_gs01c_load), h_gs01c_load],
-    [gs01_load, "gamesave_s01_world_grid_load", 0x694F30, B_GS01_LOAD, X_GS01_LOAD, Count, true, None, h_gs01_load],
-    [gs05_load, "gamesave_s05_options_load", 0x694F80, B_GS05_LOAD, X_GS05_LOAD, Count, true, None, h_gs05_load],
-    [gs23_load, "gamesave_s23_audio_a_load", 0x6950C0, B_GS23_LOAD, X_GS23_LOAD, Count, true, None, h_gs23_load],
-    [gs24_load, "gamesave_s24_audio_b_load", 0x6950D0, B_GS24_LOAD, X_GS24_LOAD, Count, true, None, h_gs24_load],
-    [gs25_load, "gamesave_s25_audio_c_load", 0x6950E0, B_GS25_LOAD, X_GS25_LOAD, Count, true, None, h_gs25_load],
-    [gs26_load, "gamesave_s26_music_store_load", 0x6950F0, B_GS26_LOAD, X_GS26_LOAD, Count, true, None, h_gs26_load],
-    [gs27_load, "gamesave_s27_store_discounts_load", 0x695130, B_GS27_LOAD, X_GS27_LOAD, Count, true, None, h_gs27_load],
-    [recv_qos, "net_recv_qos", 0x80B5B0, B_RECV_QOS, X_RECV_QOS, Snap, false, Some(rg_recv_qos), h_recv_qos],
-    [recv_bw_info, "net_recv_bw_info", 0x80B5E0, B_RECV_BW_INFO, X_RECV_BW_INFO, Count, true, None, h_recv_bw_info],
-    [recv_next_srv, "net_recv_next_srv", 0x810A20, B_RECV_NEXT_SRV, X_RECV_NEXT_SRV, Snap, false, Some(rg_recv_next_srv), h_recv_next_srv],
-    [recv_mod_sess, "net_recv_modified_session", 0x810BD0, B_RECV_MOD_SESS, X_RECV_MOD_SESS, Snap, false, Some(rg_recv_modified_session), h_recv_modified_session],
-    [recv_notor, "net_recv_notor_active", 0x924D30, B_RECV_NOTOR, X_RECV_NOTOR, Snap, false, Some(rg_recv_notor_active), h_recv_notor_active],
-    [misc_pkt_05, "misc_packet_sub_05", 0x548580, B_MISC_PKT_05, X_MISC_PKT_05, Count, true, None, h_misc_pkt_05],
-    [misc_pkt_17, "misc_packet_sub_17", 0xA2C670, B_MISC_PKT_17, X_MISC_PKT_17, Snap, false, Some(rg_misc_pkt_17), h_misc_pkt_17],
-    [hud_pkt_16, "hud_pkt_sub_16", 0xA2DDB0, B_HUD_PKT_16, X_HUD_PKT_16, Count, true, None, h_hud_pkt_16],
-    [recv_acks, "net_recv_acks", 0x7FB150, B_RECV_ACKS, X_RECV_ACKS, Count, true, None, h_recv_acks],
-    [recv_sessstart, "net_recv_sessionstart", 0x835930, B_RECV_SESSSTART, X_RECV_SESSSTART, Count, true, None, h_recv_sessionstart],
-    [act_3f, "act_packet_sub_3f", 0x5AF3F0, B_ACT_3F, X_ACT_3F, Snap, false, Some(rg_act_3f), h_act_3f],
-    [act_3e, "act_packet_sub_3e", 0x5AF390, B_ACT_3E, X_ACT_3E, Snap, false, Some(rg_act_3e), h_act_3e],
-    [act_44, "act_packet_sub_44", 0x5BBBA0, B_ACT_44, X_ACT_44, Snap, false, Some(rg_act_44), h_act_44],
-    [act_4a, "act_packet_sub_4a", 0x5F7E30, B_ACT_4A, X_ACT_4A, Snap, false, Some(rg_act_4a), h_act_4a],
-    [act_1a, "act_packet_sub_1a", 0x5E7F10, B_ACT_1A, X_ACT_1A, Snap, false, Some(rg_act_1a), h_act_1a],
-    [act_48, "act_packet_sub_48", 0x609790, B_ACT_48, X_ACT_48, Snap, false, Some(rg_act_48), h_act_48],
-    [act_46, "act_packet_sub_46", 0x5BBD20, B_ACT_46, X_ACT_46, Snap, false, Some(rg_act_46), h_act_46],
-    [recv_no_connect, "net_recv_no_connect", 0x7FAF30, B_RECV_NO_CONNECT, X_RECV_NO_CONNECT, Pure, false, None, h_recv_no_connect],
-    [act_1d, "act_packet_sub_1d", 0x677BB0, B_ACT_1D, X_ACT_1D, Count, true, None, h_act_1d],
-    [act_1e, "act_packet_sub_1e", 0x677BD0, B_ACT_1E, X_ACT_1E, Count, true, None, h_act_1e],
-    [act_15, "act_packet_sub_15", 0x566B70, B_ACT_15, X_ACT_15, Count, true, None, h_act_15],
-    [act_18, "act_packet_sub_18", 0x566C00, B_ACT_18, X_ACT_18, Count, true, None, h_act_18],
-    [act_17, "act_packet_sub_17", 0x566BD0, B_ACT_17, X_ACT_17, Count, true, None, h_act_17],
-    [act_19, "act_packet_sub_19", 0x566C30, B_ACT_19, X_ACT_19, Count, true, None, h_act_19],
-    [act_41, "act_packet_sub_41", 0x5C2600, B_ACT_41, X_ACT_41, Count, true, None, h_act_41],
+    [gc_death, "gameplay_constants_parse_death_and_busted", 0x54D150, B_GC_DEATH, X_GC_DEATH, Snap, false, Some(rg_gc_death), h_gc_death, 0],
+    [gc_fat_bones, "gameplay_constants_parse_fat_bones", 0x54D1F0, B_GC_FAT_BONES, X_GC_FAT_BONES, Snap, false, Some(rg_gc_fat_bones), h_gc_fat_bones, 0],
+    [gc_drunk, "gameplay_constants_parse_drunk_sway", 0x54D270, B_GC_DRUNK, X_GC_DRUNK, Snap, false, Some(rg_gc_drunk), h_gc_drunk, 0],
+    [gc_hit_car, "gameplay_constants_parse_hit_by_car", 0x54D2E0, B_GC_HIT_CAR, X_GC_HIT_CAR, Snap, false, Some(rg_gc_hit_car), h_gc_hit_car, 0],
+    [gc_veh_coll, "gameplay_constants_parse_vehicle_collision", 0x54D3A0, B_GC_VEH_COLL, X_GC_VEH_COLL, Snap, false, Some(rg_gc_veh_coll), h_gc_veh_coll, 0],
+    [gc_fire, "gameplay_constants_parse_fire", 0x54D420, B_GC_FIRE, X_GC_FIRE, Snap, false, Some(rg_gc_fire), h_gc_fire, 0],
+    [gc_sticky, "gameplay_constants_parse_sticky_fire", 0x54D5F0, B_GC_STICKY, X_GC_STICKY, Count, true, None, h_gc_sticky, 0],
+    [gc_pimp_ai, "gameplay_constants_parse_ho_pimp_ai", 0x54D8D0, B_GC_PIMP_AI, X_GC_PIMP_AI, Snap, false, Some(rg_gc_pimp_ai), h_gc_pimp_ai, 0],
+    [gc_throwing, "gameplay_constants_parse_throwing_constants", 0x54DB20, B_GC_THROWING, X_GC_THROWING, Snap, false, Some(rg_gc_throwing), h_gc_throwing, 0],
+    [gc_item_drops, "gameplay_constants_parse_item_drops", 0x54DBA0, B_GC_ITEM_DROPS, X_GC_ITEM_DROPS, Snap, false, Some(rg_gc_item_drops), h_gc_item_drops, 4],
+    [gc_shader_lod, "gameplay_constants_parse_shader_lod", 0x54DF50, B_GC_SHADER_LOD, X_GC_SHADER_LOD, Snap, false, Some(rg_gc_shader_lod), h_gc_shader_lod, 0],
+    [gc_shadows, "gameplay_constants_parse_shadows", 0x54DFB0, B_GC_SHADOWS, X_GC_SHADOWS, Snap, false, Some(rg_gc_shadows), h_gc_shadows, 0],
+    [gc_ctrlpat, "gameplay_constants_parse_controlpatterns", 0x54E140, B_GC_CTRLPAT, X_GC_CTRLPAT, Snap, false, Some(rg_gc_ctrlpat), h_gc_ctrlpat, 0],
+    [gc_taunt, "gameplay_constants_parse_tauntreactions", 0x54E1A0, B_GC_TAUNT, X_GC_TAUNT, Snap, false, Some(rg_gc_taunt), h_gc_taunt, 0],
+    [gc_fine_coll, "gameplay_constants_parse_human_fine_collision", 0x54E210, B_GC_FINE_COLL, X_GC_FINE_COLL, Snap, false, Some(rg_gc_fine_coll), h_gc_fine_coll, 0],
+    [gc_flame, "gameplay_constants_parse_flamethrower", 0x54F430, B_GC_FLAME, X_GC_FLAME, Snap, false, Some(rg_gc_flame), h_gc_flame, 0],
+    [gc_veh_inter, "gameplay_constants_parse_vehicle_interaction", 0x54F6D0, B_GC_VEH_INTER, X_GC_VEH_INTER, Snap, false, Some(rg_gc_veh_inter), h_gc_veh_inter, 0],
+    [gc_controls, "gameplay_constants_parse_controls", 0x54F730, B_GC_CONTROLS, X_GC_CONTROLS, Snap, false, Some(rg_gc_controls), h_gc_controls, 0],
+    [gc_stungun, "gameplay_constants_parse_stungun", 0x54F780, B_GC_STUNGUN, X_GC_STUNGUN, Snap, false, Some(rg_gc_stungun), h_gc_stungun, 0],
+    [gc_rocket, "gameplay_constants_parse_rocket_accuracy", 0x54F7E0, B_GC_ROCKET, X_GC_ROCKET, Snap, false, Some(rg_gc_rocket), h_gc_rocket, 0],
+    [gc_activity, "gameplay_constants_parse_activity_constants", 0x54F850, B_GC_ACTIVITY, X_GC_ACTIVITY, Snap, false, Some(rg_gc_activity), h_gc_activity, 0],
+    [gc_kneecap, "gameplay_constants_parse_kneecapper", 0x54F9A0, B_GC_KNEECAP, X_GC_KNEECAP, Snap, false, Some(rg_gc_kneecap), h_gc_kneecap, 4],
+    [gc_evade, "gameplay_constants_parse_vehicle_evade_ai", 0x54FC20, B_GC_EVADE, X_GC_EVADE, Snap, false, Some(rg_gc_evade), h_gc_evade, 0],
+    [gc_pepper, "gameplay_constants_parse_pepperspray", 0x54FEC0, B_GC_PEPPER, X_GC_PEPPER, Snap, false, Some(rg_gc_pepper), h_gc_pepper, 0],
+    [gc_prop_throw, "gameplay_constants_parse_wieldable_prop_throw", 0x5501A0, B_GC_PROP_THROW, X_GC_PROP_THROW, Snap, false, Some(rg_gc_prop_throw), h_gc_prop_throw, 0],
+    [gc_watercraft, "gameplay_constants_parse_watercraft_params", 0x550240, B_GC_WATERCRAFT, X_GC_WATERCRAFT, Snap, false, Some(rg_gc_watercraft), h_gc_watercraft, 0],
+    [gc_siren, "gameplay_constants_parse_siren_whoop_params", 0x5502D0, B_GC_SIREN, X_GC_SIREN, Snap, false, Some(rg_gc_siren), h_gc_siren, 0],
+    [gc_garage, "gameplay_constants_parse_garage", 0x550370, B_GC_GARAGE, X_GC_GARAGE, Snap, false, Some(rg_gc_garage), h_gc_garage, 0],
+    [gc_fall, "gameplay_constants_parse_fall_damage", 0x5503C0, B_GC_FALL, X_GC_FALL, Snap, false, Some(rg_gc_fall), h_gc_fall, 0],
+    [cam_stationary, "camera_free_read_stationary_times", 0x496110, B_CAM_STATIONARY, X_CAM_STATIONARY, Snap, false, Some(rg_cam_stationary), h_cam_stationary, 0],
+    [cam_crouch, "camera_free_parse_crouch_y_offset", 0x496150, B_CAM_CROUCH, X_CAM_CROUCH, Snap, false, Some(rg_cam_crouch), h_cam_crouch, 0],
+    [cam_swing, "camera_free_read_default_swing_rate", 0x4961A0, B_CAM_SWING, X_CAM_SWING, Snap, false, Some(rg_cam_swing), h_cam_swing, 0],
+    [cam_aggr, "camera_free_read_default_aggression", 0x4961C0, B_CAM_AGGR, X_CAM_AGGR, Snap, false, Some(rg_cam_aggr), h_cam_aggr, 0],
+    [cam_pitch, "camera_free_parse_pitch_reset_time", 0x4961E0, B_CAM_PITCH, X_CAM_PITCH, Snap, false, Some(rg_cam_pitch), h_cam_pitch, 0],
+    [gs04c, "gamesave_s04_districts_save_coop", 0x6924F0, B_GS04C, X_GS04C, Snap, false, Some(rg_gs04c), h_gs04c, 0],
+    [gs09c_save, "gamesave_s09_activity_levels_save_coop", 0x692B00, B_GS09C_SAVE, X_GS09C_SAVE, Count, true, None, h_gs09_save, 0],
+    [gs09_save, "gamesave_s09_activity_levels_save", 0x692B40, B_GS09_SAVE, X_GS09_SAVE, Count, true, None, h_gs09_save, 0],
+    [gs10_save, "gamesave_s10_script_triggers_save", 0x692B80, B_GS10_SAVE, X_GS10_SAVE, Count, true, None, h_gs10_save, 8],
+    [gs11c_save, "gamesave_s11_cribs_save_coop", 0x692C60, B_GS11C_SAVE, X_GS11C_SAVE, Count, true, None, h_gs11c_save, 0],
+    [gs00_save, "gamesave_s00_timers_save", 0x692E80, B_GS00_SAVE, X_GS00_SAVE, Count, true, None, h_gs00_save, 0],
+    [gs14_save, "gamesave_s14_playlists_save", 0x692EA0, B_GS14_SAVE, X_GS14_SAVE, Count, true, None, h_gs14_save, 0],
+    [gs15_save, "gamesave_s15_cutscene_seen_save", 0x692EC0, B_GS15_SAVE, X_GS15_SAVE, Count, true, None, h_gs15_save, 12],
+    [gs16_save, "gamesave_s16_persistent_objects_save", 0x692F00, B_GS16_SAVE, X_GS16_SAVE, Count, true, None, h_gs16_save, 12],
+    [gs17_save, "gamesave_s17_rewards_save", 0x692F30, B_GS17_SAVE, X_GS17_SAVE, Snap, false, Some(rg_gs17_save), h_gs17_save, 0],
+    [gs18_save, "gamesave_s18_activity_instances_save", 0x692FB0, B_GS18_SAVE, X_GS18_SAVE, Count, true, None, h_gs18_save, 0],
+    [gs20_save, "gamesave_s20_cheats_save", 0x693450, B_GS20_SAVE, X_GS20_SAVE, Count, true, None, h_gs20_save, 0],
+    [gs12_save, "gamesave_s12_tutorials_save", 0x693470, B_GS12_SAVE, X_GS12_SAVE, Snap, false, Some(rg_gs12_save), h_gs12_save, 0],
+    [gs01_save, "gamesave_s01_world_grid_save", 0x693570, B_GS01_SAVE, X_GS01_SAVE, Count, true, None, h_gs01_save, 0],
+    [gs05_save, "gamesave_s05_options_save", 0x6935C0, B_GS05_SAVE, X_GS05_SAVE, Count, true, None, h_gs05_save, 0],
+    [gs23_save, "gamesave_s23_audio_a_save", 0x693720, B_GS23_SAVE, X_GS23_SAVE, Count, true, None, h_gs23_save, 0],
+    [gs24_save, "gamesave_s24_audio_b_save", 0x693730, B_GS24_SAVE, X_GS24_SAVE, Count, true, None, h_gs24_save, 0],
+    [gs25_save, "gamesave_s25_audio_c_save", 0x693740, B_GS25_SAVE, X_GS25_SAVE, Count, true, None, h_gs25_save, 0],
+    [gs26_save, "gamesave_s26_music_store_save", 0x693760, B_GS26_SAVE, X_GS26_SAVE, Count, true, None, h_gs26_save, 4],
+    [gs27_save, "gamesave_s27_store_discounts_save", 0x6937A0, B_GS27_SAVE, X_GS27_SAVE, Count, true, None, h_gs27_save, 0],
+    [gs07_load, "gamesave_s07_garage_load", 0x694470, B_GS07_LOAD, X_GS07_LOAD, Count, true, None, h_gs07_load, 0],
+    [gs22_load, "gamesave_s22_wiretap_load", 0x6944C0, B_GS22_LOAD, X_GS22_LOAD, Count, true, None, h_gs22_load, 0],
+    [gs09c_load, "gamesave_s09_activity_levels_load_coop", 0x6947C0, B_GS09C_LOAD, X_GS09C_LOAD, Count, true, None, h_gs09_load, 0],
+    [gs09_load, "gamesave_s09_activity_levels_load", 0x6947E0, B_GS09_LOAD, X_GS09_LOAD, Count, true, None, h_gs09_load, 0],
+    [gs10_load, "gamesave_s10_script_triggers_load", 0x694800, B_GS10_LOAD, X_GS10_LOAD, Count, true, None, h_gs10_load, 0],
+    [gs11c_load, "gamesave_s11_cribs_load_coop", 0x6948B0, B_GS11C_LOAD, X_GS11C_LOAD, Count, true, None, h_gs11c_load, 0],
+    [gs00_load, "gamesave_s00_timers_load", 0x694AB0, B_GS00_LOAD, X_GS00_LOAD, Count, true, None, h_gs00_load, 0],
+    [gs16_load, "gamesave_s16_persistent_objects_load", 0x694AE0, B_GS16_LOAD, X_GS16_LOAD, Count, true, None, h_gs16_load, 12],
+    [gs15_load, "gamesave_s15_cutscene_seen_load", 0x694B10, B_GS15_LOAD, X_GS15_LOAD, Count, true, None, h_gs15_load, 12],
+    [gs17_load, "gamesave_s17_rewards_load", 0x694B50, B_GS17_LOAD, X_GS17_LOAD, Count, true, None, h_gs17_load, 0],
+    [gs18_load, "gamesave_s18_activity_instances_load", 0x694BD0, B_GS18_LOAD, X_GS18_LOAD, Count, true, None, h_gs18_load, 0],
+    [gs20_load, "gamesave_s20_cheats_load", 0x694E20, B_GS20_LOAD, X_GS20_LOAD, Count, true, None, h_gs20_load, 0],
+    [gs12_load, "gamesave_s12_tutorials_load", 0x694E40, B_GS12_LOAD, X_GS12_LOAD, Snap, false, Some(rg_gs12_load), h_gs12_load, 0],
+    [gs13_load, "gamesave_s13_debug_display_options_load", 0x694E70, B_GS13_LOAD, X_GS13_LOAD, Snap, false, Some(rg_gs13_load), h_gs13_load, 0],
+    [gs01c_load, "gamesave_s01_world_grid_load_coop", 0x694EE0, B_GS01C_LOAD, X_GS01C_LOAD, Snap, false, Some(rg_gs01c_load), h_gs01c_load, 0],
+    [gs01_load, "gamesave_s01_world_grid_load", 0x694F30, B_GS01_LOAD, X_GS01_LOAD, Count, true, None, h_gs01_load, 0],
+    [gs05_load, "gamesave_s05_options_load", 0x694F80, B_GS05_LOAD, X_GS05_LOAD, Count, true, None, h_gs05_load, 0],
+    [gs23_load, "gamesave_s23_audio_a_load", 0x6950C0, B_GS23_LOAD, X_GS23_LOAD, Count, true, None, h_gs23_load, 0],
+    [gs24_load, "gamesave_s24_audio_b_load", 0x6950D0, B_GS24_LOAD, X_GS24_LOAD, Count, true, None, h_gs24_load, 0],
+    [gs25_load, "gamesave_s25_audio_c_load", 0x6950E0, B_GS25_LOAD, X_GS25_LOAD, Count, true, None, h_gs25_load, 0],
+    [gs26_load, "gamesave_s26_music_store_load", 0x6950F0, B_GS26_LOAD, X_GS26_LOAD, Count, true, None, h_gs26_load, 0],
+    [gs27_load, "gamesave_s27_store_discounts_load", 0x695130, B_GS27_LOAD, X_GS27_LOAD, Count, true, None, h_gs27_load, 0],
+    [recv_qos, "net_recv_qos", 0x80B5B0, B_RECV_QOS, X_RECV_QOS, Snap, false, Some(rg_recv_qos), h_recv_qos, 0],
+    [recv_bw_info, "net_recv_bw_info", 0x80B5E0, B_RECV_BW_INFO, X_RECV_BW_INFO, Count, true, None, h_recv_bw_info, 0],
+    [recv_next_srv, "net_recv_next_srv", 0x810A20, B_RECV_NEXT_SRV, X_RECV_NEXT_SRV, Snap, false, Some(rg_recv_next_srv), h_recv_next_srv, 0],
+    [recv_mod_sess, "net_recv_modified_session", 0x810BD0, B_RECV_MOD_SESS, X_RECV_MOD_SESS, Snap, false, Some(rg_recv_modified_session), h_recv_modified_session, 0],
+    [recv_notor, "net_recv_notor_active", 0x924D30, B_RECV_NOTOR, X_RECV_NOTOR, Snap, false, Some(rg_recv_notor_active), h_recv_notor_active, 0],
+    [misc_pkt_05, "misc_packet_sub_05", 0x548580, B_MISC_PKT_05, X_MISC_PKT_05, Count, true, None, h_misc_pkt_05, 0],
+    [misc_pkt_17, "misc_packet_sub_17", 0xA2C670, B_MISC_PKT_17, X_MISC_PKT_17, Snap, false, Some(rg_misc_pkt_17), h_misc_pkt_17, 0],
+    [hud_pkt_16, "hud_pkt_sub_16", 0xA2DDB0, B_HUD_PKT_16, X_HUD_PKT_16, Count, true, None, h_hud_pkt_16, 0],
+    [recv_acks, "net_recv_acks", 0x7FB150, B_RECV_ACKS, X_RECV_ACKS, Count, true, None, h_recv_acks, 0],
+    [recv_sessstart, "net_recv_sessionstart", 0x835930, B_RECV_SESSSTART, X_RECV_SESSSTART, Count, true, None, h_recv_sessionstart, 0],
+    [act_3f, "act_packet_sub_3f", 0x5AF3F0, B_ACT_3F, X_ACT_3F, Snap, false, Some(rg_act_3f), h_act_3f, 0],
+    [act_3e, "act_packet_sub_3e", 0x5AF390, B_ACT_3E, X_ACT_3E, Snap, false, Some(rg_act_3e), h_act_3e, 0],
+    [act_44, "act_packet_sub_44", 0x5BBBA0, B_ACT_44, X_ACT_44, Snap, false, Some(rg_act_44), h_act_44, 0],
+    [act_4a, "act_packet_sub_4a", 0x5F7E30, B_ACT_4A, X_ACT_4A, Snap, false, Some(rg_act_4a), h_act_4a, 8],
+    [act_1a, "act_packet_sub_1a", 0x5E7F10, B_ACT_1A, X_ACT_1A, Snap, false, Some(rg_act_1a), h_act_1a, 0],
+    [act_48, "act_packet_sub_48", 0x609790, B_ACT_48, X_ACT_48, Snap, false, Some(rg_act_48), h_act_48, 0],
+    [act_46, "act_packet_sub_46", 0x5BBD20, B_ACT_46, X_ACT_46, Snap, false, Some(rg_act_46), h_act_46, 0],
+    [recv_no_connect, "net_recv_no_connect", 0x7FAF30, B_RECV_NO_CONNECT, X_RECV_NO_CONNECT, Pure, false, None, h_recv_no_connect, 0],
+    [act_1d, "act_packet_sub_1d", 0x677BB0, B_ACT_1D, X_ACT_1D, Count, true, None, h_act_1d, 0],
+    [act_1e, "act_packet_sub_1e", 0x677BD0, B_ACT_1E, X_ACT_1E, Count, true, None, h_act_1e, 0],
+    [act_15, "act_packet_sub_15", 0x566B70, B_ACT_15, X_ACT_15, Count, true, None, h_act_15, 0],
+    [act_18, "act_packet_sub_18", 0x566C00, B_ACT_18, X_ACT_18, Count, true, None, h_act_18, 0],
+    [act_17, "act_packet_sub_17", 0x566BD0, B_ACT_17, X_ACT_17, Count, true, None, h_act_17, 0],
+    [act_19, "act_packet_sub_19", 0x566C30, B_ACT_19, X_ACT_19, Count, true, None, h_act_19, 0],
+    [act_41, "act_packet_sub_41", 0x5C2600, B_ACT_41, X_ACT_41, Count, true, None, h_act_41, 0],
 }
 
 // =================================================================================================
@@ -3274,7 +3696,7 @@ mod tests {
             let base = ar.as_ptr() as usize;
             let mut ranges = Vec::new();
             match PORTS[id].ranges {
-                Some(f) => f(&Pushad { edi: 0, esi: 0, ebp: 0, esp: 0, ebx: 0, edx: 0, ecx: 0, eax: 0 }, std::ptr::null(), &mut ranges),
+                Some(f) => f(&Pushad { xmm: [[0; 4]; 8], edi: 0, esi: 0, ebp: 0, esp: 0, ebx: 0, edx: 0, ecx: 0, eax: 0 }, std::ptr::null(), &mut ranges),
                 None => ranges.push((0x27974C4, 16)), // sticky_fire: Count mode, no range function
             }
             let mut watch = ranges.clone();

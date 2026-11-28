@@ -104,12 +104,30 @@ macro_rules! regs_thunk {
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
-                "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 128]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
@@ -301,10 +319,10 @@ unsafe fn sun_world_position(obj: u32, out: usize) {
         if obj != 0 {
             let v: [u32; 3] = [0, q32(rd(0x00E9_8FFC)), 0];
             let mut o = [0u32; 3];
-            call_regs(0x0040_6810, 0, obj + 0x20, v.as_ptr() as u32, out as u32, 0, &[o.as_mut_ptr() as u32]);
-            st(out, f32::from_bits(o[0]) as f64 + cx);
-            st(out + 4, f32::from_bits(o[1]) as f64 + cy);
-            st(out + 8, f32::from_bits(o[2]) as f64 + cz);
+            let p = call_regs(0x0040_6810, 0, obj + 0x20, v.as_ptr() as u32, out as u32, 0, &[o.as_mut_ptr() as u32]) as usize;
+            st(out, ld(p) + cx);
+            st(out + 4, ld(p + 4) + cy);
+            st(out + 8, ld(p + 8) + cz);
         } else {
             st(out, cx + 0.0);
             st(out + 4, cy + ld64(0x00E5_CC70));
@@ -374,7 +392,7 @@ unsafe fn ambient_slot3(r: &Pushad, a: *const u32) {
 
 /// 0x4DF030 sky_weather_params_gather (EAX, ECX and arg0 = out vec3s): copies the weather results
 /// 0x2659828.. out and has 0x4E3230 blend them in place.
-unsafe fn params_gather(r: &Pushad, a: *const u32) {
+unsafe fn params_gather(r: &Pushad, a: *const u32) -> u32 {
     unsafe {
         let (o1, o3, o2) = (r.eax as usize, r.ecx as usize, *a as usize);
         for i in 0..3 {
@@ -386,7 +404,7 @@ unsafe fn params_gather(r: &Pushad, a: *const u32) {
         for i in 0..3 {
             wd(o3 + 4 * i, rd(0x0265_9840 + 4 * i));
         }
-        call_regs(0x004E_3230, o1 as u32, o3 as u32, rd(0x0265_9848), r.esi, o2 as u32, &[o3 as u32]);
+        call_regs(0x004E_3230, o1 as u32, o3 as u32, rd(0x0265_9848), r.esi, o2 as u32, &[o3 as u32])
     }
 }
 
@@ -856,17 +874,22 @@ entry!(sun_pos_entry, sun_pos_thunk, "ret", SUN_POS, 0, true, |r, a| regions [(r
     sun_world_position(r.eax, r.esi as usize);
     r.eax = r.esi;
 });
-entry!(amb_slot0_entry, amb_slot0_thunk, "ret", AMB_SLOT0, 0, false, |r, a| regions [(r.eax as usize, 12)], ambient_get(r.eax as usize, 0x00E9_D3CC, 0x0265_8DE8));
-entry!(amb_level_entry, amb_level_thunk, "ret", AMB_LEVEL, 0, false, |r, a| regions [(r.eax as usize, 12)], ambient_get(r.eax as usize, 0x00E9_D3D8, 0x0265_8DF4));
-entry!(amb_tree_entry, amb_tree_thunk, "ret", AMB_TREE, 0, false, |r, a| regions [(r.eax as usize, 12)], ambient_get(r.eax as usize, 0x00E9_D3E4, 0x0265_8E00));
-entry!(amb_slot4_entry, amb_slot4_thunk, "ret", AMB_SLOT4, 0, false, |r, a| regions [(r.eax as usize, 12)], ambient_get(r.eax as usize, 0x00E9_D3FC, 0x0265_8E18));
+entry!(amb_slot0_entry, amb_slot0_thunk, "ret", AMB_SLOT0, 0, false, |r, a| regions [(r.eax as usize, 12)], { ambient_get(r.eax as usize, 0x00E9_D3CC, 0x0265_8DE8); r.ecx = rd(0x00E9_8948); });
+entry!(amb_level_entry, amb_level_thunk, "ret", AMB_LEVEL, 0, false, |r, a| regions [(r.eax as usize, 12)], { ambient_get(r.eax as usize, 0x00E9_D3D8, 0x0265_8DF4); r.ecx = rd(0x00E9_8948); });
+entry!(amb_tree_entry, amb_tree_thunk, "ret", AMB_TREE, 0, false, |r, a| regions [(r.eax as usize, 12)], { ambient_get(r.eax as usize, 0x00E9_D3E4, 0x0265_8E00); r.ecx = rd(0x00E9_8948); });
+entry!(amb_slot4_entry, amb_slot4_thunk, "ret", AMB_SLOT4, 0, false, |r, a| regions [(r.eax as usize, 12)], { ambient_get(r.eax as usize, 0x00E9_D3FC, 0x0265_8E18); r.ecx = rd(0x00E9_8948); });
 entry!(
     amb_slot3_entry, amb_slot3_thunk, "ret", AMB_SLOT3, 5, false,
     |r, a| regions [(*a as usize, 12), (*a.add(1) as usize, 12), (*a.add(2) as usize, 12), (r.ecx as usize, 12), (r.eax as usize, 12), (*a.add(3) as usize, 4), (*a.add(4) as usize, 4)],
-    ambient_slot3(r, a)
+    {
+        ambient_slot3(r, a);
+        r.ecx = rd(0x0265_8E50);
+        r.edx = *a.add(3);
+        r.eax = *a.add(4);
+    }
 );
-entry!(gather_entry, gather_thunk, "ret", GATHER, 1, false, |r, a| regions [(r.eax as usize, 12), (*a as usize, 12), (r.ecx as usize, 12)], params_gather(r, a));
-entry!(targets_set_entry, targets_set_thunk, "ret", TARGETS_SET, 1, false, |r, a| regions [(0x00E9_D408, 60)], override_targets_set(*a));
+entry!(gather_entry, gather_thunk, "ret", GATHER, 1, false, |r, a| regions [(r.eax as usize, 12), (*a as usize, 12), (r.ecx as usize, 12)], { r.eax = params_gather(r, a); });
+entry!(targets_set_entry, targets_set_thunk, "ret", TARGETS_SET, 1, false, |r, a| regions [(0x00E9_D408, 60)], { override_targets_set(*a); let v = q32(*a); r.eax = v; r.ecx = v; r.edx = v; });
 
 /// 0x4D4480: shadowed on its returned ST0.
 extern "C" fn approach_checked(cur: u32, target: u32) -> f64 {

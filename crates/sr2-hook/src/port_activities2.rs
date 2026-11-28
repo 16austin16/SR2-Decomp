@@ -57,10 +57,28 @@ macro_rules! regs_thunk {
                 "pushad",
                 "mov eax, esp",
                 "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
@@ -259,6 +277,99 @@ unsafe fn vcall(this: u32, slot: usize, args: &[u32]) -> u32 {
     }
 }
 
+/// The seven general registers as a port tracks them (what the original leaves in each).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct St {
+    pub eax: u32,
+    pub ecx: u32,
+    pub edx: u32,
+    pub ebx: u32,
+    pub esi: u32,
+    pub edi: u32,
+    pub ebp: u32,
+}
+
+impl St {
+    fn of(p: &Pushad) -> St {
+        St { eax: p.eax, ecx: p.ecx, edx: p.edx, ebx: p.ebx, esi: p.esi, edi: p.edi, ebp: p.ebp }
+    }
+    fn put(&self, p: &mut Pushad) {
+        p.eax = self.eax;
+        p.ecx = self.ecx;
+        p.edx = self.edx;
+        p.ebx = self.ebx;
+        p.esi = self.esi;
+        p.edi = self.edi;
+        p.ebp = self.ebp;
+    }
+}
+
+#[repr(C)]
+#[allow(dead_code)] // fields are used by the asm only
+struct CallBlk {
+    f: u32,
+    r: St,
+    argp: u32,
+    argn: u32,
+    st0: f64,
+    want: u32,
+}
+
+/// Call `f` with all seven registers from `st` and the cdecl stack arguments `args` (pushed so that
+/// `args[0]` is lowest); every register the callee leaves comes back in `st`. `FIX` is what the
+/// caller must add to ESP afterwards: 0 for a callee that pops its arguments, 4 * args.len() for
+/// a cdecl one. With `want_st0` the callee's ST0 is popped and returned.
+pub(crate) unsafe fn callx_<const FIX: usize>(f: usize, st: &mut St, args: &[u32], want_st0: bool) -> f64 {
+    let mut b = CallBlk { f: f as u32, r: *st, argp: args.as_ptr() as u32, argn: args.len() as u32, st0: 0.0, want: want_st0 as u32 };
+    unsafe {
+        std::arch::asm!(
+            "push ebx", "push esi", "push edi", "push ebp",
+            "push eax",
+            "mov ecx, [eax + 36]",
+            "mov esi, [eax + 32]",
+            "2:",
+            "test ecx, ecx",
+            "jz 3f",
+            "push dword ptr [esi + ecx*4 - 4]",
+            "dec ecx",
+            "jmp 2b",
+            "3:",
+            "mov ecx, [eax + 8]", "mov edx, [eax + 12]", "mov ebx, [eax + 16]",
+            "mov esi, [eax + 20]", "mov edi, [eax + 24]", "mov ebp, [eax + 28]",
+            "call 9f",
+            "add esp, {fix}",
+            "xchg ebx, [esp]",
+            "mov [ebx + 4], eax", "mov [ebx + 8], ecx", "mov [ebx + 12], edx",
+            "mov [ebx + 20], esi", "mov [ebx + 24], edi", "mov [ebx + 28], ebp",
+            "cmp dword ptr [ebx + 48], 0",
+            "je 6f",
+            "fstp qword ptr [ebx + 40]",
+            "6:",
+            "pop dword ptr [ebx + 16]",
+            "pop ebp", "pop edi", "pop esi", "pop ebx",
+            "jmp 8f",
+            "9:",
+            "push dword ptr [eax]",
+            "mov eax, [eax + 4]",
+            "ret",
+            "8:",
+            fix = const FIX,
+            inout("eax") &mut b as *mut CallBlk => _,
+            lateout("ecx") _,
+            lateout("edx") _,
+            clobber_abi("C"),
+        );
+    }
+    *st = b.r;
+    b.st0
+}
+
+/// `callx_` for a callee that pops its own arguments (every virtual method here).
+pub(crate) unsafe fn callx(f: usize, st: &mut St, args: &[u32]) {
+    unsafe { callx_::<0>(f, st, args, false) };
+}
+
 // --- 0x53C4D0 activity_current_type -----------------------------------------------------------------
 
 /// -1 unless the current mission is an activity (kind +0x3C == 1); else the info's get_activity_type.
@@ -336,13 +447,25 @@ regs_thunk!(player_flag_thunk, player_flag_entry);
 
 /// The fight club countdown (info +0x1A4), or the constant at 0xDD0794 (5.0) when the current
 /// mission is not a type-3 activity.
-unsafe fn countdown() -> u32 {
+unsafe fn countdown(st: &mut St) -> u32 {
     unsafe {
         let m = rd(MISSION);
+        st.eax = m;
         if m != 0 && rd(m as usize + 0x3C) == 1 {
             let info = rd(m as usize + 0x90);
-            if info != 0 && vcall(info, 1, &[]) == 3 {
-                return q32(rd(info as usize + 0x1A4));
+            if info != 0 {
+                let vt = rd(info as usize);
+                let f = rd(vt as usize + 4);
+                let esi = st.esi;
+                st.eax = vt;
+                st.edx = f;
+                st.ecx = info;
+                st.esi = info;
+                callx(f as usize, st, &[]);
+                st.esi = esi;
+                if st.eax == 3 {
+                    return q32(rd(info as usize + 0x1A4));
+                }
             }
         }
         q32(rd(0x00DD_0794))
@@ -351,7 +474,9 @@ unsafe fn countdown() -> u32 {
 
 extern "C" fn countdown_entry(r: &mut Pushad, _: *const u32) -> f32 {
     let p = *r;
-    let ours = unsafe { countdown() };
+    let mut st = St::of(r);
+    let ours = unsafe { countdown(&mut st) };
+    st.put(r);
     let Some((n, orig)) = shadowing(COUNTDOWN) else { return f32::from_bits(ours) };
     let o = (unsafe { call_regs_st0(orig, p.eax, p.ecx, p.edx, p.esi, p.edi, &[]) } as f32).to_bits();
     if o != ours {
@@ -383,17 +508,34 @@ unsafe fn marker_scan(esi: u32) -> Option<u32> {
     }
 }
 
+/// ECX / EDX the two scans leave: EDX = the count; ECX = the entry's handle slot (base + 8 + 0x104 * i,
+/// one past the last entry when absent), unchanged for an empty table.
+unsafe fn marker_scan_regs(found: Option<u32>, ecx_in: u32) -> (u32, u32) {
+    unsafe {
+        let n = rd(MARKER_COUNT);
+        if (n as i32) <= 0 {
+            return (ecx_in, n);
+        }
+        let i = found.unwrap_or(n);
+        (rd(MARKER_BASE).wrapping_add(8).wrapping_add(i.wrapping_mul(0x104)), n)
+    }
+}
+
 extern "C" fn marker_find_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    let ours = unsafe { marker_scan(p.esi).map_or(0, |i| rd(MARKER_BASE).wrapping_add(i.wrapping_mul(0x104))) };
+    let found = unsafe { marker_scan(p.esi) };
+    let ours = found.map_or(0, |i| unsafe { rd(MARKER_BASE).wrapping_add(i.wrapping_mul(0x104)) });
     r.eax = checked(MARKER_FIND, &p, &[], ours);
+    (r.ecx, r.edx) = unsafe { marker_scan_regs(found, p.ecx) };
 }
 regs_thunk!(marker_find_thunk, marker_find_entry);
 
 extern "C" fn marker_index_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    let ours = unsafe { marker_scan(p.esi) }.unwrap_or(NONE);
+    let found = unsafe { marker_scan(p.esi) };
+    let ours = found.unwrap_or(NONE);
     r.eax = checked(MARKER_INDEX, &p, &[], ours);
+    (r.ecx, r.edx) = unsafe { marker_scan_regs(found, p.ecx) };
 }
 regs_thunk!(marker_index_thunk, marker_index_entry);
 
@@ -426,7 +568,11 @@ extern "C" fn marker_remove_entry(r: &mut Pushad, _: *const u32) {
         }
         v
     };
+    // The jge path leaves ECX = count - 1 (the `lea`), the copy path ends `rep movsd` with ECX = 0.
+    let n = unsafe { rd(MARKER_COUNT) };
+    let copies = (p.eax as i32) < (n.wrapping_sub(1) as i32);
     r.eax = snap_checked(MARKER_REMOVE, &p, &[], regions, || unsafe { marker_remove(p.eax) });
+    r.ecx = if copies { 0 } else { n.wrapping_sub(1) };
 }
 regs_thunk!(marker_remove_thunk, marker_remove_entry);
 
@@ -452,10 +598,24 @@ unsafe fn progress_entry(ecx: u32) -> Option<usize> {
     }
 }
 
+/// ECX / EDX the table scans leave: EDX = the count; ECX = the entry address reached (one past the
+/// last when absent), unchanged for an empty table.
+unsafe fn progress_regs(found: Option<usize>, ecx_in: u32) -> (u32, u32) {
+    unsafe {
+        let n = rd(PROGRESS_COUNT);
+        if n == 0 {
+            return (ecx_in, 0);
+        }
+        (found.unwrap_or(PROGRESS_TABLE + 12 * n as usize) as u32, n)
+    }
+}
+
 extern "C" fn levels_done_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    let ours = unsafe { progress_entry(p.ecx) }.map_or(NONE, |e| unsafe { rd(e + 4) });
+    let found = unsafe { progress_entry(p.ecx) };
+    let ours = found.map_or(NONE, |e| unsafe { rd(e + 4) });
     r.eax = checked(LEVELS_DONE, &p, &[], ours);
+    (r.ecx, r.edx) = unsafe { progress_regs(found, p.ecx) };
 }
 regs_thunk!(levels_done_thunk, levels_done_entry);
 
@@ -487,6 +647,29 @@ unsafe fn levels_mask(ecx: u32, edi: u32) -> u32 {
 extern "C" fn levels_mask_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     r.eax = checked(LEVELS_MASK, &p, &[], unsafe { levels_mask(p.ecx, p.edi) });
+    unsafe {
+        let found = progress_entry(p.ecx);
+        (r.ecx, r.edx) = progress_regs(found, p.ecx);
+        if let Some(e) = found {
+            // Found: ECX is the bit counter (0 for a negative level), EDX the last mask `1 << cl`.
+            r.ecx = 0;
+            if (p.edi as i32) >= 0 {
+                let byte = rb(e + 8) as u32;
+                let mut cl = 0u32;
+                loop {
+                    r.edx = 1u32 << (cl & 31);
+                    if byte & r.edx == 0 {
+                        break;
+                    }
+                    cl += 1;
+                    if (cl as i32) > (p.edi as i32) {
+                        break;
+                    }
+                }
+                r.ecx = cl;
+            }
+        }
+    }
 }
 regs_thunk!(levels_mask_thunk, levels_mask_entry);
 
@@ -544,34 +727,47 @@ fn button_action(index: u32) -> Option<u32> {
 }
 
 /// `input_action_down` / `just_pressed` (ECX = action -> AL), as 0 / 1 in EAX.
-unsafe fn button_query(f: usize, eax: u32) -> u32 {
+unsafe fn button_query(f: usize, st: &mut St) -> u32 {
     unsafe {
-        let Some(action) = button_action(eax) else { return lo(eax, 0) };
-        let al = call_regs(f, eax, action, 0, 0, 0, &[]) & 0xFF;
-        (al == 1) as u32
+        let Some(action) = button_action(st.eax) else { return lo(st.eax, 0) };
+        st.ecx = action;
+        callx(f, st, &[]);
+        ((st.eax & 0xFF) == 1) as u32
     }
 }
 
 extern "C" fn btn_down_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked(BTN_DOWN, &p, &[], unsafe { button_query(0x004F_F640, p.eax) });
+    let mut st = St::of(r);
+    let v = unsafe { button_query(0x004F_F640, &mut st) };
+    st.put(r);
+    r.eax = checked(BTN_DOWN, &p, &[], v);
 }
 regs_thunk!(btn_down_thunk, btn_down_entry);
 
 extern "C" fn btn_pressed_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = checked(BTN_PRESSED, &p, &[], unsafe { button_query(0x004F_F700, p.eax) });
+    let mut st = St::of(r);
+    let v = unsafe { button_query(0x004F_F700, &mut st) };
+    st.put(r);
+    r.eax = checked(BTN_PRESSED, &p, &[], v);
 }
 regs_thunk!(btn_pressed_thunk, btn_pressed_entry);
 
 extern "C" fn btn_name_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let mut st = St::of(r);
     let ours = unsafe {
         match button_action(p.eax) {
-            Some(action) => call_regs(0x004F_FBB0, action, 0, 0, 0, 0, &[]),
+            Some(action) => {
+                st.eax = action;
+                callx(0x004F_FBB0, &mut st, &[]);
+                st.eax
+            }
             None => 0,
         }
     };
+    st.put(r);
     r.eax = checked(BTN_NAME, &p, &[], ours);
 }
 regs_thunk!(btn_name_thunk, btn_name_entry);
@@ -580,13 +776,24 @@ regs_thunk!(btn_name_thunk, btn_name_entry);
 
 extern "C" fn roll_chance_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let mut st = St::of(r);
+    // ECX ends as the rolled f32's bits: `fstp [esp + 4]` overwrites the slot the entry ECX was
+    // pushed to, and `pop ecx` takes it back; EDX is what the generator leaves.
+    let mut roll_bits = 0u32;
     let ours = || unsafe {
-        let roll = call_regs_st0(0x00BD_CE30, 0x00EC_30F8, 0, 0, 0, 0, &[]) as f32;
+        let mut s2 = St::of(&p);
+        s2.eax = 0x00EC_30F8;
+        s2.esi = p.ecx;
+        let roll = callx_::<0>(0x00BD_CE30, &mut s2, &[], true) as f32;
+        st.edx = s2.edx;
+        roll_bits = roll.to_bits();
         let thr = rf(p.ecx as usize + 0x14);
         (thr > roll) as u32
     };
     // The only write is the generator's index at 0xEC30F8 + 0x9C4.
     r.eax = snap_checked(ROLL_CHANCE, &p, &[], || vec![(0x00EC_30F8 + 0x9C4, 4)], ours);
+    r.ecx = roll_bits;
+    r.edx = st.edx;
 }
 regs_thunk!(roll_chance_thunk, roll_chance_entry);
 
@@ -638,7 +845,10 @@ unsafe fn wait_timer(this: usize) -> u32 {
 extern "C" fn wait_timer_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let this = p.edx as usize;
+    // ECX: unchanged when the timer was unset; else it ends as `now - t` (t <= now) or `now`.
+    let (t, now) = unsafe { (rd(this + 0x2C) as i32, rd(GAME_NOW)) };
     r.eax = snap_checked(WAIT_TIMER, &p, &[], || vec![(this + 0xC, 4), (this + 0x2C, 4)], || unsafe { wait_timer(this) });
+    r.ecx = if t < 0 { p.ecx } else if t <= now as i32 { now.wrapping_sub(t as u32) } else { now };
 }
 regs_thunk!(wait_timer_thunk, wait_timer_entry);
 
@@ -646,7 +856,13 @@ regs_thunk!(wait_timer_thunk, wait_timer_entry);
 
 extern "C" fn hud_open_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    let ours = unsafe { call_regs(0x00B9_51E0, 0, 0x00DF_0730, 0, 0, 0, &[]) != 0 } as u32;
+    let mut st = St::of(r);
+    st.ecx = 0x00DF_0730;
+    let ours = unsafe {
+        callx(0x00B9_51E0, &mut st, &[]);
+        (st.eax != 0) as u32
+    };
+    st.put(r);
     r.eax = checked(HUD_OPEN, &p, &[], ours);
 }
 regs_thunk!(hud_open_thunk, hud_open_entry);
@@ -659,6 +875,7 @@ fn racing_regions() -> Vec<(usize, usize)> {
 
 extern "C" fn racing_leave_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    r.ecx = unsafe { rd(0x033D_630C) };
     r.eax = snap_checked(R_LEAVE, &p, &[], racing_regions, || unsafe {
         let c = rd(0x033D_630C);
         wd(0x00EA_A860, NONE);
@@ -672,6 +889,7 @@ regs_thunk!(racing_leave_thunk, racing_leave_entry);
 
 extern "C" fn racing_init_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    r.ecx = 0;
     r.eax = snap_checked(R_INIT, &p, &[], racing_regions, || unsafe {
         let c = rd(0x033D_630C);
         wd(0x00EA_A860, NONE);
@@ -760,14 +978,18 @@ fn hit(i: usize) {
     CTR[i].fetch_add(1, Ordering::Relaxed);
 }
 
-// 0x53E830 activity_release_player_control
-extern "C" fn release_control() {
+// 0x53E830 activity_release_player_control (EDX = the control object; the callee reads EBX / ESI too)
+extern "C" fn release_control_entry(r: &mut Pushad, _: *const u32) {
     hit(0);
     unsafe {
-        call_regs(0x004F_5210, 0, 0, rd(0x0252_7430), 0, 0, &[]);
+        let mut st = St::of(r);
+        st.edx = rd(0x0252_7430);
+        callx_::<0>(0x004F_5210, &mut st, &[], false);
         wd(0x0252_7430, 0);
+        st.put(r);
     }
 }
+regs_thunk!(release_control, release_control_entry);
 
 // 0x5E6410 activity_hud_marker_free (EAX = handle -> index or -1)
 unsafe fn marker_free(h: u32) -> u32 {
@@ -826,6 +1048,7 @@ extern "system" fn fighter_clear(g: u32) {
 }
 
 /// The current activity's level instance, or 0.
+#[allow(dead_code)]
 unsafe fn level_instance() -> u32 {
     unsafe {
         let act = rd(ACTIVITY);
@@ -833,184 +1056,297 @@ unsafe fn level_instance() -> u32 {
     }
 }
 
-macro_rules! activity_level_fwd {
-    ($name:ident, $c:expr, $slot:expr, ($($a:ident),*)) => {
-        extern "C" fn $name($($a: u32),*) {
-            hit($c);
-            unsafe {
-                let lv = level_instance();
-                if lv != 0 {
-                    hit($c + 1);
-                    vcall(lv, $slot / 4, &[$($a),*]);
-                }
+/// The argument `i` of the caller's stack frame (arg 0 at ESP + 4 on entry).
+unsafe fn arg(a: *const u32, i: usize) -> u32 {
+    unsafe { *a.add(i) }
+}
+
+/// `act = [ACTIVITY]; if (act) { lv = [act + 0x10]; if (lv) lv->slot(args) }`, the 0x53C1E0 .. 0x53C350
+/// shape, with EAX / ECX / EDX as the original leaves them (EAX = the method, ECX = lv, EDX = args[0]).
+unsafe fn act_level_call(r: &mut Pushad, a: *const u32, ctr: usize, slot: usize, n: usize) {
+    hit(ctr);
+    unsafe {
+        let mut st = St::of(r);
+        let act = rd(ACTIVITY);
+        st.eax = act;
+        if act != 0 {
+            let lv = rd(act as usize + 0x10);
+            st.ecx = lv;
+            if lv != 0 {
+                hit(ctr + 1);
+                let f = rd(rd(lv as usize) as usize + slot);
+                let args: [u32; 4] = [arg(a, 0), if n > 1 { arg(a, 1) } else { 0 }, if n > 2 { arg(a, 2) } else { 0 }, if n > 3 { arg(a, 3) } else { 0 }];
+                st.edx = args[0];
+                st.eax = f;
+                callx(f as usize, &mut st, &args[..n]);
             }
         }
+        st.put(r);
+    }
+}
+
+macro_rules! activity_level_fwd {
+    ($name:ident, $entry:ident, $c:expr, $slot:expr, $n:expr) => {
+        extern "C" fn $entry(r: &mut Pushad, a: *const u32) {
+            unsafe { act_level_call(r, a, $c, $slot, $n) }
+        }
+        regs_thunk!($name, $entry);
     };
 }
-activity_level_fwd!(a_ev20, 8, 0x30, (a0));
-activity_level_fwd!(a_ev21, 10, 0x34, (a0));
-activity_level_fwd!(a_ev22, 12, 0x38, (a0));
-activity_level_fwd!(a_ev23, 14, 0x3C, (a0));
-activity_level_fwd!(a_damaged, 18, 0x28, (a0, a1, a2, a3));
-activity_level_fwd!(a_ev19, 20, 0x40, (a0, a1, a2, a3));
+activity_level_fwd!(a_ev20, a_ev20_e, 8, 0x30, 1);
+activity_level_fwd!(a_ev21, a_ev21_e, 10, 0x34, 1);
+activity_level_fwd!(a_ev22, a_ev22_e, 12, 0x38, 1);
+activity_level_fwd!(a_ev23, a_ev23_e, 14, 0x3C, 1);
+activity_level_fwd!(a_damaged, a_damaged_e, 18, 0x28, 4);
+activity_level_fwd!(a_ev19, a_ev19_e, 20, 0x40, 4);
 
-// 0x53C350 game_mode_activity_on_game_event_26: the activity itself, slot 0x28, three arguments
-extern "C" fn a_ev26(a0: u32, a1: u32, a2: u32) {
+// 0x53C350 game_mode_activity_on_game_event_26: the activity itself (ECX), slot 0x28, three arguments
+extern "C" fn a_ev26_e(r: &mut Pushad, a: *const u32) {
     hit(16);
     unsafe {
+        let mut st = St::of(r);
         let act = rd(ACTIVITY);
+        st.ecx = act;
         if act != 0 {
             hit(17);
-            vcall(act, 0x28 / 4, &[a0, a1, a2]);
+            let f = rd(rd(act as usize) as usize + 0x28);
+            let args = [arg(a, 0), arg(a, 1), arg(a, 2)];
+            st.edx = args[0];
+            st.eax = f;
+            callx(f as usize, &mut st, &args);
         }
+        st.put(r);
     }
 }
+regs_thunk!(a_ev26, a_ev26_e);
 
-/// The mission info object when the current mission is an activity with a valid type, as the
-/// event callbacks 10-12 and 15 check it: kind 1, `get_activity_type != -1`, kind 1 again, info != 0.
-unsafe fn activity_info_checked() -> u32 {
+/// The mission info forwarders (0x53BED0 / 0x53BF50 / 0x53BFD0 with four arguments, 0x53C210 with
+/// five): `mission->info->type() != -1`, then the info method `info_slot` and the activity level
+/// method `level_slot`. ESI / EBX / EBP / EDI come back as they went in; EAX / ECX / EDX as the
+/// original's last instructions leave them.
+unsafe fn mission_fwd(r: &mut Pushad, a: *const u32, ctr: usize, info_slot: usize, level_slot: usize, n: usize) {
+    hit(ctr);
     unsafe {
-        let m = rd(MISSION);
-        if m == 0 || rd(m as usize + 0x3C) != 1 {
-            return 0;
+        let entry = St::of(r);
+        let mut st = entry;
+        'body: {
+            let m = rd(MISSION);
+            st.eax = m;
+            if m == 0 || rd(m as usize + 0x3C) != 1 {
+                break 'body;
+            }
+            // push esi; mov esi, 1; info->type()
+            let info = rd(m as usize + 0x90);
+            let vt = rd(info as usize);
+            let f = rd(vt as usize + 4);
+            st.ecx = info;
+            st.eax = vt;
+            st.edx = f;
+            st.esi = 1;
+            callx(f as usize, &mut st, &[]);
+            if st.eax == NONE {
+                break 'body;
+            }
+            let m = rd(MISSION);
+            st.eax = m;
+            if m == 0 || rd(m as usize + 0x3C) != 1 {
+                break 'body;
+            }
+            let info = rd(m as usize + 0x90);
+            st.ecx = info;
+            if info == 0 {
+                break 'body;
+            }
+            hit(ctr + 1);
+            let args: [u32; 5] = [arg(a, 0), arg(a, 1), arg(a, 2), arg(a, 3), arg(a, 4)];
+            let vt = rd(info as usize);
+            let f = rd(vt as usize + info_slot);
+            st.esi = args[n - 1];
+            st.ebp = args[0];
+            st.ebx = args[1];
+            st.edi = args[2];
+            st.eax = f;
+            st.edx = if n == 5 { args[0] } else { f };
+            if n == 4 {
+                st.eax = vt;
+            }
+            callx(f as usize, &mut st, &args[..n]);
+            let act = rd(ACTIVITY);
+            st.eax = act;
+            if act == 0 {
+                break 'body;
+            }
+            let lv = rd(act as usize + 0x10);
+            st.ecx = lv;
+            if lv == 0 {
+                break 'body;
+            }
+            hit(ctr + 2);
+            let vt = rd(lv as usize);
+            let f = rd(vt as usize + level_slot);
+            st.eax = if n == 5 { args[0] } else { vt };
+            st.edx = f;
+            callx(f as usize, &mut st, &args[..n]);
         }
-        if vcall(rd(m as usize + 0x90), 1, &[]) == NONE {
-            return 0;
-        }
-        let m = rd(MISSION);
-        if m == 0 || rd(m as usize + 0x3C) != 1 {
-            return 0;
-        }
-        rd(m as usize + 0x90)
+        st.esi = entry.esi;
+        st.ebx = entry.ebx;
+        st.ebp = entry.ebp;
+        st.edi = entry.edi;
+        st.put(r);
     }
 }
 
-macro_rules! activity_event_fwd {
-    ($name:ident, $c:expr, $info_slot:expr, $level_slot:expr, ($($a:ident),*)) => {
-        extern "C" fn $name($($a: u32),*) {
-            hit($c);
-            unsafe {
-                let info = activity_info_checked();
-                if info == 0 {
-                    return;
-                }
-                hit($c + 1);
-                vcall(info, $info_slot / 4, &[$($a),*]);
-                let lv = level_instance();
-                if lv != 0 {
-                    hit($c + 2);
-                    vcall(lv, $level_slot / 4, &[$($a),*]);
-                }
-            }
+macro_rules! mission_event_fwd {
+    ($name:ident, $entry:ident, $c:expr, $info_slot:expr, $level_slot:expr, $n:expr) => {
+        extern "C" fn $entry(r: &mut Pushad, a: *const u32) {
+            unsafe { mission_fwd(r, a, $c, $info_slot, $level_slot, $n) }
         }
+        regs_thunk!($name, $entry);
     };
 }
-activity_event_fwd!(a_human_killed, 22, 0x4C, 0x18, (a0, a1, a2, a3));
-activity_event_fwd!(a_obj_killed, 25, 0x50, 0x1C, (a0, a1, a2, a3));
-activity_event_fwd!(a_veh_destroyed, 28, 0x54, 0x20, (a0, a1, a2, a3));
-activity_event_fwd!(a_ev15, 31, 0x48, 0x2C, (a0, a1, a2, a3, a4));
+mission_event_fwd!(a_human_killed, a_human_killed_e, 22, 0x4C, 0x18, 4);
+mission_event_fwd!(a_obj_killed, a_obj_killed_e, 25, 0x50, 0x1C, 4);
+mission_event_fwd!(a_veh_destroyed, a_veh_destroyed_e, 28, 0x54, 0x20, 4);
+mission_event_fwd!(a_ev15, a_ev15_e, 31, 0x48, 0x2C, 5);
 
 // 0x53BE30 game_mode_activity_time_step (float dt)
-extern "C" fn a_time_step(dt: u32) {
+extern "C" fn a_time_step_e(r: &mut Pushad, a: *const u32) {
     hit(34);
     unsafe {
-        let dt = q32(dt);
-        let lv = level_instance();
-        if lv != 0 {
-            hit(35);
-            vcall(lv, 0x10 / 4, &[dt]);
-        }
-        let mut m = rd(MISSION);
-        if m == 0 {
-            return;
-        }
-        if rd(m as usize + 0x3C) == 1 {
-            if vcall(rd(m as usize + 0x90), 1, &[]) == 2 {
-                return;
+        let mut st = St::of(r);
+        let dt = q32(arg(a, 0));
+        let act = rd(ACTIVITY);
+        st.eax = act;
+        if act != 0 {
+            let lv = rd(act as usize + 0x10);
+            st.ecx = lv;
+            if lv != 0 {
+                hit(35);
+                let vt = rd(lv as usize);
+                let f = rd(vt as usize + 0x10);
+                st.eax = vt;
+                st.edx = f;
+                callx(f as usize, &mut st, &[dt]);
             }
-            m = rd(MISSION);
         }
-        if m == 0 || rd(m as usize + 0x3C) != 1 {
-            return;
+        'done: {
+            let m = rd(MISSION);
+            st.eax = m;
+            if m == 0 {
+                break 'done;
+            }
+            if rd(m as usize + 0x3C) == 1 {
+                let info = rd(m as usize + 0x90);
+                let vt = rd(info as usize);
+                let f = rd(vt as usize + 4);
+                st.eax = f;
+                st.edx = vt;
+                st.ecx = info;
+                callx(f as usize, &mut st, &[]);
+                if st.eax == 2 {
+                    break 'done;
+                }
+                st.eax = rd(MISSION);
+            }
+            let m = st.eax;
+            if m == 0 || rd(m as usize + 0x3C) != 1 {
+                break 'done;
+            }
+            let info = rd(m as usize + 0x90);
+            let vt = rd(info as usize);
+            let f = rd(vt as usize + 4);
+            st.eax = f;
+            st.edx = vt;
+            st.ecx = info;
+            callx(f as usize, &mut st, &[]);
+            if st.eax != 0xD {
+                break 'done;
+            }
+            let m = rd(MISSION);
+            st.eax = m;
+            if m != 0 && rd(m as usize + 0x3C) == 1 {
+                hit(36);
+                let info = rd(m as usize + 0x90);
+                let vt = rd(info as usize);
+                let f = rd(vt as usize + 0x68);
+                st.ecx = info;
+                st.edx = vt;
+                st.eax = f;
+                callx(f as usize, &mut st, &[dt]);
+            } else {
+                // The original loads a null `this` and faults here; do nothing instead.
+                hit(37);
+            }
         }
-        if vcall(rd(m as usize + 0x90), 1, &[]) != 0xD {
-            return;
-        }
-        let m = rd(MISSION);
-        if m != 0 && rd(m as usize + 0x3C) == 1 {
-            hit(36);
-            vcall(rd(m as usize + 0x90), 0x68 / 4, &[dt]);
-        } else {
-            // The original loads a null `this` and faults here; do nothing instead.
-            hit(37);
-        }
+        st.put(r);
     }
 }
+regs_thunk!(a_time_step, a_time_step_e);
 
 /// The current diversion instance when the local player exists, else 0.
+#[allow(dead_code)]
 unsafe fn diversion_with_player() -> u32 {
     unsafe { if rd(LOCAL_PLAYER) == 0 { 0 } else { rd(DIVERSION) } }
 }
 
-macro_rules! diversion_fwd {
-    ($name:ident, $c:expr, $slot:expr, ($($a:ident),*)) => {
-        extern "C" fn $name($($a: u32),*) {
-            hit($c);
-            unsafe {
-                let inst = diversion_with_player();
-                if inst != 0 {
-                    hit($c + 1);
-                    vcall(inst, $slot / 4, &[$($a),*]);
+/// `if (local player) { inst = [DIVERSION]; if (inst) inst->slot(args) }` with the registers the
+/// original leaves (ECX = inst, EAX = the method, EDX = args[0]); `float_arg` marks an argument that
+/// is passed through `fld` / `fstp` (quieted), `check_player` false the 0x603D70 variant without the test.
+unsafe fn div_call(r: &mut Pushad, a: *const u32, ctr: usize, slot: usize, n: usize, check_player: bool, float_arg: Option<usize>) {
+    hit(ctr);
+    unsafe {
+        let mut st = St::of(r);
+        if !check_player || rd(LOCAL_PLAYER) != 0 {
+            let inst = rd(DIVERSION);
+            st.ecx = inst;
+            if inst != 0 {
+                hit(ctr + 1);
+                let vt = rd(inst as usize);
+                let f = rd(vt as usize + slot);
+                let mut args = [0u32; 5];
+                for (i, v) in args.iter_mut().enumerate().take(n) {
+                    *v = arg(a, i);
+                    if float_arg == Some(i) {
+                        *v = q32(*v);
+                    }
                 }
+                st.eax = f;
+                st.edx = args[0];
+                if float_arg == Some(0) {
+                    // time_step: EAX keeps the vtable, EDX is the method
+                    st.eax = vt;
+                    st.edx = f;
+                }
+                callx(f as usize, &mut st, &args[..n]);
             }
         }
+        st.put(r);
+    }
+}
+
+macro_rules! diversion_fwd {
+    ($name:ident, $entry:ident, $c:expr, $slot:expr, $n:expr, $check:expr, $fl:expr) => {
+        extern "C" fn $entry(r: &mut Pushad, a: *const u32) {
+            unsafe { div_call(r, a, $c, $slot, $n, $check, $fl) }
+        }
+        regs_thunk!($name, $entry);
     };
 }
-diversion_fwd!(d_ev20, 42, 0x30, (a0));
-diversion_fwd!(d_ev21, 44, 0x34, (a0));
-diversion_fwd!(d_ev22, 46, 0x38, (a0));
-diversion_fwd!(d_obj_killed, 48, 0x18, (a0, a1, a2, a3));
-diversion_fwd!(d_veh_destroyed, 50, 0x1C, (a0, a1, a2, a3));
-diversion_fwd!(d_damaged, 52, 0x24, (a0, a1, a2, a3));
-diversion_fwd!(d_ev19, 54, 0x3C, (a0, a1, a2, a3));
-diversion_fwd!(d_human_killed, 56, 0x14, (a0, a1, a2, a3, a4));
-diversion_fwd!(d_ev15, 58, 0x28, (a0, a1, a2, a3, a4));
-
+diversion_fwd!(d_ev20, d_ev20_e, 42, 0x30, 1, true, None);
+diversion_fwd!(d_ev21, d_ev21_e, 44, 0x34, 1, true, None);
+diversion_fwd!(d_ev22, d_ev22_e, 46, 0x38, 1, true, None);
+diversion_fwd!(d_obj_killed, d_obj_killed_e, 48, 0x18, 4, true, None);
+diversion_fwd!(d_veh_destroyed, d_veh_destroyed_e, 50, 0x1C, 4, true, None);
+diversion_fwd!(d_damaged, d_damaged_e, 52, 0x24, 4, true, None);
+diversion_fwd!(d_ev19, d_ev19_e, 54, 0x3C, 4, true, None);
+diversion_fwd!(d_human_killed, d_human_killed_e, 56, 0x14, 5, true, None);
+diversion_fwd!(d_ev15, d_ev15_e, 58, 0x28, 5, true, None);
 // 0x603D70 game_mode_diversion_on_player_respawned: no local-player test
-extern "C" fn d_respawned(a0: u32) {
-    hit(40);
-    unsafe {
-        let inst = rd(DIVERSION);
-        if inst != 0 {
-            hit(41);
-            vcall(inst, 0x2C / 4, &[a0]);
-        }
-    }
-}
-
+diversion_fwd!(d_respawned, d_respawned_e, 40, 0x2C, 1, false, None);
 // 0x603CC0 game_mode_diversion_on_game_event_13: the third argument is a float
-extern "C" fn d_ev13(a0: u32, a1: u32, a2: u32, a3: u32, a4: u32) {
-    hit(60);
-    unsafe {
-        let inst = diversion_with_player();
-        if inst != 0 {
-            hit(61);
-            vcall(inst, 0x20 / 4, &[a0, a1, q32(a2), a3, a4]);
-        }
-    }
-}
-
+diversion_fwd!(d_ev13, d_ev13_e, 60, 0x20, 5, true, Some(2));
 // 0x603800 game_mode_diversion_time_step (float dt)
-extern "C" fn d_time_step(dt: u32) {
-    hit(62);
-    unsafe {
-        let inst = diversion_with_player();
-        if inst != 0 {
-            hit(63);
-            vcall(inst, 0xC / 4, &[q32(dt)]);
-        }
-    }
-}
+diversion_fwd!(d_time_step, d_time_step_e, 62, 0xC, 1, true, Some(0));
 
 // 0x603570 game_mode_diversion_reset: type vf1 on every enabled diversion type
 extern "C" fn d_reset() {

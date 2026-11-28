@@ -159,12 +159,30 @@ macro_rules! regs_thunk {
         extern "C" fn $name() {
             std::arch::naked_asm!(
                 "pushad",
-                "mov eax, esp",
-                "lea ecx, [esp + 36]",
+                "sub esp, 128",
+                "movups [esp + 0], xmm0",
+                "movups [esp + 16], xmm1",
+                "movups [esp + 32], xmm2",
+                "movups [esp + 48], xmm3",
+                "movups [esp + 64], xmm4",
+                "movups [esp + 80], xmm5",
+                "movups [esp + 96], xmm6",
+                "movups [esp + 112], xmm7",
+                "lea eax, [esp + 128]",
+                "lea ecx, [esp + 164]",
                 "push ecx",
                 "push eax",
                 "call {f}",
                 "add esp, 8",
+                "movups xmm0, [esp + 0]",
+                "movups xmm1, [esp + 16]",
+                "movups xmm2, [esp + 32]",
+                "movups xmm3, [esp + 48]",
+                "movups xmm4, [esp + 64]",
+                "movups xmm5, [esp + 80]",
+                "movups xmm6, [esp + 96]",
+                "movups xmm7, [esp + 112]",
+                "add esp, 128",
                 "popad",
                 $ret,
                 f = sym $f,
@@ -378,9 +396,32 @@ extern "C" fn player_human_entry(r: &mut Pushad, _: *const u32) {
 }
 regs_thunk!(player_human_thunk, player_human_entry);
 
+/// 0x5D8850: the exit ECX / EDX are what the original computes on the way: the handle and its slot
+/// offset (index << 4); on the success path ECX is the not-mask of the `sub / neg / sbb` sequence.
+unsafe fn ptr_player_human_regs(p: &Pushad) -> (u32, u32, u32) {
+    unsafe {
+        let h = rd(p.eax as usize);
+        if h == 0 {
+            return (0, 0, p.edx);
+        }
+        let edx = (h & 0xFFF) << 4;
+        let o = rd(HANDLES + edx as usize);
+        if o == 0 || rd(o as usize + 0x44) != h || rd(o as usize + 0x4C) != 1 {
+            return (0, h, edx);
+        }
+        let c = rb(o as usize + 0x3CC).wrapping_sub(1);
+        let mask = if c == 0 { 0xFFFF_FFFFu32 } else { 0 };
+        (o & mask, mask, edx)
+    }
+}
+
 extern "C" fn ptr_player_human_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
-    r.eax = unsafe { shadowed(PTR_PLAYER_HUMAN, &p, std::ptr::null(), 0, &[], u32::MAX, || player_human(rd(p.eax as usize))) };
+    let (eax, ecx, edx) = unsafe { ptr_player_human_regs(&p) };
+    unsafe { shadowed(PTR_PLAYER_HUMAN, &p, std::ptr::null(), 0, &[], u32::MAX, || eax) };
+    r.eax = eax;
+    r.ecx = ecx;
+    r.edx = edx;
 }
 regs_thunk!(ptr_player_human_thunk, ptr_player_human_entry);
 
@@ -468,7 +509,7 @@ const RIGID_SLOTS: usize = g(0x0169_3F60); // 0x157C body pointers
 
 /// `(seq << 16) | index` for the next free index (taken off the stack, the entry set to -1), the u16
 /// sequence post-incremented (stored as 1 if the increment wraps to 0); 0 when the pool is used up.
-unsafe fn rigid_alloc() -> u32 {
+unsafe fn rigid_alloc(regs: &mut (u32, u32)) -> u32 {
     unsafe {
         let n = rd(RIGID_USED);
         if n >= 0x157C {
@@ -483,6 +524,9 @@ unsafe fn rigid_alloc() -> u32 {
         if next == 0 {
             *(RIGID_SEQ as *mut u16) = 1;
         }
+        // exit: EDX = the index taken off the stack, CX = the incremented sequence
+        regs.0 = (regs.0 & 0xFFFF_0000) | next as u32;
+        regs.1 = idx;
         ((seq as u32) << 16) | idx
     }
 }
@@ -492,7 +536,10 @@ extern "C" fn rigid_alloc_entry(r: &mut Pushad, _: *const u32) {
     let n = unsafe { rd(RIGID_USED) } as usize;
     // the stack entry that is overwritten (the count itself is bounded by the check)
     let ent = if n < 0x157C { RIGID_STACK + n * 4 } else { RIGID_STACK };
-    r.eax = unsafe { shadowed(RIGID_ALLOC, &p, std::ptr::null(), 0, &[(RIGID_USED, 4), (RIGID_SEQ, 2), (ent, 4)], u32::MAX, || rigid_alloc()) };
+    let mut x = (p.ecx, p.edx);
+    r.eax = unsafe { shadowed(RIGID_ALLOC, &p, std::ptr::null(), 0, &[(RIGID_USED, 4), (RIGID_SEQ, 2), (ent, 4)], u32::MAX, || rigid_alloc(&mut x)) };
+    r.ecx = x.0;
+    r.edx = x.1;
 }
 regs_thunk!(rigid_alloc_thunk, rigid_alloc_entry);
 
@@ -580,15 +627,17 @@ unsafe fn filter_defer(e: u32) {
     }
 }
 
-unsafe fn filter_cancel(e: u32) {
+/// Returns (EAX, ECX) at exit: the index where the loop stopped (the count when not found) and the count.
+unsafe fn filter_cancel(e: u32) -> (u32, u32) {
     unsafe {
         let n = rd(FILTER_COUNT);
         for i in 0..n as usize {
             if rd(FILTER_LIST + i * 4) == e {
                 wd(FILTER_LIST + i * 4, 0);
-                return;
+                return (i as u32, n);
             }
         }
+        (n, n)
     }
 }
 
@@ -608,27 +657,32 @@ regs_thunk!(filter_defer_thunk, filter_defer_entry);
 extern "C" fn filter_cancel_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
     let n = unsafe { rd(FILTER_COUNT) } as usize;
+    let mut x = (p.eax, p.ecx);
     unsafe {
         shadowed(FILTER_CANCEL, &p, std::ptr::null(), 0, &[(FILTER_LIST, n.min(0x4000) * 4)], 0, || {
-            filter_cancel(p.edx);
+            x = filter_cancel(p.edx);
             p.eax
         });
     }
+    r.eax = x.0;
+    r.ecx = x.1;
 }
 regs_thunk!(filter_cancel_thunk, filter_cancel_entry);
 
 // --- 0x6FDBB0 set_collision_filter_info (EAX = info, EDX = entity), 0x6FD440 toggle ----------------
 
 /// The refresh after a filter change: deferred while the world steps, else the world update.
-unsafe fn filter_refresh(ecx: u32, e: u32, p: &Pushad) {
+/// Returns the callee's EAX (both tail positions of the original leave it in EAX). `eax` is EAX at
+/// the call of the deferred path.
+unsafe fn filter_refresh(eax: u32, ecx: u32, e: u32, p: &Pushad) -> u32 {
     unsafe {
         if rd(STEP_COUNTER) > 0 {
             br(1);
-            call_regs(FILTER_DEFER_ADDR, p.eax, ecx, e, p.esi, p.edi, &[]);
+            call_regs(FILTER_DEFER_ADDR, eax, ecx, e, p.esi, p.edi, &[])
         } else {
             br(2);
             let world = rd(WORLD);
-            call_regs(FILTER_UPDATE, 0, ecx, e, p.esi, p.edi, &[world, e, 1]);
+            call_regs(FILTER_UPDATE, 0, ecx, e, p.esi, p.edi, &[world, e, 1])
         }
     }
 }
@@ -643,7 +697,7 @@ extern "C" fn set_filter_info_entry(r: &mut Pushad, _: *const u32) {
             return;
         }
         wd(e as usize + 0x2C, p.eax);
-        filter_refresh(p.ecx, e, &p);
+        r.eax = filter_refresh(p.eax, p.ecx, e, &p);
     }
 }
 regs_thunk!(set_filter_info_thunk, set_filter_info_entry);
@@ -659,19 +713,23 @@ extern "C" fn collision_toggle_entry(r: &mut Pushad, args: *const u32) {
         let e = p.edx;
         let cur = rd(e as usize + 0x2C);
         let mut ecx = p.ecx;
+        let mut eax = cur;
         if on == 1 {
             br(4);
             let s = rd(p.ecx as usize);
             ecx = s;
             if cur != s {
                 wd(e as usize + 0x2C, s);
+                eax = s;
             }
         } else if cur != 0x8002E {
             br(5);
             wd(p.ecx as usize, cur);
             wd(e as usize + 0x2C, 0x8002E);
+            eax = 0x8002E;
         }
-        filter_refresh(ecx, e, &p);
+        r.eax = filter_refresh(eax, ecx, e, &p);
+        r.ecx = ecx;
     }
 }
 regs_thunk!(collision_toggle_thunk, collision_toggle_entry);
@@ -682,6 +740,7 @@ const BODY_TABLE: usize = g(0x028F_25C0); // 0x18-byte entries
 
 extern "C" fn body_get_handle_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let mut ecx = p.ecx;
     r.eax = unsafe {
         shadowed(BODY_GET_HANDLE, &p, std::ptr::null(), 0, &[], u32::MAX, || {
             if p.eax > 0x1387 {
@@ -689,6 +748,7 @@ extern "C" fn body_get_handle_entry(r: &mut Pushad, _: *const u32) {
             }
             let ent = BODY_TABLE + p.eax as usize * 0x18;
             let e = rd(ent);
+            ecx = e;
             if e == 0 {
                 return 0;
             }
@@ -697,6 +757,7 @@ extern "C" fn body_get_handle_entry(r: &mut Pushad, _: *const u32) {
             out[0]
         })
     };
+    r.ecx = ecx;
 }
 regs_thunk!(body_get_handle_thunk, body_get_handle_entry);
 
@@ -773,20 +834,23 @@ regs_thunk!(point_velocity_thunk, point_velocity_entry);
 
 // --- 0x70F8C0 havok_game_filter_layers_collide (ECX = a, EDX = b, stack (filter, &out), ret 8) ------
 
-unsafe fn layers_collide(a: u32, b: u32, filter: u32, out: u32) {
+/// Returns the exit (ECX, EDX): unchanged on the early paths, else the low 5 bits and the word
+/// index of the combined layer number.
+unsafe fn layers_collide(a: u32, b: u32, filter: u32, out: u32) -> (u32, u32) {
     unsafe {
         if rb(thread_block() + 0x6C) & 0x10 != 0 && (a == 0x3F || b == 0x3F) {
             wb(out as usize, 1);
-            return;
+            return (a, b);
         }
         if (a ^ b) & 0xFFFF_0000 == 0 && a & 0xFFFF_0000 != 0 {
             wb(out as usize, 0);
-            return;
+            return (a, b);
         }
         let idx = ((a & 0xFFFF) << 7).wrapping_add(b & 0xFFFF);
         let bits = rd(filter as usize + 0x34) as usize;
         let hit = rd(bits.wrapping_add((idx >> 5) as usize * 4)) & (1u32 << (idx & 31)) != 0;
         wb(out as usize, hit as u8);
+        (idx & 31, idx >> 5)
     }
 }
 
@@ -794,10 +858,13 @@ extern "C" fn layers_collide_entry(r: &mut Pushad, args: *const u32) {
     let p = *r;
     unsafe {
         let (filter, out) = (*args, *args.add(1));
+        let mut x = (p.ecx, p.edx);
         r.eax = shadowed(LAYERS_COLLIDE, &p, args, 2, &[(out as usize, 1)], u32::MAX, || {
-            layers_collide(p.ecx, p.edx, filter, out);
+            x = layers_collide(p.ecx, p.edx, filter, out);
             out
         });
+        r.ecx = x.0;
+        r.edx = x.1;
     }
 }
 regs_thunk!(layers_collide_thunk, layers_collide_entry, "ret 8");
@@ -853,9 +920,10 @@ const C_FREE_HEAD: usize = g(0x0252_7DF4);
 const C_USED_COUNT: usize = g(0x0252_7DEC);
 
 /// Take the head of the free ring, append it to the used ring; EAX = its index (address - base) / 20.
-unsafe fn cslot_alloc() -> u32 {
+unsafe fn cslot_alloc(regs: &mut (u32, u32)) -> u32 {
     unsafe {
         let s = rd(C_FREE_HEAD) as usize;
+        regs.0 = s as u32;
         if s == 0 {
             return 0xFFFF_FFFF;
         }
@@ -891,15 +959,21 @@ unsafe fn cslot_alloc() -> u32 {
         let x = (s as u32).wrapping_sub(CSLOTS as u32) as i32;
         let hi = ((x as i64 * 0x6666_6667) >> 32) as i32;
         let q = hi >> 3;
+        // exit: ECX = slot address - base, EDX = the shifted high product
+        regs.0 = x as u32;
+        regs.1 = q as u32;
         (q as u32).wrapping_add((q as u32) >> 31)
     }
 }
 
 extern "C" fn cslot_alloc_entry(r: &mut Pushad, _: *const u32) {
     let p = *r;
+    let mut x = (p.ecx, p.edx);
     r.eax = unsafe {
-        shadowed(CSLOT_ALLOC, &p, std::ptr::null(), 0, &[(CSLOTS, 0x200 * 20), (C_USED_HEAD, 4), (C_FREE_HEAD, 4), (C_USED_COUNT, 4)], u32::MAX, || cslot_alloc())
+        shadowed(CSLOT_ALLOC, &p, std::ptr::null(), 0, &[(CSLOTS, 0x200 * 20), (C_USED_HEAD, 4), (C_FREE_HEAD, 4), (C_USED_COUNT, 4)], u32::MAX, || cslot_alloc(&mut x))
     };
+    r.ecx = x.0;
+    r.edx = x.1;
 }
 regs_thunk!(cslot_alloc_thunk, cslot_alloc_entry);
 
@@ -994,15 +1068,25 @@ extern "C" fn has_attached_entry(r: &mut Pushad, _: *const u32) {
     unsafe {
         let o = p.eax;
         let k = rd(o as usize + 0x4C).wrapping_sub(1);
+        r.ecx = k;
         r.eax = match k {
             0 => {
                 br(11);
                 call_regs(HUMAN_ATTACHED, o, 0, p.edx, p.esi, p.edi, &[])
             }
-            1 => lo(o, rd(o as usize + 0xCC) != 0),
-            2 => lo(o, rd(o as usize + 0xC4) != 0),
+            1 => {
+                let f = rd(o as usize + 0xCC) != 0;
+                r.ecx = f as u32;
+                lo(o, f)
+            }
+            2 => {
+                let f = rd(o as usize + 0xC4) != 0;
+                r.edx = f as u32;
+                lo(o, f)
+            }
             4 => {
                 br(12);
+                r.edx = o;
                 call_regs(VEHICLE_ATTACHED, o, 4, o, p.esi, p.edi, &[0])
             }
             6 => lo(o, true),
