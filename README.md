@@ -87,6 +87,7 @@ The log is saved when the game exits or crashes.
 | `docs/functions.csv` | every known function: address, name, area and status |
 | `docs/analysis/` | write-ups of how each part of the game works |
 | `docs/skipped_ports.md` | functions not ported yet, and why |
+| `docs/TODO.md` | work agreed for later |
 | `docs/PLAN.md` | strategy and milestones |
 | `tools/` | analysis scripts |
 
