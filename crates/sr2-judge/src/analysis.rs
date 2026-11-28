@@ -308,6 +308,86 @@ fn x87_neutral(name: &str) -> bool {
 }
 
 impl Analyzer {
+    /// How many bytes the indirect callee at `instrs[idx]` pops, from the stack balance: the function returns with
+    /// its stack back at the entry depth, so (depth at the call) + (linear change up to the next epilogue) - (bytes
+    /// the epilogue removes) is what the callee took. Depth is tracked along the instructions in order from the
+    /// start: push / pop, add / sub esp, direct calls pop their known ret N. None when this cannot be trusted:
+    /// another indirect call or a frame-pointer epilogue in the way, or a negative result.
+    fn pop_by_epilogue(&mut self, img: &Image, instrs: &[Instruction], idx: usize) -> Option<u16> {
+        // Bytes one instruction adds to the stack depth (None: unknown effect).
+        let delta = |this: &mut Analyzer, i: &Instruction| -> Option<i64> {
+            let reg0 = i.op_count() > 0 && i.op0_kind() == OpKind::Register;
+            match i.mnemonic() {
+                Mnemonic::Push => Some(4),
+                Mnemonic::Pushad => Some(32),
+                Mnemonic::Pushfd => Some(4),
+                Mnemonic::Pop => Some(-4),
+                Mnemonic::Popad => Some(-32),
+                Mnemonic::Popfd => Some(-4),
+                Mnemonic::Sub if reg0 && i.op0_register() == Register::ESP => {
+                    if i.op1_kind() == OpKind::Register { None } else { Some(i.immediate(1) as i32 as i64) }
+                }
+                Mnemonic::Add if reg0 && i.op0_register() == Register::ESP => {
+                    if i.op1_kind() == OpKind::Register { None } else { Some(-(i.immediate(1) as i32 as i64)) }
+                }
+                Mnemonic::Mov | Mnemonic::Lea | Mnemonic::And if reg0 && i.op0_register() == Register::ESP => None,
+                Mnemonic::Leave => None,
+                Mnemonic::Call => match i.flow_control() {
+                    FlowControl::Call if i.op0_kind() == OpKind::NearBranch32 => {
+                        let t = i.near_branch_target() as usize;
+                        if image::in_text(t) {
+                            let rn = this.overrides.get(&t).and_then(|o| o.ret_n).unwrap_or_else(|| this.summarize(img, t, 0).ret_n);
+                            Some(-(rn as i64))
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None, // another indirect call
+                },
+                _ => Some(0),
+            }
+        };
+        // Depth at the call: walk from the start. After a ret, the code that follows is another path that
+        // runs at the body depth, i.e. the depth before that epilogue started.
+        let mut depth: i64 = 0;
+        let mut epi_start_depth: i64 = 0;
+        for (k, i) in instrs[..idx].iter().enumerate() {
+            if i.flow_control() == FlowControl::Return {
+                depth = epi_start_depth;
+                continue;
+            }
+            // Remember the depth before a run of pops / add esp that ends in a ret (an epilogue).
+            let next_is_epi = instrs[k..].iter().take_while(|n| matches!(n.mnemonic(), Mnemonic::Pop | Mnemonic::Add)).count() > 0
+                && instrs[k..].iter().skip_while(|n| matches!(n.mnemonic(), Mnemonic::Pop | Mnemonic::Add)).next().is_some_and(|n| n.flow_control() == FlowControl::Return);
+            if next_is_epi && (k == 0 || !matches!(instrs[k - 1].mnemonic(), Mnemonic::Pop | Mnemonic::Add)) {
+                epi_start_depth = depth;
+            }
+            if i.flow_control() == FlowControl::IndirectCall {
+                return None; // an earlier indirect call: its pop is unknown here
+            }
+            depth += delta(self, i)?;
+        }
+        // From after the call to the next ret: the change in depth, then what the epilogue removes.
+        let ret_at = instrs.iter().enumerate().skip(idx + 1).find(|(_, i)| i.flow_control() == FlowControl::Return)?.0;
+        let mut epi = ret_at;
+        while epi > idx + 1 && matches!(instrs[epi - 1].mnemonic(), Mnemonic::Pop | Mnemonic::Add) {
+            epi -= 1;
+        }
+        let mut after: i64 = 0;
+        for i in &instrs[idx + 1..epi] {
+            if matches!(i.flow_control(), FlowControl::IndirectCall | FlowControl::UnconditionalBranch | FlowControl::Return) {
+                return None;
+            }
+            after += delta(self, i)?;
+        }
+        let mut removed: i64 = 0;
+        for i in &instrs[epi..ret_at] {
+            removed -= delta(self, i)?;
+        }
+        let pop = depth + after - removed;
+        if (0..=256).contains(&pop) && pop % 4 == 0 { Some(pop as u16) } else { None }
+    }
+
     pub fn new() -> Analyzer {
         Analyzer { cache: HashMap::new(), overrides: load_overrides() }
     }
@@ -365,6 +445,13 @@ impl Analyzer {
                                     }
                                 }
                             }
+                        }
+                    }
+                    // Prefer the epilogue balance, which is exact on straight-line code: the guess above also
+                    // counts registers the function itself saved before the call.
+                    if !cdecl {
+                        if let Some(p2) = self.pop_by_epilogue(img, &instrs, idx) {
+                            pop = p2;
                         }
                     }
                     info.indirect_sites.push((ins.next_ip() as u32, pop));

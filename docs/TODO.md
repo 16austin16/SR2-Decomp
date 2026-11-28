@@ -14,9 +14,8 @@ The work agreed for later, in rough priority order. Done items move to the commi
    - float returns: 0x40EA20 and 0x49EE60 return ST0, and `_ftol2_sse` 0xDA0140 pops ST0;
    - callees that write out-structures, such as 0x4DDA50 for the weather blends.
    - Judge follow-ups found by the 2026-11-27 trial:
-     - The indirect-stub pop count counts saved-register pushes before a virtual call as arguments, so the original
-       runs with a wrong ESP (seen at 8799e0, 5cde70, 609960). Count only the pushes after the last instruction that
-       moves the arguments' base, or read the callee's ret N where the vtable target is known.
+     - (Done 2026-11-28: the indirect-stub pop count now comes from the epilogue balance.) 0xB8A010 now crashes
+       the judge process.
      - 0xB92270 crashes the judge process at 60+ cases.
 2. **Porting round on small-function lists** with the Haiku trial: a few Haiku agents and the rest on Sonnet.
    - The judge is the only acceptance test.
