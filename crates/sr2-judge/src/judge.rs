@@ -85,6 +85,7 @@ impl Env {
         sys::alloc_fixed(ARENA_BASE, ARENA_SIZE, false);
         sys::alloc_fixed(exec::STACK_BASE, exec::STACK_SIZE, false);
         sys::alloc_fixed(stubs::STUB_BASE, stubs::MAX_STUBS * stubs::STUB_SLOT, true);
+        sys::alloc_fixed(stubs::VT_BASE, stubs::VT_SIZE, false);
         exec::install_faults();
         Env { img: Image::map(), an: Analyzer::new(), arena_snap: vec![0; ARENA_SIZE], arena_a: vec![0; ARENA_SIZE] }
     }
@@ -124,6 +125,18 @@ fn describe_call(c: &stubs::CallRec, info: &FnInfo) -> String {
     let t = info.callees.get(c.id as usize).map(|c| c.target).unwrap_or(0);
     let regs: Vec<String> = (0..8).filter(|&i| i != analysis::ESP).map(|i| format!("{}={:#x}", REG_NAMES[i], c.regs[i])).collect();
     format!("call {t:#x} depth {} {} stack {:x?}", c.depth, regs.join(" "), &c.stack[..4])
+}
+
+/// Two values passed to a callee agree when they are equal, or when both point into the run's own stack:
+/// each is then the address of a local or an argument slot of its function, and Rust code cannot
+/// reproduce the original's frame layout.
+fn same_arg(x: u32, y: u32) -> bool {
+    // The run's stack, its own argument slots included (both serve as scratch; what a callee writes there is
+    // compared separately as the stack above the return address).
+    let local = |v: u32| (exec::STACK_BASE as u32..(exec::ESP_IN + 4 + 4 * exec::STACK_ARGS) as u32).contains(&v);
+    // Two NaNs passed by value: x87 and SSE keep different payloads and no game code depends on them.
+    let nan = |v: u32| v & 0x7F80_0000 == 0x7F80_0000 && v & 0x007F_FFFF != 0;
+    x == y || (local(x) && local(y)) || (nan(x) && nan(y))
 }
 
 /// Everything compared for one case; empty when the two runs agree.
@@ -169,7 +182,7 @@ fn compare(a: &RunResult, b: &RunResult, info: &FnInfo) -> Vec<String> {
             why.push("different callee".to_string());
         } else if let Some(c) = callee {
             for r in 0..8 {
-                if r != analysis::ESP && c.live_in & (1 << r) != 0 && x.regs[r] != y.regs[r] {
+                if r != analysis::ESP && c.live_in & (1 << r) != 0 && !same_arg(x.regs[r], y.regs[r]) {
                     why.push(format!("{} {:#x} vs {:#x}", REG_NAMES[r], x.regs[r], y.regs[r]));
                 }
             }
@@ -177,7 +190,7 @@ fn compare(a: &RunResult, b: &RunResult, info: &FnInfo) -> Vec<String> {
                 why.push(format!("x87 depth {} vs {}", x.depth, y.depth));
             }
             for k in 0..c.nargs.min(stubs::NSTACK) {
-                if x.stack[k] != y.stack[k] {
+                if !same_arg(x.stack[k], y.stack[k]) {
                     why.push(format!("stack arg {k} {:#x} vs {:#x}", x.stack[k], y.stack[k]));
                 }
             }
@@ -230,6 +243,7 @@ enum CaseResult {
 fn run_case(env: &mut Env, e: &RegEntry, info: &FnInfo, seed: u64, verbose: bool) -> CaseResult {
     let w = world::make(seed, info);
     world::fill_arena(seed);
+    stubs::reset_vtables(&info.indirect_sites);
     env.arena_snap.copy_from_slice(arena());
     for (a, b) in &w.globals {
         unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), *a as *mut u8, b.len()) };
@@ -244,6 +258,7 @@ fn run_case(env: &mut Env, e: &RegEntry, info: &FnInfo, seed: u64, verbose: bool
     env.arena_a.copy_from_slice(arena());
     // Put the world back.
     arena().copy_from_slice(&env.arena_snap);
+    stubs::reset_vtables(&info.indirect_sites);
     for &p in &dirty_a {
         env.img.restore_page(p);
     }
@@ -336,7 +351,7 @@ pub fn judge(env: &mut Env, e: &RegEntry, o: &Opts) -> Verdict {
     }
     let info = env.an.analyze(&env.img, e.addr, &e.body);
     // The callee patches must not touch each other or the body.
-    let mut targets: Vec<usize> = info.callees.iter().map(|c| c.target).collect();
+    let mut targets: Vec<usize> = info.callees.iter().filter(|c| !c.indirect).map(|c| c.target).collect();
     targets.sort_unstable();
     for w in targets.windows(2) {
         if w[1] < w[0] + 5 {
@@ -357,7 +372,7 @@ pub fn judge(env: &mut Env, e: &RegEntry, o: &Opts) -> Verdict {
     v.status = Status::Pass;
     let mut notes = Vec::new();
     if info.indirect_calls > 0 {
-        notes.push(format!("{} indirect call(s) not stubbed", info.indirect_calls));
+        notes.push(format!("{} indirect call site(s), stubbed through the vtable page", info.indirect_calls));
     }
     for case in 0..o.cases {
         let seed = splitmix(o.seed ^ (e.addr as u64).wrapping_mul(0x9E37_79B9) ^ ((case as u64) << 40));

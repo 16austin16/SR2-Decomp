@@ -13,6 +13,12 @@ pub const STUB_SLOT: usize = 32;
 pub const MAX_STUBS: usize = 2048;
 pub const LOG_CAP: usize = 1024;
 pub const NSTACK: usize = 16;
+/// A page every dword of which points at the indirect-call stub. The world hands out pointers into it
+/// as object vtables, so `call [vtbl+N]` lands in a recording stub instead of faulting.
+pub const VT_BASE: usize = 0x3B00_0000;
+pub const VT_SIZE: usize = 0x1_0000;
+/// Offset of the `ret imm16` operand in an indirect stub: push id (5), call (5), lea (4), C2.
+const IND_RET_IMM: usize = 15;
 
 #[derive(Clone, Copy, Debug)]
 pub struct CallRec {
@@ -31,9 +37,18 @@ pub struct StubInfo {
     pub clobber: u8,
     pub float_st0: bool,
     pub xmm0: bool,
+    pub indirect: bool,
+    /// (stack argument index, byte count) of an output structure the stub fills; count 0 = none.
+    pub out: (u8, u16),
 }
 
-pub static mut TABLE: [StubInfo; MAX_STUBS] = [StubInfo { target: 0, clobber: 0, float_st0: false, xmm0: false }; MAX_STUBS];
+pub static mut TABLE: [StubInfo; MAX_STUBS] =
+    [StubInfo { target: 0, clobber: 0, float_st0: false, xmm0: false, indirect: false, out: (0, 0) }; MAX_STUBS];
+/// Indirect call sites of the function under test: (return address, bytes the callee pops).
+pub static mut IND_SITES: [(u32, u16); 256] = [(0, 0); 256];
+pub static mut IND_N: usize = 0;
+/// The indirect stub's address (0 when the function has no indirect calls).
+pub static mut IND_STUB: u32 = 0;
 pub static mut NSTUBS: usize = 0;
 pub static mut LOG: [CallRec; LOG_CAP] = [EMPTY_REC; LOG_CAP];
 pub static mut LOG_N: usize = 0;
@@ -64,7 +79,8 @@ fn mixed(r: u64) -> u32 {
             3 | 4 => ARENA_LO + (v % (ARENA_LEN / 4)) * 4,
             5 => 0xFFFF_FFFF,
             6 => v & 0xFF,
-            _ => v,
+            // Top bit set: never a mapped address, so it cannot alias the judge's own memory.
+            _ => v | 0x8000_0000,
         }
     }
 }
@@ -90,6 +106,14 @@ pub extern "C" fn record(frame: *mut u32) -> u32 {
             return 1;
         }
         let info = TABLE[id];
+        if info.indirect {
+            // Pop what this call site pushed. Unknown sites (the port's own calls) pop nothing; the port's
+            // call helpers restore ESP themselves.
+            let ret = *frame.add(11);
+            let pop = IND_SITES[..IND_N].iter().find(|s| s.0 == ret).map_or(0, |s| s.1);
+            let at = (STUB_BASE + id * STUB_SLOT + IND_RET_IMM) as *mut u16;
+            at.write_unaligned(pop);
+        }
         let rec = &mut LOG[LOG_N];
         LOG_N += 1;
         rec.id = id as u32;
@@ -111,7 +135,7 @@ pub extern "C" fn record(frame: *mut u32) -> u32 {
             *frame.add(7) = mixed(r(1));
         }
         if info.clobber & 2 != 0 {
-            let v = (r(2) >> 16) as u32 | 0x0100_0000;
+            let v = (r(2) >> 16) as u32 | 0x8100_0000;
             *frame.add(6) = v;
             if POISON_N < POISON.len() {
                 POISON[POISON_N] = v;
@@ -119,11 +143,22 @@ pub extern "C" fn record(frame: *mut u32) -> u32 {
             }
         }
         if info.clobber & 4 != 0 {
-            let v = (r(3) >> 16) as u32 | 0x0100_0000;
+            let v = (r(3) >> 16) as u32 | 0x8100_0000;
             *frame.add(5) = v;
             if POISON_N < POISON.len() {
                 POISON[POISON_N] = v;
                 POISON_N += 1;
+            }
+        }
+        if info.out.1 > 0 {
+            // Fill the output structure the real callee would write, with values both runs share.
+            let p = *frame.add(12 + info.out.0 as usize) as usize;
+            let in_arena = p >= ARENA_LO as usize && p + info.out.1 as usize <= (ARENA_LO + ARENA_LEN) as usize;
+            let in_stack = p >= crate::exec::STACK_BASE && p + info.out.1 as usize <= crate::exec::STACK_BASE + crate::exec::STACK_SIZE;
+            if in_arena || in_stack {
+                for k in 0..(info.out.1 as usize / 4) {
+                    *((p + k * 4) as *mut u32) = mixed(r(100 + k as u64));
+                }
             }
         }
         if info.float_st0 || info.xmm0 {
@@ -143,8 +178,17 @@ pub fn install(img: &mut Image, callees: &[Callee]) -> Result<(), String> {
     let common = crate::exec::stub_common as *const () as usize;
     unsafe {
         NSTUBS = callees.len();
+        IND_STUB = 0;
         for (id, c) in callees.iter().enumerate() {
-            TABLE[id] = StubInfo { target: c.target as u32, clobber: c.clobber, float_st0: c.float_st0, xmm0: c.xmm0 };
+            TABLE[id] =
+                StubInfo {
+                    target: c.target as u32,
+                    clobber: c.clobber,
+                    float_st0: c.float_st0,
+                    xmm0: c.xmm0,
+                    indirect: c.indirect,
+                    out: c.out_arg.unwrap_or((0, 0)),
+                };
             let at = STUB_BASE + id * STUB_SLOT;
             let mut b: Vec<u8> = Vec::with_capacity(STUB_SLOT);
             b.push(0x68); // push id
@@ -161,7 +205,14 @@ pub fn install(img: &mut Image, callees: &[Callee]) -> Result<(), String> {
                 b.extend([0xF3, 0x0F, 0x10, 0x05]); // movss xmm0, [FRET32 + 4*id]
                 b.extend(((&raw const FRET32) as usize as u32 + id as u32 * 4).to_le_bytes());
             }
-            if c.ret_n == 0 {
+            if c.pop_st0 {
+                b.extend([0xDD, 0xD8]); // fstp st(0)
+            }
+            if c.indirect {
+                assert_eq!(b.len(), IND_RET_IMM - 1);
+                b.extend([0xC2, 0, 0]); // ret imm16, set per call in record()
+                IND_STUB = at as u32;
+            } else if c.ret_n == 0 {
                 b.push(0xC3);
             } else {
                 b.push(0xC2);
@@ -169,6 +220,9 @@ pub fn install(img: &mut Image, callees: &[Callee]) -> Result<(), String> {
             }
             assert!(b.len() <= STUB_SLOT);
             std::ptr::copy_nonoverlapping(b.as_ptr(), at as *mut u8, b.len());
+            if c.indirect {
+                continue; // reached through the vtable page, not patched into the image
+            }
             // callee entry: jmp stub
             let mut j = vec![0xE9u8];
             j.extend((at.wrapping_sub(c.target + 5) as u32).to_le_bytes());
@@ -182,5 +236,19 @@ pub fn install(img: &mut Image, callees: &[Callee]) -> Result<(), String> {
 pub fn remove(img: &mut Image, orig: &[(usize, [u8; 5])]) {
     for (a, b) in orig {
         img.patch(*a, b);
+    }
+}
+
+/// Fill the vtable page with the indirect stub's address (0 when there is none) and load the call sites.
+/// Done before every run, since a function may write into the page.
+pub fn reset_vtables(sites: &[(u32, u16)]) {
+    unsafe {
+        let n = sites.len().min(IND_SITES.len());
+        IND_SITES[..n].copy_from_slice(&sites[..n]);
+        IND_N = n;
+        let p = VT_BASE as *mut u32;
+        for i in 0..VT_SIZE / 4 {
+            *p.add(i) = IND_STUB;
+        }
     }
 }

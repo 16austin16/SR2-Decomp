@@ -36,7 +36,9 @@ pub struct World {
 fn arena_ptr(r: &mut Rng) -> u32 {
     // Half of the pointers land in the first 64 KB, which keeps chains of dereferences short.
     let span = if r.below(2) == 0 { 0x1_0000 } else { ARENA_SIZE as u32 - 0x100 };
-    ARENA_BASE as u32 + (r.below(span / 4)) * 4
+    let p = ARENA_BASE as u32 + (r.below(span / 4)) * 4;
+    // A third are object-aligned (64 bytes), where fill_arena often puts a vtable pointer.
+    if r.below(3) == 0 { p & !0x3F } else { p }
 }
 
 /// One value of the mix the arena is made of.
@@ -51,9 +53,14 @@ pub fn value(r: &mut Rng) -> u32 {
             (m * (r.below(1000) as f32 / 128.0 + 0.01)).to_bits()
         }
         9 => SPECIAL_F32[r.below(SPECIAL_F32.len() as u32) as usize].to_bits(),
-        10..=12 => 0,
+        10 | 11 => 0,
+        // An object's vtable pointer (twice as likely as one kind alone: methods are called often).
+        12 => stubs::VT_BASE as u32 + r.below(0x400) * 4,
         13 => r.below(0x1_0000),
-        _ => r.u32(),
+        // An object's vtable pointer: every slot of the page leads to the indirect-call stub.
+        14 => stubs::VT_BASE as u32 + r.below(0x400) * 4,
+        // Top bit set: never a mapped address, so it cannot alias the judge's own memory.
+        _ => r.u32() | 0x8000_0000,
     }
 }
 
@@ -68,6 +75,12 @@ pub fn fill_arena(seed: u64) {
     unsafe {
         for i in 0..ARENA_SIZE / 4 {
             *p.add(i) = value(&mut r);
+        }
+        // Objects: half of the 64-byte boundaries start with a vtable pointer.
+        for i in (0..ARENA_SIZE / 4).step_by(16) {
+            if r.below(2) == 0 {
+                *p.add(i) = stubs::VT_BASE as u32 + r.below(0x400) * 4;
+            }
         }
     }
 }

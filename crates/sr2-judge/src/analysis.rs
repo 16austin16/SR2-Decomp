@@ -41,6 +41,14 @@ pub struct Callee {
     pub clobber: u8,
     #[allow(dead_code)]
     pub via_jmp: bool,
+    /// The shared stub for indirect calls (vtables, function pointers): not patched into the image;
+    /// the world's vtable page points at it.
+    pub indirect: bool,
+    /// The callee consumes ST0 (`_ftol2` and similar): the stub pops it.
+    pub pop_st0: bool,
+    /// The callee fills an output structure through stack argument `.0`, `.1` bytes long: the stub writes
+    /// seeded values there.
+    pub out_arg: Option<(u8, u16)>,
 }
 
 #[derive(Default, Debug)]
@@ -50,6 +58,8 @@ pub struct FnInfo {
     pub globals: Vec<(usize, usize)>,
     pub own_ret_n: u32,
     pub indirect_calls: usize,
+    /// Indirect call sites: (return address, bytes the callee pops).
+    pub indirect_sites: Vec<(u32, u16)>,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -69,6 +79,9 @@ pub struct Override {
     pub preserve: Option<u8>,
     pub clobber: Option<u8>,
     pub live_in: Option<u8>,
+    pub pop_st0: Option<bool>,
+    pub out_arg: Option<u8>,
+    pub out_size: Option<u16>,
 }
 
 pub struct Analyzer {
@@ -124,6 +137,9 @@ pub fn load_overrides() -> HashMap<usize, Override> {
             "preserve" => o.preserve = Some(reg_mask(v)),
             "clobber" => o.clobber = Some(reg_mask(v)),
             "live_in" => o.live_in = Some(reg_mask(v)),
+            "pop_st0" => o.pop_st0 = Some(v == "true"),
+            "out_arg" => o.out_arg = parse_num(v).map(|x| x as u8),
+            "out_size" => o.out_size = parse_num(v).map(|x| x as u16),
             _ => {}
         }
     }
@@ -240,12 +256,16 @@ fn summarize(&mut self, img: &Image, entry: usize, depth: u32) -> Summary {
                     // What the nested callee reads on entry is read here too (pass-through registers).
                     sum.has_call = true;
                     let mut clob = 0b111u8;
+                    // Pass-through reads count one level deep only, and never for EBX / EBP (callee-saved
+                    // in every MSVC convention): deeper unions made almost every register look live.
                     if instr.op0_kind() == OpKind::NearBranch32 && depth < 5 && image::in_text(instr.near_branch_target() as usize) {
                         let b = self.summarize(img, instr.near_branch_target() as usize, depth + 1);
-                        sum.live_in |= b.live_in & !w;
+                        if depth == 0 {
+                            sum.live_in |= b.live_in & ARGREGS & !w;
+                        }
                         clob = (b.written | if b.has_call { 7 } else { 0 }) & 0b111;
-                    } else {
-                        sum.live_in |= ARGREGS & !w;
+                    } else if depth == 0 {
+                        sum.live_in |= (1 << ECX | 1 << EAX | 1 << EDX) & !w;
                     }
                     w |= clob;
                     sum.written |= clob;
@@ -323,7 +343,32 @@ impl Analyzer {
                     let n = if ins.op_count() == 1 { ins.immediate16() as u32 } else { 0 };
                     *own_rets.entry(n).or_default() += 1;
                 }
-                FlowControl::IndirectCall => info.indirect_calls += 1,
+                FlowControl::IndirectCall => {
+                    info.indirect_calls += 1;
+                    // Stack cleanup: a cdecl site cleans up after the call; otherwise the callee pops what was
+                    // pushed for it (counted back to the previous call or ESP adjustment).
+                    let mut pop = 0u16;
+                    let cdecl = instrs.get(idx + 1).is_some_and(|n| {
+                        n.mnemonic() == Mnemonic::Add && n.op0_kind() == OpKind::Register && n.op0_register() == Register::ESP
+                    });
+                    if !cdecl {
+                        for p in instrs[..idx].iter().rev() {
+                            if p.flow_control() != FlowControl::Next {
+                                break;
+                            }
+                            match p.mnemonic() {
+                                Mnemonic::Push => pop += 4,
+                                Mnemonic::Pushad => pop += 32,
+                                _ => {
+                                    if p.op_count() > 0 && p.op0_kind() == OpKind::Register && p.op0_register() == Register::ESP {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    info.indirect_sites.push((ins.next_ip() as u32, pop));
+                }
                 FlowControl::Call | FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
                     if ins.op0_kind() == OpKind::NearBranch32 {
                         let t = ins.near_branch_target() as usize;
@@ -417,6 +462,25 @@ impl Analyzer {
                 live_in,
                 clobber,
                 via_jmp: e.is_jmp && !e.is_call,
+                indirect: false,
+                pop_st0: ov.pop_st0.unwrap_or(false),
+                out_arg: ov.out_arg.map(|a| (a, ov.out_size.unwrap_or(4))),
+            });
+        }
+        if !info.indirect_sites.is_empty() {
+            let most = info.indirect_sites.iter().map(|s| s.1 as usize / 4).max().unwrap_or(0);
+            info.callees.push(Callee {
+                target: 0,
+                ret_n: 0,
+                nargs: most,
+                float_st0: false,
+                xmm0: false,
+                live_in: 1 << ECX,
+                clobber: 0b111,
+                via_jmp: false,
+                indirect: true,
+                pop_st0: false,
+                out_arg: None,
             });
         }
         info
