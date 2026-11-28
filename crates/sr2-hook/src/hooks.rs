@@ -49,7 +49,7 @@ extern "C" fn game_frame_tick_hook() -> i32 {
     if (n > 3600 && n.is_multiple_of(900)) || n == 900 || n == 1800 {
         log(&crate::actions::summary());
         log(&crate::lua_bindings::summary());
-        for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary(), crate::port_sim_leaves::summary(), crate::port_weapons_audio::summary(), crate::port_human_states::summary(), crate::port_ai::summary(), crate::port_render_func::summary(), crate::port_effects::summary(), crate::port_nav::summary(), crate::port_net::summary(), crate::port_leaves::summary(), crate::port_leaves_fp::summary(), crate::port_registrars::summary(), crate::port_big::summary(), crate::port_bindings3::summary(), crate::port_tables::summary(), crate::port_frame2::summary(), crate::port_vint2::summary(), crate::port_bindings4::summary(), crate::port_activities::summary(), crate::port_activities2::summary(), crate::port_cutscene::summary(), crate::port_camanim::summary(), crate::port_weather::summary(), crate::port_bindings5::summary(), crate::port_physics::summary(), crate::port_render2::summary(), crate::port_shops::summary(), crate::port_hot57a::summary(), crate::port_hot57b::summary(), crate::port_render3::summary(), crate::port_frame3::summary(), crate::port_weather2::summary(), crate::port_cutscene2::summary(), crate::port_tod_lights::summary(), crate::port_cutscene_load::summary(), crate::port_hot60::summary(), crate::port_nav2::summary(), crate::port_render4::summary(), crate::port_frame4::summary(), crate::port_small_a::summary(), crate::port_small_b::summary(), crate::port_small_c::summary(), crate::port_small_vint::summary(), crate::port_small_data::summary(), crate::port_small_game::summary()] {
+        for s in [crate::port_bindings2::summary(), crate::port_sim_humans::summary(), crate::port_states::summary(), crate::port_vehicles::summary(), crate::port_humans2::summary(), crate::port_render::summary(), crate::port_sim_leaves::summary(), crate::port_weapons_audio::summary(), crate::port_human_states::summary(), crate::port_ai::summary(), crate::port_render_func::summary(), crate::port_effects::summary(), crate::port_nav::summary(), crate::port_net::summary(), crate::port_leaves::summary(), crate::port_leaves_fp::summary(), crate::port_registrars::summary(), crate::port_big::summary(), crate::port_bindings3::summary(), crate::port_tables::summary(), crate::port_frame2::summary(), crate::port_vint2::summary(), crate::port_bindings4::summary(), crate::port_activities::summary(), crate::port_activities2::summary(), crate::port_cutscene::summary(), crate::port_camanim::summary(), crate::port_weather::summary(), crate::port_bindings5::summary(), crate::port_physics::summary(), crate::port_render2::summary(), crate::port_shops::summary(), crate::port_hot57a::summary(), crate::port_hot57b::summary(), crate::port_render3::summary(), crate::port_frame3::summary(), crate::port_weather2::summary(), crate::port_cutscene2::summary(), crate::port_tod_lights::summary(), crate::port_cutscene_load::summary(), crate::port_hot60::summary(), crate::port_nav2::summary(), crate::port_render4::summary(), crate::port_frame4::summary(), crate::port_small_a::summary(), crate::port_small_b::summary(), crate::port_small_c::summary(), crate::port_small_vint::summary(), crate::port_small_data::summary(), crate::port_small_game::summary(), crate::port_h1::summary(), crate::port_h2::summary(), crate::port_h3::summary(), crate::port_h4::summary(), crate::port_s1::summary(), crate::port_s2::summary(), crate::port_s3::summary(), crate::port_s4::summary()] {
             if !s.is_empty() {
                 log(&s);
             }
@@ -2125,6 +2125,14 @@ pub(crate) fn install_port_modules() {
     if !module_skipped("port_small_vint") { crate::port_small_vint::install(); }
     if !module_skipped("port_small_data") { crate::port_small_data::install(); }
     if !module_skipped("port_small_game") { crate::port_small_game::install(); }
+    if !module_skipped("port_h1") { crate::port_h1::install(); }
+    if !module_skipped("port_h2") { crate::port_h2::install(); }
+    if !module_skipped("port_h3") { crate::port_h3::install(); }
+    if !module_skipped("port_h4") { crate::port_h4::install(); }
+    if !module_skipped("port_s1") { crate::port_s1::install(); }
+    if !module_skipped("port_s2") { crate::port_s2::install(); }
+    if !module_skipped("port_s3") { crate::port_s3::install(); }
+    if !module_skipped("port_s4") { crate::port_s4::install(); }
 }
 
 /// Install all hooks. Safe to call repeatedly; runs once.
