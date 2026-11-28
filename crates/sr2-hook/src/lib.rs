@@ -34,6 +34,7 @@ mod input;
 mod lua_bindings;
 mod mempool;
 mod menu;
+mod overlay;
 mod missionlog;
 mod port_bindings2;
 mod port_humans2;

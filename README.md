@@ -44,6 +44,22 @@ Press **F7** in game to open the test menu. The game ignores the controls while 
 | Enter | choose or apply |
 | Backspace | back to the main page, or close |
 
+**ImGui menu (optional).** An empty file named `sr2-imgui.txt` in the game folder switches F7 to a
+new menu drawn with Dear ImGui at Present. It opens at the bottom right and has rounded panels and tabs
+(Player, World, Cheats, Shops, Logging). The game ignores input while it is open, and mouse look comes back
+cleanly when it closes.
+
+| Input | Action |
+|---|---|
+| Mouse | click buttons, drag sliders, scroll with the wheel |
+| Up / Down | move the highlight |
+| Left / Right | switch pages; change the slider value when it is hovered or highlighted |
+| Enter / Space | press the highlighted button |
+| Esc / F7 | close the menu (Esc cancels the label box first) |
+| F8 | the label box for the mission log |
+
+Writing `showcase` in the file opens the menu by itself once the game is running (for unattended screenshots).
+
 **Player options**
 - **God mode:** the player can't be hurt. It stays on through cutscenes and mission starts.
 - **Infinite ammo:** endless reserve ammo and grenades. Clips still empty and reload.

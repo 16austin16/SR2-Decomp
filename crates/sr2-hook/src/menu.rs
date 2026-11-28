@@ -132,6 +132,22 @@ fn release_pause() {
     }
 }
 
+/// Closes the box (saving the typed text as a mission-log point when `save`) and swallows
+/// Esc / Enter until they are released.
+fn close_label_box(save: bool) {
+    let mut l = label_lock();
+    let text = std::mem::take(&mut l.text);
+    l.open = false;
+    drop(l);
+    release_pause();
+    SWALLOW_KEYS.store(true, Ordering::Relaxed);
+    if save {
+        missionlog::mark_labeled(text.trim());
+        let n = missionlog::status().point;
+        lock().status = format!("marked point {n}");
+    }
+}
+
 /// Handles the open box for one frame; true while it is open (nothing else reads keys).
 fn label_keys() -> bool {
     // After the box closes, keep the game's input blocked until Esc / Enter are released: the game
@@ -151,16 +167,8 @@ fn label_keys() -> bool {
     let esc = pressed(KEY_ESC);
     let mut l = label_lock();
     if enter || esc {
-        let text = std::mem::take(&mut l.text);
-        l.open = false;
         drop(l);
-        release_pause();
-        SWALLOW_KEYS.store(true, Ordering::Relaxed);
-        if enter {
-            missionlog::mark_labeled(text.trim());
-            let n = missionlog::status().point;
-            lock().status = format!("marked point {n}");
-        }
+        close_label_box(enter);
         return true;
     }
     if pressed(KEY_BACK) {
@@ -193,7 +201,7 @@ enum Page {
 }
 
 #[derive(Clone, Copy)]
-enum Action {
+pub(crate) enum Action {
     Heal,
     Cash,
     Respect,
@@ -340,6 +348,10 @@ fn items(s: &State) -> Vec<String> {
 /// Called on the game thread right after `input_do_frame`: keys, then the menu's
 /// draw calls, which go into the frame's deferred list like the HUD's.
 pub fn input() {
+    if crate::overlay::active() {
+        overlay_input();
+        return;
+    }
     keys();
     draw();
 }
@@ -975,4 +987,254 @@ fn draw_menu() {
         call_regs(SET_VIEWPORT, 0, 0, 0, 0, y0 as u32, &[x0 as u32, vw as u32, vh as u32, 1]);
         call_regs(SET_SCISSOR, 0, 0, 0, rr as u32, l as u32, &[t as u32, b as u32]);
     }
+}
+
+// --- ImGui overlay support (src/overlay, opt-in through sr2-imgui.txt) ----------------------------
+//
+// With the opt-in file present, `input` calls `overlay_input` instead of drawing the HUD menu. The
+// game thread keeps what the game thread must do (the F7 / F8 keys, blocking the game's input,
+// reading game memory into a snapshot, running the queued actions in `tick`); the overlay's UI,
+// drawn on the render thread, reads the snapshot and calls the `ui_*` functions below, which only
+// touch the same state the old menu's keys touch.
+
+/// The ImGui menu window is open.
+static OVERLAY_OPEN: AtomicBool = AtomicBool::new(false);
+/// The showcase mode already opened the window.
+static SHOWCASE_DONE: AtomicBool = AtomicBool::new(false);
+static OVERLAY_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static OVERLAY_START: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// Game memory read on the game thread for the overlay's pages.
+#[derive(Clone, Default)]
+pub(crate) struct Snapshot {
+    /// (name, toggles, active)
+    pub cheats: Vec<(String, bool, bool)>,
+    pub weathers: Vec<String>,
+    /// (chain name, [(shop index, label with distance)])
+    pub chains: Vec<(String, Vec<(usize, String)>)>,
+    pub shops_loaded: bool,
+    pub clock: String,
+    pub log_on: bool,
+    pub log_mission: String,
+    pub log_point: u32,
+    pub log_samples: String,
+    pub mem: (u64, u64),
+}
+
+static SNAP: Mutex<Option<Snapshot>> = Mutex::new(None);
+
+pub(crate) fn overlay_snapshot() -> Snapshot {
+    SNAP.lock().unwrap_or_else(|p| p.into_inner()).clone().unwrap_or_default()
+}
+
+fn take_snapshot() {
+    let l = missionlog::status();
+    let (chains, shops_loaded) = match crate::shops_menu::chains().as_ref() {
+        Some(c) => (
+            c.iter()
+                .map(|c| {
+                    let shops = c
+                        .shops
+                        .iter()
+                        .map(|(i, n)| {
+                            let d = crate::shops_menu::distance_text(*i);
+                            (*i, if d.is_empty() { n.clone() } else { format!("{n}   ({d})") })
+                        })
+                        .collect();
+                    (c.name.clone(), shops)
+                })
+                .collect(),
+            true,
+        ),
+        None => (Vec::new(), false),
+    };
+    let snap = Snapshot {
+        cheats: (0..cheat_count()).map(|i| (cheat_name(i), cheat_toggles(i), cheat_active(i))).collect(),
+        weathers: (0..weather_count()).map(weather_name).collect(),
+        chains,
+        shops_loaded,
+        clock: clock(),
+        log_on: l.on,
+        log_mission: l.mission_label,
+        log_point: l.point,
+        log_samples: l.samples_text,
+        mem: memory(),
+    };
+    *SNAP.lock().unwrap_or_else(|p| p.into_inner()) = Some(snap);
+}
+
+/// The overlay has something to show (the render thread asks every frame).
+pub(crate) fn overlay_visible() -> bool {
+    OVERLAY_OPEN.load(Ordering::Acquire) || label_lock().open
+}
+
+pub(crate) fn overlay_menu_open() -> bool {
+    OVERLAY_OPEN.load(Ordering::Acquire)
+}
+
+pub(crate) fn overlay_label_open() -> bool {
+    label_lock().open
+}
+
+/// Frees the Windows cursor: the game warps it back to the window centre every frame while mouse
+/// look is on (flag at 0x252A5D5, see input.rs `mouse_update`).
+fn free_cursor() {
+    unsafe {
+        if SAVED_WARP.load(Ordering::Relaxed) < 0 {
+            SAVED_WARP.store(*(0x0252_A5D5 as *const u8) as i32, Ordering::Relaxed);
+        }
+        *(0x0252_A5D5 as *mut u8) = 0;
+    }
+}
+
+/// The warp flag as it was before the menu freed the cursor (-1: not freed).
+static SAVED_WARP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// Puts mouse look back once the menu and the label box are closed. The capture flag
+/// (0x252A5D6) is cleared too, so the game's first frame back has a zero mouse delta and
+/// warps the cursor to the centre instead of turning the camera by the cursor's offset.
+fn restore_cursor() {
+    let w = SAVED_WARP.swap(-1, Ordering::Relaxed);
+    if w >= 0 {
+        unsafe {
+            // Centre the cursor first (the game's centre: the middle of the window rectangle), so the
+            // first mouse delta the game reads is zero.
+            use windows_sys::Win32::Foundation::RECT;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetCursorPos};
+            let hwnd = *(0x0252_A410 as *const usize) as *mut std::ffi::c_void;
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            if !hwnd.is_null() && GetWindowRect(hwnd, &mut r) != 0 {
+                SetCursorPos(r.left + (r.right - r.left) / 2, r.top + (r.bottom - r.top) / 2);
+            }
+            *(0x0252_A5D6 as *mut u8) = 0;
+            *(0x0252_A5D5 as *mut u8) = w as u8;
+            // The look stick is filled early in the frame from the delta `mouse_update` measured
+            // late in the previous one (cursor minus centre, while the menu had the cursor free):
+            // clear it, or the camera turns by where the cursor was.
+            for a in [0x0234_F458usize, 0x0234_F45C, 0x0234_F464, 0x0234_F468] {
+                *(a as *mut u32) = 0;
+            }
+        }
+        // This runs after `input_do_frame`, which already turned that delta into this frame's
+        // look stick: block this one frame too.
+        block_game_input();
+    }
+}
+
+/// Game-thread half of the overlay menu: keys, input blocking, the snapshot.
+fn overlay_input() {
+    crate::overlay::poll();
+    OVERLAY_FRAMES.fetch_add(1, Ordering::Relaxed);
+    // Showcase mode (unattended screenshot): open once the game has run a while or has a player.
+    if crate::overlay::showcase() && !SHOWCASE_DONE.load(Ordering::Relaxed) {
+        let start = *OVERLAY_START.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert_with(std::time::Instant::now);
+        let in_game = unsafe { rd(LOCAL_PLAYER) } != 0 && OVERLAY_FRAMES.load(Ordering::Relaxed) > 300;
+        if in_game || start.elapsed().as_secs() >= 40 {
+            SHOWCASE_DONE.store(true, Ordering::Relaxed);
+            OVERLAY_OPEN.store(true, Ordering::Release);
+            crate::log("overlay: showcase mode opened the menu");
+        }
+    }
+    // Same as the old label box: keep the game's input blocked until Esc / Enter are released.
+    if SWALLOW_KEYS.load(Ordering::Relaxed) {
+        if down(KEY_ESC) || down(KEY_ENTER) || down(KEY_NUM_ENTER) {
+            block_game_input();
+            return;
+        }
+        SWALLOW_KEYS.store(false, Ordering::Relaxed);
+    }
+    if label_lock().open {
+        block_game_input();
+        free_cursor();
+        take_snapshot();
+        return;
+    }
+    if pressed(KEY_MARK) {
+        open_label_box();
+        return;
+    }
+    if pressed(KEY_MENU) {
+        SHOWCASE_DONE.store(true, Ordering::Relaxed);
+        let open = !OVERLAY_OPEN.load(Ordering::Acquire);
+        OVERLAY_OPEN.store(open, Ordering::Release);
+        if open {
+            OVERLAY_FRAMES.store(0, Ordering::Relaxed);
+        }
+    }
+    if OVERLAY_OPEN.load(Ordering::Acquire) {
+        block_game_input();
+        free_cursor();
+        if OVERLAY_FRAMES.load(Ordering::Relaxed) % 10 == 0 {
+            take_snapshot();
+        }
+    } else if !label_lock().open {
+        restore_cursor();
+    }
+}
+
+/// What the overlay shows without waiting for the next snapshot.
+pub(crate) struct Light {
+    pub god: bool,
+    pub ammo: bool,
+    pub wanted: u32,
+    pub weather: i32,
+    pub status: String,
+    pub label_point: u32,
+}
+
+pub(crate) fn ui_light() -> Light {
+    let s = lock();
+    Light {
+        god: s.god,
+        ammo: s.ammo,
+        wanted: s.wanted,
+        weather: s.weather,
+        status: s.status.clone(),
+        label_point: missionlog::status().point + 1,
+    }
+}
+
+pub(crate) fn ui_action(a: Action) {
+    lock().pending.push(a);
+}
+
+pub(crate) fn ui_set_god(on: bool) {
+    let mut s = lock();
+    s.god = on;
+    s.pending.push(Action::God(on));
+}
+
+pub(crate) fn ui_set_ammo(on: bool) {
+    let mut s = lock();
+    s.ammo = on;
+    s.status = format!("infinite ammo {}", if on { "on" } else { "off" });
+}
+
+pub(crate) fn ui_set_wanted(stars: u32) {
+    lock().wanted = stars.clamp(1, 5);
+}
+
+pub(crate) fn ui_set_weather(w: i32) {
+    let mut s = lock();
+    s.weather = w;
+    s.pending.push(Action::Weather(w));
+}
+
+pub(crate) fn ui_open_label_box() {
+    open_label_box();
+}
+
+/// Closes the label box, saving `text` as the point's label when it is Some.
+pub(crate) fn ui_close_label_box(text: Option<String>) {
+    let save = text.is_some();
+    if let Some(t) = text {
+        label_lock().text = t.chars().take(LABEL_MAX).collect();
+    }
+    close_label_box(save);
+}
+
+/// Closes the menu window (Esc / the close button) and swallows Esc until released.
+pub(crate) fn ui_close_menu() {
+    OVERLAY_OPEN.store(false, Ordering::Release);
+    SWALLOW_KEYS.store(true, Ordering::Relaxed);
 }

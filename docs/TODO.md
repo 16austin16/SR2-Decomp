@@ -56,7 +56,9 @@ The work agreed for later, in rough priority order. Done items move to the commi
 
 ## Tools
 
-- **Own 2D renderer for the F7 menu.** Use Dear ImGui (Rust bindings with the Direct3D 9 backend) and draw at
+- **Own 2D renderer for the F7 menu.** DONE 2026-11-28 (crates/sr2-hook/src/overlay, opt-in with
+  `sr2-imgui.txt`; all pages and the F8 label box ported, mouse, wheel and keyboard play-tested). Left over:
+  make it the default menu and remove the old one. Original plan: Use Dear ImGui (Rust bindings with the Direct3D 9 backend) and draw at
   `EndScene` / `Present`. That gives:
   - real anti-aliased rounded corners, any font, icons and mouse support;
   - no dependence on the game's HUD state.
