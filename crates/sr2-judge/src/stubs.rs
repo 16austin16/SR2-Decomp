@@ -17,6 +17,9 @@ pub const NSTACK: usize = 16;
 /// as object vtables, so `call [vtbl+N]` lands in a recording stub instead of faulting.
 pub const VT_BASE: usize = 0x3B00_0000;
 pub const VT_SIZE: usize = 0x1_0000;
+/// The exe's import address table (data directory 12).
+pub const IAT_BASE: usize = 0x00DB_8000;
+pub const IAT_SIZE: usize = 0x440;
 /// Offset of the `ret imm16` operand in an indirect stub: push id (5), call (5), lea (4), C2.
 const IND_RET_IMM: usize = 15;
 
@@ -49,6 +52,8 @@ pub static mut IND_SITES: [(u32, u16); 256] = [(0, 0); 256];
 pub static mut IND_N: usize = 0;
 /// The indirect stub's address (0 when the function has no indirect calls).
 pub static mut IND_STUB: u32 = 0;
+/// The import stub's address (0 when the function makes no import calls).
+pub static mut IMP_STUB: u32 = 0;
 pub static mut NSTUBS: usize = 0;
 pub static mut LOG: [CallRec; LOG_CAP] = [EMPTY_REC; LOG_CAP];
 pub static mut LOG_N: usize = 0;
@@ -101,6 +106,11 @@ pub fn reset_run(seed: u64) {
 pub extern "C" fn record(frame: *mut u32) -> u32 {
     unsafe {
         let id = *frame.add(10) as usize;
+        if id >= NSTUBS {
+            // Not one of our stubs: the code under test jumped into the stub area with a bad target.
+            sys::FAULT_CODE.store(sys::STUB_FLOOD, Ordering::SeqCst);
+            return 1;
+        }
         if LOG_N >= LOG_CAP {
             sys::FAULT_CODE.store(sys::STUB_FLOOD, Ordering::SeqCst);
             return 1;
@@ -179,6 +189,7 @@ pub fn install(img: &mut Image, callees: &[Callee]) -> Result<(), String> {
     unsafe {
         NSTUBS = callees.len();
         IND_STUB = 0;
+        IMP_STUB = 0;
         for (id, c) in callees.iter().enumerate() {
             TABLE[id] =
                 StubInfo {
@@ -211,7 +222,11 @@ pub fn install(img: &mut Image, callees: &[Callee]) -> Result<(), String> {
             if c.indirect {
                 assert_eq!(b.len(), IND_RET_IMM - 1);
                 b.extend([0xC2, 0, 0]); // ret imm16, set per call in record()
-                IND_STUB = at as u32;
+                if c.import {
+                    IMP_STUB = at as u32;
+                } else {
+                    IND_STUB = at as u32;
+                }
             } else if c.ret_n == 0 {
                 b.push(0xC3);
             } else {
@@ -249,6 +264,13 @@ pub fn reset_vtables(sites: &[(u32, u16)]) {
         let p = VT_BASE as *mut u32;
         for i in 0..VT_SIZE / 4 {
             *p.add(i) = IND_STUB;
+        }
+        // The exe's import address table is not resolved in the judge: a `call [import]` would jump to a
+        // name hint. Every slot leads to the indirect stub instead.
+        let iat = IAT_BASE as *mut u32;
+        let imp = if IMP_STUB != 0 { IMP_STUB } else { IND_STUB };
+        for i in 0..IAT_SIZE / 4 {
+            *iat.add(i) = imp;
         }
     }
 }

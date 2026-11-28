@@ -369,6 +369,16 @@ pub fn judge(env: &mut Env, e: &RegEntry, o: &Opts) -> Verdict {
         v.note = m;
         return v;
     }
+    // Containment: only the function's own pages and the stubbed callee entries stay executable, so a jump
+    // through a data table into real, unstubbed game code faults (on both sides) instead of running it.
+    let mut exec_pages: Vec<usize> = (e.addr & !(PAGE - 1)..e.addr + len).step_by(PAGE).collect();
+    for &t in &targets {
+        exec_pages.push(t & !(PAGE - 1));
+        exec_pages.push((t + 4) & !(PAGE - 1));
+    }
+    exec_pages.sort_unstable();
+    exec_pages.dedup();
+    sys::protect_text(&exec_pages, false);
     v.status = Status::Pass;
     let mut notes = Vec::new();
     if info.indirect_calls > 0 {
@@ -390,6 +400,7 @@ pub fn judge(env: &mut Env, e: &RegEntry, o: &Opts) -> Verdict {
             }
         }
     }
+    sys::protect_text(&exec_pages, true);
     stubs::remove(&mut env.img, &saved);
     image::reset_watch();
     if v.status == Status::Pass && (v.ok as u64) * 5 < v.cases as u64 {

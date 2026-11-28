@@ -231,3 +231,24 @@ pub fn install_fault_machinery(exit_eip: usize) {
         }
     });
 }
+
+/// Make the exe's code pages non-executable (read/write) except `keep`, or with `restore` everything executable
+/// again. Used while judging one port.
+pub fn protect_text(keep: &[usize], restore: bool) {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, PAGE_READWRITE, VirtualProtect};
+    let lo = crate::image::TEXT_LO & !(crate::image::PAGE - 1);
+    let hi = (crate::image::TEXT_HI + crate::image::PAGE - 1) & !(crate::image::PAGE - 1);
+    let mut old = 0u32;
+    let mut p = lo;
+    while p < hi {
+        // Runs of pages with the same protection go in one call.
+        let exec = restore || keep.binary_search(&p).is_ok();
+        let mut q = p + crate::image::PAGE;
+        while q < hi && (restore || keep.binary_search(&q).is_ok()) == exec {
+            q += crate::image::PAGE;
+        }
+        let prot = if exec { PAGE_EXECUTE_READWRITE } else { PAGE_READWRITE };
+        unsafe { VirtualProtect(p as *const _, q - p, prot, &mut old) };
+        p = q;
+    }
+}

@@ -46,6 +46,8 @@ pub struct Callee {
     pub indirect: bool,
     /// The callee consumes ST0 (`_ftol2` and similar): the stub pops it.
     pub pop_st0: bool,
+    /// The shared stub for calls through the exe's import table (Windows APIs, CRT): reads no register.
+    pub import: bool,
     /// The callee fills an output structure through stack argument `.0`, `.1` bytes long: the stub writes
     /// seeded values there.
     pub out_arg: Option<(u8, u16)>,
@@ -60,6 +62,8 @@ pub struct FnInfo {
     pub indirect_calls: usize,
     /// Indirect call sites: (return address, bytes the callee pops).
     pub indirect_sites: Vec<(u32, u16)>,
+    /// How many of those call through the import table.
+    pub import_calls: usize,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -367,15 +371,28 @@ impl Analyzer {
             }
             depth += delta(self, i)?;
         }
-        // From after the call to the next ret: the change in depth, then what the epilogue removes.
-        let ret_at = instrs.iter().enumerate().skip(idx + 1).find(|(_, i)| i.flow_control() == FlowControl::Return)?.0;
+        // From after the call to the next exit: the change in depth, then what the epilogue removes. An exit is
+        // a ret, or a tail jmp out of the function (the stack is back at the entry depth there too).
+        let lo = instrs.first()?.ip() as usize;
+        let hi = instrs.last()?.next_ip() as usize;
+        let is_exit = |i: &Instruction| {
+            i.flow_control() == FlowControl::Return
+                || (i.flow_control() == FlowControl::UnconditionalBranch
+                    && i.op0_kind() == OpKind::NearBranch32
+                    && !(lo..hi).contains(&(i.near_branch_target() as usize)))
+        };
+        let ret_at = instrs.iter().enumerate().skip(idx + 1).find(|(_, i)| is_exit(i))?.0;
         let mut epi = ret_at;
         while epi > idx + 1 && matches!(instrs[epi - 1].mnemonic(), Mnemonic::Pop | Mnemonic::Add) {
             epi -= 1;
         }
         let mut after: i64 = 0;
         for i in &instrs[idx + 1..epi] {
-            if matches!(i.flow_control(), FlowControl::IndirectCall | FlowControl::UnconditionalBranch | FlowControl::Return) {
+            if matches!(i.flow_control(), FlowControl::IndirectCall | FlowControl::Return) {
+                return None;
+            }
+            // A jump inside the function: the depth along the jump's path may differ, so stop trusting it.
+            if i.flow_control() == FlowControl::UnconditionalBranch {
                 return None;
             }
             after += delta(self, i)?;
@@ -455,6 +472,13 @@ impl Analyzer {
                         }
                     }
                     info.indirect_sites.push((ins.next_ip() as u32, pop));
+                    if ins.op0_kind() == OpKind::Memory
+                        && ins.memory_base() == Register::None
+                        && ins.memory_index() == Register::None
+                        && (0xDB_8000..0xDB_8440).contains(&(ins.memory_displacement32() as usize))
+                    {
+                        info.import_calls += 1;
+                    }
                 }
                 FlowControl::Call | FlowControl::UnconditionalBranch | FlowControl::ConditionalBranch => {
                     if ins.op0_kind() == OpKind::NearBranch32 {
@@ -550,6 +574,7 @@ impl Analyzer {
                 clobber,
                 via_jmp: e.is_jmp && !e.is_call,
                 indirect: false,
+                import: false,
                 pop_st0: ov.pop_st0.unwrap_or(false),
                 out_arg: ov.out_arg.map(|a| (a, ov.out_size.unwrap_or(4))),
             });
@@ -566,9 +591,27 @@ impl Analyzer {
                 clobber: 0b111,
                 via_jmp: false,
                 indirect: true,
+                import: false,
                 pop_st0: false,
                 out_arg: None,
             });
+            if info.import_calls > 0 {
+                // Imports are stdcall / cdecl Windows and CRT functions: no register argument.
+                info.callees.push(Callee {
+                    target: 0,
+                    ret_n: 0,
+                    nargs: most,
+                    float_st0: false,
+                    xmm0: false,
+                    live_in: 0,
+                    clobber: 0b111,
+                    via_jmp: false,
+                    indirect: true,
+                    import: true,
+                    pop_st0: false,
+                    out_arg: None,
+                });
+            }
         }
         info
     }

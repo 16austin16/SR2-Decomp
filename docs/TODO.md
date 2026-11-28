@@ -18,12 +18,14 @@ The work agreed for later, in rough priority order. Done items move to the commi
        the judge process.
      - 0xB92270 crashes the judge process at 60+ cases.
    - Judge issues found in round 9:
-     - The indirect-call pop count still falls back to the push count when the function has no `ret` (it ends in
-       a tail jmp) or has a push right before the call (ba2a60, 5c7ec0, 879a40, 6d6b50).
-     - A panic at stubs.rs:108 (TABLE[id] out of range) on calls through import slots 0xDB80CC / 0xDB80D0
-       (savedevice_acquire 0x6909B0).
-     - The judge process segfaults on some ports with random function pointers (0x6111F0, 0xCF60F0, 0x68F6F0
-       on some seeds). Make faults inside stubs and the judge itself recoverable.
+     - (Done 2026-11-28: tail jmps count as exits for the pop count; import-table calls go to their own stub,
+       which reads no register; a bad stub id is a fault, not a panic; game code outside the function under test
+       is non-executable while judging.)
+     - Still open: the judge process segfaults on 0x68F6F0 game_event_human_killed at case 145 (seed 1, 200
+       cases), even with the code containment. It calls through a table of real function pointers. Debug it with
+       --verbose and a single-case seed.
+     - Newly visible real FAILs to fix: the render_list*_add family (0x52FDA0..0x5300A0, ECX / EDX leftovers
+       after the import call), 0x47CDB0 audio_voice_slot_alloc, 0x68E560 gameplay_exit.
    - **More realistic random worlds**, to turn the ~265 INCONCLUSIVE ports into real verdicts. INCONCLUSIVE means
      that over 80% of the random cases crash on both sides before doing much, so most of the function goes untested.
      Ideas:

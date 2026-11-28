@@ -67,7 +67,7 @@ Where things are:
 - To override a wrongly detected callee (stack size, float result, which registers it keeps), ask the coordinator; do not
   edit `callees.toml` yourself.
 - Judge source hash (SHA-256 of `crates/sr2-judge/src/*.rs`, `build.rs`, `callees.toml` and `crates/sr2-hook/src/registry.rs`):
-  `ecf3dccbcddc88d7afd935ae4119bca1cf57d8217ab2ebe2bf435ee7bb893c78`. If a run prints a different hash, stop and tell the coordinator.
+  `de20670583f4ba7f284aac07f713761294a94bbbf4a5271cbe760e57c28150ff`. If a run prints a different hash, stop and tell the coordinator.
 
 ## Checks
 - Pure functions: a relocated-original shadow (detour::relocate) for the first 3000 calls, keeping the
