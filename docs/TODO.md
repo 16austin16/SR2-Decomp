@@ -24,6 +24,14 @@ The work agreed for later, in rough priority order. Done items move to the commi
        (savedevice_acquire 0x6909B0).
      - The judge process segfaults on some ports with random function pointers (0x6111F0, 0xCF60F0, 0x68F6F0
        on some seeds). Make faults inside stubs and the judge itself recoverable.
+   - **More realistic random worlds**, to turn the ~265 INCONCLUSIVE ports into real verdicts. INCONCLUSIVE means
+     that over 80% of the random cases crash on both sides before doing much, so most of the function goes untested.
+     Ideas:
+     - a valid Lua state (stack, top, base) for the script bindings;
+     - sensible values for well-known game globals (the player human at 0x21703D4, the human ring, object and
+       handle tables, the shop array) instead of random words;
+     - handles that resolve through the game's own handle tables;
+     - learn what each port reads through a short in-game trace, and seed the world with it.
 2. **Porting round on small-function lists** with the Haiku trial: a few Haiku agents and the rest on Sonnet.
    - The judge is the only acceptance test.
    - Agents must not start sub-agents.
