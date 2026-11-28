@@ -30,6 +30,18 @@ The work agreed for later, in rough priority order. Done items move to the commi
 5. **The three excluded ports:** 0xBF65F0, 0xBB8A10 and 0x72A100.
 6. Rewrite the 115 IDirect3DDevice9Lost stubs in port_small_b as real Rust.
 
+## Game quality
+
+- **Frame drops while driving (reported 2026-11-28).** The log shows dips to about 32-35 fps while driving, with
+  similar lows in the previous build. Compare the same drive with `all_ports` (vanilla) against the full build to
+  tell whether ports cause it. If they do, use the frame-rate log plus the per-module skip file to find the slow
+  module.
+- **Anti-aliasing, especially in cutscenes,** which show jagged edges. Options:
+  - a post-process AA pass (FXAA or SMAA) drawn at Present, which fits with the ImGui renderer work, since both hook
+    the end of the frame;
+  - forcing MSAA when the game creates its D3D9 device. That may clash with the game's render targets and is riskier.
+  - Possibly only during cutscenes, where the frame rate matters less.
+
 ## Tools
 
 - **Own 2D renderer for the F7 menu.** Use Dear ImGui (Rust bindings with the Direct3D 9 backend) and draw at
