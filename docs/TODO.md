@@ -32,10 +32,6 @@ The work agreed for later, in rough priority order. Done items move to the commi
 
 ## Game quality
 
-- **Frame drops while driving (reported 2026-11-28).** The log shows dips to about 32-35 fps while driving, with
-  similar lows in the previous build. Compare the same drive with `all_ports` (vanilla) against the full build to
-  tell whether ports cause it. If they do, use the frame-rate log plus the per-module skip file to find the slow
-  module.
 - **Anti-aliasing, especially in cutscenes,** which show jagged edges. Options:
   - a post-process AA pass (FXAA or SMAA) drawn at Present, which fits with the ImGui renderer work, since both hook
     the end of the frame;
@@ -63,3 +59,10 @@ The work agreed for later, in rough priority order. Done items move to the commi
   - Adds mouse support where the original is keyboard/controller only.
 - **Automatic bisect script:** launch with a skip list, auto-press Continue, wait for a crash or steady frames,
   then halve the list.
+
+## Later: optimisation (when most of the game is in Rust)
+
+- **Frame drops while driving (reported 2026-11-28).** The log shows dips to about 32-35 fps while driving; the
+  original game is known to run poorly on modern PCs. Agreed with the user to optimise near the end, once the slow
+  paths are our own code. First check with `all_ports` that ports are not the cause.
+
