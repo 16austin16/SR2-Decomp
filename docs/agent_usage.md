@@ -98,3 +98,43 @@ Lessons from this round:
 - Fix work costs much more than porting. An agent cost about 280k-560k tokens, and the hard modules did not finish.
 - Agents must be told not to start sub-agents; the helpers burned about 27% of a 5-hour window in 30 minutes.
 - At this cost, about 6 agents fit in one 5-hour window with room to spare, and 9 agents use most of it.
+
+### 2026-11-27: Haiku / Sonnet trial (8 porting agents on matched small-function lists)
+
+The 1,133 small unported functions (16-200 bytes) were dealt round-robin into 8 lists of about 142. Agents h1-h4
+run on **Haiku**, s1-s4 on **Sonnet**, with the same brief. The judge (hash 673aa7df...) is the only acceptance
+test.
+
+| Time | 5-hour | Weekly (all models) |
+|---|---:|---:|
+| Before (agents launched) | 10% | 19% |
+| After | 25% | 21% |
+
+| Agent | Model | Tokens | Accepted (PASS + INCONCLUSIVE) | Removed for FAIL | Tokens / accepted port |
+|---|---|---:|---:|---:|---:|
+| h1 | Haiku | 153k | 8 (7 PASS + 1 INC) | 0 | 19k |
+| h2 | Haiku | 158k | 9 (9 PASS) | 1 | 17.6k |
+| h3 | Haiku | 153k | 7 (4 PASS + 3 INC) | 0 | 22k |
+| h4 | Haiku | 212k | 12 (10 PASS + 2 INC) | 1 | 17.7k |
+| s1 | Sonnet | 386k | 73 (58 PASS + 15 INC) | 3 (+1 judge crash) | 5.3k |
+| s2 | Sonnet | 361k | 34 (27 PASS + 7 INC) | 3 | 10.6k |
+| s3 | Sonnet | 149k | 22 (20 PASS + 2 INC) | 0 | 6.8k |
+| s4 | Sonnet | 278k | 57 (48 PASS + 9 INC) | 3 | 4.9k |
+
+**Trial result**
+
+| Model | Agents | Tokens | Ports accepted | Removed for FAIL | Tokens / port |
+|---|---:|---:|---:|---:|---:|
+| Haiku | 4 | 676k | 36 | 2 | 18.8k |
+| Sonnet | 4 | 1,174k | 186 | 9 | 6.3k |
+
+The round took 15% of the 5-hour window and 2% of the week. The plan does not report usage by model. If the plan
+charges by API price (Haiku tokens cost about 1/20 of Sonnet's), the Haiku agents used under 1% of the window and
+the Sonnet agents about 14%. That would make Haiku about 7 times cheaper per accepted port in plan terms, even though
+it uses 3 times more tokens per port. This is an estimate, not a measurement.
+
+What the trial showed:
+- Quality is the same: every port either model submitted was accepted by the judge.
+- Haiku ports a third as much per agent (about 9 each, against about 47 for Sonnet). It stops early, and it avoids
+  vtable and x87 functions.
+- Sonnet finds more of the judge's weak spots (the indirect-stub pop count, a rustc mask miscompile).

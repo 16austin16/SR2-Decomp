@@ -80,6 +80,17 @@ for members in groups.values():
     for m in members:
         if status[m[0]][1] != "rust":
             pairs.append((m[0], p[0], m[2], m[1]))
+# Keep every pair of the existing table: installed twins are marked rust in functions.csv, so a fresh scan no
+# longer lists them, and dropping them would uninstall them. twins.rs re-checks each pair at runtime anyway.
+out = os.path.join(ROOT, "crates", "sr2-hook", "src", "twins_table.rs")
+import re as _re
+if os.path.exists(out):
+    have = {t for t, _, _, _ in pairs}
+    for m in _re.finditer(r"\(0x([0-9a-f]+), 0x([0-9a-f]+), (\d+), &\[([0-9, ]*)\]\)", open(out, encoding="utf-8").read()):
+        t = int(m.group(1), 16)
+        if t not in have:
+            fix = [int(x) for x in m.group(4).split(",") if x.strip()]
+            pairs.append((t, int(m.group(2), 16), int(m.group(3)), fix))
 pairs.sort()
 
 out = os.path.join(ROOT, "crates", "sr2-hook", "src", "twins_table.rs")

@@ -1,14 +1,3125 @@
-//! Ported functions (filled by a porting agent).
+//! Port module s1: small functions (get_title shapes, scalar deleting destructors, diversion
+//! methods, packet handlers, ...), ported from the originals' bytes and accepted by `sr2-judge`.
+//!
+//! Every port runs behind one `pushad` thunk that also saves XMM0-7 (an LTCG caller may keep a value
+//! there); the Rust body edits the saved registers and `popad` restores them. Callees stay original
+//! and are called by address through `cx`, which loads every register (and XMM0-7) from the block,
+//! calls, and stores back what the callee left, so the original's register flow (including the ECX /
+//! EDX it leaves behind) is reproduced.
 
-#![allow(unused_imports)]
+#![allow(unused_imports, dead_code, unused_variables, unused_macros)]
+
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::portlib::*;
 use crate::{detour, log};
 
-/// Install this module's replacements (called from hooks::install_all).
-pub fn install() {}
+const CAP: u32 = 1 << 24;
+const MAXP: usize = 200;
+static CNT: [AtomicU32; MAXP] = [const { AtomicU32::new(0) }; MAXP];
+static PORT_NAMES: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
 
-/// Per-function call counts for the periodic log.
-pub fn summary() -> String {
-    String::new()
+#[inline(always)]
+fn count(i: usize) {
+    let c = &CNT[i];
+    if c.load(Ordering::Relaxed) < CAP {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
 }
+
+/// What a thunk hands to its handler: XMM0-7, then the `pushad` block (lowest address first).
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(dead_code)]
+struct Pushad {
+    xmm: [[u32; 4]; 8],
+    edi: u32,
+    esi: u32,
+    ebp: u32,
+    esp: u32,
+    ebx: u32,
+    edx: u32,
+    ecx: u32,
+    eax: u32,
+}
+
+/// `pushad`, XMM0-7 saved, `f(&mut block, &stack args)`, XMM0-7 restored, `popad`.
+/// `$post` runs after the XMM restore and before `add esp, 128` (the block's `esp` slot is at
+/// `[esp + 140]`), so it can push a value onto the x87 stack.
+macro_rules! hot_thunk {
+    ($name:ident, $f:ident, $ret:literal) => {
+        hot_thunk!($name, $f, $ret, "nop");
+    };
+    ($name:ident, $f:ident, $ret:literal, $post:literal) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            std::arch::naked_asm!(
+                "pushad",
+                "sub esp, 128",
+                "movups xmmword ptr [esp], xmm0",
+                "movups xmmword ptr [esp + 16], xmm1",
+                "movups xmmword ptr [esp + 32], xmm2",
+                "movups xmmword ptr [esp + 48], xmm3",
+                "movups xmmword ptr [esp + 64], xmm4",
+                "movups xmmword ptr [esp + 80], xmm5",
+                "movups xmmword ptr [esp + 96], xmm6",
+                "movups xmmword ptr [esp + 112], xmm7",
+                "mov eax, esp",
+                "lea ecx, [esp + 164]",
+                "push ecx",
+                "push eax",
+                "call {f}",
+                "add esp, 8",
+                "movups xmm0, xmmword ptr [esp]",
+                "movups xmm1, xmmword ptr [esp + 16]",
+                "movups xmm2, xmmword ptr [esp + 32]",
+                "movups xmm3, xmmword ptr [esp + 48]",
+                "movups xmm4, xmmword ptr [esp + 64]",
+                "movups xmm5, xmmword ptr [esp + 80]",
+                "movups xmm6, xmmword ptr [esp + 96]",
+                "movups xmm7, xmmword ptr [esp + 112]",
+                $post,
+                "add esp, 128",
+                "popad",
+                $ret,
+                f = sym $f,
+            )
+        }
+    };
+}
+
+/// Stack words handed to every callee: its own arguments, then what the original's frame holds above them.
+const FW: usize = 12;
+
+/// The words the original has on the stack at a call: `own` (top first), then its return address and the
+/// caller's own stack arguments.
+unsafe fn fr(a: *const u32, own: &[u32]) -> [u32; FW] {
+    let mut w = [0u32; FW];
+    let mut n = 0;
+    for &v in own {
+        w[n] = v;
+        n += 1;
+    }
+    w[n] = unsafe { *a.sub(1) };
+    n += 1;
+    let mut i = 0;
+    while n < FW {
+        w[n] = unsafe { *a.add(i) };
+        n += 1;
+        i += 1;
+    }
+    w
+}
+
+/// Like `fr`, with registers the original pushed in between (`saved`, top first) before its return address.
+unsafe fn frs(a: *const u32, own: &[u32], saved: &[u32]) -> [u32; FW] {
+    let mut w = [0u32; FW];
+    let mut n = 0;
+    for &v in own.iter().chain(saved.iter()) {
+        w[n] = v;
+        n += 1;
+    }
+    w[n] = unsafe { *a.sub(1) };
+    n += 1;
+    let mut i = 0;
+    while n < FW {
+        w[n] = unsafe { *a.add(i) };
+        n += 1;
+        i += 1;
+    }
+    w
+}
+
+/// The words a callee entered by a tail `jmp` sees: the original's own stack arguments.
+unsafe fn fr_tail(a: *const u32) -> [u32; FW] {
+    let mut w = [0u32; FW];
+    for (i, v) in w.iter_mut().enumerate() {
+        *v = unsafe { *a.add(i) };
+    }
+    w
+}
+
+macro_rules! cx_fn {
+    ($name:ident, $n:literal) => {
+        /// Call `f` with every register and XMM0-7 of `c` and the stack words `w` pushed, then load what
+        /// the callee left back into `c`. ESP is restored from a TEB scratch slot (`fs:[0x14]`, saved
+        /// and restored around the call), so it does not matter how many of the words the callee pops.
+        unsafe fn $name(f: usize, c: &mut Pushad, w: &[u32; FW]) {
+            let blk: [u32; 3] = [f as u32, w.as_ptr() as u32, c as *mut Pushad as u32];
+            unsafe {
+                std::arch::asm!(
+                    "push ebx", "push esi", "push edi", "push ebp",
+                    "mov ebx, eax",
+                    "push dword ptr [ebx + 8]",
+                    "push dword ptr fs:[0x14]",
+                    "mov fs:[0x14], esp",
+                    "push dword ptr [ebx]",
+                    "mov esi, [ebx + 4]",
+                    "mov ecx, 12",
+                    "2:",
+                    "push dword ptr [esi + ecx*4 - 4]",
+                    "dec ecx",
+                    "jnz 2b",
+                    "mov eax, [ebx + 8]",
+                    "movups xmm0, [eax]", "movups xmm1, [eax + 16]", "movups xmm2, [eax + 32]", "movups xmm3, [eax + 48]",
+                    "movups xmm4, [eax + 64]", "movups xmm5, [eax + 80]", "movups xmm6, [eax + 96]", "movups xmm7, [eax + 112]",
+                    "mov edi, [eax + 128]", "mov esi, [eax + 132]", "mov ebp, [eax + 136]", "mov ebx, [eax + 144]",
+                    "mov edx, [eax + 148]", "mov ecx, [eax + 152]", "mov eax, [eax + 156]",
+                    "call dword ptr [esp + 48]",
+                    "mov esp, fs:[0x14]",
+                    "push eax",
+                    "mov eax, [esp + 8]",
+                    "movups [eax], xmm0", "movups [eax + 16], xmm1", "movups [eax + 32], xmm2", "movups [eax + 48], xmm3",
+                    "movups [eax + 64], xmm4", "movups [eax + 80], xmm5", "movups [eax + 96], xmm6", "movups [eax + 112], xmm7",
+                    "mov [eax + 128], edi", "mov [eax + 132], esi", "mov [eax + 136], ebp", "mov [eax + 144], ebx",
+                    "mov [eax + 148], edx", "mov [eax + 152], ecx",
+                    "pop ecx",
+                    "mov [eax + 156], ecx",
+                    "pop dword ptr fs:[0x14]",
+                    "add esp, 4",
+                    "pop ebp", "pop edi", "pop esi", "pop ebx",
+                    inout("eax") blk.as_ptr() => _,
+                    out("ecx") _, out("edx") _,
+                    clobber_abi("C"),
+                );
+            }
+        }
+    };
+}
+cx_fn!(cx, 0);
+cx_fn!(cx_p1, 1);
+cx_fn!(cx_p2, 2);
+cx_fn!(cx_p3, 3);
+cx_fn!(cx_p4, 4);
+
+const IMP_ENTER: usize = 0x00DB_80CC; // import slot: lock
+const IMP_LEAVE: usize = 0x00DB_80D0; // import slot: unlock
+const LOCK_ARG: u32 = 0x0347_ADE4;
+const NO_FREE_FLAG: usize = 0x0252_7BF7;
+const FREE: usize = 0x00CD_E870; // EAX = pointer
+
+/// A float's bits as `fld dword` / `fstp dword` leaves them (a signalling NaN is quieted).
+fn q32(b: u32) -> u32 {
+    if b & 0x7F80_0000 == 0x7F80_0000 && b & 0x007F_FFFF != 0 { b | 0x0040_0000 } else { b }
+}
+
+unsafe fn rw(p: usize) -> u16 {
+    unsafe { *(p as *const u16) }
+}
+
+unsafe fn ww(p: usize, v: u16) {
+    unsafe { *(p as *mut u16) = v }
+}
+
+/// `mov eax, fs:[0x2c]; mov eax, [eax]`: this thread's first TLS block.
+unsafe fn tls0() -> u32 {
+    let p: u32;
+    unsafe { std::arch::asm!("mov {0}, fs:[0x2c]", out(reg) p, options(nostack, readonly, preserves_flags)) };
+    unsafe { rd(p as usize) }
+}
+
+/// The condition shared by gfx_should_defer / im2d_c_begin / gfx_set_state_float_110: the
+/// `[0xe849db]` flag is clear and the thread's TLS block says it is on a deferred-render thread.
+/// Returns (take the "defer" branch, the TLS block pointer if it was read).
+unsafe fn defer_cond() -> (bool, Option<u32>) {
+    unsafe {
+        if rb(0x00E8_49DB) != 0 {
+            return (false, None);
+        }
+        let t = tls0();
+        let p = t as usize;
+        let hit = if rb(p + 0x5C) == 0 && rd(p + 0x60) == 0x00EC_26A0 { true } else { rd(p + 0x60) == 0x00EC_2610 };
+        (hit, Some(t))
+    }
+}
+
+/// The CRT `delete` tail shared by the scalar deleting destructors: when the flag (first stack
+/// argument) has bit 0 set (and `this != 0` when `null_check`), the free is skipped if the byte at
+/// 0x2527BF7 is 1, else lock (import), free (EAX = ESI), unlock (import).
+unsafe fn free_tail(r: &mut Pushad, a: *const u32, null_check: bool) {
+    unsafe {
+        if *a & 1 == 0 || (null_check && r.esi == 0) {
+            return;
+        }
+        let flag = rb(NO_FREE_FLAG);
+        r.eax = (r.eax & !0xFF) | flag as u32;
+        if flag == 1 {
+            return;
+        }
+        cx_p1(rd(IMP_ENTER) as usize, r, &fr(a, &[LOCK_ARG]));
+        r.eax = r.esi;
+        cx(FREE, r, &fr(a, &[]));
+        cx_p1(rd(IMP_LEAVE) as usize, r, &fr(a, &[LOCK_ARG]));
+    }
+}
+
+// =================================================================================================
+// Ports
+// =================================================================================================
+
+// get_title shapes: ESI / EDI constants, a call to a string helper (ESI / EDI in), both restored.
+unsafe fn gt(r: &mut Pushad, a: *const u32, f: usize, edi: u32, esi: u32) {
+    unsafe {
+        let (e0, s0) = (r.edi, r.esi);
+        r.edi = edi;
+        r.esi = esi;
+        cx(f, r, &fr(a, &[]));
+        r.edi = e0;
+        r.esi = s0;
+    }
+}
+extern "C" fn e_575110(r: &mut Pushad, a: *const u32) {
+    count(0);
+    unsafe { gt(r, a, 0x007F_49E0, 0x00DE_89E0, 0x00DE_8A40) }
+}
+hot_thunk!(t_575110, e_575110, "ret");
+extern "C" fn e_5f9590(r: &mut Pushad, a: *const u32) {
+    count(1);
+    unsafe { gt(r, a, 0x007F_4AD0, 0x00DF_2198, 0x00DF_21A8) }
+}
+hot_thunk!(t_5f9590, e_5f9590, "ret");
+extern "C" fn e_606420(r: &mut Pushad, a: *const u32) {
+    count(2);
+    unsafe { gt(r, a, 0x007F_49E0, 0, 0x00DF_383C) }
+}
+hot_thunk!(t_606420, e_606420, "ret");
+extern "C" fn e_641740(r: &mut Pushad, a: *const u32) {
+    count(3);
+    unsafe { gt(r, a, 0x007F_49E0, 0x00DF_A6D8, 0x00DF_A6F0) }
+}
+hot_thunk!(t_641740, e_641740, "ret");
+
+// flashing_diversion_type::can_start: bit 8 of the player flags, else a tail jump to 0x611060.
+extern "C" fn e_611180(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(4);
+        let p = rd(0x0217_03D4);
+        r.eax = p;
+        let c = rd(p as usize + 0x13AC) >> 8;
+        r.ecx = c;
+        if c & 1 == 0 {
+            r.eax &= !0xFF;
+            return;
+        }
+        cx(0x0061_1060, r, &fr_tail(a));
+    }
+}
+hot_thunk!(t_611180, e_611180, "ret");
+
+// stunt_wheels_diversion_type::init
+extern "C" fn e_61e210(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(5);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        cx(0x0060_2A50, r, &fr(a, &[]));
+        r.eax = 0xFFFF_FFFF;
+        let s = r.esi as usize;
+        wd(s + 0x24, 0xFFFF_FFFF);
+        wd(s + 0x2C, 0xFFFF_FFFF);
+        wd(s + 0x20, 0xFFFF_FFFF);
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_61e210, e_61e210, "ret");
+
+// stunt_near_miss_diversion_type::init
+extern "C" fn e_61c700(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(6);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        cx(0x0060_2A50, r, &fr(a, &[]));
+        let s = r.esi as usize;
+        let t = rd(0x00E8_43AC);
+        r.eax = t;
+        r.edx = 0;
+        wd(s + 0x3C, 0);
+        wd(s + 0x44, t);
+        if (t as i32) > 0x6B49_D200 {
+            wd(s + 0x44, t.wrapping_add(0x94B6_2E00));
+        }
+        r.ecx = 0xFFFF_FFFF;
+        wd(s + 0x54, 0);
+        wd(s + 0x40, 0xFFFF_FFFF);
+        wd(s + 0x50, 0);
+        wd(s + 0x4C, 0xFFFF_FFFF);
+        wd(s + 0x48, t);
+        if (t as i32) > 0x6B49_D200 {
+            r.eax = t.wrapping_add(0x94B6_2E00);
+            wd(s + 0x48, r.eax);
+        }
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_61c700, e_61c700, "ret");
+
+// notoriety_spawn_group::reset
+extern "C" fn e_922da0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(7);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        cx(0x0095_6080, r, &fr(a, &[]));
+        let s = r.esi as usize;
+        r.eax = 0;
+        r.ecx = 0xFFFF_FFFF;
+        wb(s + 0x1E8, 0);
+        wd(s + 0x1EC, 0xFFFF_FFFF);
+        wd(s + 0x1F0, 0xFFFF_FFFF);
+        wd(s + 0x1F4, 0);
+        wd(s + 0x1FC, 0);
+        wb(s + 0x2B0, 0);
+        wb(s + 0x2B1, 0);
+        wd(s + 0x2B4, 0xFFFF_FFFF);
+        wb(s + 0x2A4, 0);
+        wb(s + 0x20C, 0);
+        wb(s + 0x20D, 0);
+        wd(s + 0x210, 0xFFFF_FFFF);
+        wd(s + 0x214, 0xFFFF_FFFF);
+        wd(s + 0x218, 0xFFFF_FFFF);
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_922da0, e_922da0, "ret");
+
+// vehicle_multi_registration::on_register(handle)
+extern "C" fn e_8733c0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(8);
+        let arg = *a;
+        r.eax = arg;
+        if arg == 0 {
+            return;
+        }
+        r.ecx = (arg & 0xFFF) << 4;
+        let esi0 = r.esi;
+        r.esi = rd(r.ecx as usize + 0x0214_9C64);
+        let s = r.esi as usize;
+        if s == 0 || rd(s + 0x44) != arg || rd(s + 0x4C) != 5 {
+            r.esi = esi0;
+            return;
+        }
+        cx(0x0087_C3D0, r, &fr(a, &[]));
+        let s = r.esi as usize;
+        let e = r.eax as usize;
+        wd(s + 0x8F6C, e as u32);
+        wd(e, 0);
+        wd(e + 0x2AFC, 0);
+        wd(s + 0x80, rd(s + 0x80) | 0x180);
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_8733c0, e_8733c0, "ret 4");
+
+// script_item::on_object_spawned(obj, x)
+extern "C" fn e_a59bb0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(9);
+        let obj = *a;
+        r.eax = obj;
+        let edi0 = r.edi;
+        r.edi = r.ecx;
+        if rd(obj as usize + 0x4C) != 2 {
+            r.edi = edi0;
+            return;
+        }
+        wd(obj as usize + 0xCC, r.edi);
+        wd(r.edi as usize + 0x64, obj);
+        let x = *a.add(1);
+        r.eax = x;
+        cx_p1(0x00A2_3C00, r, &fr(a, &[x]));
+        let d = r.edi as usize;
+        wb(d + 0x51, rb(d + 0x51) | 1);
+        r.ecx = rd(d + 0x54);
+        let ne = (r.ecx != rd(0x033D_6308)) as u8;
+        let dl = (ne ^ rb(d + 0x60)) & 1;
+        r.edx = (r.edx & !0xFF) | dl as u32;
+        wb(d + 0x60, rb(d + 0x60) ^ dl);
+        r.edi = edi0;
+    }
+}
+hot_thunk!(t_a59bb0, e_a59bb0, "ret 8");
+
+// streaking_diversion_type::can_start
+extern "C" fn e_616440(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(10);
+        r.edx = rd(0x0217_03D4);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        let e = r.edx as usize;
+        if rb(e + 0x84) & 1 != 0 || rd(e + 0xD74) != 0 {
+            r.eax &= !0xFF;
+            r.esi = esi0;
+            return;
+        }
+        r.eax = rd(e + 0x13AC) >> 8;
+        if r.eax & 1 == 0 {
+            r.eax &= !0xFF;
+            r.esi = esi0;
+            return;
+        }
+        r.eax = r.edx;
+        cx(0x009C_BC60, r, &fr(a, &[]));
+        let e = r.edx as usize;
+        if r.eax & 0xFF != 0 || rd(e + 0xEA8) != 0 {
+            r.eax &= !0xFF;
+            r.esi = esi0;
+            return;
+        }
+        r.eax = (r.eax & !0xFF) | rb(r.esi as usize + 0x1C) as u32;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_616440, e_616440, "ret");
+
+// chunk_section_1b (EAX = chunk, EDX = offset)
+extern "C" fn e_4aeab0(r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        count(11);
+        let o = r.eax as usize;
+        r.ecx = rd(o).wrapping_add(r.edx);
+        r.edx = rd(r.ecx as usize);
+        wd(o + 0x1D4, r.edx);
+        wd(o + 0x1D8, 0);
+        if r.edx != 0 {
+            r.ecx = r.ecx.wrapping_add(4);
+            wd(o + 0x1D8, r.ecx);
+        }
+    }
+}
+hot_thunk!(t_4aeab0, e_4aeab0, "ret");
+
+// city_cull_chunks_job(_, ptr, count): 0x4b5c40 per element (EDI = element, stride 0x10)
+extern "C" fn e_4b64c0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(12);
+        let (esi0, edi0, ebp0) = (r.esi, r.edi, r.ebp);
+        r.esi = *a.add(2);
+        if (r.esi as i32) > 0 {
+            r.edi = *a.add(1);
+            loop {
+                cx(0x004B_5C40, r, &fr(a, &[]));
+                r.edi = r.edi.wrapping_add(0x10);
+                r.esi = r.esi.wrapping_sub(1);
+                if r.esi == 0 {
+                    break;
+                }
+            }
+        }
+        r.esi = esi0;
+        r.edi = edi0;
+        r.ebp = ebp0;
+    }
+}
+hot_thunk!(t_4b64c0, e_4b64c0, "ret");
+
+// city_submit_job(_, count, list): 0x4b5510(a, b, 0, 0) per pair
+extern "C" fn e_4b72a0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(13);
+        let (ebx0, esi0, edi0, ebp0) = (r.ebx, r.esi, r.edi, r.ebp);
+        r.ebx = *a.add(1);
+        r.esi = 0;
+        if r.ebx != 0 {
+            r.edi = *a.add(2);
+            loop {
+                let p = r.edi as usize + r.esi as usize * 8;
+                r.eax = rd(p + 4);
+                r.ecx = rd(p);
+                let (c, e) = (r.ecx, r.eax);
+                cx(0x004B_5510, r, &fr(a, &[c, e, 0, 0]));
+                r.esi = r.esi.wrapping_add(1);
+                if r.esi >= r.ebx {
+                    break;
+                }
+            }
+        }
+        r.ebx = ebx0;
+        r.esi = esi0;
+        r.edi = edi0;
+        r.ebp = ebp0;
+    }
+}
+hot_thunk!(t_4b72a0, e_4b72a0, "ret");
+
+// act_packet_sub_58 / _51: an event on the packet's own session, then a stored delta.
+unsafe fn act_pkt(r: &mut Pushad, a: *const u32, kind: u32) {
+    unsafe {
+        r.eax = rd(0x0252_7888);
+        if r.eax == 0 {
+            return;
+        }
+        r.ecx = rd(r.eax as usize + 8);
+        r.eax = rd(r.ecx as usize);
+        r.edx = rd(r.eax as usize + 8);
+        let f = r.edx as usize;
+        cx(f, r, &fr(a, &[]));
+        if r.eax != kind {
+            return;
+        }
+        r.eax = rd(0x0252_7888);
+        if r.eax == 0 {
+            return;
+        }
+        r.ecx = *a.add(1);
+        r.edx = rd(r.ecx as usize + 4);
+        r.ecx = rd(*a as usize);
+        r.ecx = r.ecx.wrapping_sub(rd(r.edx as usize + 0x223C));
+        wb(r.eax as usize + 0x70, 1);
+        wd(r.eax as usize + 0x6C, r.ecx);
+    }
+}
+extern "C" fn e_645730(r: &mut Pushad, a: *const u32) {
+    count(14);
+    unsafe { act_pkt(r, a, 0x19) }
+}
+hot_thunk!(t_645730, e_645730, "ret");
+extern "C" fn e_6495d0(r: &mut Pushad, a: *const u32) {
+    count(15);
+    unsafe { act_pkt(r, a, 0x18) }
+}
+hot_thunk!(t_6495d0, e_6495d0, "ret");
+
+// act_packet_sub_21: tail jump to 0x6768e0 with EAX = the session pointer's field
+extern "C" fn e_677c90(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(16);
+        if rd(0x0140_8E88) == 0 {
+            return;
+        }
+        r.eax = rd(0x027B_3C60);
+        if r.eax == 0 || rd(r.eax as usize + 0x3C) != 1 {
+            return;
+        }
+        r.ecx = rd(r.eax as usize + 0x90);
+        r.eax = rd(r.ecx as usize);
+        r.edx = rd(r.eax as usize + 4);
+        let f = r.edx as usize;
+        cx(f, r, &fr(a, &[]));
+        if r.eax != 2 {
+            return;
+        }
+        r.eax = rd(0x0140_8E88);
+        if r.eax != 0 {
+            r.eax = rd(r.eax as usize + 0x10);
+        }
+        cx(0x0067_68E0, r, &fr_tail(a));
+    }
+}
+hot_thunk!(t_677c90, e_677c90, "ret");
+
+// hud_pkt_sub_0b(ptr): a u16 and a flag byte copied to two places
+extern "C" fn e_7677e0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(17);
+        let p = *a as usize;
+        r.eax = p as u32;
+        r.ecx = rw(p) as u32;
+        r.edx = 0;
+        let ne = (rb(p + 2) != 0) as u8;
+        wd(0x0252_825C, 0);
+        r.eax = (r.eax & !0xFF) | ne as u32;
+        ww(0x00E8_E0D0, r.ecx as u16);
+        wb(0x029B_9CE4, ne);
+        if ne == 1 {
+            wd(0x0252_8254, 0);
+            ww(0x00E8_E0C0, r.ecx as u16);
+            wb(0x0252_8258, ne);
+            wb(0x0252_804F, 0);
+            wb(0x0252_8259, 0);
+        }
+    }
+}
+hot_thunk!(t_7677e0, e_7677e0, "ret");
+
+// vint_draw_begin
+extern "C" fn e_7f0ab0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(18);
+        let (esi0, edi0) = (r.esi, r.edi);
+        r.eax = (r.eax & !0xFF) | 0xFF;
+        wd(0x00E8_C548, 1);
+        wd(0x0252_8B14, 0);
+        wb(0x00EB_15BC, 0xFF);
+        wb(0x00EB_15BD, 0xFF);
+        wb(0x00EB_15BE, 0xFF);
+        wb(0x00EB_15BF, 0xFF);
+        cx(0x007F_0950, r, &fr(a, &[]));
+        r.eax = rd(0x022F_DC20);
+        r.esi = rd(0x022F_DC1C);
+        r.edi = 0;
+        let e = r.eax;
+        cx(0x00D1_4D20, r, &fr(a, &[0, e]));
+        r.esi = esi0;
+        r.edi = edi0;
+    }
+}
+hot_thunk!(t_7f0ab0, e_7f0ab0, "ret");
+
+// physics_body_set_collision_filter_info (EAX = body index, ECX = filter info)
+extern "C" fn e_6fd3f0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(19);
+        let ecx0 = r.ecx;
+        r.eax = r.eax.wrapping_mul(3);
+        r.edx = rd(r.eax as usize * 8 + 0x028F_25C0);
+        let e = r.edx as usize;
+        if rd(e + 0x2C) == ecx0 {
+            return;
+        }
+        wd(e + 0x2C, ecx0);
+        if rd(0x0252_7DAC) != 0 {
+            cx(0x006F_5740, r, &fr(a, &[]));
+            r.ecx = ecx0;
+            return;
+        }
+        r.ecx = rd(0x0252_7D94);
+        let (c, d) = (r.ecx, r.edx);
+        r.eax = 0;
+        cx_p3(0x00D5_CC40, r, &fr(a, &[c, d, 1]));
+        r.ecx = ecx0;
+    }
+}
+hot_thunk!(t_6fd3f0, e_6fd3f0, "ret");
+
+// gfx_should_defer
+extern "C" fn e_56c310(r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        count(20);
+        let (hit, _t) = defer_cond();
+        r.eax = hit as u32;
+    }
+}
+hot_thunk!(t_56c310, e_56c310, "ret");
+
+// im2d_c_begin (ESI = argument)
+extern "C" fn e_d0a580(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(21);
+        let (hit, t) = defer_cond();
+        if let Some(t) = t {
+            r.eax = t;
+        }
+        if hit {
+            let s = r.esi;
+            cx(0x00CF_8EA0, r, &fr(a, &[0x18, s]));
+            return;
+        }
+        r.ecx = r.esi;
+        cx(0x00D1_48D0, r, &fr(a, &[]));
+        let s = r.esi;
+        cx(0x00D1_DEB0, r, &fr(a, &[s]));
+        wd(0x0252_A300, r.eax);
+        wd(0x00E8_63C0, 0xFFFF_FFFF);
+    }
+}
+hot_thunk!(t_d0a580, e_d0a580, "ret");
+
+// render_snapshot_reset_scales (EAX = snapshot)
+extern "C" fn e_521870(r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        count(22);
+        let s = r.eax as usize;
+        let one = 0x3F80_0000u32;
+        wb(s + 0x6D, 0);
+        wd(s + 0x50, one);
+        wd(s + 0x54, one);
+        wd(s + 0x5C, 0);
+        wd(s + 0x44, one);
+        wd(s + 0x58, one);
+        wd(s + 0x60, one);
+        wd(s + 0x48, one);
+        wd(s + 0x64, one);
+        wd(s + 0x4C, one);
+        r.ecx = one;
+        r.edx = one;
+    }
+}
+hot_thunk!(t_521870, e_521870, "ret");
+
+// options_capture_audio: three floats and a dword copied to the capture block
+extern "C" fn e_7743f0(r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        count(23);
+        let v1 = q32(rd(0x00EE_34D8));
+        r.eax = rd(0x0252_6B70);
+        wd(0x01F7_A98C, v1);
+        wd(0x01F7_A998, r.eax);
+        wd(0x01F7_A990, q32(rd(0x00EE_34E0)));
+        wd(0x01F7_A994, q32(rd(0x00EE_34DC)));
+    }
+}
+hot_thunk!(t_7743f0, e_7743f0, "ret");
+
+// script_object::dtor_4 (EAX = this): resets the base fields
+extern "C" fn e_a63620(r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        count(24);
+        let s = r.eax as usize;
+        let one = 0x3F80_0000u32;
+        wd(s, 0x00E3_E3BC);
+        let g = rd(0x033D_6308);
+        wd(s + 0xC, g);
+        wb(s + 0x15, 0xFF);
+        wd(s + 4, 0x00A6_2940);
+        wd(s, 0x00E4_35B4);
+        wd(s + 8, 1);
+        wd(s + 0x10, 0);
+        wb(s + 0x14, 0);
+        wd(s + 0x18, 0);
+        wd(s + 0x1C, 0);
+        wd(s + 0x20, 0);
+        wd(s + 0x24, 0);
+        // fld1 pushes over the 0.0: the first fstp (+0x48) pops the 1.0, the rest store 0.0
+        for o in [0x28, 0x38, 0x48] {
+            wd(s + o, one);
+        }
+        for o in [0x2C, 0x30, 0x34, 0x3C, 0x40, 0x44] {
+            wd(s + o, 0);
+        }
+        wd(s + 0x4C, 0xFFFF);
+        r.ecx = 0;
+        r.edx = g;
+    }
+}
+hot_thunk!(t_a63620, e_a63620, "ret");
+
+// tod_tables_load
+extern "C" fn e_4d64a0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(25);
+        let ecx0 = r.ecx;
+        wd(0x0265_8D1C, 0x3F80_0000);
+        wd(0x0265_8D18, 0x3F80_0000);
+        cx(0x004D_3760, r, &fr(a, &[]));
+        cx(0x004D_3820, r, &fr(a, &[]));
+        cx(0x004D_3AE0, r, &fr(a, &[]));
+        cx(0x004D_3510, r, &fr(a, &[]));
+        r.eax = rd(0x0252_6DA8);
+        let e = r.eax;
+        cx(0x00C9_6490, r, &fr(a, &[0x0265_4208, e, 0x250, 0x004D_3BE0]));
+        r.ecx = ecx0;
+    }
+}
+hot_thunk!(t_4d64a0, e_4d64a0, "ret");
+
+// pcu_outfit_delete_impl (EDI / ESI = the key pair): removes it from the table at 0x215ffc8
+extern "C" fn e_9de200(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(26);
+        r.edx = rd(0x0215_FFC4);
+        r.ecx = 0;
+        r.eax = 0x0215_FFC8;
+        if (r.edx as i32) > 0 {
+            loop {
+                if rd(r.eax as usize) == r.edi && rd(r.eax as usize + 4) == r.esi {
+                    r.edx = r.edx.wrapping_sub(r.ecx);
+                    r.ecx = r.edx.wrapping_mul(8).wrapping_sub(8);
+                    let (c, e) = (r.ecx, r.eax);
+                    r.edx = r.eax.wrapping_add(8);
+                    let d = r.edx;
+                    cx(0x00C9_6060, r, &fr(a, &[e, d, c]));
+                    wd(0x0215_FFC4, rd(0x0215_FFC4).wrapping_sub(1));
+                    r.eax = (r.eax & !0xFF) | 1;
+                    return;
+                }
+                r.ecx = r.ecx.wrapping_add(1);
+                r.eax = r.eax.wrapping_add(8);
+                if (r.ecx as i32) >= (r.edx as i32) {
+                    break;
+                }
+            }
+        }
+        r.eax &= !0xFF;
+    }
+}
+hot_thunk!(t_9de200, e_9de200, "ret");
+
+// packfile_stream_close (EAX = which, EDI = the stream slot)
+extern "C" fn e_c18400(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(27);
+        if (r.eax as i32) < 0 || (r.eax as i32) > 1 {
+            r.eax &= !0xFF;
+            return;
+        }
+        let (ebx0, esi0) = (r.ebx, r.esi);
+        r.esi = rd(r.edi as usize);
+        if r.eax == 0 {
+            cx(0x00C1_84C0, r, &fr(a, &[]));
+            r.ebx = (r.ebx & !0xFF) | (r.eax & 0xFF);
+        } else {
+            r.ebx &= !0xFF;
+        }
+        cx_p1(rd(IMP_ENTER) as usize, r, &fr(a, &[0x0340_CF6C]));
+        wd(r.edi as usize, 0);
+        wd(r.edi as usize + 4, 0);
+        cx_p1(rd(IMP_LEAVE) as usize, r, &fr(a, &[0x0340_CF6C]));
+        r.esi = esi0;
+        r.eax = (r.eax & !0xFF) | (r.ebx & 0xFF);
+        r.ebx = ebx0;
+    }
+}
+hot_thunk!(t_c18400, e_c18400, "ret");
+
+// ---- scalar deleting destructors -------------------------------------------------------------
+// ECX = this, stack (flag), ret 4, EAX = this.
+
+// constraint_instance_breakable_listener / detour_multi_registration: vtable store, then delete
+extern "C" fn e_70c180(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(28);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        wd(r.esi as usize, 0x00E1_8BF8);
+        free_tail(r, a, false);
+        r.eax = r.esi;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_70c180, e_70c180, "ret 4");
+extern "C" fn e_827860(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(29);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        wd(r.esi as usize, 0x00E2_7E7C);
+        free_tail(r, a, false);
+        r.eax = r.esi;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_827860, e_827860, "ret 4");
+// stub_multi_session: three vtable-like words, then the vtable
+extern "C" fn e_812380(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(30);
+        let esi0 = r.esi;
+        r.eax = 0x00DF_FD54;
+        r.esi = r.ecx;
+        let s = r.esi as usize;
+        wd(s + 0xD50, 0x00DF_FD54);
+        wd(s + 0xD04, 0x00DF_FD54);
+        wd(s + 0xCB8, 0x00DF_FD54);
+        wd(s, 0x00E2_6924);
+        free_tail(r, a, false);
+        r.eax = r.esi;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_812380, e_812380, "ret 4");
+// event_trigger: destructor 0xbf4540 first, then delete if the flag is set and this != 0
+extern "C" fn e_bf4400(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(31);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        cx(0x00BF_4540, r, &fr(a, &[]));
+        free_tail(r, a, true);
+        r.eax = r.esi;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_bf4400, e_bf4400, "ret 4");
+// std::istrstream: this = ECX - 0x5c; destructor 0x4e4cf0 (EAX = this)
+extern "C" fn e_4e4ca0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(32);
+        let esi0 = r.esi;
+        r.esi = r.ecx.wrapping_sub(0x5C);
+        r.eax = r.esi;
+        cx(0x004E_4CF0, r, &fr(a, &[]));
+        free_tail(r, a, true);
+        r.eax = r.esi;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_4e4ca0, e_4e4ca0, "ret 4");
+
+// ---- vint_element_text / sr2_map accessors ---------------------------------------------------
+// get_text_tag(out): copies the element's tag through 0xb93800
+extern "C" fn e_ba2ff0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(33);
+        r.eax = rd(r.ecx as usize + 0x9C);
+        if r.eax == 0 {
+            r.eax &= !0xFF;
+            return;
+        }
+        let (e, x) = (r.eax, *a);
+        r.eax = x;
+        cx_p2(0x00B9_3800, r, &fr(a, &[x, e]));
+        r.eax = (r.eax & !0xFF) | 1;
+    }
+}
+hot_thunk!(t_ba2ff0, e_ba2ff0, "ret 8");
+unsafe fn get_via_b93590(r: &mut Pushad, a: *const u32, off: usize) {
+    unsafe {
+        r.eax = rd(r.ecx as usize + off);
+        let esi0 = r.esi;
+        r.esi = *a;
+        let e = r.eax;
+        cx_p1(0x00B9_3590, r, &fr(a, &[e]));
+        r.eax = (r.eax & !0xFF) | 1;
+        r.esi = esi0;
+    }
+}
+extern "C" fn e_ba3910(r: &mut Pushad, a: *const u32) {
+    count(34);
+    unsafe { get_via_b93590(r, a, 0xC0) }
+}
+hot_thunk!(t_ba3910, e_ba3910, "ret 8");
+extern "C" fn e_ba64e0(r: &mut Pushad, a: *const u32) {
+    count(35);
+    unsafe { get_via_b93590(r, a, 0x9C) }
+}
+hot_thunk!(t_ba64e0, e_ba64e0, "ret 8");
+
+// ---- get_height: the font height as a float on ST0 -------------------------------------------
+// horizontal_text_widget::get_height: fild of the integer result
+extern "C" fn e_74a3d0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(36);
+        let ecx0 = r.ecx;
+        r.ecx = rd(0x00E9_8A7C);
+        cx(0x00C1_5D60, r, &fr(a, &[]));
+        r.esp = r.eax;
+        r.ecx = r.eax; // the pushed ECX slot was overwritten with the result
+    }
+}
+hot_thunk!(t_74a3d0, e_74a3d0, "ret 4", "fild dword ptr [esp + 140]");
+unsafe fn get_height_scaled(r: &mut Pushad, a: *const u32, slot: usize) {
+    unsafe {
+        let ecx0 = r.ecx;
+        r.ecx = rd(slot);
+        cx(0x00C1_5D60, r, &fr(a, &[]));
+        let k = *(0x00E5_C228 as *const f64);
+        r.esp = ((r.eax as i32 as f64 * k) as f32).to_bits();
+        r.ecx = r.esp; // the pushed ECX slot was overwritten with the float
+    }
+}
+extern "C" fn e_74d160(r: &mut Pushad, a: *const u32) {
+    count(37);
+    unsafe { get_height_scaled(r, a, 0x00E9_8A7C) }
+}
+hot_thunk!(t_74d160, e_74d160, "ret 4", "fld dword ptr [esp + 140]");
+extern "C" fn e_77bfe0(r: &mut Pushad, a: *const u32) {
+    count(38);
+    unsafe { get_height_scaled(r, a, 0x00E9_8A80) }
+}
+hot_thunk!(t_77bfe0, e_77bfe0, "ret 4", "fld dword ptr [esp + 140]");
+extern "C" fn e_781e00(r: &mut Pushad, a: *const u32) {
+    count(39);
+    unsafe { get_height_scaled(r, a, 0x00E9_8A80) }
+}
+hot_thunk!(t_781e00, e_781e00, "ret 4", "fld dword ptr [esp + 140]");
+
+// =================================================================================================
+// Batch 2
+// =================================================================================================
+
+// fuzz_crime_j_walking::enter_state3: base enter, then a tail jump through vtable slot 0x58
+extern "C" fn e_5c5e60(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(40);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        cx(0x005C_3020, r, &fr(a, &[]));
+        r.eax = rd(r.esi as usize);
+        r.edx = rd(r.eax as usize + 0x58);
+        r.ecx = r.esi;
+        r.esi = esi0;
+        let f = r.edx as usize;
+        cx(f, r, &fr_tail(a));
+    }
+}
+hot_thunk!(t_5c5e60, e_5c5e60, "ret");
+
+// misc_packet_sub_0d(ptr): 0x47ff10 with ESI = *ptr
+extern "C" fn e_a29db0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(41);
+        let esi0 = r.esi;
+        r.eax = *a;
+        r.esi = rd(r.eax as usize);
+        cx(0x0047_FF10, r, &fr(a, &[]));
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_a29db0, e_a29db0, "ret");
+
+// act_packet_mission_start(a, b): fixes its own two arguments, then a tail jump to 0x6a1440
+extern "C" fn e_6a3db0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(42);
+        let esi0 = r.esi;
+        r.esi = 0x00E0_0D9C;
+        cx(0x006A_1250, r, &fr(a, &[]));
+        r.esi = esi0;
+        *(a.add(1) as *mut u32) = 0;
+        *(a as *mut u32) = 0x027B_3C90;
+        cx(0x006A_1440, r, &fr_tail(a));
+    }
+}
+hot_thunk!(t_6a3db0, e_6a3db0, "ret");
+
+// gamespy_atlas_module::update
+extern "C" fn e_8ce330(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(43);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        if rd(r.esi as usize + 0x20) == 0 {
+            r.esi = esi0;
+            return;
+        }
+        if (rd(0x0252_9350) as i32) > 0 {
+            let edi0 = r.edi;
+            r.edi = 0x0090_1330;
+            cx(0x008F_EAB0, r, &fr(a, &[]));
+            r.edi = edi0;
+        }
+        r.eax = rd(r.esi as usize + 0x24);
+        if r.eax == 0 || rd(r.eax as usize + 0x38) == 0 {
+            r.esi = esi0;
+            return;
+        }
+        r.esi = esi0;
+        cx(0x008D_4E20, r, &fr_tail(a));
+    }
+}
+hot_thunk!(t_8ce330, e_8ce330, "ret");
+
+// std::logic_error::ctor(msg)
+extern "C" fn e_4f1a40(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(44);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        r.eax = 0;
+        r.ecx = r.esi.wrapping_add(8);
+        let s = r.esi as usize;
+        let c = r.ecx as usize;
+        wd(s + 4, 0x00DD_E2B8);
+        wd(s, 0x00DD_E68C);
+        wd(c + 0x14, 0);
+        wd(c + 0x18, 0xF);
+        wb(c + 4, 0);
+        let m = *a;
+        r.eax = m;
+        cx_p3(0x004E_7B00, r, &fr(a, &[m, 0, 0xFFFF_FFFF]));
+        r.eax = r.esi;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_4f1a40, e_4f1a40, "ret 4");
+
+// cs_shot_parse_interp_mode_b (ESI = shot): mode name -> [esi + 4]
+extern "C" fn e_6cdd00(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(45);
+        let s = r.esi as usize;
+        cx(0x00C9_9030, r, &fr(a, &[0x00E0_CAD8, 0x00DD_C404]));
+        if r.eax == 0 {
+            wd(s + 4, r.eax);
+            return;
+        }
+        cx(0x00C9_9030, r, &fr(a, &[0x00E0_CAD8, 0x00E0_CAF4]));
+        if r.eax == 0 {
+            wd(s + 4, 1);
+            return;
+        }
+        cx(0x00C9_9030, r, &fr(a, &[0x00E0_CAD8, 0x00E0_CB00]));
+        if r.eax == 0 {
+            wd(s + 4, 2);
+            return;
+        }
+        cx(0x00C9_9030, r, &fr(a, &[0x00E0_CAD8, 0x00E0_CAD8]));
+        r.eax = if r.eax != 0 { 0 } else { 3 };
+        wd(s + 4, r.eax);
+    }
+}
+hot_thunk!(t_6cdd00, e_6cdd00, "ret");
+
+// rocket_multi_registration::free_snapshot(snap)
+extern "C" fn e_86f7f0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(46);
+        r.eax = (r.eax & !0xFF) | rb(0x0252_8B49) as u32;
+        let (esi0, edi0) = (r.esi, r.edi);
+        r.edi = *a;
+        r.esi = rd(r.edi as usize + 0x10);
+        let f = if rb(0x0252_8B49) != 0 {
+            0x0087_1520
+        } else if rd(0x00E8_C438) == 8 {
+            0x0087_09A0
+        } else {
+            0x0087_0F70
+        };
+        cx(f, r, &fr(a, &[]));
+        r.eax = 0;
+        wd(r.edi as usize + 0x10, 0);
+        wd(r.edi as usize + 0xC, 0);
+        r.edi = edi0;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_86f7f0, e_86f7f0, "ret 4");
+
+// taxi_diversion_type_info::create_instance(heap)
+extern "C" fn e_628fe0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(47);
+        r.ecx = *a;
+        r.eax = rd(r.ecx as usize);
+        r.edx = rd(r.eax as usize + 0x1C);
+        let f = r.edx as usize;
+        cx_p2(f, r, &fr(a, &[0x124, 0]));
+        if r.eax == 0 {
+            return;
+        }
+        cx(0x0062_9010, r, &fr(a, &[]));
+    }
+}
+hot_thunk!(t_628fe0, e_628fe0, "ret 4");
+
+// vehicle_runninglight_manager::init(a, b, c)
+extern "C" fn e_ad6510(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(48);
+        let c = r.ecx as usize;
+        r.eax = *a;
+        wd(c + 0x10, r.eax);
+        r.eax = 0;
+        wd(c + 8, 0);
+        wd(c + 0xC, 0);
+        wb(c + 4, 0);
+        r.eax = 0xFFFF_FFFF;
+        r.edx = rd(0x00E8_781C);
+        wd(c + 0x14, r.edx);
+        r.eax = rd(0x00E8_7824);
+        wd(c + 0x18, r.eax);
+        r.edx = rd(0x00E8_782C);
+        wd(c + 0x1C, r.edx);
+        r.eax = rd(0x00E8_7834);
+        wd(c + 0x20, r.eax);
+        r.edx = rd(0x00E8_783C);
+        wd(c + 0x24, r.edx);
+        r.edx = *a.add(2);
+        r.eax = rd(rd(c) as usize + 0x30);
+        let (p, q) = (*a.add(1), *a.add(2));
+        r.edx = p;
+        let f = r.eax as usize;
+        cx_p2(f, r, &fr(a, &[p, q]));
+    }
+}
+hot_thunk!(t_ad6510, e_ad6510, "ret 12");
+
+// object_prop::deactivate: releases the handles, then a tail jump to 0x934710 (EAX = this)
+extern "C" fn e_9350a0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(49);
+        let (esi0, edi0) = (r.esi, r.edi);
+        r.esi = r.ecx;
+        cx(0x0092_57F0, r, &fr(a, &[]));
+        let s = r.esi as usize;
+        r.eax = rd(s + 0x7C);
+        if r.eax != 0xFFFF_FFFF {
+            let e = r.eax;
+            cx(0x006F_BE90, r, &fr(a, &[e]));
+            wd(r.esi as usize + 0x7C, 0xFFFF_FFFF);
+        }
+        let s = r.esi as usize;
+        let mut free_it = true;
+        if rw(s + 0x10E) == 0xFFFF {
+            r.eax = rw(s + 0x10C) as u32;
+            if r.eax == 0 {
+                free_it = false;
+            }
+        }
+        if free_it {
+            r.ecx = rd(s + 0x10C);
+            let c = r.ecx;
+            cx(0x00A7_D4F0, r, &fr(a, &[c]));
+            wd(r.esi as usize + 0x10C, 0xFFFF_0000);
+        }
+        let s = r.esi as usize;
+        r.edi = rd(s + 0xE8);
+        if r.edi != 0 {
+            cx(0x006E_5B10, r, &fr(a, &[]));
+            wd(r.esi as usize + 0xE8, 0);
+        }
+        r.edi = edi0;
+        r.eax = r.esi;
+        r.esi = esi0;
+        cx(0x0093_4710, r, &fr_tail(a));
+    }
+}
+hot_thunk!(t_9350a0, e_9350a0, "ret");
+
+// net_recv_rop_own_deny(ptr)
+extern "C" fn e_805a50(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(50);
+        r.eax = *a;
+        let edi0 = r.edi;
+        r.edi = rw(r.eax as usize) as u32;
+        if r.edi as u16 != 0xFFFF {
+            let esi0 = r.esi;
+            r.esi = rd(0x0212_E258);
+            r.ecx = r.edi & 0xFFFF;
+            let c = r.ecx;
+            cx_p2(0x0080_8E30, r, &fr(a, &[c, 0]));
+            r.esi = esi0;
+            if r.eax != 0 {
+                r.eax = rd(r.eax as usize);
+                if r.eax != 0 {
+                    r.edx = rd(r.eax as usize + 4);
+                    r.ecx = r.edi;
+                    cx(0x0080_44C0, r, &fr(a, &[0]));
+                    r.edi = edi0;
+                    return;
+                }
+            }
+        }
+        r.edx = 0;
+        r.ecx = r.edi;
+        cx(0x0080_44C0, r, &fr(a, &[0]));
+        r.edi = edi0;
+    }
+}
+hot_thunk!(t_805a50, e_805a50, "ret");
+
+// anim_motion_def_find_index(b, a, c): the first hit of two lookups through 0x6ea0a0
+extern "C" fn e_6ef6a0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(51);
+        let (ebx0, ebp0, esi0, edi0) = (r.ebx, r.ebp, r.esi, r.edi);
+        r.ebx = *a.add(1);
+        r.ebp = *a;
+        r.esi = 0;
+        r.edi = r.ebp.wrapping_add(4);
+        let c = *a.add(2);
+        loop {
+            r.ecx = rd(r.edi as usize);
+            if r.ecx != 0 && r.ebx != 0xFFFF_FFFF {
+                r.eax = rd(r.ebp as usize + 0xC);
+                r.edx = r.ebx.wrapping_add(0x2A4);
+                let d = r.edx;
+                cx(0x006E_A0A0, r, &fr(a, &[d, c]));
+                if r.eax != 0xFFFF {
+                    break;
+                }
+            }
+            r.esi = r.esi.wrapping_add(1);
+            r.edi = r.edi.wrapping_add(4);
+            if (r.esi as i32) < 2 {
+                continue;
+            }
+            r.eax = 0xFFFF;
+            break;
+        }
+        r.edi = edi0;
+        r.esi = esi0;
+        r.ebp = ebp0;
+        r.ebx = ebx0;
+    }
+}
+hot_thunk!(t_6ef6a0, e_6ef6a0, "ret");
+
+// blocking_animation_compressor_full::decompress(a, b, c)
+extern "C" fn e_859c20(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(52);
+        let (esi0, edi0, ebx0, ebp0) = (r.esi, r.edi, r.ebx, r.ebp);
+        r.edi = *a;
+        r.esi = r.ecx;
+        if r.edi == 0 {
+            r.edi = edi0;
+            r.esi = esi0;
+            return;
+        }
+        r.ebx = *a.add(1);
+        if r.ebx == 0 {
+            r.ebx = ebx0;
+            r.edi = edi0;
+            r.esi = esi0;
+            return;
+        }
+        r.ecx = r.edi;
+        cx(0x007F_D960, r, &fr(a, &[]));
+        if r.eax & 0xFF != 0 {
+            wb_u16(r.ebx as usize, 0xFFFF);
+            wd(r.ebx as usize + 4, 0);
+            r.ebx = ebx0;
+            r.edi = edi0;
+            r.esi = esi0;
+            return;
+        }
+        let c = *a.add(2);
+        r.eax = c;
+        r.ecx = r.esi;
+        let (d, b) = (r.edi, r.ebx);
+        cx_p3(0x0085_9AB0, r, &fr(a, &[d, b, c]));
+        r.ebp = rd(r.edi as usize + 0x10);
+        r.esi = 0x10;
+        r.eax = r.ebp;
+        r.edx = r.edi;
+        cx(0x007F_D8F0, r, &fr(a, &[]));
+        r.ebp = r.ebp.wrapping_add(0x10);
+        wd(r.edi as usize + 0x10, r.ebp);
+        r.ecx = r.edi;
+        wb_u16(r.ebx as usize, r.eax as u16);
+        cx(0x007F_D960, r, &fr(a, &[]));
+        wb(r.ebx as usize + 8, r.eax as u8);
+        r.ebp = ebp0;
+        r.ebx = ebx0;
+        r.edi = edi0;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_859c20, e_859c20, "ret 12");
+
+// rails_compressed::compress(a, b, c, d): two virtual compressors on the +0x34 / +0x38 fields
+extern "C" fn e_8799e0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(53);
+        let (ebx0, ebp0, esi0, edi0) = (r.ebx, r.ebp, r.esi, r.edi);
+        r.ebx = *a.add(2);
+        r.ebp = *a.add(1);
+        r.esi = *a.add(3);
+        let a0 = *a;
+        r.edi = r.ecx;
+        let d = r.edi as usize;
+        r.edx = r.esi.wrapping_add(0x34);
+        let p4 = r.edx;
+        r.edx = r.ebx.wrapping_add(0x34);
+        let p3 = r.edx;
+        r.eax = rd(rd(d + 0x24) as usize);
+        r.edx = r.ebp.wrapping_add(0x34);
+        let p2 = r.edx;
+        r.ecx = (d + 0x24) as u32;
+        r.edx = a0;
+        let f = r.eax as usize;
+        cx_p4(f, r, &fr(a, &[a0, p2, p3, p4]));
+        r.edx = rd(d + 4);
+        r.edx = rd(r.edx as usize);
+        let f2 = r.edx as usize;
+        let q4 = r.esi.wrapping_add(0x38);
+        r.eax = q4;
+        let q3 = r.ebx.wrapping_add(0x38);
+        r.eax = a0;
+        r.ecx = (d + 4) as u32;
+        r.ebp = r.ebp.wrapping_add(0x38);
+        let q2 = r.ebp;
+        cx_p4(f2, r, &fr(a, &[a0, q2, q3, q4]));
+        r.eax = r.ebx;
+        cx(0x0087_2FC0, r, &fr(a, &[]));
+        r.edi = edi0;
+        r.esi = esi0;
+        r.ebp = ebp0;
+        r.ebx = ebx0;
+    }
+}
+hot_thunk!(t_8799e0, e_8799e0, "ret 16");
+
+// streamman_batch_cancel_pending(batch)
+extern "C" fn e_a7d9c0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(54);
+        let (ebx0, ebp0, esi0, edi0) = (r.ebx, r.ebp, r.esi, r.edi);
+        r.eax = rd(*a as usize + 0xC);
+        let fin = |r: &mut Pushad| {
+            r.edi = edi0;
+            r.esi = esi0;
+            r.ebp = ebp0;
+            r.ebx = ebx0;
+        };
+        if r.eax == 0 {
+            fin(r);
+            return;
+        }
+        r.esi = rd(r.eax as usize);
+        if r.esi == 0 {
+            fin(r);
+            return;
+        }
+        loop {
+            r.ecx = rd(r.esi as usize + 0x10);
+            r.edx = rd(r.esi as usize + 0x14);
+            r.eax = r.ecx;
+            r.edi = 0;
+            r.eax |= r.edi;
+            if r.eax == 0 {
+                r.eax = rd(rd(0x0252_9E24) as usize);
+                wd(0x0252_9E28, r.eax);
+            }
+            r.edi = rd(r.ecx as usize);
+            r.eax = r.edx;
+            r.ebx = 0;
+            r.ebp = 0;
+            if r.eax != r.edi || r.ebx != r.ebp {
+                r.eax = rd(rd(0x0252_9E24) as usize);
+                wd(0x0252_9E28, r.eax);
+            }
+            r.edi = rd(r.ecx as usize + 0x3C);
+            let (d, c) = (r.edx, r.ecx);
+            cx_p2(0x00A7_3430, r, &fr(a, &[c, d]));
+            r.ecx = *a;
+            if r.esi == rd(r.ecx as usize + 0xC) {
+                break;
+            }
+            r.esi = rd(r.esi as usize);
+            if r.esi == 0 {
+                break;
+            }
+        }
+        fin(r);
+    }
+}
+hot_thunk!(t_a7d9c0, e_a7d9c0, "ret");
+
+// savegame_cash_add_clamped (EAX = amount, ESI = savegame): adds, clamped to +-2,000,000,000
+extern "C" fn e_696180(r: &mut Pushad, _a: *const u32) {
+    unsafe {
+        count(55);
+        if r.esi == 0 {
+            return;
+        }
+        let amt = r.eax as i32;
+        if amt > 0x0131_2D00 {
+            r.ecx = 0x7735_9400;
+        } else if amt < 0xFECE_D300u32 as i32 {
+            r.ecx = 0x88CA_6C00;
+        } else {
+            r.eax = (amt.wrapping_mul(100)) as u32;
+            if (r.eax as i32) > 0x7735_9400 {
+                r.ecx = 0x7735_9400;
+            } else {
+                r.ecx = 0x88CA_6C00;
+                if (r.eax as i32) >= 0x88CA_6C00u32 as i32 {
+                    r.ecx = r.eax;
+                }
+            }
+        }
+        let s = r.esi as usize;
+        r.eax = rd(s + 0xB4).wrapping_add(r.ecx);
+        r.edx = if (r.eax as i32) < 0 { 0xFFFF_FFFF } else { 0 };
+        if r.edx == 0 {
+            if r.eax > 0x7735_9400 {
+                wd(s + 0xB4, 0x7735_9400);
+                return;
+            }
+            wd(s + 0xB4, r.eax);
+        } else if r.eax >= 0x88CA_6C00 {
+            wd(s + 0xB4, r.eax);
+        } else {
+            wd(s + 0xB4, 0x88CA_6C00);
+        }
+    }
+}
+hot_thunk!(t_696180, e_696180, "ret");
+
+// spawn_records_reset(flag)
+extern "C" fn e_951a90(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(56);
+        let flag = rb(a as usize) != 0;
+        wd(0x00E8_8758, 0x3F80_0000);
+        wd(0x0215_E090, 0);
+        wb(0x0252_9663, 0);
+        if flag {
+            let edi0 = r.edi;
+            r.ecx = 1;
+            r.edi = 0x0252_9663;
+            cx(0x0080_1810, r, &frs(a, &[0x0095_1A80], &[edi0]));
+            r.ecx = 4;
+            r.edi = 0x00E8_8758;
+            cx(0x0080_1810, r, &frs(a, &[0, 0x0095_1A80], &[edi0]));
+            r.edi = edi0;
+        }
+        r.eax = 0x02C1_80E8;
+        wd(0x0215_E094, r.eax);
+        wd(0x02C1_81C0, r.eax);
+        wd(0x02C1_81BC, r.eax);
+        r.eax = 0x02C1_81BC;
+        wd(0x02C1_80E8, r.eax);
+        wd(0x02C1_80EC, r.eax);
+        r.eax = 0xFFFF_FFFF;
+        for p in [0x02C1_80DC, 0x0215_E0A4, 0x0215_E0A8, 0x02C1_80E0, 0x0215_E0AC, 0x0215_E0B0, 0x02C1_80E4, 0x0215_E0B4, 0x0215_E0B8] {
+            wd(p, 0xFFFF_FFFF);
+        }
+        r.eax = 0x00E8_876C;
+        while (r.eax as i32) < 0x00E8_87AC {
+            wb(r.eax as usize, 0);
+            r.eax += 0x10;
+        }
+    }
+}
+hot_thunk!(t_951a90, e_951a90, "ret");
+
+// spawner_rebuild_categories (EDI = spawner)
+extern "C" fn e_93f030(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(57);
+        let esi0 = r.esi;
+        r.esi = rd(0x0252_9634);
+        r.eax = r.edi;
+        let d = r.edi as usize;
+        wd(d + 0xC, 0);
+        wd(d + 8, 0);
+        cx(0x0093_F000, r, &fr(a, &[]));
+        r.eax = (r.eax & !0xFF) | rb(0x0252_8B48) as u32;
+        'rebuild: {
+            if r.eax & 0xFF != 1 {
+                break 'rebuild;
+            }
+            r.ecx = (r.ecx & !0xFF) | rb(0x0252_8B49) as u32;
+            if r.ecx & 0xFF != r.eax & 0xFF {
+                break 'rebuild;
+            }
+            r.eax = rd(0x0252_8C14);
+            if r.eax == 0 {
+                break 'rebuild;
+            }
+            let e = r.eax;
+            cx_p1(0x0080_FCF0, r, &fr(a, &[e]));
+            if r.eax & 0xFF == 0 {
+                break 'rebuild;
+            }
+            r.esi = rd(0x0252_9638);
+            if r.esi == 0 || r.esi == rd(0x0252_9634) {
+                break 'rebuild;
+            }
+            r.eax = r.edi;
+            cx(0x0093_F000, r, &fr(a, &[]));
+        }
+        r.esi = 0;
+        loop {
+            r.edx = rd(r.esi as usize + 0x00E8_88B8);
+            r.ecx = rd(r.edx as usize);
+            r.eax = r.edi;
+            cx(0x0093_EFA0, r, &fr(a, &[]));
+            r.esi = r.esi.wrapping_add(4);
+            if r.esi >= 0x10 {
+                break;
+            }
+        }
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_93f030, e_93f030, "ret");
+
+// resource_registry_init: two allocations through the heap object's vtable, then a tail jump
+extern "C" fn e_a774e0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(58);
+        r.eax = rd(0x0277_1278);
+        r.edx = rd(r.eax as usize + 0x1C);
+        r.ecx = 0x0277_1278;
+        wd(0x0252_9E48, r.ecx);
+        let f = r.edx as usize;
+        cx_p2(f, r, &fr(a, &[0x6A40, 4]));
+        r.ecx = rd(0x0252_9E48);
+        wd(0x0252_9E44, r.eax);
+        r.eax = rd(r.ecx as usize);
+        r.edx = rd(r.eax as usize + 0x1C);
+        let f = r.edx as usize;
+        cx_p2(f, r, &fr(a, &[0x2EE0, 4]));
+        wd(0x0252_9E3C, r.eax);
+        cx(0x00A7_7180, r, &fr(a, &[]));
+        cx(0x00A7_7490, r, &fr_tail(a));
+    }
+}
+hot_thunk!(t_a774e0, e_a774e0, "ret");
+
+// string_pool::ctor
+extern "C" fn e_c06c80(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(59);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        cx(0x00BF_4990, r, &fr(a, &[]));
+        let s = r.esi as usize;
+        r.eax = 0;
+        wb(s + 0x2C, 0);
+        wd(s + 0x3C, 0);
+        wd(s, 0x00DD_A834);
+        wd(s + 0x48, 0);
+        wd(s + 0x44, 0);
+        wd(s + 0x54, 0);
+        wd(s + 0x58, 0);
+        wd(s + 0x38, 0);
+        r.eax = r.esi;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_c06c80, e_c06c80, "ret");
+
+// vint_loc_lookup_symbol (ECX, EDX = arguments): the localisation module's lookup hook
+extern "C" fn e_b92270(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(60);
+        r.eax = rd(0x0252_A1E0);
+        if r.eax == 0 {
+            r.eax = 0;
+            return;
+        }
+        r.eax = rd(r.eax as usize + 0xC);
+        if r.eax == 0 {
+            r.eax = 0;
+            return;
+        }
+        let (c, d, f) = (r.ecx, r.edx, r.eax as usize);
+        cx(f, r, &fr(a, &[d, c]));
+    }
+}
+hot_thunk!(t_b92270, e_b92270, "ret");
+
+// vint_input_event_index (EDI = name): index of the name in the 0x22-entry table, or -1
+extern "C" fn e_b99f70(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(61);
+        if r.edi == 0 || rd(0x0252_A238) == 0 {
+            r.eax = 0xFFFF_FFFF;
+            return;
+        }
+        let esi0 = r.esi;
+        r.esi = 0;
+        loop {
+            r.eax = rd(0x0252_A238);
+            r.ecx = rd(r.eax as usize + r.esi as usize * 4);
+            let (c, d) = (r.ecx, r.edi);
+            cx(0x00C9_9030, r, &fr(a, &[d, c]));
+            if r.eax == 0 {
+                r.eax = r.esi;
+                break;
+            }
+            r.esi = r.esi.wrapping_add(1);
+            if (r.esi as i32) < 0x22 {
+                continue;
+            }
+            r.eax = 0xFFFF_FFFF;
+            break;
+        }
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_b99f70, e_b99f70, "ret");
+
+// vint_object_tween::set_target_property(value)
+extern "C" fn e_b9f550(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(62);
+        let v = *a as usize;
+        r.eax = v as u32;
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        r.ecx = 0;
+        wd(r.esi as usize + 0x94, 0);
+        if rd(v) == 4 {
+            r.ecx = rd(v + 4);
+        }
+        cx(0x00BD_C9B0, r, &fr(a, &[]));
+        wd(r.esi as usize + 0x90, r.eax);
+        r.eax = (r.eax & !0xFF) | 1;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_b9f550, e_b9f550, "ret 8");
+
+// vint_dataitem_set_values (EAX = items): sets up to 0x20 items through 0xb94b60
+extern "C" fn e_b94c90(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(63);
+        let (ebx0, ebp0, esi0, edi0) = (r.ebx, r.ebp, r.esi, r.edi);
+        r.ebx = *a;
+        r.ebp = *a.add(1);
+        r.edi = r.eax;
+        if r.edi != 0 {
+            r.esi = 0;
+            while (r.esi as i32) < (r.ebp as i32) {
+                r.eax = r.edi;
+                let (s, b) = (r.esi, r.ebx);
+                cx_p2(0x00B9_4B60, r, &fr(a, &[b, s]));
+                r.esi = r.esi.wrapping_add(1);
+                r.edi = r.edi.wrapping_add(0x10);
+                if (r.esi as i32) >= 0x20 {
+                    break;
+                }
+            }
+            r.esi = esi0;
+        }
+        r.edi = edi0;
+        r.ebp = ebp0;
+        r.ebx = ebx0;
+    }
+}
+hot_thunk!(t_b94c90, e_b94c90, "ret 8");
+
+unsafe fn wb_u16(p: usize, v: u16) {
+    unsafe { ww(p, v) }
+}
+// =================================================================================================
+// Batch 3
+// =================================================================================================
+
+/// `cdq; idiv dword ptr [p]` on EDX:EAX (a zero or overflowing divisor faults, as in the original).
+/// Returns (quotient, remainder).
+unsafe fn idiv_mem(eax: u32, p: usize) -> (u32, u32) {
+    let q: u32;
+    let rem: u32;
+    unsafe {
+        std::arch::asm!(
+            "cdq",
+            "idiv dword ptr [{p}]",
+            p = in(reg) p,
+            inout("eax") eax => q,
+            out("edx") rem,
+            options(nostack),
+        );
+    }
+    (q, rem)
+}
+
+/// The packet-id hash shared by human_pkt_sub_3e / _37: a 16-bit id mixed into a bucket index, then
+/// the bucket's chain walked for the id. Returns false when the original returns early; the registers
+/// are those the original has at each exit.
+unsafe fn pkt_hash_lookup(r: &mut Pushad) -> bool {
+    unsafe {
+        r.esi = r.eax & 0xFFFF;
+        r.eax = r.esi;
+        r.eax <<= 15;
+        r.eax = !r.eax;
+        r.eax = r.eax.wrapping_add(r.esi);
+        r.ecx = r.eax;
+        r.ecx = ((r.ecx as i32) >> 10) as u32;
+        r.ecx ^= r.eax;
+        r.ecx = r.ecx.wrapping_add(r.ecx.wrapping_mul(8));
+        r.edx = r.ecx;
+        r.edx = ((r.edx as i32) >> 6) as u32;
+        r.ecx ^= r.edx;
+        r.eax = r.ecx;
+        r.eax <<= 11;
+        r.eax = !r.eax;
+        r.ecx = r.ecx.wrapping_add(r.eax);
+        r.eax = r.ecx;
+        r.eax = ((r.eax as i32) >> 16) as u32;
+        r.eax ^= r.ecx;
+        r.ecx = rd(0x0212_E258);
+        let (q, rem) = idiv_mem(r.eax, r.ecx as usize + 0x60);
+        r.eax = q;
+        r.edx = rem;
+        r.ecx = rd(r.ecx as usize + 0x5C);
+        r.edx = rd(r.ecx as usize + (r.edx as usize).wrapping_mul(4));
+        if r.edx == 0 {
+            return false;
+        }
+        while r.esi != rd(r.edx as usize + 0xC) {
+            r.edx = rd(r.edx as usize + 4);
+            if r.edx == 0 {
+                return false;
+            }
+        }
+        r.edx = rd(r.edx as usize);
+        r.edx != 0
+    }
+}
+
+// human_pkt_sub_3e(ptr)
+extern "C" fn e_559c90(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(64);
+        r.eax = rw(*a as usize) as u32;
+        if r.eax as u16 == 0xFFFF {
+            return;
+        }
+        let esi0 = r.esi;
+        'out: {
+            if !pkt_hash_lookup(r) {
+                break 'out;
+            }
+            r.ecx = rd(r.edx as usize + 4);
+            if r.ecx == 0 {
+                break 'out;
+            }
+            r.edx = r.ecx;
+            r.edx &= 0xFFF;
+            r.edx <<= 4;
+            r.eax = rd(r.edx as usize + 0x0214_9C64);
+            let e = r.eax as usize;
+            if e == 0 || rd(e + 0x44) != r.ecx || rd(e + 0x4C) != 1 || rb(e + 0x80) & 0xB != 0 {
+                break 'out;
+            }
+            r.ecx = r.eax.wrapping_add(0x10C4);
+            cx_p1(0x0055_9D40, r, &frs(a, &[0], &[esi0]));
+        }
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_559c90, e_559c90, "ret");
+
+// human_pkt_sub_37(ptr)
+extern "C" fn e_4611b0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(65);
+        r.eax = rw(*a as usize) as u32;
+        if r.eax as u16 == 0xFFFF {
+            return;
+        }
+        let esi0 = r.esi;
+        'out: {
+            if !pkt_hash_lookup(r) {
+                break 'out;
+            }
+            r.eax = rd(r.edx as usize + 4);
+            if r.eax == 0 {
+                break 'out;
+            }
+            r.edx = r.eax;
+            r.edx &= 0xFFF;
+            r.edx <<= 4;
+            r.ecx = rd(r.edx as usize + 0x0214_9C64);
+            let e = r.ecx as usize;
+            if e == 0 || rd(e + 0x44) != r.eax || rd(e + 0x4C) != 1 || rb(e + 0x3CC) != 2 || rb(e + 0x80) & 0xB != 0 || rb(e + 0x103) & 8 != 0 {
+                break 'out;
+            }
+            cx(0x0046_1490, r, &frs(a, &[0], &[esi0]));
+        }
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_4611b0, e_4611b0, "ret");
+
+// vint_object_factory_imp<>::free(obj): unlinks the object from the in-use ring, links it into the free ring
+extern "C" fn e_b9cc00(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(66);
+        let esi0 = r.esi;
+        r.eax = *a;
+        r.esi = 0;
+        let o = r.eax as usize;
+        let c = r.ecx as usize;
+        if r.eax == 0 {
+            r.esi = esi0;
+            return;
+        }
+        let mut unlink = true;
+        if rd(c + 8) == r.eax {
+            r.edx = rd(o + 0x14);
+            if r.edx == r.eax {
+                wd(o + 0x14, 0);
+                wd(o + 0x18, 0);
+                wd(c + 8, 0);
+                unlink = false;
+            } else {
+                wd(c + 8, r.edx);
+            }
+        }
+        if unlink {
+            let edi0 = r.edi;
+            r.edx = rd(o + 0x18);
+            r.edi = rd(o + 0x14);
+            wd(r.edx as usize + 0x14, r.edi);
+            r.edi = rd(o + 0x18);
+            r.edx = rd(o + 0x14);
+            wd(r.edx as usize + 0x18, r.edi);
+            wd(o + 0x14, 0);
+            wd(o + 0x18, 0);
+            r.edi = edi0;
+        }
+        r.edx = rd(c + 4);
+        if r.edx == 0 {
+            wd(o + 0x14, r.eax);
+            wd(o + 0x18, r.eax);
+            wd(c + 0xC, rd(c + 0xC).wrapping_sub(1));
+            wd(c + 4, r.eax);
+        } else {
+            r.edx = rd(r.edx as usize + 0x18);
+            wd(o + 0x18, r.edx);
+            r.edx = rd(c + 4);
+            wd(o + 0x14, r.edx);
+            r.edx = rd(c + 4);
+            r.edx = rd(r.edx as usize + 0x18);
+            wd(r.edx as usize + 0x14, r.eax);
+            r.edx = rd(c + 4);
+            wd(r.edx as usize + 0x18, r.eax);
+            wd(c + 0xC, rd(c + 0xC).wrapping_sub(1));
+        }
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_b9cc00, e_b9cc00, "ret 4");
+
+// nav_open_push_new(x, y, flag) (ESI = node, EDX = point): pushes a new open-list entry
+extern "C" fn e_a0ffe0(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(67);
+        r.eax = rd(0x02E1_60C0);
+        if (r.eax as i32) >= 0x1000 {
+            r.eax &= !0xFF;
+            return;
+        }
+        let x = q32(*a);
+        ww(r.esi as usize + 0x1E, r.eax as u16);
+        r.eax = rd(0x02E1_60BC);
+        wd(r.esi as usize + 0x20, r.eax);
+        r.ecx = rd(0x02E1_60C0);
+        r.eax = r.ecx.wrapping_mul(3).wrapping_mul(8).wrapping_add(0x02E1_60C4);
+        r.ecx = r.ecx.wrapping_add(1);
+        wd(0x02E1_60C0, r.ecx);
+        let e = r.eax as usize;
+        wd(e, x);
+        r.ecx = (r.ecx & !0xFF) | (*a.add(2) & 0xFF);
+        wd(e + 4, q32(*a.add(1)));
+        wb(e + 0x15, 1);
+        wb(e + 0x14, r.ecx as u8);
+        let d = r.edx as usize;
+        r.ecx = rd(d);
+        wd(e + 8, r.ecx);
+        r.ecx = rd(d + 4);
+        wd(e + 0xC, r.ecx);
+        r.edx = rd(d + 8);
+        wd(e + 0x10, r.edx);
+        r.ecx = (r.ecx & !0xFFFF) | rw(0x02E2_E0C4) as u32;
+        ww(e + 0x16, r.ecx as u16);
+        r.edx = rd(0x02E2_E0C4);
+        wd(r.edx as usize * 4 + 0x02E2_E0C8, r.esi);
+        wd(0x02E2_E0C4, rd(0x02E2_E0C4).wrapping_add(1));
+        r.eax = rw(e + 0x16) as u32;
+        let w = r.eax;
+        cx_p1(0x00A1_0260, r, &fr(a, &[w]));
+        r.eax = (r.eax & !0xFF) | 1;
+    }
+}
+hot_thunk!(t_a0ffe0, e_a0ffe0, "ret 12");
+
+// fuzz_crime_assassin::enter_state3
+extern "C" fn e_5cde70(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(68);
+        let esi0 = r.esi;
+        r.esi = r.ecx;
+        cx(0x005C_3020, r, &frs(a, &[], &[esi0]));
+        r.ecx = rd(r.esi as usize + 0xF8);
+        r.eax = rd(r.ecx as usize);
+        r.edx = rd(r.eax as usize + 0x34);
+        let f = r.edx as usize;
+        cx_p1(f, r, &frs(a, &[1], &[esi0]));
+        r.eax = r.eax.wrapping_add(0xF8);
+        let e = r.eax;
+        cx_p1(0x0044_01A0, r, &frs(a, &[e], &[esi0]));
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_5cde70, e_5cde70, "ret");
+
+// ai_spot_users_prune: drops the spot-user nodes the check at 0x41a780 rejects, moving them to the free ring
+extern "C" fn e_41ac50(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(69);
+        let (ebx0, esi0, edi0) = (r.ebx, r.esi, r.edi);
+        const HEAD: usize = 0x00EE_1580;
+        const FREE_HEAD: usize = 0x00EE_1584;
+        r.edi = rd(HEAD);
+        r.ebx = 0;
+        loop {
+            if r.edi == r.ebx {
+                break;
+            }
+            r.eax = rd(r.edi as usize);
+            r.esi = r.eax;
+            r.esi = r.esi.wrapping_sub(rd(HEAD));
+            r.esi = if r.esi != 0 { 0xFFFF_FFFF } else { 0 };
+            r.esi &= r.eax;
+            cx(0x0041_A780, r, &frs(a, &[], &[edi0, esi0, ebx0]));
+            if r.eax & 0xFF == 0 {
+                let d = r.edi as usize;
+                let mut skip_head_fix = false;
+                if rd(HEAD) == r.edi {
+                    r.eax = rd(d);
+                    if r.eax == r.edi {
+                        wd(HEAD, r.ebx);
+                        skip_head_fix = true;
+                    } else {
+                        wd(HEAD, r.eax);
+                    }
+                }
+                if !skip_head_fix {
+                    r.eax = rd(d + 4);
+                    if r.eax != r.ebx {
+                        r.ecx = rd(d);
+                        wd(r.eax as usize, r.ecx);
+                    }
+                    r.eax = rd(d);
+                    if r.eax != r.ebx {
+                        r.edx = rd(d + 4);
+                        wd(r.eax as usize + 4, r.edx);
+                    }
+                }
+                r.eax = rd(FREE_HEAD);
+                wd(d + 4, r.ebx);
+                wd(d, r.ebx);
+                if r.eax == r.ebx {
+                    wd(d, r.edi);
+                    wd(d + 4, r.edi);
+                    wd(FREE_HEAD, r.edi);
+                    r.edi = r.esi;
+                    continue;
+                }
+                let n = r.eax as usize;
+                r.ecx = rd(n + 4);
+                wd(d + 4, r.ecx);
+                wd(d, r.eax);
+                r.edx = rd(n + 4);
+                wd(r.edx as usize, r.edi);
+                wd(n + 4, r.edi);
+            }
+            r.edi = r.esi;
+        }
+        r.ebx = ebx0;
+        r.esi = esi0;
+        r.edi = edi0;
+    }
+}
+hot_thunk!(t_41ac50, e_41ac50, "ret");
+
+// ai_order_k15_enter(npc): picks the order's target handle, validates it, and starts the order
+extern "C" fn e_458180(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(70);
+        let edi0 = r.edi;
+        r.edi = *a;
+        if r.edi != 0 {
+            r.ecx = rd(r.edi as usize + 0x44);
+            if r.ecx != 0 {
+                r.eax = r.ecx;
+                r.eax &= 0xFFF;
+                r.eax <<= 4;
+                r.eax = rd(r.eax as usize + 0x0214_9C64);
+                let e = r.eax as usize;
+                if e != 0 && rd(e + 0x44) == r.ecx {
+                    r.ecx = 1;
+                    if rd(e + 0x4C) == r.ecx && rb(e + 0x3CC) == 1 {
+                        r.edi = edi0;
+                        return;
+                    }
+                }
+            }
+        }
+        let esi0 = r.esi;
+        r.ecx = rd(r.edi as usize + 0x150);
+        let mut have = false;
+        if r.ecx != 0 {
+            r.edx = r.ecx;
+            r.edx &= 0xFFF;
+            r.edx <<= 4;
+            r.eax = rd(r.edx as usize + 0x0214_9C64);
+            if r.eax != 0 && rd(r.eax as usize + 0x44) == r.ecx {
+                have = true;
+            }
+        }
+        if have {
+            r.ecx = (rd(r.eax as usize + 0x4C) != 2) as u32;
+            r.ecx = r.ecx.wrapping_sub(1);
+            r.ecx &= r.eax;
+            r.esi = r.ecx;
+        } else {
+            r.esi = 0;
+        }
+        r.eax = r.esi;
+        cx(0x0080_6720, r, &frs(a, &[], &[esi0, edi0]));
+        if r.eax & 0xFF == 0 {
+            let s = r.esi;
+            cx(0x0080_6B90, r, &frs(a, &[s, 0, 0x0045_7C90], &[esi0, edi0]));
+        }
+        r.eax = 0;
+        r.ecx = r.edi;
+        cx(0x0043_9FA0, r, &frs(a, &[0], &[esi0, edi0]));
+        r.eax = r.esi;
+        r.ecx = r.edi;
+        cx(0x0045_73D0, r, &frs(a, &[0], &[esi0, edi0]));
+        let e = r.edi;
+        cx(0x0043_75B0, r, &frs(a, &[e, 0x15, 0xA1, 0], &[esi0, edi0]));
+        r.esi = esi0;
+        r.edi = edi0;
+    }
+}
+hot_thunk!(t_458180, e_458180, "ret");
+
+// ai_order_k01_update(npc)
+extern "C" fn e_402900(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(71);
+        let esi0 = r.esi;
+        r.esi = *a;
+        let s = r.esi as usize;
+        r.eax = r.esi.wrapping_add(0x10C4);
+        let e = r.eax;
+        cx(0x0055_A930, r, &frs(a, &[e, 0xB, 1, 0], &[esi0, 0, 0, 0]));
+        cx(0x0096_0A80, r, &frs(a, &[1, 0], &[esi0, 0, 0, 0]));
+        r.ecx = rd(s + 0x5E0);
+        r.eax = rd(r.ecx as usize + 0x14);
+        let mut call_it = true;
+        if r.eax != 0xFFFF_FFFF {
+            r.edx = r.eax.wrapping_add(r.eax.wrapping_mul(2));
+            r.eax = (r.eax & !0xFF) | rb(r.edx as usize * 4 + 0x00E8_EE98) as u32;
+            r.eax = (r.eax & !0xFF) | (r.eax & 1);
+            if r.eax & 0xFF != 0 {
+                call_it = false;
+            }
+        }
+        if call_it {
+            cx(0x0096_CB70, r, &frs(a, &[s as u32, 0xFFFF_FFFF, 1, 1, 0], &[esi0, 0, 0, 0]));
+        }
+        let f0 = q32(rd(s + 0x150));
+        let f1 = q32(rd(s + 0x154));
+        let f2 = q32(rd(s + 0x158));
+        if rb(s + 0x140) & 4 == 0 {
+            r.ecx = f0;
+            r.edx = f1;
+            r.eax = f2;
+            wd(s + 0x760, rd(s + 0x760) & !1);
+            wb(s + 0x75C, rb(s + 0x75C) & 0xFE);
+            wd(s + 0x730, r.ecx);
+            wd(s + 0x734, r.edx);
+            wd(s + 0x738, r.eax);
+            wd(s + 0x748, 0xFFFF_FFFF);
+        }
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_402900, e_402900, "ret");
+// =================================================================================================
+// Batch 4
+// =================================================================================================
+
+// vint_object_tree_update (EAX = root): walks the element tree, calling slot 3 on every node
+extern "C" fn e_b8ac40(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(72);
+        let (esi0, edi0) = (r.esi, r.edi);
+        r.esi = r.eax;
+        r.edi = 0;
+        if r.esi != 0 {
+            loop {
+                r.eax = rd(r.esi as usize);
+                r.edx = rd(r.eax as usize + 0xC);
+                r.ecx = r.esi;
+                let f = r.edx as usize;
+                cx(f, r, &frs(a, &[], &[edi0, esi0]));
+                let s = r.esi as usize;
+                if rd(s + 0x1C) == 0 {
+                    r.esi = rd(s + 0x20);
+                    if r.esi != 0 {
+                        continue;
+                    }
+                    if r.edi == 0 {
+                        break;
+                    }
+                    r.esi = rd(r.edi as usize * 4 + 0x022E_CBAC);
+                    r.edi = r.edi.wrapping_sub(1);
+                } else {
+                    r.eax = rd(s + 0x20);
+                    if r.eax != 0 && r.edi < 0x100 {
+                        wd(r.edi as usize * 4 + 0x022E_CBB0, r.eax);
+                        r.edi = r.edi.wrapping_add(1);
+                    }
+                    r.esi = rd(s + 0x1C);
+                }
+                if r.esi == 0 {
+                    break;
+                }
+            }
+        }
+        r.edi = edi0;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_b8ac40, e_b8ac40, "ret");
+
+// vint_lua_call_alloc (ECX = request): takes a node off the free ring, links it into the in-use ring
+extern "C" fn e_b91b70(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(73);
+        r.edx = 0;
+        if r.ecx == r.edx {
+            r.eax = 0;
+            return;
+        }
+        let esi0 = r.esi;
+        r.esi = rd(0x0252_A1C4);
+        if r.esi == r.edx {
+            r.eax = r.esi;
+            r.esi = esi0;
+            return;
+        }
+        let s = r.esi as usize;
+        r.eax = rd(s);
+        if r.eax == r.esi {
+            wd(0x0252_A1C4, r.edx);
+        } else {
+            let edi0 = r.edi;
+            r.edi = rd(s + 4);
+            wd(r.edi as usize, r.eax);
+            r.edi = rd(s + 4);
+            wd(0x0252_A1C4, r.eax);
+            r.eax = rd(s);
+            wd(r.eax as usize + 4, r.edi);
+            r.edi = edi0;
+        }
+        r.eax = rd(0x0252_A1C8);
+        wd(s + 4, r.edx);
+        wd(s, r.edx);
+        if r.eax == r.edx {
+            wd(s, r.esi);
+            wd(s + 4, r.esi);
+            wd(0x0252_A1C8, r.esi);
+        } else {
+            let n = r.eax as usize;
+            r.edx = rd(n + 4);
+            wd(s + 4, r.edx);
+            wd(s, r.eax);
+            r.edx = rd(n + 4);
+            wd(r.edx as usize, r.esi);
+            wd(n + 4, r.esi);
+        }
+        cx(0x00B9_1740, r, &frs(a, &[], &[esi0]));
+        r.eax = r.esi;
+        r.esi = esi0;
+    }
+}
+hot_thunk!(t_b91b70, e_b91b70, "ret");
+
+// vint_element_bitmap_register_type: registers the element type in the 0x20-entry table
+extern "C" fn e_ba0c90(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(74);
+        let esi0 = r.esi;
+        r.eax = rd(0x00EB_DF6C);
+        r.ecx = rd(r.eax as usize);
+        r.esi = 0x031B_F130;
+        wd(0x031B_F138, r.ecx);
+        wd(0x031B_F130, 0x00EB_E340);
+        wd(0x031B_F134, 5);
+        cx(0x00B9_82E0, r, &frs(a, &[], &[esi0]));
+        r.ecx = rd(0x0252_A270);
+        r.edx = rd(0x00EB_DF6C);
+        r.esi = rd(r.edx as usize);
+        if r.ecx < 0x20 {
+            r.eax = r.ecx << 4;
+            r.edx = r.ecx;
+            r.ecx = r.ecx.wrapping_add(1);
+            let e = r.eax as usize;
+            wd(e + 0x022F_2370, 0x00E4_C8BC);
+            wd(e + 0x022F_2374, r.esi);
+            wd(e + 0x022F_2378, 0x031B_F130);
+            wd(0x0252_A270, r.ecx);
+        } else {
+            r.edx = 0xFFFF_FFFF;
+        }
+        wd(0x00E8_6CCC, r.edx);
+        cx(0x00BA_14B0, r, &frs(a, &[], &[esi0]));
+        r.eax = rd(0x00E8_6CCC);
+        r.esi = esi0;
+        if r.eax < rd(0x0252_A270) {
+            r.eax <<= 4;
+            wd(r.eax as usize + 0x022F_237C, 0x00EB_E3F8);
+        }
+        r.eax = (r.eax & !0xFF) | 1;
+    }
+}
+hot_thunk!(t_ba0c90, e_ba0c90, "ret");
+
+// stunt_jumping_diversion_type::update
+extern "C" fn e_618700(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(75);
+        let (ecx0, esi0, ebp0) = (r.ecx, r.esi, r.ebp);
+        r.esi = r.ecx;
+        let s = r.esi;
+        let f = if rd(s as usize + 0x18) == 0xFFFF_FFFF { 0x0061_8D80 } else { 0x0061_8840 };
+        cx(f, r, &frs(a, &[s], &[ecx0, esi0, ebp0]));
+        r.eax = rd(r.esi as usize + 0x50);
+        r.esi = r.esi.wrapping_add(0x50);
+        'done: {
+            if (r.eax as i32) < 0 {
+                break 'done;
+            }
+            r.ecx = rd(0x00E8_43AC);
+            if (r.eax as i32) > (r.ecx as i32) {
+                r.eax = r.eax.wrapping_sub(r.ecx);
+                if (r.eax as i32) < 0x35A4_E900 {
+                    break 'done;
+                }
+            } else {
+                r.ecx = r.ecx.wrapping_sub(r.eax);
+                if (r.ecx as i32) >= 0x35A4_E900 {
+                    break 'done;
+                }
+            }
+            r.eax = r.esi;
+            cx(0x00BD_D2A0, r, &frs(a, &[], &[ecx0, esi0, ebp0]));
+            if (r.eax as i32) > (rd(0x0252_A3AC) as i32) {
+                break 'done;
+            }
+            wd(r.esi as usize, 0xFFFF_FFFF);
+            wd(0x025F_5BE8, rd(0x025F_5BE8) & 0xFFFF_FFF7);
+        }
+        r.esi = esi0;
+        r.ebp = ebp0;
+    }
+}
+hot_thunk!(t_618700, e_618700, "ret");
+
+// diversion_driver_bailout_text(this)
+extern "C" fn e_609960(r: &mut Pushad, a: *const u32) {
+    unsafe {
+        count(76);
+        let (ebx0, ebp0, esi0, edi0) = (r.ebx, r.ebp, r.esi, r.edi);
+        r.ebx = *a;
+        r.eax = rd(r.ebx as usize);
+        r.edx = rd(r.eax as usize + 8);
+        r.ecx = r.ebx;
+        wd(r.ebx as usize + 0x18, 0);
+        let f = r.edx as usize;
+        cx(f, r, &frs(a, &[], &[edi0, esi0, ebp0, ebx0]));
+        r.ebp = r.ebx.wrapping_add(0x1C);
+        r.edi = 0x00DF_4140;
+        r.esi = 0x00DF_4180;
+        let p = r.ebp;
+        cx(0x007F_49E0, r, &frs(a, &[p], &[edi0, esi0, ebp0, ebx0]));
+        r.esi = r.ebx.wrapping_add(0x20);
+        r.ecx = 0;
+        let (q, p) = (r.esi, r.ebp);
+        cx(0x0060_52E0, r, &frs(a, &[q, p], &[edi0, esi0, ebp0, ebx0]));
+        wd(r.ebx as usize + 0x3C, 0);
+        wd(r.ebx as usize + 0x48, 0);
+        r.edi = edi0;
+        wd(r.esi as usize, 0xFFFF_FFFF);
+        r.esi = esi0;
+        wd(r.ebp as usize, 0);
+        r.ebp = ebp0;
+        r.ebx = ebx0;
+    }
+}
+hot_thunk!(t_609960, e_609960, "ret 4");
+
+// =================================================================================================
+// Install
+// =================================================================================================
+
+pub fn install() {
+    let list: Vec<(&'static str, usize, &'static [u8], usize)> = vec![
+        ("gang_fight_objective::get_start_message", 0x575110, &B_575110, t_575110 as *const () as usize),
+        ("base_jumping_diversion_type_info::get_title", 0x5f9590, &B_5F9590, t_5f9590 as *const () as usize),
+        ("driveby_diversion_type_info::get_title", 0x606420, &B_606420, t_606420 as *const () as usize),
+        ("cat_and_mouse_diversion_type_info::get_title", 0x641740, &B_641740, t_641740 as *const () as usize),
+        ("flashing_diversion_type::can_start", 0x611180, &B_611180, t_611180 as *const () as usize),
+        ("stunt_wheels_diversion_type::init", 0x61e210, &B_61E210, t_61e210 as *const () as usize),
+        ("stunt_near_miss_diversion_type::init", 0x61c700, &B_61C700, t_61c700 as *const () as usize),
+        ("notoriety_spawn_group::reset", 0x922da0, &B_922DA0, t_922da0 as *const () as usize),
+        ("vehicle_multi_registration::on_register", 0x8733c0, &B_8733C0, t_8733c0 as *const () as usize),
+        ("script_item::on_object_spawned", 0xa59bb0, &B_A59BB0, t_a59bb0 as *const () as usize),
+        ("streaking_diversion_type::can_start", 0x616440, &B_616440, t_616440 as *const () as usize),
+        ("chunk_section_1b", 0x4aeab0, &B_4AEAB0, t_4aeab0 as *const () as usize),
+        ("city_cull_chunks_job", 0x4b64c0, &B_4B64C0, t_4b64c0 as *const () as usize),
+        ("city_submit_job", 0x4b72a0, &B_4B72A0, t_4b72a0 as *const () as usize),
+        ("act_packet_sub_58", 0x645730, &B_645730, t_645730 as *const () as usize),
+        ("act_packet_sub_51", 0x6495d0, &B_6495D0, t_6495d0 as *const () as usize),
+        ("act_packet_sub_21", 0x677c90, &B_677C90, t_677c90 as *const () as usize),
+        ("hud_pkt_sub_0b", 0x7677e0, &B_7677E0, t_7677e0 as *const () as usize),
+        ("vint_draw_begin", 0x7f0ab0, &B_7F0AB0, t_7f0ab0 as *const () as usize),
+        ("physics_body_set_collision_filter_info", 0x6fd3f0, &B_6FD3F0, t_6fd3f0 as *const () as usize),
+        ("gfx_should_defer", 0x56c310, &B_56C310, t_56c310 as *const () as usize),
+        ("im2d_c_begin", 0xd0a580, &B_D0A580, t_d0a580 as *const () as usize),
+        ("render_snapshot_reset_scales", 0x521870, &B_521870, t_521870 as *const () as usize),
+        ("options_capture_audio", 0x7743f0, &B_7743F0, t_7743f0 as *const () as usize),
+        ("script_object::dtor_4", 0xa63620, &B_A63620, t_a63620 as *const () as usize),
+        ("tod_tables_load", 0x4d64a0, &B_4D64A0, t_4d64a0 as *const () as usize),
+        ("pcu_outfit_delete_impl", 0x9de200, &B_9DE200, t_9de200 as *const () as usize),
+        ("packfile_stream_close", 0xc18400, &B_C18400, t_c18400 as *const () as usize),
+        ("constraint_instance_breakable_listener::scalar_deleting_dtor", 0x70c180, &B_70C180, t_70c180 as *const () as usize),
+        ("detour_multi_registration::scalar_deleting_dtor", 0x827860, &B_827860, t_827860 as *const () as usize),
+        ("stub_multi_session::scalar_deleting_dtor", 0x812380, &B_812380, t_812380 as *const () as usize),
+        ("event_trigger::scalar_deleting_dtor", 0xbf4400, &B_BF4400, t_bf4400 as *const () as usize),
+        ("std::istrstream::scalar_deleting_dtor", 0x4e4ca0, &B_4E4CA0, t_4e4ca0 as *const () as usize),
+        ("vint_element_text::get_text_tag", 0xba2ff0, &B_BA2FF0, t_ba2ff0 as *const () as usize),
+        ("vint_element_text::get_force_case", 0xba3910, &B_BA3910, t_ba3910 as *const () as usize),
+        ("vint_element_sr2_map::get_map_mode", 0xba64e0, &B_BA64E0, t_ba64e0 as *const () as usize),
+        ("horizontal_text_widget::get_height", 0x74a3d0, &B_74A3D0, t_74a3d0 as *const () as usize),
+        ("color_picker_widget::get_height", 0x74d160, &B_74D160, t_74d160 as *const () as usize),
+        ("widget_tagging::get_height", 0x77bfe0, &B_77BFE0, t_77bfe0 as *const () as usize),
+        ("widget_divider::get_height", 0x781e00, &B_781E00, t_781e00 as *const () as usize),
+        ("fuzz_crime_j_walking::enter_state3", 0x5c5e60, &B_5C5E60, t_5c5e60 as *const () as usize),
+        ("misc_packet_sub_0d", 0xa29db0, &B_A29DB0, t_a29db0 as *const () as usize),
+        ("act_packet_mission_start", 0x6a3db0, &B_6A3DB0, t_6a3db0 as *const () as usize),
+        ("gamespy_atlas_module::update", 0x8ce330, &B_8CE330, t_8ce330 as *const () as usize),
+        ("std::logic_error::ctor", 0x4f1a40, &B_4F1A40, t_4f1a40 as *const () as usize),
+        ("cs_shot_parse_interp_mode_b", 0x6cdd00, &B_6CDD00, t_6cdd00 as *const () as usize),
+        ("rocket_multi_registration::free_snapshot", 0x86f7f0, &B_86F7F0, t_86f7f0 as *const () as usize),
+        ("taxi_diversion_type_info::create_instance", 0x628fe0, &B_628FE0, t_628fe0 as *const () as usize),
+        ("vehicle_runninglight_manager::init", 0xad6510, &B_AD6510, t_ad6510 as *const () as usize),
+        ("object_prop::deactivate", 0x9350a0, &B_9350A0, t_9350a0 as *const () as usize),
+        ("net_recv_rop_own_deny", 0x805a50, &B_805A50, t_805a50 as *const () as usize),
+        ("anim_motion_def_find_index", 0x6ef6a0, &B_6EF6A0, t_6ef6a0 as *const () as usize),
+        ("blocking_animation_compressor_full::decompress", 0x859c20, &B_859C20, t_859c20 as *const () as usize),
+        ("streamman_batch_cancel_pending", 0xa7d9c0, &B_A7D9C0, t_a7d9c0 as *const () as usize),
+        ("savegame_cash_add_clamped", 0x696180, &B_696180, t_696180 as *const () as usize),
+        ("spawn_records_reset", 0x951a90, &B_951A90, t_951a90 as *const () as usize),
+        ("spawner_rebuild_categories", 0x93f030, &B_93F030, t_93f030 as *const () as usize),
+        ("resource_registry_init", 0xa774e0, &B_A774E0, t_a774e0 as *const () as usize),
+        ("string_pool::ctor", 0xc06c80, &B_C06C80, t_c06c80 as *const () as usize),
+        ("vint_input_event_index", 0xb99f70, &B_B99F70, t_b99f70 as *const () as usize),
+        ("vint_object_tween::set_target_property", 0xb9f550, &B_B9F550, t_b9f550 as *const () as usize),
+        ("vint_dataitem_set_values", 0xb94c90, &B_B94C90, t_b94c90 as *const () as usize),
+        ("human_pkt_sub_3e", 0x559c90, &B_559C90, t_559c90 as *const () as usize),
+        ("human_pkt_sub_37", 0x4611b0, &B_4611B0, t_4611b0 as *const () as usize),
+        ("vint_object_factory_imp<>::free", 0xb9cc00, &B_B9CC00, t_b9cc00 as *const () as usize),
+        ("nav_open_push_new", 0xa0ffe0, &B_A0FFE0, t_a0ffe0 as *const () as usize),
+        ("ai_spot_users_prune", 0x41ac50, &B_41AC50, t_41ac50 as *const () as usize),
+        ("ai_order_k15_enter", 0x458180, &B_458180, t_458180 as *const () as usize),
+        ("ai_order_k01_update", 0x402900, &B_402900, t_402900 as *const () as usize),
+        ("vint_object_tree_update", 0xb8ac40, &B_B8AC40, t_b8ac40 as *const () as usize),
+        ("vint_lua_call_alloc", 0xb91b70, &B_B91B70, t_b91b70 as *const () as usize),
+        ("vint_element_bitmap_register_type", 0xba0c90, &B_BA0C90, t_ba0c90 as *const () as usize),
+        ("stunt_jumping_diversion_type::update", 0x618700, &B_618700, t_618700 as *const () as usize),
+    ];
+    let mut ok = 0;
+    for (name, addr, body, thunk) in list.iter() {
+        if replace_pinned(name, *addr, body, *thunk) {
+            ok += 1;
+        }
+    }
+    if let Ok(mut v) = PORT_NAMES.lock() {
+        v.clear();
+        for (_, n) in ALL.iter() {
+            v.push(*n);
+        }
+    }
+    log(&format!("port_s1: replaced {ok}/{} with Rust", list.len()));
+}
+
+pub fn summary() -> String {
+    let names = PORT_NAMES.lock().map(|v| v.clone()).unwrap_or_default();
+    let mut parts: Vec<String> = Vec::new();
+    for (i, c) in CNT.iter().enumerate() {
+        let n = c.load(Ordering::Relaxed);
+        if n != 0 {
+            parts.push(format!("{} {n} (0)", names.get(i).copied().unwrap_or("?")));
+        }
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!("port_s1: {}", parts.join(", "))
+}
+
+/// Every port of this module in counter order (name; the address is in the install list).
+const ALL: &[(usize, &str)] = &[
+    (0x575110, "gang_fight_objective::get_start_message"),
+    (0x5f9590, "base_jumping_diversion_type_info::get_title"),
+    (0x606420, "driveby_diversion_type_info::get_title"),
+    (0x641740, "cat_and_mouse_diversion_type_info::get_title"),
+    (0x611180, "flashing_diversion_type::can_start"),
+    (0x61e210, "stunt_wheels_diversion_type::init"),
+    (0x61c700, "stunt_near_miss_diversion_type::init"),
+    (0x922da0, "notoriety_spawn_group::reset"),
+    (0x8733c0, "vehicle_multi_registration::on_register"),
+    (0xa59bb0, "script_item::on_object_spawned"),
+    (0x616440, "streaking_diversion_type::can_start"),
+    (0x4aeab0, "chunk_section_1b"),
+    (0x4b64c0, "city_cull_chunks_job"),
+    (0x4b72a0, "city_submit_job"),
+    (0x645730, "act_packet_sub_58"),
+    (0x6495d0, "act_packet_sub_51"),
+    (0x677c90, "act_packet_sub_21"),
+    (0x7677e0, "hud_pkt_sub_0b"),
+    (0x7f0ab0, "vint_draw_begin"),
+    (0x6fd3f0, "physics_body_set_collision_filter_info"),
+    (0x56c310, "gfx_should_defer"),
+    (0xd0a580, "im2d_c_begin"),
+    (0x521870, "render_snapshot_reset_scales"),
+    (0x7743f0, "options_capture_audio"),
+    (0xa63620, "script_object::dtor_4"),
+    (0x4d64a0, "tod_tables_load"),
+    (0x9de200, "pcu_outfit_delete_impl"),
+    (0xc18400, "packfile_stream_close"),
+    (0x70c180, "constraint_instance_breakable_listener::scalar_deleting_dtor"),
+    (0x827860, "detour_multi_registration::scalar_deleting_dtor"),
+    (0x812380, "stub_multi_session::scalar_deleting_dtor"),
+    (0xbf4400, "event_trigger::scalar_deleting_dtor"),
+    (0x4e4ca0, "std::istrstream::scalar_deleting_dtor"),
+    (0xba2ff0, "vint_element_text::get_text_tag"),
+    (0xba3910, "vint_element_text::get_force_case"),
+    (0xba64e0, "vint_element_sr2_map::get_map_mode"),
+    (0x74a3d0, "horizontal_text_widget::get_height"),
+    (0x74d160, "color_picker_widget::get_height"),
+    (0x77bfe0, "widget_tagging::get_height"),
+    (0x781e00, "widget_divider::get_height"),
+    (0x5c5e60, "fuzz_crime_j_walking::enter_state3"),
+    (0xa29db0, "misc_packet_sub_0d"),
+    (0x6a3db0, "act_packet_mission_start"),
+    (0x8ce330, "gamespy_atlas_module::update"),
+    (0x4f1a40, "std::logic_error::ctor"),
+    (0x6cdd00, "cs_shot_parse_interp_mode_b"),
+    (0x86f7f0, "rocket_multi_registration::free_snapshot"),
+    (0x628fe0, "taxi_diversion_type_info::create_instance"),
+    (0xad6510, "vehicle_runninglight_manager::init"),
+    (0x9350a0, "object_prop::deactivate"),
+    (0x805a50, "net_recv_rop_own_deny"),
+    (0x6ef6a0, "anim_motion_def_find_index"),
+    (0x859c20, "blocking_animation_compressor_full::decompress"),
+    (0x8799e0, "rails_compressed::compress"),
+    (0xa7d9c0, "streamman_batch_cancel_pending"),
+    (0x696180, "savegame_cash_add_clamped"),
+    (0x951a90, "spawn_records_reset"),
+    (0x93f030, "spawner_rebuild_categories"),
+    (0xa774e0, "resource_registry_init"),
+    (0xc06c80, "string_pool::ctor"),
+    (0xb92270, "vint_loc_lookup_symbol"),
+    (0xb99f70, "vint_input_event_index"),
+    (0xb9f550, "vint_object_tween::set_target_property"),
+    (0xb94c90, "vint_dataitem_set_values"),
+    (0x559c90, "human_pkt_sub_3e"),
+    (0x4611b0, "human_pkt_sub_37"),
+    (0xb9cc00, "vint_object_factory_imp<>::free"),
+    (0xa0ffe0, "nav_open_push_new"),
+    (0x5cde70, "fuzz_crime_assassin::enter_state3"),
+    (0x41ac50, "ai_spot_users_prune"),
+    (0x458180, "ai_order_k15_enter"),
+    (0x402900, "ai_order_k01_update"),
+    (0xb8ac40, "vint_object_tree_update"),
+    (0xb91b70, "vint_lua_call_alloc"),
+    (0xba0c90, "vint_element_bitmap_register_type"),
+    (0x618700, "stunt_jumping_diversion_type::update"),
+    (0x609960, "diversion_driver_bailout_text"),
+];
+
+// --- the originals' bytes (each to its true end) ---
+const B_575110: [u8; 20] = [
+    0x56, 0x57, 0xBF, 0xE0, 0x89, 0xDE, 0x00, 0xBE, 0x40, 0x8A, 0xDE, 0x00, 0xE8, 0xBF, 0xF8, 0x27,
+    0x00, 0x5F, 0x5E, 0xC3,
+];
+const B_5F9590: [u8; 20] = [
+    0x56, 0x57, 0xBF, 0x98, 0x21, 0xDF, 0x00, 0xBE, 0xA8, 0x21, 0xDF, 0x00, 0xE8, 0x2F, 0xB5, 0x1F,
+    0x00, 0x5F, 0x5E, 0xC3,
+];
+const B_606420: [u8; 17] = [
+    0x56, 0x57, 0x33, 0xFF, 0xBE, 0x3C, 0x38, 0xDF, 0x00, 0xE8, 0xB2, 0xE5, 0x1E, 0x00, 0x5F, 0x5E,
+    0xC3,
+];
+const B_641740: [u8; 20] = [
+    0x56, 0x57, 0xBF, 0xD8, 0xA6, 0xDF, 0x00, 0xBE, 0xF0, 0xA6, 0xDF, 0x00, 0xE8, 0x8F, 0x32, 0x1B,
+    0x00, 0x5F, 0x5E, 0xC3,
+];
+const B_611180: [u8; 27] = [
+    0xA1, 0xD4, 0x03, 0x17, 0x02, 0x8B, 0x88, 0xAC, 0x13, 0x00, 0x00, 0xC1, 0xE9, 0x08, 0xF6, 0xC1,
+    0x01, 0x75, 0x03, 0x32, 0xC0, 0xC3, 0xE9, 0xC5, 0xFE, 0xFF, 0xFF,
+];
+const B_61E210: [u8; 22] = [
+    0x56, 0x8B, 0xF1, 0xE8, 0x38, 0x48, 0xFE, 0xFF, 0x83, 0xC8, 0xFF, 0x89, 0x46, 0x24, 0x89, 0x46,
+    0x2C, 0x89, 0x46, 0x20, 0x5E, 0xC3,
+];
+const B_61C700: [u8; 74] = [
+    0x56, 0x8B, 0xF1, 0xE8, 0x48, 0x63, 0xFE, 0xFF, 0xA1, 0xAC, 0x43, 0xE8, 0x00, 0x33, 0xD2, 0x3D,
+    0x00, 0xD2, 0x49, 0x6B, 0x89, 0x56, 0x3C, 0x89, 0x46, 0x44, 0x7E, 0x09, 0x8D, 0x88, 0x00, 0x2E,
+    0xB6, 0x94, 0x89, 0x4E, 0x44, 0xD9, 0xEE, 0x83, 0xC9, 0xFF, 0x3D, 0x00, 0xD2, 0x49, 0x6B, 0xD9,
+    0x5E, 0x54, 0x89, 0x4E, 0x40, 0x89, 0x56, 0x50, 0x89, 0x4E, 0x4C, 0x89, 0x46, 0x48, 0x7E, 0x08,
+    0x05, 0x00, 0x2E, 0xB6, 0x94, 0x89, 0x46, 0x48, 0x5E, 0xC3,
+];
+const B_922DA0: [u8; 99] = [
+    0x56, 0x8B, 0xF1, 0xE8, 0xD8, 0x32, 0x03, 0x00, 0x33, 0xC0, 0x83, 0xC9, 0xFF, 0x88, 0x86, 0xE8,
+    0x01, 0x00, 0x00, 0x89, 0x8E, 0xEC, 0x01, 0x00, 0x00, 0x89, 0x8E, 0xF0, 0x01, 0x00, 0x00, 0x89,
+    0x86, 0xF4, 0x01, 0x00, 0x00, 0x89, 0x86, 0xFC, 0x01, 0x00, 0x00, 0x88, 0x86, 0xB0, 0x02, 0x00,
+    0x00, 0x88, 0x86, 0xB1, 0x02, 0x00, 0x00, 0x89, 0x8E, 0xB4, 0x02, 0x00, 0x00, 0x88, 0x86, 0xA4,
+    0x02, 0x00, 0x00, 0x88, 0x86, 0x0C, 0x02, 0x00, 0x00, 0x88, 0x86, 0x0D, 0x02, 0x00, 0x00, 0x89,
+    0x8E, 0x10, 0x02, 0x00, 0x00, 0x89, 0x8E, 0x14, 0x02, 0x00, 0x00, 0x89, 0x8E, 0x18, 0x02, 0x00,
+    0x00, 0x5E, 0xC3,
+];
+const B_8733C0: [u8; 82] = [
+    0x8B, 0x44, 0x24, 0x04, 0x85, 0xC0, 0x74, 0x47, 0x8B, 0xC8, 0x81, 0xE1, 0xFF, 0x0F, 0x00, 0x00,
+    0xC1, 0xE1, 0x04, 0x56, 0x8B, 0xB1, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xF6, 0x74, 0x30, 0x39, 0x46,
+    0x44, 0x75, 0x2B, 0x83, 0x7E, 0x4C, 0x05, 0x75, 0x25, 0xE8, 0xE2, 0x8F, 0x00, 0x00, 0x89, 0x86,
+    0x6C, 0x8F, 0x00, 0x00, 0xC7, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC7, 0x80, 0xFC, 0x2A, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x81, 0x8E, 0x80, 0x00, 0x00, 0x00, 0x80, 0x01, 0x00, 0x00, 0x5E, 0xC2,
+    0x04, 0x00,
+];
+const B_A59BB0: [u8; 61] = [
+    0x8B, 0x44, 0x24, 0x04, 0x83, 0x78, 0x4C, 0x02, 0x57, 0x8B, 0xF9, 0x75, 0x2C, 0x89, 0xB8, 0xCC,
+    0x00, 0x00, 0x00, 0x89, 0x47, 0x64, 0x8B, 0x44, 0x24, 0x0C, 0x50, 0xE8, 0x30, 0xA0, 0xFC, 0xFF,
+    0x80, 0x4F, 0x51, 0x01, 0x8B, 0x4F, 0x54, 0x3B, 0x0D, 0x08, 0x63, 0x3D, 0x03, 0x0F, 0x95, 0xC2,
+    0x32, 0x57, 0x60, 0x80, 0xE2, 0x01, 0x30, 0x57, 0x60, 0x5F, 0xC2, 0x08, 0x00,
+];
+const B_616440: [u8; 69] = [
+    0x8B, 0x15, 0xD4, 0x03, 0x17, 0x02, 0xF6, 0x82, 0x84, 0x00, 0x00, 0x00, 0x01, 0x56, 0x8B, 0xF1,
+    0x74, 0x04, 0x32, 0xC0, 0x5E, 0xC3, 0x83, 0xBA, 0x74, 0x0D, 0x00, 0x00, 0x00, 0x75, 0xF3, 0x8B,
+    0x82, 0xAC, 0x13, 0x00, 0x00, 0xC1, 0xE8, 0x08, 0xA8, 0x01, 0x74, 0xE6, 0x8B, 0xC2, 0xE8, 0xED,
+    0x57, 0x3B, 0x00, 0x84, 0xC0, 0x75, 0xDB, 0x83, 0xBA, 0xA8, 0x0E, 0x00, 0x00, 0x00, 0x75, 0xD2,
+    0x8A, 0x46, 0x1C, 0x5E, 0xC3,
+];
+const B_4AEAB0: [u8; 36] = [
+    0x8B, 0x08, 0x03, 0xCA, 0x8B, 0x11, 0x85, 0xD2, 0x89, 0x90, 0xD4, 0x01, 0x00, 0x00, 0xC7, 0x80,
+    0xD8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x76, 0x09, 0x83, 0xC1, 0x04, 0x89, 0x88, 0xD8,
+    0x01, 0x00, 0x00, 0xC3,
+];
+const B_4B64C0: [u8; 37] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x56, 0x8B, 0x75, 0x10, 0x85, 0xF6, 0x57, 0x7E, 0x10, 0x8B,
+    0x7D, 0x0C, 0xE8, 0x69, 0xF7, 0xFF, 0xFF, 0x83, 0xC7, 0x10, 0x83, 0xEE, 0x01, 0x75, 0xF3, 0x5F,
+    0x5E, 0x8B, 0xE5, 0x5D, 0xC3,
+];
+const B_4B72A0: [u8; 57] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x51, 0x53, 0x8B, 0x5D, 0x0C, 0x56, 0x33, 0xF6, 0x85, 0xDB,
+    0x57, 0x76, 0x1F, 0x8B, 0x7D, 0x10, 0x8B, 0x44, 0xF7, 0x04, 0x8B, 0x0C, 0xF7, 0x6A, 0x00, 0x6A,
+    0x00, 0x50, 0x51, 0xE8, 0x48, 0xE2, 0xFF, 0xFF, 0x83, 0xC6, 0x01, 0x83, 0xC4, 0x10, 0x3B, 0xF3,
+    0x72, 0xE4, 0x5F, 0x5E, 0x5B, 0x8B, 0xE5, 0x5D, 0xC3,
+];
+const B_645730: [u8; 60] = [
+    0xA1, 0x88, 0x78, 0x52, 0x02, 0x85, 0xC0, 0x74, 0x32, 0x8B, 0x48, 0x08, 0x8B, 0x01, 0x8B, 0x50,
+    0x08, 0xFF, 0xD2, 0x83, 0xF8, 0x19, 0x75, 0x23, 0xA1, 0x88, 0x78, 0x52, 0x02, 0x85, 0xC0, 0x74,
+    0x1A, 0x8B, 0x4C, 0x24, 0x08, 0x8B, 0x51, 0x04, 0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x09, 0x2B, 0x8A,
+    0x3C, 0x22, 0x00, 0x00, 0xC6, 0x40, 0x70, 0x01, 0x89, 0x48, 0x6C, 0xC3,
+];
+const B_6495D0: [u8; 60] = [
+    0xA1, 0x88, 0x78, 0x52, 0x02, 0x85, 0xC0, 0x74, 0x32, 0x8B, 0x48, 0x08, 0x8B, 0x01, 0x8B, 0x50,
+    0x08, 0xFF, 0xD2, 0x83, 0xF8, 0x18, 0x75, 0x23, 0xA1, 0x88, 0x78, 0x52, 0x02, 0x85, 0xC0, 0x74,
+    0x1A, 0x8B, 0x4C, 0x24, 0x08, 0x8B, 0x51, 0x04, 0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x09, 0x2B, 0x8A,
+    0x3C, 0x22, 0x00, 0x00, 0xC6, 0x40, 0x70, 0x01, 0x89, 0x48, 0x6C, 0xC3,
+];
+const B_677C90: [u8; 65] = [
+    0x83, 0x3D, 0x88, 0x8E, 0x40, 0x01, 0x00, 0x74, 0x37, 0xA1, 0x60, 0x3C, 0x7B, 0x02, 0x85, 0xC0,
+    0x74, 0x2E, 0x83, 0x78, 0x3C, 0x01, 0x75, 0x28, 0x8B, 0x88, 0x90, 0x00, 0x00, 0x00, 0x8B, 0x01,
+    0x8B, 0x50, 0x04, 0xFF, 0xD2, 0x83, 0xF8, 0x02, 0x75, 0x16, 0xA1, 0x88, 0x8E, 0x40, 0x01, 0x85,
+    0xC0, 0x75, 0x05, 0xE9, 0x18, 0xEC, 0xFF, 0xFF, 0x8B, 0x40, 0x10, 0xE9, 0x10, 0xEC, 0xFF, 0xFF,
+    0xC3,
+];
+const B_7677E0: [u8; 68] = [
+    0x8B, 0x44, 0x24, 0x04, 0x0F, 0xB7, 0x08, 0x33, 0xD2, 0x38, 0x50, 0x02, 0x89, 0x15, 0x5C, 0x82,
+    0x52, 0x02, 0x0F, 0x95, 0xC0, 0x3C, 0x01, 0x66, 0x89, 0x0D, 0xD0, 0xE0, 0xE8, 0x00, 0xA2, 0xE4,
+    0x9C, 0x9B, 0x02, 0x75, 0x1E, 0x89, 0x15, 0x54, 0x82, 0x52, 0x02, 0x66, 0x89, 0x0D, 0xC0, 0xE0,
+    0xE8, 0x00, 0xA2, 0x58, 0x82, 0x52, 0x02, 0x88, 0x15, 0x4F, 0x80, 0x52, 0x02, 0x88, 0x15, 0x59,
+    0x82, 0x52, 0x02, 0xC3,
+];
+const B_7F0AB0: [u8; 76] = [
+    0xB0, 0xFF, 0x56, 0x57, 0xC7, 0x05, 0x48, 0xC5, 0xE8, 0x00, 0x01, 0x00, 0x00, 0x00, 0xC7, 0x05,
+    0x14, 0x8B, 0x52, 0x02, 0x00, 0x00, 0x00, 0x00, 0xA2, 0xBC, 0x15, 0xEB, 0x00, 0xA2, 0xBD, 0x15,
+    0xEB, 0x00, 0xA2, 0xBE, 0x15, 0xEB, 0x00, 0xA2, 0xBF, 0x15, 0xEB, 0x00, 0xE8, 0x6F, 0xFE, 0xFF,
+    0xFF, 0xA1, 0x20, 0xDC, 0x2F, 0x02, 0x8B, 0x35, 0x1C, 0xDC, 0x2F, 0x02, 0x50, 0x6A, 0x00, 0x33,
+    0xFF, 0xE8, 0x2A, 0x42, 0x52, 0x00, 0x83, 0xC4, 0x08, 0x5F, 0x5E, 0xC3,
+];
+const B_6FD3F0: [u8; 54] = [
+    0x51, 0x8D, 0x04, 0x40, 0x8B, 0x14, 0xC5, 0xC0, 0x25, 0x8F, 0x02, 0x39, 0x4A, 0x2C, 0x74, 0x24,
+    0x89, 0x4A, 0x2C, 0x83, 0x3D, 0xAC, 0x7D, 0x52, 0x02, 0x00, 0x76, 0x07, 0xE8, 0x2F, 0x83, 0xFF,
+    0xFF, 0x59, 0xC3, 0x8B, 0x0D, 0x94, 0x7D, 0x52, 0x02, 0x6A, 0x01, 0x52, 0x51, 0x33, 0xC0, 0xE8,
+    0x1C, 0xF8, 0x65, 0x00, 0x59, 0xC3,
+];
+const B_56C310: [u8; 50] = [
+    0x80, 0x3D, 0xDB, 0x49, 0xE8, 0x00, 0x00, 0x75, 0x26, 0x64, 0xA1, 0x2C, 0x00, 0x00, 0x00, 0x8B,
+    0x00, 0x80, 0x78, 0x5C, 0x00, 0x75, 0x09, 0x81, 0x78, 0x60, 0xA0, 0x26, 0xEC, 0x00, 0x74, 0x09,
+    0x81, 0x78, 0x60, 0x10, 0x26, 0xEC, 0x00, 0x75, 0x06, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x33,
+    0xC0, 0xC3,
+];
+const B_D0A580: [u8; 85] = [
+    0x80, 0x3D, 0xDB, 0x49, 0xE8, 0x00, 0x00, 0x75, 0x2C, 0x64, 0xA1, 0x2C, 0x00, 0x00, 0x00, 0x8B,
+    0x00, 0x80, 0x78, 0x5C, 0x00, 0x75, 0x09, 0x81, 0x78, 0x60, 0xA0, 0x26, 0xEC, 0x00, 0x74, 0x09,
+    0x81, 0x78, 0x60, 0x10, 0x26, 0xEC, 0x00, 0x75, 0x0C, 0x56, 0x6A, 0x18, 0xE8, 0xEF, 0xE8, 0xFE,
+    0xFF, 0x83, 0xC4, 0x08, 0xC3, 0x8B, 0xCE, 0xE8, 0x14, 0xA3, 0x00, 0x00, 0x56, 0xE8, 0xEE, 0x38,
+    0x01, 0x00, 0x83, 0xC4, 0x04, 0xA3, 0x00, 0xA3, 0x52, 0x02, 0xC7, 0x05, 0xC0, 0x63, 0xE8, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xC3,
+];
+const B_521870: [u8; 86] = [
+    0x83, 0xEC, 0x0C, 0xD9, 0xE8, 0xC6, 0x40, 0x6D, 0x00, 0xD9, 0x14, 0x24, 0x8B, 0x0C, 0x24, 0xD9,
+    0x54, 0x24, 0x04, 0x8B, 0x54, 0x24, 0x04, 0xD9, 0x54, 0x24, 0x08, 0xD9, 0x14, 0x24, 0x89, 0x48,
+    0x50, 0x8B, 0x4C, 0x24, 0x08, 0xD9, 0x54, 0x24, 0x04, 0xD9, 0x54, 0x24, 0x08, 0x89, 0x50, 0x54,
+    0xD9, 0xEE, 0x8B, 0x14, 0x24, 0xD9, 0x58, 0x5C, 0x89, 0x50, 0x44, 0x8B, 0x54, 0x24, 0x08, 0x89,
+    0x48, 0x58, 0x8B, 0x4C, 0x24, 0x04, 0xD9, 0x50, 0x60, 0x89, 0x48, 0x48, 0xD9, 0x58, 0x64, 0x89,
+    0x50, 0x4C, 0x83, 0xC4, 0x0C, 0xC3,
+];
+const B_7743F0: [u8; 47] = [
+    0xD9, 0x05, 0xD8, 0x34, 0xEE, 0x00, 0xA1, 0x70, 0x6B, 0x52, 0x02, 0xD9, 0x1D, 0x8C, 0xA9, 0xF7,
+    0x01, 0xA3, 0x98, 0xA9, 0xF7, 0x01, 0xD9, 0x05, 0xE0, 0x34, 0xEE, 0x00, 0xD9, 0x1D, 0x90, 0xA9,
+    0xF7, 0x01, 0xD9, 0x05, 0xDC, 0x34, 0xEE, 0x00, 0xD9, 0x1D, 0x94, 0xA9, 0xF7, 0x01, 0xC3,
+];
+const B_A63620: [u8; 107] = [
+    0xD9, 0xEE, 0xC7, 0x00, 0xBC, 0xE3, 0xE3, 0x00, 0x8B, 0x0D, 0x08, 0x63, 0x3D, 0x03, 0x89, 0x48,
+    0x0C, 0x8B, 0x15, 0x08, 0x63, 0x3D, 0x03, 0x89, 0x50, 0x0C, 0xC6, 0x40, 0x15, 0xFF, 0xC7, 0x40,
+    0x04, 0x40, 0x29, 0xA6, 0x00, 0xC7, 0x00, 0xB4, 0x35, 0xE4, 0x00, 0xC7, 0x40, 0x08, 0x01, 0x00,
+    0x00, 0x00, 0x33, 0xC9, 0x89, 0x48, 0x10, 0x88, 0x48, 0x14, 0x89, 0x48, 0x18, 0xD9, 0x50, 0x1C,
+    0xD9, 0x50, 0x20, 0xD9, 0x50, 0x24, 0xD9, 0xE8, 0xD9, 0x50, 0x28, 0xD9, 0x50, 0x38, 0xD9, 0x58,
+    0x48, 0xD9, 0x50, 0x2C, 0xD9, 0x50, 0x30, 0xD9, 0x50, 0x34, 0xD9, 0x50, 0x3C, 0xD9, 0x50, 0x40,
+    0xD9, 0x58, 0x44, 0xC7, 0x40, 0x4C, 0xFF, 0xFF, 0x00, 0x00, 0xC3,
+];
+const B_4D64A0: [u8; 66] = [
+    0x51, 0xD9, 0xE8, 0xD9, 0x15, 0x1C, 0x8D, 0x65, 0x02, 0xD9, 0x1D, 0x18, 0x8D, 0x65, 0x02, 0xE8,
+    0xAC, 0xD2, 0xFF, 0xFF, 0xE8, 0x67, 0xD3, 0xFF, 0xFF, 0xE8, 0x22, 0xD6, 0xFF, 0xFF, 0xE8, 0x4D,
+    0xD0, 0xFF, 0xFF, 0xA1, 0xA8, 0x6D, 0x52, 0x02, 0x68, 0xE0, 0x3B, 0x4D, 0x00, 0x68, 0x50, 0x02,
+    0x00, 0x00, 0x50, 0x68, 0x08, 0x42, 0x65, 0x02, 0xE8, 0xB3, 0xFF, 0x7B, 0x00, 0x83, 0xC4, 0x10,
+    0x59, 0xC3,
+];
+const B_9DE200: [u8; 72] = [
+    0x8B, 0x15, 0xC4, 0xFF, 0x15, 0x02, 0x33, 0xC9, 0x85, 0xD2, 0xB8, 0xC8, 0xFF, 0x15, 0x02, 0x7E,
+    0x13, 0x39, 0x38, 0x75, 0x05, 0x39, 0x70, 0x04, 0x74, 0x0D, 0x83, 0xC1, 0x01, 0x83, 0xC0, 0x08,
+    0x3B, 0xCA, 0x7C, 0xED, 0x32, 0xC0, 0xC3, 0x2B, 0xD1, 0x8D, 0x0C, 0xD5, 0xF8, 0xFF, 0xFF, 0xFF,
+    0x51, 0x8D, 0x50, 0x08, 0x52, 0x50, 0xE8, 0x25, 0x7E, 0x2B, 0x00, 0x83, 0x2D, 0xC4, 0xFF, 0x15,
+    0x02, 0x01, 0x83, 0xC4, 0x0C, 0xB0, 0x01, 0xC3,
+];
+const B_C18400: [u8; 71] = [
+    0x85, 0xC0, 0x7C, 0x40, 0x83, 0xF8, 0x01, 0x7F, 0x3B, 0x85, 0xC0, 0x53, 0x56, 0x8B, 0x37, 0x74,
+    0x04, 0x32, 0xDB, 0xEB, 0x07, 0xE8, 0xA6, 0x00, 0x00, 0x00, 0x8A, 0xD8, 0x68, 0x6C, 0xCF, 0x40,
+    0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x68, 0x6C, 0xCF, 0x40, 0x03, 0xC7, 0x07, 0x00, 0x00,
+    0x00, 0x00, 0xC7, 0x47, 0x04, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x5E,
+    0x8A, 0xC3, 0x5B, 0xC3, 0x32, 0xC0, 0xC3,
+];
+const B_70C180: [u8; 60] = [
+    0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0xF8, 0x8B, 0xE1, 0x00, 0x74, 0x26,
+    0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15,
+    0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xC5, 0x26, 0x5D, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03,
+    0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00,
+];
+const B_827860: [u8; 60] = [
+    0xF6, 0x44, 0x24, 0x04, 0x01, 0x56, 0x8B, 0xF1, 0xC7, 0x06, 0x7C, 0x7E, 0xE2, 0x00, 0x74, 0x26,
+    0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15,
+    0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xE5, 0x6F, 0x4B, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03,
+    0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00,
+];
+const B_812380: [u8; 83] = [
+    0xF6, 0x44, 0x24, 0x04, 0x01, 0xB8, 0x54, 0xFD, 0xDF, 0x00, 0x56, 0x8B, 0xF1, 0x89, 0x86, 0x50,
+    0x0D, 0x00, 0x00, 0x89, 0x86, 0x04, 0x0D, 0x00, 0x00, 0x89, 0x86, 0xB8, 0x0C, 0x00, 0x00, 0xC7,
+    0x06, 0x24, 0x69, 0xE2, 0x00, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D,
+    0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0xAE, 0xC4,
+    0x4C, 0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E,
+    0xC2, 0x04, 0x00,
+];
+const B_BF4400: [u8; 63] = [
+    0x56, 0x8B, 0xF1, 0xE8, 0x38, 0x01, 0x00, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01, 0x74, 0x2A, 0x85,
+    0xF6, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68, 0xE4, 0xAD, 0x47,
+    0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x42, 0xA4, 0x0E, 0x00, 0x68, 0xE4,
+    0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2, 0x04, 0x00,
+];
+const B_4E4CA0: [u8; 66] = [
+    0x56, 0x8D, 0x71, 0xA4, 0x8B, 0xC6, 0xE8, 0x45, 0x00, 0x00, 0x00, 0xF6, 0x44, 0x24, 0x08, 0x01,
+    0x74, 0x2A, 0x85, 0xF6, 0x74, 0x26, 0xA0, 0xF7, 0x7B, 0x52, 0x02, 0x3C, 0x01, 0x74, 0x1D, 0x68,
+    0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xCC, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0xE8, 0x9F, 0x9B, 0x7F,
+    0x00, 0x68, 0xE4, 0xAD, 0x47, 0x03, 0xFF, 0x15, 0xD0, 0x80, 0xDB, 0x00, 0x8B, 0xC6, 0x5E, 0xC2,
+    0x04, 0x00,
+];
+const B_BA2FF0: [u8; 31] = [
+    0x8B, 0x81, 0x9C, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x10, 0x50, 0x8B, 0x44, 0x24, 0x08, 0x50,
+    0xE8, 0xFB, 0x07, 0xFF, 0xFF, 0xB0, 0x01, 0xC2, 0x08, 0x00, 0x32, 0xC0, 0xC2, 0x08, 0x00,
+];
+const B_BA3910: [u8; 23] = [
+    0x8B, 0x81, 0xC0, 0x00, 0x00, 0x00, 0x56, 0x8B, 0x74, 0x24, 0x08, 0x50, 0xE8, 0x6F, 0xFC, 0xFE,
+    0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00,
+];
+const B_BA64E0: [u8; 23] = [
+    0x8B, 0x81, 0x9C, 0x00, 0x00, 0x00, 0x56, 0x8B, 0x74, 0x24, 0x08, 0x50, 0xE8, 0x9F, 0xD0, 0xFE,
+    0xFF, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00,
+];
+const B_74A3D0: [u8; 22] = [
+    0x51, 0x8B, 0x0D, 0x7C, 0x8A, 0xE9, 0x00, 0xE8, 0x84, 0xB9, 0x4C, 0x00, 0x89, 0x04, 0x24, 0xDB,
+    0x04, 0x24, 0x59, 0xC2, 0x04, 0x00,
+];
+const B_74D160: [u8; 34] = [
+    0x51, 0x8B, 0x0D, 0x7C, 0x8A, 0xE9, 0x00, 0xE8, 0xF4, 0x8B, 0x4C, 0x00, 0x89, 0x04, 0x24, 0xDB,
+    0x04, 0x24, 0xDC, 0x0D, 0x28, 0xC2, 0xE5, 0x00, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC2,
+    0x04, 0x00,
+];
+const B_77BFE0: [u8; 34] = [
+    0x51, 0x8B, 0x0D, 0x80, 0x8A, 0xE9, 0x00, 0xE8, 0x74, 0x9D, 0x49, 0x00, 0x89, 0x04, 0x24, 0xDB,
+    0x04, 0x24, 0xDC, 0x0D, 0x28, 0xC2, 0xE5, 0x00, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC2,
+    0x04, 0x00,
+];
+const B_781E00: [u8; 34] = [
+    0x51, 0x8B, 0x0D, 0x80, 0x8A, 0xE9, 0x00, 0xE8, 0x54, 0x3F, 0x49, 0x00, 0x89, 0x04, 0x24, 0xDB,
+    0x04, 0x24, 0xDC, 0x0D, 0x28, 0xC2, 0xE5, 0x00, 0xD9, 0x1C, 0x24, 0xD9, 0x04, 0x24, 0x59, 0xC2,
+    0x04, 0x00,
+];
+const B_5C5E60: [u8; 18] = [
+    0x56, 0x8B, 0xF1, 0xE8, 0xB8, 0xD1, 0xFF, 0xFF, 0x8B, 0x06, 0x8B, 0x50, 0x58, 0x8B, 0xCE, 0x5E,
+    0xFF, 0xE2,
+];
+const B_A29DB0: [u8; 14] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x8B, 0x30, 0xE8, 0x54, 0x61, 0xA5, 0xFF, 0x5E, 0xC3,
+];
+const B_6A3DB0: [u8; 33] = [
+    0x56, 0xBE, 0x9C, 0x0D, 0xE0, 0x00, 0xE8, 0x95, 0xD4, 0xFF, 0xFF, 0x5E, 0xC7, 0x44, 0x24, 0x08,
+    0x00, 0x00, 0x00, 0x00, 0xC7, 0x44, 0x24, 0x04, 0x90, 0x3C, 0x7B, 0x02, 0xE9, 0x6F, 0xD6, 0xFF,
+    0xFF,
+];
+const B_8CE330: [u8; 51] = [
+    0x56, 0x8B, 0xF1, 0x83, 0x7E, 0x20, 0x00, 0x74, 0x28, 0x83, 0x3D, 0x50, 0x93, 0x52, 0x02, 0x00,
+    0x7E, 0x0C, 0x57, 0xBF, 0x30, 0x13, 0x90, 0x00, 0xE8, 0x63, 0x07, 0x03, 0x00, 0x5F, 0x8B, 0x46,
+    0x24, 0x85, 0xC0, 0x74, 0x0C, 0x83, 0x78, 0x38, 0x00, 0x74, 0x06, 0x5E, 0xE9, 0xBF, 0x6A, 0x00,
+    0x00, 0x5E, 0xC3,
+];
+const B_4F1A40: [u8; 53] = [
+    0x56, 0x8B, 0xF1, 0x33, 0xC0, 0x8D, 0x4E, 0x08, 0xC7, 0x46, 0x04, 0xB8, 0xE2, 0xDD, 0x00, 0xC7,
+    0x06, 0x8C, 0xE6, 0xDD, 0x00, 0x6A, 0xFF, 0x89, 0x41, 0x14, 0xC7, 0x41, 0x18, 0x0F, 0x00, 0x00,
+    0x00, 0x50, 0x88, 0x41, 0x04, 0x8B, 0x44, 0x24, 0x10, 0x50, 0xE8, 0x91, 0x60, 0xFF, 0xFF, 0x8B,
+    0xC6, 0x5E, 0xC2, 0x04, 0x00,
+];
+const B_6CDD00: [u8; 118] = [
+    0x68, 0x04, 0xC4, 0xDD, 0x00, 0x68, 0xD8, 0xCA, 0xE0, 0x00, 0xE8, 0x21, 0xB3, 0x5C, 0x00, 0x83,
+    0xC4, 0x08, 0x85, 0xC0, 0x75, 0x04, 0x89, 0x46, 0x04, 0xC3, 0x68, 0xF4, 0xCA, 0xE0, 0x00, 0x68,
+    0xD8, 0xCA, 0xE0, 0x00, 0xE8, 0x07, 0xB3, 0x5C, 0x00, 0x83, 0xC4, 0x08, 0x85, 0xC0, 0x75, 0x08,
+    0xC7, 0x46, 0x04, 0x01, 0x00, 0x00, 0x00, 0xC3, 0x68, 0x00, 0xCB, 0xE0, 0x00, 0x68, 0xD8, 0xCA,
+    0xE0, 0x00, 0xE8, 0xE9, 0xB2, 0x5C, 0x00, 0x83, 0xC4, 0x08, 0x85, 0xC0, 0x75, 0x08, 0xC7, 0x46,
+    0x04, 0x02, 0x00, 0x00, 0x00, 0xC3, 0x68, 0xD8, 0xCA, 0xE0, 0x00, 0x68, 0xD8, 0xCA, 0xE0, 0x00,
+    0xE8, 0xCB, 0xB2, 0x5C, 0x00, 0x83, 0xC4, 0x08, 0xF7, 0xD8, 0x1B, 0xC0, 0x83, 0xE0, 0xFD, 0x83,
+    0xC0, 0x03, 0x89, 0x46, 0x04, 0xC3,
+];
+const B_86F7F0: [u8; 81] = [
+    0xA0, 0x49, 0x8B, 0x52, 0x02, 0x84, 0xC0, 0x56, 0x57, 0x8B, 0x7C, 0x24, 0x0C, 0x8B, 0x77, 0x10,
+    0x74, 0x12, 0xE8, 0x19, 0x1D, 0x00, 0x00, 0x33, 0xC0, 0x89, 0x47, 0x10, 0x89, 0x47, 0x0C, 0x5F,
+    0x5E, 0xC2, 0x04, 0x00, 0x83, 0x3D, 0x38, 0xC4, 0xE8, 0x00, 0x08, 0x75, 0x12, 0xE8, 0x7E, 0x11,
+    0x00, 0x00, 0x33, 0xC0, 0x89, 0x47, 0x10, 0x89, 0x47, 0x0C, 0x5F, 0x5E, 0xC2, 0x04, 0x00, 0xE8,
+    0x3C, 0x17, 0x00, 0x00, 0x33, 0xC0, 0x89, 0x47, 0x10, 0x89, 0x47, 0x0C, 0x5F, 0x5E, 0xC2, 0x04,
+    0x00,
+];
+const B_628FE0: [u8; 35] = [
+    0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x01, 0x8B, 0x50, 0x1C, 0x6A, 0x00, 0x68, 0x24, 0x01, 0x00, 0x00,
+    0xFF, 0xD2, 0x85, 0xC0, 0x74, 0x08, 0xE8, 0x15, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00, 0x33, 0xC0,
+    0xC2, 0x04, 0x00,
+];
+const B_AD6510: [u8; 99] = [
+    0x8B, 0x44, 0x24, 0x04, 0x89, 0x41, 0x10, 0x33, 0xC0, 0x89, 0x41, 0x08, 0x89, 0x41, 0x0C, 0x88,
+    0x41, 0x04, 0x83, 0xC8, 0xFF, 0x89, 0x41, 0x14, 0x89, 0x41, 0x18, 0x89, 0x41, 0x1C, 0x89, 0x41,
+    0x20, 0x89, 0x41, 0x24, 0x8B, 0x15, 0x1C, 0x78, 0xE8, 0x00, 0x89, 0x51, 0x14, 0xA1, 0x24, 0x78,
+    0xE8, 0x00, 0x89, 0x41, 0x18, 0x8B, 0x15, 0x2C, 0x78, 0xE8, 0x00, 0x89, 0x51, 0x1C, 0xA1, 0x34,
+    0x78, 0xE8, 0x00, 0x89, 0x41, 0x20, 0x8B, 0x15, 0x3C, 0x78, 0xE8, 0x00, 0x89, 0x51, 0x24, 0x8B,
+    0x54, 0x24, 0x0C, 0x8B, 0x01, 0x8B, 0x40, 0x30, 0x52, 0x8B, 0x54, 0x24, 0x0C, 0x52, 0xFF, 0xD0,
+    0xC2, 0x0C, 0x00,
+];
+const B_9350A0: [u8; 114] = [
+    0x56, 0x57, 0x8B, 0xF1, 0xE8, 0x47, 0x07, 0xFF, 0xFF, 0x8B, 0x46, 0x7C, 0x83, 0xF8, 0xFF, 0x74,
+    0x10, 0x50, 0xE8, 0xD9, 0x6D, 0xDC, 0xFF, 0x83, 0xC4, 0x04, 0xC7, 0x46, 0x7C, 0xFF, 0xFF, 0xFF,
+    0xFF, 0x66, 0x81, 0xBE, 0x0E, 0x01, 0x00, 0x00, 0xFF, 0xFF, 0x75, 0x0B, 0x0F, 0xB7, 0x86, 0x0C,
+    0x01, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x19, 0x8B, 0x8E, 0x0C, 0x01, 0x00, 0x00, 0x51, 0xE8, 0x0D,
+    0x84, 0x14, 0x00, 0x83, 0xC4, 0x04, 0xC7, 0x86, 0x0C, 0x01, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF,
+    0x8B, 0xBE, 0xE8, 0x00, 0x00, 0x00, 0x85, 0xFF, 0x74, 0x0F, 0xE8, 0x11, 0x0A, 0xDB, 0xFF, 0xC7,
+    0x86, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x5F, 0x8B, 0xC6, 0x5E, 0xE9, 0xFE, 0xF5,
+    0xFF, 0xFF,
+];
+const B_805A50: [u8; 76] = [
+    0x8B, 0x44, 0x24, 0x04, 0x57, 0x0F, 0xB7, 0x38, 0x66, 0x81, 0xFF, 0xFF, 0xFF, 0x75, 0x0F, 0x33,
+    0xD2, 0x52, 0x8B, 0xCF, 0xE8, 0x57, 0xEA, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0x5F, 0xC3, 0x56, 0x8B,
+    0x35, 0x58, 0xE2, 0x12, 0x02, 0x0F, 0xB7, 0xCF, 0x6A, 0x00, 0x51, 0xE8, 0xB0, 0x33, 0x00, 0x00,
+    0x85, 0xC0, 0x5E, 0x74, 0xDA, 0x8B, 0x00, 0x85, 0xC0, 0x74, 0xD4, 0x8B, 0x50, 0x04, 0x6A, 0x00,
+    0x8B, 0xCF, 0xE8, 0x29, 0xEA, 0xFF, 0xFF, 0x83, 0xC4, 0x04, 0x5F, 0xC3,
+];
+const B_6EF6A0: [u8; 79] = [
+    0x53, 0x8B, 0x5C, 0x24, 0x0C, 0x55, 0x8B, 0x6C, 0x24, 0x0C, 0x56, 0x57, 0x33, 0xF6, 0x8D, 0x7D,
+    0x04, 0x8B, 0x0F, 0x85, 0xC9, 0x74, 0x23, 0x83, 0xFB, 0xFF, 0x74, 0x1E, 0x8B, 0x44, 0x24, 0x1C,
+    0x50, 0x8B, 0x45, 0x0C, 0x8D, 0x93, 0xA4, 0x02, 0x00, 0x00, 0x52, 0xE8, 0xD0, 0xA9, 0xFF, 0xFF,
+    0x83, 0xC4, 0x08, 0x3D, 0xFF, 0xFF, 0x00, 0x00, 0x75, 0x10, 0x83, 0xC6, 0x01, 0x83, 0xC7, 0x04,
+    0x83, 0xFE, 0x02, 0x7C, 0xCC, 0xB8, 0xFF, 0xFF, 0x00, 0x00, 0x5F, 0x5E, 0x5D, 0x5B, 0xC3,
+];
+const B_859C20: [u8; 106] = [
+    0x56, 0x57, 0x8B, 0x7C, 0x24, 0x0C, 0x85, 0xFF, 0x8B, 0xF1, 0x74, 0x59, 0x53, 0x8B, 0x5C, 0x24,
+    0x14, 0x85, 0xDB, 0x74, 0x4F, 0x8B, 0xCF, 0xE8, 0x24, 0x3D, 0xFA, 0xFF, 0x84, 0xC0, 0x75, 0x3A,
+    0x8B, 0x44, 0x24, 0x18, 0x55, 0x50, 0x53, 0x57, 0x8B, 0xCE, 0xE8, 0x61, 0xFE, 0xFF, 0xFF, 0x8B,
+    0x6F, 0x10, 0xBE, 0x10, 0x00, 0x00, 0x00, 0x8B, 0xC5, 0x8B, 0xD7, 0xE8, 0x90, 0x3C, 0xFA, 0xFF,
+    0x83, 0xC5, 0x10, 0x89, 0x6F, 0x10, 0x8B, 0xCF, 0x66, 0x89, 0x03, 0xE8, 0xF0, 0x3C, 0xFA, 0xFF,
+    0x5D, 0x88, 0x43, 0x08, 0x5B, 0x5F, 0x5E, 0xC2, 0x0C, 0x00, 0xD9, 0xEE, 0x66, 0xC7, 0x03, 0xFF,
+    0xFF, 0xD9, 0x5B, 0x04, 0x5B, 0x5F, 0x5E, 0xC2, 0x0C, 0x00,
+];
+const B_A7D9C0: [u8; 105] = [
+    0x8B, 0x44, 0x24, 0x04, 0x8B, 0x40, 0x0C, 0x85, 0xC0, 0x53, 0x55, 0x56, 0x57, 0x74, 0x55, 0x8B,
+    0x30, 0x85, 0xF6, 0x74, 0x4F, 0x8B, 0x4E, 0x10, 0x8B, 0x56, 0x14, 0x8B, 0xC1, 0x33, 0xFF, 0x0B,
+    0xC7, 0x75, 0x0C, 0xA1, 0x24, 0x9E, 0x52, 0x02, 0x8B, 0x00, 0xA3, 0x28, 0x9E, 0x52, 0x02, 0x8B,
+    0x39, 0x8B, 0xC2, 0x33, 0xDB, 0x33, 0xED, 0x3B, 0xC7, 0x75, 0x04, 0x3B, 0xDD, 0x74, 0x0C, 0xA1,
+    0x24, 0x9E, 0x52, 0x02, 0x8B, 0x00, 0xA3, 0x28, 0x9E, 0x52, 0x02, 0x8B, 0x79, 0x3C, 0x52, 0x51,
+    0xE8, 0x1B, 0x5A, 0xFF, 0xFF, 0x8B, 0x4C, 0x24, 0x14, 0x3B, 0x71, 0x0C, 0x74, 0x06, 0x8B, 0x36,
+    0x85, 0xF6, 0x75, 0xB1, 0x5F, 0x5E, 0x5D, 0x5B, 0xC3,
+];
+const B_696180: [u8; 128] = [
+    0x85, 0xF6, 0x74, 0x7B, 0x3D, 0x00, 0x2D, 0x31, 0x01, 0x7E, 0x07, 0xB9, 0x00, 0x94, 0x35, 0x77,
+    0xEB, 0x2D, 0x3D, 0x00, 0xD3, 0xCE, 0xFE, 0x7D, 0x07, 0xB9, 0x00, 0x6C, 0xCA, 0x88, 0xEB, 0x1F,
+    0x6B, 0xC0, 0x64, 0x3D, 0x00, 0x94, 0x35, 0x77, 0x7E, 0x07, 0xB9, 0x00, 0x94, 0x35, 0x77, 0xEB,
+    0x0E, 0x3D, 0x00, 0x6C, 0xCA, 0x88, 0xB9, 0x00, 0x6C, 0xCA, 0x88, 0x7C, 0x02, 0x8B, 0xC8, 0x8B,
+    0x86, 0xB4, 0x00, 0x00, 0x00, 0x03, 0xC1, 0x99, 0x85, 0xD2, 0x7C, 0x14, 0x7F, 0x07, 0x3D, 0x00,
+    0x94, 0x35, 0x77, 0x76, 0x0B, 0xC7, 0x86, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x94, 0x35, 0x77, 0xC3,
+    0x83, 0xFA, 0xFF, 0x7F, 0x14, 0x7C, 0x07, 0x3D, 0x00, 0x6C, 0xCA, 0x88, 0x73, 0x0B, 0xC7, 0x86,
+    0xB4, 0x00, 0x00, 0x00, 0x00, 0x6C, 0xCA, 0x88, 0xC3, 0x89, 0x86, 0xB4, 0x00, 0x00, 0x00, 0xC3,
+];
+const B_951A90: [u8; 176] = [
+    0x80, 0x7C, 0x24, 0x04, 0x00, 0xD9, 0xE8, 0xD9, 0x1D, 0x58, 0x87, 0xE8, 0x00, 0xC7, 0x05, 0x90,
+    0xE0, 0x15, 0x02, 0x00, 0x00, 0x00, 0x00, 0xC6, 0x05, 0x63, 0x96, 0x52, 0x02, 0x00, 0x74, 0x2A,
+    0x57, 0x68, 0x80, 0x1A, 0x95, 0x00, 0xB9, 0x01, 0x00, 0x00, 0x00, 0xBF, 0x63, 0x96, 0x52, 0x02,
+    0xE8, 0x4B, 0xFD, 0xEA, 0xFF, 0x6A, 0x00, 0xB9, 0x04, 0x00, 0x00, 0x00, 0xBF, 0x58, 0x87, 0xE8,
+    0x00, 0xE8, 0x3A, 0xFD, 0xEA, 0xFF, 0x83, 0xC4, 0x08, 0x5F, 0xB8, 0xE8, 0x80, 0xC1, 0x02, 0xA3,
+    0x94, 0xE0, 0x15, 0x02, 0xA3, 0xC0, 0x81, 0xC1, 0x02, 0xA3, 0xBC, 0x81, 0xC1, 0x02, 0xB8, 0xBC,
+    0x81, 0xC1, 0x02, 0xA3, 0xE8, 0x80, 0xC1, 0x02, 0xA3, 0xEC, 0x80, 0xC1, 0x02, 0x83, 0xC8, 0xFF,
+    0xA3, 0xDC, 0x80, 0xC1, 0x02, 0xA3, 0xA4, 0xE0, 0x15, 0x02, 0xA3, 0xA8, 0xE0, 0x15, 0x02, 0xA3,
+    0xE0, 0x80, 0xC1, 0x02, 0xA3, 0xAC, 0xE0, 0x15, 0x02, 0xA3, 0xB0, 0xE0, 0x15, 0x02, 0xA3, 0xE4,
+    0x80, 0xC1, 0x02, 0xA3, 0xB4, 0xE0, 0x15, 0x02, 0xA3, 0xB8, 0xE0, 0x15, 0x02, 0xB8, 0x6C, 0x87,
+    0xE8, 0x00, 0xC6, 0x00, 0x00, 0x83, 0xC0, 0x10, 0x3D, 0xAC, 0x87, 0xE8, 0x00, 0x7C, 0xF3, 0xC3,
+];
+const B_93F030: [u8; 121] = [
+    0x56, 0x8B, 0x35, 0x34, 0x96, 0x52, 0x02, 0x8B, 0xC7, 0xC7, 0x47, 0x0C, 0x00, 0x00, 0x00, 0x00,
+    0xC7, 0x47, 0x08, 0x00, 0x00, 0x00, 0x00, 0xE8, 0xB4, 0xFF, 0xFF, 0xFF, 0xA0, 0x48, 0x8B, 0x52,
+    0x02, 0x3C, 0x01, 0x75, 0x36, 0x8A, 0x0D, 0x49, 0x8B, 0x52, 0x02, 0x3A, 0xC8, 0x75, 0x2C, 0xA1,
+    0x14, 0x8C, 0x52, 0x02, 0x85, 0xC0, 0x74, 0x23, 0x50, 0xE8, 0x82, 0x0C, 0xED, 0xFF, 0x84, 0xC0,
+    0x74, 0x19, 0x8B, 0x35, 0x38, 0x96, 0x52, 0x02, 0x85, 0xF6, 0x74, 0x0F, 0x3B, 0x35, 0x34, 0x96,
+    0x52, 0x02, 0x74, 0x07, 0x8B, 0xC7, 0xE8, 0x75, 0xFF, 0xFF, 0xFF, 0x33, 0xF6, 0x8D, 0x49, 0x00,
+    0x8B, 0x96, 0xB8, 0x88, 0xE8, 0x00, 0x8B, 0x0A, 0x8B, 0xC7, 0xE8, 0x01, 0xFF, 0xFF, 0xFF, 0x83,
+    0xC6, 0x04, 0x83, 0xFE, 0x10, 0x72, 0xE9, 0x5E, 0xC3,
+];
+const B_A774E0: [u8; 68] = [
+    0xA1, 0x78, 0x12, 0x77, 0x02, 0x8B, 0x50, 0x1C, 0x6A, 0x04, 0xB9, 0x78, 0x12, 0x77, 0x02, 0x68,
+    0x40, 0x6A, 0x00, 0x00, 0x89, 0x0D, 0x48, 0x9E, 0x52, 0x02, 0xFF, 0xD2, 0x8B, 0x0D, 0x48, 0x9E,
+    0x52, 0x02, 0xA3, 0x44, 0x9E, 0x52, 0x02, 0x8B, 0x01, 0x8B, 0x50, 0x1C, 0x6A, 0x04, 0x68, 0xE0,
+    0x2E, 0x00, 0x00, 0xFF, 0xD2, 0xA3, 0x3C, 0x9E, 0x52, 0x02, 0xE8, 0x61, 0xFC, 0xFF, 0xFF, 0xE9,
+    0x6C, 0xFF, 0xFF, 0xFF,
+];
+const B_C06C80: [u8; 41] = [
+    0x56, 0x8B, 0xF1, 0xE8, 0x08, 0xDD, 0xFE, 0xFF, 0x33, 0xC0, 0x88, 0x46, 0x2C, 0x89, 0x46, 0x3C,
+    0xC7, 0x06, 0x34, 0xA8, 0xDD, 0x00, 0x89, 0x46, 0x48, 0x89, 0x46, 0x44, 0x89, 0x46, 0x54, 0x89,
+    0x46, 0x58, 0x89, 0x46, 0x38, 0x8B, 0xC6, 0x5E, 0xC3,
+];
+const B_B99F70: [u8; 59] = [
+    0x85, 0xFF, 0x74, 0x33, 0x83, 0x3D, 0x38, 0xA2, 0x52, 0x02, 0x00, 0x74, 0x2A, 0x56, 0x33, 0xF6,
+    0xA1, 0x38, 0xA2, 0x52, 0x02, 0x8B, 0x0C, 0xB0, 0x51, 0x57, 0xE8, 0xA1, 0xF0, 0x0F, 0x00, 0x83,
+    0xC4, 0x08, 0x85, 0xC0, 0x74, 0x0D, 0x83, 0xC6, 0x01, 0x83, 0xFE, 0x22, 0x7C, 0xE2, 0x83, 0xC8,
+    0xFF, 0x5E, 0xC3, 0x8B, 0xC6, 0x5E, 0xC3, 0x83, 0xC8, 0xFF, 0xC3,
+];
+const B_B9F550: [u8; 40] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x8B, 0xF1, 0x33, 0xC9, 0x89, 0x8E, 0x94, 0x00, 0x00, 0x00, 0x83,
+    0x38, 0x04, 0x75, 0x03, 0x8B, 0x48, 0x04, 0xE8, 0x44, 0xD4, 0x03, 0x00, 0x89, 0x86, 0x90, 0x00,
+    0x00, 0x00, 0xB0, 0x01, 0x5E, 0xC2, 0x08, 0x00,
+];
+const B_B94C90: [u8; 51] = [
+    0x53, 0x8B, 0x5C, 0x24, 0x08, 0x55, 0x8B, 0x6C, 0x24, 0x10, 0x57, 0x8B, 0xF8, 0x85, 0xFF, 0x74,
+    0x1C, 0x56, 0x33, 0xF6, 0x3B, 0xF5, 0x7D, 0x14, 0x56, 0x53, 0x8B, 0xC7, 0xE8, 0xAF, 0xFE, 0xFF,
+    0xFF, 0x83, 0xC6, 0x01, 0x83, 0xC7, 0x10, 0x83, 0xFE, 0x20, 0x7C, 0xE8, 0x5E, 0x5F, 0x5D, 0x5B,
+    0xC2, 0x08, 0x00,
+];
+const B_559C90: [u8; 166] = [
+    0x8B, 0x44, 0x24, 0x04, 0x0F, 0xB7, 0x00, 0x66, 0x3D, 0xFF, 0xFF, 0x0F, 0x84, 0x94, 0x00, 0x00,
+    0x00, 0x56, 0x0F, 0xB7, 0xF0, 0x8B, 0xC6, 0xC1, 0xE0, 0x0F, 0xF7, 0xD0, 0x03, 0xC6, 0x8B, 0xC8,
+    0xC1, 0xF9, 0x0A, 0x33, 0xC8, 0x8D, 0x0C, 0xC9, 0x8B, 0xD1, 0xC1, 0xFA, 0x06, 0x33, 0xCA, 0x8B,
+    0xC1, 0xC1, 0xE0, 0x0B, 0xF7, 0xD0, 0x03, 0xC8, 0x8B, 0xC1, 0xC1, 0xF8, 0x10, 0x33, 0xC1, 0x8B,
+    0x0D, 0x58, 0xE2, 0x12, 0x02, 0x99, 0xF7, 0x79, 0x60, 0x8B, 0x49, 0x5C, 0x8B, 0x14, 0x91, 0x85,
+    0xD2, 0x74, 0x51, 0x3B, 0x72, 0x0C, 0x74, 0x09, 0x8B, 0x52, 0x04, 0x85, 0xD2, 0x75, 0xF4, 0x5E,
+    0xC3, 0x8B, 0x12, 0x85, 0xD2, 0x74, 0x3D, 0x8B, 0x4A, 0x04, 0x85, 0xC9, 0x74, 0x36, 0x8B, 0xD1,
+    0x81, 0xE2, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE2, 0x04, 0x8B, 0x82, 0x64, 0x9C, 0x14, 0x02, 0x85,
+    0xC0, 0x74, 0x21, 0x39, 0x48, 0x44, 0x75, 0x1C, 0x83, 0x78, 0x4C, 0x01, 0x75, 0x16, 0xF6, 0x80,
+    0x80, 0x00, 0x00, 0x00, 0x0B, 0x75, 0x0D, 0x6A, 0x00, 0x8D, 0x88, 0xC4, 0x10, 0x00, 0x00, 0xE8,
+    0x0C, 0x00, 0x00, 0x00, 0x5E, 0xC3,
+];
+const B_4611B0: [u8; 181] = [
+    0x8B, 0x44, 0x24, 0x04, 0x0F, 0xB7, 0x00, 0x66, 0x3D, 0xFF, 0xFF, 0x0F, 0x84, 0xA3, 0x00, 0x00,
+    0x00, 0x56, 0x0F, 0xB7, 0xF0, 0x8B, 0xC6, 0xC1, 0xE0, 0x0F, 0xF7, 0xD0, 0x03, 0xC6, 0x8B, 0xC8,
+    0xC1, 0xF9, 0x0A, 0x33, 0xC8, 0x8D, 0x0C, 0xC9, 0x8B, 0xD1, 0xC1, 0xFA, 0x06, 0x33, 0xCA, 0x8B,
+    0xC1, 0xC1, 0xE0, 0x0B, 0xF7, 0xD0, 0x03, 0xC8, 0x8B, 0xC1, 0xC1, 0xF8, 0x10, 0x33, 0xC1, 0x8B,
+    0x0D, 0x58, 0xE2, 0x12, 0x02, 0x99, 0xF7, 0x79, 0x60, 0x8B, 0x49, 0x5C, 0x8B, 0x14, 0x91, 0x85,
+    0xD2, 0x74, 0x60, 0x3B, 0x72, 0x0C, 0x74, 0x09, 0x8B, 0x52, 0x04, 0x85, 0xD2, 0x75, 0xF4, 0x5E,
+    0xC3, 0x8B, 0x12, 0x85, 0xD2, 0x74, 0x4C, 0x8B, 0x42, 0x04, 0x85, 0xC0, 0x74, 0x45, 0x8B, 0xD0,
+    0x81, 0xE2, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE2, 0x04, 0x8B, 0x8A, 0x64, 0x9C, 0x14, 0x02, 0x85,
+    0xC9, 0x74, 0x30, 0x39, 0x41, 0x44, 0x75, 0x2B, 0x83, 0x79, 0x4C, 0x01, 0x75, 0x25, 0x80, 0xB9,
+    0xCC, 0x03, 0x00, 0x00, 0x02, 0x75, 0x1C, 0xF6, 0x81, 0x80, 0x00, 0x00, 0x00, 0x0B, 0x75, 0x13,
+    0xF6, 0x81, 0x03, 0x01, 0x00, 0x00, 0x08, 0x75, 0x0A, 0x6A, 0x00, 0xE8, 0x30, 0x02, 0x00, 0x00,
+    0x83, 0xC4, 0x04, 0x5E, 0xC3,
+];
+const B_B9CC00: [u8; 122] = [
+    0x8B, 0x44, 0x24, 0x04, 0x56, 0x33, 0xF6, 0x3B, 0xC6, 0x74, 0x6B, 0x39, 0x41, 0x08, 0x75, 0x15,
+    0x8B, 0x50, 0x14, 0x3B, 0xD0, 0x75, 0x0B, 0x89, 0x70, 0x14, 0x89, 0x70, 0x18, 0x89, 0x71, 0x08,
+    0xEB, 0x1D, 0x89, 0x51, 0x08, 0x8B, 0x50, 0x18, 0x57, 0x8B, 0x78, 0x14, 0x89, 0x7A, 0x14, 0x8B,
+    0x78, 0x18, 0x8B, 0x50, 0x14, 0x89, 0x7A, 0x18, 0x89, 0x70, 0x14, 0x89, 0x70, 0x18, 0x5F, 0x8B,
+    0x51, 0x04, 0x3B, 0xD6, 0x75, 0x11, 0x89, 0x40, 0x14, 0x89, 0x40, 0x18, 0x83, 0x41, 0x0C, 0xFF,
+    0x89, 0x41, 0x04, 0x5E, 0xC2, 0x04, 0x00, 0x8B, 0x52, 0x18, 0x89, 0x50, 0x18, 0x8B, 0x51, 0x04,
+    0x89, 0x50, 0x14, 0x8B, 0x51, 0x04, 0x8B, 0x52, 0x18, 0x89, 0x42, 0x14, 0x8B, 0x51, 0x04, 0x89,
+    0x42, 0x18, 0x83, 0x41, 0x0C, 0xFF, 0x5E, 0xC2, 0x04, 0x00,
+];
+const B_A0FFE0: [u8; 141] = [
+    0xA1, 0xC0, 0x60, 0xE1, 0x02, 0x3D, 0x00, 0x10, 0x00, 0x00, 0x7C, 0x05, 0x32, 0xC0, 0xC2, 0x0C,
+    0x00, 0xD9, 0x44, 0x24, 0x04, 0x66, 0x89, 0x46, 0x1E, 0xA1, 0xBC, 0x60, 0xE1, 0x02, 0x89, 0x46,
+    0x20, 0x8B, 0x0D, 0xC0, 0x60, 0xE1, 0x02, 0x8D, 0x04, 0x49, 0x8D, 0x04, 0xC5, 0xC4, 0x60, 0xE1,
+    0x02, 0x83, 0xC1, 0x01, 0x89, 0x0D, 0xC0, 0x60, 0xE1, 0x02, 0xD9, 0x18, 0x8A, 0x4C, 0x24, 0x0C,
+    0xD9, 0x44, 0x24, 0x08, 0xD9, 0x58, 0x04, 0xC6, 0x40, 0x15, 0x01, 0x88, 0x48, 0x14, 0x8B, 0x0A,
+    0x89, 0x48, 0x08, 0x8B, 0x4A, 0x04, 0x89, 0x48, 0x0C, 0x8B, 0x52, 0x08, 0x89, 0x50, 0x10, 0x66,
+    0x8B, 0x0D, 0xC4, 0xE0, 0xE2, 0x02, 0x66, 0x89, 0x48, 0x16, 0x8B, 0x15, 0xC4, 0xE0, 0xE2, 0x02,
+    0x89, 0x34, 0x95, 0xC8, 0xE0, 0xE2, 0x02, 0x83, 0x05, 0xC4, 0xE0, 0xE2, 0x02, 0x01, 0x0F, 0xB7,
+    0x40, 0x16, 0x50, 0xE8, 0xF8, 0x01, 0x00, 0x00, 0xB0, 0x01, 0xC2, 0x0C, 0x00,
+];
+const B_41AC50: [u8; 148] = [
+    0x53, 0x56, 0x57, 0x8B, 0x3D, 0x80, 0x15, 0xEE, 0x00, 0x33, 0xDB, 0xEB, 0x03, 0x8D, 0x49, 0x00,
+    0x3B, 0xFB, 0x74, 0x7C, 0x8B, 0x07, 0x8B, 0xF0, 0x2B, 0x35, 0x80, 0x15, 0xEE, 0x00, 0xF7, 0xDE,
+    0x1B, 0xF6, 0x23, 0xF0, 0xE8, 0x07, 0xFB, 0xFF, 0xFF, 0x84, 0xC0, 0x75, 0x5F, 0x39, 0x3D, 0x80,
+    0x15, 0xEE, 0x00, 0x75, 0x13, 0x8B, 0x07, 0x3B, 0xC7, 0x75, 0x08, 0x89, 0x1D, 0x80, 0x15, 0xEE,
+    0x00, 0xEB, 0x1C, 0xA3, 0x80, 0x15, 0xEE, 0x00, 0x8B, 0x47, 0x04, 0x3B, 0xC3, 0x74, 0x04, 0x8B,
+    0x0F, 0x89, 0x08, 0x8B, 0x07, 0x3B, 0xC3, 0x74, 0x06, 0x8B, 0x57, 0x04, 0x89, 0x50, 0x04, 0xA1,
+    0x84, 0x15, 0xEE, 0x00, 0x3B, 0xC3, 0x89, 0x5F, 0x04, 0x89, 0x1F, 0x75, 0x0F, 0x89, 0x3F, 0x89,
+    0x7F, 0x04, 0x89, 0x3D, 0x84, 0x15, 0xEE, 0x00, 0x8B, 0xFE, 0xEB, 0x94, 0x8B, 0x48, 0x04, 0x89,
+    0x4F, 0x04, 0x89, 0x07, 0x8B, 0x50, 0x04, 0x89, 0x3A, 0x89, 0x78, 0x04, 0x8B, 0xFE, 0xEB, 0x80,
+    0x5F, 0x5E, 0x5B, 0xC3,
+];
+const B_458180: [u8; 182] = [
+    0x57, 0x8B, 0x7C, 0x24, 0x08, 0x85, 0xFF, 0x74, 0x32, 0x8B, 0x4F, 0x44, 0x85, 0xC9, 0x74, 0x2B,
+    0x8B, 0xC1, 0x25, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE0, 0x04, 0x8B, 0x80, 0x64, 0x9C, 0x14, 0x02,
+    0x85, 0xC0, 0x74, 0x17, 0x39, 0x48, 0x44, 0x75, 0x12, 0xB9, 0x01, 0x00, 0x00, 0x00, 0x39, 0x48,
+    0x4C, 0x75, 0x08, 0x38, 0x88, 0xCC, 0x03, 0x00, 0x00, 0x74, 0x79, 0x8B, 0x8F, 0x50, 0x01, 0x00,
+    0x00, 0x85, 0xC9, 0x56, 0x74, 0x1A, 0x8B, 0xD1, 0x81, 0xE2, 0xFF, 0x0F, 0x00, 0x00, 0xC1, 0xE2,
+    0x04, 0x8B, 0x82, 0x64, 0x9C, 0x14, 0x02, 0x85, 0xC0, 0x74, 0x05, 0x39, 0x48, 0x44, 0x74, 0x04,
+    0x33, 0xF6, 0xEB, 0x10, 0x33, 0xC9, 0x83, 0x78, 0x4C, 0x02, 0x0F, 0x95, 0xC1, 0x83, 0xE9, 0x01,
+    0x23, 0xC8, 0x8B, 0xF1, 0x8B, 0xC6, 0xE8, 0x25, 0xE5, 0x3A, 0x00, 0x84, 0xC0, 0x75, 0x10, 0x68,
+    0x90, 0x7C, 0x45, 0x00, 0x6A, 0x00, 0x56, 0xE8, 0x84, 0xE9, 0x3A, 0x00, 0x83, 0xC4, 0x0C, 0x6A,
+    0x00, 0x33, 0xC0, 0x8B, 0xCF, 0xE8, 0x86, 0x1D, 0xFE, 0xFF, 0x8B, 0xC6, 0x8B, 0xCF, 0xE8, 0xAD,
+    0xF1, 0xFF, 0xFF, 0x68, 0xA1, 0x00, 0x00, 0x00, 0x6A, 0x15, 0x57, 0xE8, 0x80, 0xF3, 0xFD, 0xFF,
+    0x83, 0xC4, 0x10, 0x5E, 0x5F, 0xC3,
+];
+const B_402900: [u8; 181] = [
+    0x83, 0xEC, 0x0C, 0x56, 0x8B, 0x74, 0x24, 0x14, 0x6A, 0x00, 0x6A, 0x01, 0x6A, 0x0B, 0x8D, 0x86,
+    0xC4, 0x10, 0x00, 0x00, 0x50, 0xE8, 0x16, 0x80, 0x15, 0x00, 0x6A, 0x00, 0x6A, 0x01, 0xE8, 0x5D,
+    0xE1, 0x55, 0x00, 0x8B, 0x8E, 0xE0, 0x05, 0x00, 0x00, 0x8B, 0x41, 0x14, 0x83, 0xC4, 0x08, 0x83,
+    0xF8, 0xFF, 0x74, 0x0E, 0x8D, 0x14, 0x40, 0x8A, 0x04, 0x95, 0x98, 0xEE, 0xE8, 0x00, 0x24, 0x01,
+    0x75, 0x11, 0x6A, 0x00, 0x6A, 0x01, 0x6A, 0x01, 0x6A, 0xFF, 0x56, 0xE8, 0x20, 0xA2, 0x56, 0x00,
+    0x83, 0xC4, 0x14, 0xF6, 0x86, 0x40, 0x01, 0x00, 0x00, 0x04, 0xD9, 0x86, 0x50, 0x01, 0x00, 0x00,
+    0xD9, 0x5C, 0x24, 0x04, 0xD9, 0x86, 0x54, 0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x08, 0xD9, 0x86,
+    0x58, 0x01, 0x00, 0x00, 0xD9, 0x5C, 0x24, 0x0C, 0x75, 0x36, 0x8B, 0x4C, 0x24, 0x04, 0x8B, 0x54,
+    0x24, 0x08, 0x8B, 0x44, 0x24, 0x0C, 0x83, 0xA6, 0x60, 0x07, 0x00, 0x00, 0xFE, 0x80, 0xA6, 0x5C,
+    0x07, 0x00, 0x00, 0xFE, 0x89, 0x8E, 0x30, 0x07, 0x00, 0x00, 0x89, 0x96, 0x34, 0x07, 0x00, 0x00,
+    0x89, 0x86, 0x38, 0x07, 0x00, 0x00, 0xC7, 0x86, 0x48, 0x07, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x5E, 0x83, 0xC4, 0x0C, 0xC3,
+];
+const B_B8AC40: [u8; 89] = [
+    0x56, 0x57, 0x8B, 0xF0, 0x33, 0xFF, 0x85, 0xF6, 0x74, 0x4C, 0x8D, 0x9B, 0x00, 0x00, 0x00, 0x00,
+    0x8B, 0x06, 0x8B, 0x50, 0x0C, 0x8B, 0xCE, 0xFF, 0xD2, 0x83, 0x7E, 0x1C, 0x00, 0x74, 0x1E, 0x8B,
+    0x46, 0x20, 0x85, 0xC0, 0x74, 0x12, 0x81, 0xFF, 0x00, 0x01, 0x00, 0x00, 0x73, 0x0A, 0x89, 0x04,
+    0xBD, 0xB0, 0xCB, 0x2E, 0x02, 0x83, 0xC7, 0x01, 0x8B, 0x76, 0x1C, 0xEB, 0x15, 0x8B, 0x76, 0x20,
+    0x85, 0xF6, 0x75, 0xCC, 0x85, 0xFF, 0x76, 0x0E, 0x8B, 0x34, 0xBD, 0xAC, 0xCB, 0x2E, 0x02, 0x83,
+    0xEF, 0x01, 0x85, 0xF6, 0x75, 0xBA, 0x5F, 0x5E, 0xC3,
+];
+const B_B91B70: [u8; 113] = [
+    0x33, 0xD2, 0x3B, 0xCA, 0x75, 0x03, 0x33, 0xC0, 0xC3, 0x56, 0x8B, 0x35, 0xC4, 0xA1, 0x52, 0x02,
+    0x3B, 0xF2, 0x74, 0x59, 0x8B, 0x06, 0x3B, 0xC6, 0x75, 0x08, 0x89, 0x15, 0xC4, 0xA1, 0x52, 0x02,
+    0xEB, 0x14, 0x57, 0x8B, 0x7E, 0x04, 0x89, 0x07, 0x8B, 0x7E, 0x04, 0xA3, 0xC4, 0xA1, 0x52, 0x02,
+    0x8B, 0x06, 0x89, 0x78, 0x04, 0x5F, 0xA1, 0xC8, 0xA1, 0x52, 0x02, 0x3B, 0xC2, 0x89, 0x56, 0x04,
+    0x89, 0x16, 0x75, 0x14, 0x89, 0x36, 0x89, 0x76, 0x04, 0x89, 0x35, 0xC8, 0xA1, 0x52, 0x02, 0xE8,
+    0x7C, 0xFB, 0xFF, 0xFF, 0x8B, 0xC6, 0x5E, 0xC3, 0x8B, 0x50, 0x04, 0x89, 0x56, 0x04, 0x89, 0x06,
+    0x8B, 0x50, 0x04, 0x89, 0x32, 0x89, 0x70, 0x04, 0xE8, 0x63, 0xFB, 0xFF, 0xFF, 0x8B, 0xC6, 0x5E,
+    0xC3,
+];
+const B_BA0C90: [u8; 151] = [
+    0xA1, 0x6C, 0xDF, 0xEB, 0x00, 0x8B, 0x08, 0x56, 0xBE, 0x30, 0xF1, 0x1B, 0x03, 0x89, 0x0D, 0x38,
+    0xF1, 0x1B, 0x03, 0xC7, 0x05, 0x30, 0xF1, 0x1B, 0x03, 0x40, 0xE3, 0xEB, 0x00, 0xC7, 0x05, 0x34,
+    0xF1, 0x1B, 0x03, 0x05, 0x00, 0x00, 0x00, 0xE8, 0x24, 0x76, 0xFF, 0xFF, 0x8B, 0x0D, 0x70, 0xA2,
+    0x52, 0x02, 0x83, 0xF9, 0x20, 0x8B, 0x15, 0x6C, 0xDF, 0xEB, 0x00, 0x8B, 0x32, 0x73, 0x2C, 0x8B,
+    0xC1, 0xC1, 0xE0, 0x04, 0x8B, 0xD1, 0x83, 0xC1, 0x01, 0xC7, 0x80, 0x70, 0x23, 0x2F, 0x02, 0xBC,
+    0xC8, 0xE4, 0x00, 0x89, 0xB0, 0x74, 0x23, 0x2F, 0x02, 0xC7, 0x80, 0x78, 0x23, 0x2F, 0x02, 0x30,
+    0xF1, 0x1B, 0x03, 0x89, 0x0D, 0x70, 0xA2, 0x52, 0x02, 0xEB, 0x03, 0x83, 0xCA, 0xFF, 0x89, 0x15,
+    0xCC, 0x6C, 0xE8, 0x00, 0xE8, 0xA7, 0x07, 0x00, 0x00, 0xA1, 0xCC, 0x6C, 0xE8, 0x00, 0x3B, 0x05,
+    0x70, 0xA2, 0x52, 0x02, 0x5E, 0x73, 0x0D, 0xC1, 0xE0, 0x04, 0xC7, 0x80, 0x7C, 0x23, 0x2F, 0x02,
+    0xF8, 0xE3, 0xEB, 0x00, 0xB0, 0x01, 0xC3,
+];
+const B_618700: [u8; 103] = [
+    0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x51, 0x56, 0x8B, 0xF1, 0x83, 0x7E, 0x18, 0xFF, 0x56, 0x75,
+    0x07, 0xE8, 0x6A, 0x06, 0x00, 0x00, 0xEB, 0x05, 0xE8, 0x23, 0x01, 0x00, 0x00, 0x8B, 0x46, 0x50,
+    0x83, 0xC6, 0x50, 0x85, 0xC0, 0x7C, 0x3B, 0x8B, 0x0D, 0xAC, 0x43, 0xE8, 0x00, 0x3B, 0xC1, 0x7E,
+    0x0B, 0x2B, 0xC1, 0x3D, 0x00, 0xE9, 0xA4, 0x35, 0x7C, 0x28, 0xEB, 0x0A, 0x2B, 0xC8, 0x81, 0xF9,
+    0x00, 0xE9, 0xA4, 0x35, 0x7D, 0x1C, 0x8B, 0xC6, 0xE8, 0x53, 0x4B, 0x5C, 0x00, 0x3B, 0x05, 0xAC,
+    0xA3, 0x52, 0x02, 0x7F, 0x0D, 0xC7, 0x06, 0xFF, 0xFF, 0xFF, 0xFF, 0x83, 0x25, 0xE8, 0x5B, 0x5F,
+    0x02, 0xF7, 0x5E, 0x8B, 0xE5, 0x5D, 0xC3,
+];
