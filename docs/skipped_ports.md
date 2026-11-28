@@ -67,7 +67,7 @@ These run as Rust and pass their tests, but they are one-statement-per-instructi
 
 | Issue | Notes |
 |---|---|
-| Police helicopters hover or only make fly-bys instead of chasing (2026-11-26) | Vanilla (all ports off) chases properly. vehicle_is_helicopter 0xAB5190 now leaves ECX like the original, which did not fix it. Not bisected; the user asked to note it for later. Use the skip file (module or function names, `all_ports`) and 5 stars from the F7 menu. |
+| ~~Police helicopters hover instead of chasing~~ | **Fixed 2026-11-27** by the judge fix round (AI / nav ports now leave ECX / EDX like the originals); confirmed in the play test. |
 | Ports in port_hot60 that restore ECX / EDX where the original leaves a value | 0xCF7760 (ECX = 0), 0xA96A70 (ECX, EDX = pos.z), 0x71A0A0 (ECX = &s), 0x485D30 (ECX = &b): reproduce the original's values (rule added to docs/PORTING_RULES.md) |
 
 ## Not ported in the 2026-11-23 round
